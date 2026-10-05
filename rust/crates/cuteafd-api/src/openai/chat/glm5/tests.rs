@@ -203,8 +203,23 @@ fn parse_everywhere(options: &GlmParserOptions, text: &str) -> Projection {
 }
 
 fn options(thinking: bool, tools: Option<Vec<ToolDefinition>>) -> GlmParserOptions {
-    GlmParserOptions { thinking, tools, stop_sequences: Vec::new() }
+    GlmParserOptions { thinking, tools, ..Default::default() }
 }
+
+/// Two calls after reasoning, from glmrt's fixtures.
+const GLMRT_CALLS: &str = concat!("I need the weather and a search.</think>\n",
+    "<tool_call>lookup<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>units</arg_key><arg_value>metric</arg_value></tool_call>",
+    "\n<tool_call>search<arg_key>query</arg_key><arg_value>RDMA ring buffers</arg_value><arg_key>limit</arg_key><arg_value>4</arg_value></tool_call>");
+
+/// Typed values, a call without arguments, escapes and an undeclared tool.
+const TYPED_CALLS: &str = concat!("Checking.<tool_call>search<arg_key>query</arg_key><arg_value>42</arg_value>",
+    "<arg_key>exact</arg_key><arg_value>true</arg_value><arg_key>filters</arg_key><arg_value>{\"lang\": \"zh\", \"n\": [1, 2.5]}</arg_value>",
+    "<arg_key>tags</arg_key><arg_value>null</arg_value></tool_call>",
+    "<tool_call>refresh</tool_call>",
+    "<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/a \"b\".txt</arg_value>",
+    "<arg_key>text</arg_key><arg_value>line 1\n\tline 2 \\ 台北 💡\n</arg_value></tool_call>",
+    "<tool_call>unknown<arg_key>n</arg_key><arg_value> 7 </arg_value><arg_key>s</arg_key><arg_value>plain</arg_value></tool_call>",
+    "trailing text is dropped");
 
 #[test]
 fn reasoning_then_answer() {
@@ -223,10 +238,7 @@ fn non_thinking_answer_and_stray_think_markers() {
 
 #[test]
 fn glmrt_fixture_calls_parse_with_schema_types() {
-    let text = concat!("I need the weather and a search.</think>\n",
-        "<tool_call>lookup<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>units</arg_key><arg_value>metric</arg_value></tool_call>",
-        "\n<tool_call>search<arg_key>query</arg_key><arg_value>RDMA ring buffers</arg_value><arg_key>limit</arg_key><arg_value>4</arg_value></tool_call>");
-    let projection = parse_everywhere(&options(true, Some(tools())), text);
+    let projection = parse_everywhere(&options(true, Some(tools())), GLMRT_CALLS);
     assert_eq!(projection, Projection { reasoning: "I need the weather and a search.".into(), content: String::new(),
         calls: vec![("lookup".into(), json!({"city": "Taipei", "units": "metric"})),
             ("search".into(), json!({"query": "RDMA ring buffers", "limit": 4}))], stop: None });
@@ -236,15 +248,7 @@ fn glmrt_fixture_calls_parse_with_schema_types() {
 fn typed_values_zero_argument_calls_and_template_json() {
     // Values rendered by the template's `tojson` (spaced separators) and
     // multi-line strings round-trip; an undeclared tool keeps JSON typing.
-    let text = concat!("Checking.<tool_call>search<arg_key>query</arg_key><arg_value>42</arg_value>",
-        "<arg_key>exact</arg_key><arg_value>true</arg_value><arg_key>filters</arg_key><arg_value>{\"lang\": \"zh\", \"n\": [1, 2.5]}</arg_value>",
-        "<arg_key>tags</arg_key><arg_value>null</arg_value></tool_call>",
-        "<tool_call>refresh</tool_call>",
-        "<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/a \"b\".txt</arg_value>",
-        "<arg_key>text</arg_key><arg_value>line 1\n\tline 2 \\ 台北 💡\n</arg_value></tool_call>",
-        "<tool_call>unknown<arg_key>n</arg_key><arg_value> 7 </arg_value><arg_key>s</arg_key><arg_value>plain</arg_value></tool_call>",
-        "trailing text is dropped");
-    let projection = parse_everywhere(&options(false, Some(tools())), text);
+    let projection = parse_everywhere(&options(false, Some(tools())), TYPED_CALLS);
     assert_eq!(projection.content, "Checking.");
     assert_eq!(projection.calls, vec![
         ("search".into(), json!({"query": "42", "exact": true, "filters": {"lang": "zh", "n": [1, 2.5]}, "tags": null})),
@@ -254,19 +258,55 @@ fn typed_values_zero_argument_calls_and_template_json() {
     ]);
 }
 
-#[test]
-fn string_arguments_stream_before_the_value_closes() {
-    let mut parser = GlmOutputParser::new(options(false, Some(tools())));
-    let early = parser.push("<tool_call>write_file<arg_key>text</arg_key><arg_value>first \"quoted\" line</arg_");
-    let streamed: String = early.iter().map(|chunk| match chunk {
-        OutputChunk::ToolCall { arguments, .. } | OutputChunk::ToolArgumentsDelta { content: arguments } => arguments.clone(),
-        other => panic!("unexpected {other:?}"),
-    }).collect();
-    assert_eq!(streamed, r#"{"text":"first \"quoted\" line"#);
-    let mut chunks = early;
-    chunks.extend(parser.push("value></tool_call>"));
+/// Each call's name and argument text, as a client joins its deltas.
+fn call_texts(options: &GlmParserOptions, pieces: &[&str]) -> Vec<(String, String)> {
+    let mut parser = GlmOutputParser::new(options.clone());
+    let mut chunks = Vec::new();
+    for piece in pieces { chunks.extend(parser.push(piece)); }
     chunks.extend(parser.finish());
-    assert_eq!(project(&chunks, None).calls, vec![("write_file".into(), json!({"text": "first \"quoted\" line"}))]);
+    let mut calls: Vec<(String, String)> = Vec::new();
+    for chunk in chunks {
+        match chunk {
+            OutputChunk::ToolCall { tool_name, arguments } => calls.push((tool_name, arguments)),
+            OutputChunk::ToolArgumentsDelta { content } => calls.last_mut().expect("delta follows a call").1.push_str(&content),
+            _ => {}
+        }
+    }
+    calls
+}
+
+/// Valid calls keep the argument bytes the streaming parser sent before calls
+/// were held (recorded from it), whole or a character at a time.
+#[test]
+fn valid_calls_keep_their_argument_bytes() {
+    for (thinking, text, expected) in [
+        (true, GLMRT_CALLS, vec![("lookup", r#"{"city":"Taipei","units":"metric"}"#),
+            ("search", r#"{"query":"RDMA ring buffers","limit":4}"#)]),
+        (false, TYPED_CALLS, vec![("search", r#"{"query":"42","exact":true,"filters":{"lang":"zh","n":[1,2.5]},"tags":null}"#),
+            ("refresh", "{}"), ("write_file", r#"{"path":"/tmp/a \"b\".txt","text":"line 1\n\tline 2 \\ 台北 💡\n"}"#),
+            ("unknown", r#"{"n":7,"s":"plain"}"#)]),
+    ] {
+        let expected: Vec<(String, String)> = expected.into_iter().map(|(name, arguments)| (name.into(), arguments.into())).collect();
+        let parser = options(thinking, Some(tools()));
+        let characters: Vec<String> = text.chars().map(String::from).collect();
+        assert_eq!(call_texts(&parser, &[text]), expected);
+        assert_eq!(call_texts(&parser, &characters.iter().map(String::as_str).collect::<Vec<_>>()), expected);
+    }
+}
+
+#[test]
+fn tool_calls_are_held_until_they_close() {
+    // Nothing of a call goes out before its closing tag; then its chunks are
+    // the ones a string argument always streamed as.
+    let mut parser = GlmOutputParser::new(options(false, Some(tools())));
+    assert_eq!(parser.push("<tool_call>write_file<arg_key>text</arg_key><arg_value>first \"quoted\" line</arg_"), vec![]);
+    assert_eq!(parser.push("value>"), vec![]);
+    assert_eq!(parser.tool_calls(), 0);
+    let delta = |content: &str| OutputChunk::ToolArgumentsDelta { content: content.into() };
+    assert_eq!(parser.push("</tool_call>"), vec![
+        OutputChunk::ToolCall { tool_name: "write_file".into(), arguments: "{".into() },
+        delta(r#""text":""#), delta(r#"first \"quoted\" line"#), delta("\""), delta("}")]);
+    assert_eq!(parser.tool_calls(), 1);
 }
 
 #[test]
@@ -278,18 +318,82 @@ fn partial_markers_are_withheld_until_resolved() {
     assert_eq!(chunks, vec![OutputChunk::Raw { content: " <tool_x> literal".into() }]);
 }
 
+/// One fixture per shape of unreadable call: its text, from the opening tag,
+/// comes back as content (with the whitespace before it), beside any call
+/// that parsed. Text after the first parsed call stays dropped.
 #[test]
-fn truncated_and_malformed_calls_keep_arguments_valid_json() {
-    // max_tokens inside a string value: the call is closed at finish.
-    let projection = parse(&options(false, Some(tools())),
-        &["<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/x</arg_value><arg_key>text</arg_key><arg_value>partial"]);
-    assert_eq!(projection.calls, vec![("write_file".into(), json!({"path": "/tmp/x", "text": "partial"}))]);
-    // Missing <arg_value>: glmrt discarded the call; a streamed call is closed.
-    let projection = parse_everywhere(&options(false, Some(tools())),
-        "<tool_call>lookup<arg_key>city</arg_key>Taipei</tool_call><tool_call><bad></tool_call><tool_call>refresh</tool_call>");
-    assert_eq!(projection.calls, vec![("lookup".into(), json!({})), ("refresh".into(), json!({}))]);
-    // A name that never completes emits nothing.
-    assert_eq!(parse(&options(false, Some(tools())), &["Sure.<tool_call>look"]).calls, vec![]);
+fn unreadable_calls_return_as_content() {
+    let oslo = "<tool_call>lookup<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>";
+    let parsed = || vec![("lookup".to_owned(), json!({"city": "Oslo"}))];
+    for (shape, text, content, calls) in [
+        // Closing tag missing: the output ends inside a value (max_tokens) ...
+        ("truncated value", "Writing.\n<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/x</arg_value><arg_key>text</arg_key><arg_value>partial".to_owned(),
+            "Writing.\n<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/x</arg_value><arg_key>text</arg_key><arg_value>partial".to_owned(), vec![]),
+        // ... or inside the name ...
+        ("truncated name", "Sure.<tool_call>look".to_owned(), "Sure.<tool_call>look".to_owned(), vec![]),
+        // ... or a new call opens first, which still parses.
+        ("next call", format!("<tool_call>lookup<arg_key>city</arg_key><arg_value>Rome</arg_value>\n{oslo}"),
+            "<tool_call>lookup<arg_key>city</arg_key><arg_value>Rome</arg_value>".to_owned(), parsed()),
+        // Markup in the name: either angle bracket.
+        ("markup in the name", "a <tool_call>look<up</tool_call> b".to_owned(), "a <tool_call>look<up</tool_call> b".to_owned(), vec![]),
+        ("markup in the name, >", "<tool_call>lookup><arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>".to_owned(),
+            "<tool_call>lookup><arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>".to_owned(), vec![]),
+        // Arguments without a name.
+        ("no name", "<tool_call><arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>".to_owned(),
+            "<tool_call><arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>".to_owned(), vec![]),
+        // An empty call.
+        ("empty", "<tool_call>\n</tool_call>".to_owned(), "<tool_call>\n</tool_call>".to_owned(), vec![]),
+        // After a parsed call a lost call is still returned; the text around it is not.
+        ("after a call", format!("A{oslo}B<tool_call><x></tool_call>C"), "A<tool_call><x></tool_call>".to_owned(), parsed()),
+    ] {
+        let projection = parse_everywhere(&options(false, Some(tools())), &text);
+        assert_eq!((projection.content, projection.calls, projection.stop), (content, calls, None), "{shape}");
+    }
+}
+
+/// A name closed by stray closing tags is recovered when what is left is a
+/// declared tool; otherwise the call is returned as content.
+#[test]
+fn a_stray_closing_tag_after_a_declared_name_is_recovered() {
+    let text = "<tool_call>lookup</arg_key>\n<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>";
+    let projection = parse_everywhere(&options(false, Some(tools())), text);
+    assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("lookup".into(), json!({"city": "Oslo"}))]));
+    let undeclared = text.replace("lookup", "locate");
+    let projection = parse_everywhere(&options(false, Some(tools())), &undeclared);
+    assert_eq!((projection.content.as_str(), projection.calls), (undeclared.as_str(), vec![]));
+}
+
+/// A repeated key keeps its last value, in the place of its first, so the
+/// arguments stay a JSON object without duplicate keys.
+#[test]
+fn a_repeated_argument_keeps_its_last_value() {
+    let text = concat!("<tool_call>search<arg_key>query</arg_key><arg_value>first</arg_value>",
+        "<arg_key>limit</arg_key><arg_value>1</arg_value><arg_key>query</arg_key><arg_value>second</arg_value>",
+        "<arg_key>limit</arg_key><arg_value>2</arg_value></tool_call>");
+    let expected = vec![("search".to_owned(), r#"{"query":"second","limit":2}"#.to_owned())];
+    let parser = options(false, Some(tools()));
+    let characters: Vec<String> = text.chars().map(String::from).collect();
+    assert_eq!(call_texts(&parser, &[text]), expected);
+    assert_eq!(call_texts(&parser, &characters.iter().map(String::as_str).collect::<Vec<_>>()), expected);
+}
+
+/// An argument that cannot be read, or stray text between arguments, is
+/// dropped; the call and its other arguments survive.
+#[test]
+fn unreadable_arguments_are_dropped_from_their_call() {
+    let limit = "<arg_key>limit</arg_key><arg_value>4</arg_value>";
+    for (shape, text) in [
+        ("no value", format!("<tool_call>search<arg_key>query</arg_key>no value{limit}</tool_call>")),
+        ("markup in the key", format!("<tool_call>search<arg_key><bad></arg_key><arg_value>1</arg_value>{limit}</tool_call>")),
+        ("markup in the key, >", format!("<tool_call>search<arg_key>a>b</arg_key><arg_value>1</arg_value>{limit}</tool_call>")),
+        ("stray text", format!("<tool_call>search{limit} stray </tool_call>")),
+        ("all of them", format!(concat!("<tool_call>search<arg_key>query</arg_key>no value",
+            "<arg_key><bad></arg_key><arg_value>1</arg_value>{} stray </tool_call>"), limit)),
+    ] {
+        let projection = parse_everywhere(&options(false, Some(tools())), &text);
+        assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("search".into(), json!({"limit": 4}))]),
+            "{shape}");
+    }
 }
 
 #[test]
@@ -337,14 +441,15 @@ mod router {
     }
 
     /// Serve one request whose worker streams `text` a character at a time.
-    async fn serve(body: Value, text: &'static str, check: impl FnOnce(&NativeRequest) + Send + 'static)
+    async fn serve(body: Value, text: impl Into<String>, check: impl FnOnce(&NativeRequest) + Send + 'static)
         -> (StatusCode, Vec<u8>) {
         serve_with(encoding(), body, text, check).await
     }
 
     /// [`serve`] for a server with `encoding`.
-    async fn serve_with(encoding: GlmEncoding, body: Value, text: &'static str,
+    async fn serve_with(encoding: GlmEncoding, body: Value, text: impl Into<String>,
         check: impl FnOnce(&NativeRequest) + Send + 'static) -> (StatusCode, Vec<u8>) {
+        let text = text.into();
         let (queue, mut receive) = mpsc::channel::<NativeRequest>(1);
         let worker = tokio::spawn(async move {
             let job = receive.recv().await.unwrap();
@@ -522,5 +627,76 @@ mod router {
             assert_eq!((message["content"].as_str(), message["reasoning_content"].as_str()), (Some("Hello."), None),
                 "{options}");
         }
+    }
+
+    /// A call that cannot be read comes back as content, whole or streamed,
+    /// beside any call that parsed; the finish is `tool_calls` only when one did.
+    #[tokio::test]
+    async fn unreadable_calls_come_back_as_content_in_both_response_modes() {
+        let tools = json!([{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object",
+            "properties": {"city": {"type": "string"}}}}}]);
+        let nameless = "<tool_call><arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call>";
+        let oslo = "<tool_call>lookup<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>";
+        let truncated = "<tool_call>lookup<arg_key>city</arg_key><arg_value>Os";
+        for (text, content, calls, finish) in [
+            (format!("Plan.</think>Checking.\n{nameless}"), format!("Checking.\n{nameless}"), 0, "stop"),
+            (format!("Plan.</think>Checking.\n{nameless}{oslo}"), format!("Checking.\n{nameless}"), 1, "tool_calls"),
+            (format!("Plan.</think>{truncated}"), truncated.to_owned(), 0, "stop"),
+        ] {
+            for streaming in [false, true] {
+                let body = json!({"model": MODEL, "stream": streaming, "tools": tools,
+                    "messages": [{"role": "user", "content": "Weather in Oslo?"}]});
+                let (status, bytes) = serve(body, text.clone(), |_| {}).await;
+                assert_eq!(status, StatusCode::OK);
+                let (reply, names, reason) = if streaming {
+                    let events = sse_events(&bytes);
+                    let reply: String = events.iter().filter_map(|event| event["choices"][0]["delta"]["content"].as_str()).collect();
+                    let names: Vec<String> = events.iter()
+                        .flat_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array().cloned().unwrap_or_default())
+                        .filter_map(|delta| delta["function"]["name"].as_str().map(str::to_owned)).collect();
+                    (reply, names, events.last().unwrap()["choices"][0]["finish_reason"].clone())
+                } else {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    let message = &value["choices"][0]["message"];
+                    let names = message["tool_calls"].as_array().into_iter().flatten()
+                        .map(|call| call["function"]["name"].as_str().unwrap().to_owned()).collect();
+                    (message["content"].as_str().unwrap_or_default().to_owned(), names, value["choices"][0]["finish_reason"].clone())
+                };
+                assert_eq!((reply.as_str(), names.len(), reason.as_str()), (content.as_str(), calls, Some(finish)),
+                    "{text} streaming={streaming}");
+            }
+        }
+    }
+
+    /// A call is held until it closes: nothing of it streams early, and the
+    /// stream's keepalive comment covers the wait.
+    #[tokio::test]
+    async fn a_held_call_keeps_the_stream_alive() {
+        let (queue, mut receive) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = receive.recv().await.unwrap();
+            let text = |content: &str| Ok(InferenceChunk::Text { content: content.into(), content_tokens: 1 });
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 9, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(text("Look it up.</think><tool_call>lookup<arg_key>city</arg_key><arg_value>Tai")).unwrap();
+            tokio::time::sleep(crate::openai::SSE_KEEPALIVE * 4).await;
+            job.events.send(text("pei</arg_value></tool_call>")).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).unwrap();
+        });
+        let body = json!({"model": MODEL, "stream": true, "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object",
+                "properties": {"city": {"type": "string"}}}}}]});
+        let request = Request::post("/v1/chat/completions").header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap();
+        let response = app(queue, encoding()).oneshot(request).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        worker.await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let keepalive = text.find(": keepalive\n\n").expect("a keepalive while the call is held");
+        assert!(keepalive < text.find("\"tool_calls\"").unwrap(), "{text}");
+        let arguments: String = sse_events(&bytes).iter()
+            .flat_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array().cloned().unwrap_or_default())
+            .filter_map(|delta| delta["function"]["arguments"].as_str().map(str::to_owned)).collect();
+        assert_eq!(arguments, r#"{"city":"Taipei"}"#);
     }
 }

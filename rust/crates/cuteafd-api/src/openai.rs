@@ -572,7 +572,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             };
             let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
