@@ -1,4 +1,5 @@
 #include "common.h"
+#include "cuteafd_vision.h"
 
 namespace {
 
@@ -101,7 +102,30 @@ cuteafd_status_t validate_bf16_graph_embedding_lookup_buffers(
   return CUTEAFD_STATUS_OK;
 }
 
+__global__ void embed_inject_kernel(const uint16_t* features, const uint32_t* indices,
+                                    uint16_t* out, int rows, int width, int copies) {
+  const size_t feature = blockIdx.x;
+  const uint32_t row = indices[feature];
+  if (row >= uint32_t(rows)) return;
+  for (int col = threadIdx.x; col < width; col += blockDim.x) {
+    const uint16_t value = features[feature * width + col];
+    for (int copy = 0; copy < copies; ++copy)
+      out[(size_t(row) * copies + copy) * width + col] = value;
+  }
+}
+
 }  // namespace
+
+extern "C" int32_t cuteafd_embed_inject(const uint16_t* features, const uint32_t* indices,
+                                       uint16_t* out, int32_t feature_rows, int32_t rows,
+                                       int32_t width, int32_t copies, void* stream) {
+  if (!features || !indices || !out || feature_rows < 1 || feature_rows > rows ||
+      rows < 1 || rows > 16384 || width < 1 || width > 16384 || copies < 1 || copies > 4)
+    return cudaErrorInvalidValue;
+  embed_inject_kernel<<<feature_rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      features, indices, out, rows, width, copies);
+  return cudaGetLastError();
+}
 
 extern "C" cuteafd_status_t cuteafd_cuda_graph_update_embedding_lookup_bf16_node(
     void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index,
