@@ -7,14 +7,14 @@ Base: origin/work/p0 163c3a36
 
 1. Wire the resident encoder into MiMo readiness, admission and media stats.
 2. Inject cached image features into target and drafter embeddings; preserve native token IDs and full media prefix identities.
-3. Integrate WP-4 remote placement; reuse matching native artifacts for bounded Flash image and prefix qualification, then Pro.
+3. First qualify local RTX Flash images using the standard root launcher and matching WP-4 native assets; add probes/features, then remote placement and Pro.
 4. Commit and push each green step; report measurements and remaining gates.
 
 ## Progress
 
 - d4261db5 (pushed): nonblocking local encoder adapter, canonical encoder identity and normalization helpers. Its gate was five passed/one ignored, correcting the commit-message count.
 - dff38ddd: WP-4 explicit placement parser cherry-pick.
-- Serving integration: host-only pending media, peek/encode/admit/reconcile with slot release before retry and bounded cold fallback, carved embedding-cache quota, readiness-gated API capability and media stats.
+- 3e4b1244 (pushed) serving integration: host-only pending media, peek/encode/admit/reconcile with slot release before retry and bounded cold fallback, carved embedding-cache quota, readiness-gated API capability and media stats.
 - Target serial/paired/pipelined prefills inject after token gather; MTP injects shifted known image rows. DFlash receives downstream target taps. Prefix-covered absent host features keep optional MTP cold until its reconstruction window clears.
 - Local owner QueueFull after cancellation is backpressure, not a keyed encode failure; deterministic cancellation test passes.
 - Planner accepts supported BF16 vision geometry; resident loading still validates the complete actual tower inventory.
@@ -34,7 +34,9 @@ Base: origin/work/p0 163c3a36
 
 ## Open Issues
 
-- Import WP-4 remote/planner 21123512 and launcher 35b21708 without replacing this status; wire endpoint/hash/revision and fail closed on explicit unsupported placement.
+- Imported WP-4 launcher 35b21708 and only its planner/report/CLI prerequisites from 21123512. Remote adapter, worker and expertd integration remain parked until the first correct local image answer.
+- Launcher prerequisite gates: full cargo workspace zero failures (daemon 417 passed/123 ignored); scripts 998 passed, 2 skipped, 193 subtests passed in 74.85 s, zero failing IDs. First script phase used a nonexistent task-local venv; reran using the existing project Python environment.
+- Root daemon build of 3e4b1244 completed in 12m26s; incremental planner CLI rebuild pending. Private derived images use standard release layout/entrypoint and exact mm-wp4 natives/PROGRAMS/fp8 assets; no launcher adaptation or UID change.
 - WP-8 tooling 2990f8d1/39b2e21c needs live prepared keys and image probes; synthetic component keys are not G4 qualification.
 - Live readiness time, text throughput and LM image numerical equivalence remain unmeasured.
 - Final workspace gate b6r8dl13m after bounds/hint cleanup: exit0, zero failures (daemon 416 passed/123 ignored); diff check clean.

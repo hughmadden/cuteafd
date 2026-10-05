@@ -167,6 +167,8 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct PlanArgs {
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
+    pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub(crate) vision: cuteafd_loader::plan::MediaMode,

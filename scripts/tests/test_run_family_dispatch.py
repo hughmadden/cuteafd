@@ -97,7 +97,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
-                          previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
+                          previous_peers: str | None = None, encoder_plan: dict | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -118,6 +118,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n' +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None else '') +
+                                    (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
+                                     if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
                                      " ".join(map(str, container_pids)) + " ;; esac\n"
                                      if tool == "docker" and container_pids else '') +
@@ -854,3 +856,33 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert result.returncode == 0, result.stderr
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
+
+@pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"), ("rtx:0", "rtx"), ("off", "off")])
+def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={mode}\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert ("--encoder-listen" in worker) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    if kind == "spark":
+        assert "--encoder-plan-hash " + "ab" * 32 in worker
+        assert "--encoder-plan-hash " + "ab" * 32 in launch
+        assert "--encoder-revision abc" in worker
+    assert f"--vision {kind}" in launch
+    if mode == "off": assert "cuteafd plan" not in result.stderr
+
+
+def test_mimo_encoder_plan_rejected_before_restart(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    plan = {"placement_supported": False, "fits": True, "encoder": {"kind": {"kind": "off"}}, "hints": ["rank absent"]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=spark:5\nSPECULATOR=off\n", encoder_plan=plan, restart=True)
+    assert result.returncode != 0
+    assert "docker rm" not in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr

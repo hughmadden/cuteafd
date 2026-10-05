@@ -1160,3 +1160,49 @@ fn media_off_is_disabled_and_saves_checkpoint_bytes() {
     assert_eq!(vision.bytes, 0);
     assert!(report.disabled_media_bytes > 0);
 }
+
+#[test]
+fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
+    use super::encoder::EncoderKind;
+    let mut cfg = mimo_flash_config();
+    cfg["vision_config"] = json!({"depth":28});
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(cfg, &tensors, Some(1));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96<<30], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
+    let spark = plan(dir.path(), &options).unwrap();
+    assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
+    let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
+    let memory = local.memory_layout.as_ref().unwrap();
+    let tower = memory.devices[0].items.iter().position(|i| i.group == "vision tower").unwrap();
+    let pool = memory.devices[0].items.iter().position(|i| i.group == "records").unwrap();
+    assert!(tower < pool);
+    let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
+    assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(),0);
+    assert_eq!(off.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes,0);
+    assert_ne!(spark.encoder_plan_hash,off.encoder_plan_hash);
+    assert_ne!(spark.encoder_plan_hash,local.encoder_plan_hash);
+    assert!(off.memory_layout.unwrap().devices.iter().flat_map(|d| &d.items).all(|i| !i.group.starts_with("vision")));
+}
+
+#[test]
+fn explicit_encoder_failure_and_small_pool_admission() {
+    use super::encoder::EncoderKind;
+    let mut cfg = mimo_flash_config();
+    cfg["vision_config"] = json!({"depth":28});
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(cfg, &tensors, Some(1));
+    let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32<<30], pool_tokens: Some(32768), ..Default::default()
+    }), ..Default::default() };
+    let local = plan(dir.path(), &options).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
+    for vision in [MediaMode::Rtx(Some(5)), MediaMode::Spark(Some(5))] {
+        let invalid = plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
+        assert!(!invalid.placement_supported);
+        assert!(!invalid.executable());
+        assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
+    }
+}
