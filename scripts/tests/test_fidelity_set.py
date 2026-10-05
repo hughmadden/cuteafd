@@ -130,7 +130,7 @@ def test_explicit_legacy_reference_keeps_variant_tokens_and_provenance(fake_serv
         make(fake_server, legacy_reference=reference, legacy_provenance={})
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "qwen4", "glm5_flash"])
+@pytest.mark.parametrize("family", ["mimo_v2", "qwen4", "glm5_flash", "deepseek_v4", "glm5"])
 def test_other_family_recipes_keep_internal_names(fake_server, family):
     fake_server["family"] = family
     manifest = make(fake_server)

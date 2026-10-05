@@ -488,16 +488,17 @@ def test_v41_two_lengths_isolate_module_and_cross_layer_state():
             assert np.array_equal(value.array, np.full(length, length))
 
 
-def test_glm_flash_window_dsa_handoff_is_per_window(tmp_path):
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5"])
+def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
     from contextlib import nullcontext
     manifest = tiny_set()
-    manifest["family"] = "glm5_flash"
+    manifest["family"] = family
     w = manifest["windows"][1]
     w["tokens"], w["roles"] = [1, 2, 3, 4, 5, 6, 7], ["ctx"] * 7
     manifest["set_sha256"] = set_hash(manifest)
     path = tmp_path / "input.json"
     path.write_bytes(canonical(manifest))
-    tree = ast.parse((ROOT / "python/reference/families/glm5_flash/golden.py").read_text())
+    tree = ast.parse((ROOT / "python/reference/families" / family / "golden.py").read_text())
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_windows")
     calls = []
 
@@ -509,6 +510,7 @@ def test_glm_flash_window_dsa_handoff_is_per_window(tmp_path):
         def numpy(self): return self.data.astype(np.float32)
         def __getitem__(self, key): return Tensor(self.data[key])
         def unsqueeze(self, axis): return Tensor(np.expand_dims(self.data, axis))
+        def repeat(self, *shape): return Tensor(np.tile(self.data, shape))
         def expand(self, *shape):
             shape = tuple(old if new == -1 else new for old, new in zip(self.data.shape, shape))
             return Tensor(np.broadcast_to(self.data, shape))
@@ -555,15 +557,21 @@ def test_glm_flash_window_dsa_handoff_is_per_window(tmp_path):
     exec(compile(ast.Module(body=[function], type_ignores=[]), "glm_window_runner", "exec"), scope)
     config = SimpleNamespace(hc_mult=4, num_hidden_layers=3, hidden_size=1, rms_norm_eps=1e-6,
                              layer_types=["dsa", "dsa", "kda"])
-    ref = SimpleNamespace(Glm5NextTextDecoderLayer=Layer, Glm5NextTextRMSNorm=lambda *_args: Norm())
-    scope["run_windows"](SimpleNamespace(windows=path, snapshot=tmp_path, out=tmp_path, layers=None, experts_snapshot=None),
-                         config, ref, weights, weights)
+    ref = SimpleNamespace(Glm5NextTextDecoderLayer=Layer, Glm5NextTextRMSNorm=lambda *_args: Norm(),
+        GlmMoeDsaDecoderLayer=Layer, GlmMoeDsaRMSNorm=lambda *_args: Norm(),
+        GlmMoeDsaRotaryEmbedding=lambda **_kwargs: SimpleNamespace(
+            cuda=lambda: lambda h, **_kw: (h, h)))
+    args = SimpleNamespace(windows=path, snapshot=tmp_path, out=tmp_path, layers=None, experts_snapshot=None)
+    if family == "glm5_flash":
+        scope["run_windows"](args, config, ref, weights, weights)
+    else:
+        scope["run_windows"](args, config, ref, weights)
     assert calls == [(0, 5, None), (0, 7, None), (1, 5, 5), (1, 7, 7), (2, 5, None), (2, 7, None)]
     meta = json.loads((tmp_path / "meta.json").read_text())
     assert [w["positions"] for w in meta["windows"]] == [list(range(2, 5)), list(range(2, 7))]
 
 
-@pytest.mark.parametrize("family", ["deepseek_v41", "mimo_v2/mimo_v26", "qwen4", "glm5_flash"])
+@pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "mimo_v2/mimo_v26", "qwen4", "glm5_flash", "glm5"])
 def test_goldens_have_layer_major_window_loops_and_scored_head_selection(family):
     path = ROOT / "python/reference/families" / family / "golden.py"
     tree = ast.parse(path.read_text())
@@ -574,6 +582,37 @@ def test_goldens_have_layer_major_window_loops_and_scored_head_selection(family)
     assert "score_from" in source and "write_scored_logits" in source and "finish_golden" in source
     assert "a.layers is not None" in source
     assert "load_set" in source
+
+
+def test_dsv4_reset_preserves_compressor_buffer_aliases():
+    tree = ast.parse((ROOT / "python/reference/families/deepseek_v4/golden.py").read_text())
+    names = {"initial_runtime_buffers", "reset_runtime_buffers"}
+    scope = {}
+    exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef)
+                                 and n.name in names], type_ignores=[]), "dsv4_buffers", "exec"), scope)
+
+    class Tensor:
+        def __init__(self, data): self.data = np.asarray(data)
+        def detach(self): return self
+        def cpu(self): return self
+        def clone(self): return Tensor(self.data.copy())
+        def copy_(self, other): np.copyto(self.data, other.data)
+
+    cache = Tensor(np.zeros((7, 2)))
+    scores = Tensor(np.full((4, 2), -np.inf))
+    module = SimpleNamespace(_buffers={"kv_cache": cache, "score_state": scores,
+        "freqs_cis": Tensor(np.arange(7))},
+        _non_persistent_buffers_set={"kv_cache", "score_state", "freqs_cis"})
+    module.modules = lambda: [module]
+    alias = cache.data[2:]
+    initial = scope["initial_runtime_buffers"](module)
+    for length in (2, 7, 3):
+        scope["reset_runtime_buffers"](initial)
+        assert module._buffers["kv_cache"] is cache
+        assert not alias.any() and np.isneginf(scores.data).all()
+        np.testing.assert_array_equal(module._buffers["freqs_cis"].data, np.arange(7))
+        cache.data[:length] = length
+        scores.data[:] = length
 
 
 def test_qwen_window_and_legacy_layers_enter_eval_after_loading():

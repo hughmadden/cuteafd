@@ -29,8 +29,9 @@ from safetensors import safe_open
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from shape_invariant import install
-from fidelity_windows import CheckpointStorage, release_checkpoint
+from shape_invariant import install, qualify
+from fidelity_windows import (CheckpointStorage, release_checkpoint, load_set,
+                              verify_snapshot, write_scored_logits, finish_golden)
 
 
 class Weights:
@@ -97,6 +98,66 @@ def load_layer(layer: torch.nn.Module, weights: Weights, prefix: str) -> None:
     release_checkpoint(torch.cuda, weights)
 
 
+def run_windows(a, config, ref, weights):
+    manifest = load_set(a.windows, "glm5")
+    identity = verify_snapshot(manifest, a.snapshot)
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, weights))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
+    started, rows, times, states = time.time(), [], [], []
+    with torch.inference_mode():
+        embed = weights.get("model.embed_tokens.weight")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], device="cuda")
+            h = torch.nn.functional.embedding(ids, embed)
+            states.append((h.cpu(), None))
+        del embed, ids, h
+        memory = CheckpointStorage(torch.cuda, weights)
+        rotary = ref.GlmMoeDsaRotaryEmbedding(config=config).cuda()
+        for layer_id in range(config.num_hidden_layers):
+            start = time.time()
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.GlmMoeDsaDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda")
+            load_layer(layer, weights, f"model.layers.{layer_id}.")
+            layer.eval()
+            for i, w in enumerate(manifest["windows"]):
+                host_h, host_topk = states[i]
+                h = host_h.cuda()
+                topk = host_topk.cuda() if host_topk is not None else None
+                positions = torch.arange(len(w["tokens"]), device="cuda")[None]
+                cos_sin = rotary(h, position_ids=positions)
+                # Reused DSA indices belong to this window, never the previous visit.
+                h, topk = layer(h, attention_mask=None, position_ids=positions,
+                                position_embeddings=cos_sin, prev_topk_indices=topk)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+                states[i] = (h.cpu(), topk.cpu() if topk is not None else None)
+                del h, topk, positions, cos_sin
+            del layer
+            memory.release()
+            memory.check(f"layer {layer_id}")
+            times.append(time.time() - start)
+            print(f"layer {layer_id} {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
+        norm.weight.copy_(weights.get("model.norm.weight"))
+        head = weights.get("lm_head.weight").float()
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][0][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            logits = torch.nn.functional.linear(norm(h).float()[0], head)
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        reference="transformers glm_moe_dsa (eager, fixed-M128 linears)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True)
@@ -107,7 +168,13 @@ def main() -> None:
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--requant-ue8m0", action="store_true",
                    help="re-quantize FP8 blocks to power-of-two scales (the b12x linear format)")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored logits")
+    p.add_argument("--prefix-only", action="store_true")
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
+    if a.windows and (a.text is not None or a.text_file is not None or a.requant_ue8m0):
+        p.error("--windows cannot be combined with legacy text or serving requantization")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -120,6 +187,10 @@ def main() -> None:
     install_eager(ref)
     config = AutoConfig.from_pretrained(a.snapshot)
     config._attn_implementation = "eager"
+    if a.windows:
+        a.out.mkdir(parents=True, exist_ok=True)
+        run_windows(a, config, ref, Weights(a.snapshot))
+        return
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     weights = Weights(a.snapshot)
@@ -145,6 +216,7 @@ def main() -> None:
             torch.set_default_dtype(torch.float32)
             layer = layer.to_empty(device="cuda")
             load_layer(layer, weights, f"model.layers.{layer_id}.")
+            layer.eval()
             h, topk = layer(h, attention_mask=None, position_ids=positions, position_embeddings=cos_sin,
                             prev_topk_indices=topk)
             if layer_id in save:

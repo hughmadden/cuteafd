@@ -15,6 +15,7 @@ import json
 import sys
 import time
 import types
+from types import SimpleNamespace
 from pathlib import Path
 
 # Purge freed CPU staging pages immediately on the ARM Torch allocator.
@@ -25,8 +26,9 @@ import torch
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from shape_invariant import install
-from fidelity_windows import CheckpointStorage, release_checkpoint
+from shape_invariant import install, qualify
+from fidelity_windows import (CheckpointStorage, release_checkpoint, load_set,
+                              verify_snapshot, write_scored_logits, finish_golden)
 
 HERE = Path(__file__).resolve().parent
 
@@ -102,6 +104,82 @@ def load_module(module: torch.nn.Module, weights: Weights, prefix: str) -> None:
     release_checkpoint(torch.cuda, weights)
 
 
+def initial_runtime_buffers(block):
+    return [(module, name, value.detach().cpu().clone())
+            for module in block.modules()
+            for name, value in module._buffers.items()
+            if name in module._non_persistent_buffers_set and name != "freqs_cis" and value is not None]
+
+
+def reset_runtime_buffers(initial):
+    # Compressor aliases point into these buffers: reset in place, never replace them.
+    for module, name, value in initial:
+        module._buffers[name].copy_(value)
+
+
+def run_windows(a, ref, args, weights):
+    manifest = load_set(a.windows, "deepseek_v4")
+    identity = verify_snapshot(manifest, a.snapshot)
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, ref, args, weights))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
+    args.max_seq_len = max(256, max(len(w["tokens"]) for w in manifest["windows"]))
+    started, rows, times, states = time.time(), [], [], []
+    with torch.inference_mode():
+        embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
+        load_module(embed, weights, "embed.")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], dtype=torch.long)
+            h = embed(ids).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+            states.append(h.cpu())
+        del embed, ids, h
+        memory = CheckpointStorage(torch.cuda, weights)
+        for layer_id in range(args.n_layers):
+            start = time.time()
+            block = ref.Block(layer_id, args)
+            load_module(block, weights, f"layers.{layer_id}.")
+            block.eval()
+            initial = initial_runtime_buffers(block)
+            for i, w in enumerate(manifest["windows"]):
+                reset_runtime_buffers(initial)
+                ids = torch.tensor([w["tokens"]], dtype=torch.long)
+                h = block(states[i].cuda(), 0, ids)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    torch.save(h.cpu(), folder / f"layer{layer_id:02d}.pt")
+                states[i] = h.cpu()
+                del h, ids
+            # Top-k helper lru caches also own CUDA tensors from the last visit.
+            ref.get_window_topk_idxs.cache_clear()
+            ref.get_compress_topk_idxs.cache_clear()
+            del initial, block
+            memory.release()
+            memory.check(f"layer {layer_id}")
+            times.append(time.time() - start)
+            print(f"layer {layer_id} {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        hc_fn = weights.get("hc_head_fn").cuda().float()
+        hc_scale = weights.get("hc_head_scale").cuda().float()
+        hc_base = weights.get("hc_head_base").cuda().float()
+        norm = ref.RMSNorm(args.dim, args.norm_eps)
+        load_module(norm, weights, "norm.")
+        head = ref.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
+        load_module(head, weights, "head.")
+        # hc_head needs only scalar config, not an unused full expert layer.
+        tail = SimpleNamespace(norm_eps=args.norm_eps, hc_eps=args.hc_eps)
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            h = ref.Block.hc_head(tail, h, hc_fn, hc_scale, hc_base)
+            logits = head(norm(h), full_logits=True)[0].float()
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        reference="official inference/model.py (kernel_torch, fixed-M128 linears)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True)
@@ -110,7 +188,13 @@ def main() -> None:
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored logits")
+    p.add_argument("--prefix-only", action="store_true")
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
+    if a.windows and (a.text is not None or a.tokens is not None):
+        p.error("--windows cannot be combined with legacy text/tokens")
 
     torch.cuda.set_device(a.device)
     torch.set_default_dtype(torch.bfloat16)
@@ -121,7 +205,10 @@ def main() -> None:
     from shape_invariant import bounded_sparse
     ref.sparse_attn = bounded_sparse(ref.sparse_attn)
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
-    if a.tokens:
+    if a.windows:
+        manifest = load_set(a.windows, "deepseek_v4")
+        tokens = max(manifest["windows"], key=lambda w: len(w["tokens"]))["tokens"]
+    elif a.tokens:
         tokens = a.tokens
     else:
         from tokenizers import Tokenizer
@@ -135,6 +222,9 @@ def main() -> None:
 
     weights = Weights(a.snapshot)
     a.out.mkdir(parents=True, exist_ok=True)
+    if a.windows:
+        run_windows(a, ref, args, weights)
+        return
     ids = torch.tensor([tokens], dtype=torch.long)
     save = set(range(args.n_layers)) if a.layers is None or not a.layers else set(a.layers)
     with torch.inference_mode():
@@ -149,6 +239,7 @@ def main() -> None:
             start = time.time()
             block = ref.Block(layer, args)
             load_module(block, weights, f"layers.{layer}.")
+            block.eval()
             h = block(h, 0, ids)
             if layer in save:
                 torch.save(h.cpu(), a.out / f"layer{layer:02d}.pt")
@@ -159,8 +250,8 @@ def main() -> None:
         hc_fn = weights.get("hc_head_fn").cuda().float()
         hc_scale = weights.get("hc_head_scale").cuda().float()
         hc_base = weights.get("hc_head_base").cuda().float()
-        tail = ref.Block(args.n_layers - 1, args)  # hc_head uses only module config
-        h = tail.hc_head(h, hc_fn, hc_scale, hc_base)
+        tail = SimpleNamespace(norm_eps=args.norm_eps, hc_eps=args.hc_eps)
+        h = ref.Block.hc_head(tail, h, hc_fn, hc_scale, hc_base)
         norm = ref.RMSNorm(args.dim, args.norm_eps)
         load_module(norm, weights, "norm.")
         head = ref.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
