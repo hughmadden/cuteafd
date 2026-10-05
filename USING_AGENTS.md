@@ -55,6 +55,14 @@ but bounded engineering still goes to Sol.
   subscription) first while it still has resets to use; fall back to the
   primary ones when it is spent. Astra burns budget faster than Sol but less
   than Fable.
+- **Read the error body, not the headline.** The gateway prints "Server is
+  temporarily limiting requests (not your usage limit)" for both cases. A
+  body with `usage_limit_reached` and `resets_in_seconds` in days is the
+  subscription's weekly limit: every agent on that subscription stops at
+  its next call. Relaunch each on the other subscription as a fresh agent
+  with a resume note pointing at its STATUS.md (its background jobs keep
+  running and must not be duplicated). Keep a shared
+  `codex-runs/resume-note.md` for this.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
@@ -280,3 +288,4 @@ duplicating it. Record the lesson in the table below.
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
+| Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
