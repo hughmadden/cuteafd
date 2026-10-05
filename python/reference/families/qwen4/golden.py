@@ -62,7 +62,7 @@ SHARD_ROWS = 2_500_012
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot, log_checkpoint_reads
+from fidelity_windows import CheckpointStorage, LayerCheckpoints, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot, log_checkpoint_reads
 
 
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
@@ -79,15 +79,34 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     if PREFIX + "norm.weight" in dense:
         raise ValueError("unexpected final norm: model feeds stream mixer into lm_head")
     started, times, rows, states = time.time(), [], [], []
+    checkpoints = None
+    if getattr(a, "checkpoint_layers", False) and not getattr(a, "_prefix_probe", False):
+        shapes = {w["id"]: [1, len(w["tokens"]), config.hc_count * config.hidden_size] for w in manifest["windows"]}
+        binding = {"set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                   "experts_snapshot_identity": verify_snapshot({}, a.experts_snapshot or a.snapshot),
+                   "source_seal_sha256": a.source_seal_sha256,
+                   "ple_storage_seal_sha256": dense.ple_storage_seal_sha256}
+        checkpoints = LayerCheckpoints(a.out / "layer-checkpoints", binding, shapes,
+                                       resume=getattr(a, "resume_layers", None))
+    first_layer = 0
     with torch.inference_mode():
-        embed_weight = dense.get(PREFIX + "embed_tokens.weight")
-        for w in manifest["windows"]:
-            ids = torch.tensor([w["tokens"]], device="cuda")
-            states.append(torch.nn.functional.embedding(ids, embed_weight).repeat(1, 1, config.hc_count).cpu())
-        del embed_weight, ids
+        if checkpoints is not None and checkpoints.resumed is not None:
+            last, arrays, times = checkpoints.resumed
+            if not 0 <= last < config.num_hidden_layers or len(times) != last + 1:
+                raise ValueError("invalid resumed layer extent")
+            states = [torch.from_numpy(bits).view(torch.bfloat16) for bits in arrays]
+            checkpoints.resumed = None
+            del arrays
+            first_layer = last + 1
+        else:
+            embed_weight = dense.get(PREFIX + "embed_tokens.weight")
+            for w in manifest["windows"]:
+                ids = torch.tensor([w["tokens"]], device="cuda")
+                states.append(torch.nn.functional.embedding(ids, embed_weight).repeat(1, 1, config.hc_count).cpu())
+            del embed_weight, ids
         rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
         memory = CheckpointStorage(torch.cuda, dense, experts_src)
-        for layer_id in range(config.num_hidden_layers):
+        for layer_id in range(first_layer, config.num_hidden_layers):
             start = time.time()
             read_start = time.monotonic()
             read_before = dense.read_bytes + experts_src.read_bytes if dense is not experts_src else dense.read_bytes
@@ -145,6 +164,10 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             memory.release()
             memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
+            if checkpoints is not None:
+                checkpoints.commit(layer_id, [h.view(torch.uint16).numpy() for h in states], times)
+                memory.release()
+                memory.check(f"layer {layer_id} checkpoint")
             print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
             if diagnostic_stop == layer_id:
                 (a.out / "diagnostic.json").write_text(json.dumps({
@@ -338,6 +361,9 @@ def main() -> None:
                    help="routed experts (FP8 per-expert or BF16 fused; not EXL3); default --snapshot")
     p.add_argument("--ple-local", type=Path, help="hash-sealed local PLE physical shards; all other weights still stream")
     p.add_argument("--diagnostic-stop-after", type=int, help="window layer-timing diagnostic only; no qualification or logits")
+    p.add_argument("--checkpoint-layers", action="store_true", help="rolling hash-sealed local layer states")
+    p.add_argument("--resume-layers", type=Path, help="resume into a fresh output from a complete layer checkpoint tree")
+    p.add_argument("--source-seal-sha256", help="verified immutable source seal for checkpoint/resume identity")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
@@ -354,6 +380,12 @@ def main() -> None:
     if a.media and not a.windows:
         p.error("--media requires --windows (official media hook not implemented)")
 
+    if a.checkpoint_layers and (not a.windows or a.prefix_only or a.diagnostic_stop_after is not None
+            or not a.source_seal_sha256 or len(a.source_seal_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in a.source_seal_sha256)):
+        p.error("--checkpoint-layers requires full --windows and a verified source seal SHA256")
+    if a.resume_layers and not a.checkpoint_layers:
+        p.error("--resume-layers requires --checkpoint-layers")
     if a.diagnostic_stop_after is not None and (not a.windows or a.prefix_only or a.diagnostic_stop_after < 0):
         p.error("--diagnostic-stop-after requires --windows, a nonnegative layer and no --prefix-only")
 

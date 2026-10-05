@@ -28,7 +28,7 @@ from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install, qualify
-from fidelity_windows import (CheckpointStorage, release_checkpoint, load_set,
+from fidelity_windows import (CheckpointStorage, LayerCheckpoints, release_checkpoint, load_set,
                               verify_snapshot, write_scored_logits, finish_golden, log_checkpoint_reads)
 
 HERE = Path(__file__).resolve().parent
@@ -153,16 +153,33 @@ def run_windows(a, ref, args, weights):
         return
     args.max_seq_len = max(256, max(len(w["tokens"]) for w in manifest["windows"]))
     started, rows, times, states = time.time(), [], [], []
+    checkpoints = None
+    if getattr(a, "checkpoint_layers", False) and not getattr(a, "_prefix_probe", False):
+        shapes = {w["id"]: [1, len(w["tokens"]), args.hc_mult, args.dim] for w in manifest["windows"]}
+        binding = {"set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                   "source_seal_sha256": a.source_seal_sha256}
+        checkpoints = LayerCheckpoints(a.out / "layer-checkpoints", binding, shapes,
+                                       resume=getattr(a, "resume_layers", None))
+    first_layer = 0
     with torch.inference_mode():
-        embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
-        load_module(embed, weights, "embed.")
-        for w in manifest["windows"]:
-            ids = torch.tensor([w["tokens"]], dtype=torch.long)
-            h = embed(ids).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
-            states.append(h.cpu())
-        del embed, ids, h
+        if checkpoints is not None and checkpoints.resumed is not None:
+            last, arrays, times = checkpoints.resumed
+            if not 0 <= last < args.n_layers or len(times) != last + 1:
+                raise ValueError("invalid resumed layer extent")
+            states = [torch.from_numpy(bits).view(torch.bfloat16) for bits in arrays]
+            checkpoints.resumed = None
+            del arrays
+            first_layer = last + 1
+        else:
+            embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
+            load_module(embed, weights, "embed.")
+            for w in manifest["windows"]:
+                ids = torch.tensor([w["tokens"]], dtype=torch.long)
+                h = embed(ids).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+                states.append(h.cpu())
+            del embed, ids, h
         memory = CheckpointStorage(torch.cuda, weights)
-        for layer_id in range(args.n_layers):
+        for layer_id in range(first_layer, args.n_layers):
             start = time.time()
             read_start, read_before = time.monotonic(), weights.read_bytes
             block = ref.Block(layer_id, args)
@@ -187,6 +204,10 @@ def run_windows(a, ref, args, weights):
             memory.release()
             memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
+            if checkpoints is not None:
+                checkpoints.commit(layer_id, [h.view(torch.uint16).numpy() for h in states], times)
+                memory.release()
+                memory.check(f"layer {layer_id} checkpoint")
             print(f"layer {layer_id} {times[-1]:.1f}s ({len(states)} windows)", flush=True)
         hc_fn = weights.get("hc_head_fn").cuda().float()
         hc_scale = weights.get("hc_head_scale").cuda().float()
@@ -220,9 +241,17 @@ def main() -> None:
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored logits")
     p.add_argument("--prefix-only", action="store_true")
+    p.add_argument("--checkpoint-layers", action="store_true", help="rolling hash-sealed local layer states")
+    p.add_argument("--resume-layers", type=Path, help="resume into a fresh output from a complete layer checkpoint tree")
+    p.add_argument("--source-seal-sha256", help="verified immutable source seal for checkpoint/resume identity")
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
+    if a.checkpoint_layers and (not a.windows or a.prefix_only or not a.source_seal_sha256
+            or len(a.source_seal_sha256) != 64 or any(c not in "0123456789abcdef" for c in a.source_seal_sha256)):
+        p.error("--checkpoint-layers requires full --windows and a verified source seal SHA256")
+    if a.resume_layers and not a.checkpoint_layers:
+        p.error("--resume-layers requires --checkpoint-layers")
     if a.windows and (a.text is not None or a.tokens is not None):
         p.error("--windows cannot be combined with legacy text/tokens")
 

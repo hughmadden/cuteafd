@@ -895,3 +895,54 @@ def test_qwen_layer_diagnostic_cannot_publish_golden_evidence():
     stop = next(n for n in ast.walk(tree) if isinstance(n, ast.If) and ast.unparse(n.test) == "diagnostic_stop == layer_id")
     assert isinstance(stop.body[-1], ast.Return)
     assert "finish_golden" not in ast.unparse(stop)
+
+
+def test_rolling_layer_checkpoint_exact_resume_and_retirement(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=1024 * 2**30))
+    from fidelity_windows import LayerCheckpoints
+    shapes = {"short": [1, 3, 2, 4], "long": [1, 7, 2, 4]}
+    binding = {"source_seal_sha256": "a" * 64, "set_sha256": "b" * 64}
+    states = [np.arange(np.prod(s), dtype=np.uint16).reshape(s) for s in shapes.values()]
+    store = LayerCheckpoints(tmp_path / "first", binding, shapes)
+    store.commit(0, states, [1.0])
+    store.commit(1, states, [1.0, 2.0])
+    assert not (store.root / "layer00").exists()
+    assert (store.root / "layer01" / "seal.json").exists()
+    resumed = LayerCheckpoints(tmp_path / "resumed", binding, shapes, resume=store.root)
+    layer, restored, times = resumed.resumed
+    assert layer == 1 and times == [1.0, 2.0]
+    for expected, actual in zip(states, restored):
+        np.testing.assert_array_equal(expected, actual)
+    # Interrupted successor files cannot replace the last committed complete layer.
+    (store.root / "layer02").mkdir()
+    assert store.read(store.root)[0] == 1
+    assert (store.root / "layer01").exists()
+
+
+@pytest.mark.parametrize("change", ["binding", "seal", "file", "shape"])
+def test_layer_checkpoint_resume_fails_closed(tmp_path, change, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=1024 * 2**30))
+    from fidelity_windows import LayerCheckpoints
+    shapes = {"w": [1, 2, 1, 2]}
+    binding = {"source_seal_sha256": "a" * 64}
+    store = LayerCheckpoints(tmp_path / "first", binding, shapes)
+    store.commit(0, [np.zeros(shapes["w"], dtype=np.uint16)], [1.0])
+    if change == "binding": binding = {"source_seal_sha256": "c" * 64}
+    elif change == "shape": shapes = {"w": [1, 1, 1, 4]}
+    elif change == "seal": (store.root / "layer00/seal.json").write_text("{}")
+    elif change == "file": (store.root / "layer00/w.bin").write_bytes(b"corrupt")
+    with pytest.raises(ValueError):
+        LayerCheckpoints(tmp_path / "next", binding, shapes, resume=store.root)
+
+
+def test_layer_checkpoint_admission_retains_nvme_headroom(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    from fidelity_windows import LayerCheckpoints
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=100 * 2**30))
+    with pytest.raises(RuntimeError, match="headroom"):
+        LayerCheckpoints(tmp_path / "first", {}, {"w": [1, 2, 1, 2]})

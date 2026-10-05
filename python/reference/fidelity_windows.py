@@ -92,6 +92,100 @@ def release_checkpoint(cuda, *readers):
         cuda.empty_cache()
 
 
+class LayerCheckpoints:
+    """Keep a complete hash-sealed BF16 layer until its successor is committed."""
+
+    def __init__(self, root: Path, binding: dict, shapes: dict, *, resume: Path | None = None):
+        import shutil
+        self.root, self.binding, self.shapes = root, binding, shapes
+        self.bytes_per_layer = sum(int(np.prod(shape)) * 2 for shape in shapes.values())
+        root.mkdir(parents=True, exist_ok=False)
+        if shutil.disk_usage(root).free < 2 * self.bytes_per_layer + 100 * 2**30:
+            raise RuntimeError("layer checkpoints require two layers plus100GiB NVMe headroom")
+        self.previous = None
+        self.resumed = None if resume is None else self.read(resume)
+
+    def read(self, root: Path):
+        pointer = json.loads((root / "latest.json").read_text())
+        folder = root / pointer["layer"]
+        if folder.parent != root or not re.fullmatch(r"layer[0-9]+", folder.name):
+            raise ValueError("unsafe layer checkpoint path")
+        seal_bytes = (folder / "seal.json").read_bytes()
+        if hashlib.sha256(seal_bytes).hexdigest() != pointer["seal_sha256"]:
+            raise ValueError("layer checkpoint seal changed")
+        seal = json.loads(seal_bytes)
+        if (type(seal["layer_id"]) is not int or seal["layer_id"] < 0
+                or folder.name != f"layer{seal['layer_id']:02d}"
+                or len(seal["seconds_per_layer"]) != seal["layer_id"] + 1):
+            raise ValueError("invalid layer checkpoint extent")
+        if seal["binding"] != self.binding or seal["shapes"] != self.shapes:
+            raise ValueError("layer checkpoint source/set/snapshot/shape identity differs")
+        if set(seal["files"]) != set(self.shapes):
+            raise ValueError("incomplete layer checkpoint window set")
+        states = []
+        for name, shape in self.shapes.items():
+            entry = seal["files"][name]
+            path = folder / (name + ".bin")
+            if path.resolve().parent != folder.resolve():
+                raise ValueError("layer checkpoint escapes its directory")
+            size = int(np.prod(shape)) * 2
+            data = path.read_bytes()
+            if len(data) != size or entry["bytes"] != size or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                raise ValueError("layer checkpoint bytes changed")
+            states.append(np.frombuffer(data, dtype="<u2").reshape(shape).copy())
+        return seal["layer_id"], states, seal["seconds_per_layer"]
+
+    def commit(self, layer_id: int, states, seconds_per_layer):
+        import shutil
+        if shutil.disk_usage(self.root).free < self.bytes_per_layer + 100 * 2**30:
+            raise RuntimeError("layer checkpoint write would violate100GiB NVMe headroom")
+        folder = self.root / f"layer{layer_id:02d}"
+        folder.mkdir(exist_ok=False)
+        files = {}
+        if len(states) != len(self.shapes):
+            raise ValueError("incomplete layer checkpoint state set")
+        for (name, shape), state in zip(self.shapes.items(), states):
+            if list(state.shape) != shape or state.dtype != np.dtype("uint16"):
+                raise ValueError("layer checkpoint requires exact BF16 bits/shape")
+            path = folder / (name + ".bin")
+            data = state.astype("<u2", copy=False).tobytes()
+            with path.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            files[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        seal = {"layer_id": layer_id, "binding": self.binding, "shapes": self.shapes,
+                "seconds_per_layer": seconds_per_layer, "files": files}
+        seal_bytes = canonical(seal) + b"\n"
+        with (folder / "seal.json").open("xb") as stream:
+            stream.write(seal_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        pointer = {"layer": folder.name, "seal_sha256": hashlib.sha256(seal_bytes).hexdigest()}
+        temporary = self.root / "latest.pending"
+        with temporary.open("xb") as stream:
+            stream.write(canonical(pointer) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        for directory in (folder, self.root):
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        temporary.replace(self.root / "latest.json")
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if self.previous is not None:
+            shutil.rmtree(self.previous)
+        self.previous = folder
+        print(f"layer checkpoint committed: layer={layer_id} bytes={self.bytes_per_layer}", flush=True)
+
+
 def log_checkpoint_reads(label, readers, before, started):
     """Logical cloned/sliced tensor bytes, not physical FUSE or archive traffic."""
     elapsed = time.monotonic() - started
