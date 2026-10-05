@@ -97,6 +97,7 @@ def remote(args):
     host, port = args.address.rsplit(":", 1)
     results = {"address": args.address, "sm": 121, "samples": {}, "byte_exact": True}
     with socket.create_connection((host, int(port)), timeout=60) as stream:
+        stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         header = receive(stream, 88)
         magic, identity, plan, patches, width, patch, merge = struct.unpack("<8s32s32s4I", header)
         assert magic == b"CAFDVI01" and plan.hex() == args.plan_hash

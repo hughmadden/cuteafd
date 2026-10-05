@@ -152,6 +152,9 @@ def test_remote_wire_checks_byte_identity_and_collects_three_samples(tmp_path, m
         def sendall(self, data):
             pass
 
+        def setsockopt(self, level, option, value):
+            assert (level, option, value) == (gate.socket.IPPROTO_TCP, gate.socket.TCP_NODELAY, 1)
+
     monkeypatch.setattr(gate.socket, "create_connection", lambda *a, **k: Socket(payload))
     args = gate.parse_args(["--reference", str(reference), "--address", "host:9000", "--output", str(tmp_path / "result.json")])
     gate.remote(args)
