@@ -330,12 +330,29 @@ mod tests {
     use super::*;
     #[test]
     fn injection_rejects_bad_extents_and_devices_before_launch() {
-        let buffer = crate::CuteafdDeviceBuffer { ptr: 0x1000usize as *mut c_void, bytes: 128, device_id: 0, flags: 0 };
-        assert!(validate_injection(buffer,buffer,buffer,2,4,4,4).is_ok());
-        assert!(validate_injection(buffer,buffer,buffer,2,4,4,5).is_err());
-        assert!(validate_injection(buffer,buffer,buffer,5,4,4,1).is_err());
-        assert!(validate_injection(buffer,buffer,buffer,2,4,64,4).is_err());
-        assert!(validate_injection(buffer,crate::CuteafdDeviceBuffer {device_id:1,..buffer},buffer,2,4,4,1).is_err());
+        let buffer = crate::CuteafdDeviceBuffer {
+            ptr: 0x1000usize as *mut c_void,
+            bytes: 128,
+            device_id: 0,
+            flags: 0,
+        };
+        assert!(validate_injection(buffer, buffer, buffer, 2, 4, 4, 4).is_ok());
+        assert!(validate_injection(buffer, buffer, buffer, 2, 4, 4, 5).is_err());
+        assert!(validate_injection(buffer, buffer, buffer, 5, 4, 4, 1).is_err());
+        assert!(validate_injection(buffer, buffer, buffer, 2, 4, 64, 4).is_err());
+        assert!(validate_injection(
+            buffer,
+            crate::CuteafdDeviceBuffer {
+                device_id: 1,
+                ..buffer
+            },
+            buffer,
+            2,
+            4,
+            4,
+            1
+        )
+        .is_err());
     }
     #[test]
     fn c_header_layout_is_stable() {

@@ -526,67 +526,178 @@ mod tests {
             "out_hidden_size":width,"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
             "hidden_act":"silu","fullatt_block_indexes":[0,9,18,27],"vit_window_attn_types":[-1,0,0,0,0,1,1,1,1,-1,0,0,0,0,1,1,1,1,-1,0,0,0,0,1,1,1,1,-1],
             "visual_token_window_size":64,"use_sink":true}});
-        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
         let mut header = serde_json::Map::new();
         let mut end = 0u64;
         let mut add = |name: String, shape: Vec<usize>| {
-            let start=end;end+=shape.iter().product::<usize>() as u64*2;
-            header.insert(format!("visual.{name}"),serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[start,end]}));
+            let start = end;
+            end += shape.iter().product::<usize>() as u64 * 2;
+            header.insert(
+                format!("visual.{name}"),
+                serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[start,end]}),
+            );
         };
-        add("patch_embed.proj.weight".into(),vec![1280,3,2,16,16]);
+        add("patch_embed.proj.weight".into(), vec![1280, 3, 2, 16, 16]);
         for i in 0..28 {
-            for (name,shape) in [("attn.qkv.weight",vec![3072,1280]),("attn.qkv.bias",vec![3072]),
-                ("attn.proj.weight",vec![1280,2048]),("attn.proj.bias",vec![1280]),
-                ("mlp.gate_proj.weight",vec![4608,1280]),("mlp.up_proj.weight",vec![4608,1280]),
-                ("mlp.gate_proj.bias",vec![4608]),("mlp.up_proj.bias",vec![4608]),
-                ("mlp.down_proj.weight",vec![1280,4608]),("mlp.down_proj.bias",vec![1280]),
-                ("norm1.weight",vec![1280]),("norm2.weight",vec![1280])] {add(format!("blocks.{i}.{name}"),shape);}
-            if ![0,9,18,27].contains(&i) {add(format!("blocks.{i}.attn.sinks"),vec![32]);}
+            for (name, shape) in [
+                ("attn.qkv.weight", vec![3072, 1280]),
+                ("attn.qkv.bias", vec![3072]),
+                ("attn.proj.weight", vec![1280, 2048]),
+                ("attn.proj.bias", vec![1280]),
+                ("mlp.gate_proj.weight", vec![4608, 1280]),
+                ("mlp.up_proj.weight", vec![4608, 1280]),
+                ("mlp.gate_proj.bias", vec![4608]),
+                ("mlp.up_proj.bias", vec![4608]),
+                ("mlp.down_proj.weight", vec![1280, 4608]),
+                ("mlp.down_proj.bias", vec![1280]),
+                ("norm1.weight", vec![1280]),
+                ("norm2.weight", vec![1280]),
+            ] {
+                add(format!("blocks.{i}.{name}"), shape);
+            }
+            if ![0, 9, 18, 27].contains(&i) {
+                add(format!("blocks.{i}.attn.sinks"), vec![32]);
+            }
         }
-        add("merger.ln_q.weight".into(),vec![1280]);
-        add("merger.mlp.0.weight".into(),vec![5120,5120]);
-        add("merger.mlp.2.weight".into(),vec![width,5120]);
-        let bytes=serde_json::to_vec(&header).unwrap();
-        let mut file=File::create(dir.path().join("vision.safetensors")).unwrap();
-        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();file.write_all(&bytes).unwrap();
-        file.set_len(8+bytes.len() as u64+end).unwrap();
-        let mut map=serde_json::Map::new();
-        for name in header.keys() {map.insert(name.clone(),serde_json::json!("vision.safetensors"));}
-        map.insert("model.unread_lm.weight".into(),serde_json::json!("absent-lm-shard.safetensors"));
-        std::fs::write(dir.path().join("model.safetensors.index.json"),serde_json::to_vec(&serde_json::json!({"weight_map":map})).unwrap()).unwrap();
+        add("merger.ln_q.weight".into(), vec![1280]);
+        add("merger.mlp.0.weight".into(), vec![5120, 5120]);
+        add("merger.mlp.2.weight".into(), vec![width, 5120]);
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut file = File::create(dir.path().join("vision.safetensors")).unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_len(8 + bytes.len() as u64 + end).unwrap();
+        let mut map = serde_json::Map::new();
+        for name in header.keys() {
+            map.insert(name.clone(), serde_json::json!("vision.safetensors"));
+        }
+        map.insert(
+            "model.unread_lm.weight".into(),
+            serde_json::json!("absent-lm-shard.safetensors"),
+        );
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":map})).unwrap(),
+        )
+        .unwrap();
         dir
     }
     #[test]
     fn tower_plan_fuses_gate_up_and_never_opens_lm_payload() {
-        for width in [4096,6144] {
-            let snapshot=sparse_snapshot(width);
-            let tower=TowerSpec::mimo(snapshot.path(),4096).unwrap();
-            assert_eq!(tower.native.output_width,width as u32);
-            assert_eq!(tower.native.weight_bytes,1_458_170_944+(width as u64-4096)*5120*2);
-            assert_eq!(tower.native.blocks[0].key0_bias,NO_VISION_OFFSET);
-            assert_eq!(tower.native.blocks[5].column_order,1);
+        for width in [4096, 6144] {
+            let snapshot = sparse_snapshot(width);
+            let tower = TowerSpec::mimo(snapshot.path(), 4096).unwrap();
+            assert_eq!(tower.native.output_width, width as u32);
+            assert_eq!(
+                tower.native.weight_bytes,
+                1_458_170_944 + (width as u64 - 4096) * 5120 * 2
+            );
+            assert_eq!(tower.native.blocks[0].key0_bias, NO_VISION_OFFSET);
+            assert_eq!(tower.native.blocks[5].column_order, 1);
             for i in 0..28 {
-                let gate=tower.reads.iter().find(|r| r.metadata.name==format!("visual.blocks.{i}.mlp.gate_proj.weight")).unwrap();
-                let up=tower.reads.iter().find(|r| r.metadata.name==format!("visual.blocks.{i}.mlp.up_proj.weight")).unwrap();
-                assert_eq!(up.destination,gate.destination+gate.metadata.byte_length as usize);
-                assert_eq!(tower.native.blocks[i].gate_up,gate.destination as u64);
+                let gate = tower
+                    .reads
+                    .iter()
+                    .find(|r| r.metadata.name == format!("visual.blocks.{i}.mlp.gate_proj.weight"))
+                    .unwrap();
+                let up = tower
+                    .reads
+                    .iter()
+                    .find(|r| r.metadata.name == format!("visual.blocks.{i}.mlp.up_proj.weight"))
+                    .unwrap();
+                assert_eq!(
+                    up.destination,
+                    gate.destination + gate.metadata.byte_length as usize
+                );
+                assert_eq!(tower.native.blocks[i].gate_up, gate.destination as u64);
             }
-            let config=snapshot.path().join("config.json");
-            let mut cfg:serde_json::Value=serde_json::from_reader(File::open(&config).unwrap()).unwrap();
-            cfg["vision_config"]["patch_size"]=serde_json::json!(14);
-            std::fs::write(config,serde_json::to_vec(&cfg).unwrap()).unwrap();
-            assert!(TowerSpec::mimo(snapshot.path(),4096).unwrap_err().to_string().contains("patch_size"));
+            let config = snapshot.path().join("config.json");
+            let mut cfg: serde_json::Value =
+                serde_json::from_reader(File::open(&config).unwrap()).unwrap();
+            cfg["vision_config"]["patch_size"] = serde_json::json!(14);
+            std::fs::write(config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            assert!(TowerSpec::mimo(snapshot.path(), 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("patch_size"));
         }
     }
     #[test]
     fn vector_loading_uses_absolute_extent_and_fp32_bits() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("tiny.bin");
-        std::fs::write(&path,[0,0,0,0,0x80,0x3f,0x00,0xc0]).unwrap();
-        let spec=TowerSpec {native:VisionSpec {weight_bytes:256,inv_freq:128,..Default::default()}, reads:vec![TensorRead {
-            path,metadata:SafetensorsTensorMetadata {name:"test".into(),dtype:DType::Bf16,shape:vec![2],byte_offset:4,byte_length:4},destination:0,vector:true}]};
-        let arena=spec.load_weights().unwrap();
-        assert_eq!(&arena[0..4],&1.0f32.to_le_bytes());assert_eq!(&arena[4..8],&(-2.0f32).to_le_bytes());
-        assert_eq!(&arena[128..132],&1.0f32.to_le_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, [0, 0, 0, 0, 0x80, 0x3f, 0x00, 0xc0]).unwrap();
+        let spec = TowerSpec {
+            native: VisionSpec {
+                weight_bytes: 256,
+                inv_freq: 128,
+                ..Default::default()
+            },
+            reads: vec![TensorRead {
+                path,
+                metadata: SafetensorsTensorMetadata {
+                    name: "test".into(),
+                    dtype: DType::Bf16,
+                    shape: vec![2],
+                    byte_offset: 4,
+                    byte_length: 4,
+                },
+                destination: 0,
+                vector: true,
+            }],
+        };
+        let arena = spec.load_weights().unwrap();
+        assert_eq!(&arena[0..4], &1.0f32.to_le_bytes());
+        assert_eq!(&arena[4..8], &(-2.0f32).to_le_bytes());
+        assert_eq!(&arena[128..132], &1.0f32.to_le_bytes());
+    }
+    #[test]
+    #[ignore = "requires matching CUDA container, VISION_SNAPSHOT and VISION_LIBRARY"]
+    fn resident_service_load_encode_cancel_and_drain() {
+        let snapshot = PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
+        let library = PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let spec = TowerSpec::mimo(&snapshot, 256).unwrap();
+        let ledger = NativeVision::required(&library, &spec.native).unwrap();
+        // Admission is rejected before reading any of the 1.4 GiB payload.
+        assert!(matches!(
+            VitRuntime::load(spec.clone(), &library, 0, ledger.total_bytes() - 1),
+            Err(VisionError::Unsupported(_))
+        ));
+        let width = spec.native.output_width as usize;
+        let service = EncoderService::start(spec, library, 0, ledger.total_bytes()).unwrap();
+        assert_eq!(service.ledger.device_allocations, 2);
+        let lut = Arc::new(std::array::from_fn(|i| (i % 256) as f32 / 127.5 - 1.0));
+        let job = |grid: [usize; 2]| EncodeJob {
+            rgb: vec![113; grid[0] * grid[1] * 768].into(),
+            grid,
+            lut: lut.clone(),
+            output: vec![0; grid[0] * grid[1] / 4 * width],
+        };
+        let wait = |ticket: &EncoderTicket| {
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(output) = ticket.poll().unwrap() {
+                    break output;
+                }
+                assert!(start.elapsed() < std::time::Duration::from_secs(30));
+                std::thread::yield_now();
+            }
+        };
+        let baseline = wait(&service.submit(job([4, 4])).unwrap());
+        assert!(baseline.iter().any(|v| *v != 0));
+        for _ in 0..3 {
+            wait(&service.submit(job([8, 4])).unwrap());
+            assert_eq!(wait(&service.submit(job([4, 4])).unwrap()), baseline);
+        }
+        let ticket = service.submit(job([8, 4])).unwrap();
+        ticket.cancel();
+        // Cancellation may race completion, but owner teardown must always drain.
+        drop(ticket);
+        drop(service);
     }
     #[test]
     fn cancellation_is_shared_and_disconnect_is_not_pending() {
