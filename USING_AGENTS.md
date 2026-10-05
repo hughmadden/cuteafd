@@ -129,6 +129,11 @@ Agent(subagent_type="general-purpose",
   run it. For a parallel wave, one shared allocation file says which locks
   and hosts each agent owns (e.g. one agent on `gpu1.lock` + a single
   Spark, the rest queued on the shared pool).
+- Agents may spawn their own component agents. A component's
+  `SendMessage` reaches the orchestrator, not its parent (the parent sees
+  only the component's completion). Expect to relay mid-task notes between
+  them, and tell components to put anything the parent needs in their final
+  report.
 - These agents run inside Claude Code's tool harness with this session's
   tools and permissions (Bash, Read, Edit, SSH, `agent-sudo`), not the Codex
   CLI, so `codex-launch.sh`/`codex-stop.sh` don't apply: stop one with
