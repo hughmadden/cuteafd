@@ -128,7 +128,8 @@ def legacy_window(reference: dict) -> dict:
 
 def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
               tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
-              files: list[str] | None = None) -> dict:
+              files: list[str] | None = None, legacy_reference: dict | None = None,
+              legacy_provenance: dict | None = None) -> dict:
     arm_policy(arm, checkpoint)
     agentic = load_agentic()
     files = files or REPO_FILES
@@ -137,9 +138,16 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids
     if len(corpus_ids) < 4096:
         raise ValueError("repository source list needs at least 4096 tokens")
-    legacy_path = root / "rust/crates/cuteafd-bench/references" / (LEGACY[family] + ".json")
-    legacy = legacy_window(json.loads(legacy_path.read_text()))
-    windows = [{**legacy, "provenance": source(root, str(legacy_path.relative_to(root)))}]
+    if (legacy_reference is None) != (legacy_provenance is None):
+        raise ValueError("explicit legacy reference requires its provenance")
+    if legacy_reference is None:
+        legacy_path = root / "rust/crates/cuteafd-bench/references" / (LEGACY[family] + ".json")
+        legacy_reference = json.loads(legacy_path.read_text())
+        legacy_provenance = source(root, str(legacy_path.relative_to(root)))
+    elif not isinstance(legacy_provenance, dict) or not legacy_provenance.get("sha256"):
+        raise ValueError("explicit legacy reference requires a content hash")
+    legacy = legacy_window(legacy_reference)
+    windows = [{**legacy, "provenance": legacy_provenance}]
     snapshots = []
     for recording in recordings or []:
         if recording.get("model") != model or recording.get("mode") != "record":

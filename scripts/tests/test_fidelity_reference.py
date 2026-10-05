@@ -350,6 +350,25 @@ def test_snapshot_provenance_must_match_pinned_set(tmp_path):
         verify_snapshot(manifest, snapshot)
 
 
+def test_official_reference_identity_can_differ_from_generation_checkpoint(tmp_path):
+    snapshot = tmp_path / "official-fp8"
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "config.json").write_text('{"layers":48}')
+    manifest = tiny_set()
+    identity = verify_snapshot(manifest, snapshot)
+    manifest["generation_arm"].update(snapshot_revision="exl3", config_sha256="quant-config")
+    manifest["reference_snapshot"] = identity.copy()
+    manifest["tokenizer_sha256"] = identity["tokenizer_sha256"]
+    assert verify_snapshot(manifest, snapshot) == identity
+    manifest["reference_snapshot"]["config_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="config"):
+        verify_snapshot(manifest, snapshot)
+    manifest["reference_snapshot"] = {"snapshot_revision": snapshot.name}
+    with pytest.raises(ValueError, match="all identity hashes"):
+        verify_snapshot(manifest, snapshot)
+
+
 def test_v41_two_lengths_isolate_module_and_cross_layer_state():
     tree = ast.parse((ROOT / "python/reference/families/deepseek_v41/golden.py").read_text())
     names = {"initial_runtime_buffers", "reset_runtime_buffers", "stage_shared_attention", "restore_shared_attention"}

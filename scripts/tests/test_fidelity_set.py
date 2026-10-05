@@ -107,6 +107,18 @@ def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
         builder.validate_set(changed)
 
 
+def test_explicit_legacy_reference_keeps_variant_tokens_and_provenance(fake_server):
+    reference = {"schema": "cuteafd.bench.reference/1", "score_from": 1, "tokens": [7] * 513}
+    provenance = {"path": "official-mopd-smoke.json", "sha256": "a" * 64}
+    manifest = make(fake_server, legacy_reference=reference, legacy_provenance=provenance)
+    assert manifest["windows"][0]["tokens"] == [7] * 513
+    assert manifest["windows"][0]["provenance"] == provenance
+    with pytest.raises(ValueError, match="requires its provenance"):
+        make(fake_server, legacy_reference=reference)
+    with pytest.raises(ValueError, match="content hash"):
+        make(fake_server, legacy_reference=reference, legacy_provenance={})
+
+
 @pytest.mark.parametrize("family", ["mimo_v2", "qwen4", "glm5_flash"])
 def test_other_family_recipes_keep_internal_names(fake_server, family):
     fake_server["family"] = family

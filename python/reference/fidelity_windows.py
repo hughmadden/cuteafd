@@ -122,12 +122,16 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     config_sha = hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest()
     if manifest.get("tokenizer_sha256") not in (None, tokenizer_sha):
         raise ValueError("snapshot tokenizer differs from the pinned fidelity set")
-    arm = manifest.get("generation_arm", {})
+    arm = manifest.get("reference_snapshot", manifest.get("generation_arm", {}))
     revision = arm.get("snapshot_revision")
     if revision is not None and snapshot.name != revision:
-        raise ValueError("snapshot revision differs from the generation arm")
+        raise ValueError("snapshot revision differs from the pinned reference identity")
     if arm.get("config_sha256") not in (None, config_sha):
-        raise ValueError("snapshot config differs from the generation arm")
+        raise ValueError("snapshot config differs from the pinned reference identity")
+    if "reference_snapshot" in manifest and (
+            not revision or arm.get("config_sha256") != config_sha
+            or arm.get("tokenizer_sha256") != tokenizer_sha):
+        raise ValueError("explicit reference snapshot requires all identity hashes")
     return {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
             "config_sha256": config_sha}
 
