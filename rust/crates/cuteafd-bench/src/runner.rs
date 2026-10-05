@@ -9,6 +9,7 @@ use crate::report::{
     now_rfc3339, Baseline, PanelResult, PanelStatus, PlannedPanel, Report, RunStatus, ServerInfo, SCHEMA,
 };
 use crate::store::{self, Store};
+use cuteafd_api::openai::ConsoleHub;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -91,6 +92,25 @@ pub struct ActiveRun {
     pub fraction: f64,
 }
 
+/// Allows console token text while a run holds the server; clearing on drop
+/// covers every exit path, cancellation and panics included.
+struct BenchText(Arc<ConsoleHub>);
+
+impl BenchText {
+    /// `None` when no console is attached (a bench without the API server).
+    fn enable(bench: &Bench) -> Option<Self> {
+        let console = bench.console.get()?.clone();
+        console.set_bench_active(true);
+        Some(Self(console))
+    }
+}
+
+impl Drop for BenchText {
+    fn drop(&mut self) {
+        self.0.set_bench_active(false);
+    }
+}
+
 pub struct Bench {
     store: Mutex<Store>,
     active: Mutex<Option<ActiveRun>>,
@@ -98,6 +118,10 @@ pub struct Bench {
     baselines: Mutex<HashMap<String, Baseline>>,
     info: Mutex<Option<ServerInfo>>,
     events: broadcast::Sender<Arc<str>>,
+    /// The live console of the in-process server, attached at mount. A run
+    /// allows token text on it: the lockout makes the run's own prompts the
+    /// only requests in.
+    console: OnceLock<Arc<ConsoleHub>>,
     /// `CUTEAFD_API_KEY`: when set, bench controls from outside the local
     /// network need it as a bearer token.
     pub api_key: Option<String>,
@@ -113,8 +137,14 @@ impl Bench {
             baselines: Mutex::new(HashMap::new()),
             info: Mutex::new(None),
             events,
+            console: OnceLock::new(),
             api_key: std::env::var("CUTEAFD_API_KEY").ok().filter(|k| !k.is_empty()),
         })
+    }
+
+    /// The server's live console; called once when the bench is mounted.
+    pub fn set_console(&self, console: Arc<ConsoleHub>) {
+        let _ = self.console.set(console);
     }
 
     /// The process-wide instance (SQLite under `store::default_dir()`, in memory if unwritable).
@@ -287,8 +317,11 @@ impl Bench {
             *slot = Some(active.clone());
         }
         let bench = self.clone();
+        // The run is active from here (the lockout is already refusing other
+        // clients), so its console text is allowed until it retires.
+        let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, name, plan, dropped);
+            bench.execute(active, base, name, plan, dropped, text);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -302,7 +335,7 @@ impl Bench {
     }
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, profile: String, plan: Vec<PlannedPanel>,
-        dropped: Vec<String>) {
+        dropped: Vec<String>, text: Option<BenchText>) {
         let id = active.id.clone();
         let report = Arc::new(Mutex::new(Report {
             schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
@@ -349,6 +382,9 @@ impl Bench {
         if let Ok(mut plan) = self.plan_state().lock() {
             *plan = Plan::default();
         }
+        // Console text ends before the lock lifts: a run admitted in the gap
+        // would otherwise have its own override cleared by this run's guard.
+        drop(text);
         *self.active.lock().expect("active lock") = None;
         let snapshot = report.lock().expect("report lock").clone();
         self.emit(json!({"type": "report", "run": id, "report": snapshot}));

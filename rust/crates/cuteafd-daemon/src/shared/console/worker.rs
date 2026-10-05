@@ -137,9 +137,15 @@ impl Worker {
             "gen": r.generated, "grammar": r.grammar, "images": r.images,
             "admitted": r.admitted, "first": r.first,
         })).collect();
+        // The config is built once at startup, so its `text` fact carries the
+        // live value here: the bench override toggles without a page reload.
+        let mut config = self.config.clone();
+        if let Some(config) = config.as_object_mut() {
+            config.insert("text".into(), json!(self.hub.text_enabled()));
+        }
         json!({
             "type": "snapshot", "now": self.ms(Instant::now()), "text": self.hub.text_enabled(),
-            "config": self.config, "requests": requests, "recent": self.recent,
+            "config": config, "requests": requests, "recent": self.recent,
             "g": self.gauges(),
         })
     }
@@ -342,6 +348,19 @@ mod tests {
         assert_eq!(round["req"][0], json!([3, 4, 2, 1, 2, 1, 0]));
         worker.handle(Event::Retire { id: 3, at: now, reason: "finished", generated: 0 });
         assert_eq!(worker.recent[0]["gen"], 3);
+    }
+
+    #[test]
+    fn snapshots_carry_the_live_bench_text_override() {
+        let worker = worker();
+        assert_eq!(worker.snapshot()["text"], false);
+        assert_eq!(worker.snapshot()["config"]["text"], false);
+        worker.hub.set_bench_active(true);
+        assert_eq!(worker.snapshot()["text"], true);
+        assert_eq!(worker.snapshot()["config"]["text"], true);
+        worker.hub.set_bench_active(false);
+        assert_eq!(worker.snapshot()["text"], false);
+        assert_eq!(worker.snapshot()["config"]["text"], false);
     }
 
     #[test]
