@@ -48,6 +48,32 @@ pub struct Comparison {
     pub tripwires: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullComparison {
+    pub pass: bool,
+    pub decode: Comparison,
+    pub prefill: Comparison,
+}
+
+/// A full precision decision requires both scoring shapes from the same arms.
+pub fn compare_full(
+    a_decode: &Run, b_decode: &Run, a_prefill: &Run, b_prefill: &Run,
+    bootstrap: usize, seed: u64,
+) -> Result<FullComparison> {
+    for (decode, prefill) in [(a_decode, a_prefill), (b_decode, b_prefill)] {
+        ensure!(decode.tier == "full" && prefill.tier == "full", "both paths must use the full tier");
+        ensure!(decode.path_shape == "decode-shaped" && prefill.path_shape == "prefill-shaped",
+            "full decision requires decode and prefill scoring paths");
+        ensure!(decode.arm == prefill.arm && decode.checkpoint == prefill.checkpoint
+            && decode.set_sha256 == prefill.set_sha256 && decode.reference_sha256 == prefill.reference_sha256
+            && decode.engine == prefill.engine && decode.settings == prefill.settings,
+            "scoring paths use different arms, references or server settings");
+    }
+    let decode = compare(a_decode, b_decode, 0.005, 0.005, bootstrap, seed)?;
+    let prefill = compare(a_prefill, b_prefill, 0.005, 0.005, bootstrap, seed)?;
+    Ok(FullComparison { pass: decode.pass && prefill.pass, decode, prefill })
+}
+
 /// Cluster-robust SE of a ratio-of-sums token mean, using whole windows as clusters.
 pub fn clustered_se(sums: &[f64], counts: &[usize]) -> Option<f64> {
     if sums.len() < 2 || sums.len() != counts.len() { return None; }
@@ -210,6 +236,26 @@ mod tests {
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06 }
     }
+    #[test]
+    fn full_decision_requires_both_paths_and_fixed_arms() {
+        let decode = run(12, 512);
+        let mut prefill = decode.clone();
+        prefill.path_shape = "prefill-shaped".into();
+        prefill.verify_rows = None;
+        assert!(compare_full(&decode, &decode, &prefill, &prefill, 100, 1).unwrap().pass);
+        assert!(compare_full(&decode, &decode, &decode, &prefill, 100, 1).is_err());
+        let mut quick = decode.clone(); quick.tier = "quick".into();
+        assert!(compare_full(&quick, &decode, &prefill, &prefill, 100, 1).is_err());
+        let mut changed = prefill.clone(); changed.settings = serde_json::json!({"head": "different"});
+        assert!(compare_full(&decode, &decode, &changed, &prefill, 100, 1).is_err());
+        changed = prefill.clone(); changed.arm = "different".into();
+        assert!(compare_full(&decode, &decode, &changed, &prefill, 100, 1).is_err());
+        let mut regressed = prefill.clone();
+        for p in &mut regressed.score.records { if p.position < 6 { p.agree = false; } }
+        let result = compare_full(&decode, &decode, &regressed, &prefill, 100, 1).unwrap();
+        assert!(result.decode.pass); assert!(!result.prefill.pass); assert!(!result.pass);
+    }
+
     #[test]
     fn clustered_se_by_hand() {
         let wanted = (1.5f64 * (1.5625 + 0.0625 + 2.25)).sqrt() / 4.0;

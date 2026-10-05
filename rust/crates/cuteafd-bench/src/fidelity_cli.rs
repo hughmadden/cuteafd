@@ -1,5 +1,5 @@
 //! Remote fidelity probes and local paired comparison, without a teacher service.
-use crate::fidelity::{compare, Run};
+use crate::fidelity::{compare, compare_full, Run};
 use crate::reference::{Fidelity, Reference};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -16,6 +16,23 @@ pub struct Args {
 pub enum Action {
     /// Score a pinned family reference on the served engine (cold, drafts off).
     Run(RunArgs),
+    /// Gate a full precision decision on both decode and prefill with fixed margins.
+    CompareFull {
+        #[arg(long)]
+        a_decode: PathBuf,
+        #[arg(long)]
+        b_decode: PathBuf,
+        #[arg(long)]
+        a_prefill: PathBuf,
+        #[arg(long)]
+        b_prefill: PathBuf,
+        #[arg(long, default_value_t = 5000)]
+        bootstrap: usize,
+        #[arg(long, default_value_t = 20260829)]
+        seed: u64,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Compare candidate A to checkpoint-precision baseline B, paired by position.
     Compare {
         a: PathBuf,
@@ -155,6 +172,18 @@ pub fn execute(args: Args) -> Result<bool> {
             eprintln!("{}: {} ({}) rows in {:.2}s; {} / {}", run.arm, run.score.positions,
                 run.score.missing, run.seconds, run.path_shape, run.kl_kind);
             Ok(run.score.missing == 0 && run.score.non_finite == 0)
+        }
+        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out } => {
+            let load = |path: PathBuf| -> Result<Run> {
+                Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+            };
+            let comparison = compare_full(&load(a_decode)?, &load(b_decode)?,
+                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed)?;
+            let text = serde_json::to_string_pretty(&comparison)?;
+            if let Some(path) = out { std::fs::write(path, &text)?; }
+            println!("{text}");
+            eprintln!("Both full-tier statistical paths checked; separate agentic replay remains required.");
+            Ok(comparison.pass)
         }
         Action::Compare { a, b, top1_margin, kl_margin, bootstrap, seed, out } => {
             let a: Run = serde_json::from_reader(std::fs::File::open(a)?)?;
