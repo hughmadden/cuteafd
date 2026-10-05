@@ -39,6 +39,10 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from shape_invariant import install
+
 PREFIX = "model.language_model."
 
 
@@ -139,6 +143,7 @@ def main() -> None:
     ref.Glm5NextTextExperts.forward = experts_fp32
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
+    install()
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
@@ -186,7 +191,7 @@ def main() -> None:
         norm = ref.Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
         norm.weight.copy_(dense.get(PREFIX + "norm.weight"))
         final = norm(h.mean(dim=2))
-        logits = final.float() @ dense.get("lm_head.weight").float().T
+        logits = torch.nn.functional.linear(final.float(), dense.get("lm_head.weight").float())
         (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
     argmax = logits[0].argmax(-1)
     next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()

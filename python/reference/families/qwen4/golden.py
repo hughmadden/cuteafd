@@ -63,6 +63,10 @@ from fidelity_windows import load_set, write_scored_logits, finish_golden, verif
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     manifest = load_set(a.windows, "qwen4")
     identity = verify_snapshot(manifest, a.snapshot)
+    from shape_invariant import qualify
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
     if PREFIX + "norm.weight" in dense:
         raise ValueError("unexpected final norm: model feeds stream mixer into lm_head")
     started, times, rows, states = time.time(), [], [], []
@@ -132,14 +136,15 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
         head = dense.get("lm_head.weight").float()
         for i, w in enumerate(manifest["windows"]):
             h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
-            logits = mixer(h)[0].float() @ head.T
+            logits = torch.nn.functional.linear(mixer(h)[0].float(), head)
             rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
             states[i] = None
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
         experts_snapshot=str(a.experts_snapshot or a.snapshot),
         reference="transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
-        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
 
 
 class Weights:
@@ -257,9 +262,12 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -270,6 +278,8 @@ def main() -> None:
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    from shape_invariant import install
+    install()
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
     if a.windows:
@@ -355,7 +365,7 @@ def main() -> None:
         load_module(mixer, dense, PREFIX + "hyper_connection_mixer.", set())
         final = mixer(h)
         head = dense.get("lm_head.weight").float()
-        logits = final[0].float() @ head.T
+        logits = torch.nn.functional.linear(final[0].float(), head)
         del head
         (a.out / "logits.bin").write_bytes(logits.contiguous().cpu().numpy().tobytes())
         argmax = logits.argmax(-1)

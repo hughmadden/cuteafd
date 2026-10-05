@@ -13,7 +13,9 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import canonical, finish_golden, load_set, set_hash, validate_set, write_scored_logits, verify_snapshot
+from fidelity_windows import (canonical, finish_golden, load_set, set_hash, validate_set,
+                              write_scored_logits, verify_snapshot, prefix_comparison,
+                              qualify_prefix, validate_qualification)
 
 spec = importlib.util.spec_from_file_location("make_fidelity_reference", ROOT / "scripts/bench/make-fidelity-reference.py")
 converter = importlib.util.module_from_spec(spec)
@@ -32,6 +34,15 @@ def tiny_set():
     return manifest
 
 
+def fixture_proof(manifest, identity=None, vocab=16):
+    # Synthetic qualification metadata for converter tests, not hardware evidence.
+    return {"schema": "cuteafd.fidelity.prefix/1", "passed": True, "finite": True,
+            "rows": 512, "vocab": vocab, "different_rows": [], "argmax_disagreements": 0,
+            "lengths": [576, 640], "score_from": 64, "fixed_rows": 128,
+            "family": manifest["family"], "set_sha256": manifest["set_sha256"],
+            "snapshot_identity": identity or {"snapshot_revision": "fixture"}}
+
+
 def fixture_golden(tmp_path):
     manifest = tiny_set()
     golden = tmp_path / "golden"
@@ -39,7 +50,8 @@ def fixture_golden(tmp_path):
     logits = np.arange(48, dtype=np.float32).reshape(3, 16) / 16
     logits[0, 0] = logits[0, 15]  # Deterministic top-k boundary tie handling.
     rows = [write_scored_logits(golden, w, logits) for w in manifest["windows"]]
-    finish_golden(golden, manifest, rows, snapshot="fixture", reference="fake")
+    finish_golden(golden, manifest, rows, snapshot="fixture", reference="fake",
+                  snapshot_identity={"snapshot_revision": "fixture"}, prefix_qualification=fixture_proof(manifest))
     return manifest, golden, logits
 
 
@@ -118,7 +130,8 @@ def test_legacy_output_is_byte_identical_to_base_script(tmp_path, monkeypatch):
         "roles": ["ctx"] * len(legacy["tokens"]), "score_from": 1}]
     manifest["set_sha256"] = set_hash(manifest)
     rows = [write_scored_logits(golden, manifest["windows"][0], logits[:512])]
-    finish_golden(golden, manifest, rows, snapshot=str(tmp_path / "snapshot"))
+    finish_golden(golden, manifest, rows, snapshot=str(tmp_path / "snapshot"),
+                  snapshot_identity={"snapshot_revision": "fixture"}, prefix_qualification=fixture_proof(manifest, vocab=64))
     args = options(tmp_path, golden)
     converter.convert_windows(args)
     window = json.loads(args.out.read_text())["windows"][0]
@@ -148,6 +161,77 @@ def test_window_contract_failures(mutation):
     m["set_sha256"] = set_hash(m)
     with pytest.raises(ValueError):
         validate_set(m)
+
+
+@pytest.mark.parametrize("change", ["missing", "failed", "nonfinite", "family", "hash", "snapshot", "signed_zero"])
+def test_prefix_qualification_fails_closed(tmp_path, change):
+    manifest, golden, _ = fixture_golden(tmp_path)
+    meta = json.loads((golden / "meta.json").read_text())
+    proof = meta["prefix_qualification"]
+    if change == "missing":
+        del meta["prefix_qualification"]
+    elif change == "failed":
+        proof["passed"] = False
+    elif change == "nonfinite":
+        proof["finite"] = False
+    elif change == "family":
+        proof["family"] = "other"
+    elif change == "hash":
+        proof["set_sha256"] = "other"
+    elif change == "snapshot":
+        proof["snapshot_identity"] = {"snapshot_revision": "other"}
+    else:
+        left = np.zeros((512, 16), dtype=np.float32)
+        right = left.copy()
+        right[10, 3] = -0.0
+        proof.update(prefix_comparison(left, right))
+    (golden / "meta.json").write_bytes(canonical(meta))
+    args = options(tmp_path, golden)
+    with pytest.raises(ValueError, match="prefix"):
+        converter.convert_windows(args)
+    assert not args.out.exists() and not args.rows_dir.exists()
+
+
+@pytest.mark.parametrize("bad", [False, True])
+def test_actual_prefix_runner_compares_full_rows_and_binds_set(tmp_path, bad):
+    manifest = tiny_set()
+    window = manifest["windows"][0]
+    window["tokens"], window["roles"] = [i % 16 for i in range(640)], ["ctx"] * 640
+    manifest["set_sha256"] = set_hash(manifest)
+    identity = {"snapshot_revision": "fixture"}
+    a = SimpleNamespace(out=tmp_path, layers=[0])
+
+    def execute(probe):
+        assert probe._prefix_probe and probe.layers is None
+        panel = load_set(probe.windows)
+        entries = []
+        for w in panel["windows"]:
+            count = len(w["tokens"]) - w["score_from"]
+            logits = np.arange(count * 16, dtype=np.float32).reshape(count, 16)
+            if bad and w["id"] == "prefix_extended":
+                logits[3, 2] += .125  # Same argmax, different non-top probability.
+            entries.append(write_scored_logits(probe.out, w, logits))
+        finish_golden(probe.out, panel, entries, snapshot_identity=identity, seconds=1.0)
+
+    if bad:
+        with pytest.raises(ValueError, match="prefix invariance"):
+            qualify_prefix(a, manifest, execute)
+    else:
+        proof = qualify_prefix(a, manifest, execute)
+        validate_qualification(proof, manifest, identity)
+        assert proof["vocab"] == 16 and proof["source_window"] == window["id"]
+    assert a.layers == [0] and not hasattr(a, "_prefix_probe")
+    saved = json.loads(next(tmp_path.glob("prefix-gate-*/qualification.json")).read_text())
+    assert saved["passed"] is not bad
+    assert saved["different_rows"] == ([3] if bad else [])
+
+
+def test_prefix_comparison_rejects_nonfinite_logits():
+    rows = np.ones((512, 4), dtype=np.float32)
+    for value in (np.nan, np.inf, -np.inf):
+        rows[3, 2] = value
+        proof = prefix_comparison(rows, rows.copy())
+        assert not proof["passed"] and not proof["finite"]
 
 
 def test_snapshot_provenance_must_match_pinned_set(tmp_path):

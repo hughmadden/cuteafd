@@ -281,7 +281,36 @@ on its own greedy text, the golden itself is suspect (routing or norm
 differences), and that is a finding about the reference, to fix before any
 precision decision.
 
-The paired bar does not wait for that: it is valid at any absolute level.
+Absolute agreement also contains a reference-noise component. In the first
+V4.1 investigation, the same 576-token prefix evaluated alone versus with a
+64-token suffix changed 39/512 argmax rows (7.6171875%). The original
+640-token run reproduced exactly, as did the serial versus multi-window
+576-token run. The first difference was 12 values in layer-0 `attn.wq_a`
+(max 1.52587890625e-5), before compressor/indexer state: sequence-shaped
+GEMM rounding amplified through the model, not a demonstrated causal-mask
+failure. This does not justify relaxing the absolute floors or the paired bar.
+
+Reference arithmetic now fixes row-wise GEMMs to M=128 with zero-padded
+final chunks, including quantized-kernel adapters, HC linears and LM heads;
+V4.1 grouped projection/attention einsums use the same fixed query geometry.
+Before generating a full family panel, its actual layer-major golden must
+pass a fail-closed 576/640-token common-prefix check: all 512 scored f32
+vocabulary rows finite and bit-identical. A passing proof is bound to the
+family, snapshot identity and pinned set hash, and required by the schema-2
+converter. This is a necessary sampled arithmetic/state gate, not a proof
+for all sequence lengths or GPU architectures. Other families must pass on
+the architecture that actually generates their references; a shared hook
+alone does not qualify their attention or recurrent kernels.
+
+The cancelled V4.1 baseline quick decode measured 96.9877% generated-position
+top-1, compact KL 0.0111367 nat and 56.3449 s scoring (2,689 generated of
+6,144 scored positions, 1 RTX + 4 Sparks, BF16 head, verify width 8). It used
+the unqualified shape-sensitive reference and is informational only, not a
+calibration or precision gate. Full decode failed on a missing dump parent;
+no candidate, full-prefill or paired discordance result exists from that run.
+
+The paired bar remains the precision decision rule at any absolute level,
+subject to the independent absolute gates and reference qualification.
 
 ## 9. Migration: what evolves, what stays
 
@@ -298,9 +327,13 @@ The paired bar does not wait for that: it is valid at any absolute level.
 | `release-smoke` | quick quality = this check | unchanged shape; the quick tier is what runs |
 | Hugh's teacher | second reference "where available" (PLAN) | a `cuteafd bench fidelity external --teacher DIR` path for GLM Flash only; absolute figures, no pairing with our set |
 
-Nothing already green becomes red by the schema change alone: the legacy
-window reproduces today's numbers (same tokens, same positions, top-12 ⊂
-top-32).
+The legacy converter remains byte-compatible for identical input logits
+(same tokens, positions, top-12 subset of top-32). Reference regeneration is
+separate: the old V4.1 JSON scores a 576-token prefix of a 640-token run, so
+its shape-sensitive arithmetic cannot define a prefix-invariant golden.
+Keep it unchanged for the old schema-1 path; publish schema-2 replacements
+only after the new prefix gate and qualified baseline calibration, rather
+than asserting old-versus-new golden bit identity.
 
 ## 10. Implementation plan (brief for a Codex agent)
 

@@ -20,6 +20,9 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from shape_invariant import install
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -107,6 +110,7 @@ def main() -> None:
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
+    install()
     ref = import_reference(a.snapshot)
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
     if a.tokens:

@@ -34,6 +34,10 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from shape_invariant import install
+
 
 HEAD_DIM = 192
 
@@ -163,6 +167,7 @@ def main() -> None:
     ref.MiMoV2FlashExperts.forward = experts_fp32
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
+    install()
     config = AutoConfig.from_pretrained(a.snapshot)
     config._attn_implementation = "eager"
     text = a.text_file.read_text() if a.text_file else a.text
@@ -204,7 +209,7 @@ def main() -> None:
             return
         norm = ref.MiMoV2FlashRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
         norm.weight.copy_(weights.get("model.norm.weight"))
-        logits = norm(h).float() @ weights.get("lm_head.weight").float().T
+        logits = torch.nn.functional.linear(norm(h).float(), weights.get("lm_head.weight").float())
         (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
     argmax = logits[0].argmax(-1)
     next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()

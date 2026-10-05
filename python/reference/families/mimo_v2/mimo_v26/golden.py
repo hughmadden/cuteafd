@@ -58,6 +58,10 @@ from fidelity_windows import load_set, write_scored_logits, finish_golden, verif
 def run_windows(a, config, Layer, Rotary, Norm, weights):
     manifest = load_set(a.windows, "mimo_v2")
     identity = verify_snapshot(manifest, a.snapshot)
+    from shape_invariant import qualify
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, Layer, Rotary, Norm, weights))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
     started, rows, times = time.time(), [], []
     states = []
     with torch.inference_mode():
@@ -101,13 +105,14 @@ def run_windows(a, config, Layer, Rotary, Norm, weights):
         head = weights.get("lm_head.weight").float()
         for i, w in enumerate(manifest["windows"]):
             h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
-            logits = norm(h).float()[0] @ head.T
+            logits = torch.nn.functional.linear(norm(h).float()[0], head)
             rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
             states[i] = None
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
         reference="snapshot modeling_mimo_v2.py (trust_remote_code, eager); qkv de-interleaved from TP8 shards; MXFP4 experts widened exactly",
-        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -200,9 +205,12 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, help="keep the first N tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -210,6 +218,8 @@ def main() -> None:
 
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
+    from shape_invariant import install
+    install()
     config = AutoConfig.from_pretrained(a.snapshot, trust_remote_code=True)
     config._attn_implementation = "eager"
     cls = lambda name: get_class_from_dynamic_module(f"modeling_mimo_v2.{name}", str(a.snapshot))  # noqa: E731
@@ -263,7 +273,7 @@ def main() -> None:
             return
         norm = Norm(config.hidden_size, eps=config.layernorm_epsilon).cuda().to(torch.bfloat16)
         norm.weight.copy_(weights.get("model.norm.weight"))
-        logits = norm(h).float() @ weights.get("lm_head.weight").float().T
+        logits = torch.nn.functional.linear(norm(h).float(), weights.get("lm_head.weight").float())
         (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
     argmax = logits[0].argmax(-1)
     next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()

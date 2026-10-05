@@ -1,8 +1,10 @@
 """Host-only contracts shared by the set builder, goldens and converter."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +74,87 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
         raise ValueError("snapshot config differs from the generation arm")
     return {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
             "config_sha256": config_sha}
+
+
+def prefix_comparison(short: np.ndarray, extended: np.ndarray) -> dict:
+    """Require finite, bit-identical f32 common-prefix rows, not just argmax."""
+    if short.ndim != 2 or extended.ndim != 2 or short.shape[1] != extended.shape[1] or extended.shape[0] < short.shape[0]:
+        raise ValueError("prefix qualification logits have incompatible shapes")
+    left = np.asarray(short, dtype="<f4")
+    right = np.asarray(extended[:len(short)], dtype="<f4")
+    finite = bool(np.isfinite(left).all() and np.isfinite(right).all())
+    changed = np.any(left.view("<u4") != right.view("<u4"), axis=1)
+    return {"passed": finite and not bool(changed.any()), "finite": finite,
+            "rows": len(left), "vocab": left.shape[1],
+            "different_rows": np.flatnonzero(changed).tolist(),
+            "argmax_disagreements": int(np.count_nonzero(left.argmax(1) != right.argmax(1)))}
+
+
+def qualify_prefix(a, manifest: dict, execute) -> dict:
+    """Fail closed before the full panel; execute the family's actual golden loop."""
+    source = next((w for w in manifest["windows"] if len(w["tokens"]) >= 640), None)
+    if source is None:
+        raise ValueError("prefix qualification requires a pinned window of at least 640 tokens")
+    root = Path(tempfile.mkdtemp(prefix="prefix-gate-", dir=a.out))
+    panel = copy.deepcopy(manifest)
+    panel["windows"] = []
+    for size, name in ((576, "prefix_short"), (640, "prefix_extended")):
+        window = copy.deepcopy(source)
+        window.update(id=name, tokens=source["tokens"][:size], roles=["ctx"] * size,
+                      score_from=64, bucket=bucket(64))
+        panel["windows"].append(window)
+    panel["quick_windows"] = ["prefix_short", "prefix_extended"]
+    panel["set_sha256"] = set_hash(panel)
+    validate_set(panel)
+    windows = root / "input.json"
+    windows.write_bytes(canonical(panel) + b"\n")
+    probe = copy.copy(a)
+    probe.windows, probe.out, probe.layers, probe._prefix_probe = windows, root, None, True
+    execute(probe)
+    meta = json.loads((root / "meta.json").read_text())
+    if meta.get("set_sha256") != panel["set_sha256"] or meta.get("family") != manifest["family"]:
+        raise ValueError("prefix golden provenance mismatch")
+    entries = {w["id"]: w for w in meta["windows"]}
+    arrays, hashes = [], []
+    for window in panel["windows"]:
+        entry = entries[window["id"]]
+        positions = list(range(window["score_from"], len(window["tokens"])))
+        if entry["positions"] != positions:
+            raise ValueError("prefix golden positions mismatch")
+        folder = (root / entry["path"]).resolve()
+        if not folder.is_relative_to(root.resolve()):
+            raise ValueError("prefix golden path escapes output")
+        if not np.array_equal(np.fromfile(folder / "tokens.bin", dtype="<i4"), window["tokens"]):
+            raise ValueError("prefix golden tokens mismatch")
+        path = folder / "logits.bin"
+        if path.stat().st_size != len(positions) * entry["vocab"] * 4:
+            raise ValueError("prefix golden logits extent mismatch")
+        arrays.append(np.memmap(path, dtype="<f4", mode="r", shape=(len(positions), entry["vocab"])))
+        hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    result = prefix_comparison(*arrays)
+    proof = {"schema": "cuteafd.fidelity.prefix/1", "family": manifest["family"],
+             "set_sha256": manifest["set_sha256"], "source_window": source["id"],
+             "lengths": [576, 640], "score_from": 64, "fixed_rows": 128,
+             "snapshot_identity": meta["snapshot_identity"], "logits_sha256": hashes,
+             "seconds": meta["seconds"], **result}
+    (root / "qualification.json").write_bytes(canonical(proof) + b"\n")
+    print(f"prefix qualification: {len(result['different_rows'])}/{result['rows']} different rows; {root}", flush=True)
+    if not result["passed"]:
+        raise ValueError(f"reference prefix invariance failed; see {root / 'qualification.json'}")
+    return proof
+
+
+def validate_qualification(proof: dict | None, manifest: dict, identity: dict) -> None:
+    if not isinstance(identity, dict) or not identity.get("snapshot_revision"):
+        raise ValueError("reference prefix qualification lacks snapshot identity")
+    if not isinstance(proof, dict) or proof.get("schema") != "cuteafd.fidelity.prefix/1":
+        raise ValueError("reference lacks prefix-invariance qualification")
+    required = {"passed": True, "finite": True, "rows": 512, "different_rows": [],
+                "argmax_disagreements": 0, "lengths": [576, 640], "score_from": 64,
+                "fixed_rows": 128, "family": manifest["family"],
+                "set_sha256": manifest["set_sha256"], "snapshot_identity": identity}
+    if any(proof.get(k) != v for k, v in required.items()):
+        raise ValueError("reference prefix-invariance qualification failed or mismatched provenance")
 
 
 def write_scored_logits(out: Path, window: dict, logits: np.ndarray) -> dict:

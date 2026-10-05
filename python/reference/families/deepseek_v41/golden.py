@@ -61,6 +61,10 @@ def restore_shared_attention(ref, state, device):
 def run_windows(a, ref, args, backend, weights):
     manifest = load_set(a.windows, "deepseek_v41")
     identity = verify_snapshot(manifest, a.snapshot)
+    from shape_invariant import qualify
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, ref, args, backend, weights))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
     args.max_seq_len = max(len(w["tokens"]) for w in manifest["windows"])
     started, rows = time.time(), []
     layout = ref.EngramLayout.from_args(args)
@@ -128,7 +132,8 @@ def run_windows(a, ref, args, backend, weights):
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
         reference="official inference/model.py (kernel_torch, mapped engram tables)",
-        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
 
 
 def import_reference(snapshot: Path):
@@ -236,14 +241,19 @@ def main() -> None:
     p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits only")
     p.add_argument("--layers", type=int, nargs="*", help="window-mode streams to save; default none")
     p.add_argument("--max-tokens", type=int, default=0, help="truncate the prompt to this many tokens")
+    p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
 
     torch.cuda.set_device(a.device)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
+    from shape_invariant import install
+    install()
     ref = import_reference(a.snapshot)
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
     from tokenizers import Tokenizer

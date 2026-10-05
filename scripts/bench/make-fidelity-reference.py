@@ -20,7 +20,7 @@ import numpy as np
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "python/reference"))
-from fidelity_windows import canonical, load_set
+from fidelity_windows import canonical, load_set, validate_qualification
 
 
 def convert_windows(args) -> None:
@@ -29,6 +29,7 @@ def convert_windows(args) -> None:
     if (meta.get("set_sha256") != manifest["set_sha256"] or meta.get("checkpoint") != manifest["checkpoint"]
             or meta.get("family") != manifest["family"]):
         raise ValueError("golden/set checkpoint or set hash mismatch")
+    validate_qualification(meta.get("prefix_qualification"), manifest, meta.get("snapshot_identity"))
     entries = {entry["id"]: entry for entry in meta["windows"]}
     if set(entries) != {w["id"] for w in manifest["windows"]}:
         raise ValueError("golden must contain exactly the set's windows")
@@ -49,6 +50,8 @@ def convert_windows(args) -> None:
         if pinned != w["tokens"]:
             raise ValueError("golden tokens differ from the pinned set")
         current_vocab = entry["vocab"]
+        if current_vocab != meta["prefix_qualification"]["vocab"]:
+            raise ValueError("prefix qualification vocabulary differs from golden")
         if vocab is not None and current_vocab != vocab:
             raise ValueError("mixed vocabularies in golden")
         vocab = current_vocab
@@ -93,7 +96,8 @@ def convert_windows(args) -> None:
         "generation_server": manifest.get("generation_server", {}), "set_version": manifest.get("version"),
         "source": {"golden": args.golden.name, "snapshot": meta.get("snapshot"),
                    "reference": meta.get("reference"), "experts_snapshot": meta.get("experts_snapshot"),
-                   "snapshot_identity": meta.get("snapshot_identity")},
+                   "snapshot_identity": meta.get("snapshot_identity"),
+                   "prefix_qualification": meta["prefix_qualification"]},
         "expect": {"kl_max": args.kl_max if args.kl_max is not None else 0.06,
                    "top1_min": args.top1_min if args.top1_min is not None else 0.90},
         "quick_windows": manifest["quick_windows"], "windows": windows}
