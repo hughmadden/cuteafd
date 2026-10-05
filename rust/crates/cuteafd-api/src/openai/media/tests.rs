@@ -121,6 +121,20 @@ fn public_fetch_rejects_local_special_and_mapped_addresses() {
     assert!(off.prepare(&[source()]).is_ok());
 }
 #[test]
+fn stalled_dns_returns_before_the_resolver_finishes() {
+    let (release, wait) = std::sync::mpsc::channel();
+    let (finished, done) = std::sync::mpsc::channel();
+    let error = resolve_with_timeout(move || {
+        wait.recv().unwrap();
+        finished.send(()).unwrap();
+        Ok(vec![])
+    }, Duration::from_millis(10)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
 fn any_fetch_checks_redirects_and_response_bounds() {
     use std::{
         io::{Read, Write},

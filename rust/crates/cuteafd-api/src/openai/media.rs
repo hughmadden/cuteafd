@@ -177,7 +177,7 @@ impl MediaPreparer {
             .try_proxy_from_env(false)
             .timeout_connect(Duration::from_secs(10))
             .resolver(move |netloc: &str| {
-                let addresses: Vec<_> = netloc.to_socket_addrs()?.collect();
+                let addresses = resolve_bounded(netloc)?;
                 if addresses.is_empty()
                     || (fetch == ImageUrlFetch::Public
                         && addresses.iter().any(|a| !public_ip(a.ip())))
@@ -363,6 +363,42 @@ impl MediaPreparer {
         }
         anyhow::bail!("too many image URL redirects")
     }
+}
+
+fn resolve_bounded(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let netloc = netloc.to_owned();
+    resolve_with_timeout(
+        move || netloc.to_socket_addrs().map(|addresses| addresses.collect()),
+        Duration::from_secs(10),
+    )
+}
+
+fn resolve_with_timeout(
+    resolve: impl FnOnce() -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+    timeout: Duration,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::Release);
+        }
+    }
+    // libc DNS is not cancellable. Timed-out workers keep their slot until
+    // they return, bounding both API waits and outstanding resolver threads.
+    ACTIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        (active < 4).then_some(active + 1)
+    }).map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "image DNS resolver is busy"))?;
+    let slot = Slot;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new().name("image-dns".into()).spawn(move || {
+        let _slot = slot;
+        let _ = send.send(resolve());
+    })?;
+    receive.recv_timeout(timeout).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "image DNS resolution timed out")
+    })?
 }
 
 fn public_ip(ip: IpAddr) -> bool {

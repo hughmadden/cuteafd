@@ -117,7 +117,12 @@ pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -
         } else {
             None
         };
-        let orientation = exif::orientation(metadata.as_deref(), None);
+        let xmp = if policy.exif_transpose {
+            decoder.xmp_metadata().map_err(|e| err(e.to_string()))?
+        } else {
+            None
+        };
+        let orientation = exif::orientation(metadata.as_deref(), xmp.as_deref());
         let decoded = DynamicImage::from_decoder(decoder).map_err(|e| err(e.to_string()))?;
         let decoded = match decoded {
             // Pillow truncates multi-channel PNG16 samples to their high byte.

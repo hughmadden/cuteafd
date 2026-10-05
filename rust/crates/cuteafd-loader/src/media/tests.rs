@@ -169,3 +169,32 @@ fn decode_policy_and_header_admission() {
     assert!(decode_bounded(&encoded, DecodePolicy::default(), 5).is_err());
     assert!(decode_bounded(&encoded, DecodePolicy::default(), 6).is_ok());
 }
+
+#[test]
+fn png_xmp_orientation_matches_pillow_fallback() {
+    let image = image::RgbImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6]).unwrap();
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let mut encoded = encoded.into_inner();
+    let payload = b"XML:com.adobe.xmp\0\0\0\0\0<tiff:Orientation>6</tiff:Orientation>";
+    let mut chunk = (payload.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(b"iTXt");
+    chunk.extend_from_slice(payload);
+    let mut crc = !0u32;
+    for byte in &chunk[4..] {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    chunk.extend_from_slice(&(!crc).to_be_bytes());
+    // Insert metadata before IDAT, after the fixed-length IHDR chunk.
+    encoded.splice(33..33, chunk);
+    let decoded = decode(&encoded, DecodePolicy::default()).unwrap();
+    assert_eq!((decoded.width, decoded.height), (1, 2));
+    assert_eq!(decoded.data, [1, 2, 3, 4, 5, 6]);
+    let unrotated = decode(&encoded, DecodePolicy { exif_transpose: false, ..Default::default() }).unwrap();
+    assert_eq!((unrotated.width, unrotated.height), (2, 1));
+}
