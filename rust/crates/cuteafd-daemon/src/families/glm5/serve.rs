@@ -29,7 +29,7 @@ use super::{open, Opened};
 use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
-use cuteafd_api::openai::chat::glm5::GlmEncoding;
+use cuteafd_api::openai::chat::glm5::{GlmEncoding, GlmThinkingOff};
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
@@ -55,6 +55,11 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
+    /// How a request that turns thinking off renders: low (the template's
+    /// Low effort, think block open) or empty (an empty think block after
+    /// the default Max effort).
+    #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "low")]
+    pub thinking_off: GlmThinkingOff,
     /// Decode one token per step (no copy-window drafts).
     #[arg(long)]
     pub no_copy_drafts: bool,
@@ -81,7 +86,7 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
-    let encoding = GlmEncoding::from_snapshot(&snapshot)?;
+    let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),

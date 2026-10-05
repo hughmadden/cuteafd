@@ -348,6 +348,18 @@ enum Templated {
     Qwen(Arc<qwen4::QwenEncoding>),
 }
 
+impl Templated {
+    /// The request's thinking switch and, for GLM, the effort its template
+    /// renders under the server's off form. Qwen's template reads
+    /// `reasoning_effort` from the request itself.
+    fn thinking(&self, body: &Value) -> Result<glm5::GlmThinking, String> {
+        match self {
+            Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
+            Self::Qwen(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+        }
+    }
+}
+
 /// The family's generated-text parser in front of the OpenAI chunk generator.
 enum OutputProcessor {
     Deepseek(StreamProcessor<ChatGenerator>),
@@ -465,7 +477,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     }
     // GLM renders the checkpoint template from the request itself; the
     // adapter below still validates it and owns tools and sampling options.
-    let glm_request = match glm.map(|encoding| (glm5::resolve_thinking(&body), encoding)) {
+    let glm_request = match glm.map(|encoding| (encoding.thinking(&body), encoding)) {
         None => None,
         Some((Ok(thinking), encoding)) => Some((encoding, body.clone(), thinking)),
         Some((Err(message), _)) => return error(StatusCode::BAD_REQUEST, message),
@@ -500,7 +512,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         return error(StatusCode::BAD_REQUEST, e);
     }
     if let Some((_, _, thinking)) = &glm_request {
-        converted.conversation.thinking_mode = *thinking;
+        converted.conversation.thinking_mode = thinking.enabled;
     }
     if let Some(thinking) = enable_thinking {
         converted.conversation.thinking_mode = thinking;
@@ -548,7 +560,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 (None, true) => glm5::GlmToolChoice::Required,
                 (None, false) => glm5::GlmToolChoice::Auto,
             };
-            let options = glm5::GlmPromptOptions { thinking,
+            let options = glm5::GlmPromptOptions { thinking: thinking.enabled, reasoning_effort: thinking.effort,
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
                 tool_choice, response_format };
             // Native probe ids already contain image rows, irrespective of chat template.
@@ -558,7 +570,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                     Err(message) => return error(StatusCode::BAD_REQUEST, message),
                 }
             };
-            let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking,
+            let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
@@ -569,7 +581,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 (None, true) => qwen4::prompt::QwenToolChoice::Required,
                 (None, false) => qwen4::prompt::QwenToolChoice::Auto,
             };
-            let options = qwen4::QwenPromptOptions { thinking,
+            let options = qwen4::QwenPromptOptions { thinking: thinking.enabled,
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
                 tool_choice, response_format };
             // Native probe ids already contain image rows, irrespective of chat template.
@@ -579,7 +591,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                     Err(message) => return error(StatusCode::BAD_REQUEST, message),
                 }
             };
-            let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking,
+            let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Qwen(glm5::GlmStreamProcessor::new(generator, parser)))

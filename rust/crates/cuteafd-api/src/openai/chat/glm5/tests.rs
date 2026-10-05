@@ -39,27 +39,63 @@ fn request_for(context: &Value) -> Value {
     body
 }
 
+/// Prompt options as the router resolves them for `body`.
+fn prompt_options(body: &Value, off: GlmThinkingOff) -> GlmPromptOptions {
+    let tool_names = body["tools"].as_array().into_iter().flatten()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned()).collect();
+    let thinking = resolve_glm_thinking(body, off).unwrap();
+    GlmPromptOptions { thinking: thinking.enabled, reasoning_effort: thinking.effort, tool_names,
+        tool_choice: GlmToolChoice::Auto, response_format: None }
+}
+
 #[test]
 fn openai_requests_render_the_golden_prompts() {
     let encoding = encoding();
     for case in goldens() {
         let body = request_for(&case["context"]);
-        let tool_names = body["tools"].as_array().into_iter().flatten()
-            .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned()).collect();
-        let options = GlmPromptOptions { thinking: resolve_thinking(&body).unwrap(), tool_names,
-            tool_choice: GlmToolChoice::Auto, response_format: None };
-        assert_eq!(encoding.render(&body, &options).unwrap(), case["expected"]["exl3_k4"].as_str().unwrap(),
-            "{}", case["name"]);
+        assert_eq!(encoding.render(&body, &prompt_options(&body, encoding.thinking_off())).unwrap(),
+            case["expected"]["exl3_k4"].as_str().unwrap(), "{}", case["name"]);
     }
 }
 
+/// Every way of turning thinking off: `thinking.type`, `enable_thinking`
+/// (top level or a template kwarg), the `thinking` kwarg, and the lowest
+/// effort's names.
+fn thinking_off_forms() -> [Value; 7] {
+    [json!({"thinking": {"type": "disabled"}}), json!({"enable_thinking": false}),
+        json!({"chat_template_kwargs": {"enable_thinking": false}}), json!({"chat_template_kwargs": {"thinking": false}}),
+        json!({"reasoning_effort": "none"}), json!({"reasoning_effort": "minimal"}),
+        json!({"chat_template_kwargs": {"reasoning_effort": "minimal"}})]
+}
+
+/// By default every off form renders the template's Low effort with the think
+/// block open: byte for byte the Transformers golden for `reasoning_effort` "low".
 #[test]
-fn disabled_thinking_closes_the_generation_prompt() {
-    let body = json!({"messages": [{"role": "user", "content": "Hi"}], "thinking": {"type": "disabled"}});
-    let options = GlmPromptOptions { thinking: resolve_thinking(&body).unwrap(), tool_names: vec![],
-        tool_choice: GlmToolChoice::Auto, response_format: None };
-    assert_eq!(encoding().render(&body, &options).unwrap(),
-        "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think></think>");
+fn thinking_off_renders_the_low_effort_golden() {
+    let encoding = encoding();
+    assert_eq!(encoding.thinking_off(), GlmThinkingOff::Low);
+    let case = goldens().into_iter().find(|case| case["name"] == "low_effort_multi_turn_reasoning").unwrap();
+    let mut request = request_for(&case["context"]);
+    request.as_object_mut().unwrap().remove("reasoning_effort");
+    for off in thinking_off_forms() {
+        let mut body = request.clone();
+        body.as_object_mut().unwrap().extend(off.as_object().unwrap().clone());
+        assert_eq!(encoding.render(&body, &prompt_options(&body, encoding.thinking_off())).unwrap(),
+            case["expected"]["exl3_k4"].as_str().unwrap(), "{off}");
+    }
+}
+
+/// The `empty` setting keeps glmrt's form for every off form, "minimal"
+/// included: an empty think block after the default (Max) effort.
+#[test]
+fn the_empty_setting_closes_an_empty_think_block() {
+    let encoding = encoding().with_thinking_off(GlmThinkingOff::Empty);
+    for off in thinking_off_forms() {
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        body.as_object_mut().unwrap().extend(off.as_object().unwrap().clone());
+        assert_eq!(encoding.render(&body, &prompt_options(&body, encoding.thinking_off())).unwrap(),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think></think>", "{off}");
+    }
 }
 
 #[test]
@@ -85,8 +121,8 @@ fn snapshot_loading_reads_template_eos_and_special_tokens() {
     assert_eq!(loaded.tokens(), &GlmTokenIds::glm5());
     std::fs::write(path.join("chat_template.jinja"), "[gMASK]<sop>{{ messages | length }}").unwrap();
     let loaded = GlmEncoding::from_snapshot(path).unwrap();
-    let options = GlmPromptOptions { thinking: true, tool_names: vec![], tool_choice: GlmToolChoice::Auto,
-        response_format: None };
+    let options = GlmPromptOptions { thinking: true, reasoning_effort: None, tool_names: vec![],
+        tool_choice: GlmToolChoice::Auto, response_format: None };
     assert_eq!(loaded.render(&json!({"messages": [{"role": "user", "content": "x"}]}), &options).unwrap(), "[gMASK]<sop>1");
 }
 
@@ -294,8 +330,8 @@ mod router {
 
     const MODEL: &str = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1";
 
-    fn app(queue: mpsc::Sender<NativeRequest>) -> axum::Router {
-        let profile = ModelProfile::new(MODEL, ModelEncoding::Glm(Arc::new(encoding())));
+    fn app(queue: mpsc::Sender<NativeRequest>, encoding: GlmEncoding) -> axum::Router {
+        let profile = ModelProfile::new(MODEL, ModelEncoding::Glm(Arc::new(encoding)));
         router_for_model(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
             std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile)
     }
@@ -303,6 +339,12 @@ mod router {
     /// Serve one request whose worker streams `text` a character at a time.
     async fn serve(body: Value, text: &'static str, check: impl FnOnce(&NativeRequest) + Send + 'static)
         -> (StatusCode, Vec<u8>) {
+        serve_with(encoding(), body, text, check).await
+    }
+
+    /// [`serve`] for a server with `encoding`.
+    async fn serve_with(encoding: GlmEncoding, body: Value, text: &'static str,
+        check: impl FnOnce(&NativeRequest) + Send + 'static) -> (StatusCode, Vec<u8>) {
         let (queue, mut receive) = mpsc::channel::<NativeRequest>(1);
         let worker = tokio::spawn(async move {
             let job = receive.recv().await.unwrap();
@@ -318,7 +360,7 @@ mod router {
         });
         let request = Request::post("/v1/chat/completions").header("content-type", "application/json")
             .body(Body::from(body.to_string())).unwrap();
-        let response = app(queue).oneshot(request).await.unwrap();
+        let response = app(queue, encoding).oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec();
         worker.await.unwrap();
@@ -440,28 +482,45 @@ mod router {
 
     #[tokio::test]
     async fn thinking_toggles_and_model_metadata() {
-        for (options, suffix) in [
-            (json!({"thinking": {"type": "disabled"}}), "<|assistant|><think></think>"),
-            (json!({"reasoning_effort": "none"}), "<|assistant|><think></think>"),
-            (json!({"chat_template_kwargs": {"enable_thinking": false}}), "<|assistant|><think></think>"),
-            (json!({"reasoning_effort": "low"}), "<|assistant|><think>"),
-        ] {
+        // Every off form renders the Low effort with the think block open, so
+        // the model's short plan comes back as reasoning.
+        let efforts = thinking_off_forms().into_iter().map(|off| (off, "Low"))
+            .chain([(json!({"reasoning_effort": "low"}), "Low"), (json!({"reasoning_effort": "high"}), "High"),
+                (json!({"reasoning_effort": "max"}), "Max"), (json!({}), "Max")]);
+        for (options, effort) in efforts {
             let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]});
             body.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
-            let low = options.get("reasoning_effort") == Some(&json!("low"));
-            let (status, bytes) = serve(body, "Hello.", move |job| {
-                assert!(job.prompt.ends_with(suffix), "{}", job.prompt);
-                assert_eq!(job.prompt.contains("Reasoning Effort: Low"), low);
+            let (status, bytes) = serve(body, "Greet.</think>Hello.", move |job| {
+                assert_eq!(job.prompt, format!("[gMASK]<sop><|system|>Reasoning Effort: {effort}<|user|>Hi<|assistant|><think>"));
             }).await;
             assert_eq!(status, StatusCode::OK);
             let value: Value = serde_json::from_slice(&bytes).unwrap();
-            let expected = if suffix.ends_with("</think>") { ("Hello.", None) } else { ("", Some("Hello.")) };
             let message = &value["choices"][0]["message"];
-            assert_eq!((message["content"].as_str().unwrap_or(""), message["reasoning_content"].as_str()), expected);
+            assert_eq!((message["content"].as_str(), message["reasoning_content"].as_str()), (Some("Hello."), Some("Greet.")),
+                "{options}");
         }
         let (queue, _receive) = mpsc::channel::<NativeRequest>(1);
-        let response = app(queue).oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app(queue, encoding()).oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
         let value: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap()).unwrap();
         assert_eq!((value["data"][0]["id"].as_str(), value["data"][0]["owned_by"].as_str()), (Some(MODEL), Some("wrldsuksgo2mars")));
+    }
+
+    /// With the `empty` setting an off request keeps glmrt's empty think block,
+    /// and the reply is content only.
+    #[tokio::test]
+    async fn the_empty_thinking_off_setting_answers_without_reasoning() {
+        for options in [json!({"thinking": {"type": "disabled"}}), json!({"reasoning_effort": "minimal"})] {
+            let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
+            let encoding = encoding().with_thinking_off(GlmThinkingOff::Empty);
+            let (status, bytes) = serve_with(encoding, body, "Hello.", |job| {
+                assert_eq!(job.prompt, "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think></think>");
+            }).await;
+            assert_eq!(status, StatusCode::OK);
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let message = &value["choices"][0]["message"];
+            assert_eq!((message["content"].as_str(), message["reasoning_content"].as_str()), (Some("Hello."), None),
+                "{options}");
+        }
     }
 }

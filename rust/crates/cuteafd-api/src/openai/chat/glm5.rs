@@ -2,10 +2,11 @@
 //! Transformers-compatible) and incremental parsing of reasoning, content and
 //! GLM XML tool calls into OpenAI chat-completion chunks.
 //!
-//! A GLM serve loop builds one [`GlmEncoding`] from the snapshot, passes it as
-//! `ModelEncoding::Glm` in the router's `ModelProfile`, and honours
-//! `NativeRequest::stop_token_ids`. Everything else (conversion, constraints,
-//! SSE and JSON responses) is shared with the DeepSeek profiles.
+//! A GLM serve loop builds one [`GlmEncoding`] from the snapshot (with the
+//! server's [`GlmThinkingOff`] form), passes it as `ModelEncoding::Glm` in the
+//! router's `ModelProfile`, and honours `NativeRequest::stop_token_ids`.
+//! Everything else (conversion, constraints, SSE and JSON responses) is shared
+//! with the DeepSeek profiles.
 pub mod parser;
 pub mod processor;
 pub mod prompt;
@@ -17,7 +18,10 @@ use std::path::Path;
 
 pub use parser::{GlmOutputParser, GlmParserOptions, GlmStop};
 pub use processor::{GlmStreamProcessor, TextParser};
-pub use prompt::{resolve_thinking, template_context, GlmPromptOptions, GlmToolChoice};
+pub use prompt::{
+    resolve_glm_thinking, resolve_thinking, template_context, GlmPromptOptions, GlmThinking, GlmThinkingOff,
+    GlmToolChoice,
+};
 pub use template::ChatTemplate;
 
 /// Special-token ids a GLM checkpoint's API contract depends on.
@@ -47,12 +51,19 @@ impl GlmTokenIds {
 pub struct GlmEncoding {
     template: ChatTemplate,
     tokens: GlmTokenIds,
+    thinking_off: GlmThinkingOff,
 }
 
 impl GlmEncoding {
     pub fn new(template_source: impl Into<String>, tokens: GlmTokenIds) -> Result<Self> {
         let template = ChatTemplate::new(template_source).context("compile GLM chat template")?;
-        Ok(Self { template, tokens })
+        Ok(Self { template, tokens, thinking_off: GlmThinkingOff::default() })
+    }
+
+    /// Render requests that turn thinking off as `off` (default: Low effort).
+    pub fn with_thinking_off(mut self, off: GlmThinkingOff) -> Self {
+        self.thinking_off = off;
+        self
     }
 
     /// Load `chat_template.jinja` (or `tokenizer_config.json`'s
@@ -100,13 +111,16 @@ impl GlmEncoding {
 
     pub fn tokens(&self) -> &GlmTokenIds { &self.tokens }
 
+    /// How requests that turn thinking off render.
+    pub fn thinking_off(&self) -> GlmThinkingOff { self.thinking_off }
+
     /// Render the prompt for an OpenAI chat request body.
     pub fn render(&self, body: &Value, options: &GlmPromptOptions) -> Result<String, String> {
         let context = template_context(body, options)?;
         let mut prompt = self.template.render(&context).map_err(|error| format!("chat template: {error:#}"))?;
         if !options.thinking {
-            // The template always opens `<think>`; glmrt closed it for
-            // non-thinking turns, as history turns render `<think></think>`.
+            // The template always opens `<think>`; the `empty` off form closes
+            // it as glmrt did, the way history turns render `<think></think>`.
             if !prompt.ends_with(parser::THINK_OPEN) { prompt.push_str(parser::THINK_OPEN); }
             prompt.push_str(parser::THINK_CLOSE);
         }
