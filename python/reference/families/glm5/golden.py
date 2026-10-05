@@ -20,12 +20,17 @@ import json
 import time
 from pathlib import Path
 
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install
+from fidelity_windows import CheckpointStorage, release_checkpoint
 
 
 class Weights:
@@ -42,7 +47,7 @@ class Weights:
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name)
+        return self.files[shard].get_tensor(name).clone()
 
     def get(self, name: str, device: str = "cuda") -> torch.Tensor:
         """BF16/FP32 tensors as stored; FP8 weights times their block scales."""
@@ -89,6 +94,7 @@ def load_layer(layer: torch.nn.Module, weights: Weights, prefix: str) -> None:
         if name in weights.index:
             with torch.no_grad():
                 buffer.copy_(weights.get(name).to(buffer.dtype))
+    release_checkpoint(torch.cuda, weights)
 
 
 def main() -> None:
@@ -127,6 +133,7 @@ def main() -> None:
         rotary = ref.GlmMoeDsaRotaryEmbedding(config=config).cuda()
         cos_sin = rotary(h, position_ids=positions)
         topk = None
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(layers):
             start = time.time()
             # BF16 parameters; the router keeps its explicit FP32 bias buffer.
@@ -141,7 +148,8 @@ def main() -> None:
             if layer_id in save:
                 (a.out / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             print(f"layer {layer_id} {time.time() - start:.1f}s", flush=True)
         norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda()
         norm.weight.copy_(weights.get("model.norm.weight"))

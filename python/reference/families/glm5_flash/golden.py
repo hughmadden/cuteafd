@@ -36,13 +36,17 @@ import json
 import time
 from pathlib import Path
 
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install, qualify
-from fidelity_windows import load_set, verify_snapshot, write_scored_logits, finish_golden
+from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, verify_snapshot, write_scored_logits, finish_golden
 
 PREFIX = "model.language_model."
 
@@ -64,6 +68,7 @@ def run_windows(a, config, ref, dense, experts_src):
             h = torch.nn.functional.embedding(ids, embed)
             states.append((h.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous().cpu(), None))
         del embed, ids, h
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
             kind = config.layer_types[layer_id]
@@ -92,7 +97,8 @@ def run_windows(a, config, ref, dense, experts_src):
                 states[i] = (h.cpu(), topk.cpu() if topk is not None else None)
                 del h, topk, positions, mask
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
         norm = ref.Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
@@ -124,7 +130,7 @@ class Weights:
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name)
+        return self.files[shard].get_tensor(name).clone()
 
     def get(self, name: str, device: str = "cuda") -> torch.Tensor:
         """BF16/FP32 tensors as stored; FP8 weights times their 128x128 FP32 block scales."""
@@ -173,6 +179,7 @@ def load_layer(layer: torch.nn.Module, dense: Weights, experts_src: Weights, pre
         value = torch.cat([dense.get(n) for n in names], 0) if len(names) > 1 else dense.get(names[0])
         with torch.no_grad():
             param.copy_(value.reshape(param.shape).to(param.dtype))
+    release_checkpoint(torch.cuda, dense, experts_src)
 
 
 def experts_fp32(self, hidden_states, top_k_index, top_k_weights):
@@ -243,6 +250,7 @@ def main() -> None:
     with torch.inference_mode():
         embed = torch.nn.functional.embedding(ids, dense.get(PREFIX + "embed_tokens.weight"))
         h = embed.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous()
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(layers):
             start = time.time()
             kind = config.layer_types[layer_id]
@@ -261,7 +269,8 @@ def main() -> None:
                 (a.out / f"layer{layer_id:02d}.bin").write_bytes(
                     h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             print(f"layer {layer_id} ({kind}) {time.time() - start:.1f}s", flush=True)
         if layers < n_layers:
             return

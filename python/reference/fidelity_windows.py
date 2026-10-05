@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import copy
+import ctypes
+import gc
 import hashlib
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,6 +14,59 @@ import numpy as np
 
 SET_SCHEMA = "cuteafd.fidelity.set/1"
 MAX_TOKENS = 16384
+
+
+def rss_bytes() -> int:
+    """Current Linux RSS, not ru_maxrss's irreversible peak."""
+    return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def release_checkpoint(cuda, *readers):
+    # Copy completion precedes releasing mapped checkpoint backing storage.
+    if cuda is not None:
+        cuda.synchronize()
+    for reader in readers:
+        for handle in reader.files.values():
+            handle.__exit__(None, None, None)
+            del handle
+        reader.files.clear()
+    gc.collect()
+    # glibc may retain freed CPU staging arenas, especially on unified-memory ARM.
+    # Return them to the OS so the next layer's admission sees actual live storage.
+    libc = ctypes.CDLL(None)
+    trim = getattr(libc, "malloc_trim", None)
+    if trim is not None:
+        trim.argtypes, trim.restype = [ctypes.c_size_t], ctypes.c_int
+        trim(0)
+    if cuda is not None:
+        cuda.empty_cache()
+
+
+class CheckpointStorage:
+    """Bound CPU shard lifetimes; CUDA is injected so CPU contracts stay host-only."""
+
+    def __init__(self, cuda, *readers, max_rss_gib=80, max_growth_gib=8):
+        self.cuda, self.readers = cuda, readers
+        self.max_rss = int(max_rss_gib * 2**30)
+        self.max_growth = int(max_growth_gib * 2**30)
+        if self.max_rss <= 0 or self.max_growth < 0:
+            raise ValueError("invalid checkpoint RSS bounds")
+        self.release()
+        self.baseline = rss_bytes()
+        self.check("embedding")
+
+    def release(self):
+        release_checkpoint(self.cuda, *self.readers)
+
+    def check(self, label):
+        current = rss_bytes()
+        limit = min(self.max_rss, self.baseline + self.max_growth)
+        print(f"checkpoint memory {label}: RSS={current / 2**30:.3f} GiB "
+              f"baseline={self.baseline / 2**30:.3f} limit={limit / 2**30:.3f}", flush=True)
+        if current > limit:
+            raise RuntimeError(f"checkpoint RSS bound exceeded after {label}: {current} > {limit}")
+        self.baseline = min(self.baseline, current)
+        return current
 
 
 def canonical(value: object) -> bytes:

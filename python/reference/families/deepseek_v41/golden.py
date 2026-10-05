@@ -21,12 +21,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
-from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot
 
 
 def initial_runtime_buffers(layer):
@@ -91,6 +95,7 @@ def run_windows(a, ref, args, backend, weights):
             del h, ids, hashes
         del embed
         times = []
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(args.n_layers):
             start = time.time()
             layer = ref.Block(layer_id, args, layout)
@@ -117,7 +122,8 @@ def run_windows(a, ref, args, backend, weights):
                 del h, pre_mix
             ref.shared_attn = ref.SharedAttentionRuntime()
             del initial, layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
             print(f"layer {layer_id}: {times[-1]:.1f}s ({len(states)} windows)", flush=True)
         norm = ref.RMSNorm(args.dim, args.norm_eps)
@@ -158,7 +164,7 @@ class Weights:
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name)
+        return self.files[shard].get_tensor(name).clone()
 
     def mapped(self, name: str) -> np.memmap:
         """A uint8 memory map of tensor `name` shaped [rows, bytes per row]."""
@@ -231,6 +237,7 @@ def load_module(module: torch.nn.Module, weights: Weights, prefix: str) -> None:
         missing.discard(key)
     if missing:
         raise KeyError(f"{prefix}: parameters without checkpoint tensors: {sorted(missing)[:8]}")
+    release_checkpoint(torch.cuda, weights)
 
 
 def main() -> None:
@@ -293,6 +300,7 @@ def main() -> None:
         del embed
         pre_mix = ref.make_identity_pre_mix(h, args.hc_mult)
         layer = None
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(args.n_layers):
             start = time.time()
             layer = ref.Block(layer_id, args, layout)
@@ -302,7 +310,8 @@ def main() -> None:
             h, pre_mix = layer(h, 0, pre_mix, None)
             if layer_id < args.n_layers - 1:
                 del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             print(f"layer {layer_id} {time.time() - start:.1f}s", flush=True)
         h = layer.hc_pre(h, pre_mix)
         norm = ref.RMSNorm(args.dim, args.norm_eps)

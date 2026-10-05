@@ -46,13 +46,17 @@ import sys
 import time
 from pathlib import Path
 
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mimo_v2.golden import masks  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot
 
 
 def run_windows(a, config, Layer, Rotary, Norm, weights):
@@ -70,6 +74,7 @@ def run_windows(a, config, Layer, Rotary, Norm, weights):
             ids = torch.tensor([w["tokens"]], device="cuda")
             states.append(torch.nn.functional.embedding(ids, embed).cpu())
         del embed, ids
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
             torch.set_default_dtype(torch.bfloat16)
@@ -97,7 +102,8 @@ def run_windows(a, config, Layer, Rotary, Norm, weights):
                 states[i] = h.cpu()
                 del h, mask, selected_mask, positions
             del layer, rotary
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
         norm = Norm(config.hidden_size, eps=config.layernorm_epsilon).cuda().to(torch.bfloat16)
@@ -147,7 +153,7 @@ class Weights:
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name).to(device)
+        return self.files[shard].get_tensor(name).clone().to(device)
 
     def qkv_shards(self, layer: int) -> tuple[int, int, int]:
         """(q, k, v) rows of one checkpoint TP shard of ``qkv_proj``."""
@@ -194,6 +200,7 @@ def load_layer(layer: torch.nn.Module, weights: Weights, prefix: str, layer_id: 
             raise KeyError(f"{name}: no checkpoint tensor")
         with torch.no_grad():
             param.copy_(weights.get(name, layer_id).to(param.dtype))
+    release_checkpoint(torch.cuda, weights)
 
 
 def main() -> None:
@@ -249,6 +256,7 @@ def main() -> None:
         h = torch.nn.functional.embedding(ids, weights.get("model.embed_tokens.weight"))
         cos_sin = {"full_attention": Rotary(config=config, is_swa=False).cuda()(h, positions),
                    "sliding_window_attention": Rotary(config=config, is_swa=True).cuda()(h, positions)}
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(layers):
             start = time.time()
             torch.set_default_dtype(torch.bfloat16)
@@ -267,7 +275,8 @@ def main() -> None:
                 (a.out / f"layer{layer_id:02d}.bin").write_bytes(
                     h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             print(f"layer {layer_id} ({kind}) {time.time() - start:.1f}s", flush=True)
         if layers < n:
             return

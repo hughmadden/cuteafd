@@ -15,7 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import (canonical, finish_golden, load_set, set_hash, validate_set,
                               write_scored_logits, verify_snapshot, prefix_comparison,
-                              qualify_prefix, validate_qualification)
+                              qualify_prefix, validate_qualification, CheckpointStorage,
+                              release_checkpoint)
 
 spec = importlib.util.spec_from_file_location("make_fidelity_reference", ROOT / "scripts/bench/make-fidelity-reference.py")
 converter = importlib.util.module_from_spec(spec)
@@ -59,6 +60,48 @@ def options(tmp_path, golden):
     return SimpleNamespace(windows=golden / "windows.json", golden=golden,
         rows_dir=tmp_path / "rows", out=tmp_path / "reference.json", quick_out=tmp_path / "quick.json",
         top_k=12, name=None, model=["test-model"], kl_max=None, top1_min=None)
+
+
+def test_checkpoint_retirement_drains_before_releasing_handles(monkeypatch):
+    import fidelity_windows as storage
+    events = []
+
+    class Files(dict):
+        def clear(self):
+            events.append("clear")
+            super().clear()
+
+    reader = SimpleNamespace(files=Files(shard=SimpleNamespace(
+        __exit__=lambda *_args: events.append("close"))))
+    cuda = SimpleNamespace(synchronize=lambda: events.append("drain"),
+                           empty_cache=lambda: events.append("empty"))
+    monkeypatch.setattr(storage.gc, "collect", lambda: events.append("gc"))
+    release_checkpoint(cuda, reader)
+    assert events == ["drain", "close", "clear", "gc", "empty"]
+    assert not reader.files
+
+
+def test_checkpoint_rss_guard_fails_closed_and_does_not_ratchet(monkeypatch):
+    import fidelity_windows as storage
+    rss = iter([2 * 2**30, 2 * 2**30, 3 * 2**30, 4 * 2**30 + 1])
+    monkeypatch.setattr(storage, "rss_bytes", lambda: next(rss))
+    memory = CheckpointStorage(None, max_rss_gib=80, max_growth_gib=2)
+    assert memory.check("layer 0") == 3 * 2**30
+    with pytest.raises(RuntimeError, match="RSS bound exceeded after layer 1"):
+        memory.check("layer 1")
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41", "glm5", "glm5_flash",
+                                   "mimo_v2/mimo_v2", "mimo_v2/mimo_v26", "qwen4"])
+def test_every_golden_retires_layer_storage_and_owns_cpu_reads(family):
+    tree = ast.parse((ROOT / "python/reference/families" / family / "golden.py").read_text())
+    reader = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Weights")
+    assert ".clone()" in ast.unparse(reader)
+    for function in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("main", "run_windows")):
+        source = ast.unparse(function)
+        assert "CheckpointStorage(" in source
+        assert "memory.release()" in source and "memory.check(" in source
+    assert "release_checkpoint(" in ast.unparse(tree)
 
 
 def test_schema2_scored_rows_and_full_manifest(tmp_path):
@@ -411,18 +454,20 @@ def test_glm_flash_window_dsa_handoff_is_per_window(tmp_path):
         def to(self, _dtype): return self
         def __call__(self, h): return h
 
-    weights = SimpleNamespace(get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
+    weights = SimpleNamespace(files={}, get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
     torch = SimpleNamespace(inference_mode=nullcontext, device=lambda _name: nullcontext(),
         bfloat16="bf16", float32="f32", bool="bool", set_default_dtype=lambda _dtype: None,
         tensor=lambda data, **_kwargs: Tensor(data), arange=lambda n, **_kwargs: Tensor(np.arange(n)),
-        ones=lambda *shape, **_kwargs: Tensor(np.ones(shape)), cuda=SimpleNamespace(empty_cache=lambda: None),
+        ones=lambda *shape, **_kwargs: Tensor(np.ones(shape)),
+        cuda=SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None),
         nn=SimpleNamespace(functional=SimpleNamespace(
             embedding=lambda ids, _weights: Tensor(ids.data[..., None]),
             linear=lambda x, w: Tensor(x.data @ w.data.T))))
     import time
     scope = dict(torch=torch, time=time, load_set=load_set, verify_snapshot=lambda *_args: {},
         qualify=lambda *_args: None, write_scored_logits=write_scored_logits, finish_golden=finish_golden,
-        PREFIX="model.language_model.", FP32_KEYS=(), load_layer=lambda *_args: None)
+        PREFIX="model.language_model.", FP32_KEYS=(), load_layer=lambda *_args: None,
+        CheckpointStorage=CheckpointStorage)
     exec(compile(ast.Module(body=[function], type_ignores=[]), "glm_window_runner", "exec"), scope)
     config = SimpleNamespace(hc_mult=4, num_hidden_layers=3, hidden_size=1, rms_norm_eps=1e-6,
                              layer_types=["dsa", "dsa", "kda"])

@@ -17,11 +17,16 @@ import time
 import types
 from pathlib import Path
 
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install
+from fidelity_windows import CheckpointStorage, release_checkpoint
 
 HERE = Path(__file__).resolve().parent
 
@@ -50,7 +55,7 @@ class Weights:
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name)
+        return self.files[shard].get_tensor(name).clone()
 
     def names(self, prefix: str) -> list[str]:
         return [n for n in self.index if n.startswith(prefix)]
@@ -94,6 +99,7 @@ def load_module(module: torch.nn.Module, weights: Weights, prefix: str) -> None:
         missing.discard(key)
     if missing:
         raise KeyError(f"{prefix}: parameters without checkpoint tensors: {sorted(missing)[:8]}")
+    release_checkpoint(torch.cuda, weights)
 
 
 def main() -> None:
@@ -136,6 +142,7 @@ def main() -> None:
         torch.save(h.cpu(), a.out / "embed.pt")
         h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
         del embed
+        memory = CheckpointStorage(torch.cuda, weights)
         for layer in range(args.n_layers):
             start = time.time()
             block = ref.Block(layer, args)
@@ -144,7 +151,8 @@ def main() -> None:
             if layer in save:
                 torch.save(h.cpu(), a.out / f"layer{layer:02d}.pt")
             del block
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer}")
             print(f"layer {layer} {time.time() - start:.1f}s", flush=True)
         hc_fn = weights.get("hc_head_fn").cuda().float()
         hc_scale = weights.get("hc_head_scale").cuda().float()

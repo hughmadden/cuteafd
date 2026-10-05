@@ -49,6 +49,10 @@ import json
 import time
 from pathlib import Path
 
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
+
 import torch
 from safetensors import safe_open
 
@@ -57,7 +61,7 @@ SHARD_ROWS = 2_500_012
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot
 
 
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
@@ -77,6 +81,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             states.append(torch.nn.functional.embedding(ids, embed_weight).repeat(1, 1, config.hc_count).cpu())
         del embed_weight, ids
         rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
             kind = config.layer_types[layer_id]
@@ -124,7 +129,8 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                 states[i] = h.cpu()
                 del h, ids, positions, embed_shape, causal, position_embeddings
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
         torch.set_default_dtype(torch.bfloat16)
@@ -163,7 +169,7 @@ class Weights:
         return self.files[shard]
 
     def raw(self, name: str) -> torch.Tensor:
-        return self.handle(name).get_tensor(name)
+        return self.handle(name).get_tensor(name).clone()
 
     def get(self, name: str, device: str = "cuda") -> torch.Tensor:
         """BF16/FP32/int tensors as stored; FP8 weights times their 128x128 block scales."""
@@ -196,17 +202,20 @@ class LazyNgramTable(torch.nn.Module):
         for shard in torch.unique(shard_of).tolist():
             pick = (shard_of == shard).nonzero().flatten()
             name = f"{self.prefix}shard_{shard}.weight"
-            view = self.w.handle(name).get_slice(name)
-            for i in pick.tolist():
-                r = int(unique[i]) - shard * SHARD_ROWS
-                row = view[r:r + 1]
-                if row.dtype == torch.float8_e4m3fn:
-                    if self.scale is None:
-                        raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
-                    row = row.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
-                elif row.dtype != torch.bfloat16:
-                    raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
-                out[i] = row[0]
+            # PLE may touch all 128 shards in one layer; do not cache these handles.
+            with safe_open(str(self.w.snapshot / self.w.index[name]), framework="pt", device="cpu") as handle:
+                view = handle.get_slice(name)
+                for i in pick.tolist():
+                    r = int(unique[i]) - shard * SHARD_ROWS
+                    row = view[r:r + 1]
+                    if row.dtype == torch.float8_e4m3fn:
+                        if self.scale is None:
+                            raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
+                        row = row.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
+                    elif row.dtype != torch.bfloat16:
+                        raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
+                    out[i] = row[0]
+                del row, view
         return out[inverse].reshape(*ids.shape, self.dim).to(ids.device)
 
 
@@ -216,6 +225,7 @@ def load_experts(experts, src: Weights, prefix: str) -> None:
         if fused in src:
             experts.gate_up_proj.copy_(src.get(fused).to(torch.bfloat16))
             experts.down_proj.copy_(src.get(prefix + "mlp.experts.down_proj").to(torch.bfloat16))
+            release_checkpoint(torch.cuda, src)
             return
         first = prefix + "mlp.experts.0."
         if first + "gate_proj.trellis" in src:
@@ -225,6 +235,7 @@ def load_experts(experts, src: Weights, prefix: str) -> None:
             experts.gate_up_proj[e].copy_(torch.cat([src.get(base + "gate_proj.weight"),
                                                      src.get(base + "up_proj.weight")], 0))
             experts.down_proj[e].copy_(src.get(base + "down_proj.weight"))
+    release_checkpoint(torch.cuda, src)
 
 
 def load_module(module: torch.nn.Module, dense: Weights, prefix: str, skip: set[str]) -> None:
@@ -236,6 +247,7 @@ def load_module(module: torch.nn.Module, dense: Weights, prefix: str, skip: set[
             raise KeyError(f"{name}: no checkpoint tensor for {key}")
         with torch.no_grad():
             param.copy_(dense.get(name).reshape(param.shape).to(param.dtype))
+    release_checkpoint(torch.cuda, dense)
 
 
 def experts_fp32(self, hidden_states, top_k_index, top_k_weights):
@@ -318,6 +330,7 @@ def main() -> None:
         rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
         position_embeddings = rotary(embed, mrope_positions)
         h = embed.repeat(1, 1, config.hc_count)
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(layers):
             start = time.time()
             kind = config.layer_types[layer_id]
@@ -352,7 +365,8 @@ def main() -> None:
                 (a.out / f"layer{layer_id:02d}.bin").write_bytes(
                     h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             timings.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {timings[-1]:.1f}s", flush=True)
         if layers < n_layers:
