@@ -61,6 +61,9 @@ pub struct RunArgs {
     pub out: PathBuf,
     #[arg(long)]
     pub reference: Option<PathBuf>,
+    /// Root of hash-sealed first-party image fixtures for media windows.
+    #[arg(long)]
+    pub media_root: Option<PathBuf>,
     /// Public HF dataset repository; the verified publication is the full-tier default.
     #[arg(long, num_args = 0..=1, default_missing_value = crate::fidelity_dataset::REPOSITORY,
         conflicts_with_all = ["reference", "rows"])]
@@ -138,6 +141,11 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     ensure!(reference.models.iter().any(|pattern| crate::reference::glob(pattern, model)), "reference does not match served model");
     ensure!(reference.windows.is_empty() || reference.checkpoint == model, "reference checkpoint differs from served checkpoint");
     let windows = reference.selected_windows(args.tier == "full")?;
+    let media_payloads: Vec<_> = windows.iter().map(|window| {
+        if window.media.is_empty() { return Ok(Vec::new()); }
+        let root = args.media_root.as_ref().context("media windows require --media-root")?;
+        crate::reference::media_probe_payload(window, &models["data"][0], root)
+    }).collect::<Result<_>>()?;
     if args.tier == "full" { ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe"); }
     let rows = if args.tier == "full" && dataset_identity.is_none() {
         let dir = args.rows.as_ref().context("full tier needs --rows / CUTEAFD_FIDELITY_ROWS")?;
@@ -156,11 +164,13 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         let mut spec = json!({"prompt_ids": window.tokens[..end], "score_from": window.score_from,
             "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true,
             "score_path": args.score_path});
+        if !media_payloads[i].is_empty() { spec["media"] = json!(media_payloads[i]); }
         if args.tier == "full" { spec["dump_rows"] = json!(dump); }
         if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
         let response = request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key,
             &json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
                 "temperature": 0}, "spec": spec}))?;
+        crate::reference::verify_media_echo(window, &response["probe"])?;
         let probe: cuteafd_api::openai::probe::ProbeRecord = serde_json::from_value(response["probe"].clone())?;
         if let Some(error) = &probe.error { bail!("window {}: {error}", window.id); }
         ensure!(probe.engine.is_some() && probe.cold && probe.no_speculation && probe.cached_tokens == 0,

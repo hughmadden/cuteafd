@@ -195,6 +195,13 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     };
     let started = Instant::now();
     let windows = reference.selected_windows(false)?;
+    let media_payloads: Vec<_> = if windows.iter().any(|w| !w.media.is_empty()) {
+        let root = std::env::var_os("CUTEAFD_FIDELITY_MEDIA_ROOT")
+            .context("media quick fidelity needs CUTEAFD_FIDELITY_MEDIA_ROOT")?;
+        let model = run.client.model_record()?;
+        windows.iter().map(|w| crate::reference::media_probe_payload(w, &model, std::path::Path::new(&root)))
+            .collect::<Result<_>>()?
+    } else { vec![Vec::new(); windows.len()] };
     let mut records = Vec::new();
     let mut missing = 0;
     let mut probes = Vec::new();
@@ -204,13 +211,26 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("reference window {} needs {} context tokens", window.id, window.tokens.len());
         return Ok(());
     }
-    for window in &windows {
+    for (index, window) in windows.iter().enumerate() {
         let end = window.positions.last().context("empty reference window")?.pos + 1;
         let spec = ProbeSpec { prompt_ids: Some(window.tokens[..end].to_vec()), score_from: Some(window.score_from),
             top_k: window.top_k, want: window.want(), cold: true, no_speculation: true,
             score_path: (!reference.windows.is_empty()).then(|| "decode".into()), ..ProbeSpec::default() };
-        let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
-        let record = probe_of(&chat)?;
+        let record_owned;
+        let chat;
+        let record = if window.media.is_empty() {
+            chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
+            probe_of(&chat)?
+        } else {
+            let mut wire = serde_json::to_value(spec)?;
+            wire["media"] = serde_json::json!(media_payloads[index]);
+            let response = run.client.media_probe(plain("fidelity probe", 1), wire)?;
+            crate::reference::verify_media_echo(window, &response["probe"])?;
+            record_owned = serde_json::from_value::<ProbeRecord>(response["probe"].clone())?;
+            anyhow::ensure!(record_owned.prompt_ids == window.tokens[..end], "engine ran different media tokens");
+            anyhow::ensure!(response["server"]["model"] == run.info.model, "media scoring checkpoint changed");
+            &record_owned
+        };
         if !honoured(record) { unsupported(check); return Ok(()); }
         if let Some(error) = &record.error { anyhow::bail!("scoring {}: {error}", window.id); }
         anyhow::ensure!(record.cold && record.no_speculation && record.cached_tokens == 0,

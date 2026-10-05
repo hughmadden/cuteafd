@@ -333,6 +333,61 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     return manifest
 
 
+def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures, tokenizer_sha256):
+    """Independent media panel: never rewrite a frozen 64-window text publication."""
+    import base64
+    from fidelity_media import read_fixture, validate_media
+    if family not in ("mimo_v2", "qwen4", "glm5_flash"):
+        raise ValueError("this family has no supported v2 vision tower")
+    arm_policy(arm, checkpoint)
+    fixture_manifest = json.loads((fixtures / "fixtures.json").read_text())
+    records = fixture_manifest.get("fixtures", [])
+    if fixture_manifest.get("schema") != "cuteafd.media.fixtures/1" or len(records) != 8:
+        raise ValueError("vision bucket needs eight pinned first-party fixtures")
+    windows, servers = [], []
+    for item in records:
+        fixture = {"path": item["path"], "sha256": item["sha256"]}
+        data = read_fixture(fixtures, {"fixture": fixture})
+        body = {"model": model, "messages": [{"role": "system", "content": "Inspect the image carefully. Explain only what is visible."},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(data).decode(), "detail": "auto"}},
+                {"type": "text", "text": item["question"]}]}],
+            "max_tokens": 1024, "temperature": 0, "seed": 0, "reasoning_effort": "high", "stream": False}
+        chat = probe(body)
+        record, server = chat["probe"], chat.get("server", {})
+        if server.get("model") != checkpoint or server.get("family") != family:
+            raise ValueError("media generation server identity differs from manifest")
+        spans = record.get("media")
+        if not isinstance(spans, list) or len(spans) != 1:
+            raise ValueError("media probe must return one prepared image span; refusing text-only generation")
+        span = {k: spans[0][k] for k in ("start", "len", "kind", "key", "grid")}
+        span["fixture"] = fixture
+        prompt, generated = record["prompt_ids"], record["generated"]
+        if not 576 <= len(generated) <= 1024:
+            raise ValueError("vision golden needs at least 576 real generated tokens for prefix qualification")
+        tokens, roles = prompt + generated, ["ctx"] * len(prompt) + ["gen"] * len(generated)
+        start = len(tokens) - 512
+        validate_media([span], tokens, roles, start)
+        if len(tokens) > MAX_TOKENS:
+            raise ValueError("vision window exceeds context cap")
+        windows.append({"id": item["id"], "block": "vision", "bucket": bucket(start),
+            "tokens": tokens, "roles": roles, "score_from": start, "media": [span],
+            "provenance": {"fixture_manifest_sha256": hashlib.sha256(canonical(fixture_manifest)).hexdigest(),
+                "prompt_sha256": hashlib.sha256(canonical(body)).hexdigest(), "engine": record["engine"],
+                "generated_tokens": len(generated), "server": server}})
+        servers.append(server)
+    if any(s != servers[0] for s in servers):
+        raise ValueError("server changed during media generation")
+    manifest = {"schema": SET_SCHEMA, "family": family, "model": model, "checkpoint": checkpoint,
+        "version": version, "generation_arm": arm, "generation_server": servers[0],
+        "tokenizer_sha256": tokenizer_sha256, "quick_windows": fixture_manifest["quick_windows"],
+        "fixtures_sha256": hashlib.sha256((fixtures / "fixtures.json").read_bytes()).hexdigest(),
+        "recipe": {"windows": 8, "positions_per_window": 512, "quick_windows": 2,
+                   "prompt_roles": "image/text ctx; actual assistant output gen"}, "windows": windows}
+    manifest["set_sha256"] = set_hash(manifest)
+    return validate_set(manifest)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--family", required=True, choices=LEGACY)
@@ -342,6 +397,7 @@ def main(argv=None):
     p.add_argument("--tokenizer", required=True, type=pathlib.Path)
     p.add_argument("--arm-manifest", required=True, type=pathlib.Path)
     p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
+    p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--bench-token")
@@ -359,11 +415,18 @@ def main(argv=None):
         if any(path.startswith("third_party/") for path in files):
             p.error("third-party sources are not part of the fidelity recipe")
     from tokenizers import Tokenizer
-    manifest = build_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
-        arm=json.loads(a.arm_manifest.read_text()), tokenizer=Tokenizer.from_file(str(a.tokenizer)),
-        probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
-        recordings=[json.loads(path.read_text()) for path in a.recording],
-        files=json.loads(a.file_list.read_text()) if a.file_list else None)
+    if a.media_fixtures:
+        if a.recording or a.file_list:
+            p.error("--media-fixtures cannot combine with text recipe recordings/files")
+        manifest = build_vision_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
+            arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
+            fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
+    else:
+        manifest = build_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
+            arm=json.loads(a.arm_manifest.read_text()), tokenizer=Tokenizer.from_file(str(a.tokenizer)),
+            probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
+            recordings=[json.loads(path.read_text()) for path in a.recording],
+            files=json.loads(a.file_list.read_text()) if a.file_list else None)
     manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
     manifest["set_sha256"] = set_hash(manifest)
     out = a.out or ROOT / "set" / a.family / a.version / "windows.json"
@@ -371,7 +434,8 @@ def main(argv=None):
         p.error("set versions are immutable; choose a new --version/output")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(canonical(manifest) + b"\n")
-    print(f"{out}: 64 windows, 32768 rows, sha256 {manifest['set_sha256']}")
+    count = len(manifest["windows"])
+    print(f"{out}: {count} windows, {count * 512} rows, sha256 {manifest['set_sha256']}")
 
 
 if __name__ == "__main__":

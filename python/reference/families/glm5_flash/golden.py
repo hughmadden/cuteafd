@@ -56,6 +56,8 @@ FP32_KEYS = ("conv1d", "dt_bias", "A_log", "e_score_correction_bias", "hc.base",
 
 def run_windows(a, config, ref, dense, experts_src):
     manifest = load_set(a.windows, "glm5_flash")
+    from fidelity_media import require_media_flag
+    require_media_flag(manifest, getattr(a, "media", False), "glm5_flash")
     identity = verify_snapshot(manifest, a.snapshot)
     proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
@@ -226,11 +228,14 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--media", action="store_true", help="reserved official tower hook; currently fails closed")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
+    if a.media and not a.windows:
+        p.error("--media requires --windows (official media hook not implemented)")
     if a.windows and (a.text or a.text_file or a.max_tokens or a.stop_after is not None):
         p.error("--windows cannot be combined with legacy text/truncation/stop options")
 

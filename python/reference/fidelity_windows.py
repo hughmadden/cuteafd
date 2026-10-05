@@ -160,6 +160,8 @@ def validate_set(manifest: dict) -> dict:
             raise ValueError("one ctx/gen role is required per token")
         if w["bucket"] != bucket(start):
             raise ValueError("context bucket does not match first scored position")
+        from fidelity_media import validate_media
+        validate_media(w.get("media", []), tokens, roles, start)
     if not seen or len(set(manifest["quick_windows"])) != len(manifest["quick_windows"]) or not set(manifest["quick_windows"]) <= seen:
         raise ValueError("invalid quick subset")
     return manifest
@@ -169,6 +171,9 @@ def load_set(path: Path, family: str | None = None) -> dict:
     manifest = validate_set(json.loads(path.read_text()))
     if family is not None and manifest["family"] != family:
         raise ValueError(f"set family {manifest['family']} does not match {family}")
+    if (family is not None and family not in ("mimo_v2", "qwen4", "glm5_flash")
+            and any(w.get("media") for w in manifest["windows"])):
+        raise ValueError(f"{family} golden does not support media; refusing text-only scoring")
     return manifest
 
 
@@ -216,16 +221,23 @@ def prefix_comparison(short: np.ndarray, extended: np.ndarray) -> dict:
 
 def qualify_prefix(a, manifest: dict, execute) -> dict:
     """Fail closed before the full panel; execute the family's actual golden loop."""
-    source = next((w for w in manifest["windows"] if len(w["tokens"]) >= 640), None)
+    def gate_start(w):
+        return max([64] + [s["start"] + s["len"] for s in w.get("media", [])])
+    media_panel = any(w.get("media") for w in manifest["windows"])
+    source = next((w for w in manifest["windows"]
+                   if (not media_panel or w.get("media"))
+                   and len(w["tokens"]) >= gate_start(w) + 576), None)
     if source is None:
-        raise ValueError("prefix qualification requires a pinned window of at least 640 tokens")
+        raise ValueError("prefix qualification requires 576 text tokens after media (640 for text)")
+    score_from = gate_start(source)
+    lengths = [score_from + 512, score_from + 576]
     root = Path(tempfile.mkdtemp(prefix="prefix-gate-", dir=a.out))
     panel = copy.deepcopy(manifest)
     panel["windows"] = []
-    for size, name in ((576, "prefix_short"), (640, "prefix_extended")):
+    for size, name in zip(lengths, ("prefix_short", "prefix_extended")):
         window = copy.deepcopy(source)
         window.update(id=name, tokens=source["tokens"][:size], roles=["ctx"] * size,
-                      score_from=64, bucket=bucket(64))
+                      score_from=score_from, bucket=bucket(score_from))
         panel["windows"].append(window)
     panel["quick_windows"] = ["prefix_short", "prefix_extended"]
     panel["set_sha256"] = set_hash(panel)
@@ -234,6 +246,8 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
     windows.write_bytes(canonical(panel) + b"\n")
     probe = copy.copy(a)
     probe.windows, probe.out, probe.layers, probe._prefix_probe = windows, root, None, True
+    if media_panel and not getattr(probe, "media_root", None):
+        probe.media_root = a.windows.parent
     execute(probe)
     meta = json.loads((root / "meta.json").read_text())
     if meta.get("set_sha256") != panel["set_sha256"] or meta.get("family") != manifest["family"]:
@@ -242,6 +256,8 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
     arrays, hashes = [], []
     for window in panel["windows"]:
         entry = entries[window["id"]]
+        if entry.get("media", []) != window.get("media", []):
+            raise ValueError("prefix golden media identity mismatch")
         positions = list(range(window["score_from"], len(window["tokens"])))
         if entry["positions"] != positions:
             raise ValueError("prefix golden positions mismatch")
@@ -258,7 +274,8 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
     result = prefix_comparison(*arrays)
     proof = {"schema": "cuteafd.fidelity.prefix/1", "family": manifest["family"],
              "set_sha256": manifest["set_sha256"], "source_window": source["id"],
-             "lengths": [576, 640], "score_from": 64, "fixed_rows": 128,
+             "lengths": lengths, "score_from": score_from, "fixed_rows": 128,
+             **({"media": source["media"]} if source.get("media") else {}),
              "snapshot_identity": meta["snapshot_identity"], "logits_sha256": hashes,
              "seconds": meta["seconds"], **result}
     (root / "qualification.json").write_bytes(canonical(proof) + b"\n")
@@ -277,6 +294,12 @@ def validate_qualification(proof: dict | None, manifest: dict, identity: dict) -
                 "argmax_disagreements": 0, "lengths": [576, 640], "score_from": 64,
                 "fixed_rows": 128, "family": manifest["family"],
                 "set_sha256": manifest["set_sha256"], "snapshot_identity": identity}
+    if any(w.get("media") for w in manifest["windows"]):
+        source = next((w for w in manifest["windows"] if w["id"] == proof.get("source_window")), None)
+        if source is None or not source.get("media") or proof.get("media") != source["media"]:
+            raise ValueError("media prefix qualification lacks pinned image evidence")
+        start = max([64] + [s["start"] + s["len"] for s in source["media"]])
+        required.update(score_from=start, lengths=[start + 512, start + 576])
     if any(proof.get(k) != v for k, v in required.items()):
         raise ValueError("reference prefix-invariance qualification failed or mismatched provenance")
 
@@ -291,7 +314,8 @@ def write_scored_logits(out: Path, window: dict, logits: np.ndarray) -> dict:
     np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
     np.asarray(logits, dtype="<f4").tofile(folder / "logits.bin")
     return {"id": window["id"], "path": str(folder.relative_to(out)),
-            "positions": positions, "vocab": logits.shape[1]}
+            "positions": positions, "vocab": logits.shape[1],
+            **({"media": window["media"]} if window.get("media") else {})}
 
 
 def finish_golden(out: Path, manifest: dict, rows: list[dict], **meta) -> None:

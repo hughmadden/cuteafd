@@ -61,19 +61,33 @@ from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, wr
 
 def run_windows(a, config, Layer, Rotary, Norm, weights):
     manifest = load_set(a.windows, "mimo_v2")
+    from fidelity_media import require_media_flag
+    media = require_media_flag(manifest, getattr(a, "media", False), "mimo_v2")
     identity = verify_snapshot(manifest, a.snapshot)
+    if media:
+        from mimo_media import snapshot_identity
+        identity.update(snapshot_identity(a.snapshot))
     from shape_invariant import qualify
     proof = qualify(a, manifest, lambda probe: run_windows(probe, config, Layer, Rotary, Norm, weights))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
     started, rows, times = time.time(), [], []
     states = []
+    features = {}
+    if media:
+        from mimo_media import window_features
+        features, _ = window_features(a, manifest)
     with torch.inference_mode():
         embed = weights.get("model.embed_tokens.weight")
         for w in manifest["windows"]:
             ids = torch.tensor([w["tokens"]], device="cuda")
-            states.append(torch.nn.functional.embedding(ids, embed).cpu())
-        del embed, ids
+            state = torch.nn.functional.embedding(ids, embed).cpu()
+            for span in w.get("media", []):
+                if features[span["key"]].shape != (span["len"], config.hidden_size):
+                    raise ValueError("official tower and LM hidden widths differ")
+                state[0, span["start"]:span["start"] + span["len"]].copy_(features[span["key"]])
+            states.append(state)
+        del embed, ids, features
         memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
@@ -213,11 +227,16 @@ def main() -> None:
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
     p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
+    p.add_argument("--media", action="store_true", help="inject the official BF16 tower for pinned media windows")
+    p.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
+    p.add_argument("--media-features-out", type=Path, help="write immutable probe feature files")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
+    if (a.media or a.media_root or a.media_features_out) and not (a.media and a.windows):
+        p.error("media options require --media --windows")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
