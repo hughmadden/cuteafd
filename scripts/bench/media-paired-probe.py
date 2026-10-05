@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -92,7 +93,12 @@ def capture(a):
                 "spec": {"prompt_ids": window["tokens"], "media": media, "score_from": window["score_from"],
                          "cold": True, "no_speculation": True, "score_path": "decode", "verify_rows": 1,
                          "top_k": 1, "dump_rows": str(a.server_dump / leaf)}}
-        response = http(a.url.rstrip("/") + "/v1/bench/probe", a.bench_token, body, a.timeout)
+        try:
+            response = http(a.url.rstrip("/") + "/v1/bench/probe", a.bench_token, body, a.timeout)
+        except urllib.error.HTTPError as error:
+            write_new(a.out / (leaf + ".http-error.json"), {"status": error.code,
+                "body": error.read().decode("utf-8", errors="replace")})
+            raise
         # Retain an invalid response too; it is evidence of a failed live gate.
         write_new(a.out / (leaf + ".json"), response)
         check_record(window, response, panel["checkpoint"], a.mode, a.features)
