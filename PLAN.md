@@ -782,6 +782,10 @@ Work, in priority order:
    Agents then can't archive or delete it without agent-sudo (76 GB of MiMo
    calibration dumps this time). Run as the host user (`--user`, with
    `HOME`/`USER` set) once GPU, RDMA and memlock access are checked under it.
+   Proven (2026-10-06): a GLM 5.3 Flash coordinator run as `--user 1000:1000`
+   on GPU0 + 4 Sparks completed full fidelity scoring over RDMA. All of its
+   dump files were owned by uid 1000, and its decode results were identical
+   to the root-run baseline.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
