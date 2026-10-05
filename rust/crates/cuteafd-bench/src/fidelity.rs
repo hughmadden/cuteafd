@@ -136,6 +136,10 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         "runs use different checkpoints, sets or references");
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
+    ensure!(a.engine == b.engine && a.settings.get("build") == b.settings.get("build")
+        && a.settings.get("snapshot") == b.settings.get("snapshot"), "runs use different engines, builds or snapshots");
+    ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
+    ensure!(a.tier != "quick" || a.path_shape == "decode-shaped", "quick tier must be decode-shaped");
     ensure!(matches!(a.tier.as_str(), "quick" | "full"), "unknown tier");
     if a.tier == "full" { ensure!(a.kl_kind == "full-vocabulary", "full tier cannot gate compact KL"); }
     let (pa, pb) = (pairs(a)?, pairs(b)?);
@@ -182,11 +186,7 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     // One cluster cannot estimate window uncertainty. Never certify by silently treating it as zero.
     let enough_windows = by_window.len() >= 2;
     if !enough_windows { tripwires.push("insufficient windows for clustered uncertainty".into()); }
-    let gross = [a, b].iter().any(|r| {
-        let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
-        f.confident_top1.is_some_and(|v| v < 0.95) || f.top3_contained < 0.95
-    });
-    Ok(Comparison { pass: enough_windows && absolute_pass && !gross && top_upper < top1_margin && kl_upper < kl_margin,
+    Ok(Comparison { pass: enough_windows && absolute_pass && tripwires.is_empty() && top_upper < top1_margin && kl_upper < kl_margin,
         positions: n, windows: by_window.len(), baseline_only: b_only, candidate_only: a_only,
         discordance: discordant as f64 / n as f64, top1_loss: loss, top1_upper95: top_upper,
         top1_se_bootstrap: se, kl_delta, kl_upper95: kl_upper,
@@ -240,6 +240,25 @@ mod tests {
         assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
         a = b.clone(); a.score.records[0] = a.score.records[1].clone();
         assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+    }
+    #[test]
+    fn pairing_requires_same_build_and_quick_decode_shape() {
+        let b = run(3, 8);
+        let mut a = b.clone(); a.settings = serde_json::json!({"build": {"commit": "other"}});
+        assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+        a = b.clone(); a.path_shape = "unknown".into();
+        assert!(compare(&a, &a, 0.01, 0.01, 100, 1).is_err());
+        a = b.clone(); a.tier = "quick".into(); a.path_shape = "prefill-shaped".into();
+        assert!(compare(&a, &a, 0.01, 0.01, 100, 1).is_err());
+    }
+    #[test]
+    fn tripwires_cannot_pass_a_numerically_identical_pair() {
+        let mut r = run(3, 100);
+        for p in r.score.records.iter_mut().filter(|p| p.position < 3) { p.agree = false; }
+        r.score = Fidelity::from_records(r.score.records);
+        let c = compare(&r, &r, 0.005, 0.005, 100, 1).unwrap();
+        assert!(c.absolute_pass); assert_eq!(c.top1_loss, 0.0); assert!(!c.pass);
+        assert!(c.tripwires.iter().any(|s| s.contains("confident")));
     }
     #[test]
     fn bootstrap_is_reproducible_and_preserves_unequal_counts() {

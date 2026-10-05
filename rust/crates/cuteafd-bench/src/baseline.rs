@@ -208,13 +208,15 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         let end = window.positions.last().context("empty reference window")?.pos + 1;
         let spec = ProbeSpec { prompt_ids: Some(window.tokens[..end].to_vec()), score_from: Some(window.score_from),
             top_k: window.top_k, want: window.want(), cold: true, no_speculation: true,
-            score_path: Some("decode".into()), ..ProbeSpec::default() };
+            score_path: (!reference.windows.is_empty()).then(|| "decode".into()), ..ProbeSpec::default() };
         let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
         let record = probe_of(&chat)?;
         if !honoured(record) { unsupported(check); return Ok(()); }
         if let Some(error) = &record.error { anyhow::bail!("scoring {}: {error}", window.id); }
         anyhow::ensure!(record.cold && record.no_speculation && record.cached_tokens == 0,
             "fidelity requires honored cold, drafts-off scoring");
+        anyhow::ensure!(reference.windows.is_empty() || record.score_path.as_deref() == Some("decode"),
+            "quick fidelity requires reported decode scoring");
         let f = window.score(&record.rows);
         missing += f.missing;
         records.extend(f.records);
@@ -246,10 +248,13 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if reference.windows.is_empty() { check.set("probe", probes[0]["probe"].clone()); }
     else { check.set("probes", serde_json::json!(probes)); }
     let window_floor = reference.windows.is_empty() || f.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80);
-    let gross_tripwire = !reference.windows.is_empty() &&
-        (f.confident_top1.is_some_and(|v| v < 0.95) || f.top3_contained < 0.95);
-    let ok = f.positions > 0 && f.missing == 0 && all.non_finite == 0 && f.kl <= reference.expect.kl_max
-        && f.top1 + 1e-12 >= reference.expect.top1_min && window_floor && !gross_tripwire;
+    let tripwire = !reference.windows.is_empty() &&
+        (f.confident_top1.is_some_and(|v| v < 0.98) || f.top3_contained < 0.99);
+    let (floor_top1, floor_kl) = if reference.windows.is_empty() {
+        (reference.expect.top1_min, reference.expect.kl_max)
+    } else { (reference.expect.top1_min.max(0.90), reference.expect.kl_max.min(0.06)) };
+    let ok = f.positions > 0 && f.missing == 0 && all.non_finite == 0 && f.kl <= floor_kl
+        && f.top1 + 1e-12 >= floor_top1 && window_floor && !tripwire;
     check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
     check.summary = format!("KL {:.3} · top-1 {:.1}% · NLL {:.3} vs {:.3} · {} tokens / {} windows{}",
         f.kl, 100.0 * f.top1, f.nll, f.ref_nll, f.positions, windows.len(),
