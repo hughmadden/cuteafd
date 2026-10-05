@@ -520,6 +520,13 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 Ok(constraint) => constraint,
                 Err(error) => { reject(&ready, format!("{error:#}")); continue; }
             };
+            if let Some(probe) = &ready.job().job.probe {
+                if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), engine.prefill_capacity(), DECODE_ROWS) {
+                    probe.fail(format!("cold replay: {error:#}"));
+                    reject(&ready, format!("cold replay: {error:#}"));
+                    continue;
+                }
+            }
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
             let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(engine.max_context);
             let Some(ring) = free_rings.pop() else {
@@ -607,7 +614,12 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             };
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
-            let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
+            let plan = if let Some(probe) = job.probe.as_ref().filter(|p| !p.spec.cold_steps.is_empty()) {
+                // Rebuild from zero with the source's exact prefill/decode boundaries.
+                cuteafd_engine::prefix::PointPlan {
+                    chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new(),
+                }
+            } else if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
@@ -617,7 +629,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let finished = prefills.round_pairs(|a, b| {
                 let rows = [a, b].map(|p| p.plan.chunks.get(p.chunks).copied()
                     .unwrap_or(p.tokens.len()).saturating_sub(p.done));
-                engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
+                let replay = [&*a, &*b].iter().any(|p| p.job.probe.as_ref().is_some_and(|probe| !probe.spec.cold_steps.is_empty()));
+                !replay && engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
             }, |batch| prefill_batch(engine, family, cache, selector, batch));
             if engine.is_terminal() {
                 let mut primary = None;
@@ -1086,7 +1099,13 @@ fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let retain = cache.enabled() && !probe::cold(&p.job.probe);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let start = p.placement.len;
-        let logits = engine.prefill_media_device(&mut p.placement, &p.tokens[p.done..end], false, None, None, Some(&p.media))?;
+        let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
+            .is_some_and(|step| step.decode);
+        let logits = if decode {
+            engine.verify_media_device(&mut [(&mut p.placement, count)], &p.tokens[p.done..end], None, Some(&p.media))?
+        } else {
+            engine.prefill_media_device(&mut p.placement, &p.tokens[p.done..end], false, None, None, Some(&p.media))?
+        };
         consume_prefill_chunk(engine, selector, p, start, end, logits, retain, None)?;
         Ok(())
     }));

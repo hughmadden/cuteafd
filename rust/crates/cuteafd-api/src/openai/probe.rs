@@ -41,6 +41,9 @@ pub struct ProbeSpec {
     /// Decode-shaped scoring width, bounded by the family's verify capacity.
     #[serde(default)]
     pub verify_rows: Option<usize>,
+    /// MiMo-only cold generation replay, reproducing the source prefill/decode geometry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cold_steps: Vec<ProbeColdStep>,
     /// Scoring kernel shape: `decode` or `prefill`. When absent, retain the
     /// family's legacy path (V4.1 prefill-shaped, other families decode-shaped).
     #[serde(default)]
@@ -65,6 +68,14 @@ pub struct ProbeSpec {
     /// (a reference's top-k, so KL can be estimated against it).
     #[serde(default)]
     pub want: HashMap<usize, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeColdStep {
+    pub end: usize,
+    #[serde(default)]
+    pub decode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +112,23 @@ pub fn sha256_hex(value: &str) -> bool {
 }
 
 impl ProbeSpec {
+    pub fn validate_cold_steps(&self, len: usize, prefill_rows: usize, decode_rows: usize) -> anyhow::Result<()> {
+        if self.cold_steps.is_empty() { return Ok(()); }
+        anyhow::ensure!(self.cold && self.no_speculation && self.score_from.is_none(),
+            "cold_steps requires cold non-speculative generation");
+        anyhow::ensure!(self.cold_steps.len() <= len, "too many cold_steps");
+        let mut previous = 0;
+        for step in &self.cold_steps {
+            let capacity = if step.decode { decode_rows } else { prefill_rows };
+            anyhow::ensure!(step.end > previous && step.end <= len && step.end - previous <= capacity,
+                "cold_steps must cover positive bounded chunks within the prompt");
+            previous = step.end;
+        }
+        anyhow::ensure!(previous == len && !self.cold_steps.last().unwrap().decode,
+            "cold_steps must end with a prefill at the prompt length");
+        Ok(())
+    }
+
     /// Remote callers may choose only a new leaf under an explicitly enabled root.
     pub fn constrain_dump_root(&mut self, root: &std::path::Path) -> anyhow::Result<()> {
         let Some(path) = self.dump_rows.as_ref() else { return Ok(()); };
@@ -171,6 +199,8 @@ pub struct ProbeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
     pub cached_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cold_steps: Vec<ProbeColdStep>,
     pub rows: Vec<ProbeRow>,
     pub generated: Vec<u32>,
     /// Speculation actually skipped / cache actually bypassed, as the engine saw it.
@@ -209,6 +239,7 @@ impl Probe {
             r.engine = Some(engine.to_owned());
             r.prompt_ids = prompt_ids.to_vec();
             r.cached_tokens = cached_tokens;
+            if engine == "mimo_v2" { r.cold_steps = self.spec.cold_steps.clone(); }
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
@@ -443,6 +474,35 @@ mod tests {
         assert!(probe.record().error.unwrap().contains("vocabulary changed"));
         assert_eq!(std::fs::read_to_string(path.join("manifest.jsonl")).unwrap().lines().count(), 1);
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cold_replay_requires_bounded_complete_non_speculative_geometry() {
+        let mut spec = ProbeSpec { cold: true, no_speculation: true,
+            cold_steps: vec![ProbeColdStep { end: 8, decode: false },
+                ProbeColdStep { end: 9, decode: true }, ProbeColdStep { end: 12, decode: false }],
+            ..Default::default() };
+        assert!(spec.validate_cold_steps(12, 8, 2).is_ok());
+        let probe = Probe::new(spec.clone());
+        probe.admitted("mimo_v2", &[0; 12], 0);
+        assert_eq!(probe.record().cold_steps, spec.cold_steps);
+        assert!(spec.validate_cold_steps(12, 7, 2).is_err());
+        assert!(spec.validate_cold_steps(13, 8, 2).is_err());
+        spec.cold_steps[1].end = 8;
+        assert!(spec.validate_cold_steps(12, 8, 2).is_err());
+        spec.cold_steps[1].end = 11;
+        assert!(spec.validate_cold_steps(12, 8, 2).is_err());
+        spec.cold_steps[1].end = 9;
+        spec.cold_steps[2].decode = true;
+        assert!(spec.validate_cold_steps(12, 8, 4).is_err());
+        spec.cold_steps[2].decode = false;
+        spec.cold = false;
+        assert!(spec.validate_cold_steps(12, 8, 2).is_err());
+        spec.cold = true; spec.no_speculation = false;
+        assert!(spec.validate_cold_steps(12, 8, 2).is_err());
+        spec.no_speculation = true; spec.score_from = Some(9);
+        assert!(spec.validate_cold_steps(12, 8, 2).is_err());
+        assert!(ProbeSpec::default().validate_cold_steps(0, 0, 0).is_ok());
     }
 
     #[test]
