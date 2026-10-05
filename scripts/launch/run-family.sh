@@ -204,6 +204,11 @@ case "$family:$speculator" in
 esac
 draft_args=()
 family_args=()
+case "$(get FULL_PREFILL_LOGITS off)" in
+  on) family_args+=(--full-prefill-logits) ;;
+  off) ;;
+  *) echo "FULL_PREFILL_LOGITS must be on or off" >&2; exit 2 ;;
+esac
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
   case "$(get MIMO_WEIGHT_POLICY auto)" in

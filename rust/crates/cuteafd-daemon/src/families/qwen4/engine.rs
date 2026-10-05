@@ -498,6 +498,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Prefill programs over FP8-only projections quantize their activations
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
+    pub full_prefill_logits: bool,
     /// Recorded after a Spark exchange's device-to-host copies: the host
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
@@ -601,7 +602,7 @@ impl<'a> Qwen4Engine<'a> {
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"), w8a8_prefill: false,
+            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"), w8a8_prefill: false, full_prefill_logits: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
@@ -1326,6 +1327,12 @@ impl<'a> Qwen4Engine<'a> {
         let workspace = if decode { self.decode_workspace.borrow() } else { self.workspace.borrow() };
         let w = workspace.as_ref().context("no MTP step ran")?;
         self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
+    }
+
+    pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
+        *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false, self.prefill_rows)?);
+        self.full_prefill_logits = true;
+        Ok(())
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,

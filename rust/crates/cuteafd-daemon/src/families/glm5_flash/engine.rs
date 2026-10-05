@@ -1012,6 +1012,20 @@ impl<'a> GlmfEngine<'a> {
         Ok(self.programs.spec(&format!("glmf_{name}"))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
+    pub fn prepare_scoring_prefill(&self) -> Result<()> {
+        // Prefix and short chunks use the serial workspace even with pipelining.
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false)?);
+        }
+        self.peer_workspaces(false, None)?;
+        if self.pipelined() {
+            let mut slots = self.lane_workspaces.borrow_mut();
+            while slots.len() < PREFILL_LANES { slots.push(self.workspace(self.prefill_rows, false)?); }
+            self.peer_workspaces(false, Some(PREFILL_LANES))?;
+        }
+        Ok(())
+    }
+
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.workspace_on(0, t, decode)
     }

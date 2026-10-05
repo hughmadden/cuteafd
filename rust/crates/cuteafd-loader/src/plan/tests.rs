@@ -972,6 +972,24 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
 }
 
 #[test]
+fn layout_charges_admitted_probe_outputs_before_sizing_kv() {
+    let dir = qwen_snapshot(4);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], prefill_rows: 128, pool_tokens: Some(256),
+        ..Default::default()
+    }), ..sparks(0) };
+    let ordinary = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(ordinary.devices[0].items.iter().all(|i| i.group != "probe prefill logits"));
+    options.layout.as_mut().unwrap().full_prefill_logits = true;
+    let diagnostic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let output = diagnostic.devices[0].items.iter().find(|i| i.group == "probe prefill logits").unwrap();
+    assert_eq!(output.category, cuteafd_core::memory_layout::Category::Workspace);
+    assert!(output.bytes > 0);
+    assert_eq!(ordinary.devices[0].free_bytes() - diagnostic.devices[0].free_bytes(), output.bytes as i64);
+    assert!(diagnostic.devices.iter().skip(1).all(|d| d.items.iter().all(|i| i.group != "probe prefill logits")));
+}
+
+#[test]
 fn layout_charges_local_routed_experts_to_the_coordinator() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);

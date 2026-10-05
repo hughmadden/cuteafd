@@ -466,6 +466,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
+            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                reject(&job, format!("scoring: {error:#}"));
+                continue;
+            }
             let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
                 Err(error) => {
@@ -516,8 +520,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), &mut placement,
-                    |placement, chunk, _| engine.prefill_device(placement, chunk),
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
+                    |placement, chunk, rows| {
+                        if rows > 1 {
+                            Ok(engine.prefill_forced(placement, chunk, None, None, true)?
+                                .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
+                        } else {
+                            Ok(engine.prefill_device(placement, chunk)?.map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, false)?
                         .context("scoring needs every layer"));
                 match scored {

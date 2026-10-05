@@ -176,7 +176,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     };
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
-        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
+        if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
+        else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
@@ -443,6 +444,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
+            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits()) {
+                reject(&job, format!("scoring: {error:#}"));
+                continue;
+            }
             let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
                 Err(error) => {
@@ -499,9 +504,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), &mut placement,
-                    |placement, chunk, _| engine.prefill_device(placement, chunk, false, None, None),
+                let scored = probe::score(engine.library, &job.probe, &tokens, from, if engine.full_prefill_logits() { engine.prefill_rows } else { engine.prefill_capacity() },
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
+                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows > 1, None, None)?
+                        .map(probe::ScoreLogits::Device)),
                     |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, None)?
                         .context("scoring needs every layer"));
                 match scored {

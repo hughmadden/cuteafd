@@ -45,6 +45,9 @@ pub(crate) struct EngineArgs {
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
+    /// Admit every prefill row's logits at startup for fidelity probes.
+    #[arg(long)]
+    pub full_prefill_logits: bool,
     /// Total tokens the compressed-cache pools hold across sequences; 0 uses
     /// planner admission from measured free memory before cache allocation.
     #[arg(long, default_value_t = 262_144)]
@@ -377,6 +380,7 @@ pub(crate) fn with_engine<T>(
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
     }
+    if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.

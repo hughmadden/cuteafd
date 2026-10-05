@@ -205,6 +205,9 @@ pub(crate) struct PlanArgs {
     /// Prefill workspace capacity for --layout (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
+    /// Include the diagnostic all-row prefill head reservation in --layout.
+    #[arg(long)]
+    pub(crate) full_prefill_logits: bool,
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
