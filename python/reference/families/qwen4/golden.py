@@ -103,6 +103,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                 layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, prefix, table_rows, dim)
             load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
             load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            layer.eval()
             if layer.ple is not None:
                 emb = layer.ple.ple_embedding
                 expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size, emb.ple_layer_index, emb.seed)
@@ -356,6 +357,7 @@ def main() -> None:
                 layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, table_prefix, rows, dim)
             load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
             load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            layer.eval()
             if layer.ple is not None:
                 emb = layer.ple.ple_embedding
                 expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size,

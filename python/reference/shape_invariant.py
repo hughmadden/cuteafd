@@ -74,7 +74,7 @@ def bounded_eager(function, rows=1024):
     the quadratic allocation that this wrapper is intended to avoid.
     """
     def forward(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
-        if module.training or dropout != 0:
+        if module.training:
             raise ValueError("bounded reference attention requires inference without dropout")
         outputs = []
         for start in range(0, query.shape[-2], rows):

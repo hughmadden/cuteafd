@@ -387,7 +387,8 @@ def test_eager_query_blocks_keep_keys_masks_and_selected_rows():
         assert key is kv and value is kv
         calls.append((query.shape[-2], attention_mask.copy(), kwargs["selected_kv"].copy()))
         return query.transpose(0, 2, 1, 3), np.ones((1, 3, query.shape[-2], 11))
-    module = SimpleNamespace(training=False)
+    module = SimpleNamespace(training=False, attention_dropout=.3,
+                             config=SimpleNamespace(attention_dropout=.3))
     wrapped = scope["bounded_eager"](official, rows=3)
     output, weights = wrapped(module, q, kv, kv, mask, .25, selected_kv=selected,
                               selected_valid=np.ones((1, 7, 4)))
@@ -396,8 +397,12 @@ def test_eager_query_blocks_keep_keys_masks_and_selected_rows():
     assert [c[0] for c in calls] == [3, 3, 1]
     np.testing.assert_array_equal(np.concatenate([c[1] for c in calls], axis=2), mask)
     np.testing.assert_array_equal(np.concatenate([c[2] for c in calls], axis=1), selected)
-    with pytest.raises(ValueError, match="dropout"):
-        wrapped(module, q, kv, kv, mask, .25, dropout=.1)
+    eval_output, _ = wrapped(module, q, kv, kv, mask, .25, dropout=.1,
+                             selected_kv=selected, selected_valid=np.ones((1, 7, 4)))
+    np.testing.assert_array_equal(eval_output, output)
+    module.training = True
+    with pytest.raises(ValueError, match="inference"):
+        wrapped(module, q, kv, kv, mask, .25)
     sparse_calls = []
     def sparse(query, key, sink, indices, scale):
         sparse_calls.append(query.shape[1])
@@ -569,3 +574,14 @@ def test_goldens_have_layer_major_window_loops_and_scored_head_selection(family)
     assert "score_from" in source and "write_scored_logits" in source and "finish_golden" in source
     assert "a.layers is not None" in source
     assert "load_set" in source
+
+
+def test_qwen_window_and_legacy_layers_enter_eval_after_loading():
+    tree = ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text())
+    for function_name in ("run_windows", "main"):
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == function_name)
+        source = ast.unparse(function)
+        loaded = source.index('load_experts(layer.mlp.experts')
+        evaluated = source.index('layer.eval()', loaded)
+        executed = source.index('h = layer(', evaluated)
+        assert loaded < evaluated < executed
