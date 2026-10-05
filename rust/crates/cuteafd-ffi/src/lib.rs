@@ -1752,6 +1752,18 @@ impl NativeLibrary {
         Ok(Some(guard))
     }
 
+    pub fn cuda_device_info(&self, device: i32) -> Result<CuteafdCudaDeviceInfo> {
+        // SAFETY: the symbol follows the bundled C ABI; initialized info is
+        // exclusively writable and the library remains live across the call.
+        unsafe {
+            let call: Symbol<unsafe extern "C" fn(i32, *mut CuteafdCudaDeviceInfo) -> CuteafdStatus> =
+                self.lib.get(b"cuteafd_cuda_device_info")?;
+            let mut info = CuteafdCudaDeviceInfo::default();
+            self.status_to_result("cuteafd_cuda_device_info", call(device, &mut info))?;
+            Ok(info)
+        }
+    }
+
     pub fn cuda_get_device(&self) -> Result<i32> {
         let call: Symbol<unsafe extern "C" fn(*mut i32) -> CuteafdStatus> =
             unsafe { self.lib.get(b"cuteafd_cuda_get_device")? };
