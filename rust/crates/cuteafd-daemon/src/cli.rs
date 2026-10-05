@@ -261,8 +261,8 @@ pub(crate) struct NativeExpertDaemonArgs {
     pub(crate) fp8_package: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
     pub(crate) rank: u32,
-    /// Spark tensor-parallel world; two ranks require an EXL3 checkpoint.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(2..=6))]
+    /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) world: u32,
     /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
     #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
@@ -518,7 +518,16 @@ mod tests {
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
         }
-        // The worker world range now admits the six-rank layouts.
+        // Whole-expert Qwen TP1 must reach the worker's family validation.
+        let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--device-budget-bytes", "1000", "--rank", "0", "--world"];
+        let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
+        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
+        assert_eq!((args.rank, args.world), (0, 1));
+        for invalid in ["0", "7"] {
+            assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
+        }
+        // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
             "--native-lib", "/native.so", "--device-budget-bytes", "1000",
             "--rank", "5", "--world", "6"]).unwrap();
