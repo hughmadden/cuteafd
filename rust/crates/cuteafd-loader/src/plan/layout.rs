@@ -84,14 +84,15 @@ impl Default for LayoutOptions {
 
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
 /// MiMo has one full-row head (earlier lanes are headless), GLM/GLM Flash
-/// have one per row lane, and Qwen one. V4 downloads through its existing
-/// bounded head buffer, while V4.1 already supports prefill scoring.
+/// have one per row lane (plus GLM Flash's serial workspace), and Qwen one.
+/// V4 downloads through its existing bounded head buffer; V4.1 already
+/// supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
     let (lanes, ordinary_rows) = match family {
         "mimo_v2" => (1, 1),
         "qwen4" => (1, 1),
         "glm5" => (4, rows.min(64)),
-        "glm5_flash" => (2, rows.min(64)),
+        "glm5_flash" => (3, rows.min(64)),
         _ => return 0,
     };
     let extra_rows = rows.saturating_sub(ordinary_rows);
@@ -110,7 +111,7 @@ mod scoring_workspace_tests {
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
         assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
         assert_eq!(full_prefill_logits_bytes("glm5", 128, 1000), 4 * 64 * 1000 * 4);
-        assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 2 * 64 * 1000 * 4);
+        assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 3 * 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
         }

@@ -527,7 +527,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let mut state = (&mut placement, transport.as_deref_mut());
-                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                // Diagnostic tails can be smaller than the pipeline's 512-row minimum.
+                let prefill_rows = probe::scoring_prefill_capacity(engine.full_prefill_logits,
+                    engine.prefill_rows, engine.prefill_capacity());
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, prefill_rows,
                     DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut state,
                     |(placement, transport), chunk, rows| {
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
