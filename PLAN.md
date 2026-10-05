@@ -748,12 +748,15 @@ Work, in priority order:
    rest of GLM Flash is Hugh's). V4.1 vision already works and is the
    template. Design first (docs/multimodal-design.md), then one shared
    encoder service and image-embedding cache, then the families.
-   **D1 placement remains open (2026-10-06):** generic-family launches default
-   to `VISION=off` until TJ decides; `rtx`, `spark` and Spark-first `auto`
-   remain explicit opt-ins. A shared expert Spark added ~150 ms of stall
-   for one 1024-token image and lost ~91% decode under back-to-back
-   4096-token encodes (fails the <=30% bar); an idle Spark showed no extra
-   stall in the single-image diagnostic. Keep V4.1 vision unchanged.
+   **D1 decided (TJ, 2026-10-06): the encoder goes on a Spark that already
+   holds experts.** One new image per turn costs ~150 ms of stall (one
+   1024-token image, measured), and history images come from the
+   embedding and prefix caches. That beats spending RTX memory or a whole
+   Spark on the tower. The −91% decode under back-to-back 4096-token
+   encodes is a stress case, not a gate for this default. `VISION=auto`
+   becomes the default once the item below lands; until then
+   generic-family launches default to `VISION=off`. Keep V4.1 vision
+   unchanged.
    **Open integration item:** wire `RemoteEncoder` into MiMo serving
    (`vision_peers`, `encoder_plan_hash`). Until then, MiMo launches with
    `VISION=auto` or `spark` fail closed with a clear `rtx`/`off` hint; the
