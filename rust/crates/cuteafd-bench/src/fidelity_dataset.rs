@@ -8,6 +8,16 @@ use std::path::{Component, Path, PathBuf};
 pub const REPOSITORY: &str = "wrldsuksgo2mars/cuteafd-fidelity";
 pub const REVISION: &str = "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0";
 pub const CONFIG: &str = "deepseek_v41-v2_20261005";
+pub const FLASH_REVISION: &str = "5db25a78dc2708df991df43b36636562e522a3b0";
+pub const FLASH_CONFIG: &str = "mimo_v2-v2_20261005_flash_mopd";
+
+pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    match model {
+        "deepseek-ai/DeepSeek-V4.1-Flash" => Some((REVISION, CONFIG)),
+        "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
+        _ => None,
+    }
+}
 
 fn component(text: &str) -> bool {
     !text.is_empty() && text != "." && text != ".."
@@ -169,14 +179,17 @@ mod tests {
     #[ignore = "requires published immutable HF commit and network access"]
     fn published_dataset_fetch_roundtrip() {
         let commit = std::env::var("CUTEAFD_FIDELITY_HF_REVISION").unwrap();
+        let config = std::env::var("CUTEAFD_FIDELITY_HF_CONFIG").unwrap_or_else(|_| CONFIG.into());
+        let expected_hash = std::env::var("CUTEAFD_FIDELITY_HF_MANIFEST_SHA256")
+            .unwrap_or_else(|_| "6f2b22f3ed4882765c759b565baab960f7e1563a7fe2be2bbd05540ac4f2f70c".into());
         let cache = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_HF_CACHE").unwrap());
         let (reference, hash, identity) = download(&ureq::AgentBuilder::new()
-            .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
+            .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, &config).unwrap();
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
-        assert_eq!(hash, "6f2b22f3ed4882765c759b565baab960f7e1563a7fe2be2bbd05540ac4f2f70c");
-        assert_eq!(identity, json!({"repository": REPOSITORY, "revision": commit, "config": CONFIG}));
-        let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
+        assert_eq!(hash, expected_hash);
+        assert_eq!(identity, json!({"repository": REPOSITORY, "revision": commit, "config": config}));
+        let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, &config).unwrap();
         assert_eq!(hash, again.1);
         assert_eq!(serde_json::to_value(reference).unwrap(), serde_json::to_value(again.0).unwrap());
     }

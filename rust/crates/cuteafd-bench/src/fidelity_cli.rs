@@ -68,8 +68,9 @@ pub struct RunArgs {
     /// Immutable dataset commit (defaults to the checksum-verified publication).
     #[arg(long, conflicts_with_all = ["reference", "rows"])]
     pub dataset_revision: Option<String>,
-    #[arg(long, default_value = crate::fidelity_dataset::CONFIG)]
-    pub dataset_config: String,
+    /// Published config (otherwise select the served checkpoint's verified default).
+    #[arg(long)]
+    pub dataset_config: Option<String>,
     #[arg(long)]
     pub dataset_cache: Option<PathBuf>,
     /// Full-reference directory (rows.json and sealed f16 files), visible to this client.
@@ -87,12 +88,19 @@ pub struct RunArgs {
     pub api_key: Option<String>,
 }
 
-fn dataset_source(args: &RunArgs) -> Result<Option<(&str, &str)>> {
+fn dataset_source<'a>(args: &'a RunArgs, model: &str) -> Result<Option<(&'a str, &'a str, &'a str)>> {
     let default_full = args.tier == "full" && args.reference.is_none() && args.rows.is_none();
     let repo = args.dataset.as_deref().or(default_full.then_some(crate::fidelity_dataset::REPOSITORY));
     ensure!(args.dataset_revision.is_none() || repo.is_some(),
         "--dataset-revision needs --dataset or the full-tier dataset default");
-    Ok(repo.map(|repo| (repo, args.dataset_revision.as_deref().unwrap_or(crate::fidelity_dataset::REVISION))))
+    let Some(repo) = repo else { return Ok(None); };
+    let publication = crate::fidelity_dataset::default_publication(model);
+    let config = args.dataset_config.as_deref().or(publication.map(|p| p.1))
+        .context("no published family default; use --dataset-config and --dataset-revision, or --reference")?;
+    let commit = args.dataset_revision.as_deref().or_else(|| {
+        publication.filter(|p| repo == crate::fidelity_dataset::REPOSITORY && config == p.1).map(|p| p.0)
+    }).context("explicit repository/config requires --dataset-revision")?;
+    Ok(Some((repo, commit, config)))
 }
 
 fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -> Result<Value> {
@@ -113,11 +121,11 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let base = args.url.trim_end_matches('/');
     let models: Value = agent.get(&format!("{base}/v1/models")).call()?.into_json()?;
     let model = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let (reference, digest, dataset_identity) = if let Some((repo, commit)) = dataset_source(args)? {
+    let (reference, digest, dataset_identity) = if let Some((repo, commit, config)) = dataset_source(args, model)? {
         ensure!(args.tier == "full", "qualified compact dataset requires the full tier");
         let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
             std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
-        let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, &args.dataset_config)?;
+        let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, config)?;
         (reference, digest, Some(identity))
     } else if let Some(path) = &args.reference {
         let bytes = std::fs::read(path)?;
@@ -254,20 +262,34 @@ mod tests {
     #[test]
     fn verified_full_default_preserves_quick_and_local_sources() {
         let full = parse(&["--tier", "full"]);
-        assert_eq!(dataset_source(&full).unwrap(), Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::REVISION)));
-        assert_eq!(dataset_source(&parse(&[])).unwrap(), None);
-        assert_eq!(dataset_source(&parse(&["--tier", "full", "--reference", "reference.json"])).unwrap(), None);
-        assert_eq!(dataset_source(&parse(&["--tier", "full", "--rows", "rows"])).unwrap(), None);
-        assert_eq!(dataset_source(&parse(&["--tier", "full", "--dataset"])).unwrap(), dataset_source(&full).unwrap());
+        assert_eq!(dataset_source(&full, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::REVISION, crate::fidelity_dataset::CONFIG)));
+        assert_eq!(dataset_source(&parse(&[]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--reference", "reference.json"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--rows", "rows"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--dataset"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), dataset_source(&full, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap());
+    }
+
+    #[test]
+    fn flash_publication_default_is_family_specific_and_overrides_fail_closed() {
+        let args = parse(&["--tier", "full"]);
+        assert_eq!(dataset_source(&args, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap(),
+            Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::FLASH_REVISION,
+                crate::fidelity_dataset::FLASH_CONFIG)));
+        assert!(dataset_source(&args, "unknown/model").is_err());
+        assert_eq!(dataset_source(&parse(&[]), "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap(), None);
+        let explicit = parse(&["--tier", "full", "--dataset", "other/repo"]);
+        assert!(dataset_source(&explicit, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_err());
+        let explicit = parse(&["--tier", "full", "--dataset-config", "other-config"]);
+        assert!(dataset_source(&explicit, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_err());
     }
 
     #[test]
     fn explicit_repo_and_revision_override_only_the_dataset_source() {
         let args = parse(&["--tier", "full", "--dataset", "other/repo", "--dataset-revision", "1111111111111111111111111111111111111111"]);
-        assert_eq!(dataset_source(&args).unwrap(), Some(("other/repo", "1111111111111111111111111111111111111111")));
+        assert_eq!(dataset_source(&args, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some(("other/repo", "1111111111111111111111111111111111111111", crate::fidelity_dataset::CONFIG)));
         let args = parse(&["--tier", "full", "--dataset-revision", "2222222222222222222222222222222222222222"]);
-        assert_eq!(dataset_source(&args).unwrap(), Some((crate::fidelity_dataset::REPOSITORY, "2222222222222222222222222222222222222222")));
-        assert!(dataset_source(&parse(&["--dataset-revision", "main"])).is_err());
+        assert_eq!(dataset_source(&args, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some((crate::fidelity_dataset::REPOSITORY, "2222222222222222222222222222222222222222", crate::fidelity_dataset::CONFIG)));
+        assert!(dataset_source(&parse(&["--dataset-revision", "main"]), "deepseek-ai/DeepSeek-V4.1-Flash").is_err());
         for local_flag in ["--reference", "--rows"] {
             assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "baseline", "--out", "run.json",
                 "--tier", "full", "--dataset", crate::fidelity_dataset::REPOSITORY, local_flag, "local"]).is_err());
