@@ -59,6 +59,11 @@ CUTEAFD_RELEASE_SSH_CONFIG, CUTEAFD_RELEASE_BUILD_ROOT and
 CUTEAFD_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built from
 letters, digits, dot, underscore, plus and minus - no spaces, dot segments, trailing
 slashes or shell metacharacters - because they reach remote shells and bind mounts.
+Both artifact containers run as the invoking user (--user UID:GID) with USER,
+LOGNAME, HOME and the Cargo/TorchInductor caches supplied explicitly, so their
+Cargo target dirs and staging stay deletable without sudo. The home is
+BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
+the container otherwise.
 
 Families beyond V4.1 are opt-in. CUTEAFD_RELEASE_{DSV4,GLM,MIMO,GLMF,QWEN4}_AOT=ON
 put each family's coordinator programs in the coordinator image, and
@@ -231,6 +236,45 @@ release_prepare_build_root() {
 }
 # release-build-transport:end
 
+# release-build-container-user:start
+# Every build container that compiles into a bind-mounted host directory runs as
+# the invoking user, so its Cargo target dirs and staging stay deletable without
+# sudo. UIDs differ per host (raptor 1000, the Sparks 1001), so the identity is
+# taken on the machine that runs docker: here for the coordinator leg, and inside
+# the remote heredoc for the Spark leg.
+#
+# `--user` bypasses the image's passwd lookup, so the env a non-passwd UID needs
+# is supplied explicitly: USER/LOGNAME for getpass and Torch Dynamo, a writable
+# HOME, and the two cache roots. The image's CARGO_HOME (/opt/cargo) is
+# root-owned and therefore not writable by that UID, and the dev image ships no
+# warm crate registry for the export, so the build's cargo home is relocated
+# under the writable home. With a relocated build root the home lives inside it,
+# which keeps the caches on the task's fast build filesystem and inside the
+# directory the build already owns and cleans up; otherwise it is the
+# container's own /tmp.
+release_build_container_home() {
+  local build_root="${1:-}"
+  if [[ -n "$build_root" ]]; then
+    printf '%s\n' "$build_root/container-home"
+  else
+    printf '%s\n' "/tmp/cuteafd-home"
+  fi
+}
+
+# One argument per line so a call site can mapfile the group into its own array.
+release_build_container_user_args_render() {
+  local container_home
+  container_home="$(release_build_container_home "${1:-}")"
+  printf '%s\n' \
+    --user "$(id -u):$(id -g)" \
+    -e "HOME=$container_home" \
+    -e "USER=$(id -un)" \
+    -e "LOGNAME=$(id -un)" \
+    -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor" \
+    -e "CARGO_HOME=$container_home/cargo"
+}
+# release-build-container-user:end
+
 if ((dry_run)); then
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
@@ -242,6 +286,8 @@ if ((dry_run)); then
   echo "  spark image: $SPARK_EXPERT_DOCKER_INFERENCE"
   echo "  ssh config: ${release_ssh_config:-<stock>}"
   echo "  release build root: ${release_build_root:-<container /tmp>}"
+  echo "  build container user: $(id -un) ($(id -u):$(id -g))"
+  echo "  build container home: $(release_build_container_home "$release_build_root")"
   exit 0
 fi
 
@@ -486,6 +532,8 @@ mkdir -p "$release_source_parent"
 release_source_dir="$(mktemp -d "$release_source_parent/coordinator-source.XXXXXXXX")"
 trap 'rm -rf "$release_source_dir"' EXIT
 "$repo_root/scripts/build/stage-release-source.sh" "$repo_root" "$release_source_dir"
+release_build_user_args=()
+mapfile -t release_build_user_args < <(release_build_container_user_args_render "$release_build_root")
 release_with_export_locks "" "$export_container-coordinator" \
   timeout "$export_timeout" docker run --rm --name "$export_container-coordinator" \
   --gpus device=0 \
@@ -493,6 +541,7 @@ release_with_export_locks "" "$export_container-coordinator" \
   --ulimit memlock=-1:-1 \
   -e CUDA_VISIBLE_DEVICES=0 \
   -e NVIDIA_VISIBLE_DEVICES=0 \
+  "${release_build_user_args[@]}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
@@ -646,7 +695,19 @@ docker build \
 fi
 if [[ "$phase" == export ]]; then
 mkdir -p .cuteafd-release-image
+# This host's invoking user, not root: the container writes a Cargo target dir
+# and staging into bind-mounted host paths (see the coordinator note in build.sh).
+# A --user UID has no passwd entry here, so the identity and the cache roots are
+# passed explicitly; the artifact compiler creates them before Cargo runs.
+container_home=/tmp/cuteafd-home
+[[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
 docker run --rm --name "$export_container" \
+  --user "$(id -u):$(id -g)" \
+  -e "HOME=$container_home" \
+  -e "USER=$(id -un)" \
+  -e "LOGNAME=$(id -un)" \
+  -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor" \
+  -e "CARGO_HOME=$container_home/cargo" \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1:-1 \
