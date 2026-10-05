@@ -234,9 +234,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
         None => 0,
     };
-    let native_layers = if family == "qwen4" && report.placement != ExpertPlacement::Local {
-        0 // Spark ranks do not serve Qwen's MTP experts.
-    } else if family == "deepseek_v4" && options.native_mtp_layers > 0 {
+    let native_layers = if family == "deepseek_v4" && options.native_mtp_layers > 0 {
         discovered_native_layers
     } else { options.native_mtp_layers.min(discovered_native_layers) };
     // V4 always loads all checkpoint stages and their caches; --dspark only
@@ -306,7 +304,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     // Coordinator weights: a family's exact resident layout where it has one,
     // else checkpoint bytes per component under the family's conversions.
     let v41_weights = if family == "deepseek_v41" { v41::resident_weights(checkpoint, active_gpus, native_layers > 0) } else { None };
-    let qwen_exl3 = if family == "qwen4" && report.placement == ExpertPlacement::Local {
+    let qwen_exl3 = if family == "qwen4" {
         qwen_exl3_arenas(checkpoint, native_layers > 0)
     } else { None };
     if let Some(ranks) = &v41_weights {
@@ -379,11 +377,13 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     if let Some((backbone, draft)) = qwen_exl3 {
-        devices[0].items.push(Item::new(Category::Experts, "routed expert arenas", "exl3", backbone, Basis::Formula));
+        if report.placement == ExpertPlacement::Local {
+            devices[0].items.push(Item::new(Category::Experts, "routed expert arenas", "exl3", backbone, Basis::Formula));
+        }
         if draft > 0 {
             devices[0].items.push(Item::new(Category::Experts, "native MTP expert arena", "exl3", draft, Basis::Formula));
         }
-    } else if family == "qwen4" && native_layers > 0 && report.placement == ExpertPlacement::Local {
+    } else if family == "qwen4" && native_layers > 0 {
         let native_experts: u64 = report.components.iter().filter(|c| c.component == Component::SpeculatorExpert && c.status == Status::Unused)
             .map(|c| c.bytes).sum();
         if native_experts > 0 {
@@ -392,13 +392,14 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     }
     let exl3_workspace = expert_workspace(report, model, checkpoint, options.workspace_manifest.as_deref(), prefill_rows);
     if exl3_workspace.is_none() && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"))
-        && (family == "deepseek_v4" || (family == "qwen4" && report.placement == ExpertPlacement::Local)) {
+        && (family == "deepseek_v4" || (family == "qwen4"
+            && (report.placement == ExpertPlacement::Local || native_layers > 0))) {
         notes.push("Local EXL3 workspace allowance is estimated without matching rtx-tp1/m*/v41_exl3.json capacity manifests; images bundle them, or export the exl3 tree alongside PROGRAMS.json".into());
     }
-    if family == "qwen4" && report.placement != ExpertPlacement::Local && options.native_mtp_layers > 0 {
-        notes.push("Qwen Spark layouts omit native MTP: Spark ranks do not serve its draft expert layer".into());
+    if family == "qwen4" && report.placement != ExpertPlacement::Local && native_layers > 0 {
+        notes.push("Native Qwen MTP experts stay on rtx0; Spark ranks serve backbone experts only".into());
     }
-    if family == "qwen4" && report.placement == ExpertPlacement::Local
+    if family == "qwen4" && (report.placement == ExpertPlacement::Local || native_layers > 0)
         && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) {
         // The EXL3 window retains its shared capacity arenas in addition to
         // checkpoint trellis bytes (1.15 GiB in the reference allocation ledger).

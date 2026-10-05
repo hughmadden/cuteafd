@@ -659,13 +659,14 @@ def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, d
         assert f"--mtp {depth}" in launch
 
 
-def test_qwen_spark_mtp_reports_the_missing_expert_layer(tmp_path: Path) -> None:
+def test_qwen_spark_mtp_keeps_the_draft_layer_on_coordinator(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
                                             "quantization_config": {"quant_method": "exl3"}},
                                   "test/model", "EXPERT_BACKEND=spark\nSPECULATOR=mtp\n")
-    assert result.returncode == 2
-    assert "Spark ranks do not serve the MTP layer's experts" in result.stderr
-    assert "expertd-native" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--mtp 3" in launch and "--peers " in launch and "--local-experts" not in launch
+    assert "expertd-native" in result.stderr
 
 
 @pytest.mark.parametrize("method,mtp_layers", [("exl3", 0), ("exl3", 2), ("fp8", 1), ("nvfp4", 1)])

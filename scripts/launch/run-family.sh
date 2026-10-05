@@ -167,10 +167,7 @@ if [[ -z "$speculator" ]]; then
   fi
 fi
 case "$family:$speculator" in
-  qwen4:mtp)
-    # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
-    [[ "$ranks" == 0 ]] ||
-      { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
+  qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
   *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
@@ -212,7 +209,7 @@ case "$speculator" in
     fi ;;
   mtp)
     mtp_depth=1
-    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 || $ranks != 0 ]] || mtp_depth=3
+    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle

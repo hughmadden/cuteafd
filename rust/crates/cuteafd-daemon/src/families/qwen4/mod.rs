@@ -202,7 +202,7 @@ pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
     pub cfg: Qwen4Config,
     pub library: NativeLibrary,
-    /// The expert catalog for --local-experts.
+    /// Local backbone experts, or the coordinator-local MTP layer with Spark peers.
     pub experts: Option<cuteafd_loader::OfficialV41Catalog>,
 }
 
@@ -263,7 +263,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         && geometry.topk as usize == cfg.topk && geometry.intermediate as usize == cfg.moe_intermediate,
         "checkpoint experts do not match the Qwen 3.8 Flash Next geometry");
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
-    let experts = if args.local_experts {
+    let experts = if args.local_experts || (args.peers.is_some() && args.mtp > 0) {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
         let catalog = cuteafd_loader::read_expert_catalog(source)?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
@@ -336,7 +336,7 @@ impl Opened {
         let admitted_experts = if args.pool_tokens == 0 {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
-            let experts = self.experts(args, layers)?;
+            let experts = self.experts(args, layers, stream)?;
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
                 ensure!(local.window >= layers,
                     "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
@@ -358,7 +358,7 @@ impl Opened {
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers)? } {
+        if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
@@ -371,12 +371,13 @@ impl Opened {
         result
     }
 
-    fn experts<'s>(&'s self, args: &EngineArgs, layers: usize) -> Result<Option<engine::Experts<'s>>> {
+    fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void)
+        -> Result<Option<engine::Experts<'s>>> {
         if args.shared_only {
             tracing::warn!("--shared-only: routed experts are skipped (outputs do not match the model)");
             return Ok(Some(engine::Experts::SharedOnly));
         }
-        if let Some(tensors) = self.fp8() {
+        if let Some(tensors) = self.fp8().filter(|_| args.local_experts) {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
@@ -411,7 +412,7 @@ impl Opened {
                 window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
-        if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {
+        if let Some(catalog) = self.experts.as_ref().filter(|c| args.local_experts && c.exl3().is_some()) {
             let (free, _) = self.library.cuda_memory_info()?;
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
@@ -422,6 +423,9 @@ impl Opened {
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
+        let mtp = if args.mtp > 0 && layers == self.cfg.layers {
+            Some(self.spark_mtp_experts(args, layers, stream)?)
+        } else { None };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -431,7 +435,34 @@ impl Opened {
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime, mtp }))
+    }
+
+    fn spark_mtp_experts<'s>(&'s self, args: &EngineArgs, layer: usize, stream: *mut std::ffi::c_void)
+        -> Result<engine::MtpExperts<'s>> {
+        let catalog = self.experts.as_ref().context("--mtp with Spark peers needs the local draft expert catalog")?;
+        let (free, _) = self.library.cuda_memory_info()?;
+        let budget = free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30));
+        let started = Instant::now();
+        let mtp = if catalog.exl3().is_some() {
+            let experts = crate::families::deepseek_v4::local::LocalExperts::load_range(&self.library,
+                &args.native_lib, catalog, 1, 0..0, args.prefill_rows, budget, stream)?
+                .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
+            ensure!(experts.layers() == 0 && experts.stages() == 1,
+                "Spark layout must keep exactly the MTP expert layer locally, no backbone layers");
+            engine::MtpExperts::Exl3(std::cell::RefCell::new(experts))
+        } else {
+            let tensors = catalog.fp8().context("coordinator-local MTP needs FP8, NVFP4 or EXL3 experts")?;
+            let draft = tensors.for_layer(layer)?;
+            let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
+                layer..layer + 1, 1, 0, args.prefill_rows, budget)?;
+            ensure!(!experts.wire_input(), "coordinator-local MTP FP8 package must take BF16 rows");
+            engine::MtpExperts::Fp8(experts)
+        };
+        tracing::info!(layer, elapsed_ms = started.elapsed().as_millis() as u64,
+            "Qwen MTP experts resident on coordinator; backbone experts served by Sparks");
+        Ok(mtp)
     }
 }
 

@@ -1013,6 +1013,33 @@ fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
 }
 
 #[test]
+fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
+    use cuteafd_core::memory_layout::Category;
+    let (mut tensors, _) = qwen4_exl3(1, 4);
+    let draft: Vec<Tensor> = tensors.iter().map(|(name, dtype, shape)|
+        (name.replace("model.language_model.layers.0", "mtp.layers.0"), *dtype, shape.clone())).collect();
+    tensors.extend(draft);
+    let mut config = qwen4_config(1);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let dir = snapshot(config, &tensors);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1, ..Default::default()
+    }), ..sparks(4) };
+    let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let lead = &with_mtp.devices[0];
+    assert!(lead.items.iter().any(|i| i.group == "native MTP expert arena" && i.bytes > 0), "{}", with_mtp.render());
+    assert!(!lead.items.iter().any(|i| i.group == "routed expert arenas"));
+    assert!(lead.items.iter().any(|i| i.group == "local EXL3 workspace" && i.bytes > 0));
+    assert!(with_mtp.notes.iter().any(|n| n.contains("MTP experts stay on rtx0")));
+    options.layout.as_mut().unwrap().native_mtp_layers = 0;
+    let without_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "native MTP expert arena"));
+    assert!(lead.by_category()[&Category::Kv] > without_mtp.devices[0].by_category()[&Category::Kv]);
+    assert_eq!(with_mtp.devices[1].by_category()[&Category::Experts],
+        without_mtp.devices[1].by_category()[&Category::Experts]);
+}
+
+#[test]
 fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);
