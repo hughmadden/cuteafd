@@ -80,31 +80,6 @@ impl Drop for HostAllocation<'_> {
         }
     }
 }
-/// One immutable weight allocation, either device-local or mapped pinned RAM.
-/// Both expose a stable device pointer; host placement never allocates a GPU copy.
-pub(crate) enum ResidentWeight<'a> {
-    Device(DeviceAllocation<'a>),
-    Host { storage: HostAllocation<'a>, alias: CuteafdDeviceBuffer },
-}
-impl<'a> ResidentWeight<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool) -> Result<Self> {
-        if host {
-            let storage = HostAllocation::new(library, bytes)?;
-            let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
-            Ok(Self::Host { storage, alias })
-        } else {
-            Ok(Self::Device(DeviceAllocation::new(library, bytes)?))
-        }
-    }
-    pub(crate) fn buffer(&self) -> CuteafdDeviceBuffer {
-        match self { Self::Device(a) => a.buffer, Self::Host { alias, .. } => *alias }
-    }
-    pub(crate) fn is_host(&self) -> bool { matches!(self, Self::Host { .. }) }
-    pub(crate) fn device_bytes(&self) -> usize {
-        if self.is_host() { 0 } else { self.buffer().bytes }
-    }
-}
-
 /// Pinned staging with one region per layer while V4.1 passes may run
 /// device-ordered (`chain::device_enabled`), else one region: each layer's
 /// queued uploads then read their own bytes, so the host can queue later

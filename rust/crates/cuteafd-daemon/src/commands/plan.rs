@@ -20,7 +20,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
                 pool_tokens: args.pool_tokens,
-                host_embedding: args.embedding_placement == crate::shared::token_io::EmbedPlacement::Host,
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -87,7 +86,6 @@ mod tests {
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
             model: model.display().to_string(),
-            embedding_placement: crate::shared::token_io::EmbedPlacement::Gpu,
             revision: None,
             hf_home: None,
             spark_ranks: Some(spark_ranks),

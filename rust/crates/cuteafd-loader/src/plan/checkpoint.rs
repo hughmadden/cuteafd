@@ -152,31 +152,6 @@ impl Checkpoint {
     pub fn model_type(&self) -> Option<&str> {
         self.config.get("model_type").and_then(Value::as_str)
     }
-
-    /// Host placement cannot free a tensor also used by the vocabulary head.
-    /// Require a separate head in addition to the config's tying declaration.
-    pub fn require_untied_embedding(&self, name: &str) -> Result<()> {
-        ensure!(self.text_config().get("tie_word_embeddings").and_then(Value::as_bool) != Some(true)
-            && self.config.get("tie_word_embeddings").and_then(Value::as_bool) != Some(true),
-            "{name}: host embedding is ineligible: tie_word_embeddings=true");
-        let embedding = self.tensors.iter().find(|t| t.meta.name == name)
-            .with_context(|| format!("host embedding tensor {name} is missing"))?;
-        let heads: Vec<_> = self.tensors.iter().filter(|t|
-            t.meta.name == "head.weight" || t.meta.name == "lm_head.weight"
-                || t.meta.name.ends_with(".lm_head.weight")).collect();
-        ensure!(!heads.is_empty(), "{name}: host embedding is ineligible: no separate LM head tensor");
-        for head in heads {
-            let same_file = head.shard == embedding.shard
-                || std::fs::canonicalize(self.snapshot.join(&head.shard)).ok().zip(
-                    std::fs::canonicalize(self.snapshot.join(&embedding.shard)).ok())
-                    .is_some_and(|(a, b)| a == b);
-            let overlaps = head.meta.byte_offset < embedding.meta.byte_offset.saturating_add(embedding.meta.byte_length)
-                && embedding.meta.byte_offset < head.meta.byte_offset.saturating_add(head.meta.byte_length);
-            ensure!(!(same_file && overlaps),
-                "{name}: host embedding is ineligible: LM head {} aliases its storage", head.meta.name);
-        }
-        Ok(())
-    }
 }
 
 /// Reads an integer config field, checking `text_config` first.
@@ -190,35 +165,4 @@ pub fn usize_field(config: &Value, key: &str) -> Result<usize> {
 
 pub fn opt_usize_field(config: &Value, key: &str) -> Option<usize> {
     config.get(key).and_then(Value::as_u64).map(|value| value as usize)
-}
-
-#[cfg(test)]
-mod embedding_tests {
-    use super::*;
-    use crate::SafetensorsTensorMetadata;
-    use cuteafd_core::DType;
-
-    fn fixture() -> Checkpoint {
-        let t = |name: &str, offset| CheckpointTensor { shard: "model.safetensors".into(),
-            meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
-                shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
-        Checkpoint { snapshot: Default::default(), config: serde_json::json!({"tie_word_embeddings":false}),
-            quantize_config: None, missing_shards: vec![], shard_bytes: 0,
-            tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
-    }
-
-    #[test]
-    fn host_embedding_requires_untied_distinct_storage() {
-        let mut c = fixture();
-        assert!(c.require_untied_embedding("model.embed_tokens.weight").is_ok());
-        c.config["tie_word_embeddings"] = Value::Bool(true);
-        assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("tie_word_embeddings"));
-        c.config = serde_json::json!({"text_config":{"tie_word_embeddings":true}});
-        assert!(c.require_untied_embedding("model.embed_tokens.weight").is_err());
-        c.config = serde_json::json!({});
-        c.tensors[1].meta.byte_offset = 8192;
-        assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("aliases"));
-        c.tensors.pop();
-        assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("no separate LM head"));
-    }
 }

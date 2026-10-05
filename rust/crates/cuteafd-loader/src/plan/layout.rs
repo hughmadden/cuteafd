@@ -22,8 +22,6 @@ const MIB: u64 = 1 << 20;
 pub struct LayoutOptions {
     /// Usable bytes of each coordinator GPU (1 or 2).
     pub rtx_bytes: Vec<u64>,
-    /// One mapped pinned token embedding instead of a device allocation.
-    pub host_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
     pub spark_bytes: u64,
     /// Two coordinator GPUs split attention heads (generic families) rather
@@ -61,7 +59,6 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             rtx_bytes: vec![95 * GIB + 512 * MIB],
-            host_embedding: false,
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
             head_split: true,
@@ -377,29 +374,6 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
                         the head split"), bytes: replicated });
                 }
             }
-        }
-    }
-    if options.host_embedding {
-        let embedding = report.components.iter().find(|c| c.component == Component::Embedding);
-        let names: Vec<_> = checkpoint.tensors.iter().filter(|t|
-            t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).collect();
-        if let Some(tensor) = names.first().filter(|_| names.len() == 1) {
-            match checkpoint.require_untied_embedding(&tensor.meta.name) {
-                Ok(()) => {
-                    let mut saved = 0;
-                    for device in &mut devices {
-                        device.items.retain(|item| {
-                            if item.category == Category::Embedding { saved += item.bytes; false } else { true }
-                        });
-                    }
-                    waste.retain(|w| !w.what.starts_with("embedding"));
-                    notes.push(format!("embedding placement: host (single pinned mapped copy, {} bytes backing, {saved} device bytes freed)",
-                        embedding.map_or(tensor.meta.byte_length, |c| c.bytes)));
-                }
-                Err(error) => notes.push(format!("host embedding ineligible: {error:#}; GPU residency retained")),
-            }
-        } else {
-            notes.push("host embedding ineligible: no unique token embedding; GPU residency retained".into());
         }
     }
     if let Some((backbone, draft)) = qwen_exl3 {

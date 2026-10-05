@@ -819,7 +819,7 @@ impl<'a> GlmEngine<'a> {
         if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
-            let gather = self.embedding.device_gather();
+            let gather = self.embedding.placement() == EmbedPlacement::Gpu;
             if gather {
                 self.embedding.check(tokens)?;
                 self.put(&w.ids, tokens)?;

@@ -409,12 +409,6 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
         let memory = layout::layout(&report, model.as_ref(), &checkpoint, layout_options);
-        if layout_options.host_embedding {
-            for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
-                report.fits = false;
-                report.hints.push(Hint { what: note.clone(), how: "Use --embedding-placement gpu; host placement requires a distinct untied LM head.".into() });
-            }
-        }
         for device in &memory.devices {
             let required = device.used_bytes();
             if required > device.capacity_bytes {

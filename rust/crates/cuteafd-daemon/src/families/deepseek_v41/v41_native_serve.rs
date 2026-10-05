@@ -342,7 +342,14 @@ fn worker(
         IndexLaneWeights::device_bytes(&lib, &catalog)?,
         16 * 1024 * 1024,
     )?;
-    let table = NativeRtxTensors::load_embedding(&lib, &catalog, args.embedding_placement)?;
+    let names = ["embed.weight".to_string()];
+    let table = NativeRtxTensors::load(
+        &lib,
+        &catalog,
+        &names,
+        NativeRtxTensors::plan(&catalog, &names)?,
+        16 * 1024 * 1024,
+    )?;
     eprintln!(
         "native target backbone/index/embedding weights loaded in {:.3}s",
         start.elapsed().as_secs_f64()

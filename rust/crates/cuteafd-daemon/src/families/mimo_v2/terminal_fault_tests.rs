@@ -67,8 +67,6 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
             offset: 0,
             vocab: 1,
             hidden: 4096,
-            snapshot: None,
-            tensor_name: "synthetic-terminal-fault-fixture".into(),
         },
         EmbedPlacement::Host,
         || Ok(()),

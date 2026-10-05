@@ -797,7 +797,7 @@ impl<'a> Engine<'a> {
         // Tables are copied in only after the previous step's last read (the
         // head download synchronized the stream).
         // The decode graph's first segment gathers the streams itself.
-        let gather = self.embedding.device_gather();
+        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
         for (step, lane) in lanes.iter().zip(&w.lanes) {
             self.fill(&lane.tables, step.tables)?;
             self.embedding.check(step.tokens)?;
