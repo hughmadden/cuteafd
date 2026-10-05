@@ -756,7 +756,14 @@ Work, in priority order:
    item 4m), Engram counters / shard dir / table warm (FR-D.10), preflight,
    plan-only boot and ready probe (FR-D.11), whole-step graphs and
    device-side draft acceptance, W4A4 decode rows, deterministic prefill.
-9. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+9. **Open issue: synchronized Spark response gaps.** GLM 5.3 Flash split
+   (2 RTX + 4 Sparks, 2026-10-05 01:26 UTC): one BF16 launch had ~440 ms
+   inter-wave response gaps on all four workers at once (normal 15–18 ms),
+   with identical routes, GPU work and Spark clocks, and no overlapping
+   cluster job. This caused the historical "split FP8 −24%" reading (not
+   precision). Suspect a coordinator or transport timeout/retry path; it
+   may affect every family. Investigate if it recurs.
+10. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)

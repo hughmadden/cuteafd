@@ -287,5 +287,6 @@ duplicating it. Record the lesson in the table below.
 | `sudo python …` flagged | Sudo the real command directly |
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
+| Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
