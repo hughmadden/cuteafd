@@ -580,7 +580,7 @@ require_candidate_containers() {
   local container
   for container in "$coordinator_container" "$spark_container"; do
     case "$container" in
-      cuteafd-coordinator|cuteafd-coordinator-wip|cuteafd-spark-expert|cuteafd-spark-expert-wip|cuteafd-spark-expert-*)
+      cuteafd-coordinator|cuteafd-coordinator-*|cuteafd-spark-expert|cuteafd-spark-expert-wip|cuteafd-spark-expert-*)
         release_die "container '$container' is a production/shared name; the candidate launcher refuses to start or stop it" ;;
     esac
   done
