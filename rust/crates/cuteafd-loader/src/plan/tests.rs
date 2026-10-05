@@ -526,6 +526,32 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
 }
 
 #[test]
+fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
+    let mut config = mimo_flash_mopd_config();
+    config["vision_config"] = json!({"hidden_size": 64});
+    let mut tensors = mimo_flash_mopd_tensors();
+    tensors.extend([t("visual.blocks.0.norm.weight", "BF16", &[64]),
+        t("audio_encoder.norm.weight", "BF16", &[64])]);
+    let dir = snapshot_tp(config, &tensors, Some(4));
+    for (ranks, executable) in [(0, true), (2, true), (3, false), (4, true), (6, false)] {
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert_eq!(report.executable(), executable, "{ranks}: {}", render(&report));
+        let experts = report.experts.as_ref().unwrap();
+        assert_eq!((experts.package.as_str(), experts.block, experts.spark_worlds.as_slice()),
+            ("mimof:fp8 (MXFP4)", 32, &[2, 4][..]));
+        assert_eq!(component(&report, Component::Vision).status, Status::Unused);
+        assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("family mimof")));
+        assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("follow checkpoint tensors")));
+    }
+    let mut wrong = mimo_flash_mopd_tensors();
+    wrong.iter_mut().find(|(name, ..)| name == "model.layers.1.mlp.gate.weight").unwrap().1 = "F32";
+    let report = plan(snapshot_tp(mimo_flash_mopd_config(), &wrong, Some(4)).path(), &sparks(4)).unwrap();
+    assert!(rejected(&report, Component::Router)[0].contains("Bf16"));
+    let report = plan(snapshot_tp(mimo_flash_mopd_config(), &tensors, None).path(), &sparks(4)).unwrap();
+    assert!(rejected(&report, Component::Attention).iter().any(|error| error.contains("metadata.tp_size")));
+}
+
+#[test]
 fn mimo_unsupported_inventories_name_the_tensors() {
     // V2 Flash geometry with MXFP4 experts: the mimo package runs E4M3.
     let mut tensors = mimo_flash_tensors();
@@ -552,7 +578,7 @@ fn mimo_unsupported_inventories_name_the_tensors() {
     config["num_attention_heads"] = json!(32);
     config["swa_num_attention_heads"] = json!(32);
     let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
-    assert!(rejected(&report, Component::Embedding)[0].contains("no mimo program geometry"), "{}", render(&report));
+    assert!(rejected(&report, Component::Embedding)[0].contains("no mimo program for query/full KV/SWA KV heads"), "{}", render(&report));
 }
 
 // --- R08: one canonical configuration per family ----------------------------

@@ -1,10 +1,11 @@
 //! Xiaomi MiMo V2: hybrid full / sliding-window GQA with attention sinks,
 //! sigmoid top-8 experts without shared experts, dense-FFN MTP layers.
 //!
-//! serve-mimo runs both checkpoints: V2 Flash on the `mimo` programs with the
+//! serve-mimo runs MiMo checkpoints: V2 Flash on the `mimo` programs with the
 //! checkpoint's FP8 experts (`mimo:fp8`, Spark tp2/tp4/tp6, coordinator tp1)
 //! and V2.6 Pro on the `mimop` programs with MXFP4 experts (`mimop:fp8`,
-//! Spark tp2/tp6, coordinator tp1). The plan reads the configuration with the
+//! Spark tp2/tp6, coordinator tp1); V2.6 Flash MOPD uses `mimof` and MXFP4
+//! experts (`mimof:fp8`, Spark tp2/tp4). The plan reads the configuration with the
 //! runtime's own reader (`MimoV2Config`) and checks every tensor against what
 //! `MimoLoader` stages.
 use super::deepseek::routed_shape;
@@ -187,6 +188,13 @@ impl Family for MiMo {
         let (h, i, e, k) = (spec.hidden, moe.intermediate, moe.experts, moe.top_k);
         let mxfp4 = formats.iter().any(|f| f.starts_with("mxfp4"));
         match component {
+            Component::RoutedExpert if mxfp4 && h == 4096 => Some(Hint {
+                what: format!("sigmoid top-{k} MXFP4 routed experts: H {h}, I {i}, {e} experts; no shared expert"),
+                how: format!("Exact family `mimof:fp8` (E2M1 packed U8 [N,K/2], UE8M0 U8 [N,K/32]); \
+                    fp8-mimof tp1 coordinator and tp2/tp4 Spark, package_fp8_moe_aot.py --geometry mimof. \
+                    TP2 owns {} rows per rank; TP4 owns {}. SM121 uses MXFP8 x MXFP4 large-row \
+                    prefill; FP8_EXPERT_PREFILL=w8a16 keeps BF16 down.", i / 2, i / 4),
+            }),
             Component::RoutedExpert if mxfp4 => {
                 // TP6: whole 32-blocks per rank (352/320 of 2048), stored zero-padded to 128.
                 let widest = (i / 32).div_ceil(6) * 32;
@@ -218,7 +226,7 @@ impl Family for MiMo {
             // Pro's router weight is BF16 (the bias FP32); Flash's is FP32.
             Component::Router if formats.iter().any(|f| f == "bf16") => Some(Hint {
                 what: "sigmoid noaux_tc router with FP32 e_score_correction_bias, BF16 router weight".into(),
-                how: "mimop_router_scores (BF16 weight, FP32 accumulation) then cuteafd_router_select \
+                how: "mimof/mimop_router_scores (BF16 weight, FP32 accumulation) then cuteafd_router_select \
                     (sigmoid, normalized, no routed scaling).".into(),
             }),
             _ => self.component_hint(component),
@@ -229,12 +237,12 @@ impl Family for MiMo {
         let (what, how) = match component {
             Component::Attention => (
                 "GQA full attention plus 128-token sliding-window GQA with learned sink bias",
-                "serve-mimo runs the mimo (V2 Flash) and mimop (V2.6 Pro) programs (b12x integration \
+                "serve-mimo runs mimo (V2 Flash), mimof (V2.6 Flash MOPD) and mimop (V2.6 Pro) programs (b12x integration \
                  mimo_{full,swa}_{producer,attention}, mimo_full_*_kvint8, mimo_o): int8 full-attention KV \
                  records (FP32 scale per 32 dims; --kv-cache bf16 for BF16) in paged pools, BF16 SWA rings, \
                  sinks on SWA layers only, QK 192 / V 128, NeoX RoPE on 64 dims. MimoLoader stages BF16 or E4M3 \
                  with FP32 128x128 grids, restarting per 192-row head (Flash's full-layer k_proj) or per \
-                 checkpoint TP shard (Pro's fused qkv_proj, FusedQkvLayout); another layout needs a loader \
+                 checkpoint TP shard (V2.6 fused qkv_proj, FusedQkvLayout); another layout needs a loader \
                  segment rule first.",
             ),
             Component::RoutedExpert => (
@@ -314,11 +322,7 @@ impl MimoModel {
         require(operand.is_fp8_segmented(128, &[ScaleEncoding::F32]), || {
             format!("fused qkv_proj needs FP32 scales, found {}", describe(operand))
         })?;
-        let stride = self.cfg.qkv_key_stride();
-        require(stride == layout.k
-            || (layout.k == self.cfg.head_dim && stride % 128 == 0 && layout.q % 128 == 0 && layout.v % 128 == 0), || {
-            format!("padded keys (stride {stride}) need one KV head per checkpoint shard and 128-row q/v shards")
-        })
+        layout.program_segments(&self.cfg).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
     fn routed(&self, family: &str, stem: &str, operand: &QuantOperand) -> Result<(), String> {
@@ -332,7 +336,7 @@ impl MimoModel {
             }),
             // MXFP4: packed E2M1 U8 [N, K/2] with UE8M0 [N, K/32].
             _ => require(operand.is_mxfp4(32), || {
-                format!("mimop:fp8 runs MXFP4 experts (E2M1 + UE8M0 per 32); found {}", describe(operand))
+                format!("{family}:fp8 runs MXFP4 experts (E2M1 + UE8M0 per 32); found {}", describe(operand))
             }),
         }
     }
@@ -345,7 +349,9 @@ impl MimoModel {
             intermediate: self.cfg.moe_intermediate as u32,
             layers: 0,
         };
-        [(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH, "mimo"), (cuteafd_core::ExpertGeometry::MIMO_V26_PRO, "mimop")]
+        [(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH,
+            if self.cfg.program_family().ok() == Some("mimof") { "mimof" } else { "mimo" }),
+            (cuteafd_core::ExpertGeometry::MIMO_V26_PRO, "mimop")]
             .into_iter()
             .find_map(|(shape, family)| geometry.same_shape(&shape).then_some(family))
     }
@@ -415,9 +421,10 @@ impl FamilyModel for MimoModel {
             }
             // FP32 [E, H] (V2 Flash: split into BF16 hi + lo) or BF16 (V2.6 Pro).
             (Component::Router, "gate") => require(
-                operand.is_plain(&[Encoding::F32, Encoding::Bf16])
+                operand.is_plain(&[if self.cfg.router_fp32 { Encoding::F32 } else { Encoding::Bf16 }])
                     && operand.logical == [self.cfg.experts, self.cfg.hidden],
-                || format!("the router weight is FP32 or BF16 [{}, {}], found {}", self.cfg.experts, self.cfg.hidden,
+                || format!("the selected program router weight is {:?} [{}, {}], found {}",
+                    if self.cfg.router_fp32 { Encoding::F32 } else { Encoding::Bf16 }, self.cfg.experts, self.cfg.hidden,
                     describe(operand)),
             ),
             (Component::Router, "e_score_correction_bias") => require(operand.is_plain(&[Encoding::F32]), || {
@@ -435,6 +442,12 @@ impl FamilyModel for MimoModel {
                 block: 128,
                 spark_worlds: fp8_spark_worlds(self.cfg.moe_intermediate),
                 local: Ok("serve-mimo --local-experts (fp8-mimo tp1)".into()),
+            }),
+            "mimof" if operand.is_mxfp4(32) => Some(ExpertContract {
+                package: "mimof:fp8 (MXFP4)".into(),
+                block: 32,
+                spark_worlds: vec![2, 4],
+                local: Ok("serve-mimo --local-experts (fp8-mimof tp1)".into()),
             }),
             "mimop" if operand.is_mxfp4(32) => Some(ExpertContract {
                 package: "mimop:fp8 (MXFP4)".into(),

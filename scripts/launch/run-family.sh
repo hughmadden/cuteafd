@@ -138,18 +138,19 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
 }
-# SPECULATOR picks the drafter (Qwen local EXL3: MTP3; GLM 5.3 Flash: its
-# checkpoint's measured best, see glm5_flash_speculator below; otherwise off):
+# SPECULATOR picks the drafter (Flash MOPD: bundled DFlash; Qwen local EXL3:
+# MTP3; GLM 5.3 Flash: its measured best; otherwise off):
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
-#            MiMo V2.6 Pro: the snapshot's own dflash/ drafter unless
-#            SPECULATOR_MODEL_ID names one (V2.6 Pro needs SPARK_COUNT=6)
+#            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
+#            SPECULATOR_MODEL_ID names one (Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
-# MiMo unset drafts in single-copy FP8 (the measured family default);
-# SPECULATOR_FP8=auto preserves that drafter's checkpoint format. GLM auto/unset
+# Official Flash MOPD's bundled drafter defaults to single-copy FP8 (measured
+# separately from its checkpoint BF16 target head/O); other MiMo defaults follow
+# runtime weight policy. SPECULATOR_FP8=auto keeps drafter checkpoint format. GLM auto/unset
 # drafts in single-copy FP8. on converts, off selects BF16. Pre-rename keys
 # (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
@@ -163,6 +164,9 @@ glm5_flash_speculator() {
     *) echo "dflash2 incoai/GLM-5.3-Flash-DFlash2" ;;
   esac
 }
+# Qualification is for this official checkpoint, not a shape-compatible sibling.
+mimo_flash_mopd=0
+[[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
 speculator="$(get SPECULATOR)"
 default_drafter=""
 if [[ -z "$speculator" ]]; then
@@ -180,6 +184,10 @@ if [[ -z "$speculator" ]]; then
         "(hf download $default_drafter); serving without a drafter" >&2
       speculator=off default_drafter=""
     fi
+  fi
+  if [[ $speculator == off && $mimo_flash_mopd == 1 && -z ${cfg[MTP]+set} && -z ${cfg[DFLASH]+set} ]]; then
+    speculator=dflash2
+    echo "note: MiMo V2.6 Flash MOPD drafts with its bundled DFlash; SPECULATOR=off disables it" >&2
   fi
   # Only the resident EXL3 path is qualified. Spark workers serve backbone
   # layers, not mtp.layers.0; other expert formats keep their opt-in status.
@@ -335,7 +343,11 @@ if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
   if [[ ${#draft_args[@]} -gt 0 ]]; then
     if [[ $family == mimo_v2 ]]; then
-      case "$(key SPECULATOR_FP8 DRAFT_FP8)" in
+      mimo_draft_default=""
+      if [[ $mimo_flash_mopd == 1 && $speculator == dflash2 && -z "$drafter" ]]; then
+        mimo_draft_default=on
+      fi
+      case "$(key SPECULATOR_FP8 DRAFT_FP8 "$mimo_draft_default")" in
         "") ;;
         auto) family_args+=(--draft-representation checkpoint) ;;
         on) family_args+=(--draft-fp8 true) ;;
@@ -544,7 +556,13 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
   case "$store_dtype" in
     fp8) expert_geometry=mimo ;;
-    mxfp4) expert_geometry=mimop ;;
+    mxfp4)
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      case "$hidden" in
+        4096) expert_geometry=mimof ;;
+        6144) expert_geometry=mimop ;;
+        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
+      esac ;;
     *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
   esac
   printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096

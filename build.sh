@@ -10,9 +10,9 @@ native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
   release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
-bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
+bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
-  release_die "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, glm, glmf or qwen4"
+  release_die "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf or qwen4"
 
 usage() {
   cat <<'EOF'
