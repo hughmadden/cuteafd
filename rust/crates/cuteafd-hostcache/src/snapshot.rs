@@ -300,6 +300,20 @@ impl Snapshots {
         })
     }
 
+    /// Refresh a verified engine-selected hit without selecting a different radix candidate.
+    pub(crate) fn touch(&mut self, key: Key, now_ns: u64) -> bool {
+        let Some(snapshot) = self.snapshots.get_mut(&key) else { return false; };
+        snapshot.last_access_ns = now_ns;
+        true
+    }
+
+    /// Read-only lookup; no access-clock, retention, or pin changes.
+    pub fn peek(&self, tokens: &[u32]) -> Option<Hit> {
+        let (common, frontier, &key) = self.retention.peek_reusable(tokens)?;
+        let snapshot = self.snapshots.get(&key)?;
+        Some(Hit { key, kind: snapshot.meta.kind, common, frontier })
+    }
+
     /// The resident snapshot `key`, if any. Invariant: the returned snapshot's slabs and page
     /// references are held by this store.
     pub fn get(&self, key: Key) -> Option<&HostSnapshot> {
@@ -715,6 +729,22 @@ mod tests {
     use super::*;
     use crate::pool::testing::CHUNK;
     use crate::pool::Layout;
+
+    #[test]
+    fn verified_touch_refreshes_lru_but_peek_does_not() {
+        let pool = crate::pool::testing::pool(1 << 30).0;
+        let mut store = Snapshots::with_rule(pool, ReuseRule::EXACT, EvictionOrder::LeastRecent);
+        let a = store.plan_store(meta(SnapshotKind::Prompt, &[1, 2], false), &pages(&[id(1)])).unwrap();
+        let a = store.commit_store(a, 1);
+        let b = store.plan_store(meta(SnapshotKind::Prompt, &[3, 4], false), &pages(&[id(2)])).unwrap();
+        let b = store.commit_store(b, 2);
+        assert_eq!(store.peek(&[1, 2]).unwrap().key, a);
+        assert_eq!(store.get(a).unwrap().last_access_ns, 1);
+        assert!(store.touch(a, 3));
+        assert!(!store.touch(u64::MAX, 4));
+        assert_eq!(store.evict_one().unwrap().0, b);
+        assert_eq!(store.get(a).unwrap().last_access_ns, 3);
+    }
 
     #[test]
     fn least_recent_order_evicts_by_use_then_prompt_first() {

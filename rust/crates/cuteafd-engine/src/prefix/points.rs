@@ -100,6 +100,28 @@ pub fn plan(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach
     PointPlan { chunks: ends, points }
 }
 
+/// Media-aware schedule. Ordinary prefill chunks may cross image rows, but every snapshot
+/// point rounds to the image start. Split there if the rounded point would leave mark reach.
+/// An empty span list is exactly the text-only schedule.
+pub fn plan_media(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach: usize,
+    min_tokens: usize, policy: PointPolicy, media: &[cuteafd_core::MediaSpan]) -> PointPlan {
+    if media.is_empty() { return plan(resume, len, chunk, boundaries, reach, min_tokens, policy); }
+    let resume = crate::media::round_frontier(resume, media);
+    let boundaries: Vec<_> = boundaries.iter().map(|&p| crate::media::round_frontier(p, media)).collect();
+    let mut schedule = plan(resume, len, chunk, &boundaries, reach, min_tokens, policy);
+    let mut points: Vec<_> = schedule.points.iter().map(|&(_, p)| crate::media::round_frontier(p, media))
+        .filter(|&p| p > resume && p >= min_tokens && p < len).collect();
+    points.sort_unstable();
+    points.dedup();
+    for &point in &points {
+        let end = *schedule.chunks.iter().find(|&&end| end >= point).expect("last chunk ends at len");
+        if end - point > reach { schedule.chunks.push(point); schedule.chunks.sort_unstable(); }
+    }
+    schedule.chunks.dedup();
+    schedule.points = points.into_iter().map(|p| (schedule.chunks.iter().position(|&end| end >= p).unwrap(), p)).collect();
+    schedule
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

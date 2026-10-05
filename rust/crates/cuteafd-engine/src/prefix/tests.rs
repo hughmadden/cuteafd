@@ -13,6 +13,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use super::points::{plan as plan_points, PointPolicy};
 
+include!("media_tests.rs");
+
 const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
 const WINDOW: usize = 8; // rows a forward reads back from the ring
