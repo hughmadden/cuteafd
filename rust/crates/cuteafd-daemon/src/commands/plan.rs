@@ -8,6 +8,9 @@ use crate::cli::PlanArgs;
 
 /// The planning options `args` name, validated before any checkpoint is read.
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
+    if !args.layout && args.vision_replicas != 1 {
+        return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
+    }
     let options = PlanOptions {
         vision: args.vision,
         audio: args.audio,
@@ -22,6 +25,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
                 pool_tokens: args.pool_tokens,
+                vision_replicas: args.vision_replicas as usize,
                 host_embedding: args.embedding_placement == crate::shared::token_io::EmbedPlacement::Host,
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
@@ -88,6 +92,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,
             model: model.display().to_string(),
@@ -121,6 +126,16 @@ mod tests {
         assert_eq!(cli.vision, Some(cuteafd_loader::plan::MediaMode::Off));
         assert_eq!(cli.audio, Some(cuteafd_loader::plan::MediaMode::Auto));
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "bad"]).is_err());
+    }
+
+    #[test]
+    fn replicas_require_an_explicit_layout_inventory() {
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.layout = false;
+        request.vision_replicas = 2;
+        assert!(matches!(options(&request), Err(PlanError::InvalidOption { option: "--vision-replicas", .. })));
+        request.layout = true;
+        assert_eq!(options(&request).unwrap().layout.unwrap().vision_replicas, 2);
     }
 
     #[test]

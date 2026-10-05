@@ -97,7 +97,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
-                          previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
+                          previous_peers: str | None = None, encoder_plan: dict | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -118,6 +118,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n' +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None else '') +
+                                    (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
+                                     if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
                                      " ".join(map(str, container_pids)) + " ;; esac\n"
                                      if tool == "docker" and container_pids else '') +
@@ -448,6 +450,19 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
         assert "--weight-policy" not in launch
     else:
         assert f"--weight-policy {expected}" in launch
+
+
+@pytest.mark.parametrize("quota", [None, "4MiB", "0"])
+def test_mimo_embedding_cache_quota_is_explicit_only(tmp_path, quota):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    if quota is None:
+        assert "--media-cache-bytes" not in launch
+    else:
+        assert f"--media-cache-bytes {quota}" in launch
 
 
 @pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
@@ -854,3 +869,33 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert result.returncode == 0, result.stderr
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
+
+@pytest.mark.parametrize("mode,kind", [("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
+def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    vision_key = f"VISION={mode}\n" if mode is not None else ""
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"{vision_key}RTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert ("--encoder-listen" in worker) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    assert f"--vision {kind}" in launch
+    if kind == "off": assert "cuteafd plan" not in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["auto", "spark", "spark:0", "spark:5"])
+def test_mimo_unwired_spark_encoder_rejected_before_restart(tmp_path, mode):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={mode}\nSPECULATOR=off\n", restart=True)
+    assert result.returncode == 2
+    assert "Spark encoder placement not yet wired into MiMo serving; use VISION=rtx or off" in result.stderr
+    assert "cuteafd plan" not in result.stderr
+    assert "docker rm" not in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "cuteafd serve-mimo" not in result.stderr

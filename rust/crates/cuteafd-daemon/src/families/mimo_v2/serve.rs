@@ -22,6 +22,7 @@ use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::prefix::MimoPrefix;
 use super::serve_failures::FailureRecipients;
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
 use super::{open, Opened};
@@ -69,6 +70,21 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
+    /// Resolved global vision policy, assigned before dispatch.
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    pub vision: cuteafd_loader::plan::MediaMode,
+    /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
+    #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
+    pub media_cache_bytes: Option<u64>,
+    /// Admitted resident Spark encoder endpoints, in replica order.
+    #[arg(long)]
+    pub vision_peers: Option<String>,
+    /// Shared planner admission hash (required with --vision-peers).
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_plan_hash: Option<String>,
+    /// Snapshot revision used in the encoder handshake.
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_revision: Option<String>,
 }
 
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -80,7 +96,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
     let encoding = QwenEncoding::from_snapshot(&snapshot)?;
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
@@ -97,9 +113,13 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
+    let vision = args.vision;
+    let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix));
-    ready_rx.await.context("engine failed before it was ready")??;
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, media_cache_bytes));
+    if let Some(preparer) = ready_rx.await.context("engine failed before it was ready")?? {
+        profile = profile.with_loaded_vision(preparer);
+    }
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub.clone(), profile.clone());
@@ -165,8 +185,8 @@ const PRO_TP6_STEP_MS: [(usize, f64); 9] = [(1, 31.6), (2, 39.5), (4, 54.1), (8,
     (32, 197.8), (48, 258.3), (64, 304.4)];
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Policy, prefix: PrefixArgs) -> Result<()> {
+    ready: tokio::sync::oneshot::Sender<Result<Option<Arc<cuteafd_api::openai::media::MediaPreparer>>>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -174,6 +194,14 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
+    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes) {
+        Ok(vision) => vision,
+        Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
+    };
+    let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
+    let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
+        (super::media::Encoder::Local(vision.encoder), vision.cache_bytes));
+    let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
         cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
@@ -190,13 +218,13 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
                 "MiMo decode graphs captured");
         }
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(()));
+            let _ = ready.send(Ok(preparer.clone()));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config)
+            args.token_io.token_select, host_config, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| preparer).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -206,6 +234,8 @@ struct Prefill<'a> {
     job: NativeRequest,
     constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
+    keys: MediaKeys,
+    media: RequestMedia,
     /// Prompt tokens prefilled so far (from the prefix cache's restore point).
     done: usize,
     /// Rows restored from the prefix cache.
@@ -236,6 +266,8 @@ struct Active<'a> {
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
+    keyed_history: Vec<u32>,
+    media: RequestMedia,
     /// The sequence's DFlash ring slot (None: copy-window drafts only).
     slot: Option<usize>,
     /// Recent DFlash (proposed, accepted) outcomes for the adaptive plan.
@@ -301,6 +333,7 @@ impl Active<'_> {
     fn emit(&mut self, token: u32) -> Result<bool> {
         probe::token(&self.job.probe, token);
         self.history.push(token);
+        self.keyed_history.push(token);
         self.generated += 1;
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
@@ -379,18 +412,22 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
-    host_config: Option<cuteafd_hostcache::config::Config>) -> Result<()> {
+    host_config: Option<cuteafd_hostcache::config::Config>,
+    media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
     let mut owners = super::serving_owners::ServingOwners::new(engine);
     let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
     owners.prefix(family, cache);
     owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners)
+    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>) -> Result<()> {
+    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
+    media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
     let draft = policy.copy;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
@@ -411,86 +448,128 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let mut steps = 0u64;
     let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
-    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
+    let config = &opened.checkpoint.config;
     let mut failures = FailureRecipients::default();
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
     let result = (|| -> Result<()> { loop {
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
-            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+            let ready = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy,
+                |ready| ready.job().job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
-                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
-                cuteafd_engine::prefix::AdmissionPoll::Empty => {
-                    if !busy {
-                        // Idle: publish the state the server waits in (captures and releases done).
+                cuteafd_engine::prefix::AdmissionPoll::Ready(ready) => ready,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => match media.poll(|prompt| prompt.job.events.is_closed()) {
+                    MediaPoll::Ready(ready) => ready,
+                    MediaPoll::Failed(prompt, error) => {
+                        let _ = prompt.job.events.send(Err(NativeFailure::Worker(error.to_string())));
+                        continue;
+                    }
+                    MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, cache);
-                        console::gauges_now(|| console::Gauges::prefix_cache(cache, 0, 0, 0));
-                        match receive.blocking_recv() {
-                            Some(job) => job,
-                            None => return Ok(()),
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer);
+                        let job = if !busy && media.is_empty() {
+                            match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
+                        } else {
+                            match receive.try_recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            }
+                        };
+                        failures.watch(&job.events);
+                        let tokens = match probe::prompt_ids(&job.probe,
+                            || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
+                            Ok(tokens) => tokens,
+                            Err(error) => {
+                                let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));
+                                continue;
+                            }
+                        };
+                        let events = job.events.clone();
+                        let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, config,
+                            engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
+                            Ok(prepared) => prepared,
+                            Err(error) => { let _ = events.send(Err(NativeFailure::BadRequest(format!("{error:#}")))); continue; }
+                        };
+                        if prompt.tokens.is_empty() || prompt.tokens.len() >= engine.max_context {
+                            let _ = events.send(Err(NativeFailure::BadRequest(format!("prompt of {} tokens is outside 1..{}",
+                                prompt.tokens.len(), engine.max_context))));
+                            continue;
                         }
-                    } else {
-                        match receive.try_recv() {
-                            Ok(job) => job,
-                            Err(_) => break,
+                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                            if let Some(probe) = &prompt.job.probe { probe.fail(format!("reference features: {error:#}")); }
+                            let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
+                            drop(request_media); media.cache.prune_reservations();
+                            continue;
                         }
+                        let resume = if probe::cold(&prompt.job.probe) { 0 }
+                            else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
+                        let waiter = MediaWaiter::new(prompt, request_media, jobs, resume)?;
+                        if let Err((_, error)) = media.enqueue(waiter) {
+                            let _ = events.send(Err(NativeFailure::BadRequest(error.to_string())));
+                        }
+                        continue;
                     }
                 },
             };
-            failures.watch(&job.events);
-            let reject = |job: &NativeRequest, message: String| {
-                let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
+            let reject = |ready: &MediaReady<super::media::Prompt>, message: String| {
+                let _ = ready.job().job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
+            let constraint = match ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
-                Err(error) => {
-                    reject(&job, format!("{error:#}"));
+                Err(error) => { reject(&ready, format!("{error:#}")); continue; }
+            };
+            if let Some(probe) = &ready.job().job.probe {
+                if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), engine.prefill_capacity(), DECODE_ROWS) {
+                    probe.fail(format!("cold replay: {error:#}"));
+                    reject(&ready, format!("cold replay: {error:#}"));
                     continue;
                 }
-            };
-            let tokens = match probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
-                Ok(tokens) => tokens,
-                Err(error) => {
-                    let _ = job.events.send(Err(NativeFailure::Worker(format!("prompt tokenization: {error:#}"))));
-                    continue;
-                }
-            };
-            let cold = probe::cold(&job.probe);
-            if tokens.is_empty() || tokens.len() >= engine.max_context {
-                reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
-                continue;
             }
-            let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
+            let cold = ready.cold() || probe::cold(&ready.job().job.probe);
+            let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(engine.max_context);
             let Some(ring) = free_rings.pop() else {
-                reject(&job, "SWA rings exhausted".into());
+                reject(&ready, "SWA rings exhausted".into());
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = if probe::no_speculation(&job.probe) || policy.fixed == Some(0) {
+            let slot = if probe::no_speculation(&ready.job().job.probe) || policy.fixed == Some(0) {
                 None
             } else { free_slots.pop() };
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
-            let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(family, lookup, capacity, true,
-                |pages| MimoPlacement { pages, ring, len: 0 }) {
+            let build = |pages| MimoPlacement { pages, ring, len: 0 };
+            let admission = if cold { cache.admit_cold(family, ready.job().tokens.len(), capacity, build) }
+                else { cache.admit_media(family, ready.job().keys.tokens(), ready.job().keys.spans(), capacity, true, build) };
+            let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_rings.push(ring);
                     free_slots.extend(slot);
                     // Running requests keep their pages pinned. Delay a request
                     // that fits alone instead of rejecting transient KV pressure.
-                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                    match kv_waiter.defer(ready, &error, busy, cache.pool().release_epoch()) {
                         Ok(()) => break,
-                        Err(job) => reject(&job, format!("{error:#}")),
+                        Err(ready) => reject(&ready, format!("{error:#}")),
                     }
                     continue;
                 }
             };
             let resume = admitted.resume;
+            let ready = match ready.reconcile(resume) {
+                Ok(ready) => ready,
+                Err(waiter) => {
+                    release(family, cache, &mut free_rings, &mut free_slots, &admitted.placement, slot);
+                    let events = waiter.job.job.events.clone();
+                    if let Err((_, error)) = media.enqueue(waiter) {
+                        let _ = events.send(Err(NativeFailure::BadRequest(error.to_string())));
+                    }
+                    continue;
+                }
+            };
+            let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
             probe::admitted(&job.probe, "mimo_v2", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
@@ -499,14 +578,18 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, &mut placement,
-                    |placement, chunk, _| engine.prefill_device(placement, chunk, false, None, None),
-                    |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, None)?
-                        .context("scoring needs every layer"));
+                let scored = (|| {
+                    let rows = super::media::scoring_rows(&job.probe, DECODE_ROWS)?;
+                    probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    rows, &mut placement,
+                    |placement, chunk, _last_logits| engine.prefill_media_device(placement, chunk, false, None, None, Some(&request_media)),
+                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
+                        .context("scoring needs every layer"))
+                })();
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => {
+                        if let Some(probe) = &job.probe { probe.fail(format!("scoring: {error:#}")); }
                         let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}"))));
                         if engine.is_terminal() { return Err(error); }
                     }
@@ -514,7 +597,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
                 continue;
             }
-            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
+            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
                 admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
@@ -523,16 +606,21 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
             // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
             let plan = if cache.enabled() {
-                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &boundaries,
-                    family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
+                cuteafd_engine::prefix::plan_media_points(resume, tokens.len(), engine.prefill_capacity(), &boundaries,
+                    family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points(), keys.spans())
             } else {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &[], 0, 0,
                     PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
             };
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
-            let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
-            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
+            let plan = if let Some(probe) = job.probe.as_ref().filter(|p| !p.spec.cold_steps.is_empty()) {
+                // Rebuild from zero with the source's exact prefill/decode boundaries.
+                cuteafd_engine::prefix::PointPlan {
+                    chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new(),
+                }
+            } else if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
+            prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
         }
@@ -541,7 +629,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let finished = prefills.round_pairs(|a, b| {
                 let rows = [a, b].map(|p| p.plan.chunks.get(p.chunks).copied()
                     .unwrap_or(p.tokens.len()).saturating_sub(p.done));
-                engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
+                let replay = [&*a, &*b].iter().any(|p| p.job.probe.as_ref().is_some_and(|probe| !probe.spec.cold_steps.is_empty()));
+                !replay && engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
             }, |batch| prefill_batch(engine, family, cache, selector, batch));
             if engine.is_terminal() {
                 let mut primary = None;
@@ -565,7 +654,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
-                            if let Err(error) = cache.park(family, &p.tokens[..placement.len], &placement) {
+                            if let Err(error) = cache.park_media(family, &p.keys.tokens()[..placement.len], p.keys.spans(), &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
                         }
@@ -590,11 +679,12 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
-                let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
+                let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
+                let spans = p.keys.spans().to_vec();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
                     if let Some(prompt) = &prompt {
                         let after = logits.as_deref().map_or_else(After::default, |l| After::from_logits(l, true));
-                        if let Err(error) = cache.capture(family, SnapshotKind::Prompt, prompt, placement, after) {
+                        if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, prompt, &spans, placement, after) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
                     }
@@ -610,6 +700,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         drafts: DraftHistory::default(),
                         counts: [0; 6],
                         history: p.tokens,
+                        keyed_history: p.keys.tokens().to_vec(),
+                        media: p.media,
                         draft_limit: draft,
                         draft_pause: 0,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
@@ -665,6 +757,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
+            if !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
         let cycle = Instant::now();
@@ -711,13 +804,24 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
             None if skip.drafts() && engine.mtp.is_some() && policy.fixed != Some(0)
                 && limits.iter().any(|&limit| limit > 0) => {
-                let indices: Vec<usize> = (0..active.len()).filter(|&i| limits[i] > 0).collect();
+                let indices: Vec<usize> = (0..active.len()).filter(|&i| {
+                    if limits[i] == 0 { return false; }
+                    let a = &active[i];
+                    let start = a.placement.len.saturating_sub(engine.cfg.window + engine.mtp.as_ref().unwrap().stages.len());
+                    if !a.media.ready(start, a.history.len()) {
+                        // Restored image effects are in target state, not host embeddings.
+                        // Keep MTP cold until its reconstruction window is past those rows.
+                        engine.mtp_reset(a.placement.ring as usize, a.placement.len);
+                        return false;
+                    }
+                    true
+                }).collect();
                 for &i in &indices {
                     active[i].counts[5] += 1;
                 }
                 let seqs: Vec<MtpSeq<'_>> = indices.iter().map(|&i| {
                     let a = &active[i];
-                    MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history }
+                    MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history, media: Some(&a.media) }
                 }).collect();
                 let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
                 let timer = Instant::now();
@@ -913,10 +1017,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
             (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !probe::cold(&request.job.probe)) {
                 // The conversation so far: every committed row (the last token is not in it).
-                let rows = &request.history[..request.placement.len];
-                if let Err(error) = cache.capture(family, SnapshotKind::Turn, rows, &request.placement,
+                let rows = &request.keyed_history[..request.placement.len];
+                if let Err(error) = cache.capture_media(family, SnapshotKind::Turn, rows, request.media.spans(), &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
@@ -924,7 +1028,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), cache);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer);
         console::gauges(|| console::Gauges::prefix_cache(cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     } })();
@@ -936,10 +1040,12 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
 
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats()});
+            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }
 
@@ -993,7 +1099,13 @@ fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let retain = cache.enabled() && !probe::cold(&p.job.probe);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let start = p.placement.len;
-        let logits = engine.prefill_device(&mut p.placement, &p.tokens[p.done..end], false, None, None)?;
+        let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
+            .is_some_and(|step| step.decode);
+        let logits = if decode {
+            engine.verify_media_device(&mut [(&mut p.placement, count)], &p.tokens[p.done..end], None, Some(&p.media))?
+        } else {
+            engine.prefill_media_device(&mut p.placement, &p.tokens[p.done..end], false, None, None, Some(&p.media))?
+        };
         consume_prefill_chunk(engine, selector, p, start, end, logits, retain, None)?;
         Ok(())
     }));
@@ -1009,7 +1121,7 @@ fn complete_prefill_chunk(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<C
     p: &mut Prefill<'_>) -> Result<Chunk> {
     // Intermediate snapshot points this chunk reaches (off unless configured).
     for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-        if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+        if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point], p.keys.spans(), &p.placement,
             After::default()) {
             tracing::warn!("snapshot point {point} not retained: {error:#}");
         }
@@ -1066,10 +1178,10 @@ fn prefill_batch(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let counts = [ends[0] - pair[0].done, ends[1] - pair[1].done];
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let [a, b] = &mut pair;
-        let logits = engine.prefill_pair_device([
+        let logits = engine.prefill_pair_media_device([
             (&mut a.placement, &a.tokens[a.done..ends[0]]),
             (&mut b.placement, &b.tokens[b.done..ends[1]]),
-        ])?;
+        ], [Some(&a.media), Some(&b.media)])?;
         // Each head/tap bank remains live until its own consumer has queued.
         // Context updates reuse scratch in stream order, with explicit drains.
         for (i, logits) in logits.into_iter().enumerate() {

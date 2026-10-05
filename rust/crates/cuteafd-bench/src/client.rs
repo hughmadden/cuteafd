@@ -23,7 +23,7 @@ pub struct Client {
 }
 
 /// One completed chat request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Chat {
     pub timing: StreamTiming,
     pub content: String,

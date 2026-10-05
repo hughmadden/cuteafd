@@ -19,6 +19,16 @@ fn preparer() -> MediaPreparer {
     .unwrap()
 }
 #[test]
+fn probe_fixture_hash_is_checked_before_memo_reuse() {
+    let preparer = preparer();
+    let correct = format!("{:x}", Sha256::digest(PNG));
+    assert_eq!(preparer.prepare_verified(&[source()], &[Some(correct.clone())]).unwrap().images.len(), 1);
+    assert!(preparer.prepare_verified(&[source()], &[Some("00".repeat(32))]).is_err());
+    assert!(preparer.prepare_verified(&[source()], &[Some("bad".into())]).is_err());
+    assert!(preparer.prepare_verified(&[source()], &[None, None]).is_err());
+    assert_eq!(preparer.prepare_verified(&[source()], &[Some(correct)]).unwrap().memo_hits, 1);
+}
+#[test]
 fn extraction_retains_history_and_content_order() {
     let body = json!({"messages":[{"content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"A","detail":"low"}}]},
         {"content":[{"type":"image_url","image_url":{"url":"B"}},{"type":"image_url","image_url":"C"}]}]});
@@ -40,6 +50,7 @@ fn memo_limits_detail_identity_eviction_and_failure_recovery() {
     assert_eq!((first.decode_misses, first.memo_hits), (1, 0));
     let history = preparer.prepare(&vec![source(); 128]).unwrap();
     assert_eq!((history.decode_misses, history.memo_hits), (0, 128));
+    assert_eq!(preparer.memo_hits(), 128);
     assert!(Arc::ptr_eq(&first.images[0], &history.images[0]));
     let mut low = source();
     low.low = true;

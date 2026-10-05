@@ -85,7 +85,9 @@ cuteafd-ffi      shared/vision.rs
 | RTX only (e.g. Qwen maximum, one PRO 6000) | GPU1 / GPU0 if the KV target holds | off + shortfall |
 | V4.1 (any) | RTX, unchanged | — (WP‑11 adds Spark) |
 
-D1 for TJ: on 2× PRO 6000 the GPU1 tower would cost nothing material against the 2M target and saves ~100 ms TTFT per new image. This design keeps Spark as the default per TJ's stated preference; flipping 2× PRO 6000 to `rtx:1` is a one-line policy change.
+D1 for TJ: on 2× PRO 6000 the GPU1 tower would cost nothing material against the 2M target and saves ~100 ms TTFT per new image. The opt-in `auto` planner policy remains Spark-first; flipping 2× PRO 6000 to `rtx:1` is a one-line policy change.
+
+**Measured (2026-10-06):** a single 1024-token image on a shared expert Spark added approximately 150 ms of decode stall; sustained back-to-back 4096-token encodes reduced decode by approximately 91%, failing the <=30% slowdown bar. An idle Spark showed no extra stall in the single-image diagnostic (not a sustained-load qualification). D1 remains open with TJ. Until that decision, generic-family launches default to `VISION=off`. MiMo's current serving adapter supports only `rtx`; `spark` and `auto` launches fail closed with an explicit hint until `RemoteEncoder` is wired into serving. The planner's opt-in Spark-first policy remains available for inspection. V4.1's existing RTX vision default is unchanged.
 
 ### 2.5 Latency budget against time-to-first-token
 

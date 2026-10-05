@@ -4,6 +4,7 @@ pub(crate) mod admission;
 pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod mtp;
+mod media;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 mod serving_owners;
@@ -1516,7 +1517,7 @@ fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         }
         filled = p;
         let timer = Instant::now();
-        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: 0, len: p, tokens: &tokens[..=p] }], stages)?
+        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: 0, len: p, tokens: &tokens[..=p], media: None }], stages)?
             .remove(0);
         seconds += timer.elapsed().as_secs_f64();
         for k in 0..stages {
@@ -1761,7 +1762,7 @@ fn greedy_digest(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine
     while out.len() < count {
         let timer = Instant::now();
         let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: placement.ring as usize, len: placement.len,
-            tokens: &history }], stages)?.remove(0);
+            tokens: &history, media: None }], stages)?.remove(0);
         draft_s += timer.elapsed().as_secs_f64();
         all_drafts.extend_from_slice(&drafts);
         let room = count - out.len();

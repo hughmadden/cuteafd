@@ -42,6 +42,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
         "invalid native frame budget"
     );
+    // The vision owner loads in this process/device's primary CUDA context,
+    // never beside expertd in a second process. Charge it before expert admission.
+    let _encoder = if let Some(encoder) = &config.encoder {
+        let (server, admitted) = crate::shared::vision::worker::start(encoder, &config.snapshot, config.library.clone(), config.device_budget as u64)?;
+        config.device_budget = config.device_budget.checked_sub(admitted as usize).context("vision reservation exceeds Spark budget")?;
+        Some(server)
+    } else { None };
     let library = unsafe { NativeLibrary::load(&config.library) }?;
     let (weights, remaining) = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");

@@ -552,6 +552,27 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
 }
 
 #[test]
+fn mimo_vision_accepts_only_resident_tower_geometry_and_bf16() {
+    let mut config = mimo_flash_mopd_config();
+    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut tensors = mimo_flash_mopd_tensors();
+    tensors.extend([t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]),
+        t("visual.merger.mlp.2.weight", "BF16", &[4096,5120]),
+        t("visual.blocks.0.norm1.weight", "BF16", &[1280])]);
+    let report = plan(snapshot_tp(config.clone(), &tensors, Some(4)).path(), &sparks(2)).unwrap();
+    assert_eq!(component(&report, Component::Vision).status, Status::Ready);
+    let mut wrong = tensors.clone();
+    wrong.last_mut().unwrap().1 = "F16";
+    let report = plan(snapshot_tp(config.clone(), &wrong, Some(4)).path(), &sparks(2)).unwrap();
+    assert!(rejected(&report, Component::Vision)[0].contains("BF16"));
+    config["vision_config"]["patch_size"] = json!(14);
+    let report = plan(snapshot_tp(config, &tensors, Some(4)).path(), &sparks(2)).unwrap();
+    assert!(rejected(&report, Component::Vision)[0].contains("patch_size"));
+}
+
+#[test]
 fn mimo_unsupported_inventories_name_the_tensors() {
     // V2 Flash geometry with MXFP4 experts: the mimo package runs E4M3.
     let mut tensors = mimo_flash_tensors();
@@ -1138,4 +1159,50 @@ fn media_off_is_disabled_and_saves_checkpoint_bytes() {
     assert_eq!(vision.status, Status::Disabled);
     assert_eq!(vision.bytes, 0);
     assert!(report.disabled_media_bytes > 0);
+}
+
+#[test]
+fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
+    use super::encoder::EncoderKind;
+    let mut cfg = mimo_flash_config();
+    cfg["vision_config"] = json!({"depth":28});
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(cfg, &tensors, Some(1));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96<<30], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
+    let spark = plan(dir.path(), &options).unwrap();
+    assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
+    let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
+    let memory = local.memory_layout.as_ref().unwrap();
+    let tower = memory.devices[0].items.iter().position(|i| i.group == "vision tower").unwrap();
+    let pool = memory.devices[0].items.iter().position(|i| i.group == "records").unwrap();
+    assert!(tower < pool);
+    let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
+    assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(),0);
+    assert_eq!(off.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes,0);
+    assert_ne!(spark.encoder_plan_hash,off.encoder_plan_hash);
+    assert_ne!(spark.encoder_plan_hash,local.encoder_plan_hash);
+    assert!(off.memory_layout.unwrap().devices.iter().flat_map(|d| &d.items).all(|i| !i.group.starts_with("vision")));
+}
+
+#[test]
+fn explicit_encoder_failure_and_small_pool_admission() {
+    use super::encoder::EncoderKind;
+    let mut cfg = mimo_flash_config();
+    cfg["vision_config"] = json!({"depth":28});
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(cfg, &tensors, Some(1));
+    let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32<<30], pool_tokens: Some(32768), ..Default::default()
+    }), ..Default::default() };
+    let local = plan(dir.path(), &options).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
+    for vision in [MediaMode::Rtx(Some(5)), MediaMode::Spark(Some(5))] {
+        let invalid = plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
+        assert!(!invalid.placement_supported);
+        assert!(!invalid.executable());
+        assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
+    }
 }

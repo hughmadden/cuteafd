@@ -80,6 +80,23 @@ impl RequestMedia {
         }
         Ok(())
     }
+    /// Probe-only override: bypasses the encoder with an admitted, domain-separated
+    /// feature lease. The real span identity stays unchanged; callers must cold-admit
+    /// the probe and disable every prefix snapshot. Never cache overrides by image key.
+    pub fn attach_probe_override(&mut self, image_key: ImageKey, lease: EmbeddingLease) -> Result<(), MediaError> {
+        if lease.key() == image_key { return Err(MediaError::Features); }
+        let rows = lease.features().ok_or(MediaError::NotReady(lease.key()))?;
+        let mut found = false;
+        for (span, slot) in self.spans.iter().zip(&mut self.features) {
+            if span.key == image_key {
+                if rows.len() != span.len * self.row_bytes { return Err(MediaError::Features); }
+                *slot = Some(lease.clone());
+                found = true;
+            }
+        }
+        if !found { return Err(MediaError::Spans); }
+        Ok(())
+    }
     pub fn has_features(&self, key: ImageKey) -> bool {
         self.spans
             .iter()
@@ -136,6 +153,23 @@ mod tests {
     use super::*;
     use crate::media::EmbeddingCache;
     use std::sync::Arc;
+    #[test]
+    fn probe_override_uses_a_separate_budgeted_cache_identity() {
+        let image = ImageKey([7; 32]); let override_key = ImageKey([8; 32]);
+        let mut request = RequestMedia::new(vec![MediaSpan { start: 1, len: 1, key: image }], 2, 3).unwrap();
+        let mut cache = EmbeddingCache::new(4);
+        let pin = cache.reserve(override_key, 4).unwrap();
+        let lease = cache.complete(override_key, Arc::from([0, 0, 0x80, 0x3f])).unwrap();
+        request.attach_probe_override(image, lease).unwrap(); drop(pin);
+        assert_eq!(request.spans()[0].key, image);
+        assert!(!cache.contains(image)); assert!(cache.contains(override_key));
+        assert!(cache.reserve(image, 4).is_err(), "override remains admitted and pinned");
+        let mut chunk = MediaChunk::default(); request.write_chunk(0, 3, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [1]); assert_eq!(chunk.features, [0, 0, 0x80, 0x3f]);
+        let mut native = EmbeddingCache::new(4); let pin = native.reserve(image, 4).unwrap();
+        let lease = native.complete(image, Arc::from([0; 4])).unwrap();
+        assert!(request.attach_probe_override(image, lease).is_err()); drop(pin);
+    }
     #[test]
     fn lazy_spans_stage_only_overlapping_rows_with_native_row_indices() {
         let key = ImageKey([7; 32]);
