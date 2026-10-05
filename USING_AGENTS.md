@@ -27,7 +27,7 @@ enhanced build.
 |---|---|---|
 | **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
-| **Astra 6** | Key kernel design and fresh insight on problems Sol has stalled on | Routine work (budget) |
+| **Astra 6** | Critical minimum, like Fable: a key kernel design or a fresh insight after Sol and Opus have stalled | Investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
 | **DeepSeek 4.1 Flash** | Fast structural work: renames, mechanical refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts | Numerics, kernels, judgment calls |
 | **Claude Opus subagents** | Judgment-heavy cross-cutting work: engine design changes (e.g. the device-driven exchange), hard merges, investigations needing many decisions, independent reviews | Work Sol can do from a clear brief |
 | **Claude Fable** | Extremely rarely: important design or planning, front-end design, a special kernel insight | Anything else |
@@ -45,15 +45,18 @@ but bounded engineering still goes to Sol.
 |---|---|---|
 | Default engineering, measurement, A/B, release smoke | Sol 6.1 | `high` |
 | Subtle numerics, kernels, root-cause investigations | Sol 6.1 | `xhigh` |
-| Key kernel design, new insight on a hard problem, Sol stalled at `xhigh` | Astra 6 | `medium`, `high` when it matters |
+| Critical kernel design only, after Sol `xhigh` and Opus have stalled | Astra 6 | `medium`; a short, design-only task that ends with a written design, then Sol builds it |
 | Structural or simple work, fast turnaround | DeepSeek Flash | `high`, `max` for larger sweeps |
 | Design changes, hard merges, independent review, decisions | Claude Opus | default |
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
 | Everything else exhausted | MiMo | default |
 
-- **Codex subscriptions:** use the `-backup` models (TJ's second
-  subscription) first while it still has resets to use; fall back to the
-  primary ones when it is spent. Astra burns budget faster than Sol but less
+- **Astra and Fable are rare.** Both cost far more per task; use them at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Codex subscriptions:** start new agents on the `-backup` models (TJ's
+  second subscription); when backup hits its weekly limit, start new agents
+  on primary. TJ can reset backup's usage; after a reset, new agents go
+  back to backup while running agents stay where they are (don't cancel
+  them to move them). Astra burns budget faster than Sol but less
   than Fable.
 - **Read the error body, not the headline.** The gateway prints "Server is
   temporarily limiting requests (not your usage limit)" for both cases. A
@@ -67,6 +70,7 @@ but bounded engineering still goes to Sol.
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
   error means switch subscription (backup ↔ primary) or model.
+- **Budget pacing:** a backup subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
 - **Parallelism:** run several Sol agents at once on independent tasks
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
@@ -235,6 +239,12 @@ These apply to every agent and are also in `AGENTS.md`.
 - **Disk:** builds fill raptor's root NVMe fast (`builds/` reached 1.4 TB and
   crashed runs with "No space left on device"). Delete Cargo `target*` and
   release staging when a task finishes; check `df -h /` before large builds.
+- **AOT exports outside the locks:** CuTe/Triton exporters query the device
+  at compile time, so the export container needs a GPU, but not a lock.
+  Pin it to an idle RTX (≤512 MiB used, bounded wait), watchdog its
+  memory, and on a Spark export only when no serving container runs and
+  ≥100 GiB CUDA memory is free. Log host, GPU and time so a concurrent
+  measurement can be explained.
 - **Root:** run privileged commands directly as
   `agent-sudo -n --agent-context "<why>" <command>` with the whole command
   visible. A wrapper script under sudo (`sudo python profile.py`) is flagged by
@@ -282,10 +292,12 @@ duplicating it. Record the lesson in the table below.
 | Literal 2% threshold kept a slower default | State the full decision rule |
 | Lock-order deadlock | `sparks.lock`, then `gpu1.lock`, with timeouts |
 | Stray 30 GB server | Teardown before releasing locks |
+| A build downloading wheels held sparks.lock ~45 min, 5 agents queued | Build outside hardware locks; locks only around GPU/Spark use |
 | 4-hour device-mode hang | Watchdogs and per-step timeouts |
 | Disk full at 1.4 TB of builds | Clean build output at task end |
 | `sudo python …` flagged | Sudo the real command directly |
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
+| Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |

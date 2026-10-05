@@ -88,6 +88,22 @@ pub fn report(failed: bool) -> Report {
 mod tests {
     use crate::render;
 
+    #[test]
+    fn publication_evidence_stays_in_full_report_not_card_options() {
+        let mut report = super::report(false);
+        let card = render::card::card_svg(&report);
+        for name in ["provenance.artifacts", "qualification.conditions", "supersedes-checkpoint"] {
+            report.server.configuration.settings.push(crate::report::Setting {
+                name: name.into(), value: Some("x".repeat(2048)), default: None, source: "publication".into(),
+            });
+        }
+        assert_eq!(render::card::card_svg(&report), card);
+        let full = render::report::panel_svg(&report, "configuration");
+        for name in ["provenance.artifacts", "qualification.conditions", "supersedes-checkpoint"] {
+            assert!(full.contains(name), "{name} evidence missing from full report");
+        }
+    }
+
     /// Renders every export of a normal and a failed report; with
     /// `CUTEAFD_BENCH_SAMPLE_DIR` set, writes them there for a look.
     #[test]

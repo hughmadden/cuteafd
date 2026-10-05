@@ -45,6 +45,10 @@ pub fn qualified_projection_memory(cfg: &MimoV2Config) -> Result<QualifiedProjec
 /// FP8 when every target head/O matrix has a 128-wide K grid (the single-copy
 /// FP8 consumers' layout); otherwise the checkpoint formats.
 pub fn default_policy(checkpoint: &Checkpoint, cfg: &MimoV2Config) -> MimoDefaultPolicy {
+    // The V2.6 Flash checkpoint has not qualified lossy target conversions.
+    if matches!(cfg.program_family().ok(), Some("mimof" | "mimof2")) {
+        return MimoDefaultPolicy::Checkpoint;
+    }
     let names = std::iter::once("lm_head.weight".to_string())
         .chain((0..cfg.layers).map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight")));
     for name in names {
@@ -90,6 +94,17 @@ pub(crate) mod tests {
             let spec = crate::plan::families::mimo::spec_from(&cfg, &checkpoint);
             assert!(spec.notes.iter().any(|note| note.contains("default: single-copy FP8")));
         }
+    }
+
+    #[test]
+    fn flash_mopd_does_not_inherit_qualified_lossy_target_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_snapshot(dir.path(), &crate::plan::testing::mimo_flash_mopd_config(),
+            &crate::plan::testing::mimo_flash_mopd_tensors(), Some(4));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
+        assert_eq!(default_policy(&checkpoint, &cfg.head_split(2).unwrap()), MimoDefaultPolicy::Checkpoint);
     }
 
     #[test]

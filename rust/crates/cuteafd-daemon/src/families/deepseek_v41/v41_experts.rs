@@ -32,9 +32,9 @@ pub(crate) enum ExpertLayer {
     /// slices of every expert, so every rank sees every route.
     BackboneReplicatedTp { layer: usize, rank: usize, world: usize },
     /// EXL3 compact TP shard: one rank of an implicit (no `--spark-tp/--spark-ep`
-    /// keys), unreplicated three-way intermediate split of the compressed
-    /// checkpoint, carved on whole H128 blocks. `world` is the shard count and is
-    /// only ever 3 today; the two-rank compact profile keeps the dedicated
+    /// keys), unreplicated intermediate split of the compressed checkpoint,
+    /// carved on whole H128 blocks. `world` is 1 (Qwen whole experts), 3 or 6;
+    /// the two-rank compact profile keeps the dedicated
     /// `BackboneTp2` layer so its published behavior is unchanged. This layer
     /// must never resolve to a native FP8/W4A4 kernel or native staging
     /// selection, which would substitute a different weight format.

@@ -241,7 +241,7 @@ pub(crate) fn with_engine<T>(
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     // The default pool and local-expert placement retain the existing path.
     // Auto resolves every GPU before any cache, workspace or expert allocation.
-    let auto = if args.pool_tokens == 0 {
+    let auto = if args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let memory = devices.iter().map(|&device| crate::shared::peer_split::on_device(
@@ -298,7 +298,8 @@ pub(crate) fn with_engine<T>(
                 "V4 automatic admission cannot fit the requested RTX expert layers; lower --local-expert-layers");
         }
         let profile = admission::profile(&geometry, &memory, &shape, local.peak_bytes as u64)?;
-        let capacity = admission::resolve(&profile, &memory, args.max_sequences)?;
+        let capacity = admission::resolve_pool(&profile, &memory, args.max_sequences,
+            (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
         tracing::info!(pool_tokens = capacity.allocated_gpu_kv_tokens, local_layers = local.layers,
             local_peak_bytes = local.peak_bytes, devices = ?capacity.devices, "DeepSeek V4 planner admission");
         Some((usize::try_from(capacity.allocated_gpu_kv_tokens)?, local))

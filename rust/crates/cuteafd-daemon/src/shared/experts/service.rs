@@ -500,6 +500,15 @@ mod tests {
     }
 
     #[test]
+    fn implicit_tp1_selects_whole_exl3_experts_and_rank_package() {
+        let one = config(1, 0, None);
+        assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
+        assert!(one.selection(7).unwrap().role() > 7);
+        assert_eq!(one.native_group().unwrap(), None);
+        assert!(one.exl3_directory_for(&[4, 5]).ends_with("tp1-rank0"));
+    }
+
+    #[test]
     fn legacy_selection_is_unchanged_and_topology_must_agree() {
         assert_eq!(config(4, 3, None).selection(2).unwrap(), ExpertLayer::Backbone { layer: 2, rank: 3 });
         assert_eq!(config(2, 1, None).selection(2).unwrap(), ExpertLayer::BackboneTp2 { layer: 2, rank: 1 });
@@ -732,9 +741,14 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
         return Ok(());
     }
     ensure!(
-        matches!(config.world, 2 | 3 | 4 | 6) && config.rank < config.world,
-        "implicit Spark world must be 2, 3, 4 or 6 with rank below world; \
+        matches!(config.world, 1 | 2 | 3 | 4 | 6) && config.rank < config.world,
+        "implicit Spark world must be 1, 2, 3, 4 or 6 with rank below world; \
          an explicit TP x EP topology must pass --spark-tp/--spark-ep"
+    );
+    ensure!(
+        config.world != 1 || (catalog.exl3().is_some()
+            && catalog.routed_experts().geometry()?.family() == Some("qwen4")),
+        "implicit Spark TP1 requires Qwen EXL3 experts (qwen4:exl3-k45)"
     );
     // Native FP4 Flash has a distinct TP2 shard. Other native FP4 layouts
     // continue to require the explicit ownership-aware topology outside TP4.
@@ -775,7 +789,7 @@ impl NativeExpertServiceConfig {
                 2 => ExpertLayer::BackboneTp2 { layer, rank: self.rank },
                 // Admission above admits world 3 only for an EXL3 checkpoint, so
                 // this can never resolve to the native FP8 shard family.
-                3 | 6 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: self.world },
+                1 | 3 | 6 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: self.world },
                 _ => ExpertLayer::Backbone { layer, rank: self.rank },
             });
         };

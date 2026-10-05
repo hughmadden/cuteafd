@@ -205,7 +205,7 @@ def main() -> None:
     nll = -torch.log_softmax(logits[0, :-1].double(), -1).gather(1, ids[0, 1:, None]).mean().item()
     (a.out / "meta.json").write_text(json.dumps({
         "tokens": len(tokens), "snapshot": str(a.snapshot),
-        "reference": "snapshot modeling_mimo_v2.py (trust_remote_code, eager); qkv de-interleaved from TP8 shards; "
+        "reference": f"snapshot modeling_mimo_v2.py (trust_remote_code, eager); qkv de-interleaved from TP{weights.ckpt_tp} shards; "
                      "MXFP4 experts widened exactly",
         "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok, "mean_nll": nll,
         "seconds": time.time() - started,

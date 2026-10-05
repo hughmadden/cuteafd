@@ -74,13 +74,20 @@ pub fn card_svg(report: &Report) -> String {
     // Hardware, options, build and badge.
     let hw = &r.server.hardware;
     let mut hardware = hw.line();
+    if let Some(budget) = c.settings.iter().find(|s| s.name == "coordinator-gpu-budget-gib")
+        .and_then(|s| s.value.as_deref()) {
+        hardware.push_str(&format!(" · {budget} GiB budget"));
+    }
     let links: Vec<f64> = hw.fabric.iter().filter(|p| p.active).map(|p| p.link_gbps).collect();
     if !hw.sparks.is_empty() && !links.is_empty() {
         hardware.push_str(&format!(" · RoCE {:.0} Gb/s", links.iter().cloned().fold(0.0, f64::max)));
     }
     doc.text(pad, 538.0, Font::new(16.0, t.ink).weight(600), &fit(&hardware, 16.0, WIDTH - 2.0 * pad));
     doc.text(pad, 560.0, Font::new(13.0, t.ink2), &fit(&r.capacity().line(), 13.0, WIDTH - 2.0 * pad));
-    let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str()))
+    // Publication evidence belongs in the full report, not the fixed-height option strip.
+    let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
+        && !s.name.starts_with("provenance.") && !s.name.starts_with("qualification.")
+        && s.name != "supersedes-checkpoint")
         .map(|s| s.chip()).take(10).collect();
     if !options.is_empty() {
         chips(&mut doc, &t, pad, 572.0, WIDTH - 2.0 * pad, &options, t.series[2]);

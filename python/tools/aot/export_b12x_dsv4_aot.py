@@ -298,7 +298,37 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     their intermediate slices); mHC, the DSA indexer, router, expert input and head stay the
     whole model's programs."""
     keep = ("kda_m", "kda_w8_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
-    return [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    from b12x.integration.cuteafd import glmf
+
+    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
+    programs.append(("join_heads", "join", {"half_width": g.kda_width},
+                     lambda: glmf.compile_glmf_join_aot(g.kda_width)))
+    programs.append(("join_rows", "join_rows", {"width": g.hidden},
+                     lambda: glmf.compile_glmf_join_rows_aot(g.hidden)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        programs.append((f"kda_w8_norm_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode, "output_kind": "norm"},
+                         lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(
+                             g, max_rows=r, fp8_only=m, output_kind="norm")))
+        programs.append((f"kda_output_rows_m{rows}", "kda_output_rows", {"max_rows": rows, "fp8_only": mode},
+                         lambda r=rows, m=mode: glmf.compile_glmf_kda_output_rows_aot(
+                             g, max_rows=r, fp8_only=m)))
+        for suffix, dtype in (("f32", "float32"),):
+            programs.append((f"kda_w8_{suffix}_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode, "output_dtype": dtype},
+                             lambda r=rows, m=mode, d=dtype: glmf.compile_glmf_kda_aot(
+                                 g, max_rows=r, fp8_only=m, output_dtype=d)))
+    for suffix, dtype in (("", "bfloat16"), ("_f32", "float32")):
+        programs.append((f"kda_w8{suffix}_expanded_m{prefill_rows}", "kda",
+                         {"max_rows": prefill_rows, "fp8_only": "prefill", "output_dtype": dtype, "prefill_expanded": True},
+                         lambda d=dtype: glmf.compile_glmf_kda_aot(
+                             g, max_rows=prefill_rows, fp8_only="prefill", output_dtype=d, prefill_expanded=True)))
+    programs.extend([
+        (f"kda_w8_norm_expanded_m{prefill_rows}", "kda", {"max_rows": prefill_rows, "output_kind": "norm", "prefill_expanded": True},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=prefill_rows, fp8_only="prefill", output_kind="norm", prefill_expanded=True)),
+        (f"kda_output_rows_expanded_m{prefill_rows}", "kda_output_rows", {"max_rows": prefill_rows, "prefill_expanded": True},
+         lambda: glmf.compile_glmf_kda_output_rows_aot(g, max_rows=prefill_rows, fp8_only="prefill", prefill_expanded=True)),
+    ])
+    return programs
 
 
 def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
@@ -371,7 +401,7 @@ def main() -> None:
                         help="comma-separated geometries in one table: flash, pro (DeepSeek V4; flash2 / pro2: one GPU of "
                              "its two-GPU head split), glm (GLM 5.x), "
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
-                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), "
+                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
@@ -382,15 +412,15 @@ def main() -> None:
 
     import torch
     from b12x.integration.cuteafd import (
-        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_PRO, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
+        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "glmf", "glmf2", "qwen4") for name in geometries):
-        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, glmf, glmf2 "
-                         "and/or qwen4")
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4") for name in geometries):
+        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
+                         "glmf, glmf2 and/or qwen4")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -419,6 +449,10 @@ def main() -> None:
                                      full_kv_heads=MIMO_V26_PRO.full_kv_heads // 2,
                                      swa_kv_heads=MIMO_V26_PRO.swa_kv_heads // 2,
                                      dense_inter=MIMO_V26_PRO.dense_inter // 2)
+        mimof2 = dataclasses.replace(MIMO_V26_FLASH, name="mimo_v26_flash_tp2", heads=MIMO_V26_FLASH.heads // 2,
+                                     full_kv_heads=MIMO_V26_FLASH.full_kv_heads // 2,
+                                     swa_kv_heads=MIMO_V26_FLASH.swa_kv_heads // 2,
+                                     dense_inter=MIMO_V26_FLASH.dense_inter // 2)
         # glm2: GLM 5.x split over two GPUs by heads (32 each; dense and shared MLPs by
         # intermediate).
         glm2 = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2, dense_inter=GLM53.dense_inter // 2,
@@ -435,13 +469,14 @@ def main() -> None:
                      for n, base in (("flash2", FLASH), ("pro2", PRO))}
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
-             "mimo2": mimo2, "mimop2": mimop2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
+             "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
-                  "mimo2": "mimo2", "mimop2": "mimop2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
+                  "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         make = {"flash2": head_split_programs, "pro2": head_split_programs, "glm": glm_programs,
                 "glm2": glm_head_split_programs, "mimo": mimo_programs, "mimop": mimo_programs,
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
+                "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]

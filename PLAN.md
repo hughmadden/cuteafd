@@ -743,7 +743,10 @@ Work, in priority order:
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
    without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
-   returned as content (#1 FR-G.14).
+   returned as content (#1 FR-G.14). Readiness bug (2026-10-05, fidelity
+   agent): `/v1/models` reports ready before the Spark experts finish
+   loading on the V4.1 launch path; readiness must wait for every expert
+   rank.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
@@ -756,7 +759,30 @@ Work, in priority order:
    item 4m), Engram counters / shard dir / table warm (FR-D.10), preflight,
    plan-only boot and ready probe (FR-D.11), whole-step graphs and
    device-side draft acceptance, W4A4 decode rows, deterministic prefill.
-9. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+9. **Open issue: synchronized Spark response gaps.** GLM 5.3 Flash split
+   (2 RTX + 4 Sparks, 2026-10-05 01:26 UTC): one BF16 launch had ~440 ms
+   inter-wave response gaps on all four workers at once (normal 15–18 ms),
+   with identical routes, GPU work and Spark clocks, and no overlapping
+   cluster job. This caused the historical "split FP8 −24%" reading (not
+   precision). Suspect a coordinator or transport timeout/retry path; it
+   may affect every family. Investigate if it recurs.
+10. **Build hygiene:** `./build.sh` takes the hardware locks and pins GPU0
+    through its CPU, download and AOT export phases; it should take
+    `build.lock` for those and touch hardware only where it measures.
+    Build containers run as root, leaving root-owned `target*` directories
+    agents can't delete; run them as the host user (UID 1000 on raptor,
+    1001 on the Sparks).
+11. **V4.1 NVFP4 decode (parked 2026-10-05):** NVFP4 trails official MXFP4
+    by 16% C1 / 14% C4 on 1 RTX + 4 (tokens per round 3.94 → 2.87, Spark
+    expert kernel +32% per layer). ncu: the cooperative NVFP4 kernel runs one
+    90 KB CTA per SM at 6% occupancy, versus MXFP4's fused-slice kernel at
+    2 CTAs per SM. A noncooperative NVFP4 slice kernel (fork
+    `work/v41-nvfp4-slice` 3173cc2e) reached 3 CTAs per SM but ran 28–38%
+    slower at 1–16 rows. Untested hypothesis: it re-quantizes BF16 → FP4 per
+    slice × route slot, where MXFP4 takes pre-quantized FP8 wire rows; try a
+    quantize-once input stage or an FP8 wire first. Wide-row M32 tiles lost
+    on both GPUs. Official MXFP4 stays the recommended V4.1 checkpoint.
+12. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)
@@ -1279,6 +1305,32 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     measurement is one matched D/F launch with identical 8K token IDs,
     worker timing/route distributions and Spark clocks, plus KDA/head
     precision ablation if quality remains below the split promotion bar.
+    **Fresh split profiling:** a warmed matched launch per arm did not
+    reproduce the large prefill/C4 losses, while the golden quality delta
+    reproduced exactly. Nsight timelines confirm half-head FP8 KDA on both
+    GPUs, with unchanged peer traffic and synchronization counts. W8A16
+    KDA projection compute is locally slower at wide prefill and verification
+    shapes. Row128 head slices preserve whole-weight payloads and scales
+    byte for byte. KDA-only/head-only ablations localize most extra KL to
+    KDA. Golden scoring uses a one-token prefix and 64-row verification
+    chunks, so the half-head GEMV tuning and chunked-recurrence window do
+    not explain that delta. KDA partial rounding is being tested independently;
+    MLA and dense/shared FFN partials also round before the peer sum.
+    Measurements and conditions are recorded in the profiling audit commit.
+    **Split investigation handoff (2026-10-05):** three interleaved BF16
+    versus full-K KDA token-row FP8 launches qualify the measured EXL3 K3.25
+    two-RTX/TP4 opt-in under TJ's paired quality/C1 bar. Recommend promotion
+    to Hugh/TJ, but leave defaults unchanged. C1 consistently improves;
+    C4/prefill are parity to modest gains, agentic was not measured. Original
+    large prefill loss does not reproduce in FP8; synchronized ~440 ms
+    worker-response gaps instead occur in a BF16 launch with identical routes
+    and near-stable expert execution. No overlapping serving/build container
+    found in retained lifecycle logs; incomplete host/fabric history means
+    contention is not completely excluded. Coordinator/transport stalls
+    remain a separate open issue, not a precision verdict. Full-MLA/full-FFN
+    row prototypes are retired. Conditions, medians/spreads, paired quality,
+    opt-ins and limits: `docs/models/glm5_flash.md`. Hugh owns further GLM
+    Flash work (issue #1); no new broad experiments in this task.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`

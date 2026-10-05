@@ -289,11 +289,12 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pool_tokens = if args.pool_tokens == 0 {
+        let pool_tokens = if args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
             // The planner's GLM costs stay free on each GPU; records fill the rest.
             let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
             crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, 0)?
+                args.draft.as_deref(), args.prefill_rows, 0,
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0)?
         } else {
             args.pool_tokens
         };

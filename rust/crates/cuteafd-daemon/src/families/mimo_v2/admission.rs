@@ -512,7 +512,7 @@ fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&str>) 
         Some("4") => Ok(4),
         // Flash TP4 prefill is faster with two larger waves; the Pro TP6
         // measurement above does not apply to its smaller expert geometry.
-        None => Ok(if matches!(family, "mimo" | "mimo2") { 2 } else { 3 }),
+        None => Ok(if matches!(family, "mimo" | "mimo2" | "mimof" | "mimof2") { 2 } else { 3 }),
         Some(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
     }
 }
@@ -989,7 +989,7 @@ pub(super) fn workspace_native_scratch(
 mod tests {
     #[test]
     fn prefill_lane_defaults_follow_family_and_preserve_explicit_overrides() {
-        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimop", 3), ("mimop2", 3)] {
+        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimof", 2), ("mimof2", 2), ("mimop", 3), ("mimop2", 3)] {
             assert_eq!(super::resolve_transport_lanes(true, family, None).unwrap(), default);
             for lanes in 1..=4 {
                 let configured = lanes.to_string();

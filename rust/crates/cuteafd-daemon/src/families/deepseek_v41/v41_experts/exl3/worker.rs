@@ -75,6 +75,12 @@ impl<'a> Exl3Worker<'a> {
             .context("EXL3 worker workspace budget overflow")
     }
 
+    fn validate_rank(world: usize, rank: usize) -> Result<()> {
+        ensure!(matches!(world, 1 | 2 | 3 | 4 | 6) && rank < world,
+            "EXL3 worker requires implicit Spark TP1, TP2, TP3, TP4 or TP6 weights");
+        Ok(())
+    }
+
     pub(crate) fn new(
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
@@ -87,10 +93,7 @@ impl<'a> Exl3Worker<'a> {
             anyhow::bail!("EXL3 Spark worker requires backbone layers");
         };
         let rank = first.layout.rank;
-        ensure!(
-            matches!(first.layout.world, 2 | 3 | 4 | 6) && rank < first.layout.world,
-            "EXL3 worker requires implicit Spark TP2, TP3, TP4 or TP6 weights"
-        );
+        Self::validate_rank(first.layout.world, rank)?;
         for (index, weight) in weights.iter().enumerate() {
             ensure!(
                 matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(layer)

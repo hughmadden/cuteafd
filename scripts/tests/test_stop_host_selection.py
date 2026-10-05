@@ -129,6 +129,20 @@ class StopHarness(unittest.TestCase):
 
 
 class StopHostScopeTest(StopHarness):
+    def test_explicit_pool_host_stops_without_legacy_rank_keys(self):
+        config = self.root / "moa.config"
+        config.write_text("SPARK_COUNT=1\nSPARK_HOSTS=moa\n")
+        result, lines, _ = self.run_stop("--config", str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.hosts(lines)), {"moa"})
+
+    def test_explicit_pool_hosts_preserve_legacy_cleanup_scope(self):
+        config = write_config(self.root / "override.config", FOUR_HOSTS,
+                              spark_count=4, extra="SPARK_HOSTS=moa")
+        result, lines, _ = self.run_stop("--config", str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.hosts(lines)), set(FOUR_HOSTS + ["moa"]))
+
     def test_mimo_dflash_config_stops_every_named_host(self):
         config = write_config(self.root / "mimo.config", SIX_HOSTS, spark_count=6,
                               extra="SPECULATOR=dflash2\n"

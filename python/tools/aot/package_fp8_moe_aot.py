@@ -279,6 +279,8 @@ def build(args: argparse.Namespace) -> None:
     if base.weights == "mxfp4" and not args.layouts:
         # MXFP4 slices pad to 128 (MiMo V2.6 Pro: TP6 over all six Sparks, TP2 x EP3 shards).
         layouts = list(MXFP4_ROLE_LAYOUTS[args.role])
+        if args.geometry == "mimof" and args.role == "spark":
+            layouts = ["tp2", "tp4"]
     elif base.weights == "nvfp4" and not args.layouts:
         layouts = [l for l in NVFP4_ROLE_LAYOUTS[args.role]
                    if base.intermediate // 16 >= int(l.removeprefix("tp"))]
@@ -400,7 +402,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("build")
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
-    create.add_argument("--geometry", choices=("mimo", "mimop", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
+    create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
                                                "glmfdense_nvfp4", "glmfdense_nvfp4a4"),
                         required=True)

@@ -420,6 +420,8 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     # Six ranks wherever each gets at least one H128 block (V4 Pro: 24 -> 4;
     # 2048: 16 -> 3/2; not Qwen's 5).
     worlds = (4, 2, 3, 6) if blocks >= 6 else (4, 2, 3)
+    if geometry == 'qwen4':
+        worlds = (*worlds, 1)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):

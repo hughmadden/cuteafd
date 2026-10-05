@@ -476,8 +476,7 @@ impl<'a> MimoLoader<'a> {
             "{name}: checkpoint shards do not divide into {ranks} head groups");
         let source_bytes = self.tensor(name)?.meta.byte_length as usize;
         let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-        let stride = share.qkv_key_stride();
-        let width = layout.padded_rows(stride);
+        let (width, segments) = layout.program_segments(&share)?;
         let cols = source_bytes / full.rows().max(1);
         crate::shared::memory::staging::with_staging_pair(width * cols, source_bytes, |values, bytes| {
             let (_, dtype, shape) = self.read_into(name, bytes, 0)?;
@@ -487,13 +486,6 @@ impl<'a> MimoLoader<'a> {
                 "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} \
                  {shape:?} / {scale_dtype:?} {scale_shape:?}", full.rows(), full.scale_rows(), k_blocks,
                 self.checkpoint_tp);
-            let segments = if stride == layout.k {
-                layout.segments()
-            } else {
-                ensure!(layout.k == cfg.head_dim && stride % 128 == 0 && layout.q % 128 == 0 && layout.v % 128 == 0,
-                    "{name}: padded keys need one KV head per checkpoint shard and 128-row query/value shards");
-                layout.segments_with_key_stride(stride)
-            };
             let grid: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
             (0..ranks).map(|rank| {
                 // This rank's shards: a contiguous run of checkpoint rows and grid rows.
@@ -762,7 +754,10 @@ impl<'a> MimoLoader<'a> {
             }
         } else {
             let router = format!("{p}.mlp.gate.weight");
-            if self.tensor(&router)?.meta.dtype == DType::Bf16 {
+            let expected = if cfg.router_fp32 { DType::F32 } else { DType::Bf16 };
+            ensure!(self.tensor(&router)?.meta.dtype == expected,
+                "{router}: selected program requires {expected:?} router weights");
+            if !cfg.router_fp32 {
                 ops[0].insert("w_router", self.one(&router)?);
             } else {
                 ops[0].insert("w_hilo", self.router_hilo(&router)?);

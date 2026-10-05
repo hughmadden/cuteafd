@@ -139,20 +139,36 @@ pub(crate) struct KvDevice {
 /// The largest pool (whole `unit_rows` units, at most `target` tokens) every
 /// device can hold in its free memory now, after its reserve. Restores the
 /// calling thread's device.
-pub(crate) fn auto_pool_tokens(library: &cuteafd_ffi::NativeLibrary, devices: &[KvDevice], unit_rows: u64,
-    target: u64) -> anyhow::Result<u64> {
+/// Fixed pools are checked (never silently shrunk) with the same workspace,
+/// graph, state and drafter reserves as auto pools, before cache allocation.
+/// `requested` is None for automatic admission.
+pub(crate) fn admitted_pool_tokens(library: &cuteafd_ffi::NativeLibrary, devices: &[KvDevice], unit_rows: u64,
+    target: u64, requested: Option<u64>) -> anyhow::Result<u64> {
+    use cuteafd_core::serving_capacity::{DeviceMemory, GpuMemoryBudget};
+    anyhow::ensure!(unit_rows > 0, "KV admission needs positive allocation units");
+    let wanted = requested.unwrap_or(unit_rows).div_ceil(unit_rows)
+        .checked_mul(unit_rows).ok_or_else(|| anyhow::anyhow!("KV admission token overflow"))?;
     let current = library.cuda_get_device()?;
     let mut free = Vec::with_capacity(devices.len());
     for device in devices {
         library.cuda_set_device(device.device)?;
         let sample = library.cuda_memory_info();
         library.cuda_set_device(current)?;
-        let (available, _) = sample?;
+        let (available, total) = sample?;
+        let required = device.bytes_per_token.checked_mul(wanted)
+            .and_then(|bytes| bytes.checked_add(device.reserve_bytes))
+            .ok_or_else(|| anyhow::anyhow!("KV admission byte overflow"))?;
+        GpuMemoryBudget(total as u64).admit(DeviceMemory { device: u32::try_from(device.device)?,
+            total_bytes: total as u64, baseline_free_bytes: available as u64 }, required)?;
+        tracing::info!(device = device.device, fixed_reserve_bytes = device.reserve_bytes,
+            bytes_per_token = device.bytes_per_token, requested_pool_tokens = ?requested,
+            "KV admission including workspaces, state, graphs and draft reserve");
         free.push(available as i64 - device.reserve_bytes as i64);
     }
     let per_token: Vec<u64> = devices.iter().map(|d| d.bytes_per_token).collect();
-    let tokens = cuteafd_core::memory_layout::size_pool(&free, &per_token, unit_rows, target);
-    tracing::info!(tokens, target, ?free, ?per_token, "automatic KV pool from free memory after fixed costs");
+    let tokens = requested.map_or_else(|| cuteafd_core::memory_layout::size_pool(&free, &per_token, unit_rows, target),
+        |_| wanted);
+    tracing::info!(tokens, target, ?free, ?per_token, "KV pool admitted after fixed costs");
     anyhow::ensure!(tokens >= unit_rows, "no room for a KV pool after fixed costs (free after reserve {free:?} bytes)");
     Ok(tokens)
 }
@@ -165,6 +181,18 @@ pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
         .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len())).sum()).unwrap_or(0)
 }
 
+fn admission_cache_ranks(geometry: &cuteafd_loader::serving_capacity::FamilyCacheGeometry,
+    glmf_split: bool) -> Vec<cuteafd_loader::serving_capacity::RankCacheGeometry> {
+    if !glmf_split { return geometry.ranks.clone(); }
+    geometry.ranks.iter().flat_map(|rank| {
+        let mut half = rank.clone();
+        half.active_state_per_sequence_bytes /= 2;
+        half.retained_mark_bytes /= 2;
+        half.speculative_replay_bytes /= 2;
+        [half.clone(), half]
+    }).collect()
+}
+
 /// The planner's automatic KV pool for an engine about to allocate its cache:
 /// each GPU's free memory now, minus what the planner says is still to come
 /// there (step workspaces, peer exchange, drafter, recurrent state, prefix
@@ -172,31 +200,74 @@ pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
 /// `devices` lists the KV-owning GPUs, lead first; `drafter` is an external
 /// drafter checkpoint the lead GPU will load.
 pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path, devices: &[i32],
-    drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize) -> anyhow::Result<usize> {
+    drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
+    requested: Option<u64>, future_expert_bytes: u64) -> anyhow::Result<usize> {
+    planned_pool_tokens_with_extra(library, snapshot, devices, drafter, prefill_rows, slots, requested,
+        future_expert_bytes, 0)
+}
+
+/// As `planned_pool_tokens`, also reserving a family's optional per-GPU
+/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool.
+pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
+    devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
+    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64) -> anyhow::Result<usize> {
     use anyhow::Context;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
     let model = family.open(&checkpoint).map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    // The model contract currently describes GLM Flash's one-GPU cache.
+    // Its implemented split replicates MLA and divides KDA heads per GPU.
+    let glmf = family.id() == "glm5_flash";
+    let cache_ranks = if glmf { 1 } else { devices.len() };
     let geometry = model.cache_geometry(cuteafd_loader::serving_capacity::CacheOptions {
-        coordinator_ranks: devices.len(), ..Default::default() })?
+        coordinator_ranks: cache_ranks, ..Default::default() })?
         .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
     let costs = cuteafd_loader::plan::layout::family_costs(family.id());
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let draft = drafter.map_or(0, |d| safetensors_bytes(d) + (1300 << 20));
     let unit = geometry.logical_unit_rows.max(1);
     let split = devices.len() == 2;
-    let kv: Vec<KvDevice> = devices.iter().zip(&geometry.ranks).enumerate().map(|(index, (&device, rank))| {
+    let ranks = admission_cache_ranks(&geometry, glmf && split);
+    anyhow::ensure!(ranks.len() == devices.len(), "cache geometry must cover every admitted GPU");
+    let kv: Vec<KvDevice> = devices.iter().zip(&ranks).enumerate().map(|(index, (&device, rank))| {
         let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
         let workspace = costs.workspace_bytes[role] * prefill_rows.max(1) as u64 / 4096;
-        let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * slots as u64;
+        let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * slots as u64
+            + if cuteafd_ffi::coordinator_gpu_budget().is_some() { rank.speculative_replay_bytes } else { 0 };
         let marks = rank.retained_mark_bytes * costs.mark_slots;
         KvDevice {
             device,
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
             reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 } + if index == 0 { draft } else { 0 }
-                + state + marks + costs.graph_bytes[role] + headroom,
+                + state + marks + costs.graph_bytes[role] + headroom + extra_reserve_bytes
+                + if index == 0 { future_expert_bytes } else { 0 },
         }
     }).collect();
-    let tokens = auto_pool_tokens(library, &kv, unit, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?;
+    let tokens = admitted_pool_tokens(library, &kv, unit, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
+        requested)?;
     Ok(usize::try_from(tokens)?)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use cuteafd_loader::serving_capacity::{FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+
+    #[test]
+    fn glmf_split_admits_replicated_mla_and_half_kda_on_every_gpu() {
+        let rank = RankCacheGeometry { persistent_unit_bytes: 1024, pool_metadata_unit_bytes: 4,
+            active_state_per_sequence_bytes: 2048, retained_mark_bytes: 2048,
+            speculative_replay_bytes: 512, fixed_state_bytes: 768, ..Default::default() };
+        let geometry = FamilyCacheGeometry { logical_unit_rows: 256, placement: KvPlacement::SingleDevice,
+            ranks: vec![rank.clone()] };
+        assert_eq!(admission_cache_ranks(&geometry, false), vec![rank]);
+        let split = admission_cache_ranks(&geometry, true);
+        assert_eq!(split.len(), 2);
+        for rank in split {
+            assert_eq!((rank.persistent_unit_bytes, rank.pool_metadata_unit_bytes, rank.fixed_state_bytes),
+                (1024, 4, 768));
+            assert_eq!((rank.active_state_per_sequence_bytes, rank.retained_mark_bytes, rank.speculative_replay_bytes),
+                (1024, 1024, 256));
+        }
+    }
 }

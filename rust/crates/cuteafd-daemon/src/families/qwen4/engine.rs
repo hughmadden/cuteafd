@@ -154,12 +154,19 @@ impl LocalExl3<'_> {
     }
 }
 
+/// The MTP layer stays resident locally even when backbone experts run on Sparks.
+pub(crate) enum MtpExperts<'a> {
+    Fp8(Fp8Experts<'a>),
+    Exl3(RefCell<crate::families::deepseek_v4::local::LocalExperts<'a>>),
+}
+
 /// Where the routed experts run.
 pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
-    /// Spark ranks over RoCE (one BF16 partial plane per rank).
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
+    /// Spark ranks over RoCE (one BF16 partial plane per rank), plus a local draft layer.
+    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime,
+        mtp: Option<MtpExperts<'a>> },
     /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
     SharedOnly,
 }
@@ -1776,7 +1783,7 @@ impl<'a> Qwen4Engine<'a> {
                 w.route_weights.buffer.ptr, t, self.cfg.experts, self.cfg.topk, 1.0, true, self.stream)?;
         }
         // Spark layers run the shared expert during the exchange (spark_moe).
-        if !matches!(experts, Experts::Spark { .. }) {
+        if !matches!(experts, Experts::Spark { .. }) || index == self.cfg.layers {
             self.shared(w, layer, rows)?;
         }
         if matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
@@ -1844,9 +1851,31 @@ impl<'a> Qwen4Engine<'a> {
                 }
                 return Ok(());
             }
-            Experts::Spark { transport, runtime } => {
-                ensure!(index < self.cfg.layers, "the Spark ranks do not serve the MTP layer's experts");
-                return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
+            Experts::Spark { transport, runtime, mtp } => {
+                if index < self.cfg.layers {
+                    return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
+                }
+                ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
+                match mtp.as_ref().context("Spark backbone needs coordinator-local MTP experts (--mtp)")? {
+                    MtpExperts::Fp8(experts) => {
+                        let resident = experts.index_of(index)?;
+                        // SAFETY: MTP input/routes and its output are live on this stream.
+                        unsafe { experts.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr,
+                            w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.stream)? };
+                    }
+                    MtpExperts::Exl3(experts) => {
+                        let mut experts = experts.borrow_mut();
+                        // SAFETY: the resident draft owns its workspace; wire/routes/shared
+                        // and the copied output are ordered on the engine's stream.
+                        unsafe {
+                            experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
+                                w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                                w.shared.buffer.ptr, self.stream)?;
+                            self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
+                        }
+                        return Ok(());
+                    }
+                }
             }
             Experts::SharedOnly => {
                 // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.

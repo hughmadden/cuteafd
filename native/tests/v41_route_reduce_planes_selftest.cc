@@ -1,7 +1,7 @@
 // Exact-reference check for the replicated-group N-plane compact reducer.
 //
 // Independent host scalar reference: each physical rank contributes one BF16
-// [rows,5120] plane, the 2/3/4/6 planes are summed in rank order in FP32, the
+// [rows,5120] plane, the 1/2/3/4/6 planes are summed in rank order in FP32, the
 // optional BF16 shared expert is added exactly once, and the result is rounded
 // once to BF16. Also checks:
 //   * the historical TP2/TP4 entry points agree bit-for-bit with the generic
@@ -10,7 +10,7 @@
 //     byte of the capacity-sized buffer stays at its poison value;
 //   * the rows=4096 upper boundary;
 //   * a captured graph re-reads changed plane/shared contents on every replay
-//     (ranks 3 and 6) instead of baking them;
+//     (ranks 1, 3 and 6) instead of baking them;
 //   * all-zero and single-zero active planes contribute exact zeros;
 //   * every malformed case is rejected with exactly one violation in an
 //     otherwise-valid six-slot argument set.
@@ -181,7 +181,7 @@ int main() {
   for (uint32_t rows : {1u, 16u, 80u, 3u, 4096u}) {
     fill_host(rows, 1.0f, 1.0f);
     upload_planes();
-    for (uint32_t ranks : {2u, 3u, 4u, 6u}) {
+    for (uint32_t ranks : {1u, 2u, 3u, 4u, 6u}) {
       launch_and_verify(rows, ranks, false, false, "no shared");
       launch_and_verify(rows, ranks, true, false, "with shared");
       launch_and_verify(rows, ranks, true, true, "shared exact alias");
@@ -229,7 +229,7 @@ int main() {
     const uint32_t rows = 16;
     fill_host(rows, 1.0f, 1.0f);
     upload_planes();
-    for (uint32_t ranks : {2u, 3u, 4u, 6u}) {
+    for (uint32_t ranks : {1u, 2u, 3u, 4u, 6u}) {
       for (uint32_t zero = 0; zero < ranks; ++zero) {
         const std::vector<uint16_t> saved = host_plane[zero];
         std::fill(host_plane[zero].begin(), host_plane[zero].end(), uint16_t(0));
@@ -255,14 +255,14 @@ int main() {
     }
   }
 
-  // Graph capture/replay: capture once at ranks 3 and 6, then replay with
+  // Graph capture/replay: capture once at ranks 1, 3 and 6, then replay with
   // changed plane and shared contents and require the replay to consume the new
   // contents. No allocation happens between instantiate and replay.
   {
     const uint32_t rows = 16;
     cudaStream_t stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create capture stream");
-    for (uint32_t ranks : {3u, 6u}) {
+    for (uint32_t ranks : {1u, 3u, 6u}) {
       fill_host(rows, 1.0f, 1.0f);
       upload_planes();
       upload_shared(rows);

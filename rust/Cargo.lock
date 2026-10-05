@@ -708,6 +708,7 @@ dependencies = [
  "cuteafd-core",
  "libloading",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

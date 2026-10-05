@@ -298,21 +298,14 @@ fn block(
                     what: error.to_string(),
                 }
             })?;
-        let stride = share.qkv_key_stride();
-        if layout.rows() * ranks != full.rows()
-            || layout.scale_rows() * ranks != full.scale_rows()
-            || stride != layout.k
-                && (layout.k != cfg.head_dim
-                    || stride % 128 != 0
-                    || layout.q % 128 != 0
-                    || layout.v % 128 != 0)
-        {
+        if layout.rows() * ranks != full.rows() || layout.scale_rows() * ranks != full.scale_rows() {
             return Err(CacheGeometryError::ResidentTensor {
-                name: fused,
-                what: "fused shard geometry does not provide the program's key padding (one KV head per shard is required)".into(),
+                name: fused, what: "checkpoint shards do not divide coordinator ranks".into(),
             });
         }
-        layout.padded_rows(stride) as u64
+        layout.program_segments(&share).map_err(|error| CacheGeometryError::ResidentTensor {
+            name: fused, what: error.to_string(),
+        })?.0 as u64
     } else {
         if cfg.qkv_key_stride() != cfg.head_dim {
             return Err(CacheGeometryError::ResidentTensor {

@@ -145,6 +145,37 @@ pub fn mimo_flash_tensors() -> Vec<Tensor> {
     out
 }
 
+/// V2.6 Flash MOPD: Flash shapes with BF16 routing and MXFP4 experts.
+pub fn mimo_flash_mopd_config() -> Value {
+    let mut config = mimo_flash_config();
+    config["architectures"] = json!(["MiMoV2ForCausalLM"]);
+    config["model_type"] = json!("mimo_v2");
+    config["rope_theta"] = json!(1e7);
+    config["layernorm_epsilon"] = json!(1e-6);
+    config["moe_router_dtype"] = json!("bfloat16");
+    config["attention_projection_layout"] = json!("fused_qkv");
+    config["quantization_config"]["store_dtype"] = json!("mxfp4");
+    config["quantization_config"]["mxfp4_block_size"] = json!(32);
+    config
+}
+
+/// TP4 fused QKV: full has one KV head per shard; SWA has two.
+pub fn mimo_flash_mopd_tensors() -> Vec<Tensor> {
+    let mut out = mimo_flash_tensors();
+    out.retain(|(name, ..)| !["q_proj", "k_proj", "v_proj"].iter()
+        .any(|proj| name.contains(&format!("self_attn.{proj}."))) && !name.contains(".experts."));
+    for layer in 0..2 {
+        let (rows, scales) = if layer == 0 { (13568, 108) } else { (14848, 116) };
+        out.extend(fp8(&format!("model.layers.{layer}.self_attn.qkv_proj"), rows, 4096, Some(scales)));
+    }
+    let router = out.iter_mut().find(|(name, ..)| name == "model.layers.1.mlp.gate.weight").unwrap();
+    router.1 = "BF16";
+    for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+        out.extend(mxfp4(&format!("model.layers.1.mlp.experts.0.{proj}"), n, k));
+    }
+    out
+}
+
 /// MiMo V2.6 Pro's config with two layers (full + dense, SWA + MoE).
 pub fn mimo_pro_config() -> Value {
     let mut config = json!({

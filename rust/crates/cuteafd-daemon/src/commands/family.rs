@@ -120,6 +120,29 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_budget_is_global_and_survives_family_forwarding() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "--coordinator-gpu-budget-gib", "32",
+            "serve", "--family", "qwen4", "--snapshot", "/m"]).unwrap();
+        assert_eq!(cli.coordinator_gpu_budget_gib, Some(32.0));
+        let crate::cli::Commands::Serve(args) = cli.command else { panic!("serve") };
+        let argv = argv(Kind::Serve, args).unwrap().unwrap();
+        let mut argv = argv;
+        argv.extend(["--native-lib".into(), "/lib.so".into(), "--coordinator-gpu-budget-gib".into(), "32".into()]);
+        let forwarded = crate::cli::Cli::try_parse_from(argv).unwrap();
+        assert_eq!(forwarded.coordinator_gpu_budget_gib, Some(32.0));
+        for (_, serve, _) in FAMILIES {
+            let mut argv = vec!["cuteafd", *serve, "--snapshot", "/m", "--native-lib", "/lib.so",
+                "--coordinator-gpu-budget-gib", "32"];
+            if matches!(*serve, "serve-native" | "serve-mimo" | "serve-glm" | "serve-dsv4") {
+                argv.extend(["--peers", "127.0.0.1:9,127.0.0.1:10"]);
+            }
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.coordinator_gpu_budget_gib, Some(32.0), "{serve}");
+        }
+    }
+
+    #[test]
     fn snapshot_is_found_in_either_spelling() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(snapshot_arg(&a(&["--port", "1", "--snapshot", "/x"])), Some("/x"));

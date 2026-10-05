@@ -96,10 +96,10 @@ class PackageProfileTests(unittest.TestCase):
     # How many ranks share one export per width, from the layout contract.
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
-    def build_fixture(self, root, role, bits, paired=False, require=(), tiles=()):
+    def build_fixture(self, root, role, bits, paired=False, require=(), tiles=(), geometry='v41'):
         capacities = (1, 80)
         args = argparse.Namespace(
-            output=root / 'package', build_dir=root / 'build', role=role,
+            output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)), paired_tp4=paired,
             residency=[], require_layout=list(require), tile=list(tiles),
             cxx='unused-cxx', cuda_include=root, cuda_libdir=root,
@@ -126,8 +126,13 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertNotIn('tile', options,
                                  'the exporter refuses a tile override on paired builds')
             # The build command may request a tile override and a residency cap.
-            self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'paired_boundary'},
+            self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'paired_boundary',
+                                                'hidden', 'swiglu_limit'},
                                  'unexpected option consumed by the fake export')
+            if geometry != 'v41':
+                meta['hidden'] = options['hidden']
+                self.assertEqual(options['hidden'], package.GEOMETRIES[geometry][0])
+                self.assertEqual(options['swiglu_limit'], package.swiglu_limit(geometry))
             # Same derivation as the exporter: direct vs packed routing decides the
             # route bridge, so m1 needs it too whenever routing is packed.
             direct = (False if DIRECT_ROUTES is None else bool(DIRECT_ROUTES(
@@ -145,7 +150,7 @@ class PackageProfileTests(unittest.TestCase):
                 # verification", and verify() rejects zeros outright.
                 meta['tile'] = list(NEUTRAL_POLICY_TILE)
             else:
-                meta['tile'] = list(POLICY_TILE(None, hidden_size=5120,
+                meta['tile'] = list(POLICY_TILE(None, hidden_size=package.GEOMETRIES[geometry][0],
                     intermediate_size=width, token_count=capacity,
                     direct_topk_routes=direct))
             if meta['requires_route_preparation']:
@@ -218,6 +223,25 @@ class PackageProfileTests(unittest.TestCase):
                                     self.assertEqual(
                                         path.read_bytes(),
                                         (twin / path.relative_to(first)).read_bytes())
+
+    def test_qwen_spark_tp1_packages_whole_width_bf16_experts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, calls, capacities = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), require=['tp1-rank0'], geometry='qwen4')
+            self.assertEqual(manifest['geometry'], 'qwen4')
+            self.assertEqual(manifest['requested_layouts'], ['tp1-rank0'])
+            variants = [v for v in manifest['variants'] if v['directory'].startswith('tp1-rank0/')]
+            self.assertEqual(len(variants), len(capacities))
+            for variant in variants:
+                self.assertEqual((variant['intermediate'], variant['experts'], variant['top_k'],
+                                  variant['output_dtype'], variant['bits']), (640, 512, 10, 'bf16', [4, 5]))
+                meta = json.loads((output / variant['directory'] / 'v41_exl3.json').read_text())
+                self.assertEqual(meta['hidden'], 2560)
+            whole = [call for call in calls if call.args[1] == 640]
+            self.assertEqual(len(whole), len(capacities))
+            for call in whole:
+                self.assertEqual(call.kwargs['hidden'], 2560)
+                self.assertIsNone(call.kwargs['swiglu_limit'])
 
     def test_requested_layouts_are_recorded_and_reverified(self):
         """A declared contract survives into verify(); its absence does not (v9)."""
@@ -392,6 +416,10 @@ class PackageProfileTests(unittest.TestCase):
         coordinator = [name for name, *_ in package.shard_profiles('qwen4', 'coordinator')]
         self.assertEqual(coordinator, ['rtx-tp1'])
         spark = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('qwen4', 'spark')}
+        self.assertEqual(spark['tp1-width640'], (640, ['tp1-rank0']))
+        tp1 = next(p for p in package.shard_profiles('qwen4', 'spark') if p[0] == 'tp1-width640')
+        self.assertEqual(tp1[2:5], (512, 10, 'bf16'))
+        self.assertEqual(package.parse_requested_layouts(['tp1-rank0'], 'spark', 'qwen4'), ['tp1-rank0'])
         self.assertEqual(spark['tp4-width256'], (256, ['tp4-rank0']))
         self.assertEqual(spark['tp4-width128'], (128, ['tp4-rank1', 'tp4-rank2', 'tp4-rank3']))
         self.assertEqual(spark['tp3-width256'], (256, ['tp3-rank0', 'tp3-rank1']))

@@ -91,7 +91,8 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
                           physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
                           restart: bool = False, preferred_ranks: int | None = None,
-                          gpu_free_mib: int = 97000, container_pids: tuple[int, ...] = (),
+                          gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
+                          container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
@@ -125,6 +126,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
                                          " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
                                          '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
+                                         ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
                                          " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
                                          ' ;; *) echo 0; echo 1 ;; esac\n')
@@ -135,6 +137,35 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                            *(["--restart"] if restart else [])],
                           env=env, capture_output=True, text=True, timeout=30)
+
+
+def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "SPARK_HOSTS=moa\nEXPERT_BACKEND=spark\nSPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert "moa" in worker
+    assert "--rank 0 --world 1" in worker
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--peers 10.55.0.6:" in launch
+    assert "--local-experts" not in launch
+    assert not any("ssh" in line and "h0" in line for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("hosts,message", [
+    ("moa,moa", "exactly SPARK_COUNT"),
+    ("unknown", "unknown Spark pool host"),
+    ("moa,", "comma-separated Spark pool host list"),
+    ("moa,moa\nSPARK_COUNT=2", "duplicate host"),
+])
+def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str, message: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  f"SPARK_HOSTS={hosts}\nEXPERT_BACKEND=spark\nSPECULATOR=off\n")
+    assert result.returncode == 2, result.stderr
+    assert message in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "cuteafd serve-qwen4" not in result.stderr
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
@@ -179,9 +210,22 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--split-device" in launch) == split
-    assert f"--kda-fp8 {'off' if split else 'row128'}" in launch
-    assert f"--fp8-head {'false' if split else 'true'}" in launch
+    # Both layouts default to row128 KDA and an FP8 head; the split adds
+    # token-row KDA output ownership.
+    assert "--kda-fp8 row128" in launch
+    assert "--fp8-head true" in launch
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+    assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
+
+
+@pytest.mark.parametrize("keys,shard", [("", True), ("GLM5_FLASH_KDA_SPLIT=partials\n", False),
+                                        ("GLM5_FLASH_KDA_FP8=off\n", False)])
+def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=2\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--kda-output-shard" in launch) == shard
 
 
 @pytest.mark.parametrize("layout", ["RTX_GPUS=1\n", "RTX_GPUS=2\n"])
@@ -203,8 +247,8 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 @pytest.mark.parametrize("layout,keys,kda,head", [
     ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
     ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=row128\n", "row128", "false"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=on\n", "off", "true"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -223,7 +267,8 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
     if accepted:
         assert "--fp8-prefill all" in result.stderr
     else:
-        assert "GLM5_FLASH_KDA_FP8=row128 or channel" in result.stderr
+        # The split's default token-row KDA output excludes KDA output W8A8.
+        assert "GLM5_FLASH_KDA_SPLIT=partials" in result.stderr
         assert "docker run" not in result.stderr
 
 
@@ -232,9 +277,13 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
     ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
     ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
     ("GLMF_FP8_HEAD=on\n", ["--fp8-head true"]),
-    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n", ["--fp8-prefill all"]),
+    # KDA output W8A8 (kda-o/all) excludes the split's token-row output, so
+    # those cases select the partial-sum split path explicitly.
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=all\n",
+     ["--fp8-prefill all"]),
     ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
-    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n", ["--fp8-prefill kda-o,ffn"]),
+    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n",
+     ["--fp8-prefill kda-o,ffn"]),
 ])
 def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
@@ -314,10 +363,11 @@ def test_invalid_glm_drafter_quantization_rejects_before_starting_containers(tmp
 
 
 @pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
-@pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
-def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):
+@pytest.mark.parametrize("store, geometry, ranks, hidden", [("fp8", "mimo", 4, 4096), ("mxfp4", "mimop", 6, 6144),
+                                                        ("mxfp4", "mimof", 2, 4096), ("mxfp4", "mimof", 4, 4096)])
+def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks, hidden):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
-              "quantization_config": {"store_dtype": store}}
+              "hidden_size": hidden, "quantization_config": {"store_dtype": store}}
     keys = f"EXPERT_INPUT={mode}\nSPARK_COUNT={ranks}\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n"
     keys += "".join(f"SPARK_{r}_HOST=h{r}\nSPARK_{r}_LANE_A=10.0.0.{r + 1}\n" for r in range(ranks))
     result = _family_launch_result(tmp_path, config, "test/mimo", keys)
@@ -593,6 +643,88 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
     assert "--pool-tokens 0" in dsv4
 
 
+@pytest.mark.parametrize("family_config", [*SPLIT_CONFIGS.values(),
+    {"model_type": "deepseek_v4"},
+    {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}])
+def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, family_config):
+    model = "zai-org/GLM-5.3-Flash" if family_config.get("model_type") == "glm5_next" else "test/model"
+    result = _family_launch_result(tmp_path, family_config, model,
+                                  "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line)
+    assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
+    for line in result.stderr.splitlines():
+        if "expertd-native" in line:
+            assert "--coordinator-gpu-budget-gib" not in line
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "NaN", "inf", "32GiB", "0.0000000000001", "9999999999999999999999"])
+def test_coordinator_gpu_budget_rejects_invalid_values_before_side_effects(tmp_path, budget):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  f"COORDINATOR_GPU_BUDGET_GIB={budget}\n")
+    assert result.returncode != 0
+    assert "COORDINATOR_GPU_BUDGET_GIB must be" in result.stderr
+    assert "docker " not in result.stderr and "ssh " not in result.stderr and "nest " not in result.stderr
+
+
+def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_path):
+    result = _family_launch_result(tmp_path,
+        {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
+        "COORDINATOR_GPU_BUDGET_GIB=32\n", preferred_ranks=4,
+        gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx-gib 26.0" in preflight and "--coordinator-budget-gib 26.0" in preflight
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen4" in line)
+    assert "--coordinator-gpu-budget-gib 32" in launch and "--peers" in launch
+
+
+def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
+    config = tmp_path / "budget.config"
+    config.write_text("COORDINATOR_GPU_BUDGET_GIB=32\n")
+    result = subprocess.run(["bash", "-c", 'source "$1"; release_load_config "$2" stop; printf "%s" "$COORDINATOR_GPU_BUDGET_GIB"',
+        "bash", str(ROOT / "scripts/lib/release-common.sh"), str(config)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and result.stdout == "32", result.stderr
+    for file in ("run.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
+        assert 'args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")' in (ROOT / file).read_text()
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
+    ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("DRAFT_FP8=off\n", "bf16"), ("SPECULATOR=off\n", "off"),
+    ("MTP=0\n", "off"), ("DFLASH=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
+])
+def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str) -> None:
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
+    model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
+    result = _family_launch_result(tmp_path, config, model, keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
+    if expected in ("off", "mtp"):
+        assert "--draft" not in launch
+        assert ("--mtp 1" in launch) == (expected == "mtp")
+    else:
+        assert "--draft /root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        if expected == "checkpoint":
+            assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
+        else:
+            assert f"--draft-fp8 {'true' if expected == 'fp8' else 'false'}" in launch
+
+
+def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path: Path) -> None:
+    _snapshot(tmp_path / "hf", "test/external-draft", {})
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2", "num_hidden_layers": 2,
+                                  "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+                                  "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/external-draft\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "models--test--external-draft/snapshots/abc" in launch
+    assert "--draft-fp8" not in launch
+
+
 def test_family_config_reads_share_the_stop_key_grammar() -> None:
     import re
 
@@ -659,13 +791,14 @@ def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, d
         assert f"--mtp {depth}" in launch
 
 
-def test_qwen_spark_mtp_reports_the_missing_expert_layer(tmp_path: Path) -> None:
+def test_qwen_spark_mtp_keeps_the_draft_layer_on_coordinator(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
                                             "quantization_config": {"quant_method": "exl3"}},
                                   "test/model", "EXPERT_BACKEND=spark\nSPECULATOR=mtp\n")
-    assert result.returncode == 2
-    assert "Spark ranks do not serve the MTP layer's experts" in result.stderr
-    assert "expertd-native" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--mtp 3" in launch and "--peers " in launch and "--local-experts" not in launch
+    assert "expertd-native" in result.stderr
 
 
 @pytest.mark.parametrize("method,mtp_layers", [("exl3", 0), ("exl3", 2), ("fp8", 1), ("nvfp4", 1)])
