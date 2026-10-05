@@ -4,6 +4,7 @@ You are working on CuteAFD at /home/tj/Developer/cuteafd (Rust engine + CuTe-DSL
 - Work in your own git worktree OUTSIDE the repo directory (e.g. /home/tj/Developer/cuteafd-<task>), on the named branch off origin/work/p0; push the branch. Never edit the main checkout at /home/tj/Developer/cuteafd.
 - Build only under ~/.cache/cuteafd/builds/<task> after scripts/build/assert-build-filesystem.py. Delete your Cargo target and staging directories when you finish.
 - Hardware: take sparks.lock before gpu1.lock (~/.cache/cuteafd/{sparks,gpu1}.lock, see ~/.cache/cuteafd/builds/tp2/locked2.sh), only around runs; each run is one blocking command with a timeout; stop your servers/containers and Spark workers before releasing the locks. Other agents share the cluster.
+- Hold sparks.lock / gpu1.lock only while GPUs or Spark serving are actually in use. Builds, image assembly, wheel/crate downloads and CPU tests run outside the hardware locks (use build.lock only if a build must be serialized); one agent once held sparks.lock ~45 min downloading wheels while five others queued.
 - Root: run privileged commands directly as `agent-sudo -n --agent-context "<why>" <command>` with the whole command line visible; never sudo a wrapper script or interpreter.
 - Kernel changes land on sparkinfer-glmrt master first, then bump the pin + lock here.
 - Frugal measurement: one warm launch per arm unless a number is borderline. No attribution trailers in commits.

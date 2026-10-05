@@ -282,6 +282,7 @@ duplicating it. Record the lesson in the table below.
 | Literal 2% threshold kept a slower default | State the full decision rule |
 | Lock-order deadlock | `sparks.lock`, then `gpu1.lock`, with timeouts |
 | Stray 30 GB server | Teardown before releasing locks |
+| A build downloading wheels held sparks.lock ~45 min, 5 agents queued | Build outside hardware locks; locks only around GPU/Spark use |
 | 4-hour device-mode hang | Watchdogs and per-step timeouts |
 | Disk full at 1.4 TB of builds | Clean build output at task end |
 | `sudo python …` flagged | Sudo the real command directly |
