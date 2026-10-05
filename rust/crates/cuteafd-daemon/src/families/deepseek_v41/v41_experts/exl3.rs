@@ -66,19 +66,19 @@ fn arena_layout(plan: &V41Exl3Residency) -> Result<(Vec<usize>, usize)> {
     Ok(plan.device_arena_layout()?)
 }
 
-fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer, partition: V41Exl3Partition) -> Result<V41Exl3Residency> {
-    let (layer, world, rank) = match layer {
+fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize)> {
+    Ok(match layer {
         ExpertLayer::Backbone { layer, rank } => (V41Exl3Layer::Backbone(layer), 4, rank),
         ExpertLayer::BackboneFull { layer } => (V41Exl3Layer::Backbone(layer), 1, 0),
         ExpertLayer::BackboneTp2 { layer, rank } => (V41Exl3Layer::Backbone(layer), 2, rank),
         // Implicit compact TP shard on a compressed checkpoint: the shard count
         // rides on the layer, so the whole-block H128 partition drives residency
-        // directly. Three- and six-rank groups reach this layer; the two-rank
+        // directly. One-, three- and six-rank groups reach this layer; the two-rank
         // compact profile keeps `BackboneTp2` untouched above.
         ExpertLayer::BackboneExl3Tp { layer, rank, world } => {
             ensure!(
-                matches!(world, 3 | 6) && rank < world,
-                "EXL3 Spark shards support implicit three- and six-rank groups, got TP{world} rank {rank}"
+                matches!(world, 1 | 3 | 6) && rank < world,
+                "EXL3 Spark shards support implicit one-, three- and six-rank groups, got TP{world} rank {rank}"
             );
             (V41Exl3Layer::Backbone(layer), world, rank)
         }
@@ -89,7 +89,11 @@ fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer, partition: V41Exl3Pa
         ExpertLayer::BackboneReplicatedTp { .. } => anyhow::bail!(
             "replicated TP×EP expert groups require the official native checkpoint"
         ),
-    };
+    })
+}
+
+fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer, partition: V41Exl3Partition) -> Result<V41Exl3Residency> {
+    let (layer, world, rank) = residency_selection(layer)?;
     catalog
         .exl3()
         .context("EXL3 residency requires a routed EXL3 checkpoint")?
@@ -319,6 +323,28 @@ impl<'a> Exl3Weights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_shard_residency_selection_admits_whole_experts() -> Result<()> {
+        for world in [1, 3, 6] {
+            for rank in 0..world {
+                let (layer, selected_world, selected_rank) = residency_selection(
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world })?;
+                assert!(matches!(layer, V41Exl3Layer::Backbone(7)));
+                assert_eq!((selected_world, selected_rank), (world, rank));
+            }
+            assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: world, world }).is_err());
+        }
+        for world in [0, 2, 4, 5, 7] {
+            assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world }).is_err());
+        }
+        assert!(matches!(residency_selection(ExpertLayer::BackboneTp2 { layer: 7, rank: 1 })?,
+                         (V41Exl3Layer::Backbone(7), 2, 1)));
+        assert!(matches!(residency_selection(ExpertLayer::Backbone { layer: 7, rank: 3 })?,
+                         (V41Exl3Layer::Backbone(7), 4, 3)));
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_EXL3_SNAPSHOT and CUDA memory for one TP4 layer"]
     fn compressed_layer_uploads_match_staged_bytes() -> Result<()> {
