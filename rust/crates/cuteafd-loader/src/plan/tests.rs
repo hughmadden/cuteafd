@@ -552,6 +552,27 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
 }
 
 #[test]
+fn mimo_vision_accepts_only_resident_tower_geometry_and_bf16() {
+    let mut config = mimo_flash_mopd_config();
+    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut tensors = mimo_flash_mopd_tensors();
+    tensors.extend([t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]),
+        t("visual.merger.mlp.2.weight", "BF16", &[4096,5120]),
+        t("visual.blocks.0.norm1.weight", "BF16", &[1280])]);
+    let report = plan(snapshot_tp(config.clone(), &tensors, Some(4)).path(), &sparks(2)).unwrap();
+    assert_eq!(component(&report, Component::Vision).status, Status::Ready);
+    let mut wrong = tensors.clone();
+    wrong.last_mut().unwrap().1 = "F16";
+    let report = plan(snapshot_tp(config.clone(), &wrong, Some(4)).path(), &sparks(2)).unwrap();
+    assert!(rejected(&report, Component::Vision)[0].contains("BF16"));
+    config["vision_config"]["patch_size"] = json!(14);
+    let report = plan(snapshot_tp(config, &tensors, Some(4)).path(), &sparks(2)).unwrap();
+    assert!(rejected(&report, Component::Vision)[0].contains("patch_size"));
+}
+
+#[test]
 fn mimo_unsupported_inventories_name_the_tensors() {
     // V2 Flash geometry with MXFP4 experts: the mimo package runs E4M3.
     let mut tensors = mimo_flash_tensors();

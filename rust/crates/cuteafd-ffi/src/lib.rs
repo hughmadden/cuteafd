@@ -1752,6 +1752,16 @@ impl NativeLibrary {
         Ok(Some(guard))
     }
 
+    pub fn cuda_device_info(&self, device: i32) -> Result<CuteafdCudaDeviceInfo> {
+        type Query = unsafe extern "C" fn(i32, *mut CuteafdCudaDeviceInfo) -> CuteafdStatus;
+        // SAFETY: exact native ABI; library and output remain live through this synchronous query.
+        let query: Symbol<Query> = unsafe { self.lib.get(b"cuteafd_cuda_device_info")? };
+        let mut info = CuteafdCudaDeviceInfo::default();
+        // SAFETY: query writes one initialized device-info record.
+        self.status_to_result("cuteafd_cuda_device_info", unsafe { query(device, &mut info) })?;
+        Ok(info)
+    }
+
     pub fn cuda_get_device(&self) -> Result<i32> {
         let call: Symbol<unsafe extern "C" fn(*mut i32) -> CuteafdStatus> =
             unsafe { self.lib.get(b"cuteafd_cuda_get_device")? };

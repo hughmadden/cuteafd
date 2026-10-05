@@ -959,6 +959,20 @@ impl<'a> MimoEngine<'a> {
         Ok(out)
     }
 
+    fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<()> {
+        let Some(media) = media else { return Ok(()); };
+        let start = tables.positions.first().copied().context("media prefill positions")? as usize;
+        let mut chunk = cuteafd_engine::media::MediaChunk::default();
+        media.write_chunk(start, start + tables.positions.len(), &mut chunk)?;
+        if chunk.indices.is_empty() { return Ok(()); }
+        // Reuse norm scratch and a table only before their consumers. The FFI adapter
+        // drains the injection before restoring seq_first; no new device allocations.
+        self.library.embedding_injection()?.inject_host(&chunk.features, &chunk.indices,
+            w.x.buffer, w.seq_first.buffer, w.h.buffer, tables.positions.len(), self.cfg.hidden, 1, self.stream)?;
+        self.put(&w.seq_first, &tables.seq_first)
+    }
+
     /// Prefills a sequence from its length through every resident layer and
     /// returns the last row's logits when all layers are resident, with teacher forcing: after layer `l`, `forced(l)` (when it
     /// returns rows) replaces the residual before layer `l + 1`, so each
@@ -975,6 +989,13 @@ impl<'a> MimoEngine<'a> {
     pub fn prefill_device(&self, placement: &mut MimoPlacement, tokens: &[u32], all_logits: bool,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        self.prefill_media_device(placement, tokens, all_logits, on_layer, forced, None)
+    }
+
+    pub fn prefill_media_device(&self, placement: &mut MimoPlacement, tokens: &[u32], all_logits: bool,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>)
+        -> Result<Option<DeviceLogits>> {
         ensure!(!all_logits || self.prefill_output == MimoPrefillOutput::AllRows,
             "this MiMo engine admits last-row prefill logits; load an AllRows diagnostic engine for all_logits");
         let (t, start) = (tokens.len(), placement.len);
@@ -1004,9 +1025,9 @@ impl<'a> MimoEngine<'a> {
             let lane_tables = bounds.iter().map(|&(a, b)| tables(start + a, start + b)).collect::<Result<Vec<_>>>()?;
             let steps: Vec<(&StepTables, &[u32])> = lane_tables.iter().zip(&bounds)
                 .map(|(tables, &(a, b))| (tables, &tokens[a..b])).collect();
-            self.step_lanes(&steps)?
+            self.step_lanes(&steps, media)?
         } else {
-            self.step(&tables(start, start + t)?, tokens, if all_logits { t } else { 1 }, on_layer, forced)?
+            self.step(&tables(start, start + t)?, tokens, if all_logits { t } else { 1 }, on_layer, forced, media)?
         };
         placement.len += t;
         Ok(logits)
@@ -1055,6 +1076,11 @@ impl<'a> MimoEngine<'a> {
     /// DFlash taps are separate banks, consumed with `update_lane(0/1)`.
     pub fn prefill_pair_device(&self, requests: [(&mut MimoPlacement, &[u32]); 2])
         -> Result<[Option<DeviceLogits>; 2]> {
+        self.prefill_pair_media_device(requests, [None, None])
+    }
+
+    pub fn prefill_pair_media_device(&self, requests: [(&mut MimoPlacement, &[u32]); 2],
+        media: [Option<&cuteafd_engine::media::RequestMedia>; 2]) -> Result<[Option<DeviceLogits>; 2]> {
         let [(first, first_tokens), (second, second_tokens)] = requests;
         ensure!(self.can_prefill_pair([first_tokens.len(), second_tokens.len()]),
             "independent prefill pair exceeds the admitted lanes");
@@ -1062,7 +1088,7 @@ impl<'a> MimoEngine<'a> {
         let tables = [first.prefill_tables(first_tokens.len(), self.max_context)?,
             second.prefill_tables(second_tokens.len(), self.max_context)?];
         let logits = self.submit(|| self.step_lanes_inner(&[
-            (&tables[0], first_tokens), (&tables[1], second_tokens)], true))?;
+            (&tables[0], first_tokens), (&tables[1], second_tokens)], true, &media))?;
         let logits: [Option<DeviceLogits>; 2] = logits.try_into()
             .map_err(|_| anyhow::anyhow!("an independent prefill pair returns two outputs"))?;
         first.len += first_tokens.len();
@@ -1076,11 +1102,13 @@ impl<'a> MimoEngine<'a> {
     /// wave is out. Each lane is exactly a consecutive prefill chunk (lane 0
     /// writes its KV before lane 1 reads it at every layer). Returns the last
     /// row's logits.
-    fn step_lanes(&self, lanes: &[(&StepTables, &[u32])]) -> Result<Option<DeviceLogits>> {
-        self.submit(|| self.step_lanes_inner(lanes, false).map(|mut logits| logits.pop().flatten()))
+    fn step_lanes(&self, lanes: &[(&StepTables, &[u32])], media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        let media = vec![media; lanes.len()];
+        self.submit(|| self.step_lanes_inner(lanes, false, &media).map(|mut logits| logits.pop().flatten()))
     }
 
-    fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool)
+    fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool,
+        media: &[Option<&cuteafd_engine::media::RequestMedia>])
         -> Result<Vec<Option<DeviceLogits>>> {
         let Some(Experts::Spark { transport, lanes: links, runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts with lane transports");
@@ -1113,6 +1141,7 @@ impl<'a> MimoEngine<'a> {
             self.put(&w[i].seq_first, &tables.seq_first)?;
             self.put(&w[i].page_table, &tables.page_table)?;
             self.embedding.embed(tokens, w[i].ids.buffer, 1, w[i].h.buffer, self.stream)?;
+            self.inject_media(w[i], tables, media.get(i).copied().flatten())?;
         }
         let peer_workspaces = match &self.peer {
             Some(peer) => {
@@ -1286,7 +1315,7 @@ impl<'a> MimoEngine<'a> {
                 tables.page_table.extend(pages);
             }
         }
-        let logits = self.step(&tables, tokens, rows, on_layer, None)?;
+        let logits = self.step(&tables, tokens, rows, on_layer, None, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
@@ -1295,13 +1324,13 @@ impl<'a> MimoEngine<'a> {
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
-        self.submit(|| self.step_inner(tables, tokens, logit_rows, on_layer, forced))
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        self.submit(|| self.step_inner(tables, tokens, logit_rows, on_layer, forced, media))
     }
 
     fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         let (cell, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if cell.borrow().is_none() {
@@ -1366,6 +1395,7 @@ impl<'a> MimoEngine<'a> {
             return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+        self.inject_media(w, tables, media)?;
         let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
@@ -2013,7 +2043,7 @@ impl<'a> MimoEngine<'a> {
                 if groups.is_empty() {
                     break;
                 }
-                self.mtp_pass(mtp, k, &groups, None)?;
+                self.mtp_pass(mtp, k, &groups, None, seqs)?;
                 let mut ext = mtp.ext.borrow_mut();
                 for (ring, first, tokens) in &groups {
                     ext[*ring][k] = ext[*ring][k].max(first + tokens.len());
@@ -2044,7 +2074,7 @@ impl<'a> MimoEngine<'a> {
                     rows += n;
                     index += 1;
                 }
-                self.mtp_pass(mtp, k, &groups, Some(&members))?;
+                self.mtp_pass(mtp, k, &groups, Some(&members), seqs)?;
                 let mut ext = mtp.ext.borrow_mut();
                 for (&i, (ring, _, _)) in members.iter().zip(&groups) {
                     ext[*ring][k] = ext[*ring][k].max(seqs[i].len.saturating_sub(k));
@@ -2091,7 +2121,8 @@ impl<'a> MimoEngine<'a> {
     /// with `members`, each group's last row's draft becomes stage `k`'s draft
     /// of that member (on the device). Queued: no host wait.
     fn mtp_pass(&self, mtp: &super::mtp::MtpDrafter<'_>, k: usize,
-        groups: &[(usize, usize, Vec<super::mtp::Token>)], members: Option<&[usize]>) -> Result<()> {
+        groups: &[(usize, usize, Vec<super::mtp::Token>)], members: Option<&[usize]>,
+        seqs: &[super::mtp::MtpSeq<'_>]) -> Result<()> {
         use super::mtp::{Token, HIDDEN_ROWS};
         let stage = &mtp.stages[k];
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
@@ -2139,6 +2170,14 @@ impl<'a> MimoEngine<'a> {
         // ordered on this stream before the gather; `embed` holds DECODE_ROWS rows.
         unsafe { self.embedding.embed_device_ids(mtp.ids.buffer, Some((mtp.index.buffer.ptr.cast_const(), &index)),
             t, 1, None, mtp.embed.buffer, self.stream)? };
+        if seqs.iter().any(|s| s.media.is_some()) {
+            let chunk = super::mtp::embedding_media(seqs, k, groups)?;
+            if !chunk.indices.is_empty() {
+                self.library.embedding_injection()?.inject_host(&chunk.features, &chunk.indices,
+                    w.x.buffer, w.seq_first.buffer, mtp.embed.buffer, t, h, 1, self.stream)?;
+                self.stage_async(w.seq_first.buffer, bytes_of(&tables.seq_first))?;
+            }
+        }
         // The target's hidden rows of the same positions.
         let mut at = 0;
         for (ring, first, tokens) in groups {

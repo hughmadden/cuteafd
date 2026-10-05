@@ -120,6 +120,7 @@ pub struct MediaPreparer {
     fetch: ImageUrlFetch,
     agent: ureq::Agent,
     memo: Mutex<VecDeque<MemoEntry>>,
+    memo_hits: std::sync::atomic::AtomicU64,
     /// Bound both running CPU tasks and request preparation waiters at API admission.
     pub slots: Arc<tokio::sync::Semaphore>,
 }
@@ -142,6 +143,9 @@ pub fn set_preparation_policy(max_image_tokens: usize, fetch: ImageUrlFetch) -> 
         .map_err(|_| anyhow::anyhow!("media preparation policy already installed"))
 }
 impl MediaPreparer {
+    pub fn memo_hits(&self) -> u64 {
+        self.memo_hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn config(&self) -> &ProcessorConfig {
         &self.config
     }
@@ -198,6 +202,7 @@ impl MediaPreparer {
             fetch,
             agent,
             memo: Mutex::new(VecDeque::new()),
+            memo_hits: std::sync::atomic::AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(slots.clamp(1, 4))),
         })
     }
@@ -240,6 +245,7 @@ impl MediaPreparer {
             };
             let image = if let Some(image) = cached {
                 result.memo_hits += 1;
+                self.memo_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 image
             } else {
                 ensure!(

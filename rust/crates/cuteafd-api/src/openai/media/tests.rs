@@ -40,6 +40,7 @@ fn memo_limits_detail_identity_eviction_and_failure_recovery() {
     assert_eq!((first.decode_misses, first.memo_hits), (1, 0));
     let history = preparer.prepare(&vec![source(); 128]).unwrap();
     assert_eq!((history.decode_misses, history.memo_hits), (0, 128));
+    assert_eq!(preparer.memo_hits(), 128);
     assert!(Arc::ptr_eq(&first.images[0], &history.images[0]));
     let mut low = source();
     low.low = true;

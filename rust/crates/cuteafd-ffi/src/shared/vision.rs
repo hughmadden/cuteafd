@@ -58,6 +58,7 @@ impl VisionLedger {
 pub enum VisionError {
     Native(i32),
     InvalidInput(&'static str),
+    Runtime(String),
     Library(libloading::Error),
 }
 impl fmt::Display for VisionError {
@@ -65,6 +66,7 @@ impl fmt::Display for VisionError {
         match self {
             Self::Native(status) => write!(f, "vision native status {status}"),
             Self::InvalidInput(reason) => f.write_str(reason),
+            Self::Runtime(reason) => f.write_str(reason),
             Self::Library(e) => write!(f, "vision library: {e}"),
         }
     }
@@ -256,6 +258,32 @@ impl crate::NativeLibrary {
     }
 }
 impl EmbeddingInjection<'_> {
+    /// Stages host rows into caller-owned scratch before any consumer reuses it.
+    /// Indices are checked on the host; all producers/consumers use this stream.
+    pub fn inject_host(&self, features: &[u8], indices: &[u32], feature_scratch: crate::CuteafdDeviceBuffer,
+        index_scratch: crate::CuteafdDeviceBuffer, output: crate::CuteafdDeviceBuffer,
+        rows: usize, width: usize, copies: usize, stream: *mut c_void) -> Result<(), VisionError> {
+        if indices.is_empty() { return Ok(()); }
+        validate_injection(feature_scratch, index_scratch, output, indices.len(), rows, width, copies)?;
+        if features.len() != indices.len() * width * 2
+            || indices.iter().any(|&i| i as usize >= rows)
+            || indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(VisionError::InvalidInput("host embedding rows/indices"));
+        }
+        // SAFETY: the caller's stream owns the scratch; drain its previous readers before staging.
+        unsafe { self._library.cuda_stream_synchronize(stream) }
+            .map_err(|e| VisionError::Runtime(e.to_string()))?;
+        self._library.copy_h2d(crate::CuteafdDeviceBuffer { bytes: features.len(), ..feature_scratch }, features)
+            .map_err(|e| VisionError::Runtime(e.to_string()))?;
+        let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        self._library.copy_h2d(crate::CuteafdDeviceBuffer { bytes: index_bytes.len(), ..index_scratch }, &index_bytes)
+            .map_err(|e| VisionError::Runtime(e.to_string()))?;
+        // SAFETY: extents and sorted unique indices validated; scratch/output remain owned by the engine.
+        unsafe { self.launch(feature_scratch, index_scratch, output, indices.len(), rows, width, copies, stream)? };
+        // SAFETY: finish reading the temporary index table before its normal producer overwrites it.
+        unsafe { self._library.cuda_stream_synchronize(stream) }.map_err(|e| VisionError::Runtime(e.to_string()))
+    }
+
     /// # Safety
     /// Buffers reside on the current stream device and remain live until it drains.
     /// Producers precede this launch; indices are unique and less than rows. Input

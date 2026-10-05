@@ -59,6 +59,11 @@ impl EncoderClient for LocalEncoder {
             let started = Instant::now();
             match self.service.submit(job) {
                 Ok(ticket) => self.running = Some(Running { pending, ticket, started }),
+                Err(super::VisionError::QueueFull) => {
+                    // Cancelled work still drains on the owner. Backpressure is not a failed encode.
+                    self.queue.push_front(pending);
+                    return None;
+                }
                 Err(error) => {
                     // Keep errors keyed: MediaAdmission may poll tickets in any order.
                     self.queue.push_front(pending);
@@ -98,6 +103,43 @@ mod tests {
     use super::*;
     use cuteafd_core::ImageKey;
     use std::sync::{atomic::Ordering, mpsc};
+
+    #[test]
+    fn cancelled_owner_queue_is_backpressure_not_an_encode_failure() {
+        let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
+        let (gate, wait) = mpsc::sync_channel(0);
+        let owner = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            while let Ok(mut work) = jobs.recv() {
+                if work.cancelled.load(Ordering::Acquire) { continue; }
+                work.job.output.fill(0x3f80);
+                let _ = work.reply.send(Ok(work.job.output));
+            }
+        });
+        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default() };
+        let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
+        let mut encoder = LocalEncoder::new(service, &config, 2, 256);
+        for n in 0..2 {
+            let id = encoder.submit(media::EncodeJob { key: ImageKey([n;32]), grid: [1,2,2],
+                rgb8: vec![0;3072].into(), tokens: 1, hidden_width: 2 }).unwrap();
+            assert!(encoder.poll(id).is_none());
+            encoder.cancel(id);
+        }
+        let id = encoder.submit(media::EncodeJob { key: ImageKey([2;32]), grid: [1,2,2],
+            rgb8: vec![0;3072].into(), tokens: 1, hidden_width: 2 }).unwrap();
+        assert!(encoder.poll(id).is_none());
+        assert_eq!(encoder.queue.len(), 1);
+        gate.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(output) = encoder.poll(id) {
+                assert_eq!(&*output.unwrap().features, &[0x80,0x3f,0x80,0x3f]);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn long_history_is_queued_and_cancelled_without_owner_queue_overflow() {

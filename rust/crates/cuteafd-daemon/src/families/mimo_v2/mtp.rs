@@ -70,4 +70,52 @@ pub(crate) struct MtpSeq<'t> {
     pub ring: usize,
     pub len: usize,
     pub tokens: &'t [u32],
+    pub media: Option<&'t cuteafd_engine::media::RequestMedia>,
+}
+
+/// Known MTP inputs are shifted by stage+1 relative to target hidden rows.
+pub(crate) fn embedding_media(seqs: &[MtpSeq<'_>], stage: usize,
+    groups: &[(usize, usize, Vec<Token>)]) -> anyhow::Result<cuteafd_engine::media::MediaChunk> {
+    let mut packed = cuteafd_engine::media::MediaChunk::default();
+    let mut offset = 0;
+    for (ring, first, tokens) in groups {
+        if let Some(media) = seqs.iter().find(|s| s.ring == *ring).and_then(|s| s.media) {
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            let start = first + stage + 1;
+            media.write_chunk(start, start + tokens.len(), &mut chunk)?;
+            for index in chunk.indices {
+                anyhow::ensure!(matches!(tokens[index as usize], Token::Known(_)), "image row cannot be a draft");
+                packed.indices.push(u32::try_from(offset + index as usize)?);
+            }
+            packed.features.extend(chunk.features);
+        }
+        offset += tokens.len();
+    }
+    Ok(packed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_engine::media::{EmbeddingCache, ImageKey, MediaSpan, RequestMedia};
+    use std::sync::Arc;
+
+    #[test]
+    fn mtp_media_tracks_shifted_known_rows_across_rings() {
+        let key = ImageKey([5; 32]);
+        let mut cache = EmbeddingCache::new(12);
+        let pin = cache.reserve(key, 12).unwrap();
+        let lease = cache.complete(key, Arc::from((0u8..12).collect::<Vec<_>>())).unwrap();
+        let mut media = RequestMedia::new(vec![MediaSpan { start: 3, len: 3, key }], 2, 8).unwrap();
+        media.attach(lease).unwrap();
+        drop(pin);
+        let seqs = [MtpSeq { ring: 1, len: 8, tokens: &[], media: Some(&media) },
+            MtpSeq { ring: 0, len: 8, tokens: &[], media: None }];
+        let groups = [(0, 0, vec![Token::Known(1); 2]), (1, 2, vec![Token::Known(2); 3])];
+        let chunk = embedding_media(&seqs, 1, &groups).unwrap();
+        assert_eq!(chunk.indices, [2, 3]);
+        assert_eq!(chunk.features, (4u8..12).collect::<Vec<_>>());
+        let draft = [(1, 1, vec![Token::Draft { stage: 0, member: 0 }])];
+        assert!(embedding_media(&seqs, 1, &draft).is_err());
+    }
 }
