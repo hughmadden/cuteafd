@@ -1285,24 +1285,49 @@ where
                 ))
             }
             RestoreOutcome::TimedOut => {
-                let restored = fresh.len();
-                for id in fresh {
-                    self.device.unref(id, &mut self.cache)?;
-                }
-                self.device.request_refs -= restored;
-                request.pages.clear();
-                let fresh = self.allocate_rest(request, outstanding)?;
-                request.pages.extend(fresh);
-                request.stage = Stage::Prefill {
-                    remaining: request.tokens.len(),
-                };
+                self.abandon_restore(request, fresh, outstanding)?;
                 Ok(format!(
                     "restore timed out key={}, prefilling cold",
                     hit.key
                 ))
             }
-            RestoreOutcome::Failed => Err(format!("restore failed for key {}", hit.key)),
+            // A host hit whose snapshot is no longer resident: a store commit's quota trim
+            // (`evict_to_quota`) evicted it between `lookup` and `restore`, because `lookup`
+            // deliberately does not pin — the engine can abandon a hit in `make_room` before it
+            // ever calls `restore`, so a lookup-time pin would leak. The engine's contract for
+            // exactly this case is to count the abandoned restore and prefill the request as if
+            // the cache were absent (see `HostCacheBinding::restore`); `Failed` is therefore a
+            // legal outcome, not an invariant violation. `Failed` also promises no copy is in
+            // flight, so the reservation can be handed back immediately.
+            RestoreOutcome::Failed => {
+                self.abandon_restore(request, fresh, outstanding)?;
+                Ok(format!("restore failed key={}, prefilling cold", hit.key))
+            }
         }
+    }
+
+    /// Give back the device pages reserved for a restore that did not complete and re-plan the
+    /// request as a cold prefill, exactly as the engine does whenever `restore` returns anything
+    /// but `Done`. Neither `TimedOut` nor `Failed` leaves a copy that writes the reservation, so
+    /// the pages can be released at once.
+    fn abandon_restore(
+        &mut self,
+        request: &mut Request,
+        fresh: Vec<DevicePageId>,
+        outstanding: &mut HashSet<StoreTicket>,
+    ) -> Result<(), String> {
+        let restored = fresh.len();
+        for id in fresh {
+            self.device.unref(id, &mut self.cache)?;
+        }
+        self.device.request_refs -= restored;
+        request.pages.clear();
+        let fresh = self.allocate_rest(request, outstanding)?;
+        request.pages.extend(fresh);
+        request.stage = Stage::Prefill {
+            remaining: request.tokens.len(),
+        };
+        Ok(())
     }
 
     fn finish_prefill(
