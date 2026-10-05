@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -939,3 +940,13 @@ def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
                                    extra_args=("--wip", slot))
     assert result.returncode != 0
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_restart_removes_workers_and_keeps_the_wip_container(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", restart=True)
+    assert result.returncode == 0, result.stderr
+    cleanup = next(line for line in result.stderr.splitlines()
+                   if line.startswith("ssh h0 ") and "docker ps -aq --filter" in line)
+    pattern = re.search(r'--filter "?name=([^")\s]+)', cleanup).group(1)
+    assert re.search(pattern, "cuteafd-spark-expert-h0-19441")
+    assert not re.search(pattern, "cuteafd-spark-expert-wip")
