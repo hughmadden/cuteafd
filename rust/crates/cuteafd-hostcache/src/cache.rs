@@ -587,6 +587,19 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         Ok(())
     }
 
+    /// Non-mutating lookup. Pending stores are not yet visible.
+    pub fn peek(&self, tokens: &[u32]) -> Option<Hit> {
+        self.snapshots.as_ref()?.peek(tokens)
+    }
+
+    /// Resident snapshots with their engine descriptors. This cold-path iterator lets the
+    /// engine apply full media identity verification before allocating or restoring anything.
+    pub fn resident_payloads(&self) -> impl Iterator<Item = (&SnapshotMeta, crate::snapshot::Key, &P)> {
+        self.payloads.iter().filter_map(|(&key, payload)| {
+            Some((&self.snapshots.as_ref()?.get(key)?.meta, key, payload))
+        })
+    }
+
     /// The key-space tokens of a resident snapshot (the sequence its radix entry is keyed by).
     pub fn snapshot_tokens(&self, key: Key) -> Option<&[u32]> {
         self.snapshots
@@ -615,6 +628,17 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         if hit.is_some() {
             self.metrics.get_mut().host_hits += 1;
         }
+        hit
+    }
+
+    /// Account for an engine-selected, fully verified media hit (or a miss) without rerunning
+    /// radix selection. Refreshes the timestamp used by LeastRecent eviction, unlike peek.
+    pub fn lookup_verified(&mut self, key: Option<Key>) -> bool {
+        if !self.enabled() { return false; }
+        self.metrics.get_mut().lookups += 1;
+        let now = self.engine.now_ns();
+        let hit = key.is_some_and(|key| self.snapshots.as_mut().is_some_and(|s| s.touch(key, now)));
+        if hit { self.metrics.get_mut().host_hits += 1; }
         hit
     }
 

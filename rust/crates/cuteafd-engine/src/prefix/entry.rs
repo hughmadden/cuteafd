@@ -44,6 +44,7 @@ pub fn greedy(logits: &[f32]) -> u32 {
 /// shared with their writer, the partial tail is the entry's own copy) and a mark slot.
 pub(crate) struct Entry {
     pub tokens: Vec<u32>,
+    pub media: Vec<cuteafd_core::MediaSpan>,
     pub kind: SnapshotKind,
     pub pages: Vec<u32>,
     pub mark: Option<MarkSlot>,

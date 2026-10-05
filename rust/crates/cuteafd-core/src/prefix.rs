@@ -174,6 +174,10 @@ impl<T> Node<T> {
         }
         best.filter(|found| found.skipped(rule) > 0)
     }
+    fn value_at_clock(&self, clock: u64) -> Option<&T> {
+        self.value.as_ref().filter(|(used, _)| *used == clock).map(|(_, value)| value)
+            .or_else(|| self.children.values().find_map(|child| child.value_at_clock(clock)))
+    }
     fn refresh(&mut self, old: u64, new: u64) -> Option<&T> {
         if let Some((clock, value)) = self.value.as_mut() {
             if *clock == old {
@@ -288,6 +292,11 @@ impl<T> Radix<T> {
             .expect("selected retained frontier");
         Some((found.common, found.frontier, value))
     }
+    /// Read-only lookup: no clocks or LRU order change, even on a hit.
+    pub fn peek_reusable(&self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
+        let found = self.root.find_reusable(tokens, 0, self.rule)?;
+        Some((found.common, found.frontier, self.root.value_at_clock(found.clock)?))
+    }
     /// Retained entries in this bank.
     pub fn entries(&self) -> usize {
         self.entries
@@ -368,6 +377,16 @@ impl<T> Retention<T> {
             (None, None) => return None,
         };
         self.bank_mut(kind).lookup_reusable(tokens)
+    }
+    /// The same selection as lookup, without refreshing either bank.
+    pub fn peek_reusable(&self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
+        let prompt = self.prompts.peek_reusable(tokens);
+        let turn = self.turns.peek_reusable(tokens);
+        match (prompt, turn) {
+            (Some(p), Some(t)) if self.rule().skipped(p.0, p.1) > self.rule().skipped(t.0, t.1) => Some(p),
+            (_, Some(t)) => Some(t),
+            (p, None) => p,
+        }
     }
     /// `evict_one`, returning the evicted entry and its bank.
     pub fn evict_oldest(&mut self) -> Option<(SnapshotKind, T)> {

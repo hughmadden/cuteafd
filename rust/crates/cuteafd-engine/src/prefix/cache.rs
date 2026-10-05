@@ -16,7 +16,8 @@
 //! recently used across both banks, prompt before turn at equal use ([`victim`]); `make_room`
 //! runs before every admission and capture that needs pages. A restore that cannot complete is a
 //! cache miss, never a request error.
-use super::chain::{content_id, page_chain};
+use super::chain::{content_id, page_chain_media};
+use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
 use super::entry::{victim, After, Entry, EntryId};
 use super::family::{BoxError, FamilyLayout, PrefixFamily};
 use super::marks::{MarkArena, MarkSlot};
@@ -43,6 +44,8 @@ pub enum PrefixError {
     },
     #[error("snapshot of {tokens} tokens, but the placement committed {committed} (reach {reach})")]
     Frontier { tokens: usize, committed: usize, reach: usize },
+    #[error(transparent)]
+    Media(#[from] MediaError),
     #[error("host tier: {0}")]
     Host(String),
 }
@@ -94,12 +97,15 @@ pub struct Admitted<P> {
 /// What travels with a host snapshot besides its device bytes.
 pub struct HostPayload {
     pub after: After,
+    pub media: Vec<MediaSpan>,
 }
 
 /// Counters and gauges for `/v1/stats`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PrefixStats {
     pub lookups: u64,
+    /// Rejected radix matches whose full image identities differ.
+    pub media_key_collisions: u64,
     pub hits: u64,
     /// Hits that restored the whole prompt (first token from the snapshot's logits).
     pub exact_hits: u64,
@@ -193,14 +199,26 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// Admit a request of `tokens` that may grow to `capacity` tokens. `build` turns a page list
     /// into the family's placement (called once per attempt; a failed restore retries cold).
     pub fn admit<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, tokens: &[u32], capacity: usize,
-        sampled: bool, mut build: impl FnMut(Vec<u32>) -> P) -> Result<Admitted<P>, PrefixError> {
+        sampled: bool, build: impl FnMut(Vec<u32>) -> P) -> Result<Admitted<P>, PrefixError> {
+        self.admit_media(family, tokens, &[], capacity, sampled, build)
+    }
+
+    /// `tokens` are MediaKeys' keyed copy, never the model's native ids. Verify identities
+    /// before forking pages. Encoding waiters call peek_media first, without owning a placement.
+    pub fn admit_media<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, tokens: &[u32],
+        media: &[MediaSpan], capacity: usize, sampled: bool, mut build: impl FnMut(Vec<u32>) -> P)
+        -> Result<Admitted<P>, PrefixError> {
+        crate::media::keys::validate_spans(media)?;
+        if media.last().is_some_and(|s| s.checked_end().unwrap() > tokens.len()) {
+            return Err(MediaError::Spans.into());
+        }
         let total = self.pool.pages_for(capacity.max(tokens.len()));
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
             let mut promoted = false;
-            let mut hit = self.lookup(tokens, sampled);
+            let mut hit = self.lookup_media(tokens, media, sampled);
             if hit.is_none() {
-                hit = self.promote(family, tokens, sampled)?;
+                hit = self.promote(family, tokens, media, sampled)?;
                 promoted = hit.is_some();
             }
             if let Some(hit) = hit {
@@ -215,6 +233,16 @@ impl<E: CopyEngine> PrefixCache<E> {
                 }
             }
         }
+        self.make_room(family, total, None)?;
+        let pages = self.pool.alloc(total)?;
+        Ok(Admitted { placement: build(pages), resume: 0, after: None, source: None })
+    }
+
+    /// Bypass prefix reuse after repeated peek/admission races. The caller has materialized
+    /// the entire prompt's media before invoking this allocator.
+    pub fn admit_cold<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, tokens: usize,
+        capacity: usize, build: impl FnOnce(Vec<u32>) -> P) -> Result<Admitted<P>, PrefixError> {
+        let total = self.pool.pages_for(capacity.max(tokens));
         self.make_room(family, total, None)?;
         let pages = self.pool.alloc(total)?;
         Ok(Admitted { placement: build(pages), resume: 0, after: None, source: None })
@@ -235,10 +263,96 @@ impl<E: CopyEngine> PrefixCache<E> {
                 query = &tokens[..tokens.len() - 1];
                 continue;
             }
+            if !verify_media(resume, &entry.media, &[]) { return None; }
             self.clock += 1;
             entry.last_use = self.clock;
             return Some(Hit { id, kind: entry.kind, resume, frontier });
         }
+    }
+
+    /// Non-mutating lookup across both tiers. No copies, allocation, pins, counters or LRU
+    /// touches: it is only an encoding hint, and normal admission rechecks it afterwards.
+    pub fn peek(&self, tokens: &[u32], sampled: bool) -> usize {
+        self.peek_media(tokens, &[], sampled)
+    }
+
+    pub fn peek_media(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> usize {
+        if !self.enabled() { return 0; }
+        let device = if media.is_empty() {
+            let mut query = tokens;
+            loop {
+                let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break 0 };
+                let Some(entry) = self.entries.get(&id) else { break 0 };
+                let resume = self.layout.rule.skipped(common, frontier);
+                if !verify_media(resume, &entry.media, media) { break 0; }
+                if resume == tokens.len() && !entry.after.serves(sampled) {
+                    if query.len() < tokens.len() || tokens.len() < 2 { break 0; }
+                    query = &tokens[..tokens.len() - 1];
+                } else { break resume; }
+            }
+        } else {
+            self.device_media_hit(tokens, media, sampled).0.map_or(0, |h| h.resume)
+        };
+        let host = self.host.as_ref().and_then(|host| {
+            if media.is_empty() {
+                let hit = host.peek(tokens)?;
+                let payload = host.payload(hit.key)?;
+                let resume = self.layout.rule.skipped(hit.common, hit.frontier);
+                (verify_media(resume, &payload.media, media)
+                    && (resume != tokens.len() || payload.after.serves(sampled))).then_some(resume)
+            } else { self.host_media_hit(tokens, media, sampled).0.map(|h| h.1) }
+        }).unwrap_or(0);
+        device.max(host)
+    }
+
+    fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
+        let mut best = None;
+        let mut rank = (0, false, 0);
+        let mut collisions = 0;
+        for (&id, entry) in &self.entries {
+            let (resume, collision) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
+                &entry.media, &entry.after, sampled);
+            collisions += u64::from(collision);
+            let candidate = (resume, entry.kind == SnapshotKind::Turn, entry.last_use);
+            if resume > 0 && candidate > rank {
+                rank = candidate;
+                best = Some(Hit { id, kind: entry.kind, resume, frontier: entry.len() });
+            }
+        }
+        (best, collisions)
+    }
+
+    fn lookup_media(&mut self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> Option<Hit> {
+        if media.is_empty() { return self.lookup(tokens, sampled); }
+        let (hit, collisions) = self.device_media_hit(tokens, media, sampled);
+        self.stats.media_key_collisions += collisions;
+        if let Some(hit) = hit {
+            self.clock += 1;
+            self.entries.get_mut(&hit.id)?.last_use = self.clock;
+        }
+        hit
+    }
+
+    fn host_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool)
+        -> (Option<(cuteafd_hostcache::snapshot::Hit, usize)>, u64) {
+        let Some(host) = &self.host else { return (None, 0) };
+        let mut best = None;
+        let mut rank = (0, false, 0);
+        let mut collisions = 0;
+        for (meta, key, payload) in host.resident_payloads() {
+            let (resume, collision) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
+                &payload.media, &payload.after, sampled);
+            collisions += u64::from(collision);
+            let candidate = (resume, meta.kind == SnapshotKind::Turn, key);
+            if resume > 0 && candidate > rank {
+                rank = candidate;
+                let common = common_prefix(tokens, &meta.tokens);
+                best = Some((cuteafd_hostcache::snapshot::Hit {
+                    key, kind: meta.kind, common, frontier: meta.tokens.len(),
+                }, resume));
+            }
+        }
+        (best, collisions)
     }
 
     fn restore_hit<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, hit: &Hit, tokens: &[u32], total: usize,
@@ -284,13 +398,26 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// placement's commit point (an intermediate point). Ok(false) when it was not retained
     /// (disabled, too short, no room).
     pub fn capture<F: PrefixFamily>(&mut self, family: &F, kind: SnapshotKind, tokens: &[u32],
-        placement: &F::Placement, mut after: After) -> Result<bool, PrefixError> {
+        placement: &F::Placement, after: After) -> Result<bool, PrefixError> {
+        self.capture_media(family, kind, tokens, &[], placement, after)
+    }
+
+    /// A chunk/message/cancel frontier inside an image rounds down to its first row.
+    /// If the family's mark can no longer reach that row, skip instead of capturing wrong state.
+    pub fn capture_media<F: PrefixFamily>(&mut self, family: &F, kind: SnapshotKind, tokens: &[u32],
+        media: &[MediaSpan], placement: &F::Placement, mut after: After) -> Result<bool, PrefixError> {
+        crate::media::keys::validate_spans(media)?;
+        let rounded = round_frontier(tokens.len(), media);
+        let changed = rounded != tokens.len();
+        let tokens = &tokens[..rounded];
+        if changed { after = After::default(); }
         if !self.enabled() || tokens.len() < self.config.min_tokens.max(1) {
             return Ok(false);
         }
         let committed = family.commit_point(placement);
         let reach = family.capture_reach();
         if tokens.len() > committed || committed - tokens.len() > reach {
+            if changed { self.stats.capture_skips += 1; return Ok(false); }
             return Err(PrefixError::Frontier { tokens: tokens.len(), committed, reach });
         }
         // Replace the same snapshot, or keep the bank within its bound, before taking storage.
@@ -345,7 +472,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: tokens.to_vec(), kind, pages: fork.pages, mark: slot, after,
+        self.entries.insert(id, Entry { tokens: tokens.to_vec(), media: snapshot_media(tokens.len(), media), kind, pages: fork.pages, mark: slot, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(kind).insert(tokens, id) {
             self.evict(family, evicted)?;
@@ -363,6 +490,13 @@ impl<E: CopyEngine> PrefixCache<E> {
     pub fn park<F: PrefixFamily>(&mut self, family: &F, tokens: &[u32], placement: &F::Placement)
         -> Result<bool, PrefixError> {
         let parked = self.capture(family, SnapshotKind::Prompt, tokens, placement, After::default())?;
+        self.stats.parked += u64::from(parked);
+        Ok(parked)
+    }
+
+    pub fn park_media<F: PrefixFamily>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan],
+        placement: &F::Placement) -> Result<bool, PrefixError> {
+        let parked = self.capture_media(family, SnapshotKind::Prompt, tokens, media, placement, After::default())?;
         self.stats.parked += u64::from(parked);
         Ok(parked)
     }
@@ -466,8 +600,8 @@ impl<E: CopyEngine> PrefixCache<E> {
 
     /// Host identities of an entry's pages: full pages by content (hash chain over their tokens),
     /// the partial tail by device allocation.
-    fn identities(&self, tokens: &[u32], pages: &[u32]) -> Vec<DevicePageId> {
-        let chain = page_chain(tokens, self.layout.page_rows);
+    fn identities(&self, tokens: &[u32], media: &[MediaSpan], pages: &[u32]) -> Vec<DevicePageId> {
+        let chain = page_chain_media(tokens, media, self.layout.page_rows);
         pages
             .iter()
             .enumerate()
@@ -485,7 +619,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         }
         self.drain(family)?;
         let entry = self.entries.get(&id).expect("stored entry is retained");
-        let ids = self.identities(&entry.tokens, &entry.pages);
+        let ids = self.identities(&entry.tokens, &entry.media, &entry.pages);
         let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         pages[0] = entry.pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let snapshot = DeviceSnapshot {
@@ -495,7 +629,7 @@ impl<E: CopyEngine> PrefixCache<E> {
             draft: None,
             scores: Vec::new(),
         };
-        let payload = HostPayload { after: entry.after.clone() };
+        let payload = HostPayload { after: entry.after.clone(), media: entry.media.clone() };
         let host = self.host.as_mut().expect("checked");
         let ticket = match host.store(&snapshot, payload) {
             StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => Some(ticket),
@@ -510,14 +644,32 @@ impl<E: CopyEngine> PrefixCache<E> {
 
     /// On a device miss: rebuild the best host snapshot on the device so the device path finds
     /// it. Anything short of a completed restore is a miss.
-    fn promote<F: PrefixFamily>(&mut self, family: &F, tokens: &[u32], sampled: bool) -> Result<Option<Hit>, PrefixError> {
-        let Some(host) = self.host.as_mut() else { return Ok(None) };
-        let Some(hit) = host.lookup(tokens) else { return Ok(None) };
+    fn promote<F: PrefixFamily>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> Result<Option<Hit>, PrefixError> {
+        let selected = if media.is_empty() {
+            self.host.as_mut().and_then(|host| host.lookup(tokens))
+        } else {
+            let (selected, collisions) = self.host_media_hit(tokens, media, sampled);
+            self.stats.media_key_collisions += collisions;
+            let key = selected.as_ref().map(|(hit, _)| hit.key);
+            if !self.host.as_mut().is_some_and(|host| host.lookup_verified(key)) {
+                return Ok(None);
+            }
+            selected.map(|(hit, _)| hit)
+        };
+        let Some(hit) = selected else { return Ok(None) };
+        let host = self.host.as_mut().expect("selected host snapshot");
         let (Some(snapshot_tokens), Some(payload)) = (host.snapshot_tokens(hit.key), host.payload(hit.key)) else {
             return Ok(None);
         };
         let snapshot_tokens = snapshot_tokens.to_vec();
         let after = payload.after.clone();
+        let saved_media = payload.media.clone();
+        let (resume, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
+            &saved_media, &after, sampled);
+        if resume == 0 {
+            self.stats.media_key_collisions += u64::from(collision);
+            return Ok(None);
+        }
         let len = snapshot_tokens.len();
         if len == tokens.len() && !after.serves(sampled) {
             return Ok(None);
@@ -546,7 +698,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         let pages = self.pool.alloc(need)?;
         // The restore stream writes these pages and the slot: nothing queued may still use them.
         self.drain(family)?;
-        let ids = self.identities(&snapshot_tokens, &pages);
+        let ids = self.identities(&snapshot_tokens, &saved_media, &pages);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let target = RestoreTarget {
@@ -574,12 +726,31 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: snapshot_tokens.clone(), kind: hit.kind, pages, mark: slot, after,
+        self.entries.insert(id, Entry { tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark: slot, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
         }
         self.stats.promotions += 1;
-        Ok(self.lookup(tokens, sampled))
+        Ok(self.lookup_media(tokens, media, sampled))
     }
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(a, b)| a == b).count()
+}
+
+fn media_resume(rule: cuteafd_core::prefix::ReuseRule, tokens: &[u32], media: &[MediaSpan],
+    saved_tokens: &[u32], saved_media: &[MediaSpan], after: &After, sampled: bool) -> (usize, bool) {
+    let mut common = common_prefix(tokens, saved_tokens);
+    let mut resume = rule.skipped(common, saved_tokens.len());
+    if resume == tokens.len() && !after.serves(sampled) {
+        common = common.saturating_sub(1);
+        resume = rule.skipped(common, saved_tokens.len());
+    }
+    // Apply the family's alignment/replay first, then image atomicity. A rule's partial
+    // restore starts empty, so rounding further down is safe (never claim an exact mark).
+    resume = round_frontier(round_frontier(resume, media), saved_media);
+    if !verify_media(resume, saved_media, media) { return (0, true); }
+    (resume, false)
 }
