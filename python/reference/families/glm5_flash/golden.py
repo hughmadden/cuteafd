@@ -41,9 +41,74 @@ from safetensors import safe_open
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from shape_invariant import install
+from shape_invariant import install, qualify
+from fidelity_windows import load_set, verify_snapshot, write_scored_logits, finish_golden
 
 PREFIX = "model.language_model."
+
+
+FP32_KEYS = ("conv1d", "dt_bias", "A_log", "e_score_correction_bias", "hc.base", "hc.scale")
+
+
+def run_windows(a, config, ref, dense, experts_src):
+    manifest = load_set(a.windows, "glm5_flash")
+    identity = verify_snapshot(manifest, a.snapshot)
+    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
+    started, rows, times, states = time.time(), [], [], []
+    with torch.inference_mode():
+        embed = dense.get(PREFIX + "embed_tokens.weight")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], device="cuda")
+            h = torch.nn.functional.embedding(ids, embed)
+            states.append((h.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous().cpu(), None))
+        del embed, ids, h
+        for layer_id in range(config.num_hidden_layers):
+            start = time.time()
+            kind = config.layer_types[layer_id]
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.Glm5NextTextDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda").eval()
+            for name, param in list(layer.named_parameters()) + list(layer.named_buffers()):
+                if any(key in name for key in FP32_KEYS):
+                    param.data = param.data.float()
+            load_layer(layer, dense, experts_src, f"{PREFIX}layers.{layer_id}.")
+            for i, w in enumerate(manifest["windows"]):
+                host_h, host_topk = states[i]
+                h = host_h.cuda()
+                topk = host_topk.cuda() if host_topk is not None else None
+                positions = torch.arange(len(w["tokens"]), device="cuda")[None]
+                mask = torch.ones(1, len(w["tokens"]), dtype=torch.bool, device="cuda")
+                # Mirror the official model loop, including its cross-layer DSA indices.
+                h, topk = layer(h, attention_mask=mask, position_ids=positions,
+                                past_key_values=None, prev_topk_indices=topk)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+                states[i] = (h.cpu(), topk.cpu() if topk is not None else None)
+                del h, topk, positions, mask
+            del layer
+            torch.cuda.empty_cache()
+            times.append(time.time() - start)
+            print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        norm = ref.Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
+        norm.weight.copy_(dense.get(PREFIX + "norm.weight"))
+        head = dense.get("lm_head.weight").float()
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][0][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            logits = torch.nn.functional.linear(norm(h.mean(dim=2)).float()[0], head)
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        experts_snapshot=str(a.experts_snapshot or a.snapshot),
+        reference="transformers glm5_next (eager, FP32 routed sum, fixed-M128 linears)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof)
 
 
 class Weights:
@@ -129,12 +194,18 @@ def main() -> None:
     p.add_argument("--experts-snapshot", type=Path, help="routed experts (FP8 or BF16); default --snapshot")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored-row logits")
+    p.add_argument("--prefix-only", action="store_true", help="qualify prefix arithmetic without the full panel")
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
+    if a.windows and (a.text or a.text_file or a.max_tokens or a.stop_after is not None):
+        p.error("--windows cannot be combined with legacy text/truncation/stop options")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -147,6 +218,12 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
+    if a.windows:
+        a.out.mkdir(parents=True, exist_ok=True)
+        dense = Weights(a.snapshot)
+        experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
+        run_windows(a, config, ref, dense, experts_src)
+        return
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     if a.max_tokens:
@@ -162,7 +239,7 @@ def main() -> None:
     ids = torch.tensor([tokens], device="cuda")
     positions = torch.arange(t, device="cuda")[None]
     mask = torch.ones(1, t, dtype=torch.bool, device="cuda")
-    fp32_keys = ("conv1d", "dt_bias", "A_log", "e_score_correction_bias", "hc.base", "hc.scale")
+    fp32_keys = FP32_KEYS
     with torch.inference_mode():
         embed = torch.nn.functional.embedding(ids, dense.get(PREFIX + "embed_tokens.weight"))
         h = embed.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous()

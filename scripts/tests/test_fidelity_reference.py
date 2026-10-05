@@ -307,7 +307,80 @@ def test_v41_two_lengths_isolate_module_and_cross_layer_state():
             assert np.array_equal(value.array, np.full(length, length))
 
 
-@pytest.mark.parametrize("family", ["deepseek_v41", "mimo_v2/mimo_v26", "qwen4"])
+def test_glm_flash_window_dsa_handoff_is_per_window(tmp_path):
+    from contextlib import nullcontext
+    manifest = tiny_set()
+    manifest["family"] = "glm5_flash"
+    w = manifest["windows"][1]
+    w["tokens"], w["roles"] = [1, 2, 3, 4, 5, 6, 7], ["ctx"] * 7
+    manifest["set_sha256"] = set_hash(manifest)
+    path = tmp_path / "input.json"
+    path.write_bytes(canonical(manifest))
+    tree = ast.parse((ROOT / "python/reference/families/glm5_flash/golden.py").read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_windows")
+    calls = []
+
+    class Tensor:
+        def __init__(self, data): self.data = np.asarray(data)
+        def cpu(self): return Tensor(self.data.copy())
+        def cuda(self): return Tensor(self.data.copy())
+        def float(self): return self
+        def numpy(self): return self.data.astype(np.float32)
+        def __getitem__(self, key): return Tensor(self.data[key])
+        def unsqueeze(self, axis): return Tensor(np.expand_dims(self.data, axis))
+        def expand(self, *shape):
+            shape = tuple(old if new == -1 else new for old, new in zip(self.data.shape, shape))
+            return Tensor(np.broadcast_to(self.data, shape))
+        def contiguous(self): return Tensor(self.data.copy())
+        def mean(self, dim): return Tensor(self.data.mean(axis=dim))
+        def to(self, _dtype): return self
+        def copy_(self, other): self.data = other.data.copy()
+
+    class Layer:
+        def __init__(self, _config, layer_id): self.layer_id = layer_id
+        def to_empty(self, **_kwargs): return self
+        def eval(self): return self
+        def named_parameters(self): return []
+        def named_buffers(self): return []
+        def __call__(self, h, *, prev_topk_indices, **_kwargs):
+            length = h.data.shape[1]
+            incoming = None if prev_topk_indices is None else int(prev_topk_indices.data[0, 0, 0])
+            calls.append((self.layer_id, length, incoming))
+            expected = length if self.layer_id == 1 else None
+            assert incoming == expected
+            topk = Tensor(np.full((1, length, 1), length)) if self.layer_id == 0 else None
+            return h, topk
+
+    class Norm:
+        weight = Tensor([1.0])
+        def cuda(self): return self
+        def to(self, _dtype): return self
+        def __call__(self, h): return h
+
+    weights = SimpleNamespace(get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
+    torch = SimpleNamespace(inference_mode=nullcontext, device=lambda _name: nullcontext(),
+        bfloat16="bf16", float32="f32", bool="bool", set_default_dtype=lambda _dtype: None,
+        tensor=lambda data, **_kwargs: Tensor(data), arange=lambda n, **_kwargs: Tensor(np.arange(n)),
+        ones=lambda *shape, **_kwargs: Tensor(np.ones(shape)), cuda=SimpleNamespace(empty_cache=lambda: None),
+        nn=SimpleNamespace(functional=SimpleNamespace(
+            embedding=lambda ids, _weights: Tensor(ids.data[..., None]),
+            linear=lambda x, w: Tensor(x.data @ w.data.T))))
+    import time
+    scope = dict(torch=torch, time=time, load_set=load_set, verify_snapshot=lambda *_args: {},
+        qualify=lambda *_args: None, write_scored_logits=write_scored_logits, finish_golden=finish_golden,
+        PREFIX="model.language_model.", FP32_KEYS=(), load_layer=lambda *_args: None)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "glm_window_runner", "exec"), scope)
+    config = SimpleNamespace(hc_mult=4, num_hidden_layers=3, hidden_size=1, rms_norm_eps=1e-6,
+                             layer_types=["dsa", "dsa", "kda"])
+    ref = SimpleNamespace(Glm5NextTextDecoderLayer=Layer, Glm5NextTextRMSNorm=lambda *_args: Norm())
+    scope["run_windows"](SimpleNamespace(windows=path, snapshot=tmp_path, out=tmp_path, layers=None, experts_snapshot=None),
+                         config, ref, weights, weights)
+    assert calls == [(0, 5, None), (0, 7, None), (1, 5, 5), (1, 7, 7), (2, 5, None), (2, 7, None)]
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    assert [w["positions"] for w in meta["windows"]] == [list(range(2, 5)), list(range(2, 7))]
+
+
+@pytest.mark.parametrize("family", ["deepseek_v41", "mimo_v2/mimo_v26", "qwen4", "glm5_flash"])
 def test_goldens_have_layer_major_window_loops_and_scored_head_selection(family):
     path = ROOT / "python/reference/families" / family / "golden.py"
     tree = ast.parse(path.read_text())
