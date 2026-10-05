@@ -7,6 +7,10 @@ pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    #[arg(long, global = true, env = "VISION")]
+    pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
+    #[arg(long, global = true, env = "AUDIO")]
+    pub(crate) audio: Option<cuteafd_loader::plan::MediaMode>,
     /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true)]
@@ -157,6 +161,12 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct PlanArgs {
+    /// Vision policy (auto does not imply an implemented encoder).
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
+    pub(crate) vision: cuteafd_loader::plan::MediaMode,
+    /// Audio is off until its correctness gates pass.
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    pub(crate) audio: cuteafd_loader::plan::MediaMode,
     /// Place the untied token embedding in pinned mapped RAM instead of the lead GPU.
     #[arg(long, alias = "embed-placement", value_enum, default_value_t = crate::shared::token_io::EmbedPlacement::Gpu)]
     pub(crate) embedding_placement: crate::shared::token_io::EmbedPlacement,

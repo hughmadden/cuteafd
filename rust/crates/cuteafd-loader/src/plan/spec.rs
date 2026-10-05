@@ -115,6 +115,7 @@ pub enum Component {
     Speculator,
     SpeculatorExpert,
     Vision,
+    Audio,
     Other,
 }
 
@@ -137,6 +138,7 @@ impl Component {
             Component::Speculator => "speculator",
             Component::SpeculatorExpert => "speculator_expert",
             Component::Vision => "vision",
+            Component::Audio => "audio",
             Component::Other => "other",
         }
     }
