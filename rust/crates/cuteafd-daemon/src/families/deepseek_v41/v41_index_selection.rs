@@ -226,6 +226,11 @@ impl<'a> IndexSelectionWave<'a> {
             }
         }
         self.graph = found;
+        if self.graph.is_none() {
+            tracing::debug!(target: "cuteafd::graph_capture", site="index_selection",
+                retained=self.retained_graphs.len(), retain=self.retain_decode_graphs,
+                key=?fingerprint, "graph cache miss");
+        }
         Ok(())
     }
     pub fn clear_graph(&mut self) -> Result<()> {

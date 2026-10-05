@@ -79,7 +79,8 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
             graph,
             rows,
         });
-        tracing::debug!(target: "cuteafd::graph_capture", layer, rows,
+        tracing::debug!(target: "cuteafd::graph_capture", layer, rows, retain=self.retain_small,
+            bank=self as *const Self as usize,
             owner=std::any::type_name::<W>(), retained=self.retained[layer].len()+1,
             "native layer graph captured");
         Ok(())
