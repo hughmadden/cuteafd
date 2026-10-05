@@ -1,4 +1,5 @@
 pub mod families;
+pub mod media;
 pub mod formats;
 pub mod serving_capacity;
 pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};

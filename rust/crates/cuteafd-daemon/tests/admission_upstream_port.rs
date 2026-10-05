@@ -763,7 +763,7 @@ mod http_503_mapping {
         openai::NativeRequest {
             prompt: String::new(),
             constraint: None,
-            images: Vec::new(),
+            images: Vec::new(), media: Vec::new(),
             max_tokens: 1,
             sampling: Default::default(),
             stop_token_ids: Vec::new(),

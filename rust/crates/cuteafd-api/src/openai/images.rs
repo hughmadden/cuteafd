@@ -116,7 +116,7 @@ impl ImageDecoder {
     }
 }
 
-fn data_url_bytes(url: &str, limit: usize) -> Result<Vec<u8>> {
+pub(super) fn data_url_bytes(url: &str, limit: usize) -> Result<Vec<u8>> {
     let (header, body) = url
         .strip_prefix("data:")
         .context("invalid image data URL")?

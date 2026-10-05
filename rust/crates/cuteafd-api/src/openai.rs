@@ -77,6 +77,7 @@ pub fn set_media_input_policy(vision: bool, audio: bool) {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    pub media_preparer: Option<Arc<media::MediaPreparer>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
     pub capabilities: MediaCapabilities,
     pub id: String,
@@ -91,7 +92,15 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities }
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None }
+    }
+
+    /// Install only after the matching encoder is loaded and ready. A processor
+    /// alone must never be advertised as a vision deployment.
+    pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.media_preparer = Some(preparer);
+        self.capabilities.vision = true;
+        self
     }
 
     /// Token ids that end generation for one request.
@@ -126,6 +135,7 @@ pub mod chat;
 use chat::{glm5, qwen4};
 pub use constraints::NativeConstraint;
 mod images;
+pub mod media;
 pub mod console;
 pub use console::ConsoleHub;
 pub mod probe;
@@ -157,6 +167,8 @@ pub struct NativeRequest {
     pub prompt: String,
     pub constraint: Option<NativeConstraint>,
     pub images: Vec<cuteafd_loader::V41Image>,
+    /// Generic-family media, in template order. V4.1 only uses `images`.
+    pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     pub max_tokens: usize,
     /// Resolved target-sampling parameters. `TargetSamplingParams::greedy()`
     /// keeps the legacy device-argmax route; anything else selects from the
@@ -223,7 +235,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/models", get(models))
         .route("/v1/stats", get(stats_route))
         .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(images::BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
         .with_state(NativeState { queue, limits, images, stats, admission, profile: Arc::new(profile) })
         .merge(console_routes)
 }
@@ -356,6 +368,17 @@ impl OutputProcessor {
 async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>) -> Response {
     if let Err(message) = images::guard_content(&body, state.profile.capabilities) {
         return error(StatusCode::BAD_REQUEST, message);
+    }
+    let media_sources = match &state.profile.media_preparer {
+        Some(preparer) => match media::extract_image_sources(&body, preparer.limits.images) {
+            Ok(sources) => sources,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        },
+        None => Vec::new(),
+    };
+    if !matches!(state.profile.encoding, ModelEncoding::DeepseekV41) && state.profile.capabilities.vision
+        && state.profile.media_preparer.is_none() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "vision image processor unavailable");
     }
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     // Families rendered from the checkpoint's own chat template.
@@ -582,6 +605,22 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
     };
+    let media = if media_sources.is_empty() { Vec::new() } else {
+        let preparer = state.profile.media_preparer.as_ref().expect("sources require preparer").clone();
+        let slot = match preparer.slots.clone().acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "image preparation is closed"),
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            preparer.prepare(&media_sources)
+        }).await {
+            Ok(Ok(prepared)) => prepared.images,
+            Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    };
+    let image_tokens: usize = media.iter().map(|image| image.tokens).sum();
     // Unbounded on purpose: inference threads send without ever blocking, so a
     // client that stops reading cannot stall the shared scheduler. A request's
     // backlog is bounded by its own max_tokens.
@@ -591,6 +630,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let prompt = if prepared.is_empty() { prompt }
         else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
     let job = NativeRequest {
+        media,
         prompt,
         constraint,
         images: prepared,
@@ -667,6 +707,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 match chunk {
                     Ok(chunk) => {
                         let mut value = serde_json::to_value(&chunk).unwrap();
+                        add_image_usage(&mut value, image_tokens);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -719,7 +760,18 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Some(message) = failure.lock().unwrap().clone() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
-    Json(response).into_response()
+    if image_tokens == 0 { return Json(response).into_response(); }
+    let mut value = serde_json::to_value(response).expect("chat response serializes");
+    add_image_usage(&mut value, image_tokens);
+    Json(value).into_response()
+}
+
+fn add_image_usage(response: &mut Value, image_tokens: usize) {
+    if image_tokens == 0 { return; }
+    if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+        let details = usage.entry("prompt_tokens_details").or_insert_with(|| json!({}));
+        if let Some(details) = details.as_object_mut() { details.insert("image_tokens".into(), json!(image_tokens)); }
+    }
 }
 
 /// V4.1 reasoning-effort budgets from the checkpoint's own encoder
