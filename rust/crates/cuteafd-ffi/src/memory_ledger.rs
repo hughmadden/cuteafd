@@ -214,6 +214,11 @@ fn release(state: &mut State, live: Live) {
     }
 }
 
+/// Read one live-byte counter without cloning the allocation ledger.
+pub(crate) fn current_bytes(space: Space, device: i32) -> usize {
+    state().lock().unwrap_or_else(|e| e.into_inner()).current.get(&(space, device)).copied().unwrap_or(0)
+}
+
 pub(crate) fn record_free(ptr: usize) {
     if ptr == 0 {
         return;

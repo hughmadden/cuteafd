@@ -26,6 +26,10 @@ while IFS='=' read -r key value; do
   cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
+release_validate_coordinator_gpu_budget "$coordinator_budget"
+coordinator_budget_args=()
+[[ -z "$coordinator_budget" ]] || coordinator_budget_args=(--coordinator-gpu-budget-gib "$coordinator_budget")
 # Validate the name before it is used to identify allocations during admission.
 instance="$(get INSTANCE)"
 [[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
@@ -91,6 +95,17 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       fi
     fi
     free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
+    if [[ -n "$coordinator_budget" ]]; then
+      total_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+      # Credit this launch's restart above, but charge other physical usage
+      # against the simulated smaller card, just as runtime admission does.
+      if [[ "$total_mib" =~ ^[0-9]+$ ]]; then
+        free_gib="$(python3 -c 'import sys; free,total,budget=map(float,sys.argv[1:]); print(max(0,min(free,budget-total+free)))' \
+          "$free_gib" "$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$total_mib")" "$coordinator_budget")"
+      else
+        free_gib=0 # No trustworthy sample: keep the Spark fallback.
+      fi
+    fi
     pool="$(get POOL_TOKENS 32768)"
     if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
       # CPU-only preflight reads checkpoint headers in the selected serving image.
@@ -608,7 +623,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
+  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

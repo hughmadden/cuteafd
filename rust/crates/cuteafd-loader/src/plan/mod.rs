@@ -408,7 +408,20 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
-        report.memory_layout = Some(layout::layout(&report, model.as_ref(), &checkpoint, layout_options));
+        let memory = layout::layout(&report, model.as_ref(), &checkpoint, layout_options);
+        for device in &memory.devices {
+            let required = device.used_bytes();
+            if required > device.capacity_bytes {
+                report.fits = false;
+                report.hints.push(Hint {
+                    what: format!("{} full memory layout needs {required} bytes, budget {} bytes, shortfall {} bytes",
+                        device.name(), device.capacity_bytes, required - device.capacity_bytes),
+                    how: "Weights, KV, workspaces, graphs and drafts must fit together; reduce the pool/placement \
+                        or raise the device budget.".into(),
+                });
+            }
+        }
+        report.memory_layout = Some(memory);
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {

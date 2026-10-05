@@ -20,10 +20,11 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, cfg: &Qwen
     // Prefill owns one page table and decode owns 64, each with four record
     // page ids plus one pool page id per 256-token allocation unit.
     let context_tables_per_unit = (1 + super::engine::DECODE_ROWS as u64) * 5 * 4;
-    let tokens = crate::shared::memory_report::auto_pool_tokens(library,
+    let tokens = crate::shared::memory_report::admitted_pool_tokens(library,
         &[crate::shared::memory_report::KvDevice { device: args.device,
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes
                 + context_tables_per_unit).div_ceil(unit), reserve_bytes: reserve }], unit,
-        cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?;
+        cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
+        (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
     Ok(usize::try_from(tokens)?)
 }

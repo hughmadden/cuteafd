@@ -27,15 +27,15 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let parse = |matches: clap::ArgMatches| -> (Commands, clap::ArgMatches) {
+    let parse = |matches: clap::ArgMatches| -> (Commands, clap::ArgMatches, Option<f64>) {
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches),
+            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches) = parse(Cli::command().get_matches());
+    let (command, matches, initial_budget) = parse(Cli::command().get_matches());
     // `serve` and `golden` pick the family and stand for its own command.
-    let (command, matches) = match command {
+    let (command, matches, family_budget) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -44,10 +44,21 @@ async fn main() -> Result<()> {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => (command, matches),
+        command => (command, matches, initial_budget),
     };
+    let coordinator_budget_gib = family_budget.or(initial_budget);
+    if let Some(gib) = coordinator_budget_gib {
+        anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
+            | Commands::ServeQwen4(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
+            | Commands::ServeDsv4(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_)),
+            "--coordinator-gpu-budget-gib applies only to coordinator serve/golden commands; plan uses --layout --rtx-budget-gib");
+        let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
+        cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
+        tracing::info!(gib, bytes = budget.0, "installed per-GPU coordinator memory budget; SM count and L2 unchanged");
+    }
     // A serve command's resolved options, for the server's benchmark reports.
-    commands::bench::capture(&matches);
+    commands::bench::capture(&matches, coordinator_budget_gib);
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
         Commands::Expertd(_) => shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10)),
