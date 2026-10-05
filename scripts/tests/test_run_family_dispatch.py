@@ -594,6 +594,42 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
     assert "--pool-tokens 0" in dsv4
 
 
+@pytest.mark.parametrize("keys,expected", [
+    ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
+    ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("DRAFT_FP8=off\n", "bf16"), ("SPECULATOR=off\n", "off"),
+    ("MTP=0\n", "off"), ("DFLASH=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
+])
+def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str) -> None:
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
+    model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
+    result = _family_launch_result(tmp_path, config, model, keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
+    if expected in ("off", "mtp"):
+        assert "--draft" not in launch
+        assert ("--mtp 1" in launch) == (expected == "mtp")
+    else:
+        assert "--draft /root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        if expected == "checkpoint":
+            assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
+        else:
+            assert f"--draft-fp8 {'true' if expected == 'fp8' else 'false'}" in launch
+
+
+def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path: Path) -> None:
+    _snapshot(tmp_path / "hf", "test/external-draft", {})
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2", "num_hidden_layers": 2,
+                                  "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+                                  "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/external-draft\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "models--test--external-draft/snapshots/abc" in launch
+    assert "--draft-fp8" not in launch
+
+
 def test_family_config_reads_share_the_stop_key_grammar() -> None:
     import re
 
