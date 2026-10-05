@@ -96,7 +96,7 @@ def generate(source, out, browser):
         "vision05": [("What is the count for Gamma? Answer with one integer.", "32"),
                      ("Which batch has the smallest count?", "Beta"),
                      ("What is the total of all four counts? Answer with one integer.", "93")],
-        "vision06": [("What shape encloses each numbered stage?", "rounded rectangle"),
+        "vision06": [("How many rounded rectangles enclose numbered stages? Answer with one integer.", "4"),
                      ("What color is the stage text?", "black")],
         "ui-settings": [("What is the current Theme value?", "Light"),
                         ("What is the label of the blue action button?", "Apply")],
