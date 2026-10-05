@@ -47,8 +47,10 @@ for shape in ('decode', 'prefill'):
 for entry in manifest['files']:
     assert digest(SOURCE / NAME / entry['path']) == entry['sha256']
 assert not OUT.exists(), 'Preserve immutable output attempts'
-shutil.copytree(SOURCE, OUT)
+# Only the config is handed off; the coordinator owns the shared root index/card.
+OUT.mkdir()
 config = OUT / NAME
+shutil.copytree(SOURCE / NAME, config)
 preparation = json.loads((config / 'qualification.json').read_text())
 report['prefix_qualification'] = preparation['prefix_qualification']
 report['source_audit'] = preparation['source_audit']
@@ -70,17 +72,18 @@ manifest['calibration']['coordinator_feature_commit'] = report['coordinator_feat
 manifest['calibration']['coordinator_source_diff_sha256'] = report['coordinator_source_diff_sha256']
 manifest['calibration']['comparison_policy_commit'] = args.comparison_policy_commit
 manifest['calibration']['validator_source_commit'] = args.validator_source_commit
+for entry in manifest.get('licence_files', []):
+    if entry['path'] == '../LICENSE':
+        licence = SOURCE / 'LICENSE'
+        assert digest(licence) == entry['sha256']
+        shutil.copyfile(licence, config / 'LICENSE')
+        entry['path'] = 'LICENSE'
 manifest['qualification_sha256'] = digest(config / 'qualification.json')
 manifest['publication_status'] = 'QUALIFIED REFERENCE - coordinator review and upload required; no precision default promoted'
 manifest.pop('reference_sha256')
 manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
 (config / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-index = json.loads((OUT / 'configs.json').read_text())
-entries = [e for e in index['configs'] if e['name'] == NAME]
-assert len(entries) == 1
-entries[0]['sha256'] = digest(config / 'manifest.json')
-(OUT / 'configs.json').write_text(json.dumps(index, indent=2) + '\n')
-# The README is outside the sealed config; replace draft claims with measured evidence.
+# The per-config card is outside the sealed manifest; shared root files are untouched.
 readme = (SOURCE / 'README.md').read_text()
 start = readme.index('This is a numerical-fidelity panel')
 end = readme.index('## Config')
@@ -114,7 +117,7 @@ body += ['', f"Common floor: top-1 >=90% / KL <=0.06 nat. This config's calibrat
          'The two compared arms here are repeated default-precision baselines, not',
          'a proposed precision change. No precision-default verdict or promotion is implied.', '']
 readme = readme[:start] + '\n'.join(body) + '\n' + readme[end:]
-(OUT / 'README.md').write_text(readme)
+(config / 'README.md').write_text(readme)
 for entry in manifest['files']:
     assert digest(config / entry['path']) == entry['sha256']
 assert digest(config / 'windows.json') == manifest['windows_sha256']
@@ -125,5 +128,5 @@ for window in json.loads((config / 'windows.json').read_text())['windows']:
 for path in OUT.rglob('*'):
     if path.is_file() and path.suffix != '.safetensors':
         validate_public_text(path.read_text())
-print('Qualified local tree', OUT, 'manifestSHA', entries[0]['sha256'])
+print('Qualified config folder', config, 'manifestSHA', digest(config / 'manifest.json'))
 print('No upload performed; production loader and coordinator audit still required')
