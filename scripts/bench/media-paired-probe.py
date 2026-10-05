@@ -158,8 +158,36 @@ def paired_bounds(stats, counts, replicates=5000, seed=20260829):
             "bootstrap": replicates, "seed": seed, "unit": "whole windows, ratio of sums"}
 
 
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def golden_seal(root, panel):
+    meta = json.loads((root / "meta.json").read_text())
+    validate_qualification(meta.get("prefix_qualification"), panel, meta.get("snapshot_identity"))
+    if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
+        raise ValueError("golden seal provenance differs")
+    files = {"meta.json": file_hash(root / "meta.json"), "windows.json": file_hash(root / "windows.json")}
+    for entry in meta["windows"]:
+        folder = (root / entry["path"]).resolve()
+        if not folder.is_relative_to(root.resolve()):
+            raise ValueError("golden path escapes root")
+        for name in ("tokens.bin", "logits.bin"):
+            path = folder / name
+            files[str(path.relative_to(root.resolve()))] = file_hash(path)
+    return {"schema": "cuteafd.media.golden.seal/1", "set_sha256": panel["set_sha256"],
+            "checkpoint": panel["checkpoint"], "files": files}
+
+
 def compare(a):
     panel = load_set(a.windows, "mimo_v2")
+    seal = json.loads(a.golden_seal.read_text())
+    if seal != golden_seal(a.golden, panel):
+        raise ValueError("golden files differ from immutable seal")
     meta = json.loads((a.golden / "meta.json").read_text())
     validate_qualification(meta.get("prefix_qualification"), panel, meta.get("snapshot_identity"))
     if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
@@ -247,7 +275,8 @@ def compare(a):
             "direct_reference_native_kl": float(means[4]), "direct_native_reference_kl": float(means[5])})
     bounds = paired_bounds(statistics, counts, a.bootstrap, a.seed)
     result = {"schema": "cuteafd.media.g4/1", "criterion": CRITERION, "set_sha256": panel["set_sha256"],
-              "checkpoint": panel["checkpoint"], "path": "decode-shaped", "windows": summaries, **bounds,
+              "checkpoint": panel["checkpoint"], "golden_seal_sha256": file_hash(a.golden_seal),
+              "path": "decode-shaped", "windows": summaries, **bounds,
               "pass": bounds["kl_increase_upper95"] <= .005 and bounds["top1_loss_upper95"] <= .005,
               "scope": "encoder-swap gate only; no prefill qualification or precision-default promotion"}
     write_new(a.out, result)
@@ -267,14 +296,19 @@ def main():
     capture_parser.add_argument("--bench-token")
     capture_parser.add_argument("--timeout", type=float, default=240)
     capture_parser.add_argument("--quick", action="store_true")
+    seal_parser = actions.add_parser("seal")
+    for flag in ("windows", "golden", "out"):
+        seal_parser.add_argument("--" + flag, type=Path, required=True)
     compare_parser = actions.add_parser("compare")
-    for flag in ("windows", "golden", "native", "reference", "features", "out"):
+    for flag in ("windows", "golden", "golden-seal", "native", "reference", "features", "out"):
         compare_parser.add_argument("--" + flag, type=Path, required=True)
     compare_parser.add_argument("--bootstrap", type=int, default=5000)
     compare_parser.add_argument("--seed", type=int, default=20260829)
     args = parser.parse_args()
     if args.action == "capture":
         capture(args)
+    elif args.action == "seal":
+        write_new(args.out, golden_seal(args.golden, load_set(args.windows, "mimo_v2")))
     elif not compare(args):
         raise SystemExit(3)
 

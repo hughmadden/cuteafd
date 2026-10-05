@@ -113,6 +113,9 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
         meta["windows"].append({"id": window["id"], "path": window["id"], "positions": list(range(65, 577)),
                                 "vocab": 2, "media": [span]})
     (golden / "meta.json").write_bytes(canonical(meta))
+    (golden / "windows.json").write_bytes(canonical(panel))
+    seal = tmp_path / "golden-seal.json"
+    seal.write_bytes(canonical(module.golden_seal(golden, panel)))
     features = tmp_path / "features"
     features.mkdir()
     metadata = {"key": span["key"], "sha256": "c" * 64}
@@ -148,7 +151,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
                 "manifest_sha256": hashlib.sha256((dump / "manifest.jsonl").read_bytes()).hexdigest()})
         (root / "capture.json").write_bytes(canonical(capture))
     out = tmp_path / "g4.json"
-    args = SimpleNamespace(windows=windows, golden=golden, native=tmp_path / "native",
+    args = SimpleNamespace(windows=windows, golden=golden, golden_seal=seal, native=tmp_path / "native",
                            reference=tmp_path / "reference", features=features, out=out, bootstrap=100, seed=7)
     assert module.compare(args)
     result = json.loads(out.read_text())
@@ -162,4 +165,8 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
     capture_path.write_bytes(canonical(sealed))
     args.out = tmp_path / "incomplete.json"
     with pytest.raises(ValueError, match="incomplete windows"):
+        module.compare(args)
+    with (golden / "w0/logits.bin").open("r+b") as changed:
+        changed.write(np.asarray([1.], dtype="<f4").tobytes())
+    with pytest.raises(ValueError, match="immutable seal"):
         module.compare(args)
