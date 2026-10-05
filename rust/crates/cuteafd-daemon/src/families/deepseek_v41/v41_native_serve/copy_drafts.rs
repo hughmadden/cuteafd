@@ -23,7 +23,7 @@ pub(super) const MIN_DRAFTS: usize = 2;
 /// Rounds without copy proposals after a copy round that accepted nothing.
 pub(super) const BACKOFF_ROUNDS: u8 = 2;
 
-/// Opt-in until the V4.1 hardware parity and byte-exactness gates qualify it.
+/// Opt-in: copy-heavy edits gain, but normal C1 misses the no-regression bar.
 pub(super) fn enabled() -> bool {
     std::env::var("CUTEAFD_COPY_DRAFTS").is_ok_and(|value| value == "1")
 }
