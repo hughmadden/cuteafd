@@ -156,6 +156,36 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     assert (tmp_path / "README.md").read_text() == root_card
 
 
+def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_path):
+    from fidelity_windows import validate_public_metadata, validate_public_text
+    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "validate_output_file")
+    namespace = {"digest": lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+                 "json": json, "validate_public_metadata": validate_public_metadata,
+                 "validate_public_text": validate_public_text}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "output-privacy", "exec"), namespace)
+    check = namespace["validate_output_file"]
+    licence = tmp_path / "CHECKPOINT_LICENSE"
+    official = "Official licence contact: model-business@notice.qwencloud.com\n"
+    licence.write_text(official)
+    entry = {"path": licence.name, "sha256": hashlib.sha256(licence.read_bytes()).hexdigest()}
+    manifest = {"licence_files": [entry]}
+    check(licence, tmp_path, manifest)
+    assert licence.read_text() == official
+    licence.write_text(official + "tampered\n")
+    with pytest.raises(AssertionError, match="Licence checksum"):
+        check(licence, tmp_path, manifest)
+    licence.write_text(official)
+    with pytest.raises(ValueError, match="email"):
+        check(licence, tmp_path, {"licence_files": []})
+    ordinary = tmp_path / "LICENSE"
+    ordinary.write_text(official)
+    with pytest.raises(ValueError, match="email"):
+        check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
+              "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
+
+
 def test_measured_dataset_validator_self_tests():
     subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
                     "--self-test"], check=True, timeout=60)

@@ -78,6 +78,9 @@ for entry in manifest.get('licence_files', []):
         assert digest(licence) == entry['sha256']
         shutil.copyfile(licence, config / 'LICENSE')
         entry['path'] = 'LICENSE'
+    elif entry['path'] == 'CHECKPOINT_LICENSE':
+        assert digest(config / entry['path']) == entry['sha256'], 'Licence checksum differs'
+        entry['provenance'] = 'Official checkpoint licence text, copied verbatim and unmodified from the pinned official snapshot'
 manifest['qualification_sha256'] = digest(config / 'qualification.json')
 manifest['publication_status'] = 'QUALIFIED REFERENCE - coordinator review and upload required; no precision default promoted'
 manifest.pop('reference_sha256')
@@ -126,13 +129,23 @@ assert digest(config / 'qualification.json') == manifest['qualification_sha256']
 tokenizer = Tokenizer.from_file(str(args.tokenizer))
 for window in json.loads((config / 'windows.json').read_text())['windows']:
     validate_public_text(tokenizer.decode(window['tokens'], skip_special_tokens=False), scored_text=True)
+def validate_output_file(path, config, manifest):
+    # Preserve exact upstream licence notices, including public business contacts.
+    licences = [entry for entry in manifest.get('licence_files', [])
+                if entry['path'] == 'CHECKPOINT_LICENSE'
+                and path.resolve() == (config / 'CHECKPOINT_LICENSE').resolve()]
+    if licences:
+        assert len(licences) == 1 and digest(path) == licences[0]['sha256'], 'Licence checksum differs'
+    elif path.suffix == '.json':
+        validate_public_metadata(json.loads(path.read_text()))
+    elif path.name == 'README.md':
+        validate_public_text(path.read_text(), scored_text=True)
+    else:
+        validate_public_text(path.read_text())
+
+
 for path in OUT.rglob('*'):
     if path.is_file() and path.suffix != '.safetensors':
-        if path.suffix == '.json':
-            validate_public_metadata(json.loads(path.read_text()))
-        elif path.name == 'README.md':
-            validate_public_text(path.read_text(), scored_text=True)
-        else:
-            validate_public_text(path.read_text())
+        validate_output_file(path, config, manifest)
 print('Qualified config folder', config, 'manifestSHA', digest(config / 'manifest.json'))
 print('No upload performed; production loader and coordinator audit still required')
