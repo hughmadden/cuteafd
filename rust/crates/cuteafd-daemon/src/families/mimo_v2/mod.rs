@@ -64,6 +64,9 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Admit every prefill row's logits at startup for fidelity probes.
+    #[arg(long)]
+    pub full_prefill_logits: bool,
     /// Provisional per-GPU bound for CUDA modules, libraries and constraints
     /// bookkeeping beyond named tensor/workspace reservations. This is an
     /// explicit startup bound, not a measured allocation footprint.
@@ -906,6 +909,7 @@ impl Opened {
                 engine.set_experts(experts);
             }
             engine.prepare_prefill_pair()?;
+            if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
             if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }

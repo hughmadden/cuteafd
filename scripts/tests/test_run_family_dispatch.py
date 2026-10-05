@@ -486,6 +486,28 @@ SPLIT_CONFIGS = {
 }
 
 
+@pytest.mark.parametrize("family_config", [
+    SPLIT_CONFIGS["mimo_flash"], SPLIT_CONFIGS["mimo_pro"], SPLIT_CONFIGS["qwen4"],
+    SPLIT_CONFIGS["glm5_flash"], {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+                                "first_k_dense_replace": 3}, {"model_type": "deepseek_v4"},
+])
+@pytest.mark.parametrize("setting", ["", "FULL_PREFILL_LOGITS=off\n", "FULL_PREFILL_LOGITS=on\n"])
+def test_full_prefill_logits_is_one_shared_opt_in(tmp_path, family_config, setting):
+    result = _family_launch_result(tmp_path, family_config, "test/model",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\n" + setting)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert launch.count("--full-prefill-logits") == int("=on" in setting)
+
+
+def test_full_prefill_logits_rejects_invalid_setting_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["mimo_flash"], "test/model",
+                                  "FULL_PREFILL_LOGITS=true\n")
+    assert result.returncode == 2, result.stderr
+    assert "FULL_PREFILL_LOGITS must be on or off" in result.stderr
+    assert "docker run" not in result.stderr
+
+
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
 def test_explicit_split_without_kernels_serves_from_the_first_gpu(

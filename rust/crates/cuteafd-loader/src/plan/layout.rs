@@ -29,6 +29,8 @@ pub struct LayoutOptions {
     pub head_split: bool,
     /// Prefill rows per step (workspace shape).
     pub prefill_rows: u64,
+    /// Admit the probe-only all-row vocabulary output on the lead GPU.
+    pub full_prefill_logits: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -63,6 +65,7 @@ impl Default for LayoutOptions {
             spark_bytes: 108 * GIB,
             head_split: true,
             prefill_rows: 0,
+            full_prefill_logits: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
@@ -75,6 +78,45 @@ impl Default for LayoutOptions {
             native_mtp_layers: 3,
             local_expert_layers: None,
             workspace_manifest: None,
+        }
+    }
+}
+
+/// Additional lead-GPU output bytes for admitted all-row fidelity probes.
+/// MiMo has one full-row head (earlier lanes are headless), GLM/GLM Flash
+/// have one per row lane, and Qwen one. V4 downloads through its existing
+/// bounded head buffer, while V4.1 already supports prefill scoring.
+pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
+    let (lanes, ordinary_rows) = match family {
+        "mimo_v2" => (1, 1),
+        "qwen4" => (1, 1),
+        "glm5" => (4, rows.min(64)),
+        "glm5_flash" => (2, rows.min(64)),
+        _ => return 0,
+    };
+    let extra_rows = rows.saturating_sub(ordinary_rows);
+    let logits = extra_rows.saturating_mul(lanes).saturating_mul(vocab).saturating_mul(4);
+    // Qwen's output workspace also owns one argmax and selection pair per row.
+    logits.saturating_add(if family == "qwen4" { extra_rows.saturating_mul(16) } else { 0 })
+}
+
+#[cfg(test)]
+mod scoring_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
+        assert!(!LayoutOptions::default().full_prefill_logits);
+        assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
+        assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
+        assert_eq!(full_prefill_logits_bytes("glm5", 128, 1000), 4 * 64 * 1000 * 4);
+        assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 2 * 64 * 1000 * 4);
+        for family in ["deepseek_v4", "deepseek_v41"] {
+            assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
+        }
+        for family in ["mimo_v2", "qwen4", "glm5", "glm5_flash"] {
+            assert_eq!(full_prefill_logits_bytes(family, 1, 1000), 0);
+            assert_eq!(full_prefill_logits_bytes(family, u64::MAX, u64::MAX), u64::MAX);
         }
     }
 }
@@ -455,6 +497,10 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
         let workspace_basis = if v4_workspace.is_some() { Basis::Formula } else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
+        if options.full_prefill_logits && index == 0 {
+            device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
+                full_prefill_logits_bytes(family, prefill_rows, model.spec().vocab as u64), Basis::Formula));
+        }
         if split {
             let exact_peer = if family == "deepseek_v4" {
                 crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows).ok()

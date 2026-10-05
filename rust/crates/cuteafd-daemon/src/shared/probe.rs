@@ -26,7 +26,7 @@ pub(crate) fn cold(probe: &ProbeRef) -> bool {
 
 /// Decode one token per step for this request.
 pub(crate) fn no_speculation(probe: &ProbeRef) -> bool {
-    probe.as_ref().is_some_and(|p| p.spec.no_speculation)
+    probe.as_ref().is_some_and(|p| p.spec.no_speculation || p.scoring().is_some())
 }
 
 /// The scoring start, for a teacher-forced scoring request.
@@ -122,43 +122,104 @@ fn scoring_width(capacity: usize, requested: Option<usize>) -> Result<usize> {
     Ok(rows)
 }
 
-/// A teacher-forced scoring pass over `tokens` from `from` (clamped to
-/// `1..len`): `prefill(state, chunk, logit)` runs a prompt chunk (with its last
-/// row's logits when `logit`), `verify(state, chunk)` a decode-shaped step returning
-/// every row's logits; the rows predicting `tokens[from..]` are recorded.
-/// Returns the number of rows scored.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32], from: usize, prefill_rows: usize,
-    verify_capacity: usize, requested_verify_rows: Option<usize>, state: &mut S,
-    mut prefill: impl FnMut(&mut S, &[u32], bool) -> Result<Option<DeviceLogits>>,
-    mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
-    anyhow::ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
-    let verify_rows = scoring_width(verify_capacity, requested_verify_rows)?;
-    let path = ScorePath::parse(probe.as_ref().and_then(|p| p.spec.score_path.as_deref()), ScorePath::Decode)?;
-    anyhow::ensure!(path == ScorePath::Decode, "unsupported prefill-shaped probe scoring for this family");
-    if let Some(probe) = probe { probe.selected_score_path(path.name()); }
-    let from = from.clamp(1, tokens.len() - 1);
-    let mut done = 0;
-    let mut scored = 0;
-    while done < from {
-        let end = (done + prefill_rows.max(1)).min(from);
-        let logits = prefill(state, &tokens[done..end], end == from)?;
-        if end == from {
-            let logits = logits.ok_or_else(|| anyhow::anyhow!("scoring prefill produced no logits"))?;
-            anyhow::ensure!(logits.rows > 0, "scoring prefill produced empty logits");
-            device_rows(library, probe, &logits, logits.rows - 1, 1, from)?;
-            scored += 1;
+/// Validate before grammar setup, cache admission, or any request device work.
+pub(crate) fn validate_scoring(probe: &ProbeRef, full_prefill_logits: bool) -> Result<()> {
+    let Some(probe) = probe.as_ref().filter(|p| p.scoring().is_some()) else { return Ok(()) };
+    let path = ScorePath::parse(probe.spec.score_path.as_deref(), ScorePath::Decode)?;
+    score_plan(2, 1, 1, usize::MAX, probe.spec.verify_rows, path, full_prefill_logits)?;
+    Ok(())
+}
+
+/// Pipelined prefill may return rows spanning several lane workspaces.
+/// Keep those host rows ordered rather than requiring another device buffer.
+pub(crate) enum ScoreLogits {
+    Device(DeviceLogits),
+    Host { values: Vec<f32>, vocab: usize },
+}
+
+impl ScoreLogits {
+    fn record(&self, library: &NativeLibrary, probe: &ProbeRef, n: usize, position: usize) -> Result<()> {
+        match self {
+            Self::Device(logits) => {
+                anyhow::ensure!(logits.rows >= n, "scoring needs {n} rows, got {}", logits.rows);
+                device_rows(library, probe, logits, logits.rows - n, n, position)
+            }
+            Self::Host { values, vocab } => {
+                anyhow::ensure!(*vocab > 0 && values.len() % vocab == 0, "invalid scoring host logits shape");
+                let rows = values.len() / vocab;
+                anyhow::ensure!(rows >= n, "scoring needs {n} rows, got {rows}");
+                for (j, row) in values[(rows - n) * vocab..].chunks_exact(*vocab).enumerate() {
+                    host_row(probe, position + j, row);
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScoreStep {
+    tokens: std::ops::Range<usize>,
+    path: ScorePath,
+    logit_rows: usize,
+    position: usize,
+}
+
+fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usize,
+    requested_verify_rows: Option<usize>, path: ScorePath, full_prefill_logits: bool) -> Result<Vec<ScoreStep>> {
+    anyhow::ensure!(len >= 2, "scoring needs at least two tokens");
+    let rows = match path {
+        ScorePath::Decode => scoring_width(verify_capacity, requested_verify_rows)?,
+        ScorePath::Prefill => {
+            anyhow::ensure!(requested_verify_rows.is_none(), "probe verify_rows requires score_path=decode");
+            anyhow::ensure!(full_prefill_logits,
+                "prefill-shaped probe scoring requires --full-prefill-logits at server launch (FULL_PREFILL_LOGITS=on)");
+            prefill_rows.max(1)
+        }
+    };
+    let from = from.clamp(1, len - 1);
+    let mut steps = Vec::new();
+    let mut done = 0;
+    while done < from {
+        let end = done.saturating_add(prefill_rows.max(1)).min(from);
+        steps.push(ScoreStep { tokens: done..end, path: ScorePath::Prefill,
+            logit_rows: usize::from(end == from), position: from });
         done = end;
     }
-    // Row j of a step over tokens[p..end] predicts token p + j + 1.
-    let mut p = from;
-    while p + 1 < tokens.len() {
-        let end = (p + verify_rows.max(1)).min(tokens.len() - 1);
-        let logits = verify(state, &tokens[p..end])?;
-        device_rows(library, probe, &logits, 0, end - p, p + 1)?;
-        scored += end - p;
-        p = end;
+    // Row j over tokens[p..end] predicts token p + j + 1. The final input
+    // token has no successor to score, so it is never run.
+    while done < len - 1 {
+        let end = done.saturating_add(rows).min(len - 1);
+        steps.push(ScoreStep { tokens: done..end, path, logit_rows: end - done, position: done + 1 });
+        done = end;
+    }
+    Ok(steps)
+}
+
+/// Teacher-forced scoring; `prefill` requests 0, 1, or every chunk row's
+/// logits. Its cache commit is identical to ordinary prefill. Decode remains
+/// the default, with no drafts, retained prefix, or diagnostic workspace growth.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32], from: usize, prefill_rows: usize,
+    verify_capacity: usize, requested_verify_rows: Option<usize>, full_prefill_logits: bool, state: &mut S,
+    mut prefill: impl FnMut(&mut S, &[u32], usize) -> Result<Option<ScoreLogits>>,
+    mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
+    let path = ScorePath::parse(probe.as_ref().and_then(|p| p.spec.score_path.as_deref()), ScorePath::Decode)?;
+    let steps = score_plan(tokens.len(), from, prefill_rows, verify_capacity, requested_verify_rows, path,
+        full_prefill_logits)?;
+    if let Some(probe) = probe { probe.selected_score_path(path.name()); }
+    let mut scored = 0;
+    for step in steps {
+        let chunk = &tokens[step.tokens];
+        let logits = match step.path {
+            ScorePath::Prefill => prefill(state, chunk, step.logit_rows)?,
+            ScorePath::Decode => Some(ScoreLogits::Device(verify(state, chunk)?)),
+        };
+        if step.logit_rows > 0 {
+            logits.ok_or_else(|| anyhow::anyhow!("scoring produced no logits"))?
+                .record(library, probe, step.logit_rows, step.position)?;
+            scored += step.logit_rows;
+        }
     }
     Ok(scored)
 }
@@ -176,6 +237,62 @@ mod tests {
             assert_eq!(ScorePath::parse(Some("prefill"), default).unwrap(), ScorePath::Prefill);
             assert!(ScorePath::parse(Some("other"), default).is_err());
         }
+    }
+
+    #[test]
+    fn both_shapes_map_every_scored_row_to_its_next_token() {
+        for len in [2, 3, 9, 65, 130] {
+            for requested_from in [0, 1, 8, 64, len - 1, len, usize::MAX] {
+                for width in [0, 1, 3, 8, 64, usize::MAX] {
+                    for path in [ScorePath::Decode, ScorePath::Prefill] {
+                        let from = requested_from.clamp(1, len - 1);
+                        let plan = score_plan(len, requested_from, width, 8, None, path, true).unwrap();
+                        let mut next_input = 0;
+                        let mut positions = Vec::new();
+                        for step in plan {
+                            assert_eq!(step.tokens.start, next_input);
+                            next_input = step.tokens.end;
+                            let rows = step.tokens.len();
+                            assert!(rows > 0 && step.tokens.end < len);
+                            if step.logit_rows > 0 {
+                                assert_eq!(step.position, step.tokens.end - step.logit_rows + 1);
+                                positions.extend(step.position..step.position + step.logit_rows);
+                            }
+                            if step.tokens.start >= from {
+                                assert_eq!(step.path, path);
+                                assert_eq!(step.logit_rows, rows);
+                                assert!(rows <= if path == ScorePath::Decode { 8 } else { width.max(1) });
+                            }
+                        }
+                        assert_eq!(next_input, len - 1);
+                        assert_eq!(positions, (from..len).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_requires_launch_admission_and_rejects_verify_override() {
+        let error = score_plan(20, 4, 8, 8, None, ScorePath::Prefill, false).unwrap_err();
+        assert!(error.to_string().contains("--full-prefill-logits"));
+        assert!(score_plan(20, 4, 8, 8, Some(1), ScorePath::Prefill, true).unwrap_err()
+            .to_string().contains("verify_rows requires score_path=decode"));
+        assert!(score_plan(1, 0, 8, 8, None, ScorePath::Decode, false).is_err());
+        assert!(score_plan(20, 4, 8, 8, None, ScorePath::Decode, false).is_ok());
+    }
+
+    #[test]
+    fn scoring_probes_are_cold_draft_free_and_validated_before_execution() {
+        assert!(!cold(&None));
+        assert!(!no_speculation(&None));
+        assert!(validate_scoring(&None, false).is_ok());
+        let probe = Some(Probe::new(ProbeSpec { score_from: Some(4), score_path: Some("prefill".into()),
+            ..ProbeSpec::default() }));
+        assert!(cold(&probe));
+        assert!(no_speculation(&probe));
+        assert!(validate_scoring(&probe, false).unwrap_err().to_string().contains("--full-prefill-logits"));
+        assert!(validate_scoring(&probe, true).is_ok());
     }
 
     #[test]

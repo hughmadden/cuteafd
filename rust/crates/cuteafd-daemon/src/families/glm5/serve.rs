@@ -480,6 +480,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
+            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                reject(&job, format!("scoring: {error:#}"));
+                continue;
+            }
             let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
                 Err(error) => {
@@ -524,9 +528,16 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let mut placement = admitted.placement;
                 let mut state = (&mut placement, transport.as_deref_mut());
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), &mut state,
-                    |(placement, transport), chunk, _| engine.prefill_device(placement, chunk,
-                        transport.as_deref_mut().map(|t| (t, runtime))),
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut state,
+                    |(placement, transport), chunk, rows| {
+                        let experts = transport.as_deref_mut().map(|t| (t, runtime));
+                        if rows > 1 {
+                            Ok(engine.prefill_rows_logits(placement, chunk, experts, None, rows)?
+                                .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
+                        } else {
+                            Ok(engine.prefill_device(placement, chunk, experts)?.map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |(placement, transport), chunk| engine.verify_device(&mut [(&mut **placement, chunk.len())], chunk,
                         transport.as_deref_mut().map(|t| (t, runtime)))?.context("scoring needs every layer"));
                 match scored {

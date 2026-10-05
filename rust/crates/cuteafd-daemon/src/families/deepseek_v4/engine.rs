@@ -39,6 +39,7 @@ pub(crate) struct Engine<'a> {
     pub family: &'static str,
     pub decode_rows: usize,
     pub prefill_rows: usize,
+    pub full_prefill_logits: bool,
     pub c128_width: usize,
     /// Longest sequence the exported programs' cache extents cover.
     pub max_context: usize,
@@ -459,6 +460,7 @@ impl<'a> Engine<'a> {
             family: parts.family,
             decode_rows: parts.decode_rows,
             prefill_rows: parts.prefill_rows,
+            full_prefill_logits: false,
             c128_width: parts.c128_width,
             max_context: parts.max_context,
             stream: parts.stream,
@@ -473,6 +475,17 @@ impl<'a> Engine<'a> {
             skip_routed: parts.skip_routed,
             device_link: None,
         })
+    }
+
+    /// All-row diagnostics reuse the admitted bounded head buffer, downloading
+    /// its rows in LOGIT_ROWS batches; no vocabulary-sized GPU buffer is added.
+    pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
+        *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, PREFILL_LANES)?);
+        if let Some(peer) = &self.peer {
+            *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, PREFILL_LANES)?);
+        }
+        self.full_prefill_logits = true;
+        Ok(())
     }
 
     fn workspace(&self, t: usize, lanes: usize) -> Result<Workspace<'a>> {
