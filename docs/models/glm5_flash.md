@@ -109,6 +109,24 @@ Missing GPU1 exports, BF16 reconversion, duplicated full-head KDA and
 row128 slice recalibration were ruled out; all 238 companion KDA tensor
 payloads matched.
 
+The matched continuation confirms that the original FP8 arm can prefill at
+about 6,816 tok/s and emit C4 at 290.55 tok/s; the historical large loss
+does not reproduce. A BF16 launch instead shows the long waits: identical
+BF16 routes across launches, ~455 ms coordinator GPU wait, near-stable
+expert execution, but synchronized 436-442 ms gaps between worker responses
+on all four ranks. Sampled Spark clocks remain ~2.34-2.42 GHz with event
+reason masks zero. This points to intermittent coordinator/transport
+waiting, not slow FP8 expert compute or established thermal throttling.
+
+Shared-agent contention was considered. In the slow 2026-10-05
+01:26:35-01:26:45 UTC window, retained Docker events show W4A4 workers
+already stopped by 01:24:36 and Hugh's next workers starting at 01:28:46;
+only this task's workers appear active in the intervening lifecycle record.
+No overlapping serving/build container was found. These logs do not exclude
+all host/fabric traffic or older long-lived processes. Coordinator scheduling
+or transport timeout/retry remains an open issue requiring correlated
+dispatch, completion, retry and traffic evidence, not a precision verdict.
+
 The numerical contribution is different: the original KDA output computes
 half-K partials, rounds each to BF16, then adds them. KDA-only and head-only
 ablations put most of the added KL in KDA; retaining FP32 output partials
