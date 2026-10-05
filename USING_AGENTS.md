@@ -51,9 +51,11 @@ but bounded engineering still goes to Sol.
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
 | Everything else exhausted | MiMo | default |
 
-- **Codex subscriptions:** use the `-backup` models (TJ's second
-  subscription) first while it still has resets to use; fall back to the
-  primary ones when it is spent. Astra burns budget faster than Sol but less
+- **Codex subscriptions:** start new agents on the `-backup` models (TJ's
+  second subscription); when backup hits its weekly limit, start new agents
+  on primary. TJ can reset backup's usage; after a reset, new agents go
+  back to backup while running agents stay where they are (don't cancel
+  them to move them). Astra burns budget faster than Sol but less
   than Fable.
 - **Read the error body, not the headline.** The gateway prints "Server is
   temporarily limiting requests (not your usage limit)" for both cases. A
