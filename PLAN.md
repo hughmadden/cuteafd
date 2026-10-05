@@ -811,7 +811,12 @@ Work, in priority order:
     cost after history is ~1,547+40 µs vs v1.0.0's ~1,492+37 µs. Next, if
     pursued: bisect the policy merges since v1.0.0 (569f4f6 draft policy
     core and verify-cost fit) under the same smoke-conditioned protocol.
-    Harness: ~/.cache/cuteafd/builds/c1bisect.
+    Harness: ~/.cache/cuteafd/builds/c1bisect. Correction (c1policy): 569f4f6
+    predates v1.0.0, and the gap does NOT reproduce on 1 RTX + 4 (warm C1
+    0.999, identical draft-cost fits 1,648/1,646 µs, 4.71 tokens per round
+    both). So it's 2-RTX-head-split-specific. Remaining Rust candidates on
+    the serving path: d60f989 (Hugh ports) and b615cc7 (Qwen merge); bisect
+    on 2 RTX when GPU1 is free. Evidence: ~/.cache/cuteafd/builds/c1policy.
 13. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
