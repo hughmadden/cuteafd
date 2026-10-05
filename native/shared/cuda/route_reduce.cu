@@ -121,12 +121,12 @@ __global__ void reduce_compact(const __nv_bfloat16* p0,
 }
 
 // Shared validation for the replicated-group N-plane compact reducer. Accepts
-// exactly 2, 3, 4 or 6 active planes; every inactive slot must be null. All
+// exactly 1, 2, 3, 4 or 6 active planes; every inactive slot must be null. All
 // extents and alignment checks are done in uint64 to avoid overflow.
 bool valid_compact_planes(const uint16_t* const planes[6], const uint16_t* shared,
     uint16_t* output, uint32_t rows, uint32_t ranks) {
   if (!planes || !output || !rows || rows > 4096 ||
-      (ranks != 2 && ranks != 3 && ranks != 4 && ranks != 6))
+      (ranks != 1 && ranks != 2 && ranks != 3 && ranks != 4 && ranks != 6))
     return false;
   const uint64_t bytes = uint64_t(rows) * cuteafd_expert_hidden() * 2;
   if (reinterpret_cast<uintptr_t>(output) % 2 ||
@@ -271,6 +271,10 @@ extern "C" int32_t cuteafd_reduce_compact_bf16_planes_async(
   const auto* shared_bf16 = reinterpret_cast<const __nv_bfloat16*>(shared);
   auto* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
   switch (ranks) {
+    case 1:
+      reduce_compact<1><<<blocks, 256, 0, cuda_stream>>>(p0, nullptr, nullptr, nullptr,
+          nullptr, nullptr, shared_bf16, output_bf16, count);
+      break;
     case 2:
       reduce_compact<2><<<blocks, 256, 0, cuda_stream>>>(p0, p1, nullptr, nullptr,
           nullptr, nullptr, shared_bf16, output_bf16, count);

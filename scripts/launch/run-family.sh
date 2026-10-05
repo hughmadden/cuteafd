@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch a DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 or Qwen 3.8 Flash Next
 # checkpoint (the family's serve command on one RTX, routed experts on the first
-# SPARK_COUNT Sparks) from the release images named in the config. ./run.sh
+# SPARK_COUNT Sparks, or SPARK_HOSTS in explicit rank order) from the release images named in the config. ./run.sh
 # starts this for every family but DeepSeek V4.1; the family comes from the
 # snapshot's config.json (scripts/lib/checkpoint-family.py), or --family.
 # Containers use run.sh's names, so ./stop.sh stops them.
@@ -64,6 +64,14 @@ esac
 # the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
 ranks="$(get SPARK_COUNT 4)"
 configured_ranks="$ranks"
+if [[ -n "$(get SPARK_HOSTS)" ]]; then
+  host_rows="$(release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks")" || exit 2
+  while read -r rank host lane_a lane_b; do
+    cfg[SPARK_${rank}_HOST]="$host"
+    cfg[SPARK_${rank}_LANE_A]="$lane_a"
+    cfg[SPARK_${rank}_LANE_B]="$lane_b"
+  done <<<"$host_rows"
+fi
 backend="$(get EXPERT_BACKEND auto)"
 case "$backend" in
   auto|spark) ;;

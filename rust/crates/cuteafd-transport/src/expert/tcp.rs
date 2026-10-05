@@ -25,7 +25,7 @@ impl V41Tp4Tcp {
     ) -> Result<Self> {
         Self::new_ranks(&peers, &executors, capacity, config)
     }
-    /// Generic constructor for the validated physical rank counts 2, 3, 4 and 6
+    /// Generic constructor for the validated physical rank counts 1, 2, 3, 4 and 6
     /// under the legacy (non-ownership) frame contract.
     pub fn new_ranks(
         peers: &[SocketAddr],
@@ -58,8 +58,8 @@ impl V41Tp4Tcp {
         topology: Option<SparkTopology>,
     ) -> Result<Self> {
         ensure!(
-            peers.len() == executors.len() && matches!(peers.len(), 2 | 3 | 4 | 6),
-            "native TP/EP requires two, three, four or six matching peers and executors"
+            peers.len() == executors.len() && matches!(peers.len(), 1 | 2 | 3 | 4 | 6),
+            "native TP/EP requires one, two, three, four or six matching peers and executors"
         );
         if let Some(topology) = topology {
             ensure!(

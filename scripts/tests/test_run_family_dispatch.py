@@ -137,6 +137,35 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           env=env, capture_output=True, text=True, timeout=30)
 
 
+def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "SPARK_HOSTS=moa\nEXPERT_BACKEND=spark\nSPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert "moa" in worker
+    assert "--rank 0 --world 1" in worker
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--peers 10.55.0.6:" in launch
+    assert "--local-experts" not in launch
+    assert not any("ssh" in line and "h0" in line for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("hosts,message", [
+    ("moa,moa", "exactly SPARK_COUNT"),
+    ("unknown", "unknown Spark pool host"),
+    ("moa,", "comma-separated Spark pool host list"),
+    ("moa,moa\nSPARK_COUNT=2", "duplicate host"),
+])
+def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str, message: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  f"SPARK_HOSTS={hosts}\nEXPERT_BACKEND=spark\nSPECULATOR=off\n")
+    assert result.returncode == 2, result.stderr
+    assert message in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "cuteafd serve-qwen4" not in result.stderr
+
+
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 

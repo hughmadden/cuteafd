@@ -222,13 +222,37 @@ release_known_key() {
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|COPY_DRAFTS|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|EXPERT_BACKEND) return 0 ;;
     EXL3_PAIRED_TP4|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|RTX_GPUS|RTX_EXPERT_LAYERS|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|RTX_GPUS|RTX_EXPERT_LAYERS|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_HOSTS|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE)
       return 0
       ;;
     *)
       return 1
       ;;
   esac
+}
+
+# Resolve an explicit pool-host order into rank/host/rail rows. Nothing changes
+# unless SPARK_HOSTS is set; legacy SPARK_<rank>_* configurations remain verbatim.
+release_spark_host_rows() {
+  local csv="$1" count="$2" mode="${3:-launch}" host index rank=0 seen=,
+  local -a hosts
+  [[ "$csv" =~ ^[a-z]+(,[a-z]+)*$ ]] || release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
+  IFS=, read -r -a hosts <<<"$csv"
+  if [[ "$mode" == launch ]]; then
+    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
+      release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
+  fi
+  for host in "${hosts[@]}"; do
+    [[ "$seen" != *",$host,"* ]] || release_die "SPARK_HOSTS contains duplicate host $host"
+    seen+="$host,"
+    case "$host" in
+      ostrich) index=1 ;; dodo) index=2 ;; emu) index=3 ;;
+      kiwi) index=4 ;; rhea) index=5 ;; moa) index=6 ;;
+      *) release_die "SPARK_HOSTS names unknown Spark pool host $host" ;;
+    esac
+    printf '%s %s 10.55.0.%s 10.55.1.%s\n' "$rank" "$host" "$index" "$index"
+    rank=$((rank + 1))
+  done
 }
 
 # Load and validate a configuration file.
@@ -313,6 +337,7 @@ release_load_config() {
   SPARKINFER_EXL3=disable
   EXL3_PAIRED_TP4=off
   SPARK_COUNT=4
+  SPARK_HOSTS=
   # Optional explicit replicated expert-group topology. Absent means the legacy
   # geometry (TP = SPARK_COUNT, EP = 1). See docs/tp-ep-configuration.md.
   SPARK_TP=
@@ -348,6 +373,19 @@ release_load_config() {
     [[ "$key" != MODEL_ID ]] || model_id_explicit=1
     [[ "$key" != MODEL_REVISION ]] || model_revision_explicit=1
   done <"$config"
+
+  if [[ -n "$SPARK_HOSTS" ]]; then
+    local host_rows rank host lane_a lane_b
+    host_rows="$(release_spark_host_rows "$SPARK_HOSTS" "$SPARK_COUNT" "$mode")" || return 2
+    # Stop preserves legacy host names too: cleanup is the union of both lists.
+    if [[ "$mode" != stop ]]; then
+      while read -r rank host lane_a lane_b; do
+        printf -v "SPARK_${rank}_HOST" '%s' "$host"
+        printf -v "SPARK_${rank}_LANE_A" '%s' "$lane_a"
+        printf -v "SPARK_${rank}_LANE_B" '%s' "$lane_b"
+      done <<<"$host_rows"
+    fi
+  fi
 
   # A model override without its own revision must never inherit the pinned
   # calibrated-release commit from the defaults.
@@ -767,6 +805,12 @@ release_select_stop_hosts() {
   local name host seen_host index
   local -a indices=() seen=()
   RELEASE_STOP_HOSTS=()
+  if [[ -n "${SPARK_HOSTS:-}" ]]; then
+    local -a explicit_hosts=()
+    IFS=, read -r -a explicit_hosts <<<"$SPARK_HOSTS"
+    RELEASE_STOP_HOSTS+=("${explicit_hosts[@]}")
+    seen+=("${explicit_hosts[@]}")
+  fi
 
   # Enumerate every configured SPARK_<rank>_HOST variable, whatever its index.
   # The configuration grammar (release_known_key) is the single authority on

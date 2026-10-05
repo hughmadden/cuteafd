@@ -12,13 +12,13 @@
 //!   `glm:nvfp4`): Spark tp4, tp2, tp3 and tp6 in whole 16-value blocks, a tp1
 //!   coordinator package.
 //! - EXL3 (`python/tools/aot/package_exl3_aot.py`): Spark worlds 4, 2, 3, and
-//!   6 when the intermediate has at least six 128-row blocks.
+//!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
 //!
-//! The expert transport (RoCE verbs, TCP) runs 2, 3, 4 or 6 Spark ranks.
+//! The expert transport (RoCE verbs, TCP) runs 1, 2, 3, 4 or 6 Spark ranks.
 
 /// Spark worlds the expert transport runs.
-pub const TRANSPORT_WORLDS: [usize; 4] = [2, 3, 4, 6];
+pub const TRANSPORT_WORLDS: [usize; 5] = [1, 2, 3, 4, 6];
 
 /// Default Spark layouts of an FP8 (E4M3, 128x128 scales) expert package.
 pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {
@@ -37,7 +37,7 @@ pub fn mxfp4_spark_worlds() -> Vec<usize> {
 /// Default Spark layouts of an NVFP4 package on the fp8_moe programs: the
 /// transport worlds whose ranks each own a 16-value block.
 pub fn nvfp4_spark_worlds(intermediate: usize) -> Vec<usize> {
-    TRANSPORT_WORLDS.into_iter().filter(|&tp| intermediate % 16 == 0 && intermediate / 16 >= tp).collect()
+    [2usize, 3, 4, 6].into_iter().filter(|&tp| intermediate % 16 == 0 && intermediate / 16 >= tp).collect()
 }
 
 /// Spark worlds of an EXL3 package (`package_exl3_aot.py` profiles).
