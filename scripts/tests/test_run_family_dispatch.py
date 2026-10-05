@@ -50,10 +50,14 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart\n"
     # DeepSeek V4.1 options do not apply to other families.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--concurrency", "4")
-    assert result.returncode != 0 and "take --config, --restart and --embedding-placement" in result.stderr
+    assert result.returncode != 0 and "take --config, --restart, --wip and --embedding-placement" in result.stderr
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--embedding-placement", "host")
     assert result.returncode == 0, result.stderr
     assert "--embedding-placement host" in result.stdout
+    # A ./wip.sh slot reaches run-family.sh, which serves it from the development images.
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--wip", "s1", "--restart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --wip s1\n"
 
 
 def test_family_table_names_every_launchable_family() -> None:
@@ -97,7 +101,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
-                          previous_peers: str | None = None, encoder_plan: dict | None = None) -> subprocess.CompletedProcess[str]:
+                          previous_peers: str | None = None, encoder_plan: dict | None = None,
+                          extra_args: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -140,7 +145,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
-                           *(["--restart"] if restart else [])],
+                           *(["--restart"] if restart else []), *extra_args],
                           env=env, capture_output=True, text=True, timeout=30)
 
 
@@ -922,3 +927,15 @@ def test_text_only_mimo_auto_default_does_not_start_a_tower(tmp_path):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert "--vision auto" in launch
     assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
+
+
+_GLMF = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+         "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+@pytest.mark.parametrize("slot", ["../x", "-s", "a b", ""])
+def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_args=("--wip", slot))
+    assert result.returncode != 0
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
