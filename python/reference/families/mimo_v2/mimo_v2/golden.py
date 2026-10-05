@@ -174,6 +174,8 @@ def main() -> None:
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     install()
+    from shape_invariant import install_eager
+    install_eager(ref)
     config = AutoConfig.from_pretrained(a.snapshot)
     config._attn_implementation = "eager"
     text = a.text_file.read_text() if a.text_file else a.text

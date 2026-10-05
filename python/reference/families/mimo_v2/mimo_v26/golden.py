@@ -231,6 +231,8 @@ def main() -> None:
     config._attn_implementation = "eager"
     cls = lambda name: get_class_from_dynamic_module(f"modeling_mimo_v2.{name}", str(a.snapshot))  # noqa: E731
     Layer, Rotary, Norm = cls("MiMoV2DecoderLayer"), cls("MiMoV2RotaryEmbedding"), cls("MiMoV2RMSNorm")
+    from shape_invariant import install_eager
+    install_eager(sys.modules[Layer.__module__])
     if a.windows:
         if a.text or a.text_file or a.max_tokens or a.stop_after is not None:
             p.error("--windows cannot be combined with legacy text/truncation/stop options")

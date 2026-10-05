@@ -372,6 +372,44 @@ def test_glm_kda_grouping_preserves_all_heads_and_recurrent_state():
     assert grouped(data, data, data, data, data[..., 0])[1] is None
 
 
+def test_eager_query_blocks_keep_keys_masks_and_selected_rows():
+    tree = ast.parse((ROOT / "python/reference/shape_invariant.py").read_text())
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("bounded_eager", "bounded_sparse")]
+    scope = {"torch": SimpleNamespace(cat=lambda values, dim: np.concatenate(values, axis=dim))}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "bounded_attention", "exec"), scope)
+    q = np.arange(1 * 3 * 7 * 2).reshape(1, 3, 7, 2)
+    kv = np.zeros((1, 3, 11, 2))
+    mask = np.arange(7 * 11).reshape(1, 1, 7, 11)
+    selected = np.arange(1 * 7 * 4 * 2).reshape(1, 7, 4, 2)
+    calls = []
+    def official(module, query, key, value, attention_mask, **kwargs):
+        assert key is kv and value is kv
+        calls.append((query.shape[-2], attention_mask.copy(), kwargs["selected_kv"].copy()))
+        return query.transpose(0, 2, 1, 3), np.ones((1, 3, query.shape[-2], 11))
+    module = SimpleNamespace(training=False)
+    wrapped = scope["bounded_eager"](official, rows=3)
+    output, weights = wrapped(module, q, kv, kv, mask, .25, selected_kv=selected,
+                              selected_valid=np.ones((1, 7, 4)))
+    assert weights is None
+    np.testing.assert_array_equal(output, q.transpose(0, 2, 1, 3))
+    assert [c[0] for c in calls] == [3, 3, 1]
+    np.testing.assert_array_equal(np.concatenate([c[1] for c in calls], axis=2), mask)
+    np.testing.assert_array_equal(np.concatenate([c[2] for c in calls], axis=1), selected)
+    with pytest.raises(ValueError, match="dropout"):
+        wrapped(module, q, kv, kv, mask, .25, dropout=.1)
+    sparse_calls = []
+    def sparse(query, key, sink, indices, scale):
+        sparse_calls.append(query.shape[1])
+        assert key is kv and scale == .25
+        return query + indices[..., :1, None]
+    sparse_q = q.transpose(0, 2, 1, 3)
+    indices = np.arange(7).reshape(1, 7, 1)
+    actual = scope["bounded_sparse"](sparse, rows=3)(sparse_q, kv, None, indices, .25)
+    np.testing.assert_array_equal(actual, sparse_q + indices[..., :1, None])
+    assert sparse_calls == [3, 3, 1]
+
+
 def test_official_reference_identity_can_differ_from_generation_checkpoint(tmp_path):
     snapshot = tmp_path / "official-fp8"
     snapshot.mkdir()

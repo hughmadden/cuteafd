@@ -243,6 +243,8 @@ def main() -> None:
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     install()
+    from shape_invariant import install_eager
+    install_eager(ref)
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"

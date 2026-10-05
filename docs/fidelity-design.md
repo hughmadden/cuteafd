@@ -238,9 +238,22 @@ golden: 70 layers in 295 s for 1.5K tokens, 4.2 s/layer average, 7–10 s on
 MoE layers), so running every window of the set inside each layer visit is
 nearly free: expert compute for 400K tokens × 8 experts is ≈ 160 TFLOP per
 layer (≈ 1–2 s on an RTX PRO 6000), eager attention per window is small
-below 16K (scores [H, T, T] at T = 16K ≈ 33 GB transient; 32K ≈ 130 GB does
-not fit and needs query-chunked attention in `golden.py`). Hidden streams
-for 400K tokens × 4 × 4096 × 2 B = 13 GB stay on the GPU between layers.
+only with bounded query blocks: at 16K, eager [H,T,T] scores plus FP32
+softmax temporaries already exhaust GB10 unified memory. Goldens call the
+unchanged official eager function on at most 1024 queries against all keys,
+slicing the query mask and retaining row-wise arithmetic; unused attention
+weights are discarded. Official DeepSeek sparse hooks use 128-query blocks
+before their KV gather. GLM KDA keeps its official 64-token recurrent chunks
+and bounds independent head groups instead. Small CPU byte-exact gates and
+the actual common-prefix qualification precede every full panel. Hidden
+streams for 400K tokens x 4 x 4096 x 2 B = 13 GB stay on CPU between layers.
+
+Read each layer once through `/mnt/sparknest`; do not replicate weights for
+a one-time golden. GLM Flash BF16 is spread over Spark NVMe and streams via
+RoCE (~5 GB/s, ~3 s per ~13 GB layer, about two minutes extra total). Qwen
+BF16 is in the scratch archive (~500 MB/s, about 20 minutes extra total).
+These are planning estimates, not measurements. Replication is for serving,
+which rereads weights at each launch.
 The eager per-expert Python loop (288 experts, `index_add_`) is the real
 cost: budget 10–30 s per MoE layer at 400K tokens. Estimate: **GLM Flash
 (45 layers) 15–30 min, MiMo V2.6 Pro (70 layers) 30–45 min, DeepSeek V4.1
@@ -249,11 +262,32 @@ writing 10 GB of f16 log-probs. Once per family per set version. Measure on
 the first run and record it in the commit; batching tokens per expert
 across windows is the first optimization if it runs long.
 
-Storage per family: full-vocab f16 log-softmax rows, 32,768 × vocab × 2 B
-(GLM Flash: 10.1 GB; V4.1: ≈ 8.4 GB) on `/mnt/sparknest/fidelity/<family>/
-<set-version>/` with a sha256 manifest in the repo; the compact quick-tier
-reference (12 windows, top-32 ids u32 + log-probs f16 + tail + next, ≈ 1.3
-MB binary) compiled into `cuteafd-bench` as today.
+Reference roots use vendor BF16 originals when published: GLM 5.3 Flash
+`zai-org/GLM-5.3-Flash-BF16`, Qwen 3.8 `Qwen/Qwen3.8-Flash-Next`, and GLM 5.3
+`zai-org/GLM-5.3-BF16`. V4.1, V4 Flash/Pro and MiMo MOPD keep their official
+FP8/MXFP4 releases because no vendor BF16 master is published. Manifests pin
+root checkpoint, precision, snapshot/config/tokenizer hashes separately
+from the text-generation arm. FP8-serve-generated GLM text may remain;
+Qwen FP8 serve is wanted, with explicitly labelled EXL3 generation retained
+only as an interim fallback. A root change creates a new set/reference hash
+and requires fresh prefix qualification, never reuse of an old proof.
+
+The full tier ships reference top-1024 token ids u32 and log-probs f16,
+plus f32 tail log-mass and next-token log-prob in safetensors, one HF dataset
+config per family/set-version in `tpurtell/cuteafd-fidelity`. The support is
+reference-fixed; normalize the 1024 values plus aggregate tail bin together
+and evaluate the engine on the same support with one aggregate engine tail.
+This is a coarse-grained KL, not mathematically identical full-vocabulary
+KL. Saved V4.1 FP8-head decode/prefill paired deltas and upper95 bounds agree
+with full-vocabulary results within 1.18e-7 nat (required <=1e-4), with both
+PASS verdicts unchanged; f16 entries and f32 tail were included. Full-vocab
+rows remain local validation evidence, not a required download. The bench
+fetches approved datasets pinned by immutable HF commit revision; no upload
+until TJ approves the first publication. Set/reference hashes, file hashes,
+root/generation provenance and per-checkpoint licence terms accompany each
+config. Text is ours, with source-file licence obligations preserved; logits
+derive from the named official checkpoint and do not erase its terms.
+Quick tier remains top-32 plus tail compiled into `cuteafd-bench`.
 
 **Engine scoring** (figures from GLM Flash on 1 RTX + 2 Sparks: 8K prefill
 ≈ 5,100 tok/s, decode step ≈ 40 ms):

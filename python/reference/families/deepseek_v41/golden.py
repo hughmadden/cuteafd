@@ -262,6 +262,8 @@ def main() -> None:
     from shape_invariant import install
     install()
     ref = import_reference(a.snapshot)
+    from shape_invariant import bounded_sparse
+    ref.sparse_attn = bounded_sparse(ref.sparse_attn)
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
     from tokenizers import Tokenizer
     backend = Tokenizer.from_file(str(a.snapshot / "tokenizer.json"))

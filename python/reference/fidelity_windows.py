@@ -132,8 +132,12 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
             not revision or arm.get("config_sha256") != config_sha
             or arm.get("tokenizer_sha256") != tokenizer_sha):
         raise ValueError("explicit reference snapshot requires all identity hashes")
-    return {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
-            "config_sha256": config_sha}
+    identity = {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
+                "config_sha256": config_sha}
+    for field in ("checkpoint", "precision"):
+        if field in arm:
+            identity[field] = arm[field]
+    return identity
 
 
 def prefix_comparison(short: np.ndarray, extended: np.ndarray) -> dict:

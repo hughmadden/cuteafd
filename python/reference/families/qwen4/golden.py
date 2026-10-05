@@ -294,6 +294,8 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = False
     from shape_invariant import install
     install()
+    from shape_invariant import install_eager
+    install_eager(ref)
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
     if a.windows:

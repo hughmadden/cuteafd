@@ -118,6 +118,8 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     install()
     ref = import_reference(a.snapshot)
+    from shape_invariant import bounded_sparse
+    ref.sparse_attn = bounded_sparse(ref.sparse_attn)
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
     if a.tokens:
         tokens = a.tokens
