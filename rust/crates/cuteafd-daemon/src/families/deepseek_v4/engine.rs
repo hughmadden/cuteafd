@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
@@ -797,7 +797,7 @@ impl<'a> Engine<'a> {
         // Tables are copied in only after the previous step's last read (the
         // head download synchronized the stream).
         // The decode graph's first segment gathers the streams itself.
-        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        let gather = self.embedding.device_gather();
         for (step, lane) in lanes.iter().zip(&w.lanes) {
             self.fill(&lane.tables, step.tables)?;
             self.embedding.check(step.tokens)?;

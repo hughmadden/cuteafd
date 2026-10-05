@@ -24,7 +24,7 @@ use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -881,24 +881,18 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// The step's token embeddings (`copies` per token) into `out`: the ids
-    /// staged for the device table's gather (queued unless `defer_gather`:
-    /// the decode graph's first segment runs it), else the shard's rows staged.
+    /// Stage the step's ids for a device gather from either table placement.
+    /// With `defer_gather`, the decode graph's first segment gathers the rows.
     fn stage_embedding(&self, w: &Workspace<'_>, tokens: &[u32], copies: usize, out: &Dev<'_>, defer_gather: bool)
         -> Result<()> {
-        match self.embedding.placement() {
-            EmbedPlacement::Gpu => {
-                self.embedding.check(tokens)?;
-                self.stage_table(w, &w.ids, tokens)?;
-                if !defer_gather {
-                    // SAFETY: the ids are staged on this stream; `out` holds the rows.
-                    unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
-                        std::ptr::null(), out.buffer.ptr, self.stream)? };
-                }
-                Ok(())
-            }
-            EmbedPlacement::Host => self.stage(w, out.buffer, &self.embedding.host_rows_repeated(tokens, copies)?),
+        self.embedding.check(tokens)?;
+        self.stage_table(w, &w.ids, tokens)?;
+        if !defer_gather {
+            // SAFETY: the ids are staged on this stream; `out` holds the rows.
+            unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
+                std::ptr::null(), out.buffer.ptr, self.stream)? };
         }
+        Ok(())
     }
 
     /// Queues `bytes` into `dst` through the workspace's pinned staging.
@@ -1512,7 +1506,7 @@ impl<'a> Qwen4Engine<'a> {
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
-        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        let gather = self.embedding.device_gather();
         let mut cur = 0usize;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,

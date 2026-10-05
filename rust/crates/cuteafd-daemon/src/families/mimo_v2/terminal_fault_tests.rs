@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::memory::device::Stream;
 use crate::shared::peer_split::TerminalState;
-use crate::shared::token_io::EmbedSource;
+use crate::shared::token_io::{EmbedPlacement, EmbedSource};
 use std::{mem::ManuallyDrop, time::Instant};
 
 fn cfg() -> MimoV2Config {
@@ -67,6 +67,8 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
             offset: 0,
             vocab: 1,
             hidden: 4096,
+            snapshot: None,
+            tensor_name: "synthetic-terminal-fault-fixture".into(),
         },
         EmbedPlacement::Host,
         || Ok(()),

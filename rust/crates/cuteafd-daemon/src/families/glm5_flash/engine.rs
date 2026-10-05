@@ -40,7 +40,7 @@ use crate::families::glm5::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -1128,7 +1128,7 @@ impl<'a> GlmfEngine<'a> {
     /// and are copied into each stream slot on the device.
     fn load_streams(&self, w: &Workspace<'_>, tokens: &[u32], defer_gather: bool) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len() <= w.rows, "{} tokens exceed the workspace", tokens.len());
-        if self.embedding.placement() == EmbedPlacement::Gpu {
+        if self.embedding.device_gather() {
             let host = std::time::Instant::now();
             self.embedding.check(tokens)?;
             self.put(&w.ids, tokens)?;
@@ -1766,7 +1766,7 @@ impl<'a> GlmfEngine<'a> {
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
-        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        let gather = self.embedding.device_gather();
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
                 pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };

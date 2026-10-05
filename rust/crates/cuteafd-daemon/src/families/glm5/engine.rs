@@ -13,7 +13,7 @@
 use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
 use cuteafd_transport::expert::{
     SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
@@ -819,7 +819,7 @@ impl<'a> GlmEngine<'a> {
         if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
-            let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+            let gather = self.embedding.device_gather();
             if gather {
                 self.embedding.check(tokens)?;
                 self.put(&w.ids, tokens)?;
