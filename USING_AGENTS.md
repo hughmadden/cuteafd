@@ -75,6 +75,15 @@ but bounded engineering still goes to Sol.
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
   than Claude.
+- **DeepSeek Flash track record (2026-10-05):** four tasks, all correct on
+  the first pass: a 7-host image audit and cleanup that followed the keep
+  rules exactly; a bench-console fix with unit tests and an unprompted
+  headless-browser render check; and a `max`-effort change threading the
+  console hub through six serve paths with a drop guard, where it flagged
+  its own edge case. Strong at bounded, well-specified, checkable work;
+  not yet tried on numerics, kernels, or noisy hardware measurement.
+  Stretching it next to multi-file platform items (build hygiene,
+  readiness/health).
 - Don't drop a numerics or kernel task to DeepSeek to save time; review cost
   outweighs it. Give DeepSeek work whose result is easy to check.
 
