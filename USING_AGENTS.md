@@ -235,6 +235,12 @@ These apply to every agent and are also in `AGENTS.md`.
 - **Disk:** builds fill raptor's root NVMe fast (`builds/` reached 1.4 TB and
   crashed runs with "No space left on device"). Delete Cargo `target*` and
   release staging when a task finishes; check `df -h /` before large builds.
+- **AOT exports outside the locks:** CuTe/Triton exporters query the device
+  at compile time, so the export container needs a GPU, but not a lock.
+  Pin it to an idle RTX (≤512 MiB used, bounded wait), watchdog its
+  memory, and on a Spark export only when no serving container runs and
+  ≥100 GiB CUDA memory is free. Log host, GPU and time so a concurrent
+  measurement can be explained.
 - **Root:** run privileged commands directly as
   `agent-sudo -n --agent-context "<why>" <command>` with the whole command
   visible. A wrapper script under sudo (`sudo python profile.py`) is flagged by
@@ -282,10 +288,12 @@ duplicating it. Record the lesson in the table below.
 | Literal 2% threshold kept a slower default | State the full decision rule |
 | Lock-order deadlock | `sparks.lock`, then `gpu1.lock`, with timeouts |
 | Stray 30 GB server | Teardown before releasing locks |
+| A build downloading wheels held sparks.lock ~45 min, 5 agents queued | Build outside hardware locks; locks only around GPU/Spark use |
 | 4-hour device-mode hang | Watchdogs and per-step timeouts |
 | Disk full at 1.4 TB of builds | Clean build output at task end |
 | `sudo python …` flagged | Sudo the real command directly |
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
+| Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
