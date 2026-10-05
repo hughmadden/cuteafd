@@ -274,7 +274,7 @@ and requires fresh prefix qualification, never reuse of an old proof.
 
 The full tier ships reference top-1024 token ids u32 and log-probs f16,
 plus f32 tail log-mass and next-token log-prob in safetensors, one HF dataset
-config per family/set-version in `tpurtell/cuteafd-fidelity`. The support is
+config per family/set-version in `wrldsuksgo2mars/cuteafd-fidelity`. The support is
 reference-fixed; normalize the 1024 values plus aggregate tail bin together
 and evaluate the engine on the same support with one aggregate engine tail.
 This is a coarse-grained KL, not mathematically identical full-vocabulary
@@ -282,9 +282,13 @@ KL. Saved V4.1 FP8-head decode/prefill paired deltas and upper95 bounds agree
 with full-vocabulary results within 1.18e-7 nat (required <=1e-4), with both
 PASS verdicts unchanged; f16 entries and f32 tail were included. Full-vocab
 rows remain local validation evidence, not a required download. The bench
-fetches datasets with `--dataset tpurtell/cuteafd-fidelity --dataset-config
-FAMILY-VERSION --dataset-revision IMMUTABLE_40_HEX_COMMIT`; branches and tags
-are rejected. The revision/config/repository and manifest SHA are retained
+defaults the full tier (without local `--reference`/`--rows`) to
+`wrldsuksgo2mars/cuteafd-fidelity`, config `deepseek_v41-v2_20261005`, revision
+`01a0948a62a478a0a9355dd5b57fe4a49bc6cca0`. Explicit `--dataset`,
+`--dataset-config FAMILY-VERSION` and `--dataset-revision IMMUTABLE_40_HEX_COMMIT`
+override that source; branches and tags are rejected. Future family configs
+are added to the same repository and require their own verified revision.
+The revision/config/repository and manifest SHA are retained
 in run results and must match across arms. It checks the index, manifest,
 window, qualification and safetensors hashes before scoring. Engine full-row
 dumps remain local and provide the actual omitted mass, avoiding subtraction
@@ -292,8 +296,11 @@ of rounded top probabilities. Actual Rust absolute and tripwire gates have
 also revalidated the saved compact pair, with both PASS verdicts unchanged.
 Publication provenance carries artifact hashes/fork pins and rank topology,
 not host paths, addresses or credentials; decoded source text is audited too.
-The coordinator handles the public upload; the immutable published revision
-is pinned after Hub-copy checksum verification. Set/reference hashes, file hashes,
+The coordinator handles the public upload. The pinned publication passed
+immutable Hub readback of all 72 files (212,253,166 bytes), including the
+Hub-added `.gitattributes`; every frozen-file checksum and the manifest hash
+chain matched. Manifest SHA256:
+`6f2b22f3ed4882765c759b565baab960f7e1563a7fe2be2bbd05540ac4f2f70c`. Set/reference hashes, file hashes,
 root/generation provenance and per-checkpoint licence terms accompany each
 config. Text is ours, with source-file licence obligations preserved; logits
 derive from the named official checkpoint and do not erase its terms.

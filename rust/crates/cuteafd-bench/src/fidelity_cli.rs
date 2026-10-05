@@ -61,10 +61,12 @@ pub struct RunArgs {
     pub out: PathBuf,
     #[arg(long)]
     pub reference: Option<PathBuf>,
-    /// Public HF dataset repository; always fetched at an immutable commit.
-    #[arg(long, conflicts_with_all = ["reference", "rows"])]
+    /// Public HF dataset repository; the verified publication is the full-tier default.
+    #[arg(long, num_args = 0..=1, default_missing_value = crate::fidelity_dataset::REPOSITORY,
+        conflicts_with_all = ["reference", "rows"])]
     pub dataset: Option<String>,
-    #[arg(long, requires = "dataset")]
+    /// Immutable dataset commit (defaults to the checksum-verified publication).
+    #[arg(long, conflicts_with_all = ["reference", "rows"])]
     pub dataset_revision: Option<String>,
     #[arg(long, default_value = crate::fidelity_dataset::CONFIG)]
     pub dataset_config: String,
@@ -85,6 +87,14 @@ pub struct RunArgs {
     pub api_key: Option<String>,
 }
 
+fn dataset_source(args: &RunArgs) -> Result<Option<(&str, &str)>> {
+    let default_full = args.tier == "full" && args.reference.is_none() && args.rows.is_none();
+    let repo = args.dataset.as_deref().or(default_full.then_some(crate::fidelity_dataset::REPOSITORY));
+    ensure!(args.dataset_revision.is_none() || repo.is_some(),
+        "--dataset-revision needs --dataset or the full-tier dataset default");
+    Ok(repo.map(|repo| (repo, args.dataset_revision.as_deref().unwrap_or(crate::fidelity_dataset::REVISION))))
+}
+
 fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -> Result<Value> {
     let mut request = agent.post(url);
     if let Some(key) = key { request = request.set("authorization", &format!("Bearer {key}")); }
@@ -103,9 +113,8 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let base = args.url.trim_end_matches('/');
     let models: Value = agent.get(&format!("{base}/v1/models")).call()?.into_json()?;
     let model = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let (reference, digest, dataset_identity) = if let Some(repo) = &args.dataset {
+    let (reference, digest, dataset_identity) = if let Some((repo, commit)) = dataset_source(args)? {
         ensure!(args.tier == "full", "qualified compact dataset requires the full tier");
-        let commit = args.dataset_revision.as_deref().context("--dataset requires --dataset-revision")?;
         let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
             std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
         let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, &args.dataset_config)?;
@@ -219,6 +228,48 @@ pub fn execute(args: Args) -> Result<bool> {
             println!("{text}");
             eprintln!("This is a {}-only gate. Precision defaults require both decode and prefill full-tier results.", a.path_shape);
             Ok(comparison.pass)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn parse(extra: &[&str]) -> RunArgs {
+        let mut argv = vec!["fidelity", "run", "--arm", "baseline", "--out", "run.json"];
+        argv.extend_from_slice(extra);
+        let Action::Run(args) = Cli::try_parse_from(argv).unwrap().args.action else { panic!("run action") };
+        args
+    }
+
+    #[test]
+    fn verified_full_default_preserves_quick_and_local_sources() {
+        let full = parse(&["--tier", "full"]);
+        assert_eq!(dataset_source(&full).unwrap(), Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::REVISION)));
+        assert_eq!(dataset_source(&parse(&[])).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--reference", "reference.json"])).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--rows", "rows"])).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&["--tier", "full", "--dataset"])).unwrap(), dataset_source(&full).unwrap());
+    }
+
+    #[test]
+    fn explicit_repo_and_revision_override_only_the_dataset_source() {
+        let args = parse(&["--tier", "full", "--dataset", "other/repo", "--dataset-revision", "1111111111111111111111111111111111111111"]);
+        assert_eq!(dataset_source(&args).unwrap(), Some(("other/repo", "1111111111111111111111111111111111111111")));
+        let args = parse(&["--tier", "full", "--dataset-revision", "2222222222222222222222222222222222222222"]);
+        assert_eq!(dataset_source(&args).unwrap(), Some((crate::fidelity_dataset::REPOSITORY, "2222222222222222222222222222222222222222")));
+        assert!(dataset_source(&parse(&["--dataset-revision", "main"])).is_err());
+        for local_flag in ["--reference", "--rows"] {
+            assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "baseline", "--out", "run.json",
+                "--tier", "full", "--dataset", crate::fidelity_dataset::REPOSITORY, local_flag, "local"]).is_err());
         }
     }
 }

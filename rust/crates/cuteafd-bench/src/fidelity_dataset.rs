@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
-pub const REPOSITORY: &str = "tpurtell/cuteafd-fidelity";
+pub const REPOSITORY: &str = "wrldsuksgo2mars/cuteafd-fidelity";
+pub const REVISION: &str = "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0";
 pub const CONFIG: &str = "deepseek_v41-v2_20261005";
 
 fn component(text: &str) -> bool {
@@ -172,10 +173,12 @@ mod tests {
         let (reference, hash, identity) = download(&ureq::AgentBuilder::new()
             .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
         assert_eq!(reference.windows.len(), 64);
-        assert_eq!(hash.len(), 64);
-        assert_eq!(identity["revision"], commit);
+        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
+        assert_eq!(hash, "6f2b22f3ed4882765c759b565baab960f7e1563a7fe2be2bbd05540ac4f2f70c");
+        assert_eq!(identity, json!({"repository": REPOSITORY, "revision": commit, "config": CONFIG}));
         let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
         assert_eq!(hash, again.1);
+        assert_eq!(serde_json::to_value(reference).unwrap(), serde_json::to_value(again.0).unwrap());
     }
 
     #[test]
