@@ -169,6 +169,60 @@ def test_snapshot_provenance_must_match_pinned_set(tmp_path):
         verify_snapshot(manifest, snapshot)
 
 
+def test_v41_two_lengths_isolate_module_and_cross_layer_state():
+    tree = ast.parse((ROOT / "python/reference/families/deepseek_v41/golden.py").read_text())
+    names = {"initial_runtime_buffers", "reset_runtime_buffers", "stage_shared_attention", "restore_shared_attention"}
+    helpers = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
+    scope = {}
+    exec(compile(helpers, "golden_runtime_helpers", "exec"), scope)
+
+    class Tensor:
+        def __init__(self, array): self.array = np.asarray(array)
+        def detach(self): return self
+        def cpu(self): return self
+        def clone(self): return Tensor(self.array.copy())
+        def to(self, _device): return self
+        def copy_(self, other): np.copyto(self.array, other.array)
+
+    class Indexer:
+        def __init__(self):
+            self._buffers = {"k_cache": Tensor(np.zeros(5))}
+            self._non_persistent_buffers_set = {"k_cache"}
+            self.freqs_cis = "previous window"
+
+    class Shared:
+        def __init__(self):
+            self.compress_kv = self.index_k = self.topk_idxs = self.candidates = None
+
+    indexer = Indexer()
+    compressor = SimpleNamespace(_buffers={"kv_state": Tensor(np.zeros(5)),
+        "score_state": Tensor(np.full(5, -np.inf))}, _non_persistent_buffers_set={"kv_state", "score_state"})
+    layer = SimpleNamespace(_buffers={"window_kv_cache": Tensor(np.zeros(5)),
+        "freqs_cis": Tensor(np.arange(5))}, _non_persistent_buffers_set={"window_kv_cache", "freqs_cis"})
+    layer.modules = lambda: [layer, indexer, compressor]
+    ref = SimpleNamespace(Indexer=Indexer, SharedAttentionRuntime=Shared, shared_attn=Shared())
+    initial = scope["initial_runtime_buffers"](layer)
+    snapshots = []
+    for length in [2, 5]:
+        scope["reset_runtime_buffers"](initial, layer, ref)
+        assert indexer.freqs_cis is None
+        assert not indexer._buffers["k_cache"].array.any()
+        assert not layer._buffers["window_kv_cache"].array.any()
+        assert np.isneginf(compressor._buffers["score_state"].array).all()
+        assert np.array_equal(layer._buffers["freqs_cis"].array, np.arange(5))
+        indexer._buffers["k_cache"].array[:length] = length
+        for name in vars(ref.shared_attn):
+            setattr(ref.shared_attn, name, Tensor(indexer._buffers["k_cache"].array[:length]))
+        snapshots.append(scope["stage_shared_attention"](ref.shared_attn))
+        indexer._buffers["k_cache"].array[:] = -99
+        compressor._buffers["score_state"].array[:] = 99
+    for length, state in zip([2, 5], snapshots):
+        scope["restore_shared_attention"](ref, state, "cpu")
+        for value in vars(ref.shared_attn).values():
+            assert value.array.shape == (length,)
+            assert np.array_equal(value.array, np.full(length, length))
+
+
 @pytest.mark.parametrize("family", ["deepseek_v41", "mimo_v2/mimo_v26", "qwen4"])
 def test_goldens_have_layer_major_window_loops_and_scored_head_selection(family):
     path = ROOT / "python/reference/families" / family / "golden.py"

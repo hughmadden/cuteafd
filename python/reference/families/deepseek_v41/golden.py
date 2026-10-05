@@ -29,6 +29,35 @@ sys.path.insert(0, str(HERE.parents[1]))
 from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
 
 
+def initial_runtime_buffers(layer):
+    # Non-persistent buffers are sequence state, except immutable RoPE frequencies.
+    return [(module, name, value.detach().cpu().clone())
+            for module in layer.modules()
+            for name, value in module._buffers.items()
+            if name in module._non_persistent_buffers_set and name != "freqs_cis" and value is not None]
+
+
+def reset_runtime_buffers(buffers, layer, ref):
+    for module, name, initial in buffers:
+        module._buffers[name].copy_(initial)
+    for module in layer.modules():
+        if isinstance(module, ref.Indexer):
+            module.freqs_cis = None
+
+
+def stage_shared_attention(shared):
+    return {name: value.detach().cpu().clone() if value is not None else None
+            for name, value in vars(shared).items()}
+
+
+def restore_shared_attention(ref, state, device):
+    # Each window owns the source KV/index/candidate rows handed between layers.
+    shared = ref.SharedAttentionRuntime()
+    for name, value in state.items():
+        setattr(shared, name, value.to(device) if value is not None else None)
+    ref.shared_attn = shared
+
+
 def run_windows(a, ref, args, backend, weights):
     manifest = load_set(a.windows, "deepseek_v41")
     identity = verify_snapshot(manifest, a.snapshot)
@@ -43,8 +72,9 @@ def run_windows(a, ref, args, backend, weights):
             return backend.get_vocab_size(with_added_tokens=True)
 
     # Stage streams on CPU between window visits, not all attention masks on GPU.
-    # Each layer's weights are loaded once; start_pos=0 resets its prefill caches.
+    # Load each layer once, but isolate both module buffers and cross-layer state.
     states = []
+    shared_states = [{} for _ in manifest["windows"]]
     with torch.inference_mode():
         embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
         load_module(embed, weights, "embed.")
@@ -61,12 +91,16 @@ def run_windows(a, ref, args, backend, weights):
             start = time.time()
             layer = ref.Block(layer_id, args, layout)
             load_module(layer, weights, f"layers.{layer_id}.")
+            initial = initial_runtime_buffers(layer)
             for i, w in enumerate(manifest["windows"]):
+                reset_runtime_buffers(initial, layer, ref)
                 host_h, host_mix, hashes = states[i]
                 h, pre_mix = host_h.cuda(), host_mix.cuda()
+                restore_shared_attention(ref, shared_states[i], h.device)
                 if layer.engram is not None:
                     h = layer.engram(h, hashes.cuda()[:, :, layer.engram.layer_hash_index, :], None)
                 h, pre_mix = layer(h, 0, pre_mix, None)
+                shared_states[i] = stage_shared_attention(ref.shared_attn)
                 if a.layers is not None and layer_id in a.layers:
                     folder = a.out / "windows" / w["id"]
                     folder.mkdir(parents=True, exist_ok=True)
@@ -77,7 +111,8 @@ def run_windows(a, ref, args, backend, weights):
                     h = layer.hc_pre(h[:, first:last], pre_mix[:, first:last])
                 states[i] = (h.cpu(), pre_mix.cpu(), hashes)
                 del h, pre_mix
-            del layer
+            ref.shared_attn = ref.SharedAttentionRuntime()
+            del initial, layer
             torch.cuda.empty_cache()
             times.append(time.time() - start)
             print(f"layer {layer_id}: {times[-1]:.1f}s ({len(states)} windows)", flush=True)
