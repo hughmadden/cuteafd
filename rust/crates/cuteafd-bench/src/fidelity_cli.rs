@@ -138,6 +138,7 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     ensure!(reference.models.iter().any(|pattern| crate::reference::glob(pattern, model)), "reference does not match served model");
     ensure!(reference.windows.is_empty() || reference.checkpoint == model, "reference checkpoint differs from served checkpoint");
     let windows = reference.selected_windows(args.tier == "full")?;
+    crate::reference::require_media_probe(&windows, &models["data"][0])?;
     if args.tier == "full" { ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe"); }
     let rows = if args.tier == "full" && dataset_identity.is_none() {
         let dir = args.rows.as_ref().context("full tier needs --rows / CUTEAFD_FIDELITY_ROWS")?;

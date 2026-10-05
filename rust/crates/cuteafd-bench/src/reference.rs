@@ -124,7 +124,7 @@ impl Reference {
         }).collect();
         vec![Window { id: "legacy".into(), block: "legacy".into(), bucket: "0-2K".into(),
             roles: vec!["ctx".into(); self.tokens.len()], tokens: self.tokens.clone(),
-            score_from: self.score_from, positions, top_k: self.top_k }]
+            score_from: self.score_from, positions, top_k: self.top_k, media: Vec::new() }]
     }
 
     pub fn selected_windows(&self, full: bool) -> anyhow::Result<Vec<Window>> {
@@ -190,6 +190,36 @@ pub struct Window {
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     pub positions: Vec<CompactPosition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<Media>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaFixture { pub path: String, pub sha256: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Media {
+    pub start: usize,
+    pub len: usize,
+    pub kind: String,
+    pub key: String,
+    pub grid: [u32; 3],
+    pub fixture: MediaFixture,
+}
+
+fn sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// Never let a media window fall through the text-only teacher-forcing path.
+/// The wire adapter is enabled separately after the media probe contract lands.
+pub fn require_media_probe(windows: &[Window], model: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(w) = windows.iter().find(|w| !w.media.is_empty()) {
+        anyhow::ensure!(model["capabilities"]["vision"] == true,
+            "window {} contains media but server does not advertise vision capability", w.id);
+        anyhow::bail!("window {} requires the media teacher-forcing probe adapter; refusing text-only scoring", w.id);
+    }
+    Ok(())
 }
 fn default_top_k() -> usize { 32 }
 
@@ -199,6 +229,23 @@ impl Window {
         anyhow::ensure!(self.roles.len() == self.tokens.len() && self.roles.iter().all(|r| r == "gen" || r == "ctx"),
             "invalid role mask for {}", self.id);
         anyhow::ensure!(self.tokens.iter().all(|&id| (id as usize) < vocab), "token outside vocabulary");
+        let mut media_end = 0;
+        for m in &self.media {
+            let end = m.start.checked_add(m.len).ok_or_else(|| anyhow::anyhow!("media extent overflow"))?;
+            let [t, h, w] = m.grid;
+            anyhow::ensure!(m.kind == "image" && m.len > 0 && m.start >= media_end && end <= self.score_from,
+                "invalid media extent in {}", self.id);
+            anyhow::ensure!(t == 1 && h > 0 && w > 0 && h % 2 == 0 && w % 2 == 0
+                && u64::from(h) * u64::from(w) / 4 == m.len as u64, "invalid media grid");
+            anyhow::ensure!(sha256_hex(&m.key) && sha256_hex(&m.fixture.sha256), "invalid media identity");
+            anyhow::ensure!(!m.fixture.path.is_empty() && !m.fixture.path.contains('\\')
+                && m.fixture.path.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
+                && !std::path::Path::new(&m.fixture.path).is_absolute(), "unsafe fixture path");
+            anyhow::ensure!(self.roles[m.start..end].iter().all(|r| r == "ctx")
+                && self.tokens[m.start..end].iter().all(|id| *id == self.tokens[m.start]),
+                "media placeholders must be ctx and one repeated id");
+            media_end = end;
+        }
         let mut previous = None;
         for p in &self.positions {
             anyhow::ensure!(p.pos > 0 && p.pos < self.tokens.len() && p.pos >= self.score_from
@@ -305,6 +352,26 @@ impl Fidelity {
 mod tests {
     use super::*;
     use cuteafd_api::openai::probe::summarize;
+
+    #[test]
+    fn media_windows_validate_and_never_score_as_text() {
+        let value = serde_json::json!({"id":"vision00","block":"vision","bucket":"0-2K",
+            "tokens":[1,9,9,9,9,2],"roles":["ctx","ctx","ctx","ctx","ctx","gen"],
+            "score_from":5,"positions":[{"pos":5,"next":2,"next_lp":-1.0,
+                "top":[{"id":2,"lp":-1.0}],"tail_lp":-0.5}],
+            "media":[{"start":1,"len":4,"kind":"image","key":"a".repeat(64),
+                "grid":[1,4,4],"fixture":{"path":"code.png","sha256":"b".repeat(64)}}]});
+        let mut w: Window = serde_json::from_value(value).unwrap();
+        w.validate(10).unwrap();
+        for advertised in [false, true] {
+            assert!(require_media_probe(&[w.clone()], &serde_json::json!({
+                "capabilities":{"vision":advertised}})).is_err());
+        }
+        w.media[0].fixture.path = "../code.png".into();
+        assert!(w.validate(10).is_err());
+        w.media.clear();
+        require_media_probe(&[w], &serde_json::Value::Null).unwrap();
+    }
 
     #[test]
     fn globs() {

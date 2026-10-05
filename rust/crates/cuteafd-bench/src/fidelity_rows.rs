@@ -222,7 +222,7 @@ mod tests {
             windows: vec![RowsWindow { id: "A1".into(), path: "reference.bin".into(), sha256: sha256(&path).unwrap(),
                 positions: vec![1], shape: vec![1, 2] }] };
         let window = Window { id: "A1".into(), block: "A".into(), bucket: "0-2K".into(), tokens: vec![0, 0],
-            roles: vec!["ctx".into(), "gen".into()], score_from: 1, top_k: 2,
+            roles: vec!["ctx".into(), "gen".into()], score_from: 1, top_k: 2, media: Vec::new(),
             positions: vec![CompactPosition { pos: 1, next: 0, next_lp: -2.0f64.ln(),
                 top: vec![Top { id: 0, lp: -2.0f64.ln() }, Top { id: 1, lp: -2.0f64.ln() }],
                 tail_lp: f64::NEG_INFINITY }] };

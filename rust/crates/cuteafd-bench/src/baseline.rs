@@ -195,6 +195,9 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     };
     let started = Instant::now();
     let windows = reference.selected_windows(false)?;
+    if windows.iter().any(|w| !w.media.is_empty()) {
+        crate::reference::require_media_probe(&windows, &run.client.model_record()?)?;
+    }
     let mut records = Vec::new();
     let mut missing = 0;
     let mut probes = Vec::new();

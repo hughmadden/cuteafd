@@ -71,6 +71,13 @@ impl Client {
         Ok(record)
     }
 
+    pub fn model_record(&self) -> Result<Value> {
+        let models = self.get("/v1/models")?;
+        models["data"].as_array().and_then(|records| records.iter()
+            .find(|record| record["id"].as_str() == Some(self.model.as_str())))
+            .cloned().context("served model is no longer advertised")
+    }
+
     pub fn stats(&self) -> Result<Value> {
         self.get("/v1/stats")
     }

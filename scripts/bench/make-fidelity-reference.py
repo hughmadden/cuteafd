@@ -84,7 +84,10 @@ def convert_windows(args) -> None:
                 compact.append({"pos": pos, "next": nxt, "next_lp": round(float(logp[nxt]), 5),
                     "top": [{"id": int(i), "lp": round(float(logp[i]), 5)} for i in order],
                     "tail_lp": round(float(np.log(max(1.0 - mass, 1e-30))), 5)})
+        if entry.get("media", []) != w.get("media", []):
+            raise ValueError("golden media identity differs from pinned set")
         windows.append({**{key: w[key] for key in ("id", "block", "bucket", "tokens", "roles", "score_from")},
+                        **({"media": w["media"]} if w.get("media") else {}),
                         "positions": compact, "top_k": k,
                         "nll": round(-float(np.mean([r["next_lp"] for r in compact])), 6)})
         row_manifest.append({"id": w["id"], "path": row_path.name,
