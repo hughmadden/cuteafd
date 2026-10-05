@@ -87,12 +87,18 @@ def test_schema2_scored_rows_and_full_manifest(tmp_path):
             assert compact["top"][0]["id"] == (0 if pos == 0 else 15)
 
 
-@pytest.mark.parametrize("change", ["hash", "checkpoint", "tokens", "positions", "nonfinite"])
+@pytest.mark.parametrize("change", ["hash", "checkpoint", "tokens", "positions", "nonfinite", "duplicate", "missing", "extra"])
 def test_converter_refuses_mismatched_or_corrupt_goldens(tmp_path, change):
     manifest, golden, logits = fixture_golden(tmp_path)
     meta = json.loads((golden / "meta.json").read_text())
     if change in ("hash", "checkpoint"):
         meta["set_sha256" if change == "hash" else "checkpoint"] = "wrong"
+    elif change == "duplicate":
+        meta["windows"].append(dict(meta["windows"][0]))
+    elif change == "missing":
+        meta["windows"].pop()
+    elif change == "extra":
+        meta["windows"].append({**meta["windows"][0], "id": "extra"})
     elif change == "positions":
         meta["windows"][0]["positions"] = [1, 2, 3]
     elif change == "tokens":

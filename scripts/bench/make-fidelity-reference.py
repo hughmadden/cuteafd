@@ -31,7 +31,7 @@ def convert_windows(args) -> None:
         raise ValueError("golden/set checkpoint or set hash mismatch")
     validate_qualification(meta.get("prefix_qualification"), manifest, meta.get("snapshot_identity"))
     entries = {entry["id"]: entry for entry in meta["windows"]}
-    if set(entries) != {w["id"] for w in manifest["windows"]}:
+    if len(entries) != len(meta["windows"]) or set(entries) != {w["id"] for w in manifest["windows"]}:
         raise ValueError("golden must contain exactly the set's windows")
     if not args.rows_dir:
         raise ValueError("--rows-dir is required with --windows (full-vocabulary f16 rows)")
