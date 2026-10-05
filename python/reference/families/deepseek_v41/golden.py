@@ -137,7 +137,7 @@ def run_windows(a, ref, args, backend, weights):
             states[i] = None
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
-        reference="official inference/model.py (kernel_torch, mapped engram tables)",
+        reference="official inference/model.py (kernel_torch, mapped engram tables; official math, order/shape-invariant top-k)",
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
         prefix_qualification=proof)
 
@@ -151,6 +151,8 @@ def import_reference(snapshot: Path):
     spec = importlib.util.spec_from_file_location("v41_reference", snapshot / "inference" / "model.py")
     model = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(model)
+    from shape_invariant import install_index_topk
+    install_index_topk(model)
     return model
 
 
@@ -328,7 +330,7 @@ def main() -> None:
     nll = -logp[:-1].gather(1, target[:, None]).mean().item()
     accuracy = (logits[:-1].argmax(-1) == target).float().mean().item()
     meta = {"tokens": tokens, "snapshot": str(a.snapshot),
-            "reference": "official inference/model.py (kernel_torch, mapped engram tables)",
+            "reference": "official inference/model.py (kernel_torch, mapped engram tables; official math, order/shape-invariant top-k)",
             "argmax_last": int(logits[-1].argmax()), "next_token_accuracy": accuracy, "mean_nll": nll,
             "seconds": time.time() - started}
     (a.out / "meta.json").write_text(json.dumps(meta, indent=1))

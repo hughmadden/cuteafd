@@ -107,6 +107,59 @@ def bounded_sparse(function, rows=128):
     return forward
 
 
+def fixed_index_topk(scores, slots):
+    """Official score selection, fixed slots and ascending block-id reduction order.
+
+    Stable score sorting resolves cutoff ties toward lower block ids. Padding is
+    -inf and its ids are outside the causal extent, so the official mask turns
+    those entries into -1 before sparse attention gathers them.
+    """
+    from collections import namedtuple
+    if scores.shape[-1] < slots:
+        scores = F.pad(scores, (0, slots - scores.shape[-1]), value=-float("inf"))
+    indices = scores.argsort(dim=-1, descending=True, stable=True)[..., :slots]
+    indices = indices.sort(dim=-1).values
+    result = namedtuple("FixedTopk", "values indices")
+    return result(scores.gather(-1, indices), indices)
+
+
+def install_index_topk(module):
+    """Adapt only the checkpoint Indexer.forward selection, not its score math."""
+    import ast
+    import inspect
+    import textwrap
+    function = module.Indexer.forward
+    if getattr(function, "_fixed_index_topk", False):
+        return
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    replacements = 0
+
+    class Selection(ast.NodeTransformer):
+        def visit_Call(self, node):
+            nonlocal replacements
+            self.generic_visit(node)
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "topk"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "index_score"):
+                replacements += 1
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id="_reference_fixed_index_topk", ctx=ast.Load()),
+                    args=[node.func.value, ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr="index_topk", ctx=ast.Load())], keywords=[]), node)
+            return node
+
+    tree = Selection().visit(tree)
+    if replacements != 1:
+        raise ValueError("unsupported official Indexer.forward top-k site")
+    module.__dict__["_reference_fixed_index_topk"] = fixed_index_topk
+    scope = {}
+    exec(compile(ast.fix_missing_locations(tree), inspect.getsourcefile(function), "exec"),
+         module.__dict__, scope)
+    scope["forward"]._fixed_index_topk = True
+    module.Indexer.forward = scope["forward"]
+
+
 def install_eager(module):
     """Bound the family's eager fallback without replacing its math or mask."""
     if hasattr(module, "eager_attention_forward"):

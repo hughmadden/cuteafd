@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,16 @@ def release_checkpoint(cuda, *readers):
         trim(0)
     if cuda is not None:
         cuda.empty_cache()
+
+
+def log_checkpoint_reads(label, readers, before, started):
+    """Logical cloned/sliced tensor bytes, not physical FUSE or archive traffic."""
+    elapsed = time.monotonic() - started
+    size = sum(reader.read_bytes for reader in readers) - before
+    read_seconds = sum(reader.read_seconds for reader in readers)
+    print(f"checkpoint reads {label}: utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+          f"bytes={size} elapsed={elapsed:.3f}s MB/s={size / 1e6 / max(elapsed, 1e-9):.3f} "
+          f"cumulative_read_seconds={read_seconds:.3f}", flush=True)
 
 
 class CheckpointStorage:

@@ -91,6 +91,18 @@ def test_checkpoint_rss_guard_fails_closed_and_does_not_ratchet(monkeypatch):
         memory.check("layer 1")
 
 
+def test_checkpoint_read_log_labels_logical_bytes_and_time(monkeypatch, capsys):
+    import fidelity_windows as storage
+    monkeypatch.setattr(storage.time, "monotonic", lambda: 12.0)
+    readers = (SimpleNamespace(read_bytes=4_000_000, read_seconds=0.5),
+               SimpleNamespace(read_bytes=2_000_000, read_seconds=0.25))
+    storage.log_checkpoint_reads("layer 1 load", readers, 2_000_000, 10.0)
+    output = capsys.readouterr().out
+    assert "checkpoint reads layer 1 load: utc=" in output
+    assert "bytes=4000000 elapsed=2.000s MB/s=2.000" in output
+    assert "cumulative_read_seconds=0.750" in output
+
+
 @pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41", "glm5", "glm5_flash",
                                    "mimo_v2/mimo_v2", "mimo_v2/mimo_v26", "qwen4"])
 def test_every_golden_retires_layer_storage_and_owns_cpu_reads(family):
@@ -413,6 +425,95 @@ def test_eager_query_blocks_keep_keys_masks_and_selected_rows():
     actual = scope["bounded_sparse"](sparse, rows=3)(sparse_q, kv, None, indices, .25)
     np.testing.assert_array_equal(actual, sparse_q + indices[..., :1, None])
     assert sparse_calls == [3, 3, 1]
+
+
+def test_fixed_index_topk_masks_padding_orders_ids_and_resolves_cutoff_ties():
+    tree = ast.parse((ROOT / "python/reference/shape_invariant.py").read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "fixed_index_topk")
+
+    class Tensor(np.ndarray):
+        def argsort(self, dim=-1, descending=False, stable=False):
+            assert descending and stable
+            return np.argsort(-np.asarray(self), axis=dim, kind="stable").view(Tensor)
+
+        def sort(self, dim=-1):
+            return SimpleNamespace(values=np.sort(np.asarray(self), axis=dim).view(Tensor))
+
+        def gather(self, dim, indices):
+            return np.take_along_axis(self, indices, axis=dim)
+
+    def pad(scores, extent, value):
+        assert extent[0] == 0
+        return np.pad(scores, ((0, 0), (0, extent[1])),
+                      constant_values=value).view(Tensor)
+
+    scope = {"F": SimpleNamespace(pad=pad)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "fixed_topk", "exec"), scope)
+    select = scope["fixed_index_topk"]
+    short = np.array([[2., 1., -np.inf], [0., 0., -np.inf]]).view(Tensor)
+    long = np.pad(short, ((0, 0), (0, 2)), constant_values=-np.inf).view(Tensor)
+    a, b = select(short, 8), select(long, 8)
+    np.testing.assert_array_equal(a.indices, b.indices)
+    np.testing.assert_array_equal(a.values, b.values)
+    assert a.indices.shape == (2, 8)
+    assert np.isneginf(a.values[:, 2:]).all()
+    tied = np.array([[0., 4., 4., 4., 9.]]).view(Tensor)
+    np.testing.assert_array_equal(select(tied, 3).indices, [[1, 2, 4]])
+
+
+def test_index_topk_adapter_changes_only_selection_and_fails_closed():
+    tree = ast.parse((ROOT / "python/reference/shape_invariant.py").read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "install_index_topk")
+    calls = []
+    def selection(scores, slots):
+        calls.append((scores, slots))
+        return (None, [0, 1, 2, 3])
+    scope = {"fixed_index_topk": selection}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "install_topk", "exec"), scope)
+
+    class Indexer:
+        index_topk = 4
+        def forward(self, score):
+            index_score = score + 10
+            return index_score.topk(min(self.index_topk, 2), dim=-1)[1]
+
+    module = SimpleNamespace(Indexer=Indexer)
+    scope["install_index_topk"](module)
+    scope["install_index_topk"](module)
+    assert Indexer().forward(7) == [0, 1, 2, 3]
+    assert calls == [(17, 4)]
+
+    class Unsupported:
+        def forward(self, score):
+            return score
+
+    with pytest.raises(ValueError, match="unsupported official"):
+        scope["install_index_topk"](SimpleNamespace(Indexer=Unsupported))
+
+
+def test_v4_compressed_slots_keep_order_mask_padding_and_original_cache():
+    tree = ast.parse((ROOT / "python/reference/families/deepseek_v4/golden.py").read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "install_compressed_slots")
+    scope = {"torch": SimpleNamespace(nn=SimpleNamespace(functional=SimpleNamespace(
+        pad=lambda x, extent, value: np.pad(x, [(0, 0), (0, 0), (0, extent[1])], constant_values=value))))}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "compressed_slots", "exec"), scope)
+    calls = []
+    def original(ratio, bsz, seqlen, start_pos, offset):
+        calls.append((ratio, bsz, seqlen, start_pos, offset))
+        return np.arange(seqlen // ratio).reshape(1, 1, -1) + offset
+    original.cache_clear = lambda: calls.append("clear")
+    module = SimpleNamespace(get_compress_topk_idxs=original)
+    scope["install_compressed_slots"](module, 1024)
+    ids = module.get_compress_topk_idxs(128, 1, 576, 0, 576)
+    assert ids.tolist() == [[[576, 577, 578, 579, -1, -1, -1, -1]]]
+    scope["install_compressed_slots"](module, 640)
+    assert module.get_compress_topk_idxs(128, 1, 576, 0, 576).shape[-1] == 5
+    module.get_compress_topk_idxs.cache_clear()
+    assert calls[-1] == "clear"
+    with pytest.raises(ValueError, match="panel slot extent"):
+        module.get_compress_topk_idxs(128, 1, 768, 0, 0)
 
 
 def test_official_reference_identity_can_differ_from_generation_checkpoint(tmp_path):

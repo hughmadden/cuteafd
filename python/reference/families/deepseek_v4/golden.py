@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Golden activations for DeepSeek V4 from the official inference/model.py.
 
-Runs the unmodified reference one Block at a time on one GPU (the full model
-does not fit), with kernel.py replaced by kernel_torch. Saves the embedding,
+Runs the reference one Block at a time on one GPU (the full model does not
+fit), with kernel.py replaced by kernel_torch and fixed-width, position-ordered
+index selection. Saves the embedding,
 every requested layer's output stream [1, tokens, hc, dim] and the logits.
 
   golden.py --snapshot SNAP --text "..." --out DIR [--layers 0 1 2 ...] [--device 0]
@@ -28,7 +29,7 @@ from safetensors import safe_open
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install, qualify
 from fidelity_windows import (CheckpointStorage, release_checkpoint, load_set,
-                              verify_snapshot, write_scored_logits, finish_golden)
+                              verify_snapshot, write_scored_logits, finish_golden, log_checkpoint_reads)
 
 HERE = Path(__file__).resolve().parent
 
@@ -44,6 +45,8 @@ def import_reference(snapshot: Path):
     spec = importlib.util.spec_from_file_location("v4_reference", snapshot / "inference" / "model.py")
     model = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(model)
+    from shape_invariant import install_index_topk
+    install_index_topk(model)
     return model
 
 
@@ -52,12 +55,18 @@ class Weights:
         self.snapshot = snapshot
         self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
         self.files: dict[str, object] = {}
+        self.read_bytes = 0
+        self.read_seconds = 0.0
 
     def get(self, name: str) -> torch.Tensor:
+        start = time.monotonic()
         shard = self.index[name]
         if shard not in self.files:
             self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
-        return self.files[shard].get_tensor(name).clone()
+        value = self.files[shard].get_tensor(name).clone()
+        self.read_bytes += value.numel() * value.element_size()
+        self.read_seconds += time.monotonic() - start
+        return value
 
     def names(self, prefix: str) -> list[str]:
         return [n for n in self.index if n.startswith(prefix)]
@@ -104,6 +113,22 @@ def load_module(module: torch.nn.Module, weights: Weights, prefix: str) -> None:
     release_checkpoint(torch.cuda, weights)
 
 
+def install_compressed_slots(ref, max_tokens):
+    """Keep non-indexed compressed attention reductions at a panel-fixed width."""
+    original = getattr(ref, "_reference_compress_topk", ref.get_compress_topk_idxs)
+    ref._reference_compress_topk = original
+
+    def fixed(ratio, bsz, seqlen, start_pos, offset):
+        ids = original(ratio, bsz, seqlen, start_pos, offset)
+        slots = max_tokens // ratio
+        if ids.shape[-1] > slots:
+            raise ValueError("compressed attention exceeds panel slot extent")
+        return torch.nn.functional.pad(ids, (0, slots - ids.shape[-1]), value=-1)
+
+    fixed.cache_clear = original.cache_clear
+    ref.get_compress_topk_idxs = fixed
+
+
 def initial_runtime_buffers(block):
     return [(module, name, value.detach().cpu().clone())
             for module in block.modules()
@@ -120,6 +145,9 @@ def reset_runtime_buffers(initial):
 def run_windows(a, ref, args, weights):
     manifest = load_set(a.windows, "deepseek_v4")
     identity = verify_snapshot(manifest, a.snapshot)
+    if not getattr(a, "_prefix_probe", False):
+        a._compressed_slots_max_tokens = max(len(w["tokens"]) for w in manifest["windows"])
+    install_compressed_slots(ref, a._compressed_slots_max_tokens)
     proof = qualify(a, manifest, lambda probe: run_windows(probe, ref, args, weights))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
@@ -136,8 +164,10 @@ def run_windows(a, ref, args, weights):
         memory = CheckpointStorage(torch.cuda, weights)
         for layer_id in range(args.n_layers):
             start = time.time()
+            read_start, read_before = time.monotonic(), weights.read_bytes
             block = ref.Block(layer_id, args)
             load_module(block, weights, f"layers.{layer_id}.")
+            log_checkpoint_reads(f"layer {layer_id} load", (weights,), read_before, read_start)
             block.eval()
             initial = initial_runtime_buffers(block)
             for i, w in enumerate(manifest["windows"]):
@@ -175,7 +205,7 @@ def run_windows(a, ref, args, weights):
             states[i] = None
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
-        reference="official inference/model.py (kernel_torch, fixed-M128 linears)",
+        reference="official inference/model.py (kernel_torch, fixed-M128 linears; official math, order/shape-invariant index top-k and panel-fixed masked compressed slots)",
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
         prefix_qualification=proof)
 

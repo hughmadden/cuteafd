@@ -61,7 +61,7 @@ SHARD_ROWS = 2_500_012
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot
+from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot, log_checkpoint_reads
 
 
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
@@ -84,6 +84,9 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
         memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
+            read_start = time.monotonic()
+            read_before = dense.read_bytes + experts_src.read_bytes if dense is not experts_src else dense.read_bytes
+            read_sources = (dense, experts_src) if dense is not experts_src else (dense,)
             kind = config.layer_types[layer_id]
             torch.set_default_dtype(torch.bfloat16)
             with torch.device("meta"):
@@ -103,6 +106,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                 layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, prefix, table_rows, dim)
             load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
             load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            log_checkpoint_reads(f"layer {layer_id} load", read_sources, read_before, read_start)
             layer.eval()
             if layer.ple is not None:
                 emb = layer.ple.ple_embedding
@@ -131,6 +135,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                     (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
                 states[i] = h.cpu()
                 del h, ids, positions, embed_shape, causal, position_embeddings
+            log_checkpoint_reads(f"layer {layer_id} total (includes lazy PLE)", read_sources, read_before, read_start)
             del layer
             memory.release()
             memory.check(f"layer {layer_id}")
@@ -161,6 +166,8 @@ class Weights:
         self.snapshot = snapshot
         self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
         self.files: dict[str, object] = {}
+        self.read_bytes = 0
+        self.read_seconds = 0.0
 
     def __contains__(self, name: str) -> bool:
         return name in self.index
@@ -172,7 +179,11 @@ class Weights:
         return self.files[shard]
 
     def raw(self, name: str) -> torch.Tensor:
-        return self.handle(name).get_tensor(name).clone()
+        start = time.monotonic()
+        value = self.handle(name).get_tensor(name).clone()
+        self.read_bytes += value.numel() * value.element_size()
+        self.read_seconds += time.monotonic() - start
+        return value
 
     def get(self, name: str, device: str = "cuda") -> torch.Tensor:
         """BF16/FP32/int tensors as stored; FP8 weights times their 128x128 block scales."""
@@ -210,7 +221,9 @@ class LazyNgramTable(torch.nn.Module):
                 view = handle.get_slice(name)
                 for i in pick.tolist():
                     r = int(unique[i]) - shard * SHARD_ROWS
+                    read_start = time.monotonic()
                     row = view[r:r + 1]
+                    self.w.read_bytes += row.numel() * row.element_size()
                     if row.dtype == torch.float8_e4m3fn:
                         if self.scale is None:
                             raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
@@ -218,6 +231,7 @@ class LazyNgramTable(torch.nn.Module):
                     elif row.dtype != torch.bfloat16:
                         raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
                     out[i] = row[0]
+                    self.w.read_seconds += time.monotonic() - read_start
                 del row, view
         return out[inverse].reshape(*ids.shape, self.dim).to(ids.device)
 
