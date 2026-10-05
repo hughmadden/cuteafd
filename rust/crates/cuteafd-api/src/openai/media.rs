@@ -120,6 +120,7 @@ pub struct MediaPreparer {
     fetch: ImageUrlFetch,
     agent: ureq::Agent,
     memo: Mutex<VecDeque<MemoEntry>>,
+    memo_hits: std::sync::atomic::AtomicU64,
     /// Bound both running CPU tasks and request preparation waiters at API admission.
     pub slots: Arc<tokio::sync::Semaphore>,
 }
@@ -142,6 +143,9 @@ pub fn set_preparation_policy(max_image_tokens: usize, fetch: ImageUrlFetch) -> 
         .map_err(|_| anyhow::anyhow!("media preparation policy already installed"))
 }
 impl MediaPreparer {
+    pub fn memo_hits(&self) -> u64 {
+        self.memo_hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn config(&self) -> &ProcessorConfig {
         &self.config
     }
@@ -198,10 +202,16 @@ impl MediaPreparer {
             fetch,
             agent,
             memo: Mutex::new(VecDeque::new()),
+            memo_hits: std::sync::atomic::AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(slots.clamp(1, 4))),
         })
     }
     pub fn prepare(&self, sources: &[MediaSource]) -> Result<PreparedMedia> {
+        self.prepare_verified(sources, &[])
+    }
+    /// Probe fixture identities bind the same fetched bytes used for preprocessing.
+    pub fn prepare_verified(&self, sources: &[MediaSource], hashes: &[Option<String>]) -> Result<PreparedMedia> {
+        ensure!(hashes.is_empty() || hashes.len() == sources.len(), "fixture count differs from image sources");
         ensure!(
             sources.len() <= self.limits.images,
             "at most {} images are supported including history",
@@ -215,13 +225,17 @@ impl MediaPreparer {
             image_tokens: 0,
         };
         let mut decoded_bytes = 0usize;
-        for source in sources {
+        for (index, source) in sources.iter().enumerate() {
             ensure!(
                 Instant::now() < deadline,
                 "image preparation deadline exceeded"
             );
             let bytes = self.source_bytes(&source.url, deadline)?;
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            if let Some(Some(expected)) = hashes.get(index) {
+                ensure!(super::probe::sha256_hex(expected) && format!("{:x}", Sha256::digest(&bytes)) == *expected,
+                    "probe fixture source hash differs");
+            }
             let config = self.config.with_detail(source.low);
             let processor = config.id();
             let cached = {
@@ -240,6 +254,7 @@ impl MediaPreparer {
             };
             let image = if let Some(image) = cached {
                 result.memo_hits += 1;
+                self.memo_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 image
             } else {
                 ensure!(

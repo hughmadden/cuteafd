@@ -137,7 +137,8 @@ impl Family for MiMo {
             Ok(family)
         });
         let checkpoint_tp = checkpoint_tp(&checkpoint.snapshot).map_err(|e| format!("{e:#}"));
-        Ok(Box::new(MimoModel { cfg, spec, programs, checkpoint_tp }))
+        let vision = vision_geometry(&checkpoint.config, cfg.hidden);
+        Ok(Box::new(MimoModel { cfg, spec, programs, checkpoint_tp, vision }))
     }
 
     fn expert_catalog(&self) -> bool {
@@ -258,6 +259,12 @@ impl Family for MiMo {
                 "mimo_router_scores (FP32 weight as BF16 hi + lo, FP32 sums) then cuteafd_router_select \
                  (sigmoid, normalized, no routed scaling).",
             ),
+            Component::Vision => (
+                "MiMo V2.6 resident BF16 ViT with 1-D LM positions and per-image spatial merger",
+                "28 blocks, H1280, Q32/KV8, QK64, I4608, patch16x16x2, merge2; output H4096/H6144. \
+                 The resident tower validates all headers before admitted weight/scratch allocation; \
+                 serve-mimo --vision rtx[:gpu] enables the local path. LM image qualification remains required; audio/video stay disabled.",
+            ),
             Component::Speculator => (
                 "MTP layers (SWA attention with sinks, dense FFN, eh_proj/enorm/hnorm)",
                 "serve-mimo --mtp N runs them on the SWA and dense FFN programs with the eh_proj fusion \
@@ -276,6 +283,47 @@ struct MimoModel {
     programs: Result<&'static str, String>,
     /// The checkpoint's tensor-parallel degree (fused qkv row shards).
     checkpoint_tp: Result<usize, String>,
+    vision: Result<(), String>,
+}
+
+fn vision_geometry(config: &serde_json::Value, hidden: usize) -> Result<(), String> {
+    let v = config.get("vision_config").ok_or("checkpoint has no vision_config")?;
+    for (name, expected) in [("depth", 28), ("hidden_size", 1280), ("intermediate_size", 4608),
+        ("num_heads", 32), ("num_key_value_heads", 8), ("out_hidden_size", hidden),
+        ("patch_size", 16), ("temporal_patch_size", 2), ("spatial_merge_size", 2)] {
+        require(v[name].as_u64() == Some(expected as u64), ||
+            format!("vision_config.{name} needs {expected}; add a tower exporter/kernel"))?;
+    }
+    require([4096, 6144].contains(&hidden) && v["hidden_act"] == "silu", ||
+        "MiMo vision output/activation geometry unsupported".into())?;
+    Ok(())
+}
+
+fn vision_shape(stem: &str, hidden: usize) -> Option<Vec<usize>> {
+    let name = stem.strip_prefix("visual.")?;
+    let shape: &[usize] = match name {
+        "patch_embed.proj" => &[1280, 3, 2, 16, 16],
+        "merger.ln_q" => &[1280],
+        "merger.mlp.0" => &[5120, 5120],
+        "merger.mlp.2" => return Some(vec![hidden, 5120]),
+        _ => {
+            let (block, rest) = indexed(name, "blocks.")?;
+            if block >= 28 { return None; }
+            match rest {
+                "attn.qkv" => &[3072, 1280],
+                "attn.qkv.bias" => &[3072],
+                "attn.proj" => &[1280, 2048],
+                "attn.proj.bias" => &[1280],
+                "mlp.gate_proj" | "mlp.up_proj" => &[4608, 1280],
+                "mlp.gate_proj.bias" | "mlp.up_proj.bias" => &[4608],
+                "mlp.down_proj" => &[1280, 4608],
+                "mlp.down_proj.bias" | "norm1" | "norm2" => &[1280],
+                "attn.sinks" => &[32],
+                _ => return None,
+            }
+        }
+    };
+    Some(shape.to_vec())
 }
 
 impl MimoModel {
@@ -378,8 +426,15 @@ impl FamilyModel for MimoModel {
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
-        if matches!(role.component, Component::Vision | Component::Audio) {
-            return Err("text-only: serve-mimo does not run the vision and audio towers".into());
+        if role.component == Component::Audio {
+            return Err("MiMo audio is not qualified; use --audio off".into());
+        }
+        if role.component == Component::Vision {
+            self.vision.clone()?;
+            let shape = vision_shape(stem, self.cfg.hidden).ok_or_else(||
+                format!("{stem} is not read by the resident MiMo tower"))?;
+            return require(operand.is_plain(&[Encoding::Bf16]) && operand.logical == shape, ||
+                format!("{stem} needs BF16 {shape:?}, found {}", describe(operand)));
         }
         let family = self.programs.clone()?;
         let name = leaf(stem);

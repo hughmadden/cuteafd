@@ -63,6 +63,23 @@ impl PrefixArgs {
             per_request: self.prefix_points_per_request }
     }
 
+    /// Carve embedding-cache bytes in addition to the usual host-prefix headroom.
+    pub fn with_media_headroom(&self, requested: Option<u64>) -> Result<(Self, usize)> {
+        self.media_headroom(requested, budget::host_memory()?)
+    }
+
+    fn media_headroom(&self, requested: Option<u64>, memory: budget::HostMemory) -> Result<(Self, usize)> {
+        let bytes = requested.unwrap_or((8u64 << 30).min(memory.total / 20));
+        let base = self.host_cache_headroom_bytes.max(memory.total / 10);
+        let headroom = base.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("media host headroom overflow"))?;
+        let fixed = match self.host_cache_bytes { HostBudget::Bytes(bytes) => bytes, HostBudget::Auto => 0 };
+        anyhow::ensure!(memory.available >= headroom.checked_add(fixed).ok_or_else(|| anyhow::anyhow!("media and prefix host quota overflow"))?,
+            "host RAM cannot admit embedding cache {bytes} bytes plus prefix quota {fixed} and headroom {base}");
+        let mut prefix = self.clone();
+        prefix.host_cache_headroom_bytes = headroom;
+        Ok((prefix, usize::try_from(bytes)?))
+    }
+
     /// Resolve the host quota once, before pinned allocation. Call only when
     /// this family's copy engine can restore every rank's snapshot exactly.
     /// Host prefix bytes are not active device KV capacity.
@@ -161,6 +178,22 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         prefix: PrefixArgs,
+    }
+
+    #[test]
+    fn media_quota_is_carved_before_auto_prefix_sizing() {
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
+        let memory = budget::HostMemory { total: 100 << 30, available: 80 << 30 };
+        let (carved, bytes) = prefix.media_headroom(None, memory).unwrap();
+        assert_eq!(bytes, 5usize << 30);
+        assert_eq!(carved.host_cache_headroom_bytes, 15 << 30);
+        assert_eq!(prefix.host_cache_headroom_bytes, 8 << 30);
+        assert_eq!(carved.host_cache_bytes, HostBudget::Auto);
+        let fixed = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]).prefix;
+        assert!(fixed.media_headroom(Some(8 << 30), memory).is_err());
+        let (carved, _) = prefix.media_headroom(Some(8 << 30), memory).unwrap();
+        assert_eq!(carved.host_cache_headroom_bytes, 18 << 30);
+        assert!(prefix.media_headroom(Some(u64::MAX), memory).is_err());
     }
 
     #[test]

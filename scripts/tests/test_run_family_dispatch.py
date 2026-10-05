@@ -452,6 +452,19 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
         assert f"--weight-policy {expected}" in launch
 
 
+@pytest.mark.parametrize("quota", [None, "4MiB", "0"])
+def test_mimo_embedding_cache_quota_is_explicit_only(tmp_path, quota):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    if quota is None:
+        assert "--media-cache-bytes" not in launch
+    else:
+        assert f"--media-cache-bytes {quota}" in launch
+
+
 @pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
 @pytest.mark.parametrize("value, expected", [("auto", None), ("on", "true"), ("off", "false")])
 def test_mimo_explicit_target_format_overrides_are_forwarded(tmp_path, key, option, value, expected):
