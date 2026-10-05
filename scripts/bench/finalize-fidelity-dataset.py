@@ -84,7 +84,7 @@ manifest.pop('reference_sha256')
 manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
 (config / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
 # The per-config card is outside the sealed manifest; shared root files are untouched.
-readme = (SOURCE / 'README.md').read_text()
+readme = (SOURCE / NAME / 'README.md').read_text()
 readme = readme.replace('Fidelity Draft', 'Fidelity Reference')
 start = readme.index('This is a numerical-fidelity panel') if 'This is a numerical-fidelity panel' in readme else readme.index('DRAFT:')
 end = readme.index('## Config')

@@ -125,7 +125,11 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     original = ("# Family Fidelity Draft\n\n" + intro + "\n\n## Configuration\n\n"
                 "Pinned checkpoint and tokenizer.\n\n" + calibration + "\n\n" + privacy +
                 "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n")
-    (tmp_path / "README.md").write_text(original)
+    config = tmp_path / "fixture"
+    config.mkdir()
+    (config / "README.md").write_text(original)
+    root_card = "# Coordinator-owned root card\n"
+    (tmp_path / "README.md").write_text(root_card)
     tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
     start = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == "readme" for t in node.targets))
@@ -140,7 +144,7 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
               "family_expect": {"top1_min": .93, "kl_max": .04,
                                 "tripwires": {"confident_top1_min": .95, "top3_min": .97}},
               "daemon_identity": "fixture daemon", "coordinator_sha256": "0" * 64}
-    namespace = {"SOURCE": tmp_path, "report": report}
+    namespace = {"SOURCE": tmp_path, "NAME": "fixture", "report": report}
     exec(compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "card-format", "exec"), namespace)
     card = namespace["readme"]
     assert "Family Fidelity Reference" in card and "qualified numerical-fidelity reference" in card
@@ -149,6 +153,7 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     assert "no publication revision is claimed" in card and "No precision-default verdict" in card
     assert "Pinned checkpoint and tokenizer." in card
     assert card[card.index(privacy):] == original[original.index(privacy):]
+    assert (tmp_path / "README.md").read_text() == root_card
 
 
 def test_measured_dataset_validator_self_tests():
