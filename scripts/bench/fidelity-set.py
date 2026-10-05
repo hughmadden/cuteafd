@@ -169,6 +169,11 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             if tools:
                 body.update(tools=tools, tool_choice="auto")
             body.update(extra or {})
+            leading = []
+            while body["messages"] and body["messages"][0]["role"] == "system":
+                leading.append(body["messages"].pop(0)["content"])
+            if leading:
+                body["messages"].insert(0, {"role": "system", "content": "\n\n".join(leading)})
             sample = probe(body)
             n = len(sample["probe"]["prompt_ids"])
             if target <= n < target + 384:

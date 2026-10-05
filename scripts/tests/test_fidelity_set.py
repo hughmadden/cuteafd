@@ -36,6 +36,8 @@ def fake_server():
             body, probe_spec = request["body"], request["spec"]
             assert probe_spec["cold"] and probe_spec["no_speculation"]
             assert body["temperature"] == 0 and body["reasoning_effort"] == "high"
+            assert body["messages"][0]["role"] == "system"
+            assert all(m["role"] != "system" for m in body["messages"][1:])
             if state["mode"] == "http_error":
                 self.send_response(400)
                 self.end_headers()
