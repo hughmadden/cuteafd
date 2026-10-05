@@ -16,14 +16,20 @@ fn io_counts() -> BTreeMap<String, u64> {
 }
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
-    ensure!(args.len() >= 6 && args.len() <= 8,
-        "usage: v41_load_probe SNAPSHOT LAYER EXPERT_COUNT RANK SCRATCH_ROWS [--evict-read-ranges] [--prefetch]");
-    ensure!(
-        args[6..]
-            .iter()
-            .all(|a| a == "--evict-read-ranges" || a == "--prefetch"),
-        "unknown probe option"
-    );
+    ensure!(args.len() >= 6,
+        "usage: v41_load_probe SNAPSHOT LAYER EXPERT_COUNT RANK SCRATCH_ROWS [--evict-read-ranges] [--prefetch] [--lanes=N]");
+    let mut lanes = 1usize;
+    for option in &args[6..] {
+        if let Some(value) = option.strip_prefix("--lanes=") {
+            lanes = value.parse()?;
+        } else {
+            ensure!(
+                option == "--evict-read-ranges" || option == "--prefetch",
+                "unknown probe option"
+            );
+        }
+    }
+    ensure!((1..=16).contains(&lanes), "lanes must be in 1..=16");
     let evict = args[6..].iter().any(|a| a == "--evict-read-ranges");
     let prefetch = args[6..].iter().any(|a| a == "--prefetch");
     let snapshot = PathBuf::from(&args[1]);
@@ -43,14 +49,13 @@ fn main() -> Result<()> {
         expert: 0,
         rank,
     })?;
-    let mut staging = vec![0; first.staging_bytes()];
-    let mut scratch = vec![
-        0;
-        first
-            .minimum_read_scratch_bytes()
-            .checked_mul(scratch_rows)
-            .context("scratch overflow")?
-    ];
+    let staging_bytes = first.staging_bytes();
+    let scratch_bytes = first
+        .minimum_read_scratch_bytes()
+        .checked_mul(scratch_rows)
+        .context("scratch overflow")?;
+    let mut staging = vec![vec![0; staging_bytes]; lanes];
+    let mut scratch = vec![vec![0; scratch_bytes]; lanes];
     // Evict all selected ranges before either baseline or prefetch measurement.
     for expert in 0..count {
         let plan = catalog.expert_staging(V41ExpertSelection::Backbone {
@@ -82,8 +87,10 @@ fn main() -> Result<()> {
     let mut read_seconds = 0.;
     let mut useful_bytes = 0u64;
     let mut digest = Sha256::new();
+    let mut prefetch_seconds = 0.;
     if prefetch {
-        for expert in 0..4.min(count) {
+        let started = Instant::now();
+        for expert in 0..lanes.min(count) {
             catalog
                 .expert_staging(V41ExpertSelection::Backbone {
                     layer,
@@ -92,28 +99,53 @@ fn main() -> Result<()> {
                 })?
                 .prefetch()?;
         }
+        prefetch_seconds += started.elapsed().as_secs_f64();
     }
-    for expert in 0..count {
-        let plan = catalog.expert_staging(V41ExpertSelection::Backbone {
-            layer,
-            expert,
-            rank,
-        })?;
-        if prefetch && expert + 4 < count {
-            catalog
-                .expert_staging(V41ExpertSelection::Backbone {
-                    layer,
-                    expert: expert + 4,
-                    rank,
-                })?
-                .prefetch()?;
+    for first in (0..count).step_by(lanes) {
+        let end = (first + lanes).min(count);
+        if prefetch {
+            let started = Instant::now();
+            for expert in end..(end + lanes).min(count) {
+                catalog
+                    .expert_staging(V41ExpertSelection::Backbone {
+                        layer,
+                        expert,
+                        rank,
+                    })?
+                    .prefetch()?;
+            }
+            prefetch_seconds += started.elapsed().as_secs_f64();
         }
+        let plans = (first..end)
+            .map(|expert| {
+                catalog.expert_staging(V41ExpertSelection::Backbone {
+                    layer,
+                    expert,
+                    rank,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
-        plan.read_into(&mut staging, &mut scratch)?;
+        std::thread::scope(|scope| -> Result<()> {
+            let readers: Vec<_> = plans
+                .iter()
+                .zip(&mut staging)
+                .zip(&mut scratch)
+                .map(|((plan, host), scratch)| scope.spawn(move || plan.read_into(host, scratch)))
+                .collect();
+            for reader in readers {
+                reader
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("probe read thread panicked"))??;
+            }
+            Ok(())
+        })?;
         read_seconds += started.elapsed().as_secs_f64();
-        for range in plan.tensor_ranges() {
-            useful_bytes += range.len() as u64;
-            digest.update(&staging[range.clone()]);
+        for (plan, host) in plans.iter().zip(&staging) {
+            for range in plan.tensor_ranges() {
+                useful_bytes += range.len() as u64;
+                digest.update(&host[range.clone()]);
+            }
         }
     }
     let wall_seconds = wall.elapsed().as_secs_f64();
@@ -125,9 +157,11 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::json!({"snapshot":snapshot,"layer":layer,"expert_count":count,"rank":rank,"scratch_rows":scratch_rows,
-        "scratch_bytes":scratch.len(),"staging_bytes":staging.len(),"catalog_seconds":catalog_seconds,
-        "staging_read_seconds":read_seconds,"wall_seconds_including_sha256":wall_seconds,"useful_bytes":useful_bytes,
-        "useful_gb_per_staging_second":useful_bytes as f64/read_seconds/1e9,"io_delta":io_delta,
+        "scratch_bytes":scratch_bytes*lanes,"staging_bytes":staging_bytes*lanes,
+        "scratch_bytes_per_lane":scratch_bytes,"staging_bytes_per_lane":staging_bytes,"lanes":lanes,"catalog_seconds":catalog_seconds,
+        "staging_read_seconds":read_seconds,"prefetch_seconds":prefetch_seconds,"wall_seconds_including_sha256":wall_seconds,"useful_bytes":useful_bytes,
+        "useful_gb_per_staging_second":useful_bytes as f64/read_seconds/1e9,
+        "useful_gb_per_read_and_prefetch_second":useful_bytes as f64/(read_seconds+prefetch_seconds)/1e9,"io_delta":io_delta,
         "staged_sha256":format!("{:x}",digest.finalize()),"gpu_loaded":false,"evict_read_ranges":evict,"prefetch":prefetch})
     );
     Ok(())
