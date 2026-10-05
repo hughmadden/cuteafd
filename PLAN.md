@@ -767,6 +767,13 @@ Work, in priority order:
    admitted 82 sequential set probes, then the next allocation needed 66
    pages with 65 of 65 free. Admission must reserve prompt + max_tokens
    in pages, rounded to page boundaries, before accepting a request.
+   GLM 5.3 prefill tail bug (2026-10-06, prefill-score agent): with
+   pipelined lanes, `prefill_capacity()` is lanes × `prefill_rows`, but a
+   chunk of 257–511 rows (e.g. a 511-token prompt, or the remainder after
+   1024) is below `2 × MIN_LANE_ROWS`. It takes the serial path, where
+   `glm5/engine.rs:661` requires `t <= prefill_rows` (256), and the request
+   fails with a worker error. Split such tails into serial chunks of at most
+   `prefill_rows`, or run them as one lane.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
