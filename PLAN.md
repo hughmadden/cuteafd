@@ -742,7 +742,12 @@ Work, in priority order:
    binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
    within ~0.5% (TJ, 2026-10-05).
 4. **Multimodal for every family** with planner placement and the
-   embedding cache (#3 FR-M.12 for MiMo).
+   embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
+   Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),
+   GLM 5.3 Flash (vision 24×1024; we build it, TJ 2026-10-05, though the
+   rest of GLM Flash is Hugh's). V4.1 vision already works and is the
+   template. Design first (docs/multimodal-design.md), then one shared
+   encoder service and image-embedding cache, then the families.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
