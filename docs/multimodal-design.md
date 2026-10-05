@@ -89,18 +89,21 @@ D1 for TJ: on 2× PRO 6000 the GPU1 tower would cost nothing material against th
 
 ### 2.5 Latency budget against time-to-first-token
 
-Estimated encode time per image. Effective BF16 rates are assumed: PRO 6000 150 TF/s, 5090 100 TF/s, GB10 40 TF/s; the GB10 F16 MMA peak measured 124.8 TF/s per PLAN. Hugh measured 30–100 ms for upload plus encode of ~300-token images on a 5090, which is consistent. WP‑3 and WP‑4 replace these with measurements.
+MiMo timings are measured by WP-3: median of three interleaved warm component encodes, including RGB upload and BF16 feature download, excluding CPU image preparation, model loading and remote service TCP transfer. Conditions: one RTX PRO 6000 on GPU1 (SM120), or one GB10 on ostrich (SM121), private lowest-priority stream, BF16 matrices/FP32 residuals/FP16 attention inputs, 4096-row GEMM chunks, numerical version 1, NGC PyTorch 26.05. Flash snapshot `2479e2d`, Pro `adea8e2c`. These are tower timings, not serving TTFT or concurrent-decode measurements; WP-4 measures those separately.
+
+5090 and non-MiMo cells remain estimates, not measurements. Assumed effective BF16 rates: PRO 6000 150 TF/s, 5090 100 TF/s, GB10 40 TF/s; the GB10 F16 MMA peak measured 124.8 TF/s per PLAN. No 5090 result is claimed.
 
 | Tower | LM tokens | TFLOP | PRO 6000 | 5090 | GB10 | Embeddings back |
 |---|---:|---:|---:|---:|---:|---:|
-| MiMo (28×1280, 24 windowed) | 256 / 1024 / 4096 | 1.5 / 6.3 / 31.9 | 10 / 42 / 213 ms | 15 / 63 / 319 ms | 37 / 158 / 798 ms | 2 / 8 / 32 MiB (Pro ×1.5) |
+| MiMo Flash (28×1280, 24 windowed) | 256 / 1024 / 4096 | 1.5 / 6.3 / 31.9 | **10.76 / 37.34 / 207.05 ms measured** | 15 / 63 / 319 ms estimated | **35.38 / 157.77 / 757.50 ms measured** | 2 / 8 / 32 MiB |
+| MiMo Pro (same blocks, 6144-wide merger) | 256 / 1024 / 4096 | approximately Flash | **10.58 / 36.34 / 204.11 ms measured** | not measured | **34.94 / 156.58 / 758.87 ms measured** | 3 / 12 / 48 MiB |
 | Qwen (27×1152, all full) | 256 / 1024 / 4096 | 1.0 / 5.5 / 47.2 | 7 / 37 / 315 ms | 10 / 55 / 472 ms | 25 / 138 / 1180 ms | 1.25 / 5 / 20 MiB |
 | GLM Flash (24×1024, all full) | 256 / 1024 / 4096 | 1.0 / 5.3 / 40.9 | 7 / 35 / 273 ms | 10 / 53 / 409 ms | 25 / 132 / 1023 ms | 2 / 8 / 32 MiB |
 | V4.1 (32×1024, 3×3 merge) | 256 / 1024 | 2.6 / 18.9 | 18 / 126 ms | 26 / 189 ms | 66 / 472 ms | 2.5 / 10 MiB |
 
 Typical inputs: 640×480 → 300 tokens; 1280×720 → 880 tokens (MiMo/Qwen) or 1196 (GLM); 1920×1080 → 2040 or 2691; a 4K screenshot → 8160 tokens before our cap.
 
-Budget rule: on the default placement, encoding a ≤ 1024-token image must add ≤ 250 ms to TTFT and ≤ 1.0× the prefill time of its own tokens. The Spark default meets this by estimate (~160 ms vs ~200 ms of prefill at ~5k tok/s). If WP‑4 measures above it, the planner prefers RTX for that layout.
+Budget rule: on the default placement, encoding a ≤ 1024-token image must add ≤ 250 ms to TTFT and ≤ 1.0× the prefill time of its own tokens. The measured isolated Flash Spark tower is 157.77 ms at 1024 tokens, consistent with that budget (~200 ms of prefill at ~5k tok/s). End-to-end transport and concurrent decode are still WP-4 gates; if their TTFT exceeds the budget, the planner prefers RTX for that layout.
 
 Overlap: once WP‑5 lands, text rows before the first uncached image prefill while the Spark encodes. This helps fresh prompts; agentic turns, whose prefix restores instantly, gain nothing.
 
@@ -109,8 +112,8 @@ Overlap: once WP‑5 lands, text rows before the first uncached image prefill wh
 | Tower | Weights | Scratch (16,384 patches, 4096-row GEMM chunks) | Total |
 |---|---:|---:|---:|
 | V4.1 | 925.6 MiB | as today (9216 patches) | unchanged |
-| MiMo Flash vision | 1389.7 MiB | ≈ 0.6 GiB | ≈ 2.0 GiB |
-| MiMo Pro vision | ≈ 1410 MiB (merger out 6144) | ≈ 0.6 GiB | ≈ 2.0 GiB |
+| MiMo Flash vision | 1390.6 MiB resident (FP32 vectors, alignment included) | 884.3 MiB + 4 MiB BLAS workspace, measured ledger | 2.225 GiB |
+| MiMo Pro vision | 1410.6 MiB resident (merger out 6144) | 932.3 MiB + 4 MiB BLAS workspace, measured ledger | 2.292 GiB |
 | Qwen vision | 856.3 MiB | ≈ 0.5 GiB | ≈ 1.4 GiB |
 | GLM Flash vision | 1075.0 MiB | ≈ 0.5 GiB | ≈ 1.6 GiB |
 | MiMo audio (patch encoder 448 + speech embeddings 50 + tokenizer encoder ≈ 622; the 1.15 GiB tokenizer decoder is not loaded) | ≈ 1120 MiB (Pro ≈ 1185) | ≈ 0.2 GiB | ≈ 1.3 GiB |
@@ -290,6 +293,19 @@ The plan hash includes the placement, so coordinator and Sparks agree.
 | G7 exact prefix with images | (a) repeat prompt: total hit, 0 encodes, identical first-token row; (b) next turn adds image B: restores turn 1, encodes only B, state at restore byte-equal to a cold prefill; (c) same text, different image with the same grid: hit stops at the span start; (d) host-tier round trip; (e) embedding-cache eviction → re-encode byte-identical, restore still exact | all pass; `media_key_collisions` = 0 |
 | G8 perf | added TTFT per image (256/1024/4096 tokens) on the default placement; C1 decode with the tower loaded and idle; interference (§2.3) | idle C1 unchanged (quick parity ≥ 0.98, escalation per AGENTS); TTFT within §2.5 budget or the planner switches placement |
 | G9 plan | `cuteafd plan` matrix: PRO 6000 ×1/×2, 5090, RTX-only, `VISION=off` | expected placements and bytes; `off` = 0 tower bytes |
+
+MiMo G2 calibration (WP-3): retain every original strict verdict, and also measure the official BF16 module against the same FP32 module at each stage/size. The native tower must be no worse than that BF16 floor within absolute margins (relative L2 +0.002, mean cosine -0.00005, worst-token cosine -0.001), **and mean cosine must remain >=0.9995 against FP32**. On the measured fixtures, native L2 is <=0.018 and native is better than official BF16 at every stage. Near-constant final residuals amplify BF16 rounding in merger LayerNorm; the literal 0.99 worst-token bar fails for official BF16 too. Final merger rows are what the LM sees: this calibration is not promotion, and G4's paired LM-effect bar is unchanged. Compensation that passes strict G2 but adds 60-80% encode time is rejected (limit approximately +10%).
+
+Strict G2 misses remain recorded (worst-token cosine; final norm = stage 29, merger = stage 30):
+
+| Tower / arch | Final norm, 1024 | Final norm, 4096 | Merger, 1024 | Merger, 4096 |
+|---|---:|---:|---:|---:|
+| Flash SM120 | 0.983702 | 0.961880 | passes | 0.989944 |
+| Flash SM121 | 0.983687 | 0.961888 | passes | 0.989946 |
+| Pro SM120 | 0.964557 | 0.963495 | 0.989734 | 0.984786 |
+| Pro SM121 | 0.964531 | 0.963480 | 0.989726 | 0.984782 |
+
+All scored stages pass the calibrated G2 floor and G3 is byte-identical per arch at all three sizes; this does not claim strict G2 or G4 passes. Official BF16 remains worse even when its rotary buffer stays FP32 (checked on Pro SM120 and Flash/Pro SM121). No-allocation gating uses the native resident ledger (two allocations before and after the interleaved encodes); CUDA free-memory deltas are informational, especially on GB10 unified memory. MiMo currently uses Hugh's donated `m26v_attn` key-0 attention from `mimo26f-afd` v1.3.0, not b12x varlen; b12x key-0 integration remains pending. Defaults are unchanged.
 
 Fidelity hookup (with `work/fidelity-v2`):
 
