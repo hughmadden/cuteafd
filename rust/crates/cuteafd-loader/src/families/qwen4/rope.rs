@@ -128,12 +128,17 @@ mod tests {
             }).collect();
             let positions = RopePositions::new(&ids, &images, IMAGE, 2).unwrap();
             assert_eq!(positions.delta(), case["delta"].as_i64().unwrap());
+            // Restore rebuilds metadata from this request's native spans, not
+            // the cached mark. Both row and block-start lookups survive it.
+            let restored = RopePositions::new(&ids, &images, IMAGE, 2).unwrap();
+            assert_eq!(positions, restored);
             for (row, expected) in case["positions"].as_array().unwrap().iter().enumerate() {
                 let expected: [i32; 3] = std::array::from_fn(|i| expected[i].as_i64().unwrap() as i32);
                 assert_eq!(positions.at(row).unwrap(), expected, "case {} row {row}", case["name"]);
                 // Same lookup after arbitrary chunk/prefix boundaries; pooled keys
                 // rotate at the group start, not end coordinates minus three.
-                assert_eq!(positions.clone().at(row).unwrap(), expected);
+                assert_eq!(restored.at(row).unwrap(), expected);
+                assert_eq!(restored.at(row - row % 4).unwrap(), positions.at(row - row % 4).unwrap());
             }
             let next = (ids.len() as i64 + positions.delta()) as i32;
             assert_eq!(positions.at(ids.len()).unwrap(), [next; 3]);

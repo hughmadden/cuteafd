@@ -730,6 +730,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     };
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
     if let Some(logits) = logits {
+        // Match the decode dump for exact before/after prefill qualification.
+        if let Ok(path) = std::env::var("CUTEAFD_DUMP_PREFILL_LOGITS") {
+            std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
         let golden = golden_logits()?;
         if args.nll {
             let (agree, next_ok, golden_next, nll, scored) = score(&logits, &golden, &tokens, 0, vocab);

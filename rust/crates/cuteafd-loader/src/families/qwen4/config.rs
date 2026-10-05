@@ -72,6 +72,7 @@ impl Qwen4Config {
             other => anyhow::bail!("unknown qwen4_exp layer type {other:?}"),
         }).collect::<Result<Vec<_>>>()?;
         let rope = &v["rope_parameters"];
+        check_mrope(rope)?;
         let partial = rope["partial_rotary_factor"].as_f64().or(v["partial_rotary_factor"].as_f64()).unwrap_or(1.0);
         let head_dim = int(v, "head_dim")?;
         ensure!(rope["rope_type"].as_str().unwrap_or("default") == "default", "qwen4_exp RoPE must be the default type");
@@ -158,8 +159,9 @@ impl Qwen4Config {
     pub fn check_programs(&self) -> Result<()> {
         ensure!(self.hidden == 2560 && self.hc_count == 4 && self.hc_lowrank == 320,
             "the qwen4 programs are built for hidden 2560 and 4 hyper-connection streams of rank 320");
-        ensure!(self.heads == 24 && self.kv_heads == 2 && self.head_dim == 256 && self.rope_dim == 64,
-            "the qwen4 programs are built for GQA 24/2 x 256 with 64 rotary dims");
+        ensure!(self.heads == 24 && self.kv_heads == 2 && self.head_dim == 256 && self.rope_dim == 64
+            && self.rope_theta == 10_000_000.0,
+            "the qwen4 programs are built for GQA 24/2 x 256 with 64 rotary dims and theta 1e7");
         ensure!(self.index_heads == 4 && self.index_head_dim == 128 && self.index_budget == 2048
             && self.index_block == 4, "the qwen4 programs are built for a 4 x 128 QSA indexer over 4-token blocks");
         ensure!(self.gdn_key_heads == 16 && self.gdn_value_heads == 48 && self.gdn_head_dim == 128
@@ -173,9 +175,32 @@ impl Qwen4Config {
     }
 }
 
+fn check_mrope(rope: &Value) -> Result<()> {
+    if let Some(section) = rope.get("mrope_section") {
+        ensure!(*section == serde_json::json!([11, 11, 10]),
+            "unsupported qwen4_exp mrope_section {section}: export an interleaved M-RoPE producer for these sections");
+    }
+    if let Some(interleaved) = rope.get("mrope_interleaved") {
+        ensure!(interleaved.as_bool() == Some(true),
+            "unsupported qwen4_exp mrope_interleaved {interleaved}: the producer uses interleaved T/H/W");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mrope_layout_validation() {
+        assert!(check_mrope(&serde_json::json!({})).is_ok());
+        assert!(check_mrope(&serde_json::json!({"mrope_section": [11, 11, 10], "mrope_interleaved": true})).is_ok());
+        for value in [serde_json::json!({"mrope_section": [16, 8, 8]}),
+            serde_json::json!({"mrope_section": [11, 11]}),
+            serde_json::json!({"mrope_interleaved": false})] {
+            assert!(check_mrope(&value).is_err());
+        }
+    }
 
     #[test]
     fn qwen38_flash_next_config() -> Result<()> {
