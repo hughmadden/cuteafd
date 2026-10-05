@@ -24,12 +24,20 @@ pub use spec::{AttentionKind, Component, FfnKind, ModelSpec, TensorRole};
 /// Requested policy; never implies that an encoder has actually been loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaMode { Auto, Off }
+pub enum MediaMode { Auto, Off, Rtx(Option<usize>), Spark(Option<usize>) }
 impl std::str::FromStr for MediaMode {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value { "auto" => Ok(Self::Auto), "off" => Ok(Self::Off),
-            _ => Err("media mode must be auto or off".into()) }
+        match value {
+            "auto" => Ok(Self::Auto), "off" => Ok(Self::Off),
+            "rtx" => Ok(Self::Rtx(None)), "spark" => Ok(Self::Spark(None)),
+            _ => {
+                let (kind, rank) = value.split_once(':').ok_or("media mode must be auto, off, rtx[:gpu] or spark[:rank]")?;
+                let rank = rank.parse::<usize>().map_err(|_| "encoder device must be an unsigned integer")?;
+                match kind { "rtx" => Ok(Self::Rtx(Some(rank))), "spark" => Ok(Self::Spark(Some(rank))),
+                    _ => Err("media mode must be auto, off, rtx[:gpu] or spark[:rank]".into()) }
+            }
+        }
     }
 }
 
