@@ -45,7 +45,7 @@ but bounded engineering still goes to Sol.
 |---|---|---|
 | Default engineering, measurement, A/B, release smoke | Sol 6.1 | `high` |
 | Subtle numerics, kernels, root-cause investigations | Sol 6.1 | `xhigh` |
-| Key kernel design, new insight on a hard problem, Sol stalled at `xhigh` | Astra 6 | `medium`, `high` when it matters |
+| Key kernel design, new insight on a hard problem, Sol stalled at `xhigh` | Astra 6 | `medium`, `high` when it matters; scope it to the design, have Sol do the harness/probe/rebuild plumbing around it |
 | Structural or simple work, fast turnaround | DeepSeek Flash | `high`, `max` for larger sweeps |
 | Design changes, hard merges, independent review, decisions | Claude Opus | default |
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
@@ -69,6 +69,7 @@ but bounded engineering still goes to Sol.
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
   error means switch subscription (backup ↔ primary) or model.
+- **Budget pacing:** a backup subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
 - **Parallelism:** run several Sol agents at once on independent tasks
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
