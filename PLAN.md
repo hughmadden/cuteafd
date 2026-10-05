@@ -734,8 +734,13 @@ Work, in priority order:
    `physical_sms` and `run.sh` refuses a mismatch.
 3. **Full-context planner default + 32 GB plans (PLAT-2):** per-family
    profiles (V4.1 capacity 1024 / 256 on 32 GB, #2 FR-D.3; GLM Flash
-   #1 FR-G.4; MiMo #3 FR-M.5), cold components to host RAM or a Spark,
-   1M program extents (#1 FR-G.1).
+   #1 FR-G.4; MiMo #3 FR-M.5), 1M program extents (#1 FR-G.1). Cold
+   components (vision towers, rarely used) move off the GPU by default. The
+   token embedding is not cold: every token reads one row (a gather of
+   ~8–10 KB on the decode critical path). It stays on the GPU by default; a
+   host-mapped embedding (like Engram) is a planner lever only when memory
+   binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
+   within ~0.5% (TJ, 2026-10-05).
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo).
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
