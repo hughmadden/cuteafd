@@ -350,6 +350,28 @@ def test_snapshot_provenance_must_match_pinned_set(tmp_path):
         verify_snapshot(manifest, snapshot)
 
 
+def test_glm_kda_grouping_preserves_all_heads_and_recurrent_state():
+    tree = ast.parse((ROOT / "python/reference/families/glm5_flash/golden.py").read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "bounded_kda")
+    scope = {"torch": SimpleNamespace(cat=lambda values, dim: np.concatenate(values, axis=dim))}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "bounded_kda", "exec"), scope)
+    calls = []
+    def official(query, key, value, g, beta, **kwargs):
+        calls.append((query.shape[2], kwargs["chunk_size"], kwargs["use_qk_l2norm_in_kernel"]))
+        assert key.shape == value.shape == g.shape == query.shape
+        assert beta.shape == query.shape[:-1]
+        return query + key + value, kwargs["initial_state"] if kwargs["output_final_state"] else None
+    data = np.arange(1 * 67 * 7 * 8).reshape(1, 67, 7, 8)
+    state = np.arange(1 * 7 * 8 * 8).reshape(1, 7, 8, 8)
+    grouped = scope["bounded_kda"](official, heads=3)
+    output, final = grouped(data, data, data, data, data[..., 0], initial_state=state,
+                            output_final_state=True, use_qk_l2norm_in_kernel=True)
+    np.testing.assert_array_equal(output, data * 3)
+    np.testing.assert_array_equal(final, state)
+    assert calls == [(3, 64, True), (3, 64, True), (1, 64, True)]
+    assert grouped(data, data, data, data, data[..., 0])[1] is None
+
+
 def test_official_reference_identity_can_differ_from_generation_checkpoint(tmp_path):
     snapshot = tmp_path / "official-fp8"
     snapshot.mkdir()

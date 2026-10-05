@@ -195,6 +195,26 @@ def experts_fp32(self, hidden_states, top_k_index, top_k_weights):
     return final.to(hidden_states.dtype)
 
 
+def bounded_kda(function, heads=4):
+    """Keep official per-head arithmetic while bounding its quadratic broadcast."""
+    def forward(query, key, value, g, beta, chunk_size=64, initial_state=None,
+                output_final_state=False, use_qk_l2norm_in_kernel=False, **kwargs):
+        outputs, states = [], []
+        for start in range(0, query.shape[2], heads):
+            end = start + heads
+            result, state = function(query[:, :, start:end], key[:, :, start:end],
+                value[:, :, start:end], g[:, :, start:end], beta[:, :, start:end],
+                chunk_size=chunk_size,
+                initial_state=None if initial_state is None else initial_state[:, start:end],
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs)
+            outputs.append(result)
+            if state is not None:
+                states.append(state)
+        return torch.cat(outputs, dim=2), torch.cat(states, dim=1) if states else None
+    return forward
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True, help="coordinator weights, config and tokenizer")
@@ -219,6 +239,7 @@ def main() -> None:
     from transformers.models.glm5_next import modeling_glm5_next as ref
 
     ref.Glm5NextTextExperts.forward = experts_fp32
+    ref.chunk_kimi_delta_attention = bounded_kda(ref.chunk_kimi_delta_attention)
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     install()
