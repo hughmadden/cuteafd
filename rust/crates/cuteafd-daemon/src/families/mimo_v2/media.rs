@@ -5,6 +5,12 @@ use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
 
+fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
+    if mode == MediaMode::Off { return Ok(None); }
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    Ok(config.get("vision_config").is_some().then_some(config))
+}
+
 pub(super) struct ReadyVision {
     pub encoder: crate::shared::vision::local::LocalEncoder,
     pub preparer: Arc<MediaPreparer>,
@@ -13,10 +19,7 @@ pub(super) struct ReadyVision {
 impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode, prefix: &super::serve::PrefixArgs,
         cache_bytes: Option<u64>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
-        if mode == MediaMode::Off || config.get("vision_config").is_none() {
-            return Ok((None, prefix.clone()));
-        }
+        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
         let gpu = match mode {
             MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
             MediaMode::Auto | MediaMode::Spark(_) => {
@@ -160,6 +163,31 @@ fn read_bounded(path: &std::path::Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn feature_payload(path: &std::path::Path, bytes: usize, sha256: &str, cached: Option<&Arc<[u8]>>) -> Result<Arc<[u8]>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if let Some(cached) = cached {
+        // Revalidate disk bytes without allocating a second feature-sized payload on a warm hit.
+        let mut file = std::fs::File::open(path)?;
+        anyhow::ensure!(file.metadata()?.len() == bytes as u64, "reference feature payload length differs");
+        let mut hash = Sha256::new(); let mut offset = 0usize; let mut buffer = [0; 8192];
+        loop {
+            let n = file.read(&mut buffer)?; if n == 0 { break; }
+            anyhow::ensure!(offset.checked_add(n).is_some_and(|end| end <= bytes)
+                && cached.get(offset..offset + n) == Some(&buffer[..n]), "reference feature payload differs");
+            hash.update(&buffer[..n]); offset += n;
+        }
+        anyhow::ensure!(offset == bytes && format!("{:x}", hash.finalize()) == sha256, "reference feature payload hash differs");
+        return Ok(cached.clone());
+    }
+    let payload = read_bounded(path, bytes)?;
+    anyhow::ensure!(payload.len() == bytes && format!("{:x}", Sha256::digest(&payload)) == sha256,
+        "reference feature payload length/hash differs");
+    anyhow::ensure!(payload.chunks_exact(2).all(|b| (u16::from_le_bytes([b[0], b[1]]) & 0x7f80) != 0x7f80),
+        "reference features contain nonfinite BF16 values");
+    Ok(Arc::from(payload))
+}
+
 /// Strict paired-G4 hook. Only scoring probes bypass the encoder; ordinary
 /// generation remains native. Separate cache identities cannot warm native images.
 pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
@@ -202,20 +230,24 @@ fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
         let image = prompt.job.media.iter().find(|i| key_hex(i.key) == span.key).context("feature span has no prepared image")?;
         // Admission precedes payload allocation, including on a warm override-cache hit.
         let pin = cache.reserve(override_key, bytes)?;
-        let payload = read_bounded(&payload_path, bytes)?;
-        anyhow::ensure!(payload.len() == bytes && format!("{:x}", Sha256::digest(&payload)) == meta.sha256,
-            "reference feature payload length/hash differs");
-        anyhow::ensure!(payload.chunks_exact(2).all(|b| {
-            let bits = u16::from_le_bytes([b[0], b[1]]);
-            (bits & 0x7f80) != 0x7f80
-        }), "reference features contain nonfinite BF16 values");
-        let lease = cache.complete(override_key, Arc::from(payload))?;
+        let payload = feature_payload(&payload_path, bytes, &meta.sha256, pin.features())?;
+        let lease = cache.complete(override_key, payload)?;
         media.attach_probe_override(image.key, lease)?; drop(pin);
         provenance.push(serde_json::from_slice::<serde_json::Value>(&raw)?);
     }
     probe.provenance(serde_json::json!({"mode": "reference_features", "probe_only": true,
         "encoder_bypassed": true, "features": provenance}));
     Ok(())
+}
+
+pub(super) fn scoring_rows(probe: &crate::shared::probe::ProbeRef, capacity: usize) -> Result<usize> {
+    let probe = probe.as_ref().context("scoring probe required")?;
+    anyhow::ensure!(probe.spec.score_path.as_deref().is_none_or(|p| p == "decode"),
+        "MiMo serving admits decode scoring only; prefill needs an AllRows diagnostic engine");
+    let rows = probe.spec.verify_rows.unwrap_or(capacity);
+    anyhow::ensure!(rows > 0 && rows <= capacity, "verify_rows outside admitted decode capacity");
+    probe.selected_score_path("decode");
+    Ok(rows)
 }
 
 fn key_hex(key: cuteafd_loader::media::ImageKey) -> String {
@@ -240,6 +272,176 @@ mod tests {
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+    }
+    fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};
+        let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
+        let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
+            media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
+                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
+        let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
+        let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
+        (prompt, media, serde_json::json!({"snapshot_revision": "test"}))
+    }
+    fn feature_files(root: &std::path::Path, identity: &serde_json::Value, payload: &[u8]) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let meta = serde_json::json!({"schema":"cuteafd.media.features/1", "key":"07".repeat(32), "grid":[1,4,4],
+            "shape":[4,2], "dtype":"bf16-le", "sha256":format!("{:x}", Sha256::digest(payload)),
+            "tower_dtype":"bf16", "fixture_sha256":"ab".repeat(32), "snapshot_identity":identity});
+        std::fs::write(root.join(format!("{}.json", "07".repeat(32))), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(root.join(format!("{}.bf16", "07".repeat(32))), payload).unwrap();
+        meta
+    }
+    #[test]
+    fn feature_override_is_cold_budgeted_and_never_warms_native_keys_or_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let (prompt, mut media, identity) = feature_request();
+        let payload = [0u8; 16]; feature_files(root.path(), &identity, &payload);
+        let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+        apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).unwrap();
+        assert!(media.ready(0, prompt.tokens.len()));
+        assert_eq!(media.spans()[0].key, image().key);
+        assert!(!cache.contains(image().key), "reference override must never enter the plain-image cache");
+        assert_eq!((cache.bytes(), cache.len()), (16, 1));
+        assert!(crate::shared::probe::cold(&prompt.job.probe), "scheduler must bypass prefix restore and captures");
+        assert!(crate::shared::probe::no_speculation(&prompt.job.probe));
+        let provenance = prompt.job.probe.as_ref().unwrap().record().provenance.unwrap();
+        assert_eq!(provenance["encoder_bypassed"], true);
+        let mut chunk = cuteafd_engine::media::MediaChunk::default();
+        media.write_chunk(2, 6, &mut chunk).unwrap();
+        assert_eq!(chunk.features, payload);
+        drop(media);
+        cache.reserve(ImageKey([8; 32]), 16).unwrap();
+        assert!(!cache.contains(image().key));
+    }
+    #[test]
+    fn override_admission_bypasses_even_an_unavailable_native_encoder() {
+        use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaWaiter, MediaPoll};
+        let root = tempfile::tempdir().unwrap(); let (prompt, mut request, identity) = feature_request();
+        feature_files(root.path(), &identity, &[0; 16]);
+        let mut cache = EmbeddingCache::new(16);
+        apply_probe_features(&prompt, &mut request, &mut cache, root.path(), &identity).unwrap();
+        let input = image();
+        let jobs = vec![EncodeJob { key: input.key, grid: [1,4,4], rgb8: input.rgb8.clone(), tokens: 4, hidden_width: 2 }];
+        let waiter = MediaWaiter::new(prompt, request, jobs, 0).unwrap();
+        let mut admission = MediaAdmission::new(cache, Encoder::Off, 1);
+        assert!(admission.enqueue(waiter).is_ok());
+        assert!(matches!(admission.poll(|_| false), MediaPoll::Ready(_)));
+        assert!(!admission.cache.contains(input.key));
+        assert_eq!(admission.stats(0, 0).encodes, 0);
+    }
+    #[test]
+    fn override_requires_scoring_cold_no_speculation_and_safe_complete_files() {
+        use cuteafd_api::openai::probe::Probe;
+        for field in ["cold", "speculation", "scoring", "fixture"] {
+            let root = tempfile::tempdir().unwrap(); let (mut prompt, mut media, identity) = feature_request();
+            feature_files(root.path(), &identity, &[0; 16]);
+            let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone();
+            match field { "cold" => spec.cold = false, "speculation" => spec.no_speculation = false,
+                "scoring" => spec.score_from = None, _ => spec.media[0].fixture = None }
+            prompt.job.probe = Some(Probe::new(spec));
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+            assert!(apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+            assert_eq!(cache.bytes(), 0);
+        }
+        for mode in ["missing", "json", "oversized", "escape"] {
+            let root = tempfile::tempdir().unwrap(); let outside = tempfile::tempdir().unwrap();
+            let (prompt, mut media, identity) = feature_request();
+            let path = root.path().join(format!("{}.json", "07".repeat(32)));
+            match mode {
+                "missing" => (), "json" => { feature_files(root.path(), &identity, &[0; 16]); std::fs::write(&path, "{").unwrap(); }
+                "oversized" => { feature_files(root.path(), &identity, &[0; 16]); std::fs::write(&path, vec![b' '; (64 << 10) + 1]).unwrap(); }
+                _ => { feature_files(outside.path(), &identity, &[0; 16]);
+                    #[cfg(unix)] {
+                        std::os::unix::fs::symlink(outside.path().join(path.file_name().unwrap()), &path).unwrap();
+                        std::os::unix::fs::symlink(outside.path().join(format!("{}.bf16", "07".repeat(32))),
+                            root.path().join(format!("{}.bf16", "07".repeat(32)))).unwrap();
+                    }
+                }
+            }
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+            assert!(apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+            assert_eq!(cache.bytes(), 0);
+        }
+    }
+    #[test]
+    fn feature_metadata_payload_and_admission_fail_closed() {
+        for field in ["schema", "key", "grid", "shape", "dtype", "tower_dtype", "fixture_sha256", "snapshot_identity", "unknown"] {
+            let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = feature_request();
+            let mut meta = feature_files(root.path(), &identity, &[0; 16]); meta[field] = serde_json::json!("wrong");
+            std::fs::write(root.path().join(format!("{}.json", "07".repeat(32))), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+            assert!(apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err(), "{field}");
+            assert_eq!(cache.bytes(), 0); assert!(!media.ready(0, 8));
+        }
+        for (payload, budget) in [(vec![0; 15], 16), (vec![0; 17], 16), ([0x80, 0x7f].repeat(8), 16), (vec![0; 16], 15)] {
+            let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = feature_request();
+            feature_files(root.path(), &identity, &payload);
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(budget);
+            assert!(apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+            drop(media); cache.prune_reservations(); assert_eq!(cache.bytes(), 0);
+        }
+        let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = feature_request();
+        feature_files(root.path(), &identity, &[0; 16]);
+        std::fs::write(root.path().join(format!("{}.bf16", "07".repeat(32))), [1; 16]).unwrap();
+        let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+        assert!(apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+        drop(media); cache.prune_reservations(); assert_eq!(cache.bytes(), 0);
+    }
+    #[test]
+    fn warm_override_revalidates_without_duplicate_feature_allocation() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap(); let path = root.path().join("features");
+        let cached: Arc<[u8]> = Arc::from([0; 16]); std::fs::write(&path, &cached).unwrap();
+        let hash = format!("{:x}", Sha256::digest(cached.as_ref()));
+        let warm = feature_payload(&path, 16, &hash, Some(&cached)).unwrap();
+        assert!(Arc::ptr_eq(&warm, &cached));
+        std::fs::write(&path, [1; 16]).unwrap();
+        assert!(feature_payload(&path, 16, &hash, Some(&cached)).is_err());
+        std::fs::write(&path, [0; 15]).unwrap();
+        assert!(feature_payload(&path, 16, &hash, Some(&cached)).is_err());
+    }
+    #[test]
+    fn snapshot_identity_binds_actual_snapshot_files() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        for file in ["config.json", "tokenizer.json", "modeling_mimo_v2.py", "preprocessor_config.json"] {
+            std::fs::write(root.path().join(file), file).unwrap();
+        }
+        let before = snapshot_identity(root.path()).unwrap();
+        assert_eq!(before["config_sha256"], format!("{:x}", Sha256::digest(b"config.json")));
+        std::fs::write(root.path().join("modeling_mimo_v2.py"), "changed").unwrap();
+        assert_ne!(snapshot_identity(root.path()).unwrap(), before);
+        std::fs::remove_file(root.path().join("tokenizer.json")).unwrap();
+        assert!(snapshot_identity(root.path()).is_err());
+    }
+    #[test]
+    fn ordinary_and_generation_requests_never_consult_feature_files() {
+        let (mut prompt, mut media, _) = feature_request(); prompt.job.probe = None;
+        let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
+        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        let (mut prompt, mut media, _) = feature_request();
+        let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone(); spec.score_from = None;
+        prompt.job.probe = Some(cuteafd_api::openai::probe::Probe::new(spec));
+        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        assert_eq!(cache.bytes(), 0);
+    }
+    #[test]
+    fn off_vision_never_opens_config_or_tower_payloads() {
+        assert!(vision_config(MediaMode::Off, std::path::Path::new("/does/not/exist")).unwrap().is_none());
+        assert!(vision_config(MediaMode::Rtx(None), std::path::Path::new("/does/not/exist")).is_err());
+    }
+    #[test]
+    fn scoring_shape_is_honored_or_rejected_not_silently_ignored() {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+        let p = Some(Probe::new(ProbeSpec { verify_rows: Some(1), score_path: Some("decode".into()), ..Default::default() }));
+        assert_eq!(scoring_rows(&p, 4).unwrap(), 1);
+        assert_eq!(p.unwrap().record().score_path.as_deref(), Some("decode"));
+        for (rows, path) in [(0, "decode"), (5, "decode"), (1, "prefill"), (1, "typo")] {
+            let p = Some(Probe::new(ProbeSpec { verify_rows: Some(rows), score_path: Some(path.into()), ..Default::default() }));
+            assert!(scoring_rows(&p, 4).is_err());
+        }
     }
     #[test]
     fn expanded_image_ids_and_prefix_hints_are_separate() {

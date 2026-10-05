@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+
+mod rows;
 
 /// The request header naming a registered probe.
 pub const HEADER: &str = "x-cuteafd-probe";
@@ -35,6 +38,19 @@ pub struct ProbeSpec {
     /// ends without generating.
     #[serde(default)]
     pub score_from: Option<usize>,
+    /// Decode-shaped scoring width, bounded by the family's verify capacity.
+    #[serde(default)]
+    pub verify_rows: Option<usize>,
+    /// Scoring kernel shape: `decode` or `prefill`. When absent, retain the
+    /// family's legacy path (V4.1 prefill-shaped, other families decode-shaped).
+    #[serde(default)]
+    pub score_path: Option<String>,
+    /// New server-local directory for streamed full-vocabulary F32 log-probs.
+    /// Each row is a safetensors `log_probs` tensor; `manifest.jsonl` identifies
+    /// its predicted-token position, vocabulary size and file. Existing paths
+    /// are rejected rather than overwritten. No dump is written when absent.
+    #[serde(default)]
+    pub dump_rows: Option<PathBuf>,
     /// Record the row the first generated token is selected from.
     #[serde(default)]
     pub record_first: bool,
@@ -85,6 +101,23 @@ pub fn sha256_hex(value: &str) -> bool {
 }
 
 impl ProbeSpec {
+    /// Remote callers may choose only a new leaf under an explicitly enabled root.
+    pub fn constrain_dump_root(&mut self, root: &std::path::Path) -> anyhow::Result<()> {
+        let Some(path) = self.dump_rows.as_ref() else { return Ok(()); };
+        let root = root.canonicalize()?;
+        anyhow::ensure!(root.is_dir(), "probe dump root must be an existing directory");
+        let leaf = path.file_name().filter(|name| !name.is_empty()).ok_or_else(|| anyhow::anyhow!("dump needs a new leaf"))?;
+        anyhow::ensure!(!path.components().any(|c| matches!(c, std::path::Component::ParentDir)), "dump traversal forbidden");
+        let path = if path.is_absolute() { path.clone() } else { root.join(path) };
+        let parent = path.parent().ok_or_else(|| anyhow::anyhow!("dump parent required"))?.canonicalize()?;
+        anyhow::ensure!(parent.starts_with(&root), "dump parent escapes configured root");
+        let destination = parent.join(leaf);
+        anyhow::ensure!(destination != root && std::fs::symlink_metadata(&destination).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "dump leaf must not exist");
+        self.dump_rows = Some(destination);
+        Ok(())
+    }
+
     pub fn validate_media(&self) -> anyhow::Result<()> {
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
@@ -144,6 +177,8 @@ pub struct ProbeRecord {
     pub cold: bool,
     pub no_speculation: bool,
     pub scored: usize,
+    #[serde(default)]
+    pub score_path: Option<String>,
     pub error: Option<String>,
 }
 
@@ -152,11 +187,13 @@ pub struct ProbeRecord {
 pub struct Probe {
     pub spec: ProbeSpec,
     record: Mutex<ProbeRecord>,
+    dump: Mutex<Option<rows::RowDump>>,
 }
 
 impl Probe {
     pub fn new(spec: ProbeSpec) -> Arc<Self> {
-        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()) })
+        let dump = spec.dump_rows.as_ref().map(|path| rows::RowDump::new(path.clone()));
+        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()), dump: Mutex::new(dump) })
     }
 
     fn with(&self, f: impl FnOnce(&mut ProbeRecord)) {
@@ -190,7 +227,16 @@ impl Probe {
     /// Records one host logits row predicting token `position`.
     pub fn row(&self, position: usize, logits: &[f32]) {
         let want = self.spec.want.get(&position).map(Vec::as_slice).unwrap_or(&[]);
-        let row = summarize(position, logits, self.spec.top_k.max(1), want);
+        let softmax = LogSoftmax::new(logits);
+        let row = summarize_with(position, logits, self.spec.top_k.max(1), want, &softmax);
+        if self.spec.dump_rows.is_some() {
+            let result = self.dump.lock().map_err(|_| "row dump lock poisoned".to_owned()).and_then(|mut dump| {
+                dump.as_mut().expect("dump configured").write(position, logits, &softmax).map_err(|e| e.to_string())
+            });
+            if let Err(error) = result {
+                self.fail(format!("dump rows: {error}"));
+            }
+        }
         self.with(|r| {
             r.rows.push(row);
             if self.spec.score_from.is_some_and(|from| position >= from) {
@@ -213,6 +259,10 @@ impl Probe {
         self.record.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
+    pub fn selected_score_path(&self, path: &str) {
+        self.with(|r| r.score_path = Some(path.to_owned()));
+    }
+
     /// The scoring request's rows: positions `from..len` of the prompt.
     pub fn scoring(&self) -> Option<usize> {
         self.spec.score_from
@@ -231,16 +281,31 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Log-softmax summary of one logits row.
 pub fn summarize(position: usize, logits: &[f32], top_k: usize, want: &[u32]) -> ProbeRow {
+    summarize_with(position, logits, top_k, want, &LogSoftmax::new(logits))
+}
+
+struct LogSoftmax(f64);
+
+impl LogSoftmax {
+    fn new(logits: &[f32]) -> Self {
+        let max = logits.iter().copied().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = logits.iter().filter(|v| v.is_finite()).map(|&v| f64::from(v - max).exp()).sum();
+        Self(f64::from(max) + sum.ln())
+    }
+
+    fn at(&self, value: f32) -> f32 {
+        if value.is_finite() { (f64::from(value) - self.0) as f32 } else { f32::NEG_INFINITY }
+    }
+}
+
+fn summarize_with(position: usize, logits: &[f32], top_k: usize, want: &[u32], softmax: &LogSoftmax) -> ProbeRow {
     let mut bytes = Vec::with_capacity(logits.len() * 4);
     for value in logits {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     let hash = format!("{:016x}", fnv1a(&bytes));
     let finite = logits.iter().all(|v| v.is_finite());
-    let max = logits.iter().copied().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
-    let sum: f64 = logits.iter().filter(|v| v.is_finite()).map(|&v| f64::from(v - max).exp()).sum();
-    let lse = f64::from(max) + sum.ln();
-    let lp = |v: f32| if v.is_finite() { (f64::from(v) - lse) as f32 } else { f32::NEG_INFINITY };
+    let lp = |v| softmax.at(v);
     // Partial selection of the top entries (ties to the lower id).
     let mut order: Vec<u32> = (0..logits.len() as u32).collect();
     let k = top_k.min(order.len());
@@ -305,6 +370,120 @@ pub fn registry() -> &'static ProbeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dumped_row(path: &std::path::Path) -> Vec<f32> {
+        let bytes = std::fs::read(path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        assert_eq!(header_len % 8, 0);
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        let tensor = &header["log_probs"];
+        assert_eq!(tensor["dtype"], "F32");
+        let vocab = tensor["shape"][0].as_u64().unwrap() as usize;
+        assert_eq!(tensor["data_offsets"], serde_json::json!([0, vocab * 4]));
+        let metadata = cuteafd_loader::read_safetensors_metadata(path).unwrap();
+        assert_eq!(metadata.len(), 1, "the engine loader accepts the dump");
+        assert_eq!(metadata[0].name, "log_probs");
+        assert_eq!(metadata[0].shape, vec![vocab]);
+        assert_eq!(metadata[0].byte_length, (vocab * 4) as u64);
+        let data = &bytes[8 + header_len..];
+        assert_eq!(data.len(), vocab * 4);
+        data.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn registered_probe_streams_full_rows_matching_in_band_top_k() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("arm");
+        let (id, probe) = registry().register(ProbeSpec {
+            dump_rows: Some(path.clone()), score_from: Some(3), top_k: 3,
+            want: HashMap::from([(3, vec![0, 4])]), ..ProbeSpec::default()
+        });
+        assert!(!path.exists(), "no IO until the first recorded row");
+        let engine = registry().claim(&id).unwrap();
+        engine.admitted("host-loopback", &[1, 2, 3, 4, 5], 0);
+        for (position, logits) in [(3, [1.0, 3.0, 2.0, 3.0, -1.0]), (4, [-9.0, 0.0, 5.0, 2.0, 1.0])] {
+            engine.row(position, &logits);
+            assert_eq!(std::fs::read_to_string(path.join("manifest.jsonl")).unwrap().lines().count(), position - 2,
+                "each complete row is published before the next step");
+        }
+        let record = probe.record();
+        assert!(record.error.is_none(), "{:?}", record.error);
+        assert_eq!(record.scored, 2);
+        let manifest = std::fs::read_to_string(path.join("manifest.jsonl")).unwrap();
+        for (line, row) in manifest.lines().zip(&record.rows) {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(entry["position"], row.position);
+            assert_eq!(entry["vocab_size"], 5);
+            assert_eq!(entry["tensor"], "log_probs");
+            assert_eq!(entry["byte_order"], "little");
+            let values = dumped_row(&path.join(entry["file"].as_str().unwrap()));
+            let mut ids: Vec<usize> = (0..values.len()).collect();
+            ids.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+            assert_eq!(row.top.iter().map(|&(id, _)| id as usize).collect::<Vec<_>>(), ids[..3]);
+            for &(id, lp) in row.top.iter().chain(&row.wanted) {
+                assert_eq!(values[id as usize].to_bits(), lp.to_bits());
+            }
+            assert!((values.iter().map(|&v| f64::from(v).exp()).sum::<f64>() - 1.0).abs() < 1e-6);
+        }
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn dump_rejects_existing_paths_and_vocabulary_changes_without_orphans() {
+        let temporary = tempfile::tempdir().unwrap();
+        let probe = Probe::new(ProbeSpec { dump_rows: Some(temporary.path().to_owned()), ..ProbeSpec::default() });
+        probe.row(1, &[1.0, 2.0]);
+        assert!(probe.record().error.unwrap().contains("dump rows"));
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+        let path = temporary.path().join("new");
+        let probe = Probe::new(ProbeSpec { dump_rows: Some(path.clone()), ..ProbeSpec::default() });
+        probe.row(1, &[1.0, 2.0]);
+        probe.row(2, &[1.0, 2.0, 3.0]);
+        probe.row(3, &[1.0, 2.0]);
+        assert!(probe.record().error.unwrap().contains("vocabulary changed"));
+        assert_eq!(std::fs::read_to_string(path.join("manifest.jsonl")).unwrap().lines().count(), 1);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn probe_options_are_backward_compatible_and_round_trip() {
+        let legacy: ProbeSpec = serde_json::from_str("{}").unwrap();
+        assert!(legacy.dump_rows.is_none() && legacy.verify_rows.is_none());
+        assert!(legacy.score_path.is_none());
+        let configured: ProbeSpec = serde_json::from_value(serde_json::json!({ "dump_rows": "arm", "verify_rows": 5, "score_path": "decode" })).unwrap();
+        assert_eq!(configured.dump_rows.as_deref(), Some(std::path::Path::new("arm")));
+        assert_eq!(configured.verify_rows, Some(5));
+        assert_eq!(configured.score_path.as_deref(), Some("decode"));
+        let serialized = serde_json::to_value(configured).unwrap();
+        assert_eq!(serialized["verify_rows"], 5);
+        assert_eq!(serialized["score_path"], "decode");
+        let probe = Probe::new(ProbeSpec::default());
+        probe.selected_score_path("prefill");
+        assert_eq!(probe.record().score_path.as_deref(), Some("prefill"));
+    }
+
+    #[test]
+    fn remote_dump_destination_stays_under_an_existing_root_with_a_new_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let check = |path: PathBuf| {
+            let mut spec = ProbeSpec { dump_rows: Some(path), ..Default::default() };
+            spec.constrain_dump_root(root.path()).map(|()| spec.dump_rows.unwrap())
+        };
+        assert_eq!(check("new".into()).unwrap(), root.path().canonicalize().unwrap().join("new"));
+        for path in [root.path().to_owned(), outside.path().join("new"), "../escape".into(), "missing/new".into()] {
+            assert!(check(path).is_err());
+        }
+        std::fs::write(root.path().join("exists"), "untouched").unwrap();
+        assert!(check("exists".into()).is_err());
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("missing"), root.path().join("dangling")).unwrap();
+            assert!(check("escape/new".into()).is_err());
+            assert!(check("dangling".into()).is_err());
+        }
+        assert!(!root.path().join("new").exists());
+    }
 
     #[test]
     fn summary_is_log_softmax_with_ordered_top() {

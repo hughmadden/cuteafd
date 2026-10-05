@@ -498,6 +498,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             continue;
                         }
                         if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                            if let Some(probe) = &prompt.job.probe { probe.fail(format!("reference features: {error:#}")); }
                             let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
                             drop(request_media); media.cache.prune_reservations();
                             continue;
@@ -570,14 +571,18 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, &mut placement,
+                let scored = (|| {
+                    let rows = super::media::scoring_rows(&job.probe, DECODE_ROWS)?;
+                    probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    rows, &mut placement,
                     |placement, chunk, _last_logits| engine.prefill_media_device(placement, chunk, false, None, None, Some(&request_media)),
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
-                        .context("scoring needs every layer"));
+                        .context("scoring needs every layer"))
+                })();
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => {
+                        if let Some(probe) = &job.probe { probe.fail(format!("scoring: {error:#}")); }
                         let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}"))));
                         if engine.is_terminal() { return Err(error); }
                     }
@@ -999,7 +1004,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
             (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !probe::cold(&request.job.probe)) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.keyed_history[..request.placement.len];
                 if let Err(error) = cache.capture_media(family, SnapshotKind::Turn, rows, request.media.spans(), &request.placement,

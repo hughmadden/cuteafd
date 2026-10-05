@@ -292,8 +292,13 @@ impl Bench {
 
     /// One remote probe is registered inside the serving process, where the registry lives.
     /// It holds the same exclusive inference slot as a benchmark, including on errors.
-    pub fn probe(self: &Arc<Self>, body: Value, spec: cuteafd_api::openai::probe::ProbeSpec) -> anyhow::Result<Value> {
+    pub fn probe(self: &Arc<Self>, body: Value, mut spec: cuteafd_api::openai::probe::ProbeSpec) -> anyhow::Result<Value> {
         anyhow::ensure!(body.is_object(), "probe body must be a chat object");
+        if spec.dump_rows.is_some() {
+            let root = std::env::var_os("CUTEAFD_PROBE_DUMP_ROOT")
+                .ok_or_else(|| anyhow::anyhow!("remote row dumps require CUTEAFD_PROBE_DUMP_ROOT"))?;
+            spec.constrain_dump_root(std::path::Path::new(&root))?;
+        }
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
         let active = ActiveRun { id: uuid::Uuid::new_v4().simple().to_string(),
             token: uuid::Uuid::new_v4().simple().to_string(), cancel: Arc::new(AtomicBool::new(false)),
