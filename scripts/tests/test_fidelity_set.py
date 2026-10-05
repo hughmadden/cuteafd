@@ -107,7 +107,7 @@ def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
         builder.validate_set(changed)
 
 
-@pytest.mark.parametrize("family", ["mimo_v2", "qwen4"])
+@pytest.mark.parametrize("family", ["mimo_v2", "qwen4", "glm5_flash"])
 def test_other_family_recipes_keep_internal_names(fake_server, family):
     fake_server["family"] = family
     manifest = make(fake_server)

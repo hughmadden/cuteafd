@@ -23,7 +23,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
 
-LEGACY = {"deepseek_v41": "deepseek-v4.1-flash", "mimo_v2": "mimo-v2.6-pro", "qwen4": "qwen3.8-flash-next"}
+LEGACY = {"deepseek_v41": "deepseek-v4.1-flash", "mimo_v2": "mimo-v2.6-pro",
+          "qwen4": "qwen3.8-flash-next", "glm5_flash": "glm-5.3-flash"}
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
