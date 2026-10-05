@@ -173,6 +173,7 @@ impl<'a> CompressorState<'a> {
     pub(crate) fn ensure_not_writing(&self, lease: CompressorLease) -> Result<()> {
         self.validate(lease).map(|_| ())
     }
+    pub fn active_pages(&self) -> std::collections::HashSet<u32> { self.index.active_pages() }
     pub fn check_append_capacity(&self, work: &[(CompressorLease, u32)]) -> Result<()> {
         let ratio = ratio(self.layer)?;
         let appends = work.iter().map(|&(lease, tokens)| {

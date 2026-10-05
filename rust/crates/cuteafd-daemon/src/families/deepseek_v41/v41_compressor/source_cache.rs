@@ -159,6 +159,9 @@ impl<'a> SourceCache<'a> {
     /// KV scales), in the order the host cache stores them.
     /// Pool pages: total, free, and referenced by active request slots
     /// (a page shared by two slots counts twice). Host-side reads only.
+    pub fn active_pages(&self) -> std::collections::HashSet<u32> {
+        self.pages.iter().flatten().copied().collect()
+    }
     pub fn occupancy(&self) -> [u64; 3] {
         let pool = self.pool.borrow();
         let held: usize = self.pages.iter().map(Vec::len).sum();

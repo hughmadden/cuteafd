@@ -51,9 +51,31 @@ pub(super) fn remaining_budget(tokens: usize, remaining_output: usize, committed
     Ok(append.try_into().context("request token budget exceeds u32")?)
 }
 
+/// Largest output allowance that fits without discarding a reused snapshot.
+/// A request with active peers waits instead; call only for an otherwise idle pool.
+pub(super) fn fit_output(maximum: usize, mut fits: impl FnMut(usize) -> Result<bool>) -> Result<Option<usize>> {
+    if !fits(1)? { return Ok(None); }
+    let (mut low, mut high) = (1, maximum);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid)? { low = mid; } else { high = mid - 1; }
+    }
+    Ok(Some(low))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn output_reservation_shrinks_without_touching_the_source() -> Result<()> {
+        for maximum in [1, 2, 1000] {
+            for available in [0, 1, 2, 17, 1000] {
+                assert_eq!(fit_output(maximum, |output| Ok(output <= available))?,
+                    (available > 0).then_some(maximum.min(available)));
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn blocked_admission_does_not_join_lanes_until_a_request_retires() {
         let blocked = Wake { blocked_at: Some(2), ..Wake::default() };

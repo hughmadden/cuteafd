@@ -453,6 +453,9 @@ impl<'a> BackboneCache<'a> {
             _ => end,
         })
     }
+    pub fn active_source_pages(&self) -> Vec<std::collections::HashSet<u32>> {
+        self.sources.iter().map(|source| source.active_pages()).collect()
+    }
     pub fn check_append_capacity(&self, work: &[(CacheLease, u32)]) -> Result<()> {
         for (i, source) in self.sources.iter().enumerate() {
             let appends = work.iter().map(|&(lease, tokens)|

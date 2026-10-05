@@ -247,7 +247,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let active_count = active.iter().flatten().count();
             if pending.as_ref().is_some_and(|p| p.active_when_blocked == active_count
                 && !p.prepared.job.events.is_closed()) { break; }
-            let prepared = if let Some(pending) = pending.take() { pending.prepared } else {
+            let mut prepared = if let Some(pending) = pending.take() { pending.prepared } else {
                 let job = if active_count == 0 && !closed {
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
@@ -279,7 +279,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let lane = usize::from(loads[1] < loads[0]);
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
-                let admission::Prepared { job, prompt, images } = &prepared;
+                let admission::Prepared { job, prompt, images } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = prefixes.prepare_key(prompt, images)?;
                 if !images.is_empty() {
@@ -298,7 +298,24 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     .collect::<Result<Vec<_>>>()?;
                 capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
                     requests.cache().committed_end(lease)?)?));
-                prefixes.make_room(requests, &capacity)?;
+                if let Err(error) = prefixes.make_room(requests, &capacity) {
+                    if active_count != 0 || hit.is_none()
+                        || error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
+                        return Err(error);
+                    }
+                    let committed = requests.cache().committed_end(lease)?;
+                    let output = admission::fit_output(job.max_tokens, |output| {
+                        let append = admission::remaining_budget(prompt.len(), output, committed)?;
+                        match requests.cache().check_append_capacity(&[(lease, append)]) {
+                            Ok(()) => Ok(true),
+                            Err(error) if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some() => Ok(false),
+                            Err(error) => Err(error),
+                        }
+                    })?.ok_or(error)?;
+                    tracing::info!(request_id=id, requested=job.max_tokens, reserved=output,
+                        "shrinking output reservation to preserve reused device snapshot");
+                    job.max_tokens = output;
+                }
                 Ok((image_keys, hit, restore))
             })();
             let (image_keys, hit, restore) = match admitted {

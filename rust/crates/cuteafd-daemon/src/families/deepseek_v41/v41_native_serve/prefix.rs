@@ -290,6 +290,9 @@ impl<'a> PrefixCache<'a> {
         if self.retained.lookup_reusable(&keys).is_none() {
             self.host_restore(&keys, lease, requests, draft.as_deref())?;
         }
+        // This immutable lookup borrow pins the source across restoration. No
+        // eviction can run until the lease has acquired its shared source pages
+        // and the synchronous restore has drained every queued copy.
         let Some((end, frontier, saved)) = self.retained.lookup_reusable(&keys) else {
             return Ok(None);
         };
@@ -316,6 +319,7 @@ impl<'a> PrefixCache<'a> {
         Ok(Some((end, Some(saved.next.clone()))))
     }
     pub fn make_room(&mut self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<()> {
+        let mut active_pages = None;
         loop {
             match requests.cache().check_append_capacity(work) {
                 Ok(()) => return Ok(()),
@@ -323,7 +327,13 @@ impl<'a> PrefixCache<'a> {
                     if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
                         return Err(error);
                     }
-                    match self.retained.evict_oldest() {
+                    // Build once, only under pressure. Snapshot-only sharing is
+                    // not protected: evicting a whole inactive chain can free pages.
+                    let active = active_pages.get_or_insert_with(|| requests.cache().active_source_pages());
+                    match self.retained.evict_one_where(&|saved| {
+                        let sources = saved.target.parts().0.parts().4;
+                        sources.iter().zip(active.iter()).all(|(source, pages)| source.parts().2.held_by(pages))
+                    }) {
                         Some((_, saved)) => self.host_dropped(saved),
                         None => return Err(error),
                     }
