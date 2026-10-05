@@ -18,6 +18,8 @@ Base: origin/work/p0 163c3a36
 - Target serial/paired/pipelined prefills inject after token gather; MTP injects shifted known image rows. DFlash receives downstream target taps. Prefix-covered absent host features keep optional MTP cold until its reconstruction window clears.
 - Local owner QueueFull after cancellation is backpressure, not a keyed encode failure; deterministic cancellation test passes.
 - Planner accepts supported BF16 vision geometry; resident loading still validates the complete actual tower inventory.
+- Generation media probes implemented: authorized HTTP endpoint holds/relinquishes the benchmark slot; native expanded image spans echo actual prepared keys/grids. Supplied prompt_ids + spec.media validate sources, fixture hashes, complete keys, grids, placeholder rows and boundaries without re-rendering/re-expanding. Cold generation probes never retain prompt snapshots.
+- Generation probe software gates: full cargo workspace zero failures; scripts 998 passed, 2 skipped, 193 subtests passed in 71.49 s, zero failing IDs. Source hash, authorization, API source preparation, native span echo and already-expanded identity regressions pass. Live generation capture and media scoring/swap still pending.
 - No defaults promoted; V4.1 serving untouched; main checkout untouched.
 - No WP-5 hardware job queued or locks held. WP-4 full WIP pair in slot mm-wp4 is available for native reuse; no duplicate full build.
 - Standard run.sh/run-family.sh/wip.sh UID behavior remains unchanged. UID1000 applies only to fidelity custom qualification containers.

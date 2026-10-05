@@ -369,6 +369,18 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Err(message) = images::guard_content(&body, state.profile.capabilities) {
         return error(StatusCode::BAD_REQUEST, message);
     }
+    let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
+    if let Some(p) = &probe {
+        if let Err(message) = p.spec.validate_media() {
+            p.fail(format!("{message:#}"));
+            return error(StatusCode::BAD_REQUEST, message);
+        }
+        if !p.spec.media.is_empty() && (!state.profile.capabilities.vision || state.profile.media_preparer.is_none()
+            || !matches!(state.profile.encoding, ModelEncoding::DeepseekV4)) {
+            p.fail("probe media requires a loaded encoder");
+            return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
+        }
+    }
     let media_sources = match &state.profile.media_preparer {
         Some(preparer) => match media::extract_image_sources(&body, preparer.limits.images) {
             Ok(sources) => sources,
@@ -380,7 +392,15 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         && state.profile.media_preparer.is_none() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "vision image processor unavailable");
     }
-    let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
+    let media_sources = if let Some(p) = probe.as_ref().filter(|p| !p.spec.media.is_empty()) {
+        if !media_sources.is_empty() {
+            return error(StatusCode::BAD_REQUEST, "probe media sources must not also appear in chat content");
+        }
+        p.spec.media.iter().map(|span| {
+            let source = span.image_url.as_ref().expect("validated probe source");
+            media::MediaSource { url: source.url.clone(), low: source.detail.as_deref() == Some("low") }
+        }).collect()
+    } else { media_sources };
     // Families rendered from the checkpoint's own chat template.
     let glm = match &state.profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
@@ -520,6 +540,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
+    let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty());
     let (prompt, image_sources, processor) = match glm_request {
         Some((Templated::Glm(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -558,6 +579,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             (prompt, Vec::new(), OutputProcessor::Qwen(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         None => {
+            if expanded_media_probe {
+                // Supplied native ids already contain image rows; do not render another prompt.
+                (String::new(), Vec::new(), OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
+            } else {
             let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
             } else {
@@ -570,6 +595,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             };
             (rendered.prompt, rendered.image_sources,
                 OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
+            }
         }
     };
     // Rendered sources own the image payloads needed by preprocessing. Do not
@@ -611,9 +637,11 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             Ok(slot) => slot,
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "image preparation is closed"),
         };
+        let hashes = probe.as_ref().map(|p| p.spec.media.iter()
+            .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            preparer.prepare(&media_sources)
+            preparer.prepare_verified(&media_sources, &hashes)
         }).await {
             Ok(Ok(prepared)) => prepared.images,
             Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
@@ -958,6 +986,39 @@ mod tests {
         let response = router(tx).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         worker.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
+        use base64::Engine;
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Mimo),
+            EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let bytes = include_bytes!("openai/fixtures/black.png");
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let image = preparer.prepare(&[media::MediaSource { url: url.clone(), low: false }]).unwrap().images.remove(0);
+        let key: String = image.key.0.iter().map(|v| format!("{v:02x}")).collect();
+        let (id, _) = probe::registry().register(probe::ProbeSpec { prompt_ids: Some(vec![1; image.tokens + 2]),
+            media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(), key,
+                grid: [image.grid.t, image.grid.h, image.grid.w], fixture: None,
+                image_url: Some(probe::ProbeImageUrl { url, detail: None }) }], ..Default::default() });
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert!(job.prompt.is_empty() && job.images.is_empty());
+            assert_eq!(job.media.len(), 1); assert_eq!(job.media[0].key, image.key);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let profile = ModelProfile::new(MODEL, ModelEncoding::DeepseekV4).with_loaded_vision(preparer);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").header(probe::HEADER, id)
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

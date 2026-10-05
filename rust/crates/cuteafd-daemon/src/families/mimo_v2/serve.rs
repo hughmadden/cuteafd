@@ -656,7 +656,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
-                let prompt = (resume < p.tokens.len()).then(|| p.keys.tokens().to_vec());
+                let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
                 let spans = p.keys.spans().to_vec();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
                     if let Some(prompt) = &prompt {

@@ -82,18 +82,52 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     let (tokens, spans) = if config.get("vision_config").is_some() {
         let expander = SpanExpander::from_config(config, vocabulary as u32)?;
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
-        let expanded = expander.expand(&tokens, &images, max_context)?;
-        (expanded.tokens, expanded.media)
+        if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
+            let probe = job.probe.as_ref().unwrap();
+            probe.spec.validate_media()?;
+            anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
+                "expanded probe media count/context differs");
+            anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
+            let mut spans = Vec::with_capacity(images.len());
+            for (span, image) in probe.spec.media.iter().zip(&images) {
+                let end = span.start.checked_add(span.len).context("probe media extent")?;
+                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
+                    && span.key == key_hex(image.key), "probe prepared image identity differs");
+                anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
+                    && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
+                    "probe image rows/marker boundaries differ");
+                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: image.key });
+            }
+            anyhow::ensure!(tokens.iter().filter(|&&id| id == expander.placeholder).count()
+                == spans.iter().map(|span| span.len).sum::<usize>(), "unbound probe image placeholders");
+            (tokens, spans)
+        } else {
+            let expanded = expander.expand(&tokens, &images, max_context)?;
+            (expanded.tokens, expanded.media)
+        }
     } else {
         anyhow::ensure!(job.media.is_empty(), "checkpoint has no vision tower");
         (tokens, Vec::new())
     };
+    if let Some(probe) = &job.probe {
+        anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
+        let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
+            cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
+                key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
+                fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
+        }).collect();
+        probe.media(echo);
+    }
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
     let jobs = job.media.iter().map(|image| EncodeJob { key: image.key,
         grid: [image.grid.t, image.grid.h, image.grid.w], rgb8: image.rgb8.clone(),
         tokens: image.tokens, hidden_width: hidden }).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
+}
+
+fn key_hex(key: cuteafd_loader::media::ImageKey) -> String {
+    key.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -129,6 +163,41 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].grid, [1, 4, 4]);
         assert_eq!(jobs[0].feature_bytes().unwrap(), 16);
+    }
+    #[test]
+    fn generation_probe_echoes_real_expanded_spans_without_sources() {
+        let mut job = request(vec![image()]);
+        let probe = cuteafd_api::openai::probe::Probe::new(Default::default());
+        job.probe = Some(probe.clone());
+        prepare(job, vec![1, 4, 5, 6, 2], &config(), 32, 2, 16).unwrap();
+        let record = probe.record();
+        assert_eq!((record.media[0].start, record.media[0].len, record.media[0].grid), (2, 4, [1, 4, 4]));
+        assert_eq!(record.media[0].key, "07".repeat(32));
+        assert!(record.media[0].image_url.is_none());
+    }
+    #[test]
+    fn expanded_probe_ids_are_verified_not_expanded_twice() {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
+        let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
+        let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
+            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
+        let run = |span: ProbeMedia, tokens: Vec<u32>| {
+            let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });
+            let mut job = request(vec![image()]); job.probe = Some(probe.clone());
+            prepare(job, tokens, &config(), 32, 2, 16).map(|prepared| (prepared, probe.record()))
+        };
+        let ((prompt, _, _), record) = run(span.clone(), tokens.clone()).unwrap();
+        assert_eq!(prompt.tokens, tokens);
+        assert_eq!(record.media[0].fixture, span.fixture);
+        assert!(record.media[0].image_url.is_none());
+        let mut wrong = span.clone(); wrong.key = "08".repeat(32); assert!(run(wrong, tokens.clone()).is_err());
+        let mut wrong = span.clone(); wrong.grid = [1, 2, 8]; assert!(run(wrong, tokens.clone()).is_err());
+        let mut wrong = tokens.clone(); wrong[3] = 1; assert!(run(span.clone(), wrong).is_err());
+        let mut wrong = tokens; wrong[1] = 1; assert!(run(span, wrong).is_err());
+        let mut job = request(vec![image()]);
+        job.probe = Some(Probe::new(ProbeSpec { prompt_ids: Some(vec![4, 5, 6]), ..Default::default() }));
+        assert!(prepare(job, vec![4, 5, 6], &config(), 32, 2, 16).is_err());
     }
     #[test]
     fn text_path_keeps_native_ids_and_rejects_missing_image_rows() {

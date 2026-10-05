@@ -27,6 +27,9 @@ pub struct ProbeSpec {
     /// Token ids to run instead of tokenizing the rendered prompt.
     #[serde(default)]
     pub prompt_ids: Option<Vec<u32>>,
+    /// Already-expanded native image spans, verified against prepared sources by the engine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<ProbeMedia>,
     /// Teacher-forced scoring: run the prompt and record the logits row
     /// predicting every prompt token from this index on; the request then
     /// ends without generating.
@@ -46,6 +49,66 @@ pub struct ProbeSpec {
     /// (a reference's top-k, so KL can be estimated against it).
     #[serde(default)]
     pub want: HashMap<usize, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeFixture {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeImageUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeMedia {
+    pub start: usize,
+    pub len: usize,
+    pub kind: String,
+    pub key: String,
+    pub grid: [u32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<ProbeFixture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<ProbeImageUrl>,
+}
+
+pub fn sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+impl ProbeSpec {
+    pub fn validate_media(&self) -> anyhow::Result<()> {
+        if self.media.is_empty() { return Ok(()); }
+        let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
+        anyhow::ensure!(self.media.len() <= 128, "probe media exceeds history limit");
+        let mut previous = 0;
+        for span in &self.media {
+            let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe media extent overflow"))?;
+            let [t, h, w] = span.grid;
+            anyhow::ensure!(span.kind == "image" && span.len > 0 && span.start >= previous && end <= tokens.len(),
+                "probe media spans must be sorted, disjoint and inside prompt_ids");
+            anyhow::ensure!(sha256_hex(&span.key) && t == 1 && h > 0 && w > 0 && h % 2 == 0 && w % 2 == 0
+                && u64::from(h) * u64::from(w) / 4 == span.len as u64, "invalid probe media identity/grid");
+            let source = span.image_url.as_ref().ok_or_else(|| anyhow::anyhow!("probe media image_url required"))?;
+            anyhow::ensure!(!source.url.is_empty() && source.detail.as_deref().is_none_or(|v| matches!(v, "auto" | "high" | "low")),
+                "invalid probe image source/detail");
+            if let Some(fixture) = &span.fixture {
+                anyhow::ensure!(sha256_hex(&fixture.sha256) && !fixture.path.is_empty() && !fixture.path.contains('\\')
+                    && !std::path::Path::new(&fixture.path).is_absolute()
+                    && fixture.path.split('/').all(|v| !v.is_empty() && v != "." && v != ".."), "invalid probe fixture identity");
+            }
+            previous = end;
+        }
+        Ok(())
+    }
 }
 
 /// One recorded logits row (log-softmax over the full vocabulary).
@@ -70,6 +133,10 @@ pub struct ProbeRecord {
     /// Whether an engine honoured the probe at all.
     pub engine: Option<String>,
     pub prompt_ids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<ProbeMedia>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
     pub cached_tokens: usize,
     pub rows: Vec<ProbeRow>,
     pub generated: Vec<u32>,
@@ -108,6 +175,16 @@ impl Probe {
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
+    }
+
+    /// Echo verified descriptors only, never the image's data URL.
+    pub fn media(&self, mut media: Vec<ProbeMedia>) {
+        for span in &mut media { span.image_url = None; }
+        self.with(|r| r.media = media);
+    }
+
+    pub fn provenance(&self, value: serde_json::Value) {
+        self.with(|r| r.provenance = Some(value));
     }
 
     /// Records one host logits row predicting token `position`.

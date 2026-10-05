@@ -207,6 +207,11 @@ impl MediaPreparer {
         })
     }
     pub fn prepare(&self, sources: &[MediaSource]) -> Result<PreparedMedia> {
+        self.prepare_verified(sources, &[])
+    }
+    /// Probe fixture identities bind the same fetched bytes used for preprocessing.
+    pub fn prepare_verified(&self, sources: &[MediaSource], hashes: &[Option<String>]) -> Result<PreparedMedia> {
+        ensure!(hashes.is_empty() || hashes.len() == sources.len(), "fixture count differs from image sources");
         ensure!(
             sources.len() <= self.limits.images,
             "at most {} images are supported including history",
@@ -220,13 +225,17 @@ impl MediaPreparer {
             image_tokens: 0,
         };
         let mut decoded_bytes = 0usize;
-        for source in sources {
+        for (index, source) in sources.iter().enumerate() {
             ensure!(
                 Instant::now() < deadline,
                 "image preparation deadline exceeded"
             );
             let bytes = self.source_bytes(&source.url, deadline)?;
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            if let Some(Some(expected)) = hashes.get(index) {
+                ensure!(super::probe::sha256_hex(expected) && format!("{:x}", Sha256::digest(&bytes)) == *expected,
+                    "probe fixture source hash differs");
+            }
             let config = self.config.with_detail(source.low);
             let processor = config.id();
             let cached = {
