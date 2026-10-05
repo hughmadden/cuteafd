@@ -344,6 +344,28 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
     records = fixture_manifest.get("fixtures", [])
     if fixture_manifest.get("schema") != "cuteafd.media.fixtures/1" or len(records) != 8:
         raise ValueError("vision bucket needs eight pinned first-party fixtures")
+    coding_tasks = {
+        "code": "Transcribe every visible line of code, preserving indentation. Explain each visible "
+            "function, input, branch and invariant line by line. Then write a standalone Python "
+            "test module with at least eight distinct test cases covering the visible behavior. "
+            "Explain each test's purpose and expected result. Mark cropped or unreadable text "
+            "as unknown rather than inventing the missing source.",
+        "terminal": "Transcribe every visible terminal line exactly. Explain each command and "
+            "reported count or exit status. Then write a standalone Python parser for this "
+            "transcript and a unittest module with at least eight distinct cases, including "
+            "successful runs, failures, malformed lines and contradictory counts. Explain the "
+            "expected result of every test; label invented test inputs as synthetic.",
+        "chart": "Describe every visible chart element and transcribe all labels and numeric "
+            "values. Compute the total and compare the batches. Then write a complete Python "
+            "matplotlib program reproducing the visible chart, with comments explaining the "
+            "layout and data. Add at least eight unittest cases validating the transcribed "
+            "data and calculations, and explain each expected result. Do not invent hidden values.",
+        "diagram": "Transcribe every visible node label and describe every arrow in order. "
+            "Then write a complete Python program reproducing the diagram and a validator for "
+            "the represented pipeline. Add at least eight unittest cases for stage order, "
+            "connectivity, missing stages and cycles, explaining each expected result. Label "
+            "hypothetical invalid pipelines as synthetic; do not infer unseen stages.",
+    }
     windows, servers = [], []
     for item in records:
         fixture = {"path": item["path"], "sha256": item["sha256"]}
@@ -351,8 +373,10 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
         body = {"model": model, "messages": [{"role": "system", "content": "Inspect the image carefully. Explain only what is visible."},
             {"role": "user", "content": [{"type": "image_url", "image_url": {
                 "url": "data:image/png;base64," + base64.b64encode(data).decode(), "detail": "auto"}},
-                {"type": "text", "text": item["question"]}]}],
-            "max_tokens": 1024, "temperature": 0, "seed": 0, "reasoning_effort": "high", "stream": False}
+                {"type": "text", "text": item["question"] + "\n\n" + coding_tasks[item["kind"]]
+                    + "\nGive a detailed answer of at least 800 words, including complete code "
+                    "and tests rather than placeholders. Separate observed facts from proposed code."}]}],
+            "max_tokens": 2048, "temperature": 0, "seed": 0, "reasoning_effort": "high", "stream": False}
         chat = probe(body)
         record, server = chat["probe"], chat.get("server", {})
         if server.get("model") != checkpoint or server.get("family") != family:
@@ -363,7 +387,7 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
         span = {k: spans[0][k] for k in ("start", "len", "kind", "key", "grid")}
         span["fixture"] = fixture
         prompt, generated = record["prompt_ids"], record["generated"]
-        if not 576 <= len(generated) <= 1024:
+        if not 576 <= len(generated) <= body["max_tokens"]:
             raise ValueError("vision golden needs at least 576 real generated tokens for prefix qualification")
         tokens, roles = prompt + generated, ["ctx"] * len(prompt) + ["gen"] * len(generated)
         start = len(tokens) - 512
