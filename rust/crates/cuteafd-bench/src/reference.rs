@@ -245,7 +245,8 @@ pub fn media_probe_payload(window: &Window, model: &serde_json::Value, root: &st
             "fixture hash differs from media window");
         anyhow::ensure!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "media fixtures must be PNG");
         Ok(serde_json::json!({"start":media.start,"len":media.len,"kind":media.kind,
-            "key":media.key,"grid":media.grid,"image_url":{"url":format!("data:image/png;base64,{}",
+            "key":media.key,"grid":media.grid,"fixture":media.fixture,
+            "image_url":{"url":format!("data:image/png;base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(bytes))}}))
     }).collect()
 }
@@ -417,6 +418,8 @@ mod tests {
         let model = serde_json::json!({"capabilities":{"vision":true}});
         let wire = media_probe_payload(&w, &model, root.path()).unwrap();
         assert_eq!(wire[0]["key"], "a".repeat(64));
+        assert_eq!(wire[0]["fixture"], serde_json::json!({"path":"code.png",
+            "sha256":format!("{:x}",Sha256::digest(bytes))}));
         assert!(wire[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
         std::fs::write(root.path().join("code.png"), b"changed").unwrap();
         assert!(media_probe_payload(&w, &model, root.path()).is_err());
