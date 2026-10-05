@@ -112,6 +112,45 @@ def test_dataset_finalizer_refuses_unqualified_evidence_before_copy(tmp_path):
     assert not out.exists()
 
 
+@pytest.mark.parametrize("intro,calibration,privacy", [
+    ("This is a numerical-fidelity panel, still a draft.",
+     "The first checkpoint-precision baseline is pending.",
+     "## Public-source and privacy policy"),
+    ("DRAFT: not qualified for upload or precision decisions.",
+     "## Pending Calibration\n\nRepeated baselines are pending.",
+     "## Provenance And Privacy"),
+])
+def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro, calibration, privacy):
+    # Exercise only card formatting; synthetic metrics never qualify a dataset.
+    original = ("# Family Fidelity Draft\n\n" + intro + "\n\n## Configuration\n\n"
+                "Pinned checkpoint and tokenizer.\n\n" + calibration + "\n\n" + privacy +
+                "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n")
+    (tmp_path / "README.md").write_text(original)
+    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
+    start = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "readme" for t in node.targets))
+    end = next(i for i in range(start, len(tree.body))
+               if isinstance(tree.body[i], ast.Expr) and isinstance(tree.body[i].value, ast.Call)
+               and isinstance(tree.body[i].value.func, ast.Attribute)
+               and tree.body[i].value.func.attr == "write_text"
+               and any(isinstance(a, ast.Name) and a.id == "readme" for a in tree.body[i].value.args))
+    report = {"shapes": {"decode": {"positions": 123}},
+              "baseline_metrics": {shape: [{"top1": .95, "kl": .02}] * 2
+                                   for shape in ("decode", "prefill")},
+              "family_expect": {"top1_min": .93, "kl_max": .04,
+                                "tripwires": {"confident_top1_min": .95, "top3_min": .97}},
+              "daemon_identity": "fixture daemon", "coordinator_sha256": "0" * 64}
+    namespace = {"SOURCE": tmp_path, "report": report}
+    exec(compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "card-format", "exec"), namespace)
+    card = namespace["readme"]
+    assert "Family Fidelity Reference" in card and "qualified numerical-fidelity reference" in card
+    assert "DRAFT:" not in card and "Pending Calibration" not in card and "baseline is pending" not in card
+    assert "primary count is 123" in card and "| prefill | 1 | 95.0000% | 0.02000000 |" in card
+    assert "no publication revision is claimed" in card and "No precision-default verdict" in card
+    assert "Pinned checkpoint and tokenizer." in card
+    assert card[card.index(privacy):] == original[original.index(privacy):]
+
+
 def test_measured_dataset_validator_self_tests():
     subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
                     "--self-test"], check=True, timeout=60)
