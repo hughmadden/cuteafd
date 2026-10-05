@@ -11,6 +11,12 @@ pub(crate) struct Cli {
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]
     pub(crate) audio: Option<cuteafd_loader::plan::MediaMode>,
+    /// Generic-family per-image LM token cap (detail=low also caps at 256).
+    #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=16384))]
+    pub(crate) max_image_tokens: Option<u32>,
+    /// Remote image URL policy; inline data URLs work in every mode.
+    #[arg(long, global = true)]
+    pub(crate) image_url_fetch: Option<cuteafd_api::openai::media::ImageUrlFetch>,
     /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true)]
