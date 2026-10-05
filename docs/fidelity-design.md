@@ -325,15 +325,27 @@ subject to the independent absolute gates and reference qualification.
 | engine probe (`cuteafd-api::probe`, `cuteafd-daemon::shared::probe`) | rows carry top-k + wanted ids | add `dump_rows: Option<PathBuf>` (f32 or f16 log-softmax rows to a safetensors file, streamed per step, for full-vocab KL); add `verify_rows` override for speculation-width scoring; phase 2: `prefill_rows_logits: bool` returning every row's logits from prefill chunks (the LM head on all rows of the chunk, as Hugh's `score_each`) |
 | `references/*.json` (7 families) | 512-position PLAN.md | regenerated as schema 2 with the legacy passage as window 0; the old thresholds (`kl_max 0.15`, `top1_min 0.80`) become per-window sanity bounds, the new floors live in `expect` |
 | `release-smoke` | quick quality = this check | unchanged shape; the quick tier is what runs |
-| Hugh's teacher | second reference "where available" (PLAN) | a `cuteafd bench fidelity external --teacher DIR` path for GLM Flash only; absolute figures, no pairing with our set |
+| External teacher | not used | no external dataset; references generated from official checkpoints only (§11.7) |
 
 The legacy converter remains byte-compatible for identical input logits
-(same tokens, positions, top-12 subset of top-32). Reference regeneration is
-separate: the old V4.1 JSON scores a 576-token prefix of a 640-token run, so
-its shape-sensitive arithmetic cannot define a prefix-invariant golden.
-Keep it unchanged for the old schema-1 path; publish schema-2 replacements
-only after the new prefix gate and qualified baseline calibration, rather
-than asserting old-versus-new golden bit identity.
+(same tokens, positions, top-12 subset of top-32): converting the old raw
+640-token golden reproduces the shipped JSON. This proves the converter,
+not the old reference arithmetic. The old V4.1 JSON scores a 576-token
+prefix of a 640-token run; evaluating those same tokens at length 576
+changes 39/512 argmax rows, and the qualified fixed-M128 legacy differs
+from the shipped JSON at 48/512 rows. The old reference is arithmetically
+unqualified. Requiring a shape-invariant golden to reproduce it byte for
+byte would preserve the defect, so that regeneration-equality gate is
+retired, without relaxing the absolute floors or paired decision rule.
+
+Replacement reference gates are: (1) the actual finite, bit-exact
+common-prefix proof bound to the family, snapshot and set; (2) conversion
+of the old raw logits reproduces the old JSON, retaining converter
+compatibility; and (3) a newly generated qualified legacy window is
+published as window 0 of schema 2. Publish schema-2 replacements only
+after qualified baseline calibration. Regenerate the old schema-1 V4.1
+JSON from qualified logits when the bench switches over; retain the old
+raw evidence for diagnosis, not as a certification target.
 
 ## 10. Implementation plan (brief for a Codex agent)
 
@@ -360,8 +372,11 @@ hardware runs, small commits, tables in commit messages).
    logits for V4.1 Flash first (TJ's anchor; the V4.1 FP8-head decision is
    pending), then MiMo V2.6 Pro, MiMo V2.6 Flash MOPD, Qwen (GLM Flash is
    Hugh Madden's now); `make-fidelity-reference.py` schema 2 and the
-   sparknest manifest. Gate: the legacy window's compact reference equals
-   today's file bit for bit (same top-12 ids and log-probs to 5 decimals).
+   sparknest manifest. Reference gates: finite bit-exact common-prefix
+   qualification; old raw logits still reproduce the shipped legacy JSON
+   (converter compatibility); regenerate and publish the qualified legacy
+   window in schema 2. Old-versus-new golden equality is retired for the
+   arithmetic reason and measured evidence in §9.
 4. **Engine probe.** `dump_rows`, `verify_rows` override; family `serve.rs`
    call sites pass them through (`deepseek_v4`, `glm5`, `glm5_flash`,
    `mimo_v2`, `qwen4`). Gate: loopback test writes rows whose top-k equals
