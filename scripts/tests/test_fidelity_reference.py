@@ -80,6 +80,22 @@ def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
         validate_public_text(text, scored_text=True)
 
 
+def test_dataset_finalizer_refuses_unqualified_evidence_before_copy(tmp_path):
+    validation = tmp_path / "validation"
+    validation.mkdir()
+    (validation / "report.json").write_text(json.dumps({"qualifies": False, "repeatability_pass": False}))
+    out = tmp_path / "qualified"
+    command = [sys.executable, str(ROOT / "scripts/bench/finalize-fidelity-dataset.py")]
+    for name, path in {"source": tmp_path / "source", "out": out, "validation": validation,
+                       "arms": tmp_path / "arms", "tokenizer": tmp_path / "tokenizer.json"}.items():
+        command += ["--" + name, str(path)]
+    command += ["--config", "fixture", "--comparison-policy-commit", "0" * 40,
+                "--validator-source-commit", "0" * 40]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0 and "Measured qualification" in result.stderr
+    assert not out.exists()
+
+
 def test_measured_dataset_validator_self_tests():
     subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
                     "--self-test"], check=True, timeout=60)
