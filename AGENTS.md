@@ -257,10 +257,16 @@ facts recorded somewhere for agents working on it.
 - Every host mounts sparknest at `/mnt/sparknest`; `HF_HOME` is
   `/mnt/sparknest/hf-home`. Sealed local copies read at NVMe speed; files
   without a local copy stream over RoCE at ~5 GB/s. Reads never replicate.
+- Don't replicate for loading: serving and golden references stream
+  checkpoint shards from wherever sparknest holds them (one copy spread
+  across hosts is enough; ~5 GB/s over RoCE, slower readiness is
+  acceptable). The exception is a model's Engram tables (V4.1): they are
+  read at random every token, so keep them local on the coordinator
+  (sparknest rules `v41-engram-*` pin them to raptor). Watch readiness
+  loosely for traffic changes rather than replicating to speed it up.
 - `nest where hf:ORG/MODEL` shows copies; `nest replicate SEL --hosts
-  @sparks --wait` places them; `nest evict` removes (never the last copy);
-  `nest plan --free` when space is tight. Replicate a model to every rank
-  while working on it, then shrink to one copy or 1/N. Manage space.
+  ... --wait` places them; `nest evict` removes (never the last copy);
+  `nest plan --free` when space is tight. Manage space.
 - Each host's `~/.cache/huggingface/hub` is a symlink into `/mnt/sparknest`;
   containers must mount the resolved hub (`run.sh` does) or `/mnt/sparknest`.
 - `/mnt/scratch` and `/mnt/models` are slow archive stores (150 MB/s
