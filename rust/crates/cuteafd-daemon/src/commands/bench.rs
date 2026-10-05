@@ -18,6 +18,8 @@ pub(crate) struct BenchArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum BenchAction {
+    /// Multi-window fidelity probes and paired non-inferiority gates.
+    Fidelity(cuteafd_bench::fidelity_cli::Args),
     /// Rebuild the root README's results table and benchmarks/README.md from
     /// the reports under benchmarks/<family>/<date>-<profile>-<hardware>/.
     Publish(PublishArgs),
@@ -84,6 +86,13 @@ pub(crate) struct PublishArgs {
 
 pub(crate) fn run(args: BenchArgs) -> Result<()> {
     match args.action {
+        Some(BenchAction::Fidelity(args)) => {
+            match cuteafd_bench::fidelity_cli::execute(args) {
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(3),
+                Err(error) => { eprintln!("fidelity: {error:#}"); std::process::exit(1); }
+            }
+        }
         Some(BenchAction::Publish(publish)) => {
             let (readme, index, count) = cuteafd_bench::publish::publish(&publish.root, &publish.dirs)?;
             eprintln!("{count} reports: updated {} and {}", readme.display(), index.display());

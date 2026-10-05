@@ -222,6 +222,39 @@ impl Bench {
         }
     }
 
+    /// One remote probe is registered inside the serving process, where the registry lives.
+    /// It holds the same exclusive inference slot as a benchmark, including on errors.
+    pub fn probe(self: &Arc<Self>, body: Value, spec: cuteafd_api::openai::probe::ProbeSpec) -> anyhow::Result<Value> {
+        anyhow::ensure!(body.is_object(), "probe body must be a chat object");
+        let base = crate::context::loopback().ok_or(StartError::NotReady)?;
+        let active = ActiveRun { id: uuid::Uuid::new_v4().simple().to_string(),
+            token: uuid::Uuid::new_v4().simple().to_string(), cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(), eta_s: 900.0, panel: "fidelity probe".into(), fraction: 0.0 };
+        {
+            let mut slot = self.active.lock().map_err(|_| anyhow::anyhow!("active lock poisoned"))?;
+            if let Some(current) = slot.as_ref() { return Err(StartError::Busy(current.id.clone()).into()); }
+            *slot = Some(active.clone());
+        }
+        struct Release(Arc<Bench>, String);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Ok(mut slot) = self.0.active.lock() {
+                    if slot.as_ref().is_some_and(|a| a.id == self.1) { *slot = None; }
+                }
+            }
+        }
+        let _release = Release(self.clone(), active.id.clone());
+        let mut client = Client::new(&base, Some(active.token), active.cancel);
+        client.discover()?;
+        let model = client.model.clone();
+        let chat = client.chat(body, Some(spec))?;
+        let mut value = serde_json::to_value(chat)?;
+        let context = crate::context::get();
+        value["server"] = json!({"model": model, "family": context.family,
+            "snapshot": context.snapshot, "settings": context.settings, "build": crate::server::build_info()});
+        Ok(value)
+    }
+
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;

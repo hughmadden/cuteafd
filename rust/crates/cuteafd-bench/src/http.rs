@@ -158,6 +158,27 @@ async fn start(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<Sock
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ProbeRequest {
+    body: serde_json::Value,
+    spec: cuteafd_api::openai::probe::ProbeSpec,
+}
+
+async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
+    Json(request): Json<ProbeRequest>) -> Response {
+    if !authorized(&bench, peer(connect), &headers) { return forbidden(); }
+    match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
+        Ok(Ok(chat)) => Json(chat).into_response(),
+        Ok(Err(error)) => {
+            let status = if error.downcast_ref::<StartError>().is_some_and(|e| matches!(e, StartError::Busy(_))) {
+                StatusCode::CONFLICT
+            } else { StatusCode::BAD_REQUEST };
+            (status, Json(json!({"error": {"message": format!("{error:#}")}}))).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn cancel(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
     Path(id): Path<String>) -> Response {
     if !authorized(&bench, peer(connect), &headers) {
@@ -270,6 +291,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/bench", get(page))
         .route("/bench/banner.js", get(banner))
         .route("/v1/bench/status", get(status))
+        .route("/v1/bench/probe", post(probe_request))
         .route("/v1/bench/panels", get(panels))
         .route("/v1/bench/profiles", get(profiles))
         .route("/v1/bench/profiles/:name", put(save_profile).delete(delete_profile))

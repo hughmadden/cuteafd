@@ -193,25 +193,37 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("no fidelity reference for {}", run.info.model);
         return Ok(());
     };
-    let n = reference.ids.len();
-    let tokens = reference.tokens[..reference.score_from + n].to_vec();
-    if tokens.len() as u64 + 8 > run.max_context {
+    let started = Instant::now();
+    let windows = reference.selected_windows(false)?;
+    let mut records = Vec::new();
+    let mut missing = 0;
+    let mut probes = Vec::new();
+    // Validate the whole quick set before spending time on an unsupported context.
+    if let Some(window) = windows.iter().find(|w| w.tokens.len() as u64 + 8 > run.max_context) {
         check.status = CheckStatus::Skipped;
-        check.summary = format!("the reference needs {} tokens of context", tokens.len());
+        check.summary = format!("reference window {} needs {} context tokens", window.id, window.tokens.len());
         return Ok(());
     }
-    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: reference.top_k,
-        want: reference.want(), cold: true, ..ProbeSpec::default() };
-    let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
-    let record = probe_of(&chat)?;
-    if !honoured(record) {
-        unsupported(check);
-        return Ok(());
+    for window in &windows {
+        let end = window.positions.last().context("empty reference window")?.pos + 1;
+        let spec = ProbeSpec { prompt_ids: Some(window.tokens[..end].to_vec()), score_from: Some(window.score_from),
+            top_k: window.top_k, want: window.want(), cold: true, no_speculation: true, ..ProbeSpec::default() };
+        let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
+        let record = probe_of(&chat)?;
+        if !honoured(record) { unsupported(check); return Ok(()); }
+        if let Some(error) = &record.error { anyhow::bail!("scoring {}: {error}", window.id); }
+        anyhow::ensure!(record.cold && record.no_speculation && record.cached_tokens == 0,
+            "fidelity requires honored cold, drafts-off scoring");
+        let f = window.score(&record.rows);
+        missing += f.missing;
+        records.extend(f.records);
+        probes.push(serde_json::json!({"window": window.id, "probe": record}));
     }
-    if let Some(error) = &record.error {
-        anyhow::bail!("scoring: {error}");
-    }
-    let f = reference.score(&record.rows);
+    let all = crate::reference::Fidelity::from_records(records);
+    let mut f = if reference.windows.is_empty() { all.clone() } else {
+        crate::reference::Fidelity::from_records(all.records.iter().filter(|p| p.role == "gen").cloned().collect())
+    };
+    f.missing = missing;
     check.set("kl", f.kl);
     check.set("top1", f.top1);
     check.set("nll", f.nll);
@@ -221,14 +233,25 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("kl_max", reference.expect.kl_max);
     check.set("top1_min", reference.expect.top1_min);
     check.set("reference", reference.name.clone());
-    // Preserve the teacher-forced rows so two weight policies can be compared
-    // on the same positions, including top-1 flips hidden by aggregate scores.
-    check.set("probe", serde_json::to_value(record)?);
-    let ok = f.missing == 0 && f.non_finite == 0 && f.kl <= reference.expect.kl_max
-        && f.top1 >= reference.expect.top1_min;
+    check.set("seconds", started.elapsed().as_secs_f64());
+    check.set("confident_top1", serde_json::to_value(f.confident_top1)?);
+    check.set("top3_contained", f.top3_contained);
+    check.set("agree_text", f.agree_text);
+    check.set("per_window", serde_json::to_value(all.groups("window"))?);
+    check.set("per_block", serde_json::to_value(all.groups("block"))?);
+    check.set("per_role", serde_json::to_value(all.groups("role"))?);
+    check.set("per_bucket", serde_json::to_value(all.groups("bucket"))?);
+    // Keep schema-1 output compatible; schema-2 pairs retain all selected positions.
+    if reference.windows.is_empty() { check.set("probe", probes[0]["probe"].clone()); }
+    else { check.set("probes", serde_json::json!(probes)); }
+    let window_floor = reference.windows.is_empty() || f.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80);
+    let gross_tripwire = !reference.windows.is_empty() &&
+        (f.confident_top1.is_some_and(|v| v < 0.95) || f.top3_contained < 0.95);
+    let ok = f.positions > 0 && f.missing == 0 && all.non_finite == 0 && f.kl <= reference.expect.kl_max
+        && f.top1 + 1e-12 >= reference.expect.top1_min && window_floor && !gross_tripwire;
     check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
-    check.summary = format!("KL {:.3} · top-1 {:.1}% · NLL {:.3} vs {:.3} · {} tokens vs {} reference{}",
-        f.kl, 100.0 * f.top1, f.nll, f.ref_nll, f.positions, reference.name,
+    check.summary = format!("KL {:.3} · top-1 {:.1}% · NLL {:.3} vs {:.3} · {} tokens / {} windows{}",
+        f.kl, 100.0 * f.top1, f.nll, f.ref_nll, f.positions, windows.len(),
         if f.missing > 0 { format!(" · {} rows missing", f.missing) } else { String::new() });
     Ok(())
 }
