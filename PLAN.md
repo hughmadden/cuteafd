@@ -676,9 +676,10 @@ The full Release smoke matrix (family × quant × natural-minimum and maximum
 hardware) published as the README card grid is the v0 artifact. Images stay
 local until TJ says to push them. No model license notes: we bundle no weights.
 
-## Next release scope (decided 2026-10-05)
+## Release v2 scope (decided 2026-10-05)
 
-TJ's decisions, recorded with Hugh Madden's 5090 feature requests
+The next release is v2.0.0 (TJ: multimodal and the 5090 platform make it
+major). TJ's decisions, recorded with Hugh Madden's 5090 feature requests
 ([#1](https://github.com/tpurtell/cuteafd/issues/1) GLM 5.3 Flash,
 [#2](https://github.com/tpurtell/cuteafd/issues/2) V4.1,
 [#3](https://github.com/tpurtell/cuteafd/issues/3) MiMo V2.6 Flash; replies
