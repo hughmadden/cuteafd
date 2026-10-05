@@ -21,6 +21,8 @@ def load_script(name):
 
 
 def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
+    pytest.importorskip("PIL")
+    pytest.importorskip("matplotlib")
     import json
     generator = load_script("generate-media-fixtures")
     one = generator.generate(tmp_path / "one")

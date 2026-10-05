@@ -128,7 +128,7 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
+  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib);
   no failing ids since the codex/v1 merge (808 pass); add none.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
