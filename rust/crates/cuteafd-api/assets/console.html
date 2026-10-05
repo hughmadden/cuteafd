@@ -171,6 +171,7 @@ function onSnapshot(m) {
   S.offsets = []; clock(m.now);
   S.config = m.config || {}; S.textAllowed = !!m.text;
   $('#v-text').disabled = !S.textAllowed;
+  $('#v-text').textContent = S.textAllowed ? 'TEXT' : 'TEXT (off)';
   $('#v-text').title = S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
   if (!S.textAllowed && S.mode === 'text') setMode('time');
   const live = new Set();
