@@ -676,6 +676,83 @@ The full Release smoke matrix (family × quant × natural-minimum and maximum
 hardware) published as the README card grid is the v0 artifact. Images stay
 local until TJ says to push them. No model license notes: we bundle no weights.
 
+## Next release scope (decided 2026-10-05)
+
+TJ's decisions, recorded with Hugh Madden's 5090 feature requests
+([#1](https://github.com/tpurtell/cuteafd/issues/1) GLM 5.3 Flash,
+[#2](https://github.com/tpurtell/cuteafd/issues/2) V4.1,
+[#3](https://github.com/tpurtell/cuteafd/issues/3) MiMo V2.6 Flash; replies
+posted). Hugh donated his code: port it directly from ds41rt-rtx5090
+v2.1.0, glm53f-afd v1.1.0 and mimo26f-afd v1.3.0, crediting repo, tag and
+file in the commit. Our gates and policies still decide, and we don't
+benchmark against his engines. Agent branches are listed with each item.
+
+Policy decisions:
+- **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must keep golden
+  top-1 within ~0.5 point of the checkpoint-precision arm (GLM Flash ~89%
+  is the floor TJ accepts) and KL within 0.005 nat of it. Hugh's BF16
+  teacher (`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits`) is a second
+  reference where available.
+- **Exact speculation:** attempt byte-exact greedy speculation (drafts
+  on/off, C1→C4) per family when it doesn't cost C1. Where it does, keep the
+  faster path and accept proven rounding.
+- **Context and KV:** the planner's default admits at least one request at
+  the model's full context. The default KV target is 2M tokens on an RTX
+  PRO 6000 and 1M on a 5090 (launch flag); the planner adapts expert-layer
+  onboarding and cold-component placement to meet it, and reports any
+  shortfall.
+- **Multimodal** is in scope for every model: official bundled encoders
+  only, planner-placed (the tower can live on a Spark, likely by default,
+  since it's rarely used), and an image-embedding cache tied into the
+  prefix cache, so long sessions carry many images without re-encoding.
+- **MiMo Flash** moves to `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` (same geometry
+  as Hugh's V2.6 Flash RL).
+- **Sampling:** keyed Gumbel-max draws with coupled drafts (#3 FR-M.11) go
+  in if they are at least as fast; seeded output then repeats across
+  batches, caches and draft settings.
+- **Thinking off** maps to the template's Low effort as a setting (GLM
+  default Low); `"minimal"` never reaches the template as Max.
+
+Work, in priority order:
+1. **In flight (wave 1):** Qwen 32 GB + 1 Spark minimum with a generic
+   coordinator memory budget (`work/qwen-min-5090`); V4.1 Spark load speed —
+   the serial WILLNEED prefetch cost ~94% of each Spark layer's load
+   (`work/v41-spark-load`); V4.1 NVFP4 W4A4 wide-row efficiency (FP4 at 3–5%
+   of peak at 2048/4096 rows; Spark decode already at 70–75% of GB10
+   bandwidth; `work/v41-nvfp4-w4a4`); GLM Flash split FP8 root cause and
+   per-layout precision under the bar (`work/glmf-split-fp8`); Hugh's V4.1
+   patches 0001–0003 plus the ~1M self-eviction fix (`work/hugh-v41-ports`);
+   MiMo V2.6 Flash MOPD bring-up (`work/mimo-flash-mopd`).
+2. **One SM120 image for the PRO 6000 and the 5090 (PLAT-1, #2 FR-D.1/2):**
+   remove the 188-SM guards and size grids from `cudaDevAttr`; sparse-MLA
+   blocks in whole waves (#1 FR-G.10); interim: images carry
+   `physical_sms` and `run.sh` refuses a mismatch.
+3. **Full-context planner default + 32 GB plans (PLAT-2):** per-family
+   profiles (V4.1 capacity 1024 / 256 on 32 GB, #2 FR-D.3; GLM Flash
+   #1 FR-G.4; MiMo #3 FR-M.5), cold components to host RAM or a Spark,
+   1M program extents (#1 FR-G.1).
+4. **Multimodal for every family** with planner placement and the
+   embedding cache (#3 FR-M.12 for MiMo).
+5. **Platform robustness:** GeForce defaults (probed pinned intake, no
+   P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
+   balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
+   without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
+   API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
+   returned as content (#1 FR-G.14).
+6. **GLM Flash:** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
+   four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
+   and row-independent kernels for exact speculation (FR-G.2, G.6), the GB10
+   EXL3 decode schedule (FR-G.7) — port from glm53f-afd.
+7. **MiMo:** decode expert rows and the 16-stream scheduler (#3 FR-M.7/8),
+   copy windows (FR-M.10), the RAM snapshot tier (FR-M.9) — port from
+   mimo26f-afd.
+8. **V4.1 carry-overs:** cold-prefill graph reuse in the plan (#2 FR-D.8,
+   item 4m), Engram counters / shard dir / table warm (FR-D.10), preflight,
+   plan-only boot and ready probe (FR-D.11), whole-step graphs and
+   device-side draft acceptance, W4A4 decode rows, deterministic prefill.
+9. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+   Spark-side reduce, split intake.
+
 ## Release v1 scope (decided 2026-10-04)
 
 v1 ships when these are done; everything else below moves to v1.x/v2.
