@@ -125,7 +125,7 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
-    /// Generic constructor for the validated physical rank counts 2, 3, 4 and 6.
+    /// Generic constructor for the validated physical rank counts 1, 2, 3, 4 and 6.
     ///
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size; paired EXL3 keeps its four-rank requirement.
@@ -135,8 +135,8 @@ impl V41Tp4ChunkReceiver {
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(executors.len(), 2 | 3 | 4 | 6),
-            "native TP/EP requires two, three, four or six executors"
+            matches!(executors.len(), 1 | 2 | 3 | 4 | 6),
+            "native TP/EP requires one, two, three, four or six executors"
         );
         if request.is_paired() {
             ensure!(executors.len() == 4, "paired EXL3 requires four ranks");

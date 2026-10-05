@@ -780,15 +780,15 @@ fn spark_rank_options_follow_transport_and_packages() {
         t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
     for ranks in 0..=8 {
         let options = sparks(ranks);
-        if !matches!(ranks, 0 | 2 | 3 | 4 | 6) {
+        if !matches!(ranks, 0 | 1 | 2 | 3 | 4 | 6) {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
         }
-        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 2/3/4; V4.1: Sparks 2/3/4/6 only.
-        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, ranks != 3, "mimo {ranks}");
+        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
+        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, !matches!(ranks, 1 | 3), "mimo {ranks}");
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, ranks != 6, "qwen {ranks}");
-        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, ranks != 0, "v41 {ranks}");
+        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, !matches!(ranks, 0 | 1), "v41 {ranks}");
     }
 }
 

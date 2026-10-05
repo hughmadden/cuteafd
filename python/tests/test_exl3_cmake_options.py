@@ -128,6 +128,25 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 self.assertEqual(requests, [layouts, layouts], 'one request per tier family')
                 self.assertNotIn('--require-layout tp4-rank0 tp4-rank1', rules)
 
+    def test_qwen_tp1_layout_is_required_and_stamped_on_sparks_only(self):
+        for architecture, layouts in (
+            ('121', DISJOINT_SPARK_LAYOUTS + ['tp1-rank0']),
+            ('120', ['rtx-tp1']),
+        ):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / 'CMakeLists.txt').write_text(harness(architecture))
+                result = self.cmake(root, root / 'build', ['-DCUTEAFD_EXPERT_FAMILIES=qwen4:exl3-k45'])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rules = (root / 'build/build.ninja').read_text()
+                self.assertIn('--geometry qwen4', rules)
+                self.assertIn('--require-layout ' + ','.join(layouts), rules)
+                stamp = (root / 'build/exl3_qwen4_k45_config.stamp').read_text()
+                self.assertIn('layouts=' + ','.join(layouts), stamp)
+                self.assertIn('exl3-qwen4-k45/manifest.json', rules)
+                if architecture != '121':
+                    self.assertNotIn('tp1-rank0', stamp)
+
     def test_paired_package_requests_only_tp4(self):
         result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
                                        '-DCUTEAFD_V41_EXL3_BITS=3;4')
