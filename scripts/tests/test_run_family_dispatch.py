@@ -870,7 +870,7 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
 
-@pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"), ("rtx:0", "rtx"), ("off", "off")])
+@pytest.mark.parametrize("mode,kind", [("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
 def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     placement = {"kind": kind}
@@ -878,24 +878,24 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     if kind == "rtx": placement["gpu"] = 0
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
             "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={mode}\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    vision_key = f"VISION={mode}\n" if mode is not None else ""
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"{vision_key}RTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--encoder-listen" in worker) == (kind == "spark")
     assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
-    if kind == "spark":
-        assert "--encoder-plan-hash " + "ab" * 32 in worker
-        assert "--encoder-plan-hash " + "ab" * 32 in launch
-        assert "--encoder-revision abc" in worker
     assert f"--vision {kind}" in launch
-    if mode == "off": assert "cuteafd plan" not in result.stderr
+    if kind == "off": assert "cuteafd plan" not in result.stderr
 
 
-def test_mimo_encoder_plan_rejected_before_restart(tmp_path):
+@pytest.mark.parametrize("mode", ["auto", "spark", "spark:0", "spark:5"])
+def test_mimo_unwired_spark_encoder_rejected_before_restart(tmp_path, mode):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
-    plan = {"placement_supported": False, "fits": True, "encoder": {"kind": {"kind": "off"}}, "hints": ["rank absent"]}
-    result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=spark:5\nSPECULATOR=off\n", encoder_plan=plan, restart=True)
-    assert result.returncode != 0
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={mode}\nSPECULATOR=off\n", restart=True)
+    assert result.returncode == 2
+    assert "Spark encoder placement not yet wired into MiMo serving; use VISION=rtx or off" in result.stderr
+    assert "cuteafd plan" not in result.stderr
     assert "docker rm" not in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+    assert "cuteafd serve-mimo" not in result.stderr

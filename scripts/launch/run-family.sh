@@ -29,7 +29,7 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
-vision="$(get VISION auto)"
+vision="$(get VISION off)"
 audio="$(get AUDIO off)"
 vision_replicas="$(get VISION_REPLICAS 1)"
 [[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
@@ -72,6 +72,11 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
+if [[ "$family" == mimo_v2 ]]; then
+  case "$vision" in
+    auto|spark|spark:*) release_die "Spark encoder placement not yet wired into MiMo serving; use VISION=rtx or off" ;;
+  esac
+fi
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
 # the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
