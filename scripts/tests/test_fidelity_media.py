@@ -20,6 +20,33 @@ def load_script(name):
     return module
 
 
+def test_g6_additive_ui_question_contract(tmp_path, monkeypatch):
+    import json
+    generator = load_script("generate-media-fixtures")
+    source = tmp_path / "source"
+    generator.generate(source)
+    original = {p.name: p.read_bytes() for p in source.iterdir()}
+    g6 = load_script("generate-media-g6")
+    monkeypatch.setattr(g6, "render", lambda html, png, browser: png.write_bytes(b"owned-ui"))
+    monkeypatch.setattr(g6.subprocess, "check_output", lambda *args, **kwargs: "test-browser")
+    one = g6.generate(source, tmp_path / "one", "browser")
+    two = g6.generate(source, tmp_path / "two", "browser")
+    assert one == two
+    assert len(one["fixtures"]) == 9 and len(one["questions"]) == 24
+    assert {q["category"] for q in one["questions"]} == {
+        "ocr", "chart_values", "shapes_colors", "ui_labels"}
+    assert len({q["id"] for q in one["questions"]}) == 24
+    assert {p.name: p.read_bytes() for p in source.iterdir()} == original
+    assert "data:font/ttf;base64," in g6.ui_html("settings")
+    assert "Apply" in g6.ui_html("settings") and "Ready" in g6.ui_html("ide")
+    assert json.loads((tmp_path / "one/g6.json").read_text()) == one
+    with pytest.raises(ValueError, match="must be new"):
+        g6.generate(source, tmp_path / "one", "browser")
+    (source / "code0.png").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="seal differs"):
+        g6.generate(source, tmp_path / "bad", "browser")
+
+
 def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     pytest.importorskip("PIL")
     pytest.importorskip("matplotlib")

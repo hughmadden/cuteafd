@@ -12,6 +12,30 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+def test_capture_retains_http_error_body(tmp_path, monkeypatch):
+    import io
+    import urllib.error
+    from types import SimpleNamespace
+    window = {"id": "vision00", "tokens": [9, 2], "score_from": 1,
+              "media": [{"fixture": {"path": "image.png", "sha256": "a" * 64}}]}
+    panel = {"checkpoint": "model", "quick_windows": ["vision00"], "windows": [window]}
+    monkeypatch.setattr(module, "load_set", lambda *args: panel)
+    monkeypatch.setattr(module, "read_fixture", lambda *args: b"png")
+    def http(url, token, body=None, timeout=240):
+        if body is None:
+            return {"data": [{"id": "model", "capabilities": {"vision": True}}]}
+        raise urllib.error.HTTPError(url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"media guard"}'))
+    monkeypatch.setattr(module, "http", http)
+    args = SimpleNamespace(windows=tmp_path / "windows", out=tmp_path / "out", url="http://localhost",
+        bench_token=None, mode="native", features=None, quick=False, media_root=tmp_path,
+        host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10)
+    with pytest.raises(urllib.error.HTTPError):
+        module.capture(args)
+    saved = json.loads((args.out / "vision00.http-error.json").read_text())
+    assert saved == {"status": 400, "body": '{"error":"media guard"}'}
+    assert not (args.out / "capture.json").exists()
+
+
 def test_window_bootstrap_is_paired_and_deterministic():
     stats, counts = [[.02, .01], [.04, .02]], [10, 20]
     result = module.paired_bounds(stats, counts, 500, 7)
