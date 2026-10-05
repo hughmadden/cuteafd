@@ -192,7 +192,8 @@ pub fn run(args: &RunArgs) -> Result<Run> {
             else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
         dataset: dataset_identity,
         verify_rows: args.verify_rows, engine, settings, seconds: started.elapsed().as_secs_f64(), score,
-        floor_top1: reference.expect.top1_min, floor_kl: reference.expect.kl_max };
+        floor_top1: reference.expect.top1_min, floor_kl: reference.expect.kl_max,
+        tripwire_expect: reference.expect.tripwires.clone() };
     std::fs::write(&args.out, serde_json::to_vec_pretty(&run)?)?;
     Ok(run)
 }

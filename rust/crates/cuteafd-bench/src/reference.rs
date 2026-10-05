@@ -11,6 +11,16 @@ include!(concat!(env!("OUT_DIR"), "/references.rs"));
 pub struct Expect {
     pub kl_max: f64,
     pub top1_min: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripwires: Option<TripwireExpect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TripwireExpect {
+    pub confident_top1_min: f64,
+    pub top3_min: f64,
+    pub confident_drop_margin: f64,
+    pub top3_drop_margin: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,7 +337,7 @@ mod tests {
         let k = 4;
         let mut r = Reference { name: "t".into(), models: vec![], tokenizer_sha256: None, vocab, tokens: tokens.clone(),
             score_from: 1, top_k: k, ids: vec![], lps: vec![], tail_lp: vec![], next_lp: vec![], nll: 0.0,
-            expect: Expect { kl_max: 0.1, top1_min: 0.9 }, schema: None, checkpoint: String::new(),
+            expect: Expect { kl_max: 0.1, top1_min: 0.9, tripwires: None }, schema: None, checkpoint: String::new(),
             set_sha256: String::new(), quick_windows: vec![], windows: vec![] };
         let mut served = Vec::new();
         for p in 1..7 {

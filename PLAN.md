@@ -697,8 +697,10 @@ Policy decisions:
   paired one-sided 95% non-inferiority bounds: top-1 loss <0.005 and KL
   increase <0.005 nat on both full-tier scoring shapes. Use only qualified
   goldens from official checkpoints, no external teacher (§11 of
-  `docs/fidelity-design.md`). Qualified V4.1 calibration sets the common
-  absolute gates to top-1 >=94% / KL <=0.04 nat. Its FP8 vocabulary head
+  `docs/fidelity-design.md`). The cross-family absolute floor stays at
+  top-1 >=90% / KL <=0.06 nat. Each config derives its own `expect` from
+  its repeated baselines; V4.1's calibrated `expect` is top-1 >=94% /
+  KL <=0.04 nat, not a common floor. Its FP8 vocabulary head
   passes full decode and prefill (top-1 upper bounds 0.000937 / 0.001854;
   KL upper bounds 0.000846 / 0.000305 nat). Quick is inconclusive, not fail;
   independent agentic replay remains required and defaults are unchanged.

@@ -25,6 +25,8 @@ pub struct Run {
     pub score: Fidelity,
     pub floor_top1: f64,
     pub floor_kl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripwire_expect: Option<crate::reference::TripwireExpect>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,24 @@ pub struct Comparison {
     pub seed: u64,
     pub absolute_pass: bool,
     pub tripwires: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_tripwires: Option<CalibratedTripwires>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripwireMetric {
+    pub baseline: f64,
+    pub candidate: f64,
+    pub loss: f64,
+    pub lower95: f64,
+    pub upper95: f64,
+    pub gross_margin: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibratedTripwires {
+    pub confident_top1: Option<TripwireMetric>,
+    pub top3: TripwireMetric,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +90,8 @@ pub fn compare_full(
             && decode.set_sha256 == prefill.set_sha256 && decode.reference_sha256 == prefill.reference_sha256
             && decode.engine == prefill.engine && decode.settings == prefill.settings && decode.dataset == prefill.dataset,
             "scoring paths use different arms, references or server settings");
+        ensure!(decode.tripwire_expect == prefill.tripwire_expect,
+            "scoring paths use different calibrated tripwire expectations");
     }
     let decode = compare(a_decode, b_decode, 0.005, 0.005, bootstrap, seed)?;
     let prefill = compare(a_prefill, b_prefill, 0.005, 0.005, bootstrap, seed)?;
@@ -231,11 +253,59 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     let chi2 = if discordant > 0 { ((a_only.abs_diff(b_only) as f64 - 1.0).max(0.0)).powi(2) / discordant as f64 } else { 0.0 };
     let absolute_pass = absolute(a) && absolute(b);
     let mut tripwires = Vec::new();
-    for (name, r) in [("candidate", a), ("baseline", b)] {
-        let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
-        if f.confident_top1.is_some_and(|v| v < 0.98) { tripwires.push(format!("{name}: confident top1 <98%")); }
-        if f.top3_contained < 0.99 { tripwires.push(format!("{name}: reference top3 containment <99%")); }
-    }
+    ensure!(a.tripwire_expect == b.tripwire_expect, "runs use different calibrated tripwire expectations");
+    let calibrated_tripwires = if let Some(expect) = &a.tripwire_expect {
+        ensure!([expect.confident_top1_min, expect.top3_min].iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+            && expect.confident_drop_margin == 0.01 && expect.top3_drop_margin == 0.005,
+            "invalid calibrated tripwire thresholds or gross margins");
+        for (name, r) in [("candidate", a), ("baseline", b)] {
+            let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+            if f.confident_top1.is_some_and(|v| v + 1e-12 < expect.confident_top1_min) {
+                tripwires.push(format!("{name}: confident top1 below family calibrated minimum"));
+            }
+            if f.top3_contained + 1e-12 < expect.top3_min {
+                tripwires.push(format!("{name}: top3 containment below family calibrated minimum"));
+            }
+        }
+        let metric = |confident_only: bool, margin: f64| -> Option<TripwireMetric> {
+            let mut windows: BTreeMap<&str, ([f64; 2], usize)> = BTreeMap::new();
+            let (mut baseline, mut candidate) = (0usize, 0usize);
+            for (key, x) in &pa {
+                if x.role != "gen" || (confident_only && !x.confident) { continue; }
+                let y = pb[key];
+                let (av, bv) = if confident_only { (x.agree, y.agree) } else { (x.top3_contained, y.top3_contained) };
+                baseline += usize::from(bv); candidate += usize::from(av);
+                let (sum, count) = windows.entry(&key.0).or_default();
+                sum[0] += f64::from(bv) - f64::from(av);
+                *count += 1;
+            }
+            if windows.is_empty() { return None; }
+            let stats: Vec<_> = windows.values().map(|v| v.0).collect();
+            let counts: Vec<_> = windows.values().map(|v| v.1).collect();
+            let count = counts.iter().sum::<usize>() as f64;
+            let samples: Vec<_> = block_bootstrap(&stats, &counts, bootstrap, seed).iter().map(|s| s[0]).collect();
+            Some(TripwireMetric { baseline: baseline as f64 / count, candidate: candidate as f64 / count,
+                loss: (baseline as f64 - candidate as f64) / count,
+                lower95: quantile(&samples, 0.05), upper95: quantile(&samples, 0.95), gross_margin: margin })
+        };
+        let confident = metric(true, expect.confident_drop_margin);
+        let top3 = metric(false, expect.top3_drop_margin).context("missing generated top3 rows")?;
+        if confident.as_ref().is_some_and(|m| m.lower95 > m.gross_margin) {
+            tripwires.push("paired confident top1 drop exceeds 1 point beyond noise".into());
+        }
+        if top3.lower95 > top3.gross_margin {
+            tripwires.push("paired top3 containment drop exceeds 0.5 point beyond noise".into());
+        }
+        Some(CalibratedTripwires { confident_top1: confident, top3 })
+    } else {
+        // Frozen legacy runs retain their original constants and verdicts.
+        for (name, r) in [("candidate", a), ("baseline", b)] {
+            let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+            if f.confident_top1.is_some_and(|v| v < 0.98) { tripwires.push(format!("{name}: confident top1 <98%")); }
+            if f.top3_contained < 0.99 { tripwires.push(format!("{name}: reference top3 containment <99%")); }
+        }
+        None
+    };
     let code = |r: &Run| Fidelity::from_records(r.score.records.iter().filter(|p| p.block == "C").cloned().collect());
     let (ac, bc) = (code(a), code(b));
     if ac.positions > 0 && ac.nll - bc.nll > 0.01 { tripwires.push("human code NLL increases >0.01 nat".into()); }
@@ -248,7 +318,7 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         top1_se_bootstrap: se, kl_delta, kl_upper95: kl_upper,
         kl_se_clustered: clustered_se(&stats.iter().map(|s| s[1]).collect::<Vec<_>>(), &counts),
         mcnemar_p: if discordant == 0 { 1.0 } else { erfc((chi2 / 2.0).sqrt()) },
-        top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires })
+        top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires, calibrated_tripwires })
 }
 
 #[cfg(test)]
@@ -264,7 +334,7 @@ mod tests {
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
             path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
-            score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06 }
+            score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
     }
     #[test]
     fn full_decision_requires_both_paths_and_fixed_arms() {
@@ -367,6 +437,105 @@ mod tests {
         assert!(c.absolute_pass); assert_eq!(c.top1_loss, 0.0); assert!(!c.pass);
         assert!(c.tripwires.iter().any(|s| s.contains("confident")));
     }
+    fn calibrated_run() -> Run {
+        let mut r = run(4, 1000);
+        r.tripwire_expect = Some(crate::reference::TripwireExpect {
+            confident_top1_min: 0.95, top3_min: 0.97,
+            confident_drop_margin: 0.01, top3_drop_margin: 0.005,
+        });
+        r
+    }
+
+    #[test]
+    fn family_tripwires_allow_qualified_regimes_below_legacy_constants() {
+        let mut r = calibrated_run();
+        for p in &mut r.score.records {
+            p.agree = p.position >= 30;
+            p.top3_contained = p.position >= 20;
+        }
+        let c = compare(&r, &r, 0.005, 0.005, 100, 1).unwrap();
+        assert!(c.pass);
+        let metrics = c.calibrated_tripwires.unwrap();
+        let confident = metrics.confident_top1.unwrap();
+        assert_eq!(confident.baseline, 0.97);
+        assert_eq!(confident.candidate, 0.97);
+        assert_eq!(confident.loss, 0.0);
+        assert_eq!(confident.lower95, 0.0);
+        assert_eq!(confident.upper95, 0.0);
+        assert_eq!(metrics.top3.baseline, 0.98);
+        r.tripwire_expect = None;
+        let legacy = compare(&r, &r, 0.005, 0.005, 100, 1).unwrap();
+        assert!(!legacy.pass);
+        assert!(legacy.calibrated_tripwires.is_none());
+        assert!(legacy.tripwires.iter().any(|s| s.contains("<98%")));
+        assert!(legacy.tripwires.iter().any(|s| s.contains("<99%")));
+    }
+
+    #[test]
+    fn family_tripwires_reject_gross_not_merely_detectable_drops() {
+        let baseline = calibrated_run();
+        for (flips, gross) in [(4, false), (12, true)] {
+            let mut candidate = baseline.clone();
+            for p in &mut candidate.score.records {
+                p.agree = p.position >= flips;
+                p.top3_contained = p.position >= flips;
+            }
+            let c = compare(&candidate, &baseline, 0.005, 0.005, 100, 1).unwrap();
+            assert_eq!(c.tripwires.iter().any(|s| s.contains("paired confident")), gross);
+            assert_eq!(c.tripwires.iter().any(|s| s.contains("paired top3")), gross);
+            assert_eq!(c.pass, !gross);
+            let m = c.calibrated_tripwires.unwrap().confident_top1.unwrap();
+            assert!((m.lower95 - flips as f64 / 1000.0).abs() < 1e-12);
+            assert!((m.upper95 - m.lower95).abs() < 1e-12);
+        }
+        let mut top3 = baseline.clone();
+        for p in &mut top3.score.records { p.top3_contained = p.position >= 6; }
+        let c = compare(&top3, &baseline, 0.005, 0.005, 100, 1).unwrap();
+        assert!(!c.pass);
+        assert!(c.tripwires.iter().any(|s| s.contains("paired top3")));
+        assert!(!c.tripwires.iter().any(|s| s.contains("paired confident")));
+    }
+
+    #[test]
+    fn calibrated_runs_report_absent_confident_subset_and_legacy_json_roundtrip() {
+        let mut r = calibrated_run();
+        for p in &mut r.score.records { p.confident = false; }
+        let c = compare(&r, &r, 0.005, 0.005, 100, 1).unwrap();
+        assert!(c.pass);
+        assert!(c.calibrated_tripwires.unwrap().confident_top1.is_none());
+        r.tripwire_expect = None;
+        let value = serde_json::to_value(&r).unwrap();
+        assert!(value.get("tripwire_expect").is_none());
+        let legacy: Run = serde_json::from_value(value).unwrap();
+        assert!(legacy.tripwire_expect.is_none());
+        let c = compare(&legacy, &legacy, 0.005, 0.005, 100, 1).unwrap();
+        assert!(serde_json::to_value(c).unwrap().get("calibrated_tripwires").is_none());
+    }
+
+    #[test]
+    fn family_tripwire_calibration_must_match_and_be_valid() {
+        let r = calibrated_run();
+        let mut other = r.clone();
+        other.tripwire_expect.as_mut().unwrap().top3_min = 0.96;
+        assert!(compare(&r, &other, 0.005, 0.005, 100, 1).is_err());
+        for value in [f64::NAN, -0.1, 1.1] {
+            other = r.clone();
+            other.tripwire_expect.as_mut().unwrap().confident_top1_min = value;
+            assert!(compare(&other, &other, 0.005, 0.005, 100, 1).is_err());
+        }
+        other = r.clone();
+        other.tripwire_expect.as_mut().unwrap().confident_drop_margin = 0.0;
+        assert!(compare(&other, &other, 0.005, 0.005, 100, 1).is_err());
+        let mut prefill = r.clone(); prefill.path_shape = "prefill-shaped".into();
+        prefill.tripwire_expect = None;
+        assert!(compare_full(&r, &r, &prefill, &prefill, 100, 1).is_err());
+        other = r.clone();
+        for p in &mut other.score.records { p.top3_contained = p.position >= 31; }
+        let c = compare(&other, &other, 0.005, 0.005, 100, 1).unwrap();
+        assert!(c.tripwires.iter().any(|s| s.contains("family calibrated minimum")));
+        assert!(!c.pass);
+    }
+
     #[test]
     fn bootstrap_is_reproducible_and_preserves_unequal_counts() {
         let stats = [[1.0, 2.0], [4.0, 8.0], [6.0, 12.0]];

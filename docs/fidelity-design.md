@@ -20,9 +20,17 @@ references and the independent agentic replay gate remain in progress.
   90% is a floor the set is built to clear by several points, not the
   target; it fails only for broken kernels or a stale reference.
 - **Tripwires (report, fail only when gross):** confident-top-1 (reference
-  p₁ ≥ 0.5) ≥ 98%; candidate argmax in reference top-3 ≥ 99%; NLL on human
-  code within +0.01 nat of the BF16 arm; zero invalid tool-call JSON in the
-  agentic replay.
+  p₁ ≥ 0.5) and candidate argmax in reference top-3 use family/config
+  expectations: round the minimum repeated baseline down to a whole
+  percentage point, then subtract 2 points, using the least restrictive
+  decode/prefill expectation. Fail below those calibrated expectations, or
+  when the one-sided 95% lower bound of baseline minus candidate exceeds
+  **1.0 point** for confident-top-1 or **0.5 point** for top-3. Always report
+  raw baseline/candidate values, loss, and lower/upper bounds. V4.1's 98%/99%
+  constants are legacy context, not universal floors; frozen legacy reports
+  without calibrated fields retain their original constants and verdicts.
+  NLL on human code stays within +0.01 nat of the baseline arm; zero invalid
+  tool-call JSON in the agentic replay.
 - **Set:** 64 windows, 32,768 scored positions per family, chat-templated
   agentic coding (reasoning + tool calls + diffs) 40%, long-context code
   reading 20%, plain repository code 15%, JSON/tool grammar 10%, prose and
@@ -70,8 +78,8 @@ judged on sensitivity to that, cost, and statistical tractability:
 |---|---|---|
 | **Top-1 agreement** with the reference argmax, teacher-forced | per-step greedy divergence probability | **Carries the bar.** Direct model of greedy decoding. Noise from near-ties is removed by pairing (both arms see the same near-ties) and by the confident-top-1 tripwire. |
 | Top-N containment, N ≥ 3 ("reference argmax in our top-N") | nothing about greedy output; ~99.9% for any sane engine | reject as a bar |
-| Candidate argmax ∈ reference top-3 | whether our greedy pick is at least plausible to the reference | **Tripwire ≥ 99%**: catches a broken kernel that keeps aggregate agreement; cheap (already have `top`). |
-| Confident top-1 (positions with reference p₁ ≥ 0.5) | flips that cannot be near-ties | **Tripwire ≥ 98%** and the first thing to read when the bar fails: a flip here is a real error. |
+| Candidate argmax ∈ reference top-3 | whether our greedy pick is at least plausible to the reference | **Calibrated gross tripwire (§0)**: catches a broken kernel that keeps aggregate agreement; cheap (already have `top`); 99% is V4.1 legacy context. |
+| Confident top-1 (positions with reference p₁ ≥ 0.5) | flips that cannot be near-ties | **Calibrated gross tripwire (§0)** and the first thing to read when the bar fails; 98% is V4.1 legacy context, not a universal floor. |
 | **Full-vocab KL(ref ‖ engine)** | continuous distance; sensitive to mass shifts near-ties hide; paired differences are precise | **Carries the 0.005 bar** (full tier, full-vocab f16 rows). Quick tier keeps top-32 + tail as a lower-bound proxy. |
 | NLL on the fixed text, paired | absolute competence, independent of the reference's arithmetic | **Supporting**: reported per role; tripwire +0.01 nat on human-written code. The one metric robust to reference mismatch (the MiMo lesson). |
 | NLL on reference-sampled continuations | ≈ cross-entropy to the reference; redundant with KL | report only |
@@ -403,12 +411,14 @@ Every generated aggregate clears the 92% stop bar, the confident-position
 is 94.3359% on either full path. The old 90% floor is comfortably met on
 agentic text. Applying §10's whole-percentage-point round-down minus two
 literally gives 95% for quick and full prefill, but **94% for full decode**
-(96.9529% rounds down to 96%, not up to 97%). A common published `expect`
-therefore uses `top1_min = 0.94`; per-path calibration retains 0.95/0.94/0.95.
-The KL ceiling uses the analogous conservative upward 0.01-nat rounding
-plus 0.02 nat, capped at 0.06: 0.04 quick, 0.03 on each full path; a common
-`expect` uses `kl_max = 0.04`. These are absolute sanity gates, not a
-replacement for the unchanged paired 0.005 top-1 / 0.005-nat decision.
+(96.9529% rounds down to 96%, not up to 97%). V4.1's published `expect`,
+shared across its scoring paths, therefore uses `top1_min = 0.94`;
+per-path calibration retains 0.95/0.94/0.95. The KL ceiling uses conservative
+upward 0.01-nat rounding plus 0.02 nat, capped at 0.06: 0.04 quick, 0.03 on
+each full path; V4.1's shared `expect` uses `kl_max = 0.04`. These are
+config-specific sanity gates calibrated from V4.1, not cross-family floors.
+The common floor remains top-1 >=0.90 / KL <=0.06; the precision-decision
+bar remains paired 0.005 top-1 / 0.005 nat on both full scoring shapes.
 
 ### First paired V4.1 FP8 vocabulary-head decision (2026-10-05)
 
@@ -510,9 +520,16 @@ hardware runs, small commits, tables in commit messages).
    FP8 KDA/head arm on both tiers, run `compare`. Deliverables in the commit
    message: the absolute numbers per block and bucket, δ̂ and bounds for
    both paths, the discordance rate d actually observed (feeds §5). No
-   external teacher cross-check (TJ, 2026-10-05). This run calibrates the floors in `expect`: floor = BF16
-   arm's top-1 rounded down to the point minus 2, never below 0.90; KL
-   floor similarly, never above 0.06.
+   external teacher cross-check (TJ, 2026-10-05). Each family/config derives
+   its own per-path `expect` from repeated default-precision baselines:
+   top-1 minimum = agreement rounded down to a whole percentage point
+   minus 2 points, never below 0.90; KL maximum = KL rounded up to
+   0.01 nat plus 0.02 nat, capped at 0.06. Use the lower repeated top-1
+   and higher repeated KL for each path, and the least restrictive of
+   those path-specific gates for the config's shared `expect`. Label it
+   "calibrated from this config's baselines". Keep the common 0.90/0.06
+   floor and paired 0.005/0.005 decision bar separate. Repeatability
+   qualification of a reference is not a precision-default verdict.
 6. **Wire the tiers.** Quick tier in `baseline.rs`; `cuteafd bench
    fidelity run/compare`; Release smoke unchanged in shape. Re-run the
    current `release-smoke` matrix entry for GLM Flash to show the ≤ 5 min
