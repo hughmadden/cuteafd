@@ -2,33 +2,51 @@
 //! `scripts/bench/make-fidelity-reference.py` from a family golden run) and
 //! the scores of a teacher-forced pass against one.
 use cuteafd_api::openai::probe::ProbeRow;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 include!(concat!(env!("OUT_DIR"), "/references.rs"));
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Expect {
     pub kl_max: f64,
     pub top1_min: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
     pub name: String,
     pub models: Vec<String>,
     #[serde(default)]
     pub tokenizer_sha256: Option<String>,
     pub vocab: usize,
+    #[serde(default)]
     pub tokens: Vec<u32>,
+    #[serde(default)]
     pub score_from: usize,
+    #[serde(default)]
     pub top_k: usize,
+    #[serde(default)]
     pub ids: Vec<Vec<u32>>,
+    #[serde(default)]
     pub lps: Vec<Vec<f32>>,
+    #[serde(default)]
     pub tail_lp: Vec<f32>,
+    #[serde(default)]
     pub next_lp: Vec<f32>,
+    #[serde(default)]
     pub nll: f64,
     pub expect: Expect,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub checkpoint: String,
+    #[serde(default)]
+    pub set_sha256: String,
+    #[serde(default)]
+    pub quick_windows: Vec<String>,
+    #[serde(default)]
+    pub windows: Vec<Window>,
 }
 
 /// `*` matches any run of characters; the rest is literal (ASCII case-insensitive).
@@ -86,66 +104,191 @@ impl Reference {
         }).collect()
     }
 
-    /// Compares the served model's rows with the reference.
+    /// Schema 1 remains a single legacy window with its original sanity bounds.
+    pub fn all_windows(&self) -> Vec<Window> {
+        if !self.windows.is_empty() { return self.windows.clone(); }
+        let positions = self.positions().enumerate().map(|(i, pos)| CompactPosition {
+            pos, next: self.tokens[pos], next_lp: f64::from(self.next_lp[i]),
+            top: self.ids[i].iter().zip(&self.lps[i]).map(|(&id, &lp)| Top { id, lp: f64::from(lp) }).collect(),
+            tail_lp: f64::from(self.tail_lp[i]),
+        }).collect();
+        vec![Window { id: "legacy".into(), block: "legacy".into(), bucket: "0-2K".into(),
+            roles: vec!["ctx".into(); self.tokens.len()], tokens: self.tokens.clone(),
+            score_from: self.score_from, positions, top_k: self.top_k }]
+    }
+
+    pub fn selected_windows(&self, full: bool) -> anyhow::Result<Vec<Window>> {
+        self.validate()?;
+        if full && self.windows.is_empty() { anyhow::bail!("full tier requires schema 2 references"); }
+        let all = self.all_windows();
+        if full || self.windows.is_empty() { return Ok(all); }
+        anyhow::ensure!(!self.quick_windows.is_empty(), "schema 2 reference has no pinned quick subset");
+        let selected: Vec<_> = all.into_iter().filter(|w| self.quick_windows.contains(&w.id)).collect();
+        anyhow::ensure!(selected.len() == self.quick_windows.len(), "unknown or duplicate quick window id");
+        Ok(selected)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.vocab > 0, "empty reference vocabulary");
+        if self.windows.is_empty() {
+            let n = self.ids.len();
+            anyhow::ensure!(n > 0 && self.lps.len() == n && self.tail_lp.len() == n && self.next_lp.len() == n,
+                "legacy reference arrays differ in length");
+            anyhow::ensure!(self.score_from > 0 && self.tokens.len() >= self.score_from + n,
+                "legacy reference positions outside tokens");
+            for (ids, lps) in self.ids.iter().zip(&self.lps) {
+                anyhow::ensure!(ids.len() == self.top_k && lps.len() == ids.len(), "legacy top-k arrays differ");
+            }
+        } else {
+            anyhow::ensure!(self.schema.as_deref() == Some("cuteafd.fidelity.reference/2"), "unknown reference schema");
+            anyhow::ensure!(!self.checkpoint.is_empty() && !self.set_sha256.is_empty(), "missing reference provenance");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for w in self.all_windows() {
+            anyhow::ensure!(seen.insert(w.id.clone()), "duplicate window {}", w.id);
+            w.validate(self.vocab)?;
+        }
+        Ok(())
+    }
+
+    /// Legacy API; multi-window callers must score each window separately.
     pub fn score(&self, rows: &[ProbeRow]) -> Fidelity {
-        let by_position: HashMap<usize, &ProbeRow> = rows.iter().map(|r| (r.position, r)).collect();
-        let mut fidelity = Fidelity { ref_nll: self.nll, ..Fidelity::default() };
-        let (mut kl, mut nll, mut agree, mut ref_nll) = (0.0f64, 0.0f64, 0usize, 0.0f64);
-        for (i, p) in self.positions().enumerate() {
-            let Some(row) = by_position.get(&p) else {
-                fidelity.missing += 1;
-                continue;
-            };
-            let lp: HashMap<u32, f64> = row.wanted.iter().map(|&(id, v)| (id, f64::from(v))).collect();
-            let Some(&next) = lp.get(&self.tokens[p]) else {
-                fidelity.missing += 1;
-                continue;
-            };
-            fidelity.positions += 1;
-            nll -= next;
-            ref_nll -= f64::from(self.next_lp[i]);
-            // KL(reference || served) over the reference's top-k plus one tail bucket:
-            // a coarse-graining, so it never exceeds the full-vocabulary KL.
-            let mut q_mass = 0.0;
-            let mut sum = 0.0;
-            for (&id, &p_lp) in self.ids[i].iter().zip(&self.lps[i]) {
-                let q_lp = lp.get(&id).copied().unwrap_or(f64::NEG_INFINITY).max(-80.0);
-                q_mass += q_lp.exp();
-                sum += f64::from(p_lp).exp() * (f64::from(p_lp) - q_lp);
-            }
-            let p_tail = f64::from(self.tail_lp[i]).exp();
-            let q_tail = (1.0 - q_mass).max(1e-12);
-            if p_tail > 0.0 {
-                sum += p_tail * (p_tail.ln() - q_tail.ln());
-            }
-            kl += sum.max(0.0);
-            if row.argmax == self.ids[i][0] {
-                agree += 1;
-            }
-            if !row.finite {
-                fidelity.non_finite += 1;
-            }
-        }
-        if fidelity.positions > 0 {
-            let n = fidelity.positions as f64;
-            fidelity.kl = kl / n;
-            fidelity.nll = nll / n;
-            fidelity.ref_nll = ref_nll / n;
-            fidelity.top1 = agree as f64 / n;
-        }
-        fidelity
+        self.all_windows()[0].score(rows)
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Top { pub id: u32, pub lp: f64 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactPosition {
+    pub pos: usize,
+    pub next: u32,
+    pub next_lp: f64,
+    pub top: Vec<Top>,
+    pub tail_lp: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Window {
+    pub id: String,
+    pub block: String,
+    pub bucket: String,
+    pub tokens: Vec<u32>,
+    pub roles: Vec<String>,
+    pub score_from: usize,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    pub positions: Vec<CompactPosition>,
+}
+fn default_top_k() -> usize { 32 }
+
+impl Window {
+    pub fn validate(&self, vocab: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.id.is_empty() && !self.positions.is_empty(), "empty window");
+        anyhow::ensure!(self.roles.len() == self.tokens.len() && self.roles.iter().all(|r| r == "gen" || r == "ctx"),
+            "invalid role mask for {}", self.id);
+        anyhow::ensure!(self.tokens.iter().all(|&id| (id as usize) < vocab), "token outside vocabulary");
+        let mut previous = None;
+        for p in &self.positions {
+            anyhow::ensure!(p.pos > 0 && p.pos < self.tokens.len() && p.pos >= self.score_from
+                && previous.is_none_or(|prev| prev < p.pos), "invalid positions in {}", self.id);
+            anyhow::ensure!(p.next == self.tokens[p.pos], "next token differs in {}", self.id);
+            let unique: std::collections::HashSet<_> = p.top.iter().map(|t| t.id).collect();
+            anyhow::ensure!(!p.top.is_empty() && unique.len() == p.top.len() && p.top.iter().all(|t|
+                (t.id as usize) < vocab && t.lp.is_finite() && t.lp <= 0.0)
+                && p.next_lp.is_finite() && p.next_lp <= 0.0
+                && !p.tail_lp.is_nan() && p.tail_lp <= 0.0, "invalid probabilities in {}", self.id);
+            anyhow::ensure!(p.top.windows(2).all(|t| t[0].lp >= t[1].lp), "unsorted top-k in {}", self.id);
+            previous = Some(p.pos);
+        }
+        Ok(())
+    }
+
+    pub fn want(&self) -> HashMap<usize, Vec<u32>> {
+        self.positions.iter().map(|p| {
+            let mut ids: Vec<_> = p.top.iter().map(|t| t.id).collect();
+            if !ids.contains(&p.next) { ids.push(p.next); }
+            (p.pos, ids)
+        }).collect()
+    }
+
+    pub fn score(&self, rows: &[ProbeRow]) -> Fidelity {
+        let by_position: HashMap<_, _> = rows.iter().map(|r| (r.position, r)).collect();
+        let mut records = Vec::new();
+        let mut missing = 0;
+        for p in &self.positions {
+            let Some(row) = by_position.get(&p.pos) else { missing += 1; continue; };
+            let lp: HashMap<_, _> = row.wanted.iter().map(|&(id, v)| (id, f64::from(v))).collect();
+            let Some(&next_lp) = lp.get(&p.next) else { missing += 1; continue; };
+            if p.top.iter().any(|t| !lp.contains_key(&t.id)) { missing += 1; continue; }
+            let mut q_mass = 0.0;
+            let mut kl = 0.0;
+            for t in &p.top {
+                let q_lp = lp[&t.id];
+                q_mass += q_lp.exp();
+                kl += t.lp.exp() * (t.lp - q_lp);
+            }
+            let p_tail = p.tail_lp.exp();
+            if p_tail > 0.0 { kl += p_tail * (p.tail_lp - (1.0 - q_mass).max(1e-12).ln()); }
+            let finite = row.finite && kl.is_finite() && next_lp.is_finite();
+            records.push(Position {
+                window: self.id.clone(), block: self.block.clone(), bucket: self.bucket.clone(),
+                role: self.roles[p.pos].clone(), position: p.pos, agree: row.argmax == p.top[0].id,
+                confident: p.top[0].lp.exp() >= 0.5,
+                top3_contained: p.top.iter().take(3).any(|t| t.id == row.argmax),
+                agree_text: row.argmax == p.next, finite, kl: kl.max(0.0), nll: -next_lp, ref_nll: -p.next_lp,
+                argmax: row.argmax, reference_argmax: p.top[0].id,
+            });
+        }
+        let mut score = Fidelity::from_records(records);
+        score.missing = missing;
+        score
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Position {
+    pub window: String, pub block: String, pub bucket: String, pub role: String,
+    pub position: usize, pub agree: bool, pub confident: bool, pub top3_contained: bool,
+    pub agree_text: bool, pub finite: bool, pub kl: f64, pub nll: f64, pub ref_nll: f64,
+    pub argmax: u32, pub reference_argmax: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Fidelity {
-    pub positions: usize,
-    pub missing: usize,
-    pub non_finite: usize,
-    pub nll: f64,
-    pub ref_nll: f64,
-    pub kl: f64,
-    pub top1: f64,
+    pub positions: usize, pub missing: usize, pub non_finite: usize,
+    pub nll: f64, pub ref_nll: f64, pub kl: f64, pub top1: f64,
+    pub confident_positions: usize, pub confident_top1: Option<f64>,
+    pub top3_contained: f64, pub agree_text: f64, pub records: Vec<Position>,
+}
+impl Fidelity {
+    pub fn from_records(records: Vec<Position>) -> Self {
+        let n = records.len();
+        let mut f = Self { positions: n, records, ..Self::default() };
+        if n == 0 { return f; }
+        let den = n as f64;
+        for p in &f.records {
+            f.nll += p.nll / den; f.ref_nll += p.ref_nll / den; f.kl += p.kl / den;
+            f.top1 += f64::from(p.agree) / den; f.top3_contained += f64::from(p.top3_contained) / den;
+            f.agree_text += f64::from(p.agree_text) / den;
+            f.non_finite += usize::from(!p.finite);
+        }
+        f.confident_positions = f.records.iter().filter(|p| p.confident).count();
+        if f.confident_positions > 0 {
+            f.confident_top1 = Some(f.records.iter().filter(|p| p.confident && p.agree).count() as f64 / f.confident_positions as f64);
+        }
+        f
+    }
+
+    pub fn groups(&self, dimension: &str) -> std::collections::BTreeMap<String, Self> {
+        let mut groups: std::collections::BTreeMap<String, Vec<Position>> = std::collections::BTreeMap::new();
+        for p in &self.records {
+            let key = match dimension { "window" => &p.window, "block" => &p.block, "bucket" => &p.bucket, _ => &p.role };
+            groups.entry(key.clone()).or_default().push(p.clone());
+        }
+        groups.into_iter().map(|(key, records)| (key, Self::from_records(records))).collect()
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +327,8 @@ mod tests {
         let k = 4;
         let mut r = Reference { name: "t".into(), models: vec![], tokenizer_sha256: None, vocab, tokens: tokens.clone(),
             score_from: 1, top_k: k, ids: vec![], lps: vec![], tail_lp: vec![], next_lp: vec![], nll: 0.0,
-            expect: Expect { kl_max: 0.1, top1_min: 0.9 } };
+            expect: Expect { kl_max: 0.1, top1_min: 0.9 }, schema: None, checkpoint: String::new(),
+            set_sha256: String::new(), quick_windows: vec![], windows: vec![] };
         let mut served = Vec::new();
         for p in 1..7 {
             let row = &rows[p - 1];

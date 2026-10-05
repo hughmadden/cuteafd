@@ -10,6 +10,7 @@ pub mod baseline;
 pub mod cli;
 pub mod client;
 pub mod context;
+pub mod fidelity;
 pub mod http;
 pub mod panels;
 pub mod profiles;

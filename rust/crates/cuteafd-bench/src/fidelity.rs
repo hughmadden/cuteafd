@@ -1,0 +1,252 @@
+//! Paired fidelity reports and window-clustered non-inferiority statistics.
+//! Statistics ported from Hugh Madden's MIT glm53f-afd v1.1.0 harness/klgate.py.
+use crate::reference::{Fidelity, Position};
+use anyhow::{ensure, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub schema: String,
+    pub arm: String,
+    pub checkpoint: String,
+    pub set_sha256: String,
+    pub reference_sha256: String,
+    pub tier: String,
+    /// Never compare decode and prefill rows, or call a compact KL full-vocabulary.
+    pub path_shape: String,
+    pub kl_kind: String,
+    pub verify_rows: Option<usize>,
+    pub engine: String,
+    pub settings: serde_json::Value,
+    pub seconds: f64,
+    pub score: Fidelity,
+    pub floor_top1: f64,
+    pub floor_kl: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comparison {
+    pub pass: bool,
+    pub positions: usize,
+    pub windows: usize,
+    pub baseline_only: usize,
+    pub candidate_only: usize,
+    pub discordance: f64,
+    pub top1_loss: f64,
+    pub top1_upper95: f64,
+    pub top1_se_bootstrap: f64,
+    pub kl_delta: f64,
+    pub kl_upper95: f64,
+    pub kl_se_clustered: Option<f64>,
+    pub mcnemar_p: f64,
+    pub top1_margin: f64,
+    pub kl_margin: f64,
+    pub bootstrap: usize,
+    pub seed: u64,
+    pub absolute_pass: bool,
+    pub tripwires: Vec<String>,
+}
+
+/// Cluster-robust SE of a ratio-of-sums token mean, using whole windows as clusters.
+pub fn clustered_se(sums: &[f64], counts: &[usize]) -> Option<f64> {
+    if sums.len() < 2 || sums.len() != counts.len() { return None; }
+    let n = counts.iter().sum::<usize>() as f64;
+    if n == 0.0 { return None; }
+    let mean = sums.iter().sum::<f64>() / n;
+    let residual = sums.iter().zip(counts).map(|(t, &c)| (t - c as f64 * mean).powi(2)).sum::<f64>();
+    let g = sums.len() as f64;
+    Some((g / (g - 1.0) * residual).sqrt() / n)
+}
+
+pub fn quantile(xs: &[f64], q: f64) -> f64 {
+    let mut sorted = xs.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let h = (sorted.len() - 1) as f64 * q;
+    let lo = h.floor() as usize;
+    sorted[lo] + (sorted[(lo + 1).min(sorted.len() - 1)] - sorted[lo]) * (h - lo as f64)
+}
+
+// SplitMix64; reproducible independent of platform and without a serving RNG dependency.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+    fn index(&mut self, n: usize) -> usize {
+        let n = n as u64;
+        let threshold = n.wrapping_neg() % n;
+        loop { let x = self.next(); if x >= threshold { return (x % n) as usize; } }
+    }
+}
+
+/// Hugh's ratio-of-sums window-block bootstrap; a sampled window keeps every row.
+pub fn block_bootstrap(stats: &[[f64; 2]], counts: &[usize], b: usize, seed: u64) -> Vec<[f64; 2]> {
+    let mut rng = Rng(seed);
+    (0..b).map(|_| {
+        let (mut sums, mut n) = ([0.0; 2], 0usize);
+        for _ in stats {
+            let i = rng.index(stats.len());
+            n += counts[i];
+            sums[0] += stats[i][0]; sums[1] += stats[i][1];
+        }
+        [sums[0] / n as f64, sums[1] / n as f64]
+    }).collect()
+}
+
+fn erfc(x: f64) -> f64 {
+    // Numerical Recipes approximation (absolute error < 1.3e-7).
+    let t = 1.0 / (1.0 + 0.5 * x.abs());
+    let value = t * (-x * x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418
+        + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587
+        + t * (-0.82215223 + t * 0.17087277))))))))).exp();
+    if x < 0.0 { 2.0 - value } else { value.min(1.0) }
+}
+
+fn pairs(run: &Run) -> Result<BTreeMap<(String, usize), &Position>> {
+    ensure!(run.schema == "cuteafd.fidelity.run/2", "unknown run schema");
+    ensure!(run.score.missing == 0 && run.score.non_finite == 0, "run has missing or nonfinite rows");
+    ensure!(run.score.positions == run.score.records.len(), "run position count differs from records");
+    let mut out = BTreeMap::new();
+    for p in &run.score.records {
+        ensure!(p.finite && p.kl.is_finite() && p.nll.is_finite() && p.ref_nll.is_finite(), "nonfinite position");
+        ensure!(p.role == "gen" || p.role == "ctx", "unknown role");
+        ensure!(out.insert((p.window.clone(), p.position), p).is_none(), "duplicate position");
+    }
+    ensure!(!out.is_empty(), "no scored rows");
+    Ok(out)
+}
+
+fn absolute(run: &Run) -> bool {
+    let score = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+    score.positions > 0 && score.top1 + 1e-12 >= run.floor_top1.max(0.90) && score.kl <= run.floor_kl.min(0.06)
+        && score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80)
+}
+
+pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: usize, seed: u64) -> Result<Comparison> {
+    ensure!(top1_margin.is_finite() && top1_margin > 0.0 && kl_margin.is_finite() && kl_margin > 0.0,
+        "margins must be positive and finite");
+    ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
+    ensure!(!a.checkpoint.is_empty() && !a.set_sha256.is_empty() && !a.reference_sha256.is_empty(), "missing provenance");
+    ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
+        "runs use different checkpoints, sets or references");
+    ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows,
+        "runs use different tiers, scoring shapes, KL estimators or verify widths");
+    ensure!(matches!(a.tier.as_str(), "quick" | "full"), "unknown tier");
+    if a.tier == "full" { ensure!(a.kl_kind == "full-vocabulary", "full tier cannot gate compact KL"); }
+    let (pa, pb) = (pairs(a)?, pairs(b)?);
+    ensure!(pa.keys().collect::<Vec<_>>() == pb.keys().collect::<Vec<_>>(), "runs score different rows");
+    let mut by_window: BTreeMap<String, ([f64; 2], usize)> = BTreeMap::new();
+    let (mut a_only, mut b_only) = (0usize, 0usize);
+    for (key, x) in &pa {
+        let y = pb[key];
+        ensure!(x.role == y.role && x.block == y.block && x.bucket == y.bucket && x.reference_argmax == y.reference_argmax
+            && x.ref_nll == y.ref_nll && x.confident == y.confident, "row metadata differ at {key:?}");
+        if x.role != "gen" { continue; }
+        a_only += usize::from(x.agree && !y.agree);
+        b_only += usize::from(!x.agree && y.agree);
+        let (sums, count) = by_window.entry(key.0.clone()).or_default();
+        sums[0] += f64::from(y.agree) - f64::from(x.agree);
+        sums[1] += x.kl - y.kl;
+        *count += 1;
+    }
+    ensure!(!by_window.is_empty(), "no assistant-generated positions");
+    let stats: Vec<_> = by_window.values().map(|v| v.0).collect();
+    let counts: Vec<_> = by_window.values().map(|v| v.1).collect();
+    let n = counts.iter().sum::<usize>();
+    let loss = (b_only as f64 - a_only as f64) / n as f64;
+    let kl_delta = stats.iter().map(|s| s[1]).sum::<f64>() / n as f64;
+    let reps = block_bootstrap(&stats, &counts, bootstrap, seed);
+    let top_reps: Vec<_> = reps.iter().map(|s| s[0]).collect();
+    let kl_reps: Vec<_> = reps.iter().map(|s| s[1]).collect();
+    let mean = top_reps.iter().sum::<f64>() / bootstrap as f64;
+    let se = (top_reps.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (bootstrap - 1) as f64).sqrt();
+    let top_upper = loss + 1.6448536269514722 * se;
+    let kl_upper = quantile(&kl_reps, 0.95);
+    let discordant = a_only + b_only;
+    let chi2 = if discordant > 0 { ((a_only.abs_diff(b_only) as f64 - 1.0).max(0.0)).powi(2) / discordant as f64 } else { 0.0 };
+    let absolute_pass = absolute(a) && absolute(b);
+    let mut tripwires = Vec::new();
+    for (name, r) in [("candidate", a), ("baseline", b)] {
+        let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+        if f.confident_top1.is_some_and(|v| v < 0.98) { tripwires.push(format!("{name}: confident top1 <98%")); }
+        if f.top3_contained < 0.99 { tripwires.push(format!("{name}: reference top3 containment <99%")); }
+    }
+    let code = |r: &Run| Fidelity::from_records(r.score.records.iter().filter(|p| p.block == "C").cloned().collect());
+    let (ac, bc) = (code(a), code(b));
+    if ac.positions > 0 && ac.nll - bc.nll > 0.01 { tripwires.push("human code NLL increases >0.01 nat".into()); }
+    // One cluster cannot estimate window uncertainty. Never certify by silently treating it as zero.
+    let enough_windows = by_window.len() >= 2;
+    if !enough_windows { tripwires.push("insufficient windows for clustered uncertainty".into()); }
+    let gross = [a, b].iter().any(|r| {
+        let f = Fidelity::from_records(r.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+        f.confident_top1.is_some_and(|v| v < 0.95) || f.top3_contained < 0.95
+    });
+    Ok(Comparison { pass: enough_windows && absolute_pass && !gross && top_upper < top1_margin && kl_upper < kl_margin,
+        positions: n, windows: by_window.len(), baseline_only: b_only, candidate_only: a_only,
+        discordance: discordant as f64 / n as f64, top1_loss: loss, top1_upper95: top_upper,
+        top1_se_bootstrap: se, kl_delta, kl_upper95: kl_upper,
+        kl_se_clustered: clustered_se(&stats.iter().map(|s| s[1]).collect::<Vec<_>>(), &counts),
+        mcnemar_p: if discordant == 0 { 1.0 } else { erfc((chi2 / 2.0).sqrt()) },
+        top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn run(windows: usize, rows: usize) -> Run {
+        let records = (0..windows).flat_map(|w| (0..rows).map(move |p| Position {
+            window: w.to_string(), block: "A".into(), bucket: "0-2K".into(), role: "gen".into(), position: p,
+            agree: true, confident: true, top3_contained: true, agree_text: true, finite: true,
+            kl: 0.01, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1,
+        })).collect();
+        Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
+            set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
+            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8),
+            engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
+            score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06 }
+    }
+    #[test]
+    fn clustered_se_by_hand() {
+        let wanted = (1.5f64 * (1.5625 + 0.0625 + 2.25)).sqrt() / 4.0;
+        assert!((clustered_se(&[1.0, 2.0, 6.0], &[1, 1, 2]).unwrap() - wanted).abs() < 1e-15);
+    }
+    #[test]
+    fn identical_runs_pass_with_zero_delta() {
+        let r = run(12, 512);
+        let c = compare(&r, &r, 0.005, 0.005, 5000, 20260829).unwrap();
+        assert!(c.pass); assert_eq!(c.top1_loss, 0.0); assert_eq!(c.kl_upper95, 0.0);
+    }
+    #[test]
+    fn one_point_regression_fails_full_gate_and_small_panel_cannot_certify_it() {
+        for windows in [64, 1] {
+            let b = run(windows, 512);
+            let mut a = b.clone();
+            for p in &mut a.score.records { if p.position < 6 { p.agree = false; } }
+            let c = compare(&a, &b, 0.005, 0.005, 5000, 1).unwrap();
+            assert!(!c.pass); assert!(c.top1_loss > 0.01);
+        }
+    }
+    #[test]
+    fn pairing_rejects_missing_duplicates_and_changed_provenance() {
+        let b = run(12, 8);
+        let mut a = b.clone(); a.checkpoint = "other".into();
+        assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+        a = b.clone(); a.score.records.pop();
+        assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+        a = b.clone(); a.score.records[0] = a.score.records[1].clone();
+        assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+    }
+    #[test]
+    fn bootstrap_is_reproducible_and_preserves_unequal_counts() {
+        let stats = [[1.0, 2.0], [4.0, 8.0], [6.0, 12.0]];
+        let a = block_bootstrap(&stats, &[1, 2, 3], 5000, 7);
+        assert_eq!(a, block_bootstrap(&stats, &[1, 2, 3], 5000, 7));
+        assert!(a.iter().all(|s| s[1] == 2.0 * s[0]));
+        assert_eq!(quantile(&[0.0, 10.0], 0.95), 9.5);
+    }
+}
