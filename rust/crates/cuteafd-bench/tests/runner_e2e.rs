@@ -1,54 +1,15 @@
 //! The runner end to end against a fake engine behind the real OpenAI router:
 //! a share run over loopback completes, exports render, and other clients get
 //! 503 + Retry-After while it runs.
-use cuteafd_api::openai::{router_with_console, ConsoleHub, InferenceChunk, InferenceFinishReason, NativeLimits,
-    NativeRequest, PromptUsage};
+mod common;
+use common::fake_engine;
+use cuteafd_api::openai::{router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use cuteafd_bench::report::RunStatus;
 use cuteafd_bench::store::Store;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// A worker that streams 2 ms tokens and honours probes with fake rows.
-fn fake_engine(mut receive: mpsc::Receiver<NativeRequest>) {
-    std::thread::spawn(move || {
-        while let Some(job) = receive.blocking_recv() {
-            std::thread::spawn(move || {
-                let ids: Vec<u32> = job.probe.as_ref().and_then(|p| p.spec.prompt_ids.clone())
-                    .unwrap_or_else(|| job.prompt.bytes().map(u32::from).collect());
-                if let Some(probe) = &job.probe {
-                    probe.admitted("fake", &ids, 0);
-                }
-                let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: ids.len(), prompt_cache_hit_tokens: 0 } }));
-                if let Some(probe) = &job.probe {
-                    let logits: Vec<f32> = (0..64).map(|v| ((v * 31 + ids.len()) % 17) as f32).collect();
-                    if let Some(from) = probe.scoring() {
-                        for p in from..ids.len() {
-                            probe.row(p, &logits);
-                        }
-                        let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
-                        return;
-                    }
-                    if probe.spec.record_first {
-                        probe.row(ids.len(), &logits);
-                    }
-                }
-                for i in 0..job.max_tokens.min(48) {
-                    std::thread::sleep(Duration::from_millis(2));
-                    if let Some(probe) = &job.probe {
-                        probe.token(7 + i as u32);
-                    }
-                    if job.events.send(Ok(InferenceChunk::Text { content: "a ".into(), content_tokens: 1 })).is_err() {
-                        return;
-                    }
-                }
-                let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
-            });
-        }
-    });
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn share_run_completes_and_locks_out_other_clients() {
