@@ -106,6 +106,9 @@ fn snapshot_processor_overrides_defaults_and_rejects_bad_config() {
 fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
     let config = serde_json::json!({"image_token_id":12,"vision_start_token_id":11,"vision_end_token_id":13});
     let expander = SpanExpander::from_config(&config, 100).unwrap();
+    let glm_config = serde_json::json!({"image_token_id":12,"image_start_token_id":11,"image_end_token_id":13});
+    let glm = SpanExpander::from_config(&glm_config, 100).unwrap();
+    assert_eq!((glm.placeholder, glm.start, glm.end), (12, 11, 13));
     let image = ProcessorConfig::for_family(ImageFamily::Mimo)
         .prepare_rgb(rgb(64, 64), EncoderId([0; 32]))
         .unwrap();

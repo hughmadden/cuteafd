@@ -26,8 +26,8 @@ impl SpanExpander {
         };
         let expander = Self {
             placeholder: id(&["image_token_id"])?,
-            start: id(&["vision_start_token_id", "boi_token_id"])?,
-            end: id(&["vision_end_token_id", "eoi_token_id"])?,
+            start: id(&["vision_start_token_id", "image_start_token_id", "boi_token_id"])?,
+            end: id(&["vision_end_token_id", "image_end_token_id", "eoi_token_id"])?,
             vocabulary,
         };
         if vocabulary >= 1 << 31
