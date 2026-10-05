@@ -45,6 +45,7 @@ install -m 0644 \
   "$build_output/V41_EXPERT_TP_AOT.json" \
   "$incoming/workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json"
 install -m 0644 "$build_output/V41_FP8_AOT.json" "$incoming/workspace/.cuteafd-wip/V41_FP8_AOT.json"
+install -m 0644 "$build_output/PROGRAMS.json" "$incoming/workspace/.cuteafd-wip/PROGRAMS.json"
 if [[ -d "$build_output/exl3" ]]; then
   mkdir -p "$incoming/workspace/.cuteafd-wip"
   cp -a "$build_output/exl3" "$incoming/workspace/.cuteafd-wip/exl3"

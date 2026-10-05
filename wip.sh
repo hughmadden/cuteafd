@@ -206,6 +206,19 @@ ensure_seed_image() {
 ensure_local_image
 ensure_seed_image
 
+# stream_between_hosts SRC SRC_CMD DST DST_CMD: SRC_CMD's stdout into DST_CMD's stdin, over
+# rdmapipe when both hosts have it, otherwise a plain ssh pipe relayed through this host (the
+# fallback scripts/build/build-dev-images.sh uses for the development images).
+stream_between_hosts() {
+  local src="$1" src_cmd="$2" dst="$3" dst_cmd="$4"
+  if ssh -o BatchMode=yes "$src" 'command -v rdmapipe >/dev/null' &&
+    ssh -o BatchMode=yes "$dst" 'command -v rdmapipe >/dev/null'; then
+    ssh -o BatchMode=yes "$src" "$src_cmd | rdmapipe --send" | ssh -o BatchMode=yes "$dst" "rdmapipe --recv | $dst_cmd"
+  else
+    ssh -o BatchMode=yes "$src" "$src_cmd" | ssh -o BatchMode=yes "$dst" "$dst_cmd"
+  fi
+}
+
 distribute_spark_dev_image() {
   local seed_id
   seed_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
@@ -216,18 +229,12 @@ distribute_spark_dev_image() {
     [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
   done
   ((${#targets[@]})) || return 0
-  for host in "$seed_host" "${targets[@]}"; do
-    ssh -o BatchMode=yes "$host" "command -v rdmapipe >/dev/null" ||
-      release_die "rdmapipe is required to distribute the WIP development image ($host)"
-  done
   echo "== concurrently distributing Spark development image from $seed_host =="
   local -a pids=()
   for host in "${targets[@]}"; do
     (
       set -o pipefail
-      ssh -o BatchMode=yes "$seed_host" \
-        "docker image save '$SPARK_EXPERT_DOCKER_DEV' | rdmapipe --send" |
-        ssh -o BatchMode=yes "$host" 'rdmapipe --recv | docker image load'
+      stream_between_hosts "$seed_host" "docker image save '$SPARK_EXPERT_DOCKER_DEV'" "$host" 'docker image load'
     ) &
     pids+=("$!")
   done
@@ -559,10 +566,8 @@ distribute_expert_slot() {
       set -o pipefail
       ssh -o BatchMode=yes "$host" \
         "docker exec '$spark_container' bash -lc 'rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert'"
-      ssh -o BatchMode=yes "$seed_host" \
-        "docker exec '$spark_container' tar -C '/wip/slots/$slot/spark-expert' -cf - . | rdmapipe --send" |
-        ssh -o BatchMode=yes "$host" \
-          "rdmapipe --recv | docker exec -i '$spark_container' tar -C '/wip/incoming/$slot.spark-expert' -xf -"
+      stream_between_hosts "$seed_host" "docker exec '$spark_container' tar -C '/wip/slots/$slot/spark-expert' -cf - ." \
+        "$host" "docker exec -i '$spark_container' tar -C '/wip/incoming/$slot.spark-expert' -xf -"
       ssh -o BatchMode=yes "$host" \
         "docker exec '$spark_container' bash -lc 'mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert'"
     ) &
