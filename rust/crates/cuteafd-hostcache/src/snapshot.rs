@@ -6,8 +6,9 @@
 //! is never shared: a concurrent plan copies it into its own slab and the later commit releases
 //! the duplicate in favour of a reference. Lookups use the engine's own `Retention` radix
 //! (`cuteafd-core::prefix`), so a host hit is exactly a snapshot the device tier would have
-//! chosen. Eviction follows the same bank order (prompts before turns, oldest access first) and
-//! never touches a pinned snapshot.
+//! chosen. Eviction is configurable: Banks uses prompts before turns, oldest access first;
+//! LeastRecent (used by V4.1 and the generic engine) takes the oldest store/lookup across
+//! banks, with prompts first only at equal use. Neither order touches a pinned snapshot.
 use crate::pool::{Class, HostRange, PoolExhausted, Slab, SlabPool};
 use crate::SnapshotKind;
 use crate::COMPRESSORS;
@@ -33,10 +34,10 @@ pub type Key = u64;
 /// Which unpinned snapshot the host tier deletes first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum EvictionOrder {
-    /// V4.1: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
+    /// Legacy order: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
     #[default]
     Banks,
-    /// Generic engine: least recently used; at equal use a prompt snapshot first (a prompt
+    /// Least recently used; at equal use a prompt snapshot first (a prompt
     /// snapshot shares its pages with its turn snapshot, so bank order deleted fresh prompts
     /// before stale turns and made retries prefill from cold).
     LeastRecent,
