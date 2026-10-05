@@ -104,6 +104,28 @@ def source(root: pathlib.Path, path: str) -> dict:
     return {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def legacy_window(reference: dict) -> dict:
+    if reference.get("schema") == "cuteafd.fidelity.reference/2":
+        matches = [w for w in reference.get("windows", []) if w.get("id") == "legacy"]
+        if len(matches) != 1:
+            raise ValueError("schema 2 reference needs exactly one legacy window")
+        legacy = matches[0]
+    elif reference.get("schema") == "cuteafd.bench.reference/1":
+        legacy = reference
+    else:
+        raise ValueError("unsupported legacy reference schema")
+    start, tokens = legacy.get("score_from"), legacy.get("tokens")
+    if type(start) is not int or start < 1 or not isinstance(tokens, list):
+        raise ValueError("invalid legacy reference tokens/score_from")
+    end = start + 512
+    if len(tokens) < end or end > MAX_TOKENS:
+        raise ValueError("legacy reference has fewer than 512 positions or exceeds the 16K cap")
+    if any(type(t) is not int or not 0 <= t <= 2147483647 for t in tokens[:end]):
+        raise ValueError("invalid legacy reference token id")
+    return {"id": "legacy", "block": "E", "bucket": bucket(start),
+            "tokens": tokens[:end], "roles": ["ctx"] * end, "score_from": start}
+
+
 def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
               tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
               files: list[str] | None = None) -> dict:
@@ -116,13 +138,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     if len(corpus_ids) < 4096:
         raise ValueError("repository source list needs at least 4096 tokens")
     legacy_path = root / "rust/crates/cuteafd-bench/references" / (LEGACY[family] + ".json")
-    legacy = json.loads(legacy_path.read_text())
-    end = legacy["score_from"] + 512
-    if len(legacy["tokens"]) < end:
-        raise ValueError("legacy reference has fewer than 512 positions")
-    windows = [{"id": "legacy", "block": "E", "bucket": bucket(legacy["score_from"]),
-                "tokens": legacy["tokens"][:end], "roles": ["ctx"] * end,
-                "score_from": legacy["score_from"], "provenance": source(root, str(legacy_path.relative_to(root)))}]
+    legacy = legacy_window(json.loads(legacy_path.read_text()))
+    windows = [{**legacy, "provenance": source(root, str(legacy_path.relative_to(root)))}]
     snapshots = []
     for recording in recordings or []:
         if recording.get("model") != model or recording.get("mode") != "record":

@@ -149,6 +149,38 @@ def test_probe_reports_server_rejection(fake_server):
         make(fake_server)
 
 
+def test_legacy_recipe_survives_schema2_reference_migration():
+    legacy = {"tokens": list(range(640)), "score_from": 64}
+    before = builder.legacy_window({"schema": "cuteafd.bench.reference/1", **legacy})
+    reference = {"schema": "cuteafd.fidelity.reference/2", "windows": [
+        {"id": "a00", "tokens": [9] * 1024, "score_from": 512},
+        {"id": "legacy", **legacy}], "tokens": [0], "score_from": 1}
+    assert builder.legacy_window(reference) == before
+    assert before["tokens"] == legacy["tokens"][:576]
+    assert before["roles"] == ["ctx"] * 576
+    assert legacy["tokens"] == list(range(640))
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "schema", "start", "short", "token"])
+def test_migrated_legacy_reference_fails_closed(change):
+    window = {"id": "legacy", "tokens": [3] * 576, "score_from": 64}
+    reference = {"schema": "cuteafd.fidelity.reference/2", "windows": [window]}
+    if change == "missing":
+        reference["windows"] = []
+    elif change == "duplicate":
+        reference["windows"].append(dict(window))
+    elif change == "schema":
+        reference["schema"] = "unknown"
+    elif change == "start":
+        window["score_from"] = True
+    elif change == "short":
+        window["tokens"].pop()
+    else:
+        window["tokens"][0] = -1
+    with pytest.raises(ValueError, match="legacy"):
+        builder.legacy_window(reference)
+
+
 def test_arm_provenance_and_sources_fail_closed():
     arm = policy()
     arm["head"] = "fp8"
