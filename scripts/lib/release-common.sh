@@ -360,6 +360,11 @@ release_load_config() {
   COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator
   SPARK_EXPERT_DOCKER_DEV=cuteafd-spark-expert-dev
   SPARK_EXPERT_DOCKER_INFERENCE=cuteafd-spark-expert
+  # Reset on every load: the coordinator container name is derived from the
+  # constant at the top of this file plus INSTANCE at the end of the function,
+  # so a second load in one process must not suffix an already-suffixed name.
+  RELEASE_COORDINATOR_CONTAINER_NAME=cuteafd-coordinator
+  INSTANCE=
   for release_i in 0 1 2 3 4 5; do
     printf -v "SPARK_${release_i}_HOST" '%s' ""
     printf -v "SPARK_${release_i}_LANE_A" '%s' ""
@@ -450,6 +455,10 @@ release_load_config() {
   [[ "$SPARK_REDUCTION_MIN_ROWS" =~ ^[1-9][0-9]*$ ]] ||
     release_die "SPARK_REDUCTION_MIN_ROWS must be a positive integer"
   [[ "$EXPERT_PORT" =~ ^[0-9]+$ ]] && ((EXPERT_PORT >= 1 && EXPERT_PORT <= 65535)) || release_die "EXPERT_PORT must be in 1..65535"
+  # The same shape scripts/launch/run-family.sh accepts, so one key means one
+  # container name in the family launcher and the production launcher alike.
+  [[ -z "$INSTANCE" || "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
+    release_die "INSTANCE must be [A-Za-z0-9_.-]"
   [[ "$COORDINATOR_GPU_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || release_die "COORDINATOR_GPU_HEADROOM_GIB must be non-negative"
   release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
@@ -546,6 +555,16 @@ release_load_config() {
   RELEASE_CONFIG="$(realpath "$config")"
   RELEASE_MODEL_ID="$MODEL_ID"
   RELEASE_MODEL_REVISION="$MODEL_REVISION"
+  # INSTANCE names a launch that runs beside others on disjoint hardware: its
+  # coordinator container is cuteafd-coordinator-INSTANCE, exactly the suffix
+  # scripts/launch/run-family.sh derives from the same key, so pickers and stops
+  # can never touch another agent's server. Empty keeps the single shared
+  # cuteafd-coordinator. Derived here, from the constant, so every caller
+  # (run.sh, stop.sh, build.sh) uses the same name and a repeated load cannot
+  # double-suffix it. Spark workers stay host+port keyed: their names already
+  # carry the host and the expert port, so two launches on that host would
+  # collide on the port regardless of INSTANCE.
+  RELEASE_COORDINATOR_CONTAINER_NAME="${RELEASE_COORDINATOR_CONTAINER_NAME}${INSTANCE:+-$INSTANCE}"
 }
 
 # Stop-only configuration validation.

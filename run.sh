@@ -20,6 +20,11 @@ SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
 the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
 See docs/tp-ep-configuration.md.
 Command-line values override cuteafd.config for this launch.
+INSTANCE (configuration key, empty by default) names a launch that runs beside
+others on disjoint hardware: its coordinator container is
+cuteafd-coordinator-INSTANCE instead of the one shared cuteafd-coordinator, and
+./stop.sh with the same configuration stops only that one. Accepts Docker's
+container-name characters, [A-Za-z0-9_.-], as scripts/launch/run-family.sh does.
 
   --config FILE                 alternate complete configuration
   --listen HOST:PORT            API address (default 0.0.0.0:8000)
@@ -430,6 +435,7 @@ spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 
 if ((dry_run)); then
   echo "Dry-run checks passed for native V4.1; no services changed."
+  echo "  coordinator container: $coordinator"
   echo "  RTX layout: $RELEASE_RTX_GPUS GPU(s), host indices $gpu_index_csv"
   echo "  physical GPUs: $gpu_uuid_csv"
   echo "  TP2 attention/query/output/draft experts: $TP2_ATTENTION/$TP2_QUERY_PROJECTION/$TP2_OUTPUT_PROJECTION/$TP2_DSPARK_EXPERTS"
