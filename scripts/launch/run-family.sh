@@ -12,13 +12,15 @@ config="$repo_root/cuteafd.config"
 restart=0
 family=""
 embedding_override=""
+wip_slot=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
     --family) family="${2:?--family requires ID}"; shift 2 ;;
     --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--restart]" >&2; exit 2 ;;
+    --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--restart] [--wip SLOT]" >&2; exit 2 ;;
   esac
 done
 # Plain KEY=VALUE lines; the launch reads only the keys below.
@@ -383,6 +385,25 @@ served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
+# --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
+# the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
+# does for DeepSeek V4.1).
+wip_layout="" wip_mount_args=() wip_worker_args=""
+if [[ -n "$wip_slot" ]]; then
+  [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
+  coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
+  wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
+    -v "$wip_layout/share:/opt/cuteafd/share:ro"
+    -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
+    --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
+  wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$wip_slot/bin:/opt/cuteafd/bin:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$wip_slot/lib:/opt/cuteafd/lib:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$wip_slot/share:/opt/cuteafd/share:ro \
+    -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
+fi
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
 # (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
@@ -396,6 +417,7 @@ if [[ -n "$trace" ]]; then
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
 fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
+[[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
@@ -648,13 +670,42 @@ drop_spark_caches() {
   done
   return "$failed"
 }
+if [[ -n "$wip_slot" ]]; then
+  # The slot must exist everywhere before anything starts, and the development images must
+  # carry the SparkInfer revision this checkout pins.
+  pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
+    --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
+  release_require_dev_image_sparkinfer "$(hostname)" "$coordinator_image" \
+    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$coordinator_image")" "$pinned_sparkinfer"
+  release_stage_wip_layout cuteafd-coordinator-wip "$wip_slot" coordinator "$wip_layout"
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" <<'STAGE' ||
+set -euo pipefail
+slot="$1" image="$2" pinned="$3"
+label="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image" 2>/dev/null || true)"
+[[ "$label" == "$pinned" ]] || { echo "$(hostname): $image carries SparkInfer ${label:-<none>}, this checkout pins $pinned" >&2; exit 1; }
+layout="$HOME/.cache/cuteafd/wip-run/$slot" raw="$HOME/.cache/cuteafd/wip-run/$slot.tmp/raw"
+rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
+docker cp "cuteafd-spark-expert-wip:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
+docker cp "cuteafd-spark-expert-wip:/wip/slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
+mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
+mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
+[[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
+[[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
+mv "$raw/"* "$layout.tmp/share/"
+rm -rf "$raw" "$layout" && mv "$layout.tmp" "$layout"
+STAGE
+      { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
+  done
+fi
 ((ranks == 0)) || drop_spark_caches || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
   peers+=("$lane:$port")
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill $device_map_env \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill $device_map_env $wip_worker_args \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
@@ -694,7 +745,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
-  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${device_map_args[@]}" \
+  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${device_map_args[@]}" "${wip_mount_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \

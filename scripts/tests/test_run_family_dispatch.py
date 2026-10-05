@@ -50,10 +50,14 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart\n"
     # DeepSeek V4.1 options do not apply to other families.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--concurrency", "4")
-    assert result.returncode != 0 and "take --config, --restart and --embedding-placement" in result.stderr
+    assert result.returncode != 0 and "take --config, --restart, --wip and --embedding-placement" in result.stderr
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--embedding-placement", "host")
     assert result.returncode == 0, result.stderr
     assert "--embedding-placement host" in result.stdout
+    # A ./wip.sh slot reaches run-family.sh, which serves it from the development images.
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--wip", "s1", "--restart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --wip s1\n"
 
 
 def test_family_table_names_every_launchable_family() -> None:
@@ -98,7 +102,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None, with_nest: bool = True,
-                          extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                          extra_env: dict[str, str] | None = None,
+                          extra_args: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -142,7 +147,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         # Hide any nest the host has, keeping only the stub directory and the system tools.
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
-                           *(["--restart"] if restart else [])],
+                           *(["--restart"] if restart else []), *extra_args],
                           env=env, capture_output=True, text=True, timeout=30)
 
 
@@ -900,3 +905,11 @@ def test_spark_page_caches_drop_over_ssh_without_nest(tmp_path):
     worker = next(i for i, line in enumerate(lines) if "docker run -d --name cuteafd-spark-expert-" in line)
     assert drops[0] < worker < drops[1]
     assert "could not drop" not in result.stderr
+
+
+@pytest.mark.parametrize("slot", ["../x", "-s", "a b", ""])
+def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_args=("--wip", slot))
+    assert result.returncode != 0
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())

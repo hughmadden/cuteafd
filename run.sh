@@ -118,11 +118,12 @@ family="$(release_config_family "$config")"
 if [[ "$family" != deepseek_v41 ]]; then
   embedding_override="${overrides[EMBEDDING]:-}"
   unset 'overrides[EMBEDDING]'
-  ((${#overrides[@]} == 0 && dry_run == 0)) && [[ -z "$wip_slot$dspark_draft_limit" ]] ||
-    release_die "$family checkpoints take --config, --restart and --embedding-placement here (the other options are DeepSeek V4.1's; see scripts/launch/run-family.sh for its config keys)"
+  ((${#overrides[@]} == 0 && dry_run == 0)) && [[ -z "$dspark_draft_limit" ]] ||
+    release_die "$family checkpoints take --config, --restart, --wip and --embedding-placement here (the other options are DeepSeek V4.1's; see scripts/launch/run-family.sh for its config keys)"
   family_args=(--config "$config" --family "$family")
   [[ -z "$embedding_override" ]] || family_args+=(--embedding-placement "$embedding_override")
   ((restart == 0)) || family_args+=(--restart)
+  [[ -z "$wip_slot" ]] || family_args+=(--wip "$wip_slot")
   exec "$repo_root/scripts/launch/run-family.sh" "${family_args[@]}"
 fi
 
