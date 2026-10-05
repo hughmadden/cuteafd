@@ -45,6 +45,7 @@ Writes the raw files ``qwen4-golden`` reads:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -70,7 +71,9 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     require_media_flag(manifest, getattr(a, "media", False), "qwen4")
     identity = verify_snapshot(manifest, a.snapshot)
     from shape_invariant import qualify
-    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
+    diagnostic_stop = getattr(a, "diagnostic_stop_after", None)
+    proof = None if diagnostic_stop is not None else qualify(
+        a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
     if PREFIX + "norm.weight" in dense:
@@ -143,6 +146,14 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             memory.check(f"layer {layer_id}")
             times.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+            if diagnostic_stop == layer_id:
+                (a.out / "diagnostic.json").write_text(json.dumps({
+                    "qualification": False, "kind": "layer-timing-only",
+                    "set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                    "ple_storage_seal_sha256": dense.ple_storage_seal_sha256,
+                    "seconds_per_layer": times, "windows": [w["id"] for w in manifest["windows"]],
+                }, indent=2) + "\n")
+                return
         torch.set_default_dtype(torch.bfloat16)
         with torch.device("meta"):
             mixer = ref.Qwen4ExpTextGatedResidual(config, use_combine=False)
@@ -160,16 +171,54 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
         experts_snapshot=str(a.experts_snapshot or a.snapshot),
         reference="transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
-        prefix_qualification=proof)
+        prefix_qualification=proof, ple_storage_seal_sha256=dense.ple_storage_seal_sha256)
+
+
+def verify_ple_storage(snapshot: Path, local: Path, index: dict) -> str:
+    """Admit a sealed local copy of only the indexed random-access table files."""
+    seal_bytes = (local / "seal.json").read_bytes()
+    seal = json.loads(seal_bytes)
+    expected = {v for k, v in index.items() if ".ple.ple_embedding.ngram_embedding.shard_" in k}
+    entries = seal.get("files", [])
+    if (seal.get("complete") is not True or seal.get("snapshot_revision") != snapshot.name
+            or seal.get("index_sha256") != hashlib.sha256((snapshot / "model.safetensors.index.json").read_bytes()).hexdigest()
+            or {entry["path"] for entry in entries} != expected or len(entries) != len(expected)):
+        raise ValueError("local PLE seal does not match the pinned checkpoint index")
+    total = 0
+    for entry in entries:
+        name = entry["path"]
+        path = local / name
+        if Path(name).name != name or path.resolve().parent != local.resolve():
+            raise ValueError("local PLE file escapes its staging directory")
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            while data := stream.read(8 << 20):
+                digest.update(data)
+                size += len(data)
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        if size != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
+            raise ValueError(f"local PLE bytes differ from the copy seal: {name}")
+        total += size
+    if total != seal.get("total_bytes"):
+        raise ValueError("local PLE total bytes differ from the copy seal")
+    return hashlib.sha256(seal_bytes).hexdigest()
 
 
 class Weights:
-    def __init__(self, snapshot: Path):
+    def __init__(self, snapshot: Path, ple_local: Path | None = None):
         self.snapshot = snapshot
         self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
         self.files: dict[str, object] = {}
         self.read_bytes = 0
         self.read_seconds = 0.0
+        self.ple_local = ple_local
+        self.ple_storage_seal_sha256 = verify_ple_storage(snapshot, ple_local, self.index) if ple_local else None
+
+    def ple_path(self, name: str) -> Path:
+        if ".ple.ple_embedding.ngram_embedding.shard_" not in name:
+            raise ValueError("local PLE mapping requested for a non-table tensor")
+        return (self.ple_local or self.snapshot) / self.index[name]
 
     def __contains__(self, name: str) -> bool:
         return name in self.index
@@ -219,7 +268,7 @@ class LazyNgramTable(torch.nn.Module):
             pick = (shard_of == shard).nonzero().flatten()
             name = f"{self.prefix}shard_{shard}.weight"
             # PLE may touch all 128 shards in one layer; do not cache these handles.
-            with safe_open(str(self.w.snapshot / self.w.index[name]), framework="pt", device="cpu") as handle:
+            with safe_open(str(self.w.ple_path(name)), framework="pt", device="cpu") as handle:
                 view = handle.get_slice(name)
                 for i in pick.tolist():
                     r = int(unique[i]) - shard * SHARD_ROWS
@@ -287,6 +336,8 @@ def main() -> None:
     p.add_argument("--snapshot", type=Path, required=True, help="coordinator weights, config and tokenizer")
     p.add_argument("--experts-snapshot", type=Path,
                    help="routed experts (FP8 per-expert or BF16 fused; not EXL3); default --snapshot")
+    p.add_argument("--ple-local", type=Path, help="hash-sealed local PLE physical shards; all other weights still stream")
+    p.add_argument("--diagnostic-stop-after", type=int, help="window layer-timing diagnostic only; no qualification or logits")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
@@ -303,6 +354,9 @@ def main() -> None:
     if a.media and not a.windows:
         p.error("--media requires --windows (official media hook not implemented)")
 
+    if a.diagnostic_stop_after is not None and (not a.windows or a.prefix_only or a.diagnostic_stop_after < 0):
+        p.error("--diagnostic-stop-after requires --windows, a nonnegative layer and no --prefix-only")
+
     from tokenizers import Tokenizer
     from transformers import AutoConfig
     from transformers.masking_utils import create_causal_mask
@@ -318,11 +372,13 @@ def main() -> None:
     install_eager(ref)
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
+    if a.diagnostic_stop_after is not None and a.diagnostic_stop_after >= config.num_hidden_layers:
+        p.error("diagnostic layer is outside the model")
     if a.windows:
         if a.text or a.text_file or a.max_tokens or a.stop_after is not None:
             p.error("--windows cannot be combined with legacy text/truncation/stop options")
         a.out.mkdir(parents=True, exist_ok=True)
-        dense = Weights(a.snapshot)
+        dense = Weights(a.snapshot, a.ple_local)
         experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
         run_windows(a, config, ref, dense, experts_src, create_causal_mask)
         return
@@ -330,7 +386,7 @@ def main() -> None:
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     if a.max_tokens:
         tokens = tokens[:a.max_tokens]
-    dense = Weights(a.snapshot)
+    dense = Weights(a.snapshot, a.ple_local)
     experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
     if PREFIX + "norm.weight" in dense:
         raise ValueError("unexpected final norm: this model feeds the stream mixer straight into lm_head")

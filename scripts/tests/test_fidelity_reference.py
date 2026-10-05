@@ -825,3 +825,73 @@ def test_qwen_window_and_legacy_layers_enter_eval_after_loading():
         evaluated = source.index('layer.eval()', loaded)
         executed = source.index('h = layer(', evaluated)
         assert loaded < evaluated < executed
+
+
+def qwen_storage_scope():
+    tree = ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "__future__"]
+    nodes += [n for n in tree.body if getattr(n, "name", None) in ("verify_ple_storage", "Weights")]
+    import os
+    scope = {"Path": pathlib.Path, "hashlib": hashlib, "json": json, "os": os}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "qwen-storage", "exec"), scope)
+    return scope
+
+
+def ple_storage_fixture(tmp_path):
+    snapshot = tmp_path / "pinned-revision"
+    local = tmp_path / "local"
+    snapshot.mkdir()
+    local.mkdir()
+    table = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    index = {table: "table.safetensors", "lm_head.weight": "head.safetensors"}
+    index_bytes = json.dumps({"weight_map": index}).encode()
+    (snapshot / "model.safetensors.index.json").write_bytes(index_bytes)
+    data = b"synthetic table bytes"
+    (local / "table.safetensors").write_bytes(data)
+    seal = {"complete": True, "snapshot_revision": snapshot.name,
+            "index_sha256": hashlib.sha256(index_bytes).hexdigest(), "total_bytes": len(data),
+            "files": [{"path": "table.safetensors", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}]}
+    (local / "seal.json").write_text(json.dumps(seal))
+    return snapshot, local, index, table, seal
+
+
+def test_qwen_local_ple_mapping_keeps_dense_weights_streamed(tmp_path):
+    scope = qwen_storage_scope()
+    snapshot, local, index, table, seal = ple_storage_fixture(tmp_path)
+    weights = scope["Weights"](snapshot, local)
+    assert weights.ple_path(table) == local / index[table]
+    assert weights.ple_storage_seal_sha256 == hashlib.sha256((local / "seal.json").read_bytes()).hexdigest()
+    assert scope["Weights"](snapshot).ple_path(table) == snapshot / index[table]
+    with pytest.raises(ValueError, match="non-table"):
+        weights.ple_path("lm_head.weight")
+    assert "self.snapshot / shard" in ast.unparse(ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text()))
+
+
+@pytest.mark.parametrize("change", ["incomplete", "revision", "index", "bytes", "hash", "missing", "extra", "total", "symlink"])
+def test_qwen_local_ple_storage_fails_closed(tmp_path, change):
+    scope = qwen_storage_scope()
+    snapshot, local, index, table, seal = ple_storage_fixture(tmp_path)
+    if change == "incomplete": seal["complete"] = False
+    elif change == "revision": seal["snapshot_revision"] = "other"
+    elif change == "index": seal["index_sha256"] = "0" * 64
+    elif change == "bytes": seal["files"][0]["bytes"] += 1
+    elif change == "hash": (local / "table.safetensors").write_bytes(b"corrupted table bytes")
+    elif change == "missing": seal["files"] = []
+    elif change == "extra": seal["files"].append(dict(seal["files"][0], path="head.safetensors"))
+    elif change == "total": seal["total_bytes"] += 1
+    elif change == "symlink":
+        (local / "table.safetensors").rename(tmp_path / "outside")
+        (local / "table.safetensors").symlink_to(tmp_path / "outside")
+    (local / "seal.json").write_text(json.dumps(seal))
+    with pytest.raises(ValueError):
+        scope["Weights"](snapshot, local)
+
+
+def test_qwen_layer_diagnostic_cannot_publish_golden_evidence():
+    tree = ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text())
+    run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
+    assert "None if diagnostic_stop is not None else qualify" in run
+    assert "'qualification': False" in run and "'kind': 'layer-timing-only'" in run
+    stop = next(n for n in ast.walk(tree) if isinstance(n, ast.If) and ast.unparse(n.test) == "diagnostic_stop == layer_id")
+    assert isinstance(stop.body[-1], ast.Return)
+    assert "finish_golden" not in ast.unparse(stop)
