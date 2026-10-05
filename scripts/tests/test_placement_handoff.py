@@ -56,6 +56,8 @@ KV_POOL_SIZE=
 MEMORY_RESERVATION=
 DSPARK=on
 EMBEDDING=gpu
+VISION=auto
+AUDIO=off
 # Mirror the run.sh scope the extracted block relies on: release_load_config
 # defaults DSPARK_DRAFT_POLICY, and run.sh's argument parsing always defines
 # dspark_draft_limit (empty unless --dspark-draft-limit was passed). Omitting
