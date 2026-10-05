@@ -102,12 +102,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     ready_rx.await.context("engine failed before it was ready")??;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub, profile.clone());
+        hub.clone(), profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
     tokio::select! {
-        served = axum::serve(listener, cuteafd_bench::app(router)
+        served = axum::serve(listener, cuteafd_bench::app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         finished = worker => finished??,
     }

@@ -109,8 +109,8 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
-    let router = cuteafd_api::openai::router_with_console(send, limits, stats, http_queue_wait, console_hub);
-    axum::serve(listener, cuteafd_bench::app(router).into_make_service_with_connect_info::<std::net::SocketAddr>())
+    let router = cuteafd_api::openai::router_with_console(send, limits, stats, http_queue_wait, console_hub.clone());
+    axum::serve(listener, cuteafd_bench::app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

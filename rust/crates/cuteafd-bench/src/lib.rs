@@ -26,9 +26,13 @@ pub mod text;
 
 pub use runner::Bench;
 
-/// `router` with the benchmark mounted (routes and lockout) on the process-wide bench.
-pub fn app(router: axum::Router) -> axum::Router {
-    http::mount(router, Bench::global())
+/// `router` with the benchmark mounted (routes and lockout) on the process-wide
+/// bench. `console` is the server's live console: a run allows token text on it
+/// while the lockout makes the run's own requests the only ones served.
+pub fn app(router: axum::Router, console: std::sync::Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
+    let bench = Bench::global();
+    bench.set_console(console);
+    http::mount(router, bench)
 }
 
 /// Records that the API now accepts requests on `listener` (readiness time
