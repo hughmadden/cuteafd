@@ -776,6 +776,12 @@ Work, in priority order:
    `prefill_rows`, or run them as one lane. The default is 4096 rows, so
    this needs a small `--prefill-rows` (256 here); the same mismatch
    applies to any tail between `prefill_rows` and `2 × MIN_LANE_ROWS`.
+   Root-owned outputs (2026-10-06): `run.sh` and `scripts/launch/run-family.sh`
+   start coordinator containers as root. Everything they write to mounted
+   host directories (bench dir, fidelity `--dump-dir`) becomes root-owned.
+   Agents then can't archive or delete it without agent-sudo (76 GB of MiMo
+   calibration dumps this time). Run as the host user (`--user`, with
+   `HOME`/`USER` set) once GPU, RDMA and memlock access are checked under it.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
