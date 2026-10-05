@@ -30,7 +30,12 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     for f in one["fixtures"]:
         assert (tmp_path / "one" / f["path"]).read_bytes() == (tmp_path / "two" / f["path"]).read_bytes()
     builder = load_script("fidelity-set")
+    requests = []
     def probe(body):
+        requests.append(body)
+        assert body["max_tokens"] == 2048
+        task = body["messages"][1]["content"][1]["text"]
+        assert "at least 800 words" in task and "at least eight" in task
         assert body["messages"][1]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
         return {"probe": {"engine": "fake", "prompt_ids": [1] + [9] * 4 + [2],
                 "generated": [3] * 600, "media": [{k: v for k, v in span().items() if k != "fixture"}]},
@@ -41,6 +46,23 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
         arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
     assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
     assert all(w["block"] == "vision" and set(w["roles"][w["score_from"]:]) == {"gen"} for w in result["windows"])
+    tasks = [body["messages"][1]["content"][1]["text"] for body in requests]
+    assert "visible line of code" in tasks[0] and "Python parser" in tasks[2]
+    assert "matplotlib program" in tasks[4] and "validator" in tasks[6]
+    def short(body):
+        response = probe(body)
+        response["probe"]["generated"] = [3] * 525
+        return response
+    with pytest.raises(ValueError, match="576 real generated"):
+        builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media2",
+            arm=arm, probe=short, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+    def long(body):
+        response = probe(body)
+        response["probe"]["generated"] = [3] * 1536
+        return response
+    expanded = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media2",
+        arm=arm, probe=long, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+    assert all(w["provenance"]["generated_tokens"] == 1536 for w in expanded["windows"])
     def missing(body):
         response = probe(body)
         del response["probe"]["media"]
