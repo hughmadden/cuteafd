@@ -18,6 +18,14 @@ set_property(CACHE CUTEAFD_V41_NVFP4_TILE_M PROPERTY STRINGS auto 16 32 64 128)
 if(NOT "${CUTEAFD_V41_NVFP4_TILE_M}" MATCHES "^(auto|16|32|64|128)$")
   message(FATAL_ERROR "CUTEAFD_V41_NVFP4_TILE_M must be auto, 16, 32, 64, or 128")
 endif()
+set(CUTEAFD_V41_NVFP4_WIDE_TILE_M "" CACHE STRING "Optional NVFP4 tile M override for capacities above 16")
+set(CUTEAFD_V41_NVFP4_WIDE_TILE_ARG "")
+if(NOT "${CUTEAFD_V41_NVFP4_WIDE_TILE_M}" STREQUAL "")
+  if(NOT "${CUTEAFD_V41_NVFP4_WIDE_TILE_M}" MATCHES "^(16|32|64|128)$")
+    message(FATAL_ERROR "CUTEAFD_V41_NVFP4_WIDE_TILE_M must be empty, 16, 32, 64, or 128")
+  endif()
+  set(CUTEAFD_V41_NVFP4_WIDE_TILE_ARG --wide-tile-m "${CUTEAFD_V41_NVFP4_WIDE_TILE_M}")
+endif()
 set(CUTEAFD_V41_NVFP4_OUTPUT_SHARDS "0" CACHE STRING "NVFP4 output splitting: 0 adaptive, 1 disabled, positive divisor of 40 direct-only")
 if(NOT "${CUTEAFD_V41_NVFP4_OUTPUT_SHARDS}" MATCHES "^(0|1|2|4|5|8|10|20|40)$")
   message(FATAL_ERROR "CUTEAFD_V41_NVFP4_OUTPUT_SHARDS must be 0 or a positive divisor of 40")
@@ -57,6 +65,7 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
       --output-dir "${nvfp4_dir}" --role "${role}"
       --rows "${CUTEAFD_V41_NVFP4_CAPACITY_ARG}"
       --tile-m "${CUTEAFD_V41_NVFP4_TILE_M}"
+      ${CUTEAFD_V41_NVFP4_WIDE_TILE_ARG}
       --output-shards "${CUTEAFD_V41_NVFP4_OUTPUT_SHARDS}"
       ${CUTEAFD_V41_NVFP4_SHARE_INPUT_ARG}
       ${CUTEAFD_V41_NVFP4_PAD_ARG}

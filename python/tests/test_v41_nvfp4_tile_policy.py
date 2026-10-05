@@ -65,9 +65,10 @@ def test_export_rejects_invalid_shards_before_gpu_import(exporter, monkeypatch, 
         exporter.export(tmp_path / "output", "rtx_tp2", [1], 16, output_shards=value)
 
 
+@pytest.mark.parametrize("wide", [None, 32])
 @pytest.mark.parametrize("requested", [None, 16, 32, 64, 128])
 @pytest.mark.parametrize("shards", [0, 1, 5])
-def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requested, shards):
+def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requested, shards, wide):
     dtype = NS(itemsize=2)
     torch = NS(bfloat16=dtype, int32="int32", device=lambda *args: "cuda",
                cuda=NS(init=Mock(), current_device=lambda: 0,
@@ -80,7 +81,7 @@ def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requ
         configs.append(caps.decode_config)
         # Deliberately resolve a different tile for explicit requests too: the
         # exporter must trust the plan, never its input or a second policy call.
-        tile = {1: 16, 80: 32, 256: 64, 4096: 128}[caps.max_tokens]
+        tile = {1: 16, 16: 16, 80: 32, 256: 64, 4096: 128}[caps.max_tokens]
         resolved.append(tile)
         core = NS(tensor_specs=[
             NS(name="packed_input", shape=(1, tile), dtype=dtype, init=None),
@@ -109,17 +110,18 @@ def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requ
     monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe", NS(_impl=moe))
     monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe._tuning",
                         NS(MoeDecodeConfig=lambda **kwargs: NS(**kwargs)))
-    exporter.export(tmp_path, "rtx_tp2", [1, 80, 256, 4096], requested, output_shards=shards)
+    exporter.export(tmp_path, "rtx_tp2", [1, 16, 80, 256, 4096], requested, output_shards=shards, wide_tile_m=wide)
     manifest = json.loads((tmp_path / "v41_nvfp4_experts.json").read_text())
-    assert [config.dynamic_tile_m for config in configs] == [requested] * 4
-    assert compiled_tiles == resolved == [16, 32, 64, 128]
-    expected_shards = [0] * 4 if shards == 0 else [shards, 1, 1, 1]
+    assert [config.dynamic_tile_m for config in configs] == [requested] * 2 + [wide if wide is not None else requested] * 3
+    assert compiled_tiles == resolved == [16, 16, 32, 64, 128]
+    expected_shards = [0] * 5 if shards == 0 else [shards, 1, 1, 1, 1]
     assert compiled_shards == expected_shards
     assert [v["output_shards"] for v in manifest["variants"]] == expected_shards
     assert manifest["tile_m"] == requested
+    assert manifest["wide_tile_m"] == wide
     assert [variant["tile_m"] for variant in manifest["variants"]] == resolved
     assert [variant["route_mode"] for variant in manifest["variants"]] == [
-        "direct", "grouped", "grouped", "grouped"]
+        "direct", "grouped", "grouped", "grouped", "grouped"]
 
 
 @pytest.mark.parametrize("value", [None, "auto", "16", "32", "64", "128", "8", "AUTO", ""])
@@ -145,3 +147,35 @@ def test_cmake_tile_validation(tmp_path, value):
         assert f"TILE={value or '16'}" in result.stdout
     assert '--tile-m "${CUTEAFD_V41_NVFP4_TILE_M}"' in source
     assert "PROPERTY STRINGS auto 16 32 64 128" in source
+
+
+@pytest.mark.parametrize("value", [0, 8, 256, "auto", 16.0, True])
+def test_export_rejects_invalid_wide_tiles(exporter, monkeypatch, tmp_path, value):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.raises(ValueError, match="wide_tile_m"):
+        exporter.export(tmp_path / "output", "rtx_tp2", [1], 16, wide_tile_m=value)
+
+
+@pytest.mark.parametrize("value", ["", "16", "32", "64", "128", "8", "auto"])
+def test_cmake_wide_tile_validation(tmp_path, value):
+    if shutil.which("cmake") is None:
+        pytest.skip("cmake unavailable")
+    source = CMAKE.read_text()
+    declarations = source.split("set(CUTEAFD_V41_NVFP4_INCLUDE_DIRS)")[0]
+    script = tmp_path / "wide-policy.cmake"
+    script.write_text('set(CUTEAFD_ENABLE_CUDA ON)\nset(CUTEAFD_CUDA_ARCHITECTURES 120)\n'
+                      + declarations)
+    result = subprocess.run(
+        ["cmake", f"-DCUTEAFD_V41_NVFP4_WIDE_TILE_M={value}", "-P", str(script)],
+        capture_output=True, text=True)
+    assert (result.returncode == 0) == (value not in ("8", "auto")), result.stderr
+    assert '${CUTEAFD_V41_NVFP4_WIDE_TILE_ARG}' in source
+
+
+def test_cli_wide_tile_policy(exporter, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", [str(EXPORTER), "--output-dir", str(tmp_path),
+                                    "--role", "rtx_tp2", "--wide-tile-m", "32"])
+    exporter.export = Mock()
+    exporter.main()
+    assert exporter.export.call_args.args[3] == 16
+    assert exporter.export.call_args.args[-1] == 32

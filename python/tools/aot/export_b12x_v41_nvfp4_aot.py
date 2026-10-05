@@ -114,6 +114,7 @@ def export(
     output_shards: int = 1,
     share_input: bool = False,
     pad_intermediate: bool = False,
+    wide_tile_m: int | None = None,
 ) -> None:
     if type(share_input) is not bool:
         raise TypeError("share_input must be boolean")
@@ -123,6 +124,9 @@ def export(
         raise ValueError("output_shards must be 0 (adaptive) or a positive divisor of 40")
     if tile_m is not None and (type(tile_m) is not int or tile_m not in TILE_M_CHOICES):
         raise ValueError("tile_m must be None (auto), 16, 32, 64, or 128")
+
+    if wide_tile_m is not None and (type(wide_tile_m) is not int or wide_tile_m not in TILE_M_CHOICES):
+        raise ValueError("wide_tile_m must be None (unchanged), 16, 32, 64, or 128")
 
     import torch
     from b12x.moe.fused_moe import _impl as moe
@@ -167,6 +171,7 @@ def export(
         "capability": [properties.major, properties.minor],
         "physical_sms": properties.multi_processor_count,
         "tile_m": tile_m,
+        "wide_tile_m": wide_tile_m,
         "share_input": share_input,
         "pad_intermediate": pad_intermediate,
         "geometry": {
@@ -196,7 +201,7 @@ def export(
             backend="dynamic",
             route_planner="internal",
             max_active_clusters=None,
-            dynamic_tile_m=tile_m,
+            dynamic_tile_m=wide_tile_m if requested_rows > 16 and wide_tile_m is not None else tile_m,
             dynamic_route_mode=route_mode,
             w4a16_route_mode=None,
             nvfp4_share_input=share_input,
@@ -415,6 +420,10 @@ def main() -> None:
         help="default 16 until GPU qualified; auto opts into the planner's tile ladder",
     )
     parser.add_argument(
+        "--wide-tile-m", type=int, choices=TILE_M_CHOICES, default=None,
+        help="override tile M only for capacities above 16; decode buckets stay unchanged",
+    )
+    parser.add_argument(
         "--max-active-clusters",
         type=int,
         default=None,
@@ -433,7 +442,7 @@ def main() -> None:
     args = parser.parse_args()
     rows = [int(value) for value in args.rows.split(",") if value]
     export(args.output_dir, args.role, rows, args.tile_m, args.max_active_clusters,
-           args.output_shards, args.share_input, args.pad_intermediate)
+           args.output_shards, args.share_input, args.pad_intermediate, args.wide_tile_m)
 
 
 if __name__ == "__main__":
