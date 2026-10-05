@@ -84,11 +84,24 @@ const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash"
 fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
     // The newest basic-profile report per family, checkpoint and hardware (`placed`
     // is newest first), on the reference layouts (one or two RTX, Sparks or none).
+    // A qualified replacement can retire a checkpoint from current cards without
+    // deleting its historical reports or removing it from the benchmark index.
+    let superseded: Vec<_> = placed.iter().filter(|p| {
+        p.report.baseline.as_ref().is_some_and(|b| b.quality.status == CheckStatus::Pass)
+            && matches!(p.report.profile.as_str(), "smoke" | "share")
+    }).flat_map(|p| p.report.server.configuration.settings.iter()
+        .filter(|s| s.name == "supersedes-checkpoint")
+        .filter_map(|s| s.value.as_ref())
+        .filter(|name| name.as_str() != p.report.server.checkpoint())
+        .map(|name| (p.report.server.family.clone(), name.clone()))).collect();
     let mut newest: BTreeMap<(usize, String, String, String), &Placed> = BTreeMap::new();
     for p in placed {
         let r = &p.report;
         if r.baseline.is_none() || !matches!(r.profile.as_str(), "smoke" | "share")
             || !(1..=2).contains(&r.server.hardware.used_gpus()) {
+            continue;
+        }
+        if superseded.iter().any(|(family, name)| *family == r.server.family && *name == r.server.checkpoint()) {
             continue;
         }
         let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
@@ -296,6 +309,43 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_replacement_retires_cards_but_keeps_history() {
+        let mut old = crate::sample::report(false);
+        old.server.family = Some("mimo_v2".into());
+        old.server.configuration.snapshot = None;
+        old.server.model = "XiaomiMiMo/MiMo-V2-Flash".into();
+        let mut replacement = old.clone();
+        replacement.server.model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into();
+        replacement.server.configuration.settings.push(crate::report::Setting {
+            name: "supersedes-checkpoint".into(), value: Some(old.server.checkpoint()),
+            default: None, source: "publication".into(),
+        });
+        let mut other_family = old.clone();
+        other_family.server.family = Some("qwen4".into());
+        let mut placed = vec![
+            Placed { dir: "benchmarks/mimo_v2/new".into(), report: replacement },
+            Placed { dir: "benchmarks/mimo_v2/old".into(), report: old },
+            Placed { dir: "benchmarks/qwen4/other".into(), report: other_family },
+        ];
+        let rows = reference_rows(&placed);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|(family, _, _, p)| family == "mimo_v2"
+            && p.report.server.checkpoint() == "XiaomiMiMo/MiMo-V2-Flash"));
+        assert!(family_cards(&placed, "mimo_v2").contains("/new/card.svg"));
+        assert!(!family_cards(&placed, "mimo_v2").contains("/old/card.svg"));
+        assert!(index(&placed).contains("MiMo-V2-Flash"));
+        assert!(index(&placed).contains("MiMo-V2.6-Flash-MOPD"));
+        // A failed or non-basic replacement never hides a previous qualified result.
+        placed[0].report.baseline.as_mut().unwrap().quality.status = CheckStatus::Fail;
+        assert_eq!(reference_rows(&placed).len(), 3);
+        placed[0].report.baseline.as_mut().unwrap().quality.status = CheckStatus::Pass;
+        placed[0].report.profile = "decode".into();
+        assert_eq!(reference_rows(&placed).len(), 2);
+        assert!(reference_rows(&placed).iter().any(|(family, _, _, p)| family == "mimo_v2"
+            && p.report.server.checkpoint() == "XiaomiMiMo/MiMo-V2-Flash"));
+    }
 
     #[test]
     fn publish_rebuilds_the_table_and_index() {
