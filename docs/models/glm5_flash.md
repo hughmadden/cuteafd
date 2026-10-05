@@ -76,8 +76,10 @@ reasoning-enabled history and reports median per-turn decode rate.
 | **F (default)** | **111.1** | **172.4** | **5,137** | **132.6** | 86.52% | 0.04231 | 3.46966 |
 
 F gains 9.0% C1, 8.2% C4 and 3.9% agentic decode, with 0.59 points less
-top-1 and better KL/NLL. Readiness medians were 41 → 43 s (worker and
-container startup included).
+top-1 and better KL/NLL. The three-position top-1 loss is borderline against
+the later paired ~0.5-point bar and is noisy on 512 positions; it does not
+establish a precise quality ranking. Readiness medians were 41 → 43 s
+(worker and container startup included).
 
 2 RTX + 4 Sparks, head split, one warm launch per arm:
 
@@ -86,12 +88,99 @@ container startup included).
 | **D (default)** | **157.6** | **283.2** | **6,767** | **202.0** | 88.48% | 0.04508 | 3.47410 |
 | F (opt-in) | 172.1 | 255.7 | 5,113 | 209.4 | 86.91% | 0.04780 | 3.47082 |
 
-F gains 9.2% C1 but loses 9.7% C4 and 24.4% prefill, loses 1.56 top-1
-points and worsens KL. It fails the promotion bar under the head split.
-Readiness was 53 → 50 s. Both arms/layouts pass fidelity and exact
-prefix-cache restores; the speculation check permits verify rounding and
-does not establish byte-identical speculative output. See the
+Original column-split F gains 9.2% C1 but loses 9.7% C4 and 24.4% prefill
+in this single pair, loses 1.56 top-1 points and worsens KL. It fails the
+nominal paired top-1 bar under the head split; its KL delta of 0.00273 nat
+is within the later 0.005-nat bar. The large performance loss was not stable
+across subsequent warmed launches. Readiness was 53 → 50 s. Both
+arms/layouts pass fidelity and exact prefix-cache restores; the speculation
+check permits verify rounding and does not establish byte-identical
+speculative output. See the
 [full comparison and conditions](../../benchmarks/glm5_flash/2026-10-04-fp8-recheck/comparison.json).
+
+The original timed 8K regression is principally expert-receive waiting:
+BF16 expert waits were 387/382 ms, versus 575/979 ms for FP8, while FP8 GPU
+wait stayed 487/487 ms (BF16 454/453 ms). The FP8 warm request was faster
+than BF16. Profiling separately found a real local wide-row W8A16 expansion
+cost, but unchanged synchronization/peer counts and no observed prefill
+allocation or graph instantiation. Original route/clock evidence was absent,
+so attributing the growing expert wait to thermal throttling is unsupported.
+Missing GPU1 exports, BF16 reconversion, duplicated full-head KDA and
+row128 slice recalibration were ruled out; all 238 companion KDA tensor
+payloads matched.
+
+The numerical contribution is different: the original KDA output computes
+half-K partials, rounds each to BF16, then adds them. KDA-only and head-only
+ablations put most of the added KL in KDA; retaining FP32 output partials
+improves the paired golden result. Full-K token-row ownership removes that
+partial-rounding/reduction change at the KDA output. It does not prove
+end-to-end batch or speculative numerical invariance.
+
+## Split KDA token-row opt-in
+
+The qualified component path keeps KDA heads, recurrence and state split, but
+shares normalized heads for each GPU's owned token rows. Each GPU projects
+its rows with the full output-weight K dimension; completed rows concatenate
+without a partial sum. This avoids rounding two KDA output partials before
+the peer addition. It does not replace MLA, dense/shared FFN, or Spark
+expert reduction.
+
+With two distinct coordinator GPUs, select the following on `cuteafd serve-glmf`,
+retaining `--fp8-prefill mla,ffn` and the existing FP8 DFlash2 drafter:
+
+```text
+--kda-fp8 row128 --fp8-head --kda-output-shard --kda-prefill-expanded
+```
+
+The last two switches also accept `CUTEAFD_GLMF_KDA_OUTPUT_SHARD=1` and
+`CUTEAFD_GLMF_KDA_PREFILL_EXPANDED=1` inside the coordinator container.
+`run-family.sh` does not forward these environment variables from the host;
+the task kit's KDA-only image entrypoint selects them explicitly. Do not add
+them as unknown launcher configuration keys. Expansion is transient in
+existing scratch; there is still one resident FP8 format per tensor.
+
+The full KDA output FP8 payload/scales are replicated once on each GPU,
+adding 561 MiB per GPU over column slicing. Extra peer slots add 128 MiB per
+GPU at 4096 prefill rows. Global row count chooses GEMV/TMA arithmetic even
+when each GPU owns fewer rows; odd and zero-owned suffixes retain matching
+peer flag sequences. Component gates cover full-head byte equality, guards,
+changed-input graph replay and the 1/22/63/64/512/513/4096-row cases.
+
+At 4096 rows, the qualified whole-output-path component measured column
+shard to token rows at 1579.8 to 1212.3 us idle (-23.3%) and 2443.9 to
+1791.8 us under 31.7 GB/s GPU0 ingress (-26.7%). Expansion is included;
+one warm graph per condition and 16 timed replays were used. Per-GPU peer
+payload falls from 48 to 32 MiB. These component timings are not an
+end-to-end throughput claim.
+
+Earlier prototype9, EXL3 K3.25 with FP8 DFlash2, two RTX PRO 6000 at
+325 W plus TP4, one warmed launch per arm:
+
+| Arm | C1 | C4 | Warm 8K prefill | Top-1 /512 | KL | NLL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 KDA/head | 156.88 | 253.48 | 6,704 | 453 | 0.045076 | 3.474099 |
+| Full-K token-row FP8 KDA/head | 167.65 | 255.18 | 6,796 | 460 | 0.045916 | 3.460224 |
+
+The candidate passes the revised paired quality bar (KL +0.000840 nat,
+no top-1 loss). C1 improves 6.9%; C4 and prefill are effectively flat in
+this single pair. The seven-position top-1 gain is noisy, not evidence of
+better precision. Readiness was 56 to 49 s; exact prefix restores pass.
+The warm prefill rate is not the median of all timed requests; final
+interleaved D/T evidence is indexed in the task STATUS.
+
+`--kda-fp32-partials` is a mutually exclusive diagnostic, not the recommended
+serving path. The unfinished `--split-mla-rows` and `--split-ffn-rows`
+prototypes are retired; their historical commits do not qualify them for
+serving. No launcher or precision default changes in this branch.
+
+Hugh Madden owns the follow-up ([issue #1](https://github.com/tpurtell/cuteafd/issues/1)).
+The reproducible local kit, provenance, final measurements and gate logs are
+indexed by `/home/tj/.cache/cuteafd/builds/glmf-split-fp8/STATUS.md`.
+The existing 512-position top-k-plus-tail golden is a smoke check, not a
+full-vocabulary teacher KL comparison or a statistically precise top-1
+ranking (about 1.4 percentage-point standard error). The paired precision
+bar is FP8 minus same-layout BF16 KL at most 0.005 nat and top-1 loss at most
+about 0.5 percentage point; small top-1 deltas need a larger fidelity set.
 
 ## Known limits
 
@@ -102,10 +191,13 @@ does not establish byte-identical speculative output. See the
 - Running BF16 attention natively (`CUTEAFD_GLM_BF16=native`) costs a
   meaningful coordinator-step slowdown versus the default FP8-block path;
   use it only when the extra precision is worth it.
-- FP8 KDA/head under the two-GPU head split misses the C4, prefill and
-  top-1/KL promotion bars. BF16 KDA/head stays the split default; explicit
-  FP8 remains opt-in. The Spark-wait and split-rounding contributions need
-  a matched follow-up before any promotion.
+- Original column-split FP8 KDA/head misses the nominal paired top-1 bar
+  on the two-GPU layout. Its large single-pair C4/prefill losses were not
+  stable across warmed launches. Full-K KDA token rows pass component
+  correctness and the prototype9 paired quality bar, but do not establish
+  full batch/speculative invariance. BF16 KDA/head stays the split default;
+  token rows remain an explicit opt-in, scoped to the measured EXL3 K3.25
+  layout rather than qualified across all quants or on RTX 5090.
 - Prefill timing is sensitive to the exact smoke prompt, including its
   random nonce. Release comparisons use a separate fixed-prompt probe;
   historical single-card throughput alone does not establish a regression.
