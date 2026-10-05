@@ -171,6 +171,9 @@ def load_set(path: Path, family: str | None = None) -> dict:
     manifest = validate_set(json.loads(path.read_text()))
     if family is not None and manifest["family"] != family:
         raise ValueError(f"set family {manifest['family']} does not match {family}")
+    if (family is not None and family not in ("mimo_v2", "qwen4", "glm5_flash")
+            and any(w.get("media") for w in manifest["windows"])):
+        raise ValueError(f"{family} golden does not support media; refusing text-only scoring")
     return manifest
 
 
@@ -243,6 +246,8 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
     windows.write_bytes(canonical(panel) + b"\n")
     probe = copy.copy(a)
     probe.windows, probe.out, probe.layers, probe._prefix_probe = windows, root, None, True
+    if media_panel and not getattr(probe, "media_root", None):
+        probe.media_root = a.windows.parent
     execute(probe)
     meta = json.loads((root / "meta.json").read_text())
     if meta.get("set_sha256") != panel["set_sha256"] or meta.get("family") != manifest["family"]:
@@ -251,6 +256,8 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
     arrays, hashes = [], []
     for window in panel["windows"]:
         entry = entries[window["id"]]
+        if entry.get("media", []) != window.get("media", []):
+            raise ValueError("prefix golden media identity mismatch")
         positions = list(range(window["score_from"], len(window["tokens"])))
         if entry["positions"] != positions:
             raise ValueError("prefix golden positions mismatch")

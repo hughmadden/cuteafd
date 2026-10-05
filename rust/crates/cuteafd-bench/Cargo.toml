@@ -10,6 +10,7 @@ description = "In-server benchmark runner: panels driven over the server's own O
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+base64 = "=0.22.1"
 clap.workspace = true
 cuteafd-api = { path = "../cuteafd-api" }
 cuteafd-loader = { path = "../cuteafd-loader" }

@@ -50,7 +50,13 @@ def read_fixture(root: Path, span: dict) -> bytes:
     path = (root / span["fixture"]["path"]).resolve()
     if not path.is_relative_to(root.resolve()):
         raise ValueError("fixture path escapes fixture root")
-    data = path.read_bytes()
+    cap = 32 * 1024 * 1024
+    with path.open("rb") as source:
+        if path.stat().st_size > cap:
+            raise ValueError("fixture exceeds image byte cap")
+        data = source.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError("fixture exceeds image byte cap")
     if hashlib.sha256(data).hexdigest() != span["fixture"]["sha256"]:
         raise ValueError("fixture bytes differ from pinned media identity")
     return data

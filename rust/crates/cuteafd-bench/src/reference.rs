@@ -211,21 +211,51 @@ fn sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-/// Never let a media window fall through the text-only teacher-forcing path.
-/// The wire adapter is enabled separately after the media probe contract lands.
-pub fn require_media_probe(windows: &[Window], model: &serde_json::Value) -> anyhow::Result<()> {
-    if let Some(w) = windows.iter().find(|w| !w.media.is_empty()) {
-        anyhow::ensure!(model["capabilities"]["vision"] == true,
-            "window {} contains media but server does not advertise vision capability", w.id);
-        anyhow::bail!("window {} requires the media teacher-forcing probe adapter; refusing text-only scoring", w.id);
+/// Check the prepared media echo before parsing a ProbeRecord (old servers ignore media).
+pub fn verify_media_echo(window: &Window, probe: &serde_json::Value) -> anyhow::Result<()> {
+    if window.media.is_empty() { return Ok(()); }
+    let actual = probe["media"].as_array().ok_or_else(|| anyhow::anyhow!("server did not honor media probe"))?;
+    anyhow::ensure!(actual.len() == window.media.len(), "media probe image count differs");
+    for (span, got) in window.media.iter().zip(actual) {
+        anyhow::ensure!(got["start"] == span.start && got["len"] == span.len
+            && got["kind"] == span.kind && got["key"] == span.key
+            && got["grid"] == serde_json::json!(span.grid), "server ran different media identity");
     }
     Ok(())
 }
+/// Build the agreed HTTP teacher-force wire shape, binding each image to sealed bytes.
+pub fn media_probe_payload(window: &Window, model: &serde_json::Value, root: &std::path::Path)
+    -> anyhow::Result<Vec<serde_json::Value>> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    if window.media.is_empty() { return Ok(Vec::new()); }
+    anyhow::ensure!(model["capabilities"]["vision"] == true, "server does not advertise vision capability");
+    let root = root.canonicalize()?;
+    window.media.iter().map(|media| {
+        let path = root.join(&media.fixture.path).canonicalize()?;
+        anyhow::ensure!(path.starts_with(&root), "fixture escapes media root");
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        const CAP: u64 = 32 * 1024 * 1024;
+        anyhow::ensure!(file.metadata()?.len() <= CAP, "fixture exceeds image byte cap");
+        let mut bytes = Vec::new();
+        file.take(CAP + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() as u64 <= CAP, "fixture exceeds image byte cap");
+        anyhow::ensure!(format!("{:x}", Sha256::digest(&bytes)) == media.fixture.sha256,
+            "fixture hash differs from media window");
+        anyhow::ensure!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "media fixtures must be PNG");
+        Ok(serde_json::json!({"start":media.start,"len":media.len,"kind":media.kind,
+            "key":media.key,"grid":media.grid,"image_url":{"url":format!("data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes))}}))
+    }).collect()
+}
+
 fn default_top_k() -> usize { 32 }
 
 impl Window {
     pub fn validate(&self, vocab: usize) -> anyhow::Result<()> {
         anyhow::ensure!(!self.id.is_empty() && !self.positions.is_empty(), "empty window");
+        anyhow::ensure!(self.score_from > 0 && self.score_from < self.tokens.len(), "score_from outside window");
         anyhow::ensure!(self.roles.len() == self.tokens.len() && self.roles.iter().all(|r| r == "gen" || r == "ctx"),
             "invalid role mask for {}", self.id);
         anyhow::ensure!(self.tokens.iter().all(|&id| (id as usize) < vocab), "token outside vocabulary");
@@ -363,14 +393,33 @@ mod tests {
                 "grid":[1,4,4],"fixture":{"path":"code.png","sha256":"b".repeat(64)}}]});
         let mut w: Window = serde_json::from_value(value).unwrap();
         w.validate(10).unwrap();
-        for advertised in [false, true] {
-            assert!(require_media_probe(&[w.clone()], &serde_json::json!({
-                "capabilities":{"vision":advertised}})).is_err());
-        }
+        assert!(verify_media_echo(&w, &serde_json::Value::Null).is_err());
+        let echo = serde_json::json!({"media": w.media});
+        verify_media_echo(&w, &echo).unwrap();
         w.media[0].fixture.path = "../code.png".into();
         assert!(w.validate(10).is_err());
         w.media.clear();
-        require_media_probe(&[w], &serde_json::Value::Null).unwrap();
+        verify_media_echo(&w, &serde_json::Value::Null).unwrap();
+    }
+
+    #[test]
+    fn media_wire_requires_sealed_fixture_and_vision() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        std::fs::write(root.path().join("code.png"), bytes).unwrap();
+        let value = serde_json::json!({"id":"vision00","block":"vision","bucket":"0-2K",
+            "tokens":[9,2],"roles":["ctx","gen"],"score_from":1,"positions":[],
+            "media":[{"start":0,"len":1,"kind":"image","key":"a".repeat(64),"grid":[1,2,2],
+                "fixture":{"path":"code.png","sha256":format!("{:x}",Sha256::digest(bytes))}}]});
+        let w: Window = serde_json::from_value(value).unwrap();
+        assert!(media_probe_payload(&w, &serde_json::Value::Null, root.path()).is_err());
+        let model = serde_json::json!({"capabilities":{"vision":true}});
+        let wire = media_probe_payload(&w, &model, root.path()).unwrap();
+        assert_eq!(wire[0]["key"], "a".repeat(64));
+        assert!(wire[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        std::fs::write(root.path().join("code.png"), b"changed").unwrap();
+        assert!(media_probe_payload(&w, &model, root.path()).is_err());
     }
 
     #[test]

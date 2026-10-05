@@ -12,6 +12,44 @@ sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_media import read_fixture, require_media_flag, validate_media, write_features
 
 
+def load_script(name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), ROOT / "scripts/bench" / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
+    import json
+    generator = load_script("generate-media-fixtures")
+    one = generator.generate(tmp_path / "one")
+    two = generator.generate(tmp_path / "two")
+    assert one == two
+    assert len(one["fixtures"]) == 8
+    for f in one["fixtures"]:
+        assert (tmp_path / "one" / f["path"]).read_bytes() == (tmp_path / "two" / f["path"]).read_bytes()
+    builder = load_script("fidelity-set")
+    def probe(body):
+        assert body["messages"][1]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+        return {"probe": {"engine": "fake", "prompt_ids": [1] + [9] * 4 + [2],
+                "generated": [3] * 600, "media": [{k: v for k, v in span().items() if k != "fixture"}]},
+                "server": {"model": "model", "family": "mimo_v2"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+           "state": "bf16", "speculation": False, "prefix_cache": False}
+    result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
+        arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+    assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
+    assert all(w["block"] == "vision" and set(w["roles"][w["score_from"]:]) == {"gen"} for w in result["windows"])
+    def missing(body):
+        response = probe(body)
+        del response["probe"]["media"]
+        return response
+    with pytest.raises(ValueError, match="prepared image"):
+        builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
+            arm=arm, probe=missing, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+
+
 def span():
     return {"start": 1, "len": 4, "kind": "image", "key": "a" * 64,
             "grid": [1, 4, 4], "fixture": {"path": "code.png", "sha256": "b" * 64}}
@@ -30,6 +68,46 @@ def test_media_contract():
         validate_media([s, s], [1, 9, 9, 9, 9, 2], ["ctx"] * 5 + ["gen"], 5)
     with pytest.raises(ValueError):
         validate_media([s], [1, 9, 8, 9, 9, 2], ["ctx"] * 5 + ["gen"], 5)
+
+
+def test_media_prefix_keeps_images_and_cannot_use_text_evidence(tmp_path):
+    from types import SimpleNamespace
+    from fidelity_windows import (SET_SCHEMA, bucket, finish_golden, qualify_prefix,
+        set_hash, validate_qualification, write_scored_logits)
+    import json
+    s = span()
+    tokens = [1] + [9] * 4 + [3] * 700
+    window = {"id": "vision00", "block": "vision", "bucket": bucket(193),
+              "tokens": tokens, "roles": ["ctx"] * 193 + ["gen"] * 512,
+              "score_from": 193, "media": [s]}
+    manifest = {"schema": SET_SCHEMA, "family": "mimo_v2", "checkpoint": "model",
+                "quick_windows": ["vision00"], "windows": [window]}
+    manifest["set_sha256"] = set_hash(manifest)
+    identity = {"snapshot_revision": "pinned"}
+    seen = []
+    def execute(args):
+        panel = json.loads(args.windows.read_text())
+        rows = []
+        for w in panel["windows"]:
+            seen.append(w["media"])
+            rows.append(write_scored_logits(args.out, w, np.zeros((len(w["tokens"]) - w["score_from"], 4), dtype=np.float32)))
+        finish_golden(args.out, panel, rows, snapshot_identity=identity, seconds=0)
+    a = SimpleNamespace(out=tmp_path, windows=tmp_path / "windows.json", layers=None)
+    proof = qualify_prefix(a, manifest, execute)
+    assert proof["passed"] and seen == [[s], [s]] and proof["media"] == [s]
+    validate_qualification(proof, manifest, identity)
+    del proof["media"]
+    with pytest.raises(ValueError, match="image evidence"):
+        validate_qualification(proof, manifest, identity)
+    def dropped_media(args):
+        execute(args)
+        meta_path = args.out / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        for entry in meta["windows"]:
+            entry.pop("media", None)
+        meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="media identity"):
+        qualify_prefix(a, manifest, dropped_media)
 
 
 def test_feature_writer_binds_immutable_bytes(tmp_path):
@@ -52,6 +130,10 @@ def test_fixture_hash_and_family_fail_closed(tmp_path):
     assert read_fixture(tmp_path, s) == b"fixture"
     (tmp_path / "code.png").write_bytes(b"changed")
     with pytest.raises(ValueError, match="pinned"):
+        read_fixture(tmp_path, s)
+    with (tmp_path / "code.png").open("wb") as f:
+        f.truncate(32 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match="byte cap"):
         read_fixture(tmp_path, s)
     manifest = {"windows": [{"media": [s]}]}
     assert require_media_flag(manifest, True, "mimo_v2")
