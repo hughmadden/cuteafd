@@ -602,7 +602,7 @@ def test_family_config_reads_share_the_stop_key_grammar() -> None:
     for new, old in re.findall(r'\bkey ([A-Z][A-Z_0-9]+) ([A-Z][A-Z_0-9]+)', launcher):
         if new != "NEW":
             keys.update((new, old))
-    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD"))
+    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD", "V41_COPY_DRAFTS"))
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; shift; for key; do release_known_key "$key" || exit 1; done',
          "bash", str(ROOT / "scripts/lib/release-common.sh"), *sorted(keys)],

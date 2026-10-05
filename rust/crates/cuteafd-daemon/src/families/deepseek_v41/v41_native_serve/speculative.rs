@@ -166,6 +166,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.predicted[lane] = None;
         self.lane_shared[lane] = shared;
         let width = self.lane_width[lane];
+        // Every request of the round copied: it has no dSpark lengths to choose.
+        if requests.is_empty() { return Ok(None); }
         let Some(policy) = &mut self.policy else { return Ok(None) };
         let probabilities = requests.iter().map(|&(id, maximum)| {
             if maximum == 0 { return Ok(Vec::new()); }
@@ -196,27 +198,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         })
     }
     /// Feed one completed lane round to the policy. `requests` are (identity,
-    /// verifier rows, accepted inputs) in lane order; `total_us` spans draft
-    /// start to commit. Observation problems are logged, never fatal.
+    /// verifier rows, accepted inputs, copied) in lane order; `total_us` spans
+    /// draft start to commit. Observation problems are logged, never fatal.
     pub fn observe_round(&mut self, lane: usize, shared: bool, routes: &[Vec<[u32; 6]>],
-        layer_us: &[Option<f64>], requests: &[(u64, usize, u32)], total_us: u64, draft_us: u64) {
+        layer_us: &[Option<f64>], requests: &[(u64, usize, u32, bool)], total_us: u64, draft_us: u64) {
         let predicted = self.predicted.get_mut(lane).and_then(Option::take);
         let width = self.lane_width.get(lane).copied().unwrap_or(0);
         let Some(policy) = &mut self.policy else { return };
-        // Every drafted position's confidence, verified or not: the policy
-        // bounds reliability evidence to reached positions itself.
-        let confidence: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, _, _)|
-            self.confidence_trace.get(&id).map(|logits| logits.iter().map(|&x| policy::sigmoid(x)).collect()))
-            .collect();
-        let observed: Vec<_> = requests.iter().zip(&confidence).map(|(&(id, rows, accepted), confidence)|
-            cuteafd_core::DsparkObservedRequest { id, rows, accepted: accepted as usize,
-                confidence: confidence.as_deref() }).collect();
-        let layer_us: [Option<f64>; cuteafd_core::DSPARK_LAYERS] =
-            std::array::from_fn(|layer| layer_us.get(layer).copied().flatten());
-        if let Err(error) = policy.observe(cuteafd_core::DsparkRoundObservation { shared, requests: &observed,
-            routes, layer_us: &layer_us, total_us: total_us as f64, predicted_us: predicted,
-            draft_us: if width > 0 { draft_us as f64 } else { f64::NAN },
-            wide: width > policy.widths().0 }) {
+        if let Err(error) = policy::observe(policy, &self.confidence_trace, shared, routes, layer_us,
+            requests, total_us, draft_us, width, predicted) {
             tracing::warn!(error, lane, "dSpark policy round observation skipped");
         }
         tracing::debug!(target: "cuteafd::draft_policy", lane, shared, predicted_us=predicted, total_us,
@@ -450,6 +440,19 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         requests.revoke_batch(batch);
         for id in ids { if let Err(error) = self.release(id) { result = Err(error); } }
         result
+    }
+
+    /// Copy-window drafts replace dSpark's for the `copied` requests of this lane
+    /// round, so the chain drafts only the others (no draft pass runs unless
+    /// `drafting`). Their stale confidence is cleared so neither the policy nor
+    /// the logs attribute an earlier dSpark round to this one. Like any request
+    /// that did not draft, their accepted rows still reach every window through
+    /// the batch commit, which reads the target's taps for every batch member.
+    pub fn skip_copied(&mut self, lane: usize, copied: &[u64], drafting: bool) -> Result<()> {
+        ensure!(lane < self.lane_width.len(), "invalid draft lane");
+        for id in copied { self.confidence_trace.remove(id); }
+        if !drafting { self.lane_width[lane] = 0; }
+        Ok(())
     }
 
     /// Each lane owns its draft scratch and stream; both can replay concurrently.
