@@ -48,7 +48,7 @@ set(CUTEAFD_GLM_GEOMETRIES "glm;glm2" CACHE STRING
   "GLM program geometries with CUTEAFD_ENABLE_GLM_AOT: glm (GLM 5.x), glm2 (its two-GPU head split)")
 option(CUTEAFD_ENABLE_MIMO_AOT "Build the MiMo V2 coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_MIMO_GEOMETRIES "mimo" CACHE STRING
-  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro); mimo2 / mimop2 their two-GPU head splits")
+  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimof (V2.6 Flash MOPD), mimop (V2.6 Pro); suffix 2 selects each two-GPU head split")
 option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING

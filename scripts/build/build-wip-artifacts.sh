@@ -53,7 +53,7 @@ bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 IFS=';' read -ra bf16_family_list <<<"$bf16_families"
 for bf16_family in "${bf16_family_list[@]}"; do
   case "$bf16_family" in
-    mimo|mimop|glm|glmf|qwen4) ;;
+    mimo|mimop|mimof|glm|glmf|qwen4) ;;
     *) echo "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES: unknown family $bf16_family" >&2; exit 2 ;;
   esac
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||

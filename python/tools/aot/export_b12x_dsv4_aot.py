@@ -371,7 +371,7 @@ def main() -> None:
                         help="comma-separated geometries in one table: flash, pro (DeepSeek V4; flash2 / pro2: one GPU of "
                              "its two-GPU head split), glm (GLM 5.x), "
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
-                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), "
+                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
@@ -382,15 +382,15 @@ def main() -> None:
 
     import torch
     from b12x.integration.cuteafd import (
-        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_PRO, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
+        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "glmf", "glmf2", "qwen4") for name in geometries):
-        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, glmf, glmf2 "
-                         "and/or qwen4")
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4") for name in geometries):
+        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
+                         "glmf, glmf2 and/or qwen4")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -419,6 +419,10 @@ def main() -> None:
                                      full_kv_heads=MIMO_V26_PRO.full_kv_heads // 2,
                                      swa_kv_heads=MIMO_V26_PRO.swa_kv_heads // 2,
                                      dense_inter=MIMO_V26_PRO.dense_inter // 2)
+        mimof2 = dataclasses.replace(MIMO_V26_FLASH, name="mimo_v26_flash_tp2", heads=MIMO_V26_FLASH.heads // 2,
+                                     full_kv_heads=MIMO_V26_FLASH.full_kv_heads // 2,
+                                     swa_kv_heads=MIMO_V26_FLASH.swa_kv_heads // 2,
+                                     dense_inter=MIMO_V26_FLASH.dense_inter // 2)
         # glm2: GLM 5.x split over two GPUs by heads (32 each; dense and shared MLPs by
         # intermediate).
         glm2 = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2, dense_inter=GLM53.dense_inter // 2,
@@ -435,13 +439,14 @@ def main() -> None:
                      for n, base in (("flash2", FLASH), ("pro2", PRO))}
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
-             "mimo2": mimo2, "mimop2": mimop2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
+             "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
-                  "mimo2": "mimo2", "mimop2": "mimop2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
+                  "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         make = {"flash2": head_split_programs, "pro2": head_split_programs, "glm": glm_programs,
                 "glm2": glm_head_split_programs, "mimo": mimo_programs, "mimop": mimo_programs,
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
+                "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]

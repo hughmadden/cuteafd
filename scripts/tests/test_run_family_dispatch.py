@@ -314,10 +314,11 @@ def test_invalid_glm_drafter_quantization_rejects_before_starting_containers(tmp
 
 
 @pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
-@pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
-def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):
+@pytest.mark.parametrize("store, geometry, ranks, hidden", [("fp8", "mimo", 4, 4096), ("mxfp4", "mimop", 6, 6144),
+                                                        ("mxfp4", "mimof", 2, 4096), ("mxfp4", "mimof", 4, 4096)])
+def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks, hidden):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
-              "quantization_config": {"store_dtype": store}}
+              "hidden_size": hidden, "quantization_config": {"store_dtype": store}}
     keys = f"EXPERT_INPUT={mode}\nSPARK_COUNT={ranks}\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n"
     keys += "".join(f"SPARK_{r}_HOST=h{r}\nSPARK_{r}_LANE_A=10.0.0.{r + 1}\n" for r in range(ranks))
     result = _family_launch_result(tmp_path, config, "test/mimo", keys)

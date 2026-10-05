@@ -508,7 +508,13 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
   case "$store_dtype" in
     fp8) expert_geometry=mimo ;;
-    mxfp4) expert_geometry=mimop ;;
+    mxfp4)
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      case "$hidden" in
+        4096) expert_geometry=mimof ;;
+        6144) expert_geometry=mimop ;;
+        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
+      esac ;;
     *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
   esac
   printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
