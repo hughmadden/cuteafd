@@ -121,6 +121,14 @@ Agent(subagent_type="general-purpose",
 | `opus`, `fable` | Claude subagents |
 | `claude/xiaomi/mimo-v2.6-pro` | last resort; no graded effort |
 
+- Keep briefs as files, as in the plain path: write
+  `~/.cache/cuteafd/builds/codex-runs/<name>.md` and make the prompt
+  "read the preamble, the wave's hardware allocation file and `<name>.md`,
+  keep `builds/<name>/STATUS.md` current". The brief then survives a
+  restart, a resume note can be appended to it, and either launch path can
+  run it. For a parallel wave, one shared allocation file says which locks
+  and hosts each agent owns (e.g. one agent on `gpu1.lock` + a single
+  Spark, the rest queued on the shared pool).
 - These agents run inside Claude Code's tool harness with this session's
   tools and permissions (Bash, Read, Edit, SSH, `agent-sudo`), not the Codex
   CLI, so `codex-launch.sh`/`codex-stop.sh` don't apply: stop one with
