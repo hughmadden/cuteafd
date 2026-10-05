@@ -228,7 +228,7 @@ DeepSeek and MiMo are not available in this environment.
 
 These apply to every agent and are also in `AGENTS.md`.
 
-- **Locks:** take `sparks.lock` before `gpu1.lock`, only around actual runs,
+- **Locks:** take `sparks.lock`, then `gpu0.lock` when using GPU0 (TJ may hold it for an interactive server), then `gpu1.lock`, only around actual runs,
   each run one blocking command with a timeout. Reversed lock order
   deadlocked the cluster with both GPUs idle and ~30 jobs queued.
 - **Teardown:** stop servers, containers and Spark workers before releasing
