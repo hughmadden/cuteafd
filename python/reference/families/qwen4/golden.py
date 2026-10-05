@@ -96,6 +96,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                 if table_rows != 128 * SHARD_ROWS:
                     raise ValueError("unexpected n-gram table shape")
                 emb.ngram_embedding = torch.nn.Identity()
+                del emb
             layer = layer.to_empty(device="cuda")
             if layer.ple is not None:
                 prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
@@ -109,6 +110,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
                         and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
                         and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
                     raise ValueError("checkpoint n-gram hash buffers differ from module")
+                del emb, expected
             for i, w in enumerate(manifest["windows"]):
                 h = states[i].cuda()
                 ids = torch.tensor([w["tokens"]], device="cuda")
@@ -345,6 +347,7 @@ def main() -> None:
                 if rows != 128 * SHARD_ROWS:
                     raise ValueError(f"n-gram table has {rows} rows, expected 128 shards of {SHARD_ROWS}")
                 emb.ngram_embedding = torch.nn.Identity()  # dropped before allocation
+                del emb
             layer = layer.to_empty(device="cuda")
             if layer.ple is not None:
                 table_prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
@@ -359,6 +362,7 @@ def main() -> None:
                         and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
                         and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
                     raise ValueError("checkpoint n-gram hash buffers differ from the module's construction")
+                del emb, expected
             h = layer(h, position_embeddings=position_embeddings, attention_mask=causal, conv_mask=conv_mask,
                       past_key_values=None, ple_input_ids=ids)
             if layer_id in save:
