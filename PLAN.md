@@ -751,7 +751,12 @@ Work, in priority order:
    returned as content (#1 FR-G.14). Readiness bug (2026-10-05, fidelity
    agent): `/v1/models` reports ready before the Spark experts finish
    loading on the V4.1 launch path; readiness must wait for every expert
-   rank.
+   rank. Admission bug (2026-10-05, host-embedding agent): MiMo V2.6 Pro
+   `admission.rs:356-370` appends `startup.spark_intake_probe_temporary`
+   (64 MiB) after `resolve_capacity`, so an automatic pool that fills the
+   budget (466 KB margin) is admitted and then refused at startup
+   (shortfall 66.6 MB). Reserve every startup-phase temporary before pool
+   resolution, in every family's admission.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
