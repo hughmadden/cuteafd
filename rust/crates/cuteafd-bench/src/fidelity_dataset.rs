@@ -165,6 +165,20 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires published immutable HF commit and network access"]
+    fn published_dataset_fetch_roundtrip() {
+        let commit = std::env::var("CUTEAFD_FIDELITY_HF_REVISION").unwrap();
+        let cache = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_HF_CACHE").unwrap());
+        let (reference, hash, identity) = download(&ureq::AgentBuilder::new()
+            .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
+        assert_eq!(reference.windows.len(), 64);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(identity["revision"], commit);
+        let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, CONFIG).unwrap();
+        assert_eq!(hash, again.1);
+    }
+
+    #[test]
     #[ignore = "requires locally prepared sealed dataset"]
     fn prepared_dataset_and_saved_pair() {
         use crate::fidelity::{compare, Run};
