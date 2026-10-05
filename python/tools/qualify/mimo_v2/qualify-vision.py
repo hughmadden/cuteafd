@@ -166,6 +166,22 @@ def metrics(native,ref):
     return result
 
 
+def calibrated_metrics(measured,floor):
+    result=dict(measured,strict_pass=measured["pass"])
+    result["pass"]=(measured["relative_l2"]<=floor["relative_l2"]+0.002
+                    and measured["mean_cosine"]>=max(0.9995,floor["mean_cosine"]-0.00005)
+                    and measured["worst_cosine"]>=floor["worst_cosine"]-0.001)
+    return result
+
+
+def allocation_metrics(initial,final,before,after,sm):
+    # GB10 free memory also reflects CPU/page-cache activity. Only the native
+    # ledger decides whether the resident owner allocated during encode.
+    return dict(no_encode_device_allocation=initial.device_allocations==final.device_allocations==2,
+                steady_cuda_memory_growth_bytes=before["free"]-after["free"],
+                unified_memory_observation=tuple(sm)==(12,1))
+
+
 def run(args):
     import torch
     cfg=json.loads((args.snapshot/"config.json").read_text())
@@ -250,12 +266,7 @@ def run(args):
                     result["bf16_yardstick"][str(tokens)]=yardstick
                     # Orchestrator-calibrated tower floor; keep all original strict
                     # verdicts so this does not conceal a literal design-bar miss.
-                    for stage,m in compared.items():
-                        floor=yardstick[stage]
-                        m["strict_pass"]=m["pass"]
-                        m["pass"]=(m["relative_l2"]<=max(0.03,floor["relative_l2"]+0.002)
-                                   and m["mean_cosine"]>=max(0.9995,floor["mean_cosine"]-0.00005)
-                                   and m["worst_cosine"]>=min(0.99,floor["worst_cosine"]-0.001))
+                    compared={stage:calibrated_metrics(m,yardstick[stage]) for stage,m in compared.items()}
                     model.float()
                     model.rotary_pos_emb.inv_freq.copy_(inv_freq)
                 for h in hooks:h.remove()
@@ -263,7 +274,9 @@ def run(args):
                 print(json.dumps(dict(event="G2",tokens=tokens,stages=compared)),flush=True)
             del stages
         # Three encodes of each image, interleaved with different sizes. CUDA's
-        # actual free memory complements the explicit-arena allocation counter.
+        # free memory is informational; the ledger gates native allocations.
+        initial_ledger=Ledger();check(lib.cuteafd_vision_get_ledger(owner,C.byref(initial_ledger)))
+        result["initial_ledger"]=initial_ledger.as_dict()
         def cuda_memory():
             free=C.c_size_t();total=C.c_size_t()
             check(cudart.cudaMemGetInfo(C.byref(free),C.byref(total)))
@@ -277,7 +290,8 @@ def run(args):
         ledger=Ledger();check(lib.cuteafd_vision_get_ledger(owner,C.byref(ledger)))
         result["final_ledger"]=ledger.as_dict()
         result["steady_memory_after"]=cuda_memory()
-        result["no_encode_device_allocation"]=(ledger.device_allocations==2 and result["steady_memory_before"]==result["steady_memory_after"])
+        result.update(allocation_metrics(initial_ledger,ledger,result["steady_memory_before"],
+                                         result["steady_memory_after"],result["sm"]))
         result["bf16_rotary_fp32"]=bool(args.bf16_rotary_fp32)
         result["g2_pass"]=bool(result["g2"]) and all(m["pass"] for stages in result["g2"].values() for m in stages.values())
         result["g3_pass"]=all(result["g3"].values())
