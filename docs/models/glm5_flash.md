@@ -183,8 +183,60 @@ The candidate passes the revised paired quality bar (KL +0.000840 nat,
 no top-1 loss). C1 improves 6.9%; C4 and prefill are effectively flat in
 this single pair. The seven-position top-1 gain is noisy, not evidence of
 better precision. Readiness was 56 to 49 s; exact prefix restores pass.
-The warm prefill rate is not the median of all timed requests; final
-interleaved D/T evidence is indexed in the task STATUS.
+The warm prefill rate is not the median of all timed requests.
+
+### Final interleaved qualification
+
+2026-10-05, same EXL3 K3.25 / FP8 DFlash2 / two RTX PRO 6000 at 325 W
+plus ostrich/dodo/emu/kiwi TP4. Launch order D/O/T/D/T/D/T; the inherited
+outer timeout ended after D-b, then the missing T-b/D-c/T-c completed under
+separate locks. D and T each have three launches, O one. Fixed code
+prompts/nonces, thinking disabled, 320-token cap, one warm batch at C1/C4;
+prefill calibration plus one exact-8192 warm request and two timed requests
+per launch, zero prefix hits. Source/request SHA256 and actual token hashes
+match. Audit and worker timing enabled, no profiler: these are matched
+diagnostic numbers, not release-card or reasoning-agent measurements.
+
+Medians across launches, with observed min-max in parentheses. Prefill uses
+the median of each launch's two timed rates, then the three-launch median.
+No samples, including the slow D-a, are excluded.
+
+| Metric | D: BF16 KDA/head | T: full-K token-row FP8 KDA/head | Median change |
+| --- | ---: | ---: | ---: |
+| C1 emitted tok/s | 154.16 (144.01-154.64) | 165.83 (162.79-166.17) | +7.6% |
+| C4 aggregate emitted tok/s | 248.67 (210.94-276.65) | 259.78 (251.95-279.09) | +4.5% |
+| 8K prefill tok/s | 6,713 (3,946-6,783) | 6,823 (6,767-6,865) | +1.6% |
+| Reasoning-on agentic | Not measured | Not measured | No claim |
+| Readiness s | 61 (53-66) | 61 (52-64) | Flat |
+| Golden top-1 /512 | 453 | 460 | +1.37 points; noisy |
+| Compact KL nat | 0.0450756 | 0.0459160 | +0.0008404 |
+| NLL | 3.474099 | 3.460224 | -0.013875 |
+
+Each paired quality gate passes with zero missing positions. Scores repeat
+exactly on the same 512 positions; this is not a larger independent sample.
+C1 improves in every pair (+13.0%, +7.2%, +7.8%). C4 varies widely: the
+last two paired changes are only +1.3%/+0.9%; call it parity to modest gain,
+not a firm 4.5% general speedup. The last two 8K pairs are -0.24%/+1.63%,
+also effectively parity. D-a timed rates were 2682/5210 tok/s and exhibit
+the synchronized wait issue described above. All six timed T rates lie
+6731-6870 tok/s. Original O's one-launch 8K/C1/C4 rates are
+6816/169.29/290.55; it still misses the nominal top-1 bar (445/512).
+
+Recommendation to Hugh and TJ: **promote token-row FP8 KDA/head for the
+measured two-RTX EXL3 K3.25 split layout** under the stated paired quality
+and C1 bar. It passes quality and consistently gains C1 without a meaningful
+C4/prefill regression. This branch deliberately leaves BF16 split defaults
+unchanged; promotion is their decision. Do not extend this recommendation
+without gates to NVFP4, tr3, different hardware or exact speculative/batch
+invariance. One-RTX natural-minimum row128 KDA/FP8 head remains recommended
+on the existing performance evidence; its historical three-position top-1
+loss is borderline/noisy under the revised bar, not a fresh qualification.
+
+Provenance: frozen engine `eb8bf7c`, published fork `6205cb3`, identical
+D/O/T binary/native image layers with arm-only environment differences.
+The frozen image includes inactive retired prototypes; the clean serving
+branch cannot select them. Final evidence and overlap audit are indexed by
+the local STATUS; no new V4.1 serving parity launch was performed here.
 
 `--kda-fp32-partials` is a mutually exclusive diagnostic, not the recommended
 serving path. The unfinished `--split-mla-rows` and `--split-ffn-rows`
@@ -212,7 +264,7 @@ about 0.5 percentage point; small top-1 deltas need a larger fidelity set.
 - Original column-split FP8 KDA/head misses the nominal paired top-1 bar
   on the two-GPU layout. Its large single-pair C4/prefill losses were not
   stable across warmed launches. Full-K KDA token rows pass component
-  correctness and the prototype9 paired quality bar, but do not establish
+  correctness and all three final paired quality gates, but do not establish
   full batch/speculative invariance. BF16 KDA/head stays the split default;
   token rows remain an explicit opt-in, scoped to the measured EXL3 K3.25
   layout rather than qualified across all quants or on RTX 5090.
