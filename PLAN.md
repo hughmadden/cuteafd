@@ -769,7 +769,17 @@ Work, in priority order:
     Build containers run as root, leaving root-owned `target*` directories
     agents can't delete; run them as the host user (UID 1000 on raptor,
     1001 on the Sparks).
-11. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+11. **V4.1 NVFP4 decode (parked 2026-10-05):** NVFP4 trails official MXFP4
+    by 16% C1 / 14% C4 on 1 RTX + 4 (tokens per round 3.94 → 2.87, Spark
+    expert kernel +32% per layer). ncu: the cooperative NVFP4 kernel runs one
+    90 KB CTA per SM at 6% occupancy, versus MXFP4's fused-slice kernel at
+    2 CTAs per SM. A noncooperative NVFP4 slice kernel (fork
+    `work/v41-nvfp4-slice` 3173cc2e) reached 3 CTAs per SM but ran 28–38%
+    slower at 1–16 rows. Untested hypothesis: it re-quantizes BF16 → FP4 per
+    slice × route slot, where MXFP4 takes pre-quantized FP8 wire rows; try a
+    quantize-once input stage or an FP8 wire first. Wide-row M32 tiles lost
+    on both GPUs. Official MXFP4 stays the recommended V4.1 checkpoint.
+12. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)
