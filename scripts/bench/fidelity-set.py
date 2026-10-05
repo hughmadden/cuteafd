@@ -59,6 +59,10 @@ class BucketMismatch(ValueError):
     pass
 
 
+class ContextCap(ValueError):
+    pass
+
+
 class ProbeClient:
     def __init__(self, base: str, token: str | None, timeout: float):
         self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", token, timeout
@@ -75,6 +79,8 @@ class ProbeClient:
                 chat = json.load(response)
         except urllib.error.HTTPError as error:
             detail = error.read(4096).decode("utf-8", errors="replace")
+            if error.code == 400 and "prompt of " in detail and "outside 1..16384" in detail:
+                raise ContextCap(f"generation probe HTTP {error.code}: {detail}") from error
             raise ValueError(f"generation probe HTTP {error.code}: {detail}") from error
         record = chat.get("probe")
         if not record or record.get("error") or not record.get("engine"):
@@ -180,13 +186,13 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 break
             if not count and n >= target:
                 if n + 1024 > MAX_TOKENS:
-                    raise ValueError(f"{name}: original history exceeds 16K cap")
+                    raise ContextCap(f"{name}: original history exceeds 16K cap")
                 break
             count = max(0, count + (target + 96 - n) * 3)
         else:
             raise ValueError(f"{name}: could not size rendered prompt to target {target}")
         if n + 1024 > MAX_TOKENS:
-            raise ValueError(f"{name}: rendered prompt plus generation exceeds 16K cap")
+            raise ContextCap(f"{name}: rendered prompt plus generation exceeds 16K cap")
         body["max_tokens"] = 1024
         chat = probe(body)
         server = chat.get("server", {})
@@ -243,7 +249,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         target = 1024 if i < 8 else 4096 if i < 20 else 10240
         try:
             chat = generate(f"a{i:02d}", "A", messages, target, tools)
-        except BucketMismatch:
+        except (BucketMismatch, ContextCap) as error:
+            if isinstance(error, ContextCap) and windows:
+                windows[-1]["provenance"]["ended_at_context_cap"] = True
             if snapshots:
                 raise
             # A growing tool history can leave the scheduled length stratum.
@@ -251,19 +259,42 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             workspace, messages = fresh_task(i)
             chat = generate(f"a{i:02d}", "A", messages, target, tools)
         if not snapshots:
-            calls = chat.get("tool_calls", [])
-            assistant = {"role": "assistant", "content": chat.get("content", ""),
-                         "reasoning_content": chat.get("reasoning", "")}
-            if calls:
+            malformed = 0
+            for recovery in range(3):
+                calls = chat.get("tool_calls", [])
+                assistant = {"role": "assistant", "content": chat.get("content", ""),
+                             "reasoning_content": chat.get("reasoning", "")}
+                if not calls:
+                    messages = None
+                    break
                 assistant["tool_calls"] = calls
                 messages.append(assistant)
+                errors = 0
                 for call in calls:
                     output, error = workspace.execute(call["function"]["name"], call["function"]["arguments"])
-                    if error:
-                        raise ValueError(f"fixture tool call failed: {error}")
+                    errors += int(error is not None)
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-            else:
-                messages = None
+                malformed += errors
+                if not errors:
+                    break
+                if recovery == 2:
+                    # Retain the final actual model turn, but do not carry a stuck
+                    # invalid-call loop into the next scheduled fixture window.
+                    messages = None
+                    break
+                prior = windows.pop()
+                try:
+                    chat = generate(f"a{i:02d}", "A", messages, target, tools)
+                except (BucketMismatch, ContextCap) as error:
+                    if isinstance(error, ContextCap):
+                        prior["provenance"]["ended_at_context_cap"] = True
+                    # Error history cannot be truncated to force a length stratum.
+                    windows.append(prior)
+                    messages = None
+                    break
+            windows[-1]["provenance"]["malformed_tool_calls"] = malformed
+            windows[-1]["provenance"]["tool_error_retries"] = recovery
+        windows[-1]["provenance"].setdefault("ended_at_context_cap", False)
     for i in range(12):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     for i in range(10):

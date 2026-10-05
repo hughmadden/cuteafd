@@ -22,7 +22,7 @@ class FakeTokenizer:
 
 @pytest.fixture
 def fake_server():
-    state = {"requests": [], "mode": "good", "generated": 600, "family": "deepseek_v41", "tool_once": False, "called": False}
+    state = {"requests": [], "mode": "good", "generated": 600, "family": "deepseek_v41", "tool_once": False, "called": False, "malformed_remaining": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -43,6 +43,11 @@ def fake_server():
                 self.end_headers()
                 self.wfile.write(b'{"error":"native library not found"}')
                 return
+            if state["mode"] == "context_cap" and any(m.get("role") == "tool" for m in body["messages"]):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"prompt of 16520 tokens is outside 1..16384"}}')
+                return
             text = json.dumps(body["messages"], sort_keys=True)
             ids = FakeTokenizer().encode(text).ids
             probe = {"engine": "fake-bf16", "cold": True, "no_speculation": True, "cached_tokens": 0,
@@ -59,6 +64,10 @@ def fake_server():
                 response["tool_calls"] = [{"id": "fixture_call", "type": "function",
                     "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}}]
                 state["called"] = True
+            if state["malformed_remaining"] and body["max_tokens"] == 1024 and body.get("tools"):
+                response["tool_calls"] = [{"id": "invalid_call", "type": "function",
+                    "function": {"name": "list_dir", "arguments": "{}"}}]
+                state["malformed_remaining"] -= 1
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -139,6 +148,31 @@ def test_live_fixture_tools_execute_and_reasoning_is_echoed(fake_server):
     assistant = next(m for m in continued if m.get("role") == "assistant")
     assert tool["tool_call_id"] == "fixture_call" and "README.md" in tool["content"]
     assert assistant["reasoning_content"] == "because"
+
+
+@pytest.mark.parametrize("invalid_calls, retries", [(1, 1), (3, 2)])
+def test_malformed_tool_call_recovers_with_bounded_error_turns(fake_server, invalid_calls, retries):
+    fake_server["malformed_remaining"] = invalid_calls
+    manifest = make(fake_server)
+    assert len(manifest["windows"]) == 64
+    window = next(w for w in manifest["windows"] if w["id"] == "a00")
+    assert window["provenance"]["malformed_tool_calls"] == invalid_calls
+    assert window["provenance"]["tool_error_retries"] == retries
+    histories = [request["body"]["messages"] for request in fake_server["requests"]]
+    errors = [m for history in histories for m in history if m["role"] == "tool"]
+    assert any("path" in m["content"] and "error" in m["content"] for m in errors)
+    assert fake_server["malformed_remaining"] == 0
+
+
+def test_context_cap_keeps_last_complete_turn_and_restarts_without_truncation(fake_server):
+    fake_server["mode"] = "context_cap"
+    fake_server["tool_once"] = True
+    manifest = make(fake_server)
+    first = next(w for w in manifest["windows"] if w["id"] == "a00")
+    assert first["provenance"]["ended_at_context_cap"]
+    assert len(manifest["windows"]) == 64
+    assert first["provenance"]["generated_tokens"] == 600
+    assert all(len(w["tokens"]) <= builder.MAX_TOKENS for w in manifest["windows"])
 
 
 def test_short_assistant_turns_get_context_padding_not_fake_gen(fake_server):
