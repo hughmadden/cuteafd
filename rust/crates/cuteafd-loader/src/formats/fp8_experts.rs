@@ -107,7 +107,7 @@ struct Located {
 }
 
 /// Where every routed FP8 expert tensor lives in the snapshot.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fp8ExpertTensors {
     snapshot: PathBuf,
     shape: RoutedExpertShape,
@@ -196,6 +196,33 @@ impl Fp8ExpertTensors {
 
     pub fn format(&self) -> ExpertFormat {
         self.format
+    }
+
+    /// Storage format of a layer's first gate, including mixed-format MTP
+    /// layers. This only inspects headers; validate_layer checks the full
+    /// layer against the selected package before any weight is loaded.
+    pub fn layer_format(&self, layer: usize) -> Result<ExpertFormat> {
+        let first = self.name(layer, 0, Fp8Projection::Gate);
+        match &self.located(&first)?.dtype {
+            DType::F8E4M3 => Ok(ExpertFormat::Fp8Block128),
+            DType::U8 | DType::I8 => {
+                let nvfp4 = self.tensors.get(&format!("{first}_scale"))
+                    .is_some_and(|s| s.dtype == DType::F8E4M3)
+                    && self.tensors.contains_key(&format!("{first}_scale_2"));
+                Ok(if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 })
+            }
+            dtype => anyhow::bail!("{first}: unsupported expert dtype {dtype:?}"),
+        }
+    }
+
+    /// A metadata-only view using this layer's format. The layer numbering and
+    /// tensor names are preserved so a mixed-format MTP package can own just
+    /// the draft layer. Validate all experts before allocating its storage.
+    pub fn for_layer(&self, layer: usize) -> Result<Self> {
+        let mut view = self.clone();
+        view.format = self.layer_format(layer)?;
+        view.validate_layer(layer)?;
+        Ok(view)
     }
 
     /// Whether `layer` has routed FP8 experts in this snapshot.
@@ -519,6 +546,7 @@ mod tests {
             }
         }
         tensors.validate_layer(3).unwrap();
+        assert_eq!(tensors.layer_format(3).unwrap(), ExpertFormat::Nvfp4);
         let gate = tensors.name(3, 0, Fp8Projection::Gate);
         let input = format!("{}.input_scale", gate.strip_suffix(".weight").unwrap());
         let scale = tensors.tensors.remove(&input).unwrap();
@@ -527,8 +555,26 @@ mod tests {
         let mtp = tensors.name(78, 0, Fp8Projection::Gate);
         tensors.tensors.insert(mtp.clone(), Located { shard: "not-read.safetensors".into(), offset: 0,
             bytes: 128 * 128, dtype: DType::F8E4M3, shape: vec![128, 128] });
+        assert_eq!(tensors.layer_format(78).unwrap(), ExpertFormat::Fp8Block128);
+        assert!(tensors.layer_format(79).is_err());
         let error = tensors.validate_layer(78).unwrap_err().to_string();
         assert!(error.contains(&mtp) && error.contains("expected packed E2M1 U8"), "{error}");
+        // A separate package view accepts the complete FP8 draft, without
+        // changing the backbone contract or duplicating device weights.
+        for projection in Fp8Projection::ALL {
+            let name = tensors.name(78, 0, projection);
+            tensors.tensors.insert(name.clone(), Located { shard: "not-read.safetensors".into(), offset: 0,
+                bytes: 128 * 128, dtype: DType::F8E4M3, shape: vec![128, 128] });
+            tensors.tensors.insert(format!("{name}_scale_inv"), Located {
+                shard: "not-read.safetensors".into(), offset: 0,
+                bytes: 4, dtype: DType::F32, shape: vec![1, 1] });
+        }
+        let draft = tensors.for_layer(78).unwrap();
+        assert_eq!(draft.format(), ExpertFormat::Fp8Block128);
+        assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+        assert_eq!(draft.name(78, 0, Fp8Projection::Gate), mtp);
+        assert!(draft.validate_layer(3).is_err());
+        assert!(tensors.validate_layer(78).is_err());
         tensors.tensors.remove(&format!("{}_scale", tensors.name(3, 0, Fp8Projection::Down)));
         assert!(tensors.validate_layer(3).is_err());
     }

@@ -149,12 +149,22 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     };
     let target = PREFILL_TOKENS.min(max_context.saturating_sub(64)) as f64;
     let words = ((target - intercept) / slope).max(64.0) as usize;
-    // The first prompt of this size pays one-time costs (workspaces, chunk plans): untimed.
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, words));
+    // Warm beyond the full 8K chunk when context permits. Near-equal filler
+    // lengths can move a lane boundary and leave part of the measured lane
+    // cold. Keep normal prefix-cache retention work in both requests.
+    let warm_target = (target + 512.0).min(max_context.saturating_sub(64) as f64);
+    let warm_words = ((warm_target - intercept) / slope).max(64.0) as usize;
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, warm_words));
     client.chat(plain(&text, 1), None).context("8K prefill warm-up")?;
     let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(99, words));
+    // Prime this exact lane shape and its routed expert accesses too. A cold
+    // probe neither reads nor retains a prefix, so the timed ordinary request
+    // still performs its full prefill and normal snapshot work.
+    client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+        .context("8K prefill route warm-up")?;
     let chat = client.chat(plain(&text, 1), None).context("8K prefill")?;
     let t = chat.timing.clone();
+    anyhow::ensure!(t.cached_tokens == 0, "8K cold prefill reused {} cached tokens", t.cached_tokens);
     run.baseline.card.prefill = Some(PrefillRate { prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(),
         ttft_s: t.ttft_s, runs: vec![t] });
     run.publish();

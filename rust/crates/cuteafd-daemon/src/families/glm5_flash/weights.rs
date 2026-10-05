@@ -641,9 +641,10 @@ impl<'a> GlmfLoader<'a> {
         Ok(out)
     }
 
-    /// The FP8 source's E4M3 bytes and FP32 128x128 grid of the 2-D `name`: values, grid, rows, cols.
-    fn fp8_block_host(&self, name: &str) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
-        let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
+    /// The selected source's 2-D `name` as E4M3 blocks, quantized from BF16
+    /// when necessary: values, FP32 scale grid, rows, cols.
+    fn fp8_block_host(checkpoint: &Checkpoint, name: &str, scales: crate::shared::fp8_linear::Fp8Scales)
+        -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
         let read = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
@@ -654,8 +655,17 @@ impl<'a> GlmfLoader<'a> {
             Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
         };
         let (values, dtype, shape) = read(name)?;
-        ensure!(dtype == DType::F8E4M3 && shape.len() == 2, "{name}: native BF16 GLMF block consumer/exporter is \
-            unsupported; select checkpoint FP8 inputs with --fp8-snapshot (found {dtype:?} {shape:?})");
+        ensure!(shape.len() == 2 && shape[0] % 128 == 0 && shape[1] % 128 == 0,
+            "{name}: split FP8 blocks require whole 128x128 blocks, found {shape:?}");
+        if dtype == DType::Bf16 {
+            // Match the unsplit loader: quantize the selected checkpoint once,
+            // before slicing, so both ranks inherit exactly the same blocks.
+            let (values, scales) = super::fp8::quantize(&values, shape[0], shape[1],
+                super::fp8::Layout::Block, scales);
+            let grid = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+            return Ok((values, grid, shape[0], shape[1]));
+        }
+        ensure!(dtype == DType::F8E4M3, "{name}: split FP8 blocks require BF16 or E4M3, found {dtype:?}");
         let (grid, grid_dtype, grid_shape) = read(&format!("{name}_scale_inv"))?;
         ensure!(grid_dtype == DType::F32 && shape[0] % 128 == 0 && shape[1] % 128 == 0
             && grid_shape == [shape[0] / 128, shape[1] / 128],
@@ -670,7 +680,8 @@ impl<'a> GlmfLoader<'a> {
         ensure!(axis == Axis::Rows || names.len() == 1, "{names:?}: concatenated weights split by rows");
         let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
         for name in names {
-            let (v, g, rows, cols) = self.fp8_block_host(name)?;
+            let (v, g, rows, cols) = Self::fp8_block_host(self.fp8_source.unwrap_or(self.checkpoint), name,
+                self.fp8_scales)?;
             let along = if axis == Axis::Rows { rows } else { cols };
             ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 blocks over \
                 {ranks} GPUs");
@@ -869,6 +880,33 @@ mod tests {
     use crate::families::glm5_flash::fp8::{quantize, KdaFp8, Layout};
     use crate::shared::fp8_linear::Fp8Scales;
     use crate::shared::peer_split::{slice_2d, Axis};
+
+    #[test]
+    fn split_reads_bf16_blocks_without_a_companion_or_scale_tensors() {
+        use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
+        use cuteafd_loader::SafetensorsTensorMetadata;
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for row in 0..256 {
+            for col in 0..256 {
+                let value = [1.0f32, 2.0, 4.0, 8.0][row / 128 * 2 + col / 128];
+                bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+            }
+        }
+        std::fs::write(dir.path().join("weights.bin"), &bytes).unwrap();
+        let checkpoint = Checkpoint { snapshot: dir.path().into(), config: serde_json::json!({}),
+            quantize_config: None, missing_shards: vec![], shard_bytes: bytes.len() as u64,
+            tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
+                name: "projection.weight".into(), dtype: cuteafd_core::DType::Bf16, shape: vec![256, 256],
+                byte_offset: 0, byte_length: bytes.len() as u64 } }] };
+        let (values, grid, rows, cols) = super::GlmfLoader::fp8_block_host(&checkpoint, "projection.weight",
+            crate::shared::fp8_linear::Fp8Scales::Amax).unwrap();
+        assert_eq!((rows, cols), (256, 256));
+        assert_eq!(values, vec![0x7e; 256 * 256]);
+        let grid: Vec<f32> = grid.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(grid, [1.0 / 448.0, 2.0 / 448.0, 4.0 / 448.0, 8.0 / 448.0]);
+    }
 
     #[test]
     fn kmajor_scales_transpose_row_blocks() {

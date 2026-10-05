@@ -88,6 +88,8 @@ pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
+    /// Mixed-format MTP owns its FP8 package separately from NVFP4 target layers.
+    pub mtp_experts: Option<Fp8Experts<'a>>,
     pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
@@ -1800,8 +1802,16 @@ impl<'a> Qwen4Engine<'a> {
         match self.experts.as_ref().context("MoE layer without experts")? {
             Experts::Local(local) => {
                 self.exchange_window(index, decode, true)?;
-                let resident = local.index_of(index)?;
-                let fp8 = local.experts.borrow();
+                let target;
+                let fp8 = if let Some(draft) = local.mtp_experts.as_ref()
+                    .filter(|draft| draft.layers.iter().any(|layer| layer.layer == index)) {
+                    draft
+                } else {
+                    local.index_of(index)?;
+                    target = local.experts.borrow();
+                    &*target
+                };
+                let resident = fp8.index_of(index)?;
                 ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
                 // SAFETY: input rows, route ids, weights and the output are live
                 // buffers of `t` rows on this engine's stream.

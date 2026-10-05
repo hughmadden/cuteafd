@@ -5,6 +5,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/release-export-locks.sh"
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
+native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
+[[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
+native_build_env_args=()
+[[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
 bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
   release_die "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, glm, glmf or qwen4"
@@ -30,6 +35,9 @@ GPU exports take sparks.lock then gpu1.lock on the coordinator, including the
 remote Spark export. CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS bounds each lock wait
 (default 1200); CUTEAFD_RELEASE_EXPORT_TIMEOUT_SECONDS bounds each export
 (default 7200). Containers are removed before releasing the locks.
+Set CUTEAFD_RELEASE_NATIVE_BUILD_JOBS to a positive integer to bound concurrent
+native compile/export jobs on both hosts (e.g. 1 for the full family matrix on
+unified-memory Sparks). Unset keeps the build tool's existing concurrency.
 Set CUTEAFD_RELEASE_SSH_CONFIG to an ssh config file that every remote step should
 use (default empty: stock OpenSSH resolution, so a build host's ~/.ssh/config keeps
 working, with BatchMode forced either way). Pass /dev/null to discard a system
@@ -487,6 +495,7 @@ release_with_export_locks "" "$export_container-coordinator" \
   -e NVIDIA_VISIBLE_DEVICES=0 \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
@@ -570,7 +579,7 @@ build_spark_release_leg() {
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
   "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
-  "$phase" "$export_container-expert" <<'REMOTE'
+  "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -618,6 +627,10 @@ fi
 cd "$remote_dir"
 phase="${13:?}"
 export_container="${14:?}"
+native_build_jobs="${15-__legacy__}"
+[[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
+native_build_env_args=()
+[[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
 if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
@@ -641,6 +654,7 @@ docker run --rm --name "$export_container" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
   -v "$remote_dir/.cuteafd-release-image:/output" \

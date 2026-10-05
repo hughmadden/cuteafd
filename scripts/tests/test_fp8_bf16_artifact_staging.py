@@ -42,7 +42,8 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
     return path
 
 
-def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revision=REVISION):
+def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revision=REVISION,
+          families="mimo:fp8;glm:nvfp4"):
     built = tmp_path / "build"
     native = built / "native/fp8"
     output = tmp_path / "output"
@@ -53,6 +54,10 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
     owner = "spark" if role == "expert" else "coordinator"
     for name in ("fp8-mimo", "fp8-glm-nvfp4", "fp8-glm-nvfp4a4"):
         write_package(native / name, input_kind=wire, role=owner)
+    for name in ("fp8-qwen4-nvfp4", "fp8-qwen4-nvfp4a4"):
+        write_package(native / name, input_kind=wire, role=owner)
+    if role == "coordinator":
+        write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
     # An earlier opt-in in the same slot must disappear after opting out.
     write_package(output / "fp8/fp8-mimo-bf16", input_kind="bf16")
@@ -64,9 +69,20 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
     result = subprocess.run(["bash", "-c", preamble + body], capture_output=True, text=True,
                             env={**os.environ, "build_root": str(built), "build_dir": str(built),
                                  "source_dir": str(REPO), "output_dir": str(output), "role": role,
-                                 "expert_families": "mimo:fp8;glm:nvfp4", "bf16_families": requested},
+                                 "expert_families": families, "bf16_families": requested},
                             timeout=30)
     return result, output / "fp8"
+
+
+@pytest.mark.parametrize("role", ["coordinator", "expert"])
+def test_release_stages_nvfp4_mtp_sibling_only_on_coordinator(tmp_path, role):
+    result, output = stage(tmp_path, "release", requested="", role=role,
+                           families="qwen4:nvfp4")
+    assert result.returncode == 0, result.stderr
+    expected = {"fp8-qwen4-nvfp4", "fp8-qwen4-nvfp4a4", "fp8-mimo-bf16"}
+    if role == "coordinator":
+        expected.add("fp8-qwen4")
+    assert {p.name for p in output.iterdir()} == expected
 
 
 @pytest.mark.parametrize("kind", ["release", "wip"])

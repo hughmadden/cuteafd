@@ -31,6 +31,11 @@ set(CUTEAFD_FP8_MOE_MANIFESTS)
 set(CUTEAFD_FP8_MOE_ENTRIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}")
+  # ModelOpt Qwen keeps MTP experts in FP8 beside NVFP4 routed layers.
+  # Local MTP therefore needs the TP1 FP8 package in the same image.
+  if(entry MATCHES "^qwen4:nvfp4(a4)?$" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "coordinator")
+    list(APPEND CUTEAFD_FP8_MOE_ENTRIES "qwen4:fp8")
+  endif()
   if(entry MATCHES ":nvfp4$")
     list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}a4")
   endif()
