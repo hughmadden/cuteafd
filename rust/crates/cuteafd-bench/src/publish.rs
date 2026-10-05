@@ -351,6 +351,7 @@ mod tests {
         assert_eq!((rows[0].2, rows[0].3.report.id.as_str()), (0, "minimum"));
         assert_eq!((rows[1].2, rows[1].3.report.id.as_str()), (1, "maximum"));
         assert!(short_hardware(&rows[0].3.report).contains("32 GiB budget"));
+        assert!(crate::render::card::card_svg(&rows[0].3.report).contains("32 GiB budget"));
         let html = results(&reports);
         assert!(html.contains("benchmarks/qwen4/minimum/card.svg"));
         assert!(html.contains("benchmarks/qwen4/maximum/card.svg"));

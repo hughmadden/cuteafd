@@ -74,6 +74,10 @@ pub fn card_svg(report: &Report) -> String {
     // Hardware, options, build and badge.
     let hw = &r.server.hardware;
     let mut hardware = hw.line();
+    if let Some(budget) = c.settings.iter().find(|s| s.name == "coordinator-gpu-budget-gib")
+        .and_then(|s| s.value.as_deref()) {
+        hardware.push_str(&format!(" · {budget} GiB budget"));
+    }
     let links: Vec<f64> = hw.fabric.iter().filter(|p| p.active).map(|p| p.link_gbps).collect();
     if !hw.sparks.is_empty() && !links.is_empty() {
         hardware.push_str(&format!(" · RoCE {:.0} Gb/s", links.iter().cloned().fold(0.0, f64::max)));
