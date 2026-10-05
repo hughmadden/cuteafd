@@ -66,6 +66,7 @@ but bounded engineering still goes to Sol.
   with a resume note pointing at its STATUS.md (its background jobs keep
   running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
+- **Transient 429s on long tasks:** a stream cut off after `response.created` with HTTP 429 (no `usage_limit_reached`) is provider throttling. Three long Sol-backup agents died this way within ~90 minutes on 2026-10-05; when it repeats, start long tasks on the other subscription and keep the throttled one for short work.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
