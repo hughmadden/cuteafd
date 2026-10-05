@@ -360,6 +360,7 @@ impl<'a> ExpertWeights<'a> {
         } else {
             layer.kernel(library, 16)?
         };
+        let load_started = std::time::Instant::now();
         let mut owned = Vec::with_capacity(4);
         for size in sizes {
             owned.push(DeviceAllocation::new(library, size)?);
@@ -377,20 +378,22 @@ impl<'a> ExpertWeights<'a> {
             library,
             raw: library.cuda_stream_create()?,
         };
-        // Read one bounded group in parallel while advising only the next group.
+        let allocation_seconds = load_started.elapsed().as_secs_f64();
+        let mut planning_seconds = 0.;
+        let mut read_seconds = 0.;
+        let mut upload_pack_seconds = 0.;
+        // WILLNEED can perform blocking I/O, serializing all six tensor extents
+        // per expert. Let the bounded parallel readers issue the reads instead.
         // CPU readers borrow disjoint pinned byte slices; all CUDA calls remain
         // on this owning thread, after the scoped readers have joined.
-        for expert in 0..EXPERT_READ_LANES.min(experts) {
-            catalog.expert_staging(layer.expert(expert))?.prefetch()?;
-        }
         for first in (0..experts).step_by(EXPERT_READ_LANES) {
             let end = (first + EXPERT_READ_LANES).min(experts);
-            for future in end..(end + EXPERT_READ_LANES).min(experts) {
-                catalog.expert_staging(layer.expert(future))?.prefetch()?;
-            }
+            let started = std::time::Instant::now();
             let plans = (first..end)
                 .map(|expert| catalog.expert_staging(layer.expert(expert)))
                 .collect::<Result<Vec<_>>>()?;
+            planning_seconds += started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
             std::thread::scope(|scope| -> Result<()> {
                 let mut readers = Vec::with_capacity(plans.len());
                 for ((plan, host), scratch) in plans.iter().zip(&mut hosts).zip(&mut read_scratch) {
@@ -404,6 +407,8 @@ impl<'a> ExpertWeights<'a> {
                 }
                 Ok(())
             })?;
+            read_seconds += started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
             for (offset, (plan, host)) in plans.iter().zip(&hosts).enumerate() {
                 let expert = first + offset;
                 unsafe {
@@ -436,7 +441,12 @@ impl<'a> ExpertWeights<'a> {
             }
             // Only CPU reuse of pinned staging requires host completion.
             unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+            upload_pack_seconds += started.elapsed().as_secs_f64();
         }
+        tracing::info!(?layer, experts, allocation_seconds, planning_seconds, read_seconds,
+            upload_pack_seconds, elapsed_seconds = load_started.elapsed().as_secs_f64(),
+            staging_bytes_per_expert = budget.device_staging_bytes,
+            "native expert load timeline");
         Ok(Self {
             buffers,
             layer,
