@@ -11,10 +11,12 @@ source "$repo_root/scripts/lib/release-common.sh"
 config="$repo_root/cuteafd.config"
 restart=0
 family=""
+embedding_override=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
     --family) family="${2:?--family requires ID}"; shift 2 ;;
+    --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
     *) echo "usage: $0 [--config FILE] [--family ID] [--restart]" >&2; exit 2 ;;
   esac
@@ -25,6 +27,7 @@ while IFS='=' read -r key value; do
   release_known_key "$key" || release_die "unknown configuration key: $key"
   cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
+[[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
@@ -203,7 +206,9 @@ case "$family:$speculator" in
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
-family_args=()
+embedding="$(get EMBEDDING gpu)"
+case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
+family_args=(--embedding-placement "$embedding")
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
   case "$(get MIMO_WEIGHT_POLICY auto)" in

@@ -157,6 +157,9 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct PlanArgs {
+    /// Place the untied token embedding in pinned mapped RAM instead of the lead GPU.
+    #[arg(long, alias = "embed-placement", value_enum, default_value_t = crate::shared::token_io::EmbedPlacement::Gpu)]
+    pub(crate) embedding_placement: crate::shared::token_io::EmbedPlacement,
     /// Hugging Face model id (resolved under HF_HOME) or a snapshot directory.
     pub(crate) model: String,
     #[arg(long)]
@@ -556,6 +559,9 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Keep the untied target/dSpark embedding on GPU0 or in pinned mapped RAM.
+    #[arg(long, alias = "embed-placement", value_enum, default_value_t = crate::shared::token_io::EmbedPlacement::Gpu)]
+    pub embedding_placement: crate::shared::token_io::EmbedPlacement,
     /// Force one RTX or the distributed two-RTX layout (automatic launcher selection is pending).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
     pub rtx_gpus: u32,

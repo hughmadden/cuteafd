@@ -105,3 +105,36 @@ fn native_image_replacement_and_reuse() -> Result<()> {
     eprintln!("PASS image replacement invalid-index/type/extent rejection and recovery");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA and official embedding weights"]
+fn native_host_embedding_exact_512() -> Result<()> {
+    use crate::shared::token_io::EmbedPlacement;
+    // SAFETY: the test's native library remains alive after all of its owners.
+    let lib = unsafe { NativeLibrary::load(std::env::var_os("CUTEAFD_VISION_LIBRARY").context("library")?)? };
+    let model = std::path::PathBuf::from(std::env::var_os("CUTEAFD_VISION_MODEL").context("model")?);
+    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &model)?;
+    let tokens: Vec<u32> = (0..512).map(|i| ((i * 7919) % 129280) as u32).collect();
+    let positions: Vec<u64> = (0..512).collect();
+    let copy = |output: TargetEmbedding<'_>| -> Result<(Vec<u8>, Vec<u8>)> {
+        let (mut residual, mut pre) = (vec![0; output.residual.bytes], vec![0; output.pre.bytes]);
+        lib.copy_d2h(&mut residual, output.residual)?;
+        lib.copy_d2h(&mut pre, output.pre)?;
+        Ok((residual, pre))
+    };
+    let mut reference = None;
+    for placement in [EmbedPlacement::Gpu, EmbedPlacement::Host] {
+        let before = lib.cuda_physical_memory_info()?.0;
+        let table = NativeRtxTensors::load_embedding(&lib, &catalog, placement)?;
+        let after = lib.cuda_physical_memory_info()?.0;
+        assert_eq!(table.resident_bytes(), if placement == EmbedPlacement::Gpu { 129280 * 5120 * 2 } else { 0 });
+        let mut wave = TargetEmbeddingWave::new(&lib, &table, 512, TargetEmbeddingWave::device_bytes(512)?)?;
+        let output = copy(wave.execute(&tokens, &positions)?)?;
+        assert_eq!(copy(wave.execute(&tokens, &positions)?)?, output);
+        if let Some(reference) = &reference { assert_eq!(&output, reference); }
+        else { reference = Some(output); }
+        eprintln!("PASS embedding {placement:?}: 512 rows, graph replay exact, table device bytes {}, physical GPU delta {}",
+            table.resident_bytes(), before.saturating_sub(after));
+    }
+    Ok(())
+}

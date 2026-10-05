@@ -4,12 +4,12 @@
 //! (greedy argmax and the GPU sampler over device logits; only ids and
 //! statuses come back to the host).
 //!
-//! Both have a host twin selected by flag: `--embed-placement host` reads the
-//! rows from the checkpoint shard (kept open) for memory-tight placements, and
+//! Both have a host twin selected by flag: `--embedding-placement host` keeps
+//! one pinned mapped table, gathered by stream-ordered kernels, and
 //! `--token-select host` downloads the logits rows and selects with
 //! [`TargetSamplingParams::select_token`], the reference the device path
 //! must reproduce (token-identical for greedy rows).
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, ResidentWeight};
 use crate::shared::sampler::{TargetSamplingRowRequest, TargetSamplingWave, SAMPLING_MAX_RETAINED};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{TargetSamplingError, TargetSamplingParams};
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 pub(crate) enum EmbedPlacement {
     /// A BF16 copy on the coordinator GPU: steps upload token ids.
     Gpu,
-    /// Rows read from the checkpoint shard each step (memory-tight placements).
+    /// One pinned mapped host copy, gathered without a host hop.
     Host,
 }
 
@@ -41,9 +41,8 @@ pub(crate) enum SelectPlacement {
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub(crate) struct TokenIoArgs {
     /// Where the token embedding table lives: `gpu` keeps a BF16 copy on the
-    /// coordinator GPU (steps upload token ids); `host` reads rows from the
-    /// checkpoint shard each step.
-    #[arg(long, value_enum, default_value_t = EmbedPlacement::Gpu)]
+    /// coordinator GPU; `host` keeps one pinned mapped copy (untied tables only).
+    #[arg(long = "embedding-placement", alias = "embed-placement", value_enum, default_value_t = EmbedPlacement::Gpu)]
     pub embed_placement: EmbedPlacement,
     /// Where next tokens are selected: `device` (only ids come back) or
     /// `host` (logits rows come back; the reference path).
@@ -65,8 +64,6 @@ pub(crate) enum TokenIoError {
     TokenOutOfRange { token: u32, vocab: usize },
     #[error("{rows} rows exceed the token selector's {capacity}")]
     Capacity { rows: usize, capacity: usize },
-    #[error("the embedding table is host-resident; device gathers need --embed-placement gpu")]
-    HostTable,
 }
 
 /// The BF16 `[vocab, hidden]` embedding tensor in a checkpoint shard.
@@ -76,6 +73,8 @@ pub(crate) struct EmbedSource {
     pub offset: u64,
     pub vocab: usize,
     pub hidden: usize,
+    pub snapshot: Option<PathBuf>,
+    pub tensor_name: String,
 }
 
 impl EmbedSource {
@@ -87,7 +86,8 @@ impl EmbedSource {
             error(format!("shape {:?}, not [vocab, {hidden}]", meta.shape)));
         let vocab = meta.shape[0];
         ensure!(meta.byte_length == (vocab * hidden * 2) as u64, error(format!("{} bytes", meta.byte_length)));
-        Ok(Self { path: snapshot.join(shard), offset: meta.byte_offset, vocab, hidden })
+        Ok(Self { path: snapshot.join(shard), offset: meta.byte_offset, vocab, hidden,
+            snapshot: Some(snapshot.to_owned()), tensor_name: meta.name.clone() })
     }
 
     fn bytes(&self) -> usize {
@@ -95,14 +95,14 @@ impl EmbedSource {
     }
 }
 
-/// The token embedding table: resident on the GPU or read from its shard.
+/// The token embedding table: one device-local or mapped pinned copy.
 pub(crate) struct TokenEmbedding<'a> {
     library: &'a NativeLibrary,
     source: EmbedSource,
     /// The shard, kept open: an open through the sparknest mount costs more
     /// than the row reads.
     file: std::fs::File,
-    table: Option<DeviceAllocation<'a>>,
+    table: ResidentWeight<'a>,
 }
 
 impl<'a> TokenEmbedding<'a> {
@@ -114,26 +114,39 @@ impl<'a> TokenEmbedding<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
         if placement == EmbedPlacement::Host {
-            return Ok((Self { library, source, file, table: None }, during()?));
+            if let Some(snapshot) = &source.snapshot {
+                cuteafd_loader::plan::checkpoint::Checkpoint::open(snapshot)?
+                    .require_untied_embedding(&source.tensor_name)?;
+            }
         }
-        let table = DeviceAllocation::new(library, source.bytes())?;
+        let mut table = ResidentWeight::new(library, source.bytes(), placement == EmbedPlacement::Host)?;
         let device = library.cuda_get_device()?;
-        let (address, started) = (table.buffer.ptr as usize, std::time::Instant::now());
+        let (address, started) = (table.buffer().ptr as usize, std::time::Instant::now());
         let result = std::thread::scope(|scope| -> Result<T> {
-            let filler = scope.spawn(|| fill_table(library, device, &file, &source, address));
+            let filler = match &mut table {
+                ResidentWeight::Host { storage, .. } => {
+                    let bytes = storage.bytes_mut();
+                    let (file, offset) = (&file, source.offset);
+                    scope.spawn(move || file.read_exact_at(bytes, offset).map_err(anyhow::Error::from))
+                }
+                ResidentWeight::Device(_) => scope.spawn(|| fill_table(library, device, &file, &source, address)),
+            };
             let value = during();
             let filled = filler.join().map_err(|_| anyhow::anyhow!("embedding table loader panicked"))?;
             filled.context("loading the embedding table")?;
             value
         })?;
         tracing::info!(vocab = source.vocab, hidden = source.hidden, gib = source.bytes() as f64 / (1u64 << 30) as f64,
-            elapsed_ms = started.elapsed().as_millis() as u64, "token embedding table resident on the GPU");
-        Ok((Self { library, source, file, table: Some(table) }, result))
+            ?placement, device_bytes = table.device_bytes(), pinned_bytes = if table.is_host() { source.bytes() } else { 0 },
+            elapsed_ms = started.elapsed().as_millis() as u64, "token embedding placement (single residency)");
+        Ok((Self { library, source, file, table }, result))
     }
 
     pub fn placement(&self) -> EmbedPlacement {
-        if self.table.is_some() { EmbedPlacement::Gpu } else { EmbedPlacement::Host }
+        if self.table.is_host() { EmbedPlacement::Host } else { EmbedPlacement::Gpu }
     }
+
+    pub fn device_gather(&self) -> bool { true }
 
     pub fn vocab(&self) -> usize {
         self.source.vocab
@@ -157,7 +170,10 @@ impl<'a> TokenEmbedding<'a> {
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
         for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
-            self.file.read_exact_at(slot, self.source.offset + u64::from(token) * row as u64)?;
+            match &self.table {
+                ResidentWeight::Host { storage, .. } => slot.copy_from_slice(&storage.bytes()[token as usize * row..(token as usize + 1) * row]),
+                ResidentWeight::Device(_) => self.file.read_exact_at(slot, self.source.offset + u64::from(token) * row as u64)?,
+            }
         }
         Ok(out)
     }
@@ -181,15 +197,11 @@ impl<'a> TokenEmbedding<'a> {
     /// Writes `copies` copies of each token's row into `out` (BF16
     /// `[tokens * copies, hidden]`) on `stream`. With the GPU table the ids go
     /// up into `ids` (at least `tokens.len()` U32) and the rows are gathered
-    /// on the device; otherwise the rows are read from the shard and copied up.
+    /// on the device from either the local or mapped pinned table.
     pub fn embed(&self, tokens: &[u32], ids: CuteafdDeviceBuffer, copies: usize, out: CuteafdDeviceBuffer,
         stream: *mut c_void) -> Result<()> {
         ensure!(!tokens.is_empty() && out.bytes >= tokens.len() * copies * self.source.hidden * 2,
             "embedding of {} rows x {copies} exceeds its output", tokens.len());
-        if self.table.is_none() {
-            let rows = self.host_rows_repeated(tokens, copies)?;
-            return self.library.copy_h2d(CuteafdDeviceBuffer { bytes: rows.len(), ..out }, &rows);
-        }
         self.check(tokens)?;
         ensure!(ids.bytes >= tokens.len() * 4, "token id buffer of {} bytes for {} ids", ids.bytes, tokens.len());
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -209,15 +221,14 @@ impl<'a> TokenEmbedding<'a> {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
         fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
-        let table = self.table.as_ref().ok_or(TokenIoError::HostTable)?;
+        let table = self.table.buffer();
         // SAFETY: the caller's contract; the table is a live [vocab, hidden] BF16 buffer.
-        unsafe { self.library.cuda_embed_gather_bf16_async(table.buffer.ptr, self.source.vocab, self.source.hidden,
+        unsafe { self.library.cuda_embed_gather_bf16_async(table.ptr, self.source.vocab, self.source.hidden,
             ids, index, rows, copies, fallback, out, stream) }
     }
 
-    /// [`Self::gather`] for either placement. `index` and `fallback` pair the
-    /// device pointer with its host copy; a host table reads the ids back
-    /// (synchronizing `stream`), then copies the shard rows up.
+    /// [`Self::gather`] for either placement, without a device-id download.
+    /// `index` and `fallback` pair the device pointer with its host reference.
     ///
     /// # Safety
     /// As for [`Self::gather`]; `ids` is a device buffer holding every id the
@@ -226,43 +237,16 @@ impl<'a> TokenEmbedding<'a> {
     pub unsafe fn embed_device_ids(&self, ids: CuteafdDeviceBuffer, index: Option<(*const c_void, &[u32])>,
         rows: usize, copies: usize, fallback: Option<(*const c_void, &[u8])>, out: CuteafdDeviceBuffer,
         stream: *mut c_void) -> Result<()> {
-        if self.table.is_some() {
-            let index_ptr = index.map_or(std::ptr::null(), |(device, _)| device);
-            let fallback = fallback.map_or(std::ptr::null(), |(device, _)| device);
-            // SAFETY: the caller's contract.
-            return unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, stream) };
-        }
-        let picks: Vec<usize> = match index {
-            Some((_, host)) => host.iter().map(|&i| i as usize).take(rows).collect(),
-            None => (0..rows).collect(),
-        };
-        ensure!(picks.len() == rows, "{rows} rows with {} indices", picks.len());
-        let count = picks.iter().max().map_or(0, |&m| m + 1);
-        ensure!(count * 4 <= ids.bytes, "token id index past its buffer");
-        // SAFETY: the caller's stream; the ids are complete once it drains.
-        unsafe { self.library.cuda_stream_synchronize(stream)? };
-        let mut raw = vec![0u8; count * 4];
-        self.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: count * 4, ..ids })?;
-        let row = self.source.hidden * 2;
-        let mut bytes = Vec::with_capacity(rows * copies * row);
-        for pick in picks {
-            let id = u32::from_le_bytes(raw[pick * 4..pick * 4 + 4].try_into().unwrap());
-            let r = if (id as usize) < self.source.vocab {
-                self.host_rows(&[id])?
-            } else {
-                fallback.map_or_else(|| vec![0u8; row], |(_, host)| host.to_vec())
-            };
-            for _ in 0..copies {
-                bytes.extend_from_slice(&r);
-            }
-        }
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..out }, &bytes)
+        let index_ptr = index.map_or(std::ptr::null(), |(device, _)| device);
+        let fallback = fallback.map_or(std::ptr::null(), |(device, _)| device);
+        // SAFETY: both placements expose a stable device-visible table; caller owns the stream and outputs.
+        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, stream) }
     }
 
     /// Compares every byte of the resident table with the shard (the
     /// embedding gate); returns the bytes compared.
     pub fn verify_resident(&self) -> Result<usize> {
-        let table = self.table.as_ref().ok_or(TokenIoError::HostTable)?;
+        let table = self.table.buffer();
         let chunk = 64usize << 20;
         let (mut host, mut device) = (vec![0u8; chunk], vec![0u8; chunk]);
         let total = self.source.bytes();
@@ -271,8 +255,8 @@ impl<'a> TokenEmbedding<'a> {
             let n = chunk.min(total - at);
             self.file.read_exact_at(&mut host[..n], self.source.offset + at as u64)?;
             // SAFETY: `at + n` lies inside the table.
-            let ptr = unsafe { table.buffer.ptr.cast::<u8>().add(at) }.cast();
-            self.library.copy_d2h(&mut device[..n], CuteafdDeviceBuffer { ptr, bytes: n, ..table.buffer })?;
+            let ptr = unsafe { table.ptr.cast::<u8>().add(at) }.cast();
+            self.library.copy_d2h(&mut device[..n], CuteafdDeviceBuffer { ptr, bytes: n, ..table })?;
             ensure!(host[..n] == device[..n], "resident embedding table differs from the shard at byte {at}");
             at += n;
         }
@@ -651,7 +635,7 @@ impl<'a> TokenSelector<'a> {
 pub(crate) fn gate(library: &NativeLibrary, embedding: &TokenEmbedding<'_>, first: u32, steps: usize,
     mut step: impl FnMut(u32) -> Result<DeviceLogits>) -> Result<()> {
     let vocab = embedding.vocab();
-    if embedding.placement() == EmbedPlacement::Gpu {
+    if embedding.device_gather() {
         let started = std::time::Instant::now();
         let bytes = embedding.verify_resident()?;
         let mut rng = 0x2545_f491_4f6c_dd1du64;

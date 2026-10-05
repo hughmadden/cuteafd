@@ -147,16 +147,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         16 << 20,
     )?;
     memory_checkpoint("Engram weights")?;
-    let names = ["embed.weight".to_string()];
-    let table = devices[0].own(|| {
-        NativeRtxTensors::load(
-            &lib,
-            &catalog,
-            &names,
-            NativeRtxTensors::plan(&catalog, &names)?,
-            16 << 20,
-        )
-    })?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding(&lib, &catalog, args.embedding_placement))?;
     memory_checkpoint("embedding weights")?;
     let vocab = [
         devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,

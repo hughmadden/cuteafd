@@ -771,7 +771,9 @@ Work, in priority order:
    cluster job. This caused the historical "split FP8 −24%" reading (not
    precision). Suspect a coordinator or transport timeout/retry path; it
    may affect every family. Investigate if it recurs.
-10. **Build hygiene:** `./build.sh` takes the hardware locks and pins GPU0
+10. **Build hygiene (merged 2026-10-05, `work/build-hygiene`; verify on the
+    first real `./build.sh`: GPU access under `--user` and the relocated
+    CARGO_HOME were only checked by inspection):** `./build.sh` took the hardware locks and pinned GPU0
     through its CPU, download and AOT export phases; it should take
     `build.lock` for those and touch hardware only where it measures.
     Build containers run as root, leaving root-owned `target*` directories

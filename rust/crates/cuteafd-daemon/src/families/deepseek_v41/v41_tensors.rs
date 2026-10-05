@@ -11,8 +11,28 @@ pub(crate) use vocabulary_shard::VocabularyShard;
 pub(crate) struct NativeRtxTensors<'a> {
     tensors: BTreeMap<String, DeviceAllocation<'a>>,
     resident_bytes: usize,
+    mapped_embedding: Option<(HostAllocation<'a>, CuteafdDeviceBuffer)>,
 }
 impl<'a> NativeRtxTensors<'a> {
+    /// Target and dSpark borrow the same immutable table on both CED devices.
+    pub fn load_embedding(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        placement: crate::shared::token_io::EmbedPlacement) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("embedding");
+        let names = ["embed.weight".to_owned()];
+        let bytes = Self::plan(catalog, &names)?;
+        if placement == crate::shared::token_io::EmbedPlacement::Gpu {
+            tracing::info!(?placement, device_bytes=bytes, pinned_bytes=0, "V4.1 embedding placement (single residency, RTX0 only)");
+            return Self::load(library, catalog, &names, bytes, 16 << 20);
+        }
+        cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
+            .require_untied_embedding("embed.weight")?;
+        let mut storage = HostAllocation::new(library, bytes)?;
+        catalog.coordinator_tensor_reader("embed.weight")?.read_into(0, storage.bytes_mut())?;
+        let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
+        tracing::info!(?placement, device_bytes=0, pinned_bytes=bytes, "V4.1 embedding placement (single residency, shared target/dSpark)");
+        Ok(Self { tensors: BTreeMap::new(), resident_bytes: 0, mapped_embedding: Some((storage, alias)) })
+    }
+
     pub fn plan(catalog: &OfficialV41Catalog, names: &[String]) -> Result<usize> {
         ensure!(!names.is_empty(), "RTX tensor set is empty");
         let mut seen = BTreeSet::new();
@@ -68,10 +88,14 @@ impl<'a> NativeRtxTensors<'a> {
         Ok(Self {
             tensors,
             resident_bytes,
+            mapped_embedding: None,
         })
     }
     /// Borrowed native representation; never free or retain after the owner drops.
     pub fn get(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
+        if name == "embed.weight" {
+            if let Some((_, alias)) = &self.mapped_embedding { return Ok(*alias); }
+        }
         Ok(self
             .tensors
             .get(name)

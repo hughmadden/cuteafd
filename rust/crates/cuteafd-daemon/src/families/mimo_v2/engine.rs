@@ -1348,7 +1348,7 @@ impl<'a> MimoEngine<'a> {
         if tables.decode && self.decode_graphs && on_layer.is_none() && forced.is_none() && self.graphable() {
             // The first captured segment gathers the rows from the uploaded ids; the
             // last runs the head and the greedy selection.
-            let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+            let gather = self.embedding.device_gather();
             if gather {
                 self.embedding.check(tokens)?;
                 self.put(&w.ids, tokens)?;
@@ -1796,7 +1796,7 @@ impl<'a> MimoEngine<'a> {
             "MiMo eager vocabulary head initialization outside graph storage");
         observe("eager-vocabulary-head-initialization")?;
         let free_before = (0..self.ranks()).map(&free).collect::<Result<Vec<_>>>()?;
-        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        let gather = self.embedding.device_gather();
         let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         let mut previous_free = free_before.clone();
         for t in 1..=max_rows {

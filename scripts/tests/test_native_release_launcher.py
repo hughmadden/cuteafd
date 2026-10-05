@@ -13,6 +13,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_embedding_placement_registered_and_gpu_default(self) -> None:
+        result = subprocess.run(['bash', '-c',
+            'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '
+            'release_load_config scripts/fixtures/cuteafd.build-v11.config; printf "%s" "$EMBEDDING"'], cwd=ROOT, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'gpu')
+        native = (ROOT / 'run.sh').read_text()
+        generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
+        self.assertIn('--embedding-placement "$EMBEDDING"', native)
+        self.assertIn('family_args=(--embedding-placement "$embedding")', generic)
+        self.assertIn('cfg[EMBEDDING]="$embedding_override"', generic)
+
     def test_explicit_dual_layer_boundary_covers_delegated_experts(self) -> None:
         for layout, layers, expected in [('2', 'auto', '20'), ('2', '17', '17'),
                                          ('2', '1', '1'), ('2', '40', '39'),
