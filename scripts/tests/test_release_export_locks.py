@@ -69,12 +69,38 @@ def test_cleanup_accepts_auto_removed_container(tmp_path, monkeypatch):
     assert result.returncode == 0, result.stderr
 
 
-def test_build_wraps_both_gpu_legs_and_uses_unique_names():
+def test_build_takes_a_cpu_lock_and_only_guards_its_export_gpus():
+    """`build.sh` must not hold a hardware lock while it compiles, downloads,
+    assembles images or exports: the build's serialization is its own CPU lock,
+    and each AOT export borrows one idle GPU behind a guard instead."""
     build = (ROOT / 'build.sh').read_text()
-    assert 'release_with_export_locks "" "$export_container-coordinator"' in build
-    assert 'timeout "$export_timeout" docker run --rm --name "$export_container-coordinator"' in build
-    assert 'release_with_export_locks "$seed_host" "$export_container-expert" build_spark_release_leg export' in build
+    assert 'exec 9>"$release_build_lock_dir/build.lock"' in build
+    assert 'release_build_lock_dir="$HOME/.cache/cuteafd"' in build
+    # The only flock in the build is the build lock: no sparks.lock/gpu1.lock,
+    # no hardware-lock helper, and therefore no wait behind or for a measurement.
+    assert [line.strip() for line in build.splitlines() if 'flock' in line and not line.strip().startswith('release_need')] == [
+        'flock -w "$release_build_lock_timeout" 9 ||'
+    ]
+    assert 'release_with_export_locks' not in build
+    assert 'release-export-locks.sh' not in build
+    assert build.index('if ((dry_run)); then') < build.index('exec 9>"$release_build_lock_dir/build.lock"')
+    # The coordinator export picks an idle device (<512 MiB used), pins it by
+    # UUID, watches it, and cleans its container up inline (the old cleanup rode
+    # on the lock helper's traps).
+    assert 'export_gpu_pick="$(release_select_idle_export_gpu)" || exit 2' in build
+    assert '--gpus "device=$export_gpu_uuid"' in build
+    assert '-e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid"' in build
+    assert 'release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &' in build
+    assert 'timeout "$export_timeout" docker run --rm --name "$coordinator_export_container"' in build
+    assert "trap 'release_stop_export_watchdog; release_export_cleanup; exit 143' TERM" in build
+    assert "trap 'release_export_cleanup; rm -rf \"$release_source_dir\"' EXIT" in build
+    # The Spark export is guarded on the host: no serving worker, >=100 GiB
+    # CUDA-free, an ssh-side EXIT/HUP cleanup and a contention watchdog.
+    assert 'build_spark_release_leg export' in build
     assert 'timeout "$export_timeout" ssh "${release_ssh_opts[@]}" "$seed_host"' in build
+    assert "trap 'cleanup_export_container' EXIT HUP INT TERM" in build
+    assert "name=^cuteafd-spark-expert-[a-z0-9_.-]+-[0-9]+$" in build
+    assert 'CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB' in build
     helper = (ROOT / 'scripts/lib/release-export-locks.sh').read_text()
     assert helper.index('flock -w "$wait_seconds" 9') < helper.index('flock -w "$wait_seconds" 8')
 
