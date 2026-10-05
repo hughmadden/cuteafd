@@ -2,8 +2,9 @@
 
 Working draft. Decides how a precision or kernel default (FP8 KDA/head, A8,
 W4A4, speculation paths) is judged against the checkpoint-precision engine,
-replacing the single 512-token PLAN.md passage. Everything here is a plan;
-nothing has run.
+replacing the single 512-token PLAN.md passage. The qualified V4.1
+calibration and first paired decision are complete (see §8); other-family
+references and the independent agentic replay gate remain in progress.
 
 ## 0. Recommendation in one box
 
@@ -358,11 +359,27 @@ plus 0.02 nat, capped at 0.06: 0.04 quick, 0.03 on each full path; a common
 `expect` uses `kl_max = 0.04`. These are absolute sanity gates, not a
 replacement for the unchanged paired 0.005 top-1 / 0.005-nat decision.
 
-No candidate arm has been scored yet, so actual candidate-versus-baseline
-paired discordance and bounds remain unmeasured. Baseline decode versus
-prefill has 524/17,656 differing agreement indicators and 547/17,656
-argmax differences; those describe shape sensitivity, **not** the paired
-precision-arm discordance used in §5's power calculation.
+### First paired V4.1 FP8 vocabulary-head decision (2026-10-05)
+
+The FP8-head candidate uses the same immutable reference, build, checkpoint,
+resolved nonprecision settings and GPU0 + TP4 layout as calibration. The
+**full tier passes on both shapes**; all absolute gates and statistical
+tripwires pass. The quick tier is **inconclusive**, not a demonstrated
+regression: its top-1 upper bound exceeds the quick margin, while the
+prespecified full-tier bounds comfortably clear the precision bar.
+
+| Tier / shape | Generated positions | Baseline-only / candidate-only agreements | Discordance | Top-1 loss upper 95% | KL delta upper 95% (nat) | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Quick / decode | 2,689 | 56 / 37 | 3.4585% | 0.012199 | 0.001923 | Inconclusive |
+| Full / decode | 17,656 | 250 / 269 | 2.9395% | 0.000937 | 0.000846 | Pass |
+| Full / prefill | 17,656 | 252 / 255 | 2.8715% | 0.001854 | 0.000305 | Pass |
+
+Candidate scoring takes 55.10 / 346.43 / 255.64 s for quick decode / full
+decode / full prefill. Independent agentic replay validity remains an
+unfulfilled separate gate; this statistical verdict does not promote a
+default. Baseline decode versus prefill has 524/17,656 differing agreement
+indicators and 547/17,656 argmax differences; those describe shape
+sensitivity, not precision-arm discordance.
 
 The paired bar remains the precision decision rule at any absolute level,
 subject to the independent absolute gates and reference qualification.

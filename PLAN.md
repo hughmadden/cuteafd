@@ -693,11 +693,15 @@ Policy decisions:
   (±1.4-point top-1 standard error, no code or tool calls). A redesigned
   agentic-coding set (draft `docs/fidelity-design.md`) replaces it before
   any precision default changes on the new bar.
-- **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must keep golden
-  top-1 within ~0.5 point of the checkpoint-precision arm (GLM Flash ~89%
-  is the floor TJ accepts) and KL within 0.005 nat of it. Hugh's BF16
-  teacher (`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits`) is a second
-  reference where available.
+- **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must pass the
+  paired one-sided 95% non-inferiority bounds: top-1 loss <0.005 and KL
+  increase <0.005 nat on both full-tier scoring shapes. Use only qualified
+  goldens from official checkpoints, no external teacher (§11 of
+  `docs/fidelity-design.md`). Qualified V4.1 calibration sets the common
+  absolute gates to top-1 >=94% / KL <=0.04 nat. Its FP8 vocabulary head
+  passes full decode and prefill (top-1 upper bounds 0.000937 / 0.001854;
+  KL upper bounds 0.000846 / 0.000305 nat). Quick is inconclusive, not fail;
+  independent agentic replay remains required and defaults are unchanged.
 - **Exact speculation:** attempt byte-exact greedy speculation (drafts
   on/off, C1→C4) per family when it doesn't cost C1. Where it does, keep the
   faster path and accept proven rounding.
