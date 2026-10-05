@@ -7,10 +7,6 @@ use cuteafd_loader::plan::checkpoint::Checkpoint;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProjectionInputError {
-    #[error("GLMF token-row FFNs require hidden=4096, dense intermediate=12288 and shared intermediate=2048, found {hidden}/{dense}/{shared}")]
-    FfnRowsGeometry { hidden: usize, dense: usize, shared: usize },
-    #[error("{name}: GLMF token-row FFNs require native E4M3 weights with FP32 128x128 scales; {actual:?} needs another consumer")]
-    FfnRowsSource { name: String, actual: DType },
     #[error("GLMF checkpoint has no selected projection tensor {name}")]
     Missing { name: String },
     #[error("{name}: GLMF {consumer} reads {expected:?}, found {actual:?}")]
@@ -25,44 +21,6 @@ pub(crate) enum ProjectionInputError {
     Bytes { name: String, consumer: &'static str, expected: u64, actual: u64 },
     #[error("{name}: GLMF projection geometry overflows its storage byte count")]
     Overflow { name: String },
-}
-
-/// Full-intermediate FFNs replicate the selected checkpoint's native FP8 bytes.
-/// Admit every used tensor before any native library or GPU allocation; a packed
-/// primary dense MLP retains its own format and cannot take this option.
-pub(crate) fn check_ffn_row_inputs(primary: &Checkpoint, fp8_source: Option<&Checkpoint>,
-    cfg: &GlmNextConfig, layers: usize) -> Result<(), ProjectionInputError> {
-    if (cfg.hidden, cfg.dense_intermediate, cfg.moe_intermediate) != (4096, 12288, 2048) {
-        return Err(ProjectionInputError::FfnRowsGeometry {
-            hidden: cfg.hidden, dense: cfg.dense_intermediate, shared: cfg.moe_intermediate });
-    }
-    let source = fp8_source.unwrap_or(primary);
-    for layer in 0..layers.min(cfg.layers) {
-        let (mlp, inter) = if cfg.dense[layer] { ("mlp", cfg.dense_intermediate) }
-            else { ("mlp.shared_experts", cfg.moe_intermediate) };
-        let prefix = format!("model.language_model.layers.{layer}.{mlp}");
-        for (projection, rows, cols) in [("gate_proj", inter, cfg.hidden), ("up_proj", inter, cfg.hidden),
-            ("down_proj", cfg.hidden, inter)] {
-            let name = format!("{prefix}.{projection}.weight");
-            if cfg.dense[layer] {
-                let at = primary.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
-                    .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
-                if primary.tensors[at].meta.dtype == DType::U8 {
-                    return Err(ProjectionInputError::FfnRowsSource { name, actual: DType::U8 });
-                }
-            }
-            let at = source.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
-                .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
-            if source.tensors[at].meta.dtype != DType::F8E4M3 {
-                return Err(ProjectionInputError::FfnRowsSource {
-                    name, actual: source.tensors[at].meta.dtype.clone() });
-            }
-            require(source, name.clone(), DType::F8E4M3, vec![rows, cols], 1, "token-row FFN")?;
-            require(source, format!("{name}_scale_inv"), DType::F32,
-                vec![rows / 128, cols / 128], 4, "token-row FFN")?;
-        }
-    }
-    Ok(())
 }
 
 fn require(checkpoint: &Checkpoint, name: String, dtype: DType, shape: Vec<usize>,
@@ -212,70 +170,6 @@ mod tests {
                 tensor.meta.byte_length *= 2;
             }
         }
-    }
-
-    #[test]
-    fn token_row_ffns_admit_native_selected_payload_and_reject_packed_dense() {
-        let (native, cfg) = fixture();
-        check_ffn_row_inputs(&native, None, &cfg, cfg.layers).unwrap();
-        let (mut bf16, _) = fixture();
-        widen_sources(&mut bf16);
-        assert!(matches!(check_ffn_row_inputs(&bf16, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::FfnRowsSource { actual: DType::Bf16, .. })));
-        check_ffn_row_inputs(&bf16, Some(&native), &cfg, cfg.layers).unwrap();
-        assert!(matches!(check_ffn_row_inputs(&native, Some(&bf16), &cfg, cfg.layers),
-            Err(ProjectionInputError::FfnRowsSource { actual: DType::Bf16, .. })));
-        let (mut packed, _) = fixture();
-        packed.tensors.iter_mut().find(|t| t.meta.name ==
-            "model.language_model.layers.0.mlp.gate_proj.weight").unwrap().meta.dtype = DType::U8;
-        assert!(matches!(check_ffn_row_inputs(&packed, Some(&native), &cfg, cfg.layers),
-            Err(ProjectionInputError::FfnRowsSource { actual: DType::U8, .. })));
-    }
-
-    #[test]
-    fn token_row_ffns_require_full_payload_and_matching_native_scale_grid() {
-        let name = "model.language_model.layers.1.mlp.shared_experts.down_proj.weight";
-        let (mut checkpoint, cfg) = fixture();
-        checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.shape = vec![4096, 1024];
-        assert!(matches!(check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::Shape { .. })));
-        let (mut checkpoint, cfg) = fixture();
-        checkpoint.tensors.iter_mut().find(|t| t.meta.name == format!("{name}_scale_inv"))
-            .unwrap().meta.shape = vec![32, 8];
-        assert!(matches!(check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::Shape { .. })));
-        let (mut checkpoint, cfg) = fixture();
-        checkpoint.tensors.iter_mut().find(|t| t.meta.name == format!("{name}_scale_inv"))
-            .unwrap().meta.dtype = DType::Bf16;
-        assert!(matches!(check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::Dtype { expected: DType::F32, .. })));
-        let (mut checkpoint, cfg) = fixture();
-        checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.byte_length -= 1;
-        assert!(matches!(check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::Bytes { .. })));
-        let (checkpoint, mut cfg) = fixture();
-        cfg.moe_intermediate = 1024;
-        assert!(matches!(check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers),
-            Err(ProjectionInputError::FfnRowsGeometry { shared: 1024, .. })));
-    }
-
-    #[test]
-    fn token_row_ffn_replica_admission_counts_one_native_copy_per_rank() {
-        let (checkpoint, cfg) = fixture();
-        check_ffn_row_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap();
-        let bytes = |prefix: &str, scale: bool| checkpoint.tensors.iter()
-            .filter(|t| t.meta.name.starts_with(prefix) && t.meta.name.ends_with("_scale_inv") == scale)
-            .map(|t| t.meta.byte_length).sum::<u64>();
-        let (dense_values, dense_scales) = (bytes("model.language_model.layers.0.mlp.", false),
-            bytes("model.language_model.layers.0.mlp.", true));
-        let (shared_values, shared_scales) = (bytes("model.language_model.layers.1.mlp.shared_experts.", false),
-            bytes("model.language_model.layers.1.mlp.shared_experts.", true));
-        assert_eq!((dense_values, dense_scales), (150_994_944, 36_864));
-        assert_eq!((shared_values, shared_scales), (25_165_824, 6_144));
-        // Replication replaces each rank's half-intermediate copy; it adds one
-        // half of these full byte counts over the 3 dense + 42 shared layers.
-        assert_eq!((dense_values + dense_scales) / 2 * 3
-            + (shared_values + shared_scales) / 2 * 42, 755_159_040);
     }
 
     #[test]

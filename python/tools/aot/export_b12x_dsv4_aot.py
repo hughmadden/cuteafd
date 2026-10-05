@@ -306,13 +306,7 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
                      lambda: glmf.compile_glmf_join_aot(g.kda_width)))
     programs.append(("join_rows", "join_rows", {"width": g.hidden},
                      lambda: glmf.compile_glmf_join_rows_aot(g.hidden)))
-    programs.append(("join_mla_heads", "join", {"half_width": g.heads * g.v_head_dim},
-                     lambda: glmf.compile_glmf_join_mla_heads_aot(g)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
-        programs.append((f"mla_values_m{rows}", "mla_values", {"max_rows": rows},
-                         lambda r=rows: glmf.compile_glmf_mla_values_aot(g, max_rows=r)))
-        programs.append((f"mla_output_rows_m{rows}", "mla_output_rows", {"max_rows": rows, "fp8_only": mode},
-                         lambda r=rows, m=mode: glmf.compile_glmf_mla_output_rows_aot(g, max_rows=r, fp8_only=m)))
         programs.append((f"kda_w8_norm_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode, "output_kind": "norm"},
                          lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(
                              g, max_rows=r, fp8_only=m, output_kind="norm")))

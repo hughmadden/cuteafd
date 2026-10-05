@@ -135,10 +135,6 @@ pub(crate) struct GlmfLoader<'a> {
     pub kda_fp8: super::fp8::KdaFp8,
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
-    /// Replicate the native MLA output weight; project complete owned token rows.
-    pub split_mla_rows: bool,
-    /// Replicate native FP8 dense/shared FFNs for token-row ownership on two GPUs.
-    pub split_ffn_rows: bool,
     pub fp8_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
@@ -796,16 +792,9 @@ impl<'a> GlmfLoader<'a> {
                 let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("q_b_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_q_b_fp8", q);
                 put(&mut ops, "w_q_b_scale", s);
-                if self.split_mla_rows {
-                    ensure!(ranks == 2, "MLA output token rows require two coordinator ranks");
-                    let (q, s) = self.fp8(&[a("o_proj.weight")], super::fp8::Layout::Block)?;
-                    put(&mut ops, "w_o_fp8", self.replicate(q)?);
-                    put(&mut ops, "w_o_scale", self.replicate(s)?);
-                } else {
-                    let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
-                    put(&mut ops, "w_o_fp8", q);
-                    put(&mut ops, "w_o_scale", s);
-                }
+                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
+                put(&mut ops, "w_o_fp8", q);
+                put(&mut ops, "w_o_scale", s);
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 put(&mut ops, "w_iq", self.replicate(self.one(&i("wq_b.weight"))?)?);
                 put(&mut ops, "w_ik", self.replicate(self.rows(&[i("wk.weight"), i("weights_proj.weight"),
@@ -817,16 +806,7 @@ impl<'a> GlmfLoader<'a> {
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
-        if self.split_ffn_rows {
-            ensure!(ranks == 2, "token-row FFNs require two GPUs");
-            let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"),
-                format!("{mlp}.up_proj.weight")], super::fp8::Layout::Block)?;
-            put(&mut ops, "w_gate_up_fp8", self.replicate(q)?);
-            put(&mut ops, "w_gate_up_scale", self.replicate(s)?);
-            let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], super::fp8::Layout::Block)?;
-            put(&mut ops, "w_down_fp8", self.replicate(q)?);
-            put(&mut ops, "w_down_scale", self.replicate(s)?);
-        } else if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
+        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
             let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[format!("{mlp}.gate_proj.weight"),
                 format!("{mlp}.up_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
             put(&mut ops, "w_gate_up_fp8", q);
@@ -848,10 +828,6 @@ impl<'a> GlmfLoader<'a> {
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
         validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
-        if self.split_ffn_rows {
-            ensure!(self.ranks() == 2, "token-row FFNs require two GPUs");
-            super::precision::check_ffn_row_inputs(self.checkpoint, self.fp8_source, cfg, layers)?;
-        }
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer)?) {

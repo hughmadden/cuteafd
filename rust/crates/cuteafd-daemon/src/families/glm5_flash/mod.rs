@@ -101,15 +101,9 @@ pub(crate) struct EngineArgs {
     /// Split KDA output token rows after sharing BF16 heads; round each output once.
     #[arg(long, env = "CUTEAFD_GLMF_KDA_OUTPUT_SHARD", default_value_t = false, conflicts_with = "kda_fp32_partials")]
     pub kda_output_shard: bool,
-    /// Project complete MLA outputs for owned token rows after sharing head values.
-    #[arg(long, env = "CUTEAFD_GLMF_SPLIT_MLA_ROWS", default_value_t = false, conflicts_with = "kda_fp32_partials")]
-    pub split_mla_rows: bool,
     /// Expand W8A16 prefill weights once in existing scratch.
     #[arg(long, env = "CUTEAFD_GLMF_KDA_PREFILL_EXPANDED", default_value_t = false)]
     pub kda_prefill_expanded: bool,
-    /// Run full-intermediate native FP8 dense/shared FFNs on owned token rows.
-    #[arg(long, env = "CUTEAFD_GLMF_SPLIT_FFN_ROWS", default_value_t = false)]
-    pub split_ffn_rows: bool,
     /// Keep only an E4M3 LM head (per row x 128-K scales, quantized at load):
     /// every logits call (target, verify, prefill, DFlash drafts) runs the FP8
     /// head program in 16-row spans; no BF16 head stays resident.
@@ -232,21 +226,6 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn token_row_ffns_require_two_distinct_gpus_and_spark_peers() {
-        assert!(!parse(&[]).split_ffn_rows);
-        check_options(&parse(&["--split-ffn-rows", "--split-device", "1", "--peers",
-            "127.0.0.1:19000", "--fp8-prefill", "none"])).unwrap();
-        for extra in [&["--split-ffn-rows"][..], &["--split-ffn-rows", "--split-device", "1"][..],
-            &["--split-ffn-rows", "--split-device", "0", "--peers", "127.0.0.1:19000"][..],
-            &["--split-ffn-rows", "--split-device", "1", "--peers", " "][..],
-            &["--split-ffn-rows", "--split-device", "1", "--peers", "127.0.0.1:19000", "--skip-experts"][..],
-            &["--split-ffn-rows", "--split-device", "1", "--local-experts"][..]] {
-            let error = check_options(&parse(extra)).unwrap_err().to_string();
-            assert!(error.contains("two distinct GPUs and Spark --peers"), "{error}");
-        }
-    }
-
-    #[test]
     fn precise_kda_partials_need_compatible_split_programs() {
         let defaults = parse(&[]);
         assert!(!defaults.kda_fp32_partials && !defaults.kda_output_shard && !defaults.kda_prefill_expanded);
@@ -267,17 +246,6 @@ mod draft_cli_tests {
         assert_eq!(engine::fp32_partial_reserve(32, 4096), 6_291_456);
         assert_eq!(engine::output_shard_reserve(4096, 4096), 134_217_728);
         assert_eq!(engine::output_shard_reserve(32, 4096), 2_097_152);
-    }
-
-    #[test]
-    fn mla_output_rows_require_a_distinct_split_device_and_account_for_odd_slots() {
-        assert!(!parse(&[]).split_mla_rows);
-        assert!(check_options(&parse(&["--split-mla-rows"])).is_err());
-        assert!(check_options(&parse(&["--split-mla-rows", "--split-device", "0"])).is_err());
-        check_options(&parse(&["--split-mla-rows", "--split-device", "1"])).unwrap();
-        assert_eq!(engine::mla_output_shard_reserve(4096, 4096, 8192), 134_217_728);
-        assert_eq!(engine::mla_output_shard_reserve(65, 4096, 8192), 2_228_224);
-        assert_eq!(engine::mla_output_shard_reserve(513, 4096, 8192), 16_908_288);
     }
 }
 
@@ -406,12 +374,6 @@ pub(crate) struct GoldenArgs {
 
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
-    ensure!(!args.split_mla_rows || args.split_device.is_some_and(|peer| peer != args.device),
-        "--split-mla-rows requires distinct --device/--split-device");
-    ensure!(!args.split_ffn_rows || (args.split_device.is_some_and(|d| d != args.device)
-        && args.peers.as_deref().is_some_and(|p| !p.trim().is_empty())
-        && !args.local_experts && !args.skip_experts),
-        "--split-ffn-rows requires two distinct GPUs and Spark --peers (no local/skip experts)");
     let precise = args.kda_fp32_partials || args.kda_output_shard;
     ensure!(!(precise || args.kda_prefill_expanded) ||
         (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
@@ -457,10 +419,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
     precision::check_projection_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
         args.layers.unwrap_or(cfg.layers))?;
-    if args.split_ffn_rows {
-        precision::check_ffn_row_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
-            args.layers.unwrap_or(cfg.layers))?;
-    }
     if let Some(snapshot) = &args.draft {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
             .context("DFlash target has no lm_head.weight")?;
@@ -521,26 +479,14 @@ impl Opened {
                 "glmf2_kda_output_rows_m64", "glmf2_kda_output_rows_m4096",
                 "glmf2_join_heads", "glmf2_join_rows"]);
         }
-        if args.split_mla_rows {
-            ensure!(self.cfg.heads * self.cfg.v_head_dim == 4 * self.cfg.hidden,
-                "MLA output token rows require value width=4*hidden, got {} heads * {} values / hidden {}",
-                self.cfg.heads, self.cfg.v_head_dim, self.cfg.hidden);
-            needed.extend(["glmf2_mla_values_m64", "glmf2_mla_values_m4096",
-                "glmf2_mla_output_rows_m64", "glmf2_mla_output_rows_m4096",
-                "glmf2_join_mla_heads", "glmf2_join_rows"]);
-        }
         if args.kda_prefill_expanded {
             needed.push(if args.kda_output_shard { "glmf2_kda_w8_norm_expanded_m4096" }
                 else if args.kda_fp32_partials { "glmf2_kda_w8_f32_expanded_m4096" }
                 else { "glmf2_kda_w8_expanded_m4096" });
             if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
         }
-        if args.split_ffn_rows {
-            needed.extend(["glmf_ffn_i2048_m64", "glmf_ffn_i2048_m4096",
-                "glmf_ffn_i12288_m64", "glmf_ffn_i12288_m4096", "glmf2_join_rows"]);
-        }
         for name in needed {
-            programs.spec(name).with_context(|| format!("selected single-copy precision options need \
+            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
                 program {name}; this native library predates it"))?;
         }
         programs.load_all()?;
@@ -555,11 +501,9 @@ impl Opened {
             }
             None => None,
         };
-        ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded || args.split_ffn_rows)
+        ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
-            "split precision options require native head-split programs (missing glmf2_kda_m64)");
-        ensure!(!args.split_mla_rows || split_device.is_some(),
-            "--split-mla-rows requires native head-split programs (missing glmf2_kda_m64)");
+            "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -575,8 +519,6 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
-            split_mla_rows: args.split_mla_rows,
-            split_ffn_rows: args.split_ffn_rows,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
@@ -594,7 +536,6 @@ impl Opened {
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
-            split_ffn_rows = args.split_ffn_rows,
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -602,13 +543,10 @@ impl Opened {
         // 0: the planner's automatic pool (free memory after the costs still to come).
         let pool_tokens = if args.pool_tokens == 0 {
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot,
-                &if args.kda_fp32_partials || args.kda_output_shard || args.split_mla_rows || args.split_ffn_rows {
-                    vec![args.device, args.split_device.context("precise head split")?] }
+                &if args.kda_fp32_partials || args.kda_output_shard { vec![args.device, args.split_device.context("precise head split")?] }
                     else { vec![args.device] },
                 args.draft.as_deref(), args.prefill_rows, args.slots,
-                if args.split_mla_rows { engine::mla_output_shard_reserve(args.prefill_rows, self.cfg.hidden,
-                    self.cfg.heads * self.cfg.v_head_dim / 2) }
-                    else if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
+                if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
                     else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
                         if args.kda_fp32_partials { 4 } else { 2 }) })?
         } else {
@@ -619,9 +557,7 @@ impl Opened {
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
-        engine.split_mla_rows = args.split_mla_rows;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
-        engine.split_ffn_rows = args.split_ffn_rows;
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
