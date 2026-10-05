@@ -105,8 +105,8 @@ end = readme.index('## Config')
 readme = readme[:start] + ('This is a qualified numerical-fidelity reference, not a training corpus or a general\n'
     'quality ranking. Both full scoring shapes preserve paired full-vocabulary versus\n'
     'top-1024 deltas and bounds within 1e-4 nat and preserve the repeatability verdict.\n'
-    'This is reference qualification, not a precision-default decision. Coordinator\n'
-    'review and upload remain required; no publication revision is claimed.\n\n') + readme[end:]
+    'This is reference qualification, not a precision-default decision.\n'
+    'No publication revision is claimed.\n\n') + readme[end:]
 readme = readme.replace('`qualification.json` currently records preparation checks, not a paired PASS.',
                        '`qualification.json` records actual paired repeatability and compact/full equivalence evidence.')
 start = readme.index('The first checkpoint-precision baseline') if 'The first checkpoint-precision baseline' in readme else readme.index('## Pending Calibration')
@@ -132,6 +132,9 @@ body += ['', f"Common floor: top-1 >=90% / KL <=0.06 nat. This config's calibrat
          'The two compared arms here are repeated default-precision baselines, not',
          'a proposed precision change. No precision-default verdict or promotion is implied.', '']
 readme = readme[:start] + '\n'.join(body) + '\n' + readme[end:]
+readme = readme.replace('Coordinator review and explicit upload approval remain required. No publication\n'
+                        'revision, precision-default verdict or promotion is claimed.',
+                        'No publication revision, precision-default verdict or promotion is claimed.')
 (config / 'README.md').write_text(readme)
 for entry in manifest['files']:
     assert digest(config / entry['path']) == entry['sha256']

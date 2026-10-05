@@ -124,7 +124,9 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     # Exercise only card formatting; synthetic metrics never qualify a dataset.
     original = ("# Family Fidelity Draft\n\n" + intro + "\n\n## Configuration\n\n"
                 "Pinned checkpoint and tokenizer.\n\n" + calibration + "\n\n" + privacy +
-                "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n")
+                "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n"
+                "\nCoordinator review and explicit upload approval remain required. No publication\n"
+                "revision, precision-default verdict or promotion is claimed.\n")
     config = tmp_path / "fixture"
     config.mkdir()
     (config / "README.md").write_text(original)
@@ -150,9 +152,14 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     assert "Family Fidelity Reference" in card and "qualified numerical-fidelity reference" in card
     assert "DRAFT:" not in card and "Pending Calibration" not in card and "baseline is pending" not in card
     assert "primary count is 123" in card and "| prefill | 1 | 95.0000% | 0.02000000 |" in card
-    assert "no publication revision is claimed" in card and "No precision-default verdict" in card
+    assert "No publication revision is claimed" in card and "No precision-default verdict" in card
+    assert "coordinator review" not in card.lower() and "upload approval" not in card.lower()
     assert "Pinned checkpoint and tokenizer." in card
-    assert card[card.index(privacy):] == original[original.index(privacy):]
+    expected_tail = original[original.index(privacy):].replace(
+        'Coordinator review and explicit upload approval remain required. No publication\n'
+        'revision, precision-default verdict or promotion is claimed.',
+        'No publication revision, precision-default verdict or promotion is claimed.')
+    assert card[card.index(privacy):] == expected_tail
     assert (tmp_path / "README.md").read_text() == root_card
 
 
