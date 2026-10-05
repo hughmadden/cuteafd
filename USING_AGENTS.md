@@ -308,5 +308,6 @@ duplicating it. Record the lesson in the table below.
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
 | Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
+| Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
