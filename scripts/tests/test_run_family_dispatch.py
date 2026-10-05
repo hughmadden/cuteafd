@@ -97,7 +97,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
-                          previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
+                          previous_peers: str | None = None, with_nest: bool = True,
+                          extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -111,7 +112,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     _snapshot(hf, model, family_config)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for tool in ("docker", "ssh", "nest"):
+    for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
@@ -136,7 +137,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
-    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}", **(extra_env or {})}
+    if not with_nest:
+        # Hide any nest the host has, keeping only the stub directory and the system tools.
+        env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                            *(["--restart"] if restart else [])],
                           env=env, capture_output=True, text=True, timeout=30)
@@ -854,3 +858,45 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert result.returncode == 0, result.stderr
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
+
+
+_GLMF = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+         "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+def test_rdma_device_map_reaches_the_workers_and_the_coordinator(tmp_path):
+    device_map = "10.0.0.9=mlx5_bond_0,10.0.0.1=rocep1s0f1"
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    worker = next(line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line)
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert f"-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={device_map}" in worker, worker
+    assert f"-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={device_map}" in coordinator, coordinator
+
+
+def test_rdma_device_map_is_not_set_unless_given(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": ""})
+    assert result.returncode == 0, result.stderr
+    assert "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP" not in result.stderr
+
+
+def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=dev x"})
+    assert result.returncode == 2
+    assert "local-ip=device" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_spark_page_caches_drop_over_ssh_without_nest(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=False)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    drops = [i for i, line in enumerate(lines) if line.startswith("ssh -n h0 ") and "drop_caches" in line]
+    assert len(drops) == 2, result.stderr  # before the workers start and once they are resident
+    worker = next(i for i, line in enumerate(lines) if "docker run -d --name cuteafd-spark-expert-" in line)
+    assert drops[0] < worker < drops[1]
+    assert "could not drop" not in result.stderr

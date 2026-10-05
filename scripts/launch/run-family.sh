@@ -620,16 +620,41 @@ fi
 # coordinator GPU). Spark workers and the coordinator both read it.
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
 case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
-# GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
+# CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each process picks the entry
+# for its own fabric address) reaches the coordinator and every worker when it is set. Without
+# it each opens its first RDMA device, which need not carry the fabric address (GB10 exposes
+# several RDMA functions per port).
+device_map="${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}"
+device_map_env="" device_map_args=()
+if [[ -n "$device_map" ]]; then
+  [[ "$device_map" =~ ^[A-Za-z0-9.:=,_-]+$ ]] ||
+    { echo "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP must be local-ip=device[,local-ip=device...]" >&2; exit 2; }
+  device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
+  device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
+fi
+# GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts, through
+# SparkNest's nest when it is installed, otherwise over ssh (passwordless sudo on each host).
 spark_hosts=()
-for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done
-((ranks == 0)) || nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches" >&2
+spark_host_names=()
+for ((rank = 0; rank < ranks; rank++)); do
+  spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")")
+  spark_host_names+=("$(get "SPARK_${rank}_HOST")")
+done
+drop_spark_caches() {
+  if command -v nest >/dev/null; then nest drop-caches "${spark_hosts[@]}" >/dev/null; return; fi
+  local host failed=0
+  for host in "${spark_host_names[@]}"; do
+    ssh -n "$host" 'sync; echo 1 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null' || failed=1
+  done
+  return "$failed"
+}
+((ranks == 0)) || drop_spark_caches || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
   peers+=("$lane:$port")
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill $device_map_env \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
@@ -647,9 +672,8 @@ done
 # Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
 # workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
 # cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
-   command -v nest >/dev/null; then
-  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]]; then
+  drop_spark_caches || echo "warning: could not drop Spark page caches after loading" >&2
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
@@ -670,7 +694,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
-  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
+  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
