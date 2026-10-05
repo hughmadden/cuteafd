@@ -274,9 +274,9 @@ prose; Hugh's engine reads 0.025 and 95% to a BF16 teacher on low-entropy
 packed text. Two effects mix: text entropy (3.45 vs 0.8 nat) and arithmetic
 (eager BF16 attention with an FP32 routed sum vs the served kernels, plus
 official FP8 experts vs EXL3). The first run of the new set separates them:
-the BF16 arm's absolute number on the model's own text, plus the GLM Flash
-cross-check against Hugh's teacher on its 25 windows. Expect the absolute
-KL to land in 0.02–0.04 and top-1 in 93–96%; if the BF16 arm sits below 92%
+the BF16 arm's absolute number on the model's own text, using only references
+we generate from official checkpoints (no external teacher, §11.7). The
+initial expectation was KL 0.02–0.04 and top-1 93–96%; if the BF16 arm sits below 92%
 on its own greedy text, the golden itself is suspect (routing or norm
 differences), and that is a finding about the reference, to fix before any
 precision decision.
@@ -308,6 +308,61 @@ top-1, compact KL 0.0111367 nat and 56.3449 s scoring (2,689 generated of
 the unqualified shape-sensitive reference and is informational only, not a
 calibration or precision gate. Full decode failed on a missing dump parent;
 no candidate, full-prefill or paired discordance result exists from that run.
+
+### Qualified V4.1 calibration (2026-10-05)
+
+The first qualified head-off calibration uses the pinned 64-window set
+`16f94cfc43ad1c59879b497194cfa6ddeb793cb98f8225206dc0f747ea33cc91`,
+checkpoint revision `dba1be0a40aa45a94ad051997016db3960a90277`, daemon
+`090a5c3`, one RTX GPU0 and ostrich/dodo/emu/kiwi TP4. Drafts and prefix
+cache are off; the decode verification width is 8. "Head off" is the
+checkpoint-precision arm, not a claim that the family's native FP4 KV or
+FP8 SWA/expert formats are all BF16. The SM120 reference passed its finite,
+bit-exact common-prefix gate; full generation took 3203.17 s including
+qualification, below the 60-minute stop bar.
+
+All numbers here score actual generated positions, not context padding.
+Quick KL is top-32-plus-tail; full KL is full-vocabulary. Scoring times
+include requests and row scoring, not model loading or reference generation.
+
+| Tier / shape | Generated positions | Top-1 | KL (nat) | Scoring (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Quick / decode | 2,689 | 97.1737% | 0.010847 | 55.56 |
+| Full / decode | 17,656 | 96.9529% | 0.008547 | 346.31 |
+| Full / prefill | 17,656 | 97.0888% | 0.008573 | 262.75 |
+
+| Generated block | Quick top-1 / KL | Full decode top-1 / KL | Full prefill top-1 / KL |
+| --- | ---: | ---: | ---: |
+| A, agentic | 97.8349% / 0.004431 | 98.4574% / 0.004352 | 98.4392% / 0.004283 |
+| B, code reading | 96.8750% / 0.007576 | 96.4030% / 0.008658 | 96.5495% / 0.008471 |
+| D, JSON/tool | 96.1353% / 0.031786 | 97.8479% / 0.013373 | 97.2023% / 0.016861 |
+| E, prose/reasoning | 97.6562% / 0.009719 | 95.6163% / 0.011955 | 96.1589% / 0.011331 |
+
+Block C has no generated positions. Its context top-1/KL is 95.3125% /
+0.014620 quick, 97.9688% / 0.008652 full decode, and 97.7734% / 0.008343
+full prefill. Across all context positions, KL is 0.040108 quick, 0.096022
+full decode and 0.053880 full prefill. D's appended context dominates this
+mismatch (0.605894 / 0.268443 nat on the two full shapes); it is reported
+separately and does not become assistant text or enter the generated bar.
+D also has the highest generated-span KL in every tier/shape.
+
+Every generated aggregate clears the 92% stop bar, the confident-position
+98% and reference-top-3 99% tripwires pass, and the worst generated window
+is 94.3359% on either full path. The old 90% floor is comfortably met on
+agentic text. Applying §10's whole-percentage-point round-down minus two
+literally gives 95% for quick and full prefill, but **94% for full decode**
+(96.9529% rounds down to 96%, not up to 97%). A common published `expect`
+therefore uses `top1_min = 0.94`; per-path calibration retains 0.95/0.94/0.95.
+The KL ceiling uses the analogous conservative upward 0.01-nat rounding
+plus 0.02 nat, capped at 0.06: 0.04 quick, 0.03 on each full path; a common
+`expect` uses `kl_max = 0.04`. These are absolute sanity gates, not a
+replacement for the unchanged paired 0.005 top-1 / 0.005-nat decision.
+
+No candidate arm has been scored yet, so actual candidate-versus-baseline
+paired discordance and bounds remain unmeasured. Baseline decode versus
+prefill has 524/17,656 differing agreement indicators and 547/17,656
+argmax differences; those describe shape sensitivity, **not** the paired
+precision-arm discordance used in §5's power calculation.
 
 The paired bar remains the precision decision rule at any absolute level,
 subject to the independent absolute gates and reference qualification.
