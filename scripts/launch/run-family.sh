@@ -459,9 +459,12 @@ fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
-# 128x128 blocks at load). Resolve precision after the serving split: one GPU
-# defaults to row128 KDA and an FP8 head; a two-GPU head split keeps BF16 KDA
-# and head. Explicit current or legacy keys override either layout default.
+# 128x128 blocks at load). Resolve precision after the serving split: both
+# layouts default to row128 KDA and an FP8 head; the two-GPU head split adds
+# token-row KDA output ownership (--kda-output-shard --kda-prefill-expanded),
+# which avoids rounding half-K BF16 partials (2026-10-05: C1 +7.6%, paired
+# top-1 453 -> 460/512, KL +0.0008). GLM5_FLASH_KDA_SPLIT=partials keeps the
+# old split path. Explicit current or legacy keys override either default.
 # Each weight has one resident copy; the DFlash2 drafter stays FP8 by default.
 # Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
@@ -477,16 +480,22 @@ if [[ $family == glm5_flash ]]; then
   fi
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128; [[ $head_split == 0 ]] || kda_fp8=off ;;
+    ""|auto) kda_fp8=row128 ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
+  kda_split="$(get GLM5_FLASH_KDA_SPLIT auto)"
+  case "$kda_split" in
+    ""|auto) [[ $head_split == 0 || $kda_fp8 == off ]] || family_args+=(--kda-output-shard --kda-prefill-expanded) ;;
+    partials) ;;
+    *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
+  esac
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
-    ""|auto) fp8_head=on; [[ $head_split == 0 ]] || fp8_head=off ;;
+    ""|auto) fp8_head=on ;;
     on|off) ;;
     *) echo "GLM5_FLASH_FP8_HEAD must be auto, on or off" >&2; exit 2 ;;
   esac
@@ -495,6 +504,13 @@ if [[ $family == glm5_flash ]]; then
     off) family_args+=(--fp8-head false) ;;
   esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
+  if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
+    case ",$fp8_prefill," in
+      *,all,*|*,kda-o,*)
+        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill (KDA output W8A8) does not combine with the split's token-row KDA output; set GLM5_FLASH_KDA_SPLIT=partials or drop kda-o" >&2
+        exit 2 ;;
+    esac
+  fi
   case ",$fp8_prefill," in
     *,all,*|*,kda-in,*|*,kda-o,*)
       if [[ $kda_fp8 == off ]]; then

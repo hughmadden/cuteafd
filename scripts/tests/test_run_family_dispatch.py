@@ -210,9 +210,22 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--split-device" in launch) == split
-    assert f"--kda-fp8 {'off' if split else 'row128'}" in launch
-    assert f"--fp8-head {'false' if split else 'true'}" in launch
+    # Both layouts default to row128 KDA and an FP8 head; the split adds
+    # token-row KDA output ownership.
+    assert "--kda-fp8 row128" in launch
+    assert "--fp8-head true" in launch
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+    assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
+
+
+@pytest.mark.parametrize("keys,shard", [("", True), ("GLM5_FLASH_KDA_SPLIT=partials\n", False),
+                                        ("GLM5_FLASH_KDA_FP8=off\n", False)])
+def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=2\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--kda-output-shard" in launch) == shard
 
 
 @pytest.mark.parametrize("layout", ["RTX_GPUS=1\n", "RTX_GPUS=2\n"])
@@ -234,8 +247,8 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 @pytest.mark.parametrize("layout,keys,kda,head", [
     ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
     ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=row128\n", "row128", "false"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=on\n", "off", "true"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -254,7 +267,8 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
     if accepted:
         assert "--fp8-prefill all" in result.stderr
     else:
-        assert "GLM5_FLASH_KDA_FP8=row128 or channel" in result.stderr
+        # The split's default token-row KDA output excludes KDA output W8A8.
+        assert "GLM5_FLASH_KDA_SPLIT=partials" in result.stderr
         assert "docker run" not in result.stderr
 
 
@@ -263,9 +277,13 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
     ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
     ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
     ("GLMF_FP8_HEAD=on\n", ["--fp8-head true"]),
-    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n", ["--fp8-prefill all"]),
+    # KDA output W8A8 (kda-o/all) excludes the split's token-row output, so
+    # those cases select the partial-sum split path explicitly.
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=all\n",
+     ["--fp8-prefill all"]),
     ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
-    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n", ["--fp8-prefill kda-o,ffn"]),
+    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n",
+     ["--fp8-prefill kda-o,ffn"]),
 ])
 def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
