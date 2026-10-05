@@ -763,7 +763,13 @@ Work, in priority order:
    cluster job. This caused the historical "split FP8 −24%" reading (not
    precision). Suspect a coordinator or transport timeout/retry path; it
    may affect every family. Investigate if it recurs.
-10. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+10. **Build hygiene:** `./build.sh` takes the hardware locks and pins GPU0
+    through its CPU, download and AOT export phases; it should take
+    `build.lock` for those and touch hardware only where it measures.
+    Build containers run as root, leaving root-owned `target*` directories
+    agents can't delete; run them as the host user (UID 1000 on raptor,
+    1001 on the Sparks).
+11. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)
