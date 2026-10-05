@@ -179,6 +179,8 @@ struct StepTables {
     /// advancing their state (`commit` applies the accepted rows).
     spec: bool,
     positions: Vec<i64>,
+    rope_positions: Vec<[i32; 3]>,
+    block_rope_positions: Vec<[i32; 3]>,
     /// K/V record slot per row (also the row's raw index-key slot).
     kv_slots: Vec<i64>,
     /// GDN / PLE state slot per row.
@@ -218,6 +220,9 @@ pub(crate) struct Qwen4Placement {
     /// placement rewound ([`Qwen4Engine::rewind`]).
     pub state_len: usize,
     pub history: NgramHistory,
+    /// Request metadata from native ids/span grids, recomputed on prefix restore.
+    /// Never radix keys; rotary coordinates never change logical cache rows.
+    pub rope: cuteafd_loader::families::qwen4::RopePositions,
 }
 
 impl Qwen4Placement {
@@ -226,7 +231,7 @@ impl Qwen4Placement {
         let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
             .collect();
         let pool_pages = units.iter().map(|&u| u as i32).collect();
-        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history }
+        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default() }
     }
 
     pub fn record(&self, position: usize) -> Result<i64> {
@@ -273,6 +278,31 @@ mod tests {
             assert_eq!(next, rows);
         }
         assert_eq!(super::fp8_head_spans(0).count(), 0);
+    }
+
+    #[test]
+    fn image_rotary_metadata_leaves_logical_slots_and_native_ple_history_unchanged() {
+        use cuteafd_loader::families::qwen4::{ImageSpan, NgramHistory, RopePositions};
+        let ids = [10, 248053, 248056, 248056, 248056, 248056, 248056, 248056, 248054];
+        let images = [ImageSpan { start: 2, grid: [1, 4, 6] }];
+        let hasher = NgramHasher::from_config(248_320, 20_000_000, 3, 8, 0, 1234, 248044);
+        let mut placement = super::Qwen4Placement::new(vec![2], 0, NgramHistory(vec![248044; 2]));
+        let before: Vec<_> = (0..ids.len()).map(|row| (placement.record(row).unwrap(),
+            placement.pool_slot(row).unwrap())).collect();
+        placement.rope = RopePositions::new(&ids, &images, 248056, 2).unwrap();
+        assert_eq!(placement.rope.at(7).unwrap(), [2, 3, 4]);
+        assert_eq!(placement.rope.at(8).unwrap(), [5; 3]);
+        for (row, expected) in before.into_iter().enumerate() {
+            assert_eq!((placement.record(row).unwrap(), placement.pool_slot(row).unwrap()), expected);
+        }
+        let mut history = hasher.start();
+        hasher.hash(&mut history, &ids, &mut Vec::new()).unwrap();
+        assert_eq!(super::ngram_history(248044, 3, &ids), history);
+        assert_eq!(history.0, vec![248056, 248054]);
+        // Prefix restoration installs rebuilt request metadata, not cached radix ids.
+        placement.rope = RopePositions::new(&ids, &images, 248056, 2).unwrap();
+        assert_eq!(placement.rope.at(4).unwrap(), [2, 2, 4]);
+        assert_eq!(placement.rope.at(ids.len()).unwrap(), [6; 3]);
     }
 
     #[test]
@@ -323,7 +353,11 @@ impl Allocator {
         -> Result<(Qwen4Placement, Option<cuteafd_engine::prefix::TailCopy>)> {
         let slot = self.slots.pop().context("state slots exhausted")?;
         match self.units.fork(&source.units, tokens.len(), self.units.pages_for(capacity)) {
-            Ok(fork) => Ok((Qwen4Placement::new(fork.pages, slot, history_of(&self.cfg, tokens)), fork.copy)),
+            Ok(fork) => {
+                let mut placement = Qwen4Placement::new(fork.pages, slot, history_of(&self.cfg, tokens));
+                placement.rope = source.rope.clone();
+                Ok((placement, fork.copy))
+            },
             Err(error) => {
                 self.slots.push(slot);
                 Err(error).context("cache pages exhausted")
@@ -346,6 +380,8 @@ struct Workspace<'a> {
     shared: Dev<'a>,
     routed: Dev<'a>,
     positions: Dev<'a>,
+    rope_positions: Dev<'a>,
+    block_rope_positions: Dev<'a>,
     kv_slots: Dev<'a>,
     slots: Dev<'a>,
     seq_first: Dev<'a>,
@@ -800,6 +836,8 @@ impl<'a> Qwen4Engine<'a> {
             shared: self.alloc(t * h * 2)?,
             routed: self.alloc(t * h * 2)?,
             positions: self.alloc(t * 8)?,
+            rope_positions: self.alloc(t * 12)?,
+            block_rope_positions: self.alloc(t * 12)?,
             kv_slots: self.alloc(t * 8)?,
             slots: self.alloc(t * 4)?,
             seq_first: self.alloc(t * 4)?,
@@ -844,7 +882,7 @@ impl<'a> Qwen4Engine<'a> {
             select: self.alloc(logit_rows * 8)?,
             logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
             staging: RefCell::new((HostAllocation::new(self.library, 16 * 16
-                + t * (8 * 3 + 4 * 4 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
+                + t * (8 * 3 + 4 * 4 + 24 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
                 + table_rows * (self.pages + self.pool_pages) * 4)?, 0)),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
@@ -954,6 +992,8 @@ impl<'a> Qwen4Engine<'a> {
             let position = start + i;
             ensure!(position < self.max_context, "position {position} past the context {}", self.max_context);
             tables.positions.push(position as i64);
+            tables.rope_positions.push(placement.rope.at(position)?);
+            tables.block_rope_positions.push(placement.rope.at(position - position % BLOCK)?);
             tables.kv_slots.push(placement.record(position)?);
             tables.pool_slots.push(placement.pool_slot(position)?);
             tables.slots.push(placement.slot);
@@ -963,6 +1003,8 @@ impl<'a> Qwen4Engine<'a> {
             tables.pool_width = tables.pool_width.max((position + 1).div_ceil(POOL_PAGE_TOKENS));
         }
         if let Some(ple) = &self.ple {
+            // These are native embedding ids, including image placeholders, not
+            // prefix-cache radix keys. The reference uses ple_input_ids=input_ids.
             ple.hasher.hash(&mut placement.history, tokens, &mut tables.ple_ids)?;
         }
         Ok(())
@@ -1170,6 +1212,8 @@ impl<'a> Qwen4Engine<'a> {
                 let position = row.position;
                 ensure!(position < self.max_context, "MTP position {position} past the context");
                 tables.positions.push(position as i64);
+                tables.rope_positions.push(placement.rope.at(position)?);
+                tables.block_rope_positions.push(placement.rope.at(position - position % BLOCK)?);
                 tables.kv_slots.push(placement.record(position)?);
                 tables.pool_slots.push(placement.pool_slot(position)?);
                 tables.slots.push(placement.slot);
@@ -1218,10 +1262,12 @@ impl<'a> Qwen4Engine<'a> {
             }
         };
         // Staged bytes (16-byte aligned tables, then the embedding rows at most).
-        let staged = 16 * 16 + t * (8 * 3 + 4 * 4) + (tables.page_table.len() + tables.pool_table.len()) * 4
+        let staged = 16 * 16 + t * (8 * 3 + 4 * 4 + 24) + (tables.page_table.len() + tables.pool_table.len()) * 4
             + t * h * 2;
         self.continue_staging(w, staged)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
+        self.stage_table(w, &w.rope_positions, &tables.rope_positions)?;
+        self.stage_table(w, &w.block_rope_positions, &tables.block_rope_positions)?;
         self.stage_table(w, &w.kv_slots, &tables.kv_slots)?;
         self.stage_table(w, &w.slots, &tables.slots)?;
         self.stage_table(w, &w.seq_first, &tables.seq_first)?;
@@ -1338,6 +1384,8 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
         self.begin_staging(w)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
+        self.stage_table(w, &w.rope_positions, &tables.rope_positions)?;
+        self.stage_table(w, &w.block_rope_positions, &tables.block_rope_positions)?;
         self.stage_table(w, &w.kv_slots, &tables.kv_slots)?;
         self.stage_table(w, &w.slots, &tables.slots)?;
         self.stage_table(w, &w.seq_first, &tables.seq_first)?;
@@ -1732,7 +1780,8 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
-            ("positions", w.positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
+            ("positions", w.positions.buffer.ptr), ("rope_positions", w.rope_positions.buffer.ptr),
+            ("block_rope_positions", w.block_rope_positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
             ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);

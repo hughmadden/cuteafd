@@ -14,6 +14,8 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, cfg: &Qwen
     let marks = args.planner_prefix_bytes.unwrap_or(rank.retained_mark_bytes * costs.mark_slots);
     let reserve = future_expert_bytes + costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096
         + costs.graph_bytes[0]
+        // Persistent row and block-start T/H/W tables for both workspaces.
+        + 24 * (args.prefill_rows.max(1) as u64 + super::engine::DECODE_ROWS as u64)
         + rank.active_state_per_sequence_bytes * args.slots as u64
         + rank.fixed_state_bytes + rank.speculative_replay_bytes + marks
         + cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30);
