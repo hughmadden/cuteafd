@@ -30,13 +30,14 @@ Base: origin/work/p0 163c3a36
 - Focused planner vision gate: 1 passed, zero failures.
 - Cancellation backpressure gate: 1 passed, zero failures; 58.40 s compilation.
 - Initial script run failed from uninitialized pinned sources; resolved, not waived.
-- Pending: first correct live Flash image answer, probe image support and strict feature swap, G4-G7, live text prefix qualification, 64-image history, C4 images, Flash text C1/C16 >=0.98 vs work/p0, Pro.
+- First correct live Flash image answer: chart0 correctly identifies Delta with count 35. Standard root launcher, VISION=rtx, Flash-MOPD 2479e2d, one RTX + two Sparks, checkpoint weights, speculation/graphs off; 54 s readiness, 0.955 s cold request, 290 prompt tokens including 256 image rows, 16 generated tokens. Media stats: one encode, 53.078 ms, 2 MiB cache, zero collisions/pending. Exact owned containers removed and locks verified released; orchestrator notified.
+- Pending: probe image support and strict feature swap, G4-G7, live text prefix qualification, 64-image history, C4 images, Flash text C1/C16 >=0.98 vs work/p0, Pro.
 
 ## Open Issues
 
 - Imported WP-4 launcher 35b21708 and only its planner/report/CLI prerequisites from 21123512. Remote adapter, worker and expertd integration remain parked until the first correct local image answer.
 - Launcher prerequisite gates: full cargo workspace zero failures (daemon 417 passed/123 ignored); scripts 998 passed, 2 skipped, 193 subtests passed in 74.85 s, zero failing IDs. First script phase used a nonexistent task-local venv; reran using the existing project Python environment.
-- Root daemon build of 3e4b1244 completed in 12m26s; incremental planner CLI rebuild pending. Private derived images use standard release layout/entrypoint and exact mm-wp4 natives/PROGRAMS/fp8 assets; no launcher adaptation or UID change.
+- Root daemon build of 3e4b1244 completed in 12m26s; bced591a incremental planner CLI rebuild completed offline in 38.48 s. Private derived images built and CPU placement preflight passes; standard release layout/entrypoint and exact mm-wp4 natives/PROGRAMS/fp8 assets, no launcher adaptation or UID change. Two prelaunch guard false positives matched persistent WIP containers; corrected exclusions before the successful bounded run.
 - WP-8 tooling 2990f8d1/39b2e21c needs live prepared keys and image probes; synthetic component keys are not G4 qualification.
-- Live readiness time, text throughput and LM image numerical equivalence remain unmeasured.
+- First local readiness/request time measured; text throughput and LM image numerical equivalence remain unmeasured. A correct chart answer is not G4-G7 qualification.
 - Final workspace gate b6r8dl13m after bounds/hint cleanup: exit0, zero failures (daemon 416 passed/123 ignored); diff check clean.
