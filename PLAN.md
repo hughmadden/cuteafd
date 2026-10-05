@@ -738,8 +738,13 @@ Work, in priority order:
    `physical_sms` and `run.sh` refuses a mismatch.
 3. **Full-context planner default + 32 GB plans (PLAT-2):** per-family
    profiles (V4.1 capacity 1024 / 256 on 32 GB, #2 FR-D.3; GLM Flash
-   #1 FR-G.4; MiMo #3 FR-M.5), cold components to host RAM or a Spark,
-   1M program extents (#1 FR-G.1).
+   #1 FR-G.4; MiMo #3 FR-M.5), 1M program extents (#1 FR-G.1). Cold
+   components (vision towers, rarely used) move off the GPU by default. The
+   token embedding is not cold: every token reads one row (a gather of
+   ~8–10 KB on the decode critical path). It stays on the GPU by default; a
+   host-mapped embedding (like Engram) is a planner lever only when memory
+   binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
+   within ~0.5% (TJ, 2026-10-05).
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo).
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
@@ -747,7 +752,15 @@ Work, in priority order:
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
    without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
-   returned as content (#1 FR-G.14).
+   returned as content (#1 FR-G.14). Readiness bug (2026-10-05, fidelity
+   agent): `/v1/models` reports ready before the Spark experts finish
+   loading on the V4.1 launch path; readiness must wait for every expert
+   rank. Admission bug (2026-10-05, host-embedding agent): MiMo V2.6 Pro
+   `admission.rs:356-370` appends `startup.spark_intake_probe_temporary`
+   (64 MiB) after `resolve_capacity`, so an automatic pool that fills the
+   budget (466 KB margin) is admitted and then refused at startup
+   (shortfall 66.6 MB). Reserve every startup-phase temporary before pool
+   resolution, in every family's admission.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
@@ -767,13 +780,25 @@ Work, in priority order:
    cluster job. This caused the historical "split FP8 −24%" reading (not
    precision). Suspect a coordinator or transport timeout/retry path; it
    may affect every family. Investigate if it recurs.
-10. **Build hygiene:** `./build.sh` takes the hardware locks and pins GPU0
+10. **Build hygiene (merged 2026-10-05, `work/build-hygiene`; verify on the
+    first real `./build.sh`: GPU access under `--user` and the relocated
+    CARGO_HOME were only checked by inspection):** `./build.sh` took the hardware locks and pinned GPU0
     through its CPU, download and AOT export phases; it should take
     `build.lock` for those and touch hardware only where it measures.
     Build containers run as root, leaving root-owned `target*` directories
     agents can't delete; run them as the host user (UID 1000 on raptor,
     1001 on the Sparks).
-11. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+11. **V4.1 NVFP4 decode (parked 2026-10-05):** NVFP4 trails official MXFP4
+    by 16% C1 / 14% C4 on 1 RTX + 4 (tokens per round 3.94 → 2.87, Spark
+    expert kernel +32% per layer). ncu: the cooperative NVFP4 kernel runs one
+    90 KB CTA per SM at 6% occupancy, versus MXFP4's fused-slice kernel at
+    2 CTAs per SM. A noncooperative NVFP4 slice kernel (fork
+    `work/v41-nvfp4-slice` 3173cc2e) reached 3 CTAs per SM but ran 28–38%
+    slower at 1–16 rows. Untested hypothesis: it re-quantizes BF16 → FP4 per
+    slice × route slot, where MXFP4 takes pre-quantized FP8 wire rows; try a
+    quantize-once input stage or an FP8 wire first. Wide-row M32 tiles lost
+    on both GPUs. Official MXFP4 stays the recommended V4.1 checkpoint.
+12. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)
@@ -1170,7 +1195,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         recompute only. Smoke V4 Flash min and V4.1 min: prompt and turn end
         2 rows byte-identical, cold recompute differs. Deterministic prefill
         stays open: an ordered serial-slice reducer passed component gates
-        on a private codex branch (Flash TP4 only); not merged.
+        on a private codex branch (Flash TP4 only); not merged. V4.1's unchanged
+        base also produces different long-context reasoning across launches
+        with fixed dSpark drafts (34,745-token prompt, 2,048-token output);
+        cold/warm restores match within each launch. Long text comparisons
+        cannot qualify decode graph changes until cold prefill is deterministic.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         Opt-in BF16 expert-input Spark packages (`EXPERT_INPUT=bf16`,
         `CUTEAFD_*_FP8_MOE_BF16_FAMILIES=mimo`) improve it; default stays FP8.

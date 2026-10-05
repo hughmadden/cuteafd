@@ -15,7 +15,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::sync::broadcast;
@@ -38,6 +38,9 @@ const STARTING: &str = r#"{"type":"snapshot","starting":true}"#;
 pub struct ConsoleHub {
     viewers: AtomicUsize,
     text: bool,
+    /// Token text is allowed while a benchmark run holds the server: its own
+    /// synthetic prompts are the only requests the bench lockout admits.
+    bench_text: AtomicBool,
     enabled: bool,
     frames: broadcast::Sender<Arc<str>>,
     snapshot: Mutex<Arc<str>>,
@@ -57,6 +60,7 @@ impl ConsoleHub {
         Arc::new(Self {
             viewers: AtomicUsize::new(0),
             text,
+            bench_text: AtomicBool::new(false),
             enabled,
             frames,
             snapshot: Mutex::new(Arc::from(snapshot)),
@@ -67,8 +71,15 @@ impl ConsoleHub {
     pub fn viewers(&self) -> usize {
         self.viewers.load(Ordering::Relaxed)
     }
+    /// Token text may go on the wire: the server's own switch, or a benchmark
+    /// run holding the server. A hub with no producer is always off.
     pub fn text_enabled(&self) -> bool {
-        self.text
+        self.enabled && (self.text || self.bench_text.load(Ordering::Relaxed))
+    }
+    /// The bench runner sets this on while a run holds the server and clears it
+    /// on every exit path.
+    pub fn set_bench_active(&self, active: bool) {
+        self.bench_text.store(active, Ordering::Relaxed);
     }
     pub fn publish(&self, frame: String) {
         // No receivers is the normal idle case, not an error.
@@ -199,6 +210,25 @@ mod tests {
                 assert!(!text.contains(&format!("url({external}")), "page loads an external resource");
             }
         }
+    }
+
+    #[test]
+    fn bench_text_toggles_text_and_a_disabled_hub_stays_off() {
+        let hub = ConsoleHub::new(false);
+        assert!(!hub.text_enabled());
+        hub.set_bench_active(true);
+        assert!(hub.text_enabled());
+        hub.set_bench_active(false);
+        assert!(!hub.text_enabled());
+        // `--console-text` keeps text on whatever the bench does.
+        let hub = ConsoleHub::new(true);
+        hub.set_bench_active(true);
+        hub.set_bench_active(false);
+        assert!(hub.text_enabled());
+        // A hub with no producer never streams text.
+        let disabled = ConsoleHub::disabled();
+        disabled.set_bench_active(true);
+        assert!(!disabled.text_enabled());
     }
 
     #[tokio::test]

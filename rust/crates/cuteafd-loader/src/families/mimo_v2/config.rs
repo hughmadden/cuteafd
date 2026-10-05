@@ -90,6 +90,8 @@ pub struct MimoV2Config {
     pub routed_scale: f64,
     pub rms_norm_eps: f64,
     pub v_scale: f64,
+    /// FP32 hi/lo router (V2 Flash), or the native BF16 router (V2.6).
+    pub router_fp32: bool,
 }
 
 /// One per-layer pattern in either spelling: each spelling present must be a
@@ -221,22 +223,83 @@ impl MimoV2Config {
             routed_scale: v["routed_scaling_factor"].as_f64().unwrap_or(1.0),
             rms_norm_eps: v["layernorm_epsilon"].as_f64().or_else(|| v["rms_norm_eps"].as_f64()).unwrap_or(1e-5),
             v_scale: v["attention_value_scale"].as_f64().unwrap_or(1.0),
+            router_fp32: match v["moe_router_dtype"].as_str() {
+                Some("float32") => true,
+                Some("bfloat16") => false,
+                None => int("hidden_size")? == 4096 && v["model_type"] == "mimo_v2_flash",
+                Some(dtype) => anyhow::bail!("unsupported MiMo moe_router_dtype {dtype}"),
+            },
         })
     }
 
-    /// The coordinator program family built for this attention geometry
-    /// (`b12x.integration.cuteafd` MiMoGeometry): `mimo` (V2 Flash: hidden 4096,
-    /// 64 heads, 4/8 KV heads) or `mimop` (V2.6 Pro: hidden 6144, 128 heads, 8/8).
+    /// Select only programs matching every checkpoint arithmetic constant.
+    /// Layer patterns and RoPE tables are dynamic; their theta values still
+    /// identify the qualified checkpoint variant rather than aliasing V2 Flash.
     pub fn program_family(&self) -> Result<&'static str> {
-        match (self.hidden, self.heads, self.full_kv_heads, self.swa_kv_heads, self.experts) {
-            (4096, 64, 4, 8, 256) => Ok("mimo"),
-            (6144, 128, 8, 8, 384) => Ok("mimop"),
-            // One GPU of a two-GPU head split (`head_split(2)`): V2 Flash, V2.6 Pro.
-            (4096, 32, 2, 4, 256) => Ok("mimo2"),
-            (6144, 64, 4, 4, 384) => Ok("mimop2"),
-            other => anyhow::bail!("no mimo program geometry for (hidden, heads, full KV, SWA KV, experts) {other:?}: \
-                add a MiMoGeometry to b12x.integration.cuteafd._common and an exporter entry"),
+        let (base, split, value, epsilon, theta, fp32) = match (self.hidden, self.experts) {
+            (4096, 256) if self.full_rope_theta == 5.0e6 => ("mimo", "mimo2", 0.707, 1e-5, 5.0e6, true),
+            (4096, 256) => ("mimof", "mimof2", 0.707, 1e-6, 1.0e7, false),
+            (6144, 384) => ("mimop", "mimop2", 0.612, 1e-5, 1.0e7, false),
+            _ => anyhow::bail!("no MiMo program for hidden {} / {} experts: add a MiMoGeometry and exporter entry",
+                self.hidden, self.experts),
+        };
+        let full_heads = if self.hidden == 4096 { (64, 4, 8) } else { (128, 8, 8) };
+        let share_heads = (full_heads.0 / 2, full_heads.1 / 2, full_heads.2 / 2);
+        let heads = (self.heads, self.full_kv_heads, self.swa_kv_heads);
+        let (family, dense) = if heads == full_heads { (base, 16384) }
+            else if heads == share_heads { (split, 8192) }
+            else { anyhow::bail!("no {base} program for query/full KV/SWA KV heads {heads:?}") };
+        for (key, actual, expected) in [
+            ("head_dim", self.head_dim, 192), ("v_head_dim", self.v_head_dim, 128),
+            ("rope_dim", self.rope_dim, 64), ("sliding_window", self.window, 128),
+            ("intermediate_size", self.dense_intermediate, dense),
+            ("moe_intermediate_size", self.moe_intermediate, 2048), ("num_experts_per_tok", self.topk, 8),
+        ] {
+            ensure!(actual == expected, "{family} manifest requires {key}={expected}, config has {actual}; add a matching export");
         }
+        for (key, actual, expected) in [
+            ("layernorm_epsilon", self.rms_norm_eps, epsilon), ("attention_value_scale", self.v_scale, value),
+            ("rope_theta", self.full_rope_theta, theta), ("swa_rope_theta", self.swa_rope_theta, 1.0e4),
+            ("routed_scaling_factor", self.routed_scale, 1.0),
+        ] {
+            ensure!(actual == expected, "{family} manifest requires {key}={expected}, config has {actual}; add a matching export");
+        }
+        ensure!(self.router_fp32 == fp32, "{family} manifest requires moe_router_dtype={}, config disagrees",
+            if fp32 { "float32" } else { "bfloat16" });
+        ensure!(!self.full_sinks && self.swa_sinks, "{family} requires sinks on SWA layers only");
+        Ok(family)
+    }
+
+    /// Check the loaded export, including constants not used by family selection
+    /// (the FP8 head's vocabulary, and cache page/ring extents).
+    pub fn validate_program_manifest(&self, manifest: &Value, ranks: usize) -> Result<()> {
+        let mut configs = vec![self.clone()];
+        if ranks > 1 { configs.push(self.head_split(ranks)?); }
+        for cfg in configs {
+            let family = cfg.program_family()?;
+            let geometry = &manifest["families"][family];
+            for (key, expected) in [
+                ("hidden", cfg.hidden), ("heads", cfg.heads), ("full_kv_heads", cfg.full_kv_heads),
+                ("swa_kv_heads", cfg.swa_kv_heads), ("qk_head_dim", cfg.head_dim),
+                ("v_head_dim", cfg.v_head_dim), ("rope_dim", cfg.rope_dim), ("window", cfg.window),
+                ("dense_inter", cfg.dense_intermediate), ("moe_inter", cfg.moe_intermediate),
+                ("routed_experts", cfg.experts), ("top_k", cfg.topk), ("vocab_size", cfg.vocab_size),
+                ("qkv_k_stride", cfg.qkv_key_stride()), ("page_rows", 64), ("ring_rows", 256),
+            ] {
+                ensure!(geometry[key].as_u64() == Some(expected as u64),
+                    "{family} manifest {key}={} disagrees with config/runtime {expected}; add a matching export",
+                    geometry[key]);
+            }
+            for (key, expected) in [("norm_eps", cfg.rms_norm_eps), ("v_scale", cfg.v_scale),
+                ("full_rope_theta", cfg.full_rope_theta), ("swa_rope_theta", cfg.swa_rope_theta)] {
+                ensure!(geometry[key].as_f64() == Some(expected),
+                    "{family} manifest {key}={} disagrees with config {expected}; add a matching export",
+                    geometry[key]);
+            }
+            ensure!(geometry["router_fp32"].as_bool() == Some(cfg.router_fp32),
+                "{family} manifest router_fp32 disagrees with checkpoint router dtype");
+        }
+        Ok(())
     }
 
     /// Rows between key heads in the coordinator's qkv layout: 192, or 256 for
@@ -364,6 +427,67 @@ mod tests {
             "rope_theta": 5000000, "swa_rope_theta": 10000, "sliding_window": 128, "intermediate_size": 16384,
             "n_routed_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
         })
+    }
+
+    fn flash_mopd() -> MimoV2Config {
+        let mut value = crate::plan::testing::mimo_flash_config();
+        value["model_type"] = serde_json::json!("mimo_v2");
+        value["vocab_size"] = serde_json::json!(152576);
+        value["rope_theta"] = serde_json::json!(1.0e7);
+        value["layernorm_epsilon"] = serde_json::json!(1.0e-6);
+        value["moe_router_dtype"] = serde_json::json!("bfloat16");
+        MimoV2Config::from_hf(&value).unwrap()
+    }
+
+    #[test]
+    fn flash_mopd_constants_do_not_alias_old_flash_or_pro() -> Result<()> {
+        let cfg = flash_mopd();
+        assert_eq!(cfg.program_family()?, "mimof");
+        assert_eq!(cfg.head_split(2)?.program_family()?, "mimof2");
+        let mut variants = Vec::new();
+        macro_rules! wrong { ($field:ident, $value:expr) => {{
+            let mut wrong = cfg.clone(); wrong.$field = $value; variants.push(wrong);
+        }}; }
+        wrong!(rms_norm_eps, 1e-5); wrong!(v_scale, 0.612); wrong!(full_rope_theta, 5e6);
+        wrong!(swa_rope_theta, 2e4); wrong!(router_fp32, true); wrong!(routed_scale, 2.0);
+        wrong!(head_dim, 128); wrong!(v_head_dim, 192); wrong!(rope_dim, 128); wrong!(window, 256);
+        wrong!(dense_intermediate, 8192); wrong!(moe_intermediate, 4096); wrong!(topk, 4);
+        wrong!(full_sinks, true); wrong!(swa_sinks, false);
+        for wrong in variants { assert!(wrong.program_family().is_err(), "{wrong:?}"); }
+        Ok(())
+    }
+
+    fn manifest_geometry(cfg: &MimoV2Config) -> Value {
+        serde_json::json!({"hidden": cfg.hidden, "heads": cfg.heads,
+            "full_kv_heads": cfg.full_kv_heads, "swa_kv_heads": cfg.swa_kv_heads,
+            "qk_head_dim": cfg.head_dim, "v_head_dim": cfg.v_head_dim, "rope_dim": cfg.rope_dim,
+            "window": cfg.window, "dense_inter": cfg.dense_intermediate, "moe_inter": cfg.moe_intermediate,
+            "routed_experts": cfg.experts, "top_k": cfg.topk, "vocab_size": cfg.vocab_size,
+            "qkv_k_stride": cfg.qkv_key_stride(), "page_rows": 64, "ring_rows": 256,
+            "norm_eps": cfg.rms_norm_eps, "v_scale": cfg.v_scale,
+            "full_rope_theta": cfg.full_rope_theta, "swa_rope_theta": cfg.swa_rope_theta,
+            "router_fp32": cfg.router_fp32})
+    }
+
+    #[test]
+    fn loaded_manifests_must_match_all_constants_before_allocation() -> Result<()> {
+        let cfg = flash_mopd();
+        let manifest = serde_json::json!({"families": {"mimof": manifest_geometry(&cfg),
+            "mimof2": manifest_geometry(&cfg.head_split(2)?)}});
+        cfg.validate_program_manifest(&manifest, 1)?;
+        cfg.validate_program_manifest(&manifest, 2)?;
+        for family in ["mimof", "mimof2"] {
+            for key in manifest["families"][family].as_object().unwrap().keys() {
+                let mut wrong = manifest.clone();
+                wrong["families"][family][key] = Value::Null;
+                let error = cfg.validate_program_manifest(&wrong, 2).unwrap_err().to_string();
+                assert!(error.contains(key), "{error}");
+            }
+        }
+        let mut wrong_vocab = cfg.clone(); wrong_vocab.vocab_size -= 128;
+        assert!(wrong_vocab.validate_program_manifest(&manifest, 1).unwrap_err().to_string().contains("vocab_size"));
+        assert!(cfg.validate_program_manifest(&serde_json::json!({}), 1).is_err());
+        Ok(())
     }
 
     #[test]

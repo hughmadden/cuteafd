@@ -60,7 +60,8 @@ raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 
 class Exl3ReleasePreflightTest(unittest.TestCase):
     def launch(self, *, exl3=True, paired=True, mismatch=False, spark_count=4,
-               reservation='', rtx_gpus='1', extra=(), legacy=False, gpu_mib=97887):
+               reservation='', rtx_gpus='1', extra=(), legacy=False, gpu_mib=97887,
+               instance=''):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             binary = directory / 'bin'
@@ -83,7 +84,8 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'
                               + ('EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n' if spark_count == 2 else '')
-                              + (f'MEMORY_RESERVATION={reservation}\n' if reservation else ''))
+                              + (f'MEMORY_RESERVATION={reservation}\n' if reservation else '')
+                              + (f'INSTANCE={instance}\n' if instance else ''))
             result = subprocess.run(['bash', 'run.sh', '--config', str(config),
                                      '--rtx-gpus', rtx_gpus, *extra,
                                      '--restart' if mismatch else '--dry-run'],
@@ -98,6 +100,16 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                                     (['image', 'inspect'], ['container', 'inspect']) or
                                     (args[0] == 'run' and '--entrypoint' in args), (host, args))
             return result, calls
+
+    def test_instance_namespaces_the_coordinator_container(self):
+        """INSTANCE must reach the dry-run plan: two agents' cleanups must not
+        be able to target each other's coordinator."""
+        result, _ = self.launch(paired=False, instance='own')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('coordinator container: cuteafd-coordinator-own\n', result.stdout)
+        plain, _ = self.launch(paired=False)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertIn('coordinator container: cuteafd-coordinator\n', plain.stdout)
 
     def test_matching_packages_pass_dry_run(self):
         for paired in (False, True):

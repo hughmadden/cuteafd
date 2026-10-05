@@ -40,6 +40,23 @@ docker_args=(
   -e CUTEAFD_MODEL_REVISION="${CUTEAFD_MODEL_REVISION:-}"
 )
 
+# Non-root container (scripts/agents/codex-preamble.md): this container compiles
+# into the bind-mounted checkout, so it runs as the invoking user and its output
+# -- Cargo target dirs, build trees -- is deletable without sudo. `--user`
+# bypasses the image's passwd lookup, so the identity and the caches are passed
+# explicitly: the image's CARGO_HOME (/opt/cargo) is root-owned and not writable
+# by that UID, and a Spark UID has no passwd entry for getpass or Torch Dynamo to
+# find. Tools create the home and their cache leaves on demand.
+container_home="${CUTEAFD_DEV_CONTAINER_HOME:-/tmp/cuteafd-dev-home}"
+docker_args+=(
+  --user "$(id -u):$(id -g)"
+  -e "HOME=$container_home"
+  -e "USER=$(id -un)"
+  -e "LOGNAME=$(id -un)"
+  -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"
+  -e "CARGO_HOME=$container_home/cargo"
+)
+
 if [[ "$role" == "expert" || "$role" == "spark" ]]; then
   docker_args+=(--gpus all)
 else

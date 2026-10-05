@@ -4,9 +4,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
-bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
+bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
-  release_die "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, glm, glmf or qwen4"
+  release_die "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf or qwen4"
 
 usage() {
   cat <<'EOF'

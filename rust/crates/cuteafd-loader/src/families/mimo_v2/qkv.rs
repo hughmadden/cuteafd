@@ -1,11 +1,9 @@
-//! MiMo V2.6 Pro's fused `self_attn.qkv_proj`: FP8 E4M3 rows stored
-//! interleaved for the checkpoint's tensor-parallel degree (`tp_size` in the
-//! index metadata, 8). Each of the `tp` row shards is `[q | k | v]` of its
-//! heads (`heads/tp` query heads, `max(1, kv/tp)` KV heads) with its own
-//! 128x128 FP32 block grid, so a shard's 192-row key is a 128-row block then
-//! a 64-row block. SGLang's loader (`load_mimo_v2_qkv_proj_weight`,
-//! `_deinterleave_qkv_shards`) reads it the same way; the reference modeling
-//! code splits the de-interleaved `[q; k; v]`.
+//! MiMo V2.6 fused `self_attn.qkv_proj`: FP8 E4M3 rows interleaved for
+//! `metadata.tp_size` in the checkpoint index (Flash TP4, Pro TP8).
+//! Every shard stores `[q | k | v]` with an independent 128x128 FP32 scale
+//! grid for each segment. Flash SWA shards contain two contiguous key heads;
+//! Pro has one key head per shard and pads it only in the program layout.
+//! The reference modeling code splits the de-interleaved `[q; k; v]`.
 use super::config::{MimoAttention, MimoV2Config};
 use anyhow::{ensure, Context, Result};
 use std::path::Path;
@@ -40,6 +38,18 @@ impl FusedQkvLayout {
         ensure!(tp <= kv_heads, "fused qkv with replicated KV heads (checkpoint TP {tp} > {kv_heads}) is not supported");
         Ok(Self { shards: tp, q: heads / tp * cfg.head_dim, k: kv_heads / tp * cfg.head_dim,
             v: kv_heads / tp * cfg.v_head_dim })
+    }
+
+    /// Projection rows and copy runs for the selected program. Flash keeps
+    /// multi-head checkpoint shards contiguous; only Pro pads one-head keys.
+    pub fn program_segments(&self, cfg: &MimoV2Config) -> Result<(usize, Vec<QkvSegment>)> {
+        let stride = cfg.qkv_key_stride();
+        if stride == cfg.head_dim {
+            return Ok((self.rows(), self.segments()));
+        }
+        ensure!(self.k == cfg.head_dim && stride % 128 == 0 && self.q % 128 == 0 && self.v % 128 == 0,
+            "padded keys (stride {stride}) need one KV head per checkpoint shard and 128-row q/v shards");
+        Ok((self.padded_rows(stride), self.segments_with_key_stride(stride)))
     }
 
     pub fn rows(&self) -> usize {
@@ -80,16 +90,81 @@ impl FusedQkvLayout {
     }
 }
 
-/// The checkpoint's tensor-parallel degree (`metadata.tp_size` of the index; 1 when absent).
+/// The index's positive integer `metadata.tp_size`; required for fused QKV.
 pub fn checkpoint_tp(snapshot: &Path) -> Result<usize> {
     let index = crate::plan::checkpoint::read_json(&snapshot.join("model.safetensors.index.json"))
         .context("reading model.safetensors.index.json")?;
-    Ok(index["metadata"]["tp_size"].as_u64().map_or(1, |tp| tp as usize))
+    let fused = index["weight_map"].as_object().is_some_and(|weights|
+        weights.keys().any(|name| name.ends_with("self_attn.qkv_proj.weight")));
+    let raw = &index["metadata"]["tp_size"];
+    if raw.is_null() && !fused { return Ok(1); }
+    let tp = raw.as_u64().filter(|&tp| tp > 0)
+        .context("fused qkv_proj requires positive integer metadata.tp_size in the checkpoint index")?;
+    usize::try_from(tp).context("metadata.tp_size does not fit usize")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flash_tp4_keeps_two_swa_key_heads_contiguous_and_scales_segmented() -> Result<()> {
+        let mut value = crate::plan::testing::mimo_flash_config();
+        value["model_type"] = serde_json::json!("mimo_v2");
+        value["rope_theta"] = serde_json::json!(1e7);
+        value["layernorm_epsilon"] = serde_json::json!(1e-6);
+        value["moe_router_dtype"] = serde_json::json!("bfloat16");
+        let cfg = MimoV2Config::from_hf(&value)?;
+        for (kind, rows, scales, key_rows) in [(MimoAttention::Full, 13568, 108, 192),
+            (MimoAttention::Sliding, 14848, 116, 384)] {
+            let layout = FusedQkvLayout::new(&cfg, kind, 4)?;
+            let (width, segments) = layout.program_segments(&cfg)?;
+            assert_eq!((width, layout.scale_rows(), layout.k), (rows, scales, key_rows));
+            // Label every checkpoint row by its own restarted scale-grid row,
+            // and prove de-interleaving leaves no holes or duplicate writes.
+            let mut dest = vec![usize::MAX; width];
+            for segment in &segments {
+                for row in 0..segment.rows {
+                    let at = segment.dest_row + row;
+                    assert_eq!(dest[at], usize::MAX);
+                    dest[at] = segment.scale_row + row / 128;
+                }
+            }
+            assert!(dest.iter().all(|&row| row < scales));
+            let q_all = 64 * 192;
+            for shard in 0..4 {
+                let key = segments[shard * 3 + 1];
+                assert_eq!(key.dest_row, q_all + shard * key_rows);
+                assert_eq!(dest[key.dest_row + key_rows - 1], key.scale_row + (key_rows - 1) / 128);
+            }
+            let share = cfg.head_split(2)?;
+            let half = FusedQkvLayout::new(&share, kind, 2)?;
+            assert_eq!((half.program_segments(&share)?.0 * 2, half.scale_rows() * 2), (width, scales));
+            for (whole, split) in segments[..6].iter().zip(half.segments()) {
+                assert_eq!((whole.source_row, whole.scale_row, whole.rows), (split.source_row, split.scale_row, split.rows));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_checkpoint_requires_positive_integer_tp_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("model.safetensors.index.json");
+        for tp in [serde_json::Value::Null, serde_json::json!(0), serde_json::json!("4"),
+            serde_json::json!(-1), serde_json::json!(4.5)] {
+            let index = serde_json::json!({"metadata": {"tp_size": tp}, "weight_map": {
+                "model.layers.0.self_attn.qkv_proj.weight": "model.safetensors"}});
+            std::fs::write(&path, serde_json::to_vec(&index)?)?;
+            assert!(checkpoint_tp(dir.path()).unwrap_err().to_string().contains("metadata.tp_size"));
+        }
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"metadata": {"tp_size": 4},
+            "weight_map": {"model.layers.0.self_attn.qkv_proj.weight": "model.safetensors"}}))?)?;
+        assert_eq!(checkpoint_tp(dir.path())?, 4);
+        std::fs::write(&path, b"{\"weight_map\": {}}")?;
+        assert_eq!(checkpoint_tp(dir.path())?, 1);
+        Ok(())
+    }
 
     #[test]
     fn pro_layout_matches_the_checkpoint_grid() -> Result<()> {
@@ -99,6 +174,7 @@ mod tests {
             "swa_num_key_value_heads": 8, "rope_theta": 1e7, "swa_rope_theta": 1e4, "sliding_window": 128,
             "hybrid_layer_pattern": [0], "moe_layer_freq": [0], "intermediate_size": 16384,
             "n_routed_experts": 384, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
+            "attention_value_scale": 0.612,
         });
         let cfg = MimoV2Config::from_hf(&v)?;
         let layout = FusedQkvLayout::new(&cfg, MimoAttention::Full, 8)?;

@@ -24,6 +24,8 @@ phase fails; the script exits nonzero if anything could not be stopped.
 keys define the cleanup scope. Only syntax, known keys, value domains and host
 tokens are validated: a file that is incomplete or invalid for launching (for
 example six hosts without SPARK_TP/SPARK_EP) still stops every host it names.
+INSTANCE in that file selects the coordinator container to stop: with INSTANCE
+set it is cuteafd-coordinator-INSTANCE, otherwise the shared cuteafd-coordinator.
 EOF
 }
 

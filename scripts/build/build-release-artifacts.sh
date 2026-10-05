@@ -18,6 +18,15 @@ output_dir="$(realpath -m "$4")"
 # template, so honoring this variable is what makes the relocation real: a mere
 # TMPDIR export would be ignored by the template.
 build_root_parent="${CUTEAFD_RELEASE_BUILD_ROOT:-/tmp}"
+# The build containers run as the invoking user rather than root (build.sh passes
+# --user): that UID has no passwd entry and no home the image created, so the
+# writable home and cache roots the caller named are created before Cargo, CMake
+# or TorchInductor touches them (Cargo does create its own home leaf, but not the
+# human home above it).
+for writable_root in "${HOME:-}" "${CARGO_HOME:-}" "${TORCHINDUCTOR_CACHE_DIR:-}"; do
+  [[ -n "$writable_root" ]] || continue
+  mkdir -p "$writable_root"
+done
 # Reject unsafe output/cache filesystems before staging or invoking Cargo.
 # SOURCE_DIR is a read-only input: the release container mounts it `/source:ro`
 # and this script stages a writable copy into the build root below, so probing
@@ -86,7 +95,7 @@ bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 IFS=';' read -ra bf16_family_list <<<"$bf16_families"
 for bf16_family in "${bf16_family_list[@]}"; do
   case "$bf16_family" in
-    mimo|mimop|glm|glmf|qwen4) ;;
+    mimo|mimop|mimof|glm|glmf|qwen4) ;;
     *) echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES: unknown family $bf16_family" >&2; exit 2 ;;
   esac
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||

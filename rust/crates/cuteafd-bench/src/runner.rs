@@ -9,6 +9,7 @@ use crate::report::{
     now_rfc3339, Baseline, PanelResult, PanelStatus, PlannedPanel, Report, RunStatus, ServerInfo, SCHEMA,
 };
 use crate::store::{self, Store};
+use cuteafd_api::openai::ConsoleHub;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -41,6 +42,44 @@ pub enum StartError {
     NotReady,
 }
 
+/// What the progress ticker knows about the panel now running: enough to price
+/// the whole run (`remaining`/`total`) and this panel on its own.
+#[derive(Debug, Clone)]
+struct Plan {
+    run: String,
+    panel: String,
+    /// Estimated seconds for one pass of this panel.
+    estimate: f64,
+    /// Whole-run seconds still to run.
+    remaining: f64,
+    /// Whole-run seconds at the start.
+    total: f64,
+    /// The pass now running (1-based) and how many this panel runs.
+    pass: u32,
+    passes: u32,
+    /// When the running pass started.
+    started: Instant,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self { run: String::new(), panel: String::new(), estimate: 0.0, remaining: 0.0, total: 1.0,
+            pass: 1, passes: 1, started: Instant::now() }
+    }
+}
+
+/// Seconds left in the running panel: the pass's measured pace once it has
+/// enough data to extrapolate from, else its estimate; later passes at the
+/// estimate.
+fn panel_eta_s(estimate: f64, pass: u32, passes: u32, fraction: f64, elapsed: f64) -> f64 {
+    let pass_left = if fraction > 0.1 && elapsed > 0.0 {
+        elapsed * (1.0 - fraction) / fraction
+    } else {
+        estimate * (1.0 - fraction)
+    };
+    (pass_left + estimate * f64::from(passes.saturating_sub(pass))).max(0.0)
+}
+
 /// The run holding the lock.
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
@@ -53,6 +92,25 @@ pub struct ActiveRun {
     pub fraction: f64,
 }
 
+/// Allows console token text while a run holds the server; clearing on drop
+/// covers every exit path, cancellation and panics included.
+struct BenchText(Arc<ConsoleHub>);
+
+impl BenchText {
+    /// `None` when no console is attached (a bench without the API server).
+    fn enable(bench: &Bench) -> Option<Self> {
+        let console = bench.console.get()?.clone();
+        console.set_bench_active(true);
+        Some(Self(console))
+    }
+}
+
+impl Drop for BenchText {
+    fn drop(&mut self) {
+        self.0.set_bench_active(false);
+    }
+}
+
 pub struct Bench {
     store: Mutex<Store>,
     active: Mutex<Option<ActiveRun>>,
@@ -60,6 +118,10 @@ pub struct Bench {
     baselines: Mutex<HashMap<String, Baseline>>,
     info: Mutex<Option<ServerInfo>>,
     events: broadcast::Sender<Arc<str>>,
+    /// The live console of the in-process server, attached at mount. A run
+    /// allows token text on it: the lockout makes the run's own prompts the
+    /// only requests in.
+    console: OnceLock<Arc<ConsoleHub>>,
     /// `CUTEAFD_API_KEY`: when set, bench controls from outside the local
     /// network need it as a bearer token.
     pub api_key: Option<String>,
@@ -75,8 +137,14 @@ impl Bench {
             baselines: Mutex::new(HashMap::new()),
             info: Mutex::new(None),
             events,
+            console: OnceLock::new(),
             api_key: std::env::var("CUTEAFD_API_KEY").ok().filter(|k| !k.is_empty()),
         })
+    }
+
+    /// The server's live console; called once when the bench is mounted.
+    pub fn set_console(&self, console: Arc<ConsoleHub>) {
+        let _ = self.console.set(console);
     }
 
     /// The process-wide instance (SQLite under `store::default_dir()`, in memory if unwritable).
@@ -282,8 +350,11 @@ impl Bench {
             *slot = Some(active.clone());
         }
         let bench = self.clone();
+        // The run is active from here (the lockout is already refusing other
+        // clients), so its console text is allowed until it retires.
+        let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, name, plan, dropped);
+            bench.execute(active, base, name, plan, dropped, text);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -297,7 +368,7 @@ impl Bench {
     }
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, profile: String, plan: Vec<PlannedPanel>,
-        dropped: Vec<String>) {
+        dropped: Vec<String>, text: Option<BenchText>) {
         let id = active.id.clone();
         let report = Arc::new(Mutex::new(Report {
             schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
@@ -342,8 +413,11 @@ impl Bench {
             let _ = ticker.join();
         }
         if let Ok(mut plan) = self.plan_state().lock() {
-            *plan = (String::new(), String::new(), 0.0, 0.0, 1.0);
+            *plan = Plan::default();
         }
+        // Console text ends before the lock lifts: a run admitted in the gap
+        // would otherwise have its own override cleared by this run's guard.
+        drop(text);
         *self.active.lock().expect("active lock") = None;
         let snapshot = report.lock().expect("report lock").clone();
         self.emit(json!({"type": "report", "run": id, "report": snapshot}));
@@ -378,7 +452,7 @@ impl Bench {
             Some(b) => b,
             None => {
                 let estimate = crate::baseline::estimate_s(&rates);
-                self.begin(active, "baseline", estimate, remaining, total, progress);
+                self.begin(active, "baseline", estimate, remaining, total, 1, 1, progress);
                 let b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context,
                     max_output)?;
                 remaining -= estimate;
@@ -413,7 +487,7 @@ impl Bench {
             let started = Instant::now();
             for pass in 1..=planned.passes {
                 client.check()?;
-                self.begin(active, panel.id(), estimate, remaining, total, progress);
+                self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: Some(&baseline), rates, progress, pass,
                     history: &earlier, max_context, max_output };
                 let outcome = panel.run(&ctx);
@@ -449,18 +523,20 @@ impl Bench {
         Ok(())
     }
 
-    /// A panel (or the baseline) starts: reset its progress and the ETA base.
-    fn begin(&self, active: &ActiveRun, panel: &str, estimate: f64, remaining: f64, total: f64, progress: &Progress) {
+    /// A panel (or the baseline) starts a pass: reset its progress and the ETA base.
+    fn begin(&self, active: &ActiveRun, panel: &str, estimate: f64, remaining: f64, total: f64,
+        pass: u32, passes: u32, progress: &Progress) {
         progress.reset();
         if let Ok(mut plan) = self.plan_state().lock() {
-            *plan = (active.id.clone(), panel.to_string(), estimate, remaining, total);
+            *plan = Plan { run: active.id.clone(), panel: panel.to_string(), estimate, remaining, total,
+                pass, passes, started: Instant::now() };
         }
         self.update_active(|a| a.panel = panel.to_string());
     }
 
-    fn plan_state(&self) -> &'static Mutex<(String, String, f64, f64, f64)> {
-        static STATE: OnceLock<Mutex<(String, String, f64, f64, f64)>> = OnceLock::new();
-        STATE.get_or_init(|| Mutex::new((String::new(), String::new(), 0.0, 0.0, 1.0)))
+    fn plan_state(&self) -> &'static Mutex<Plan> {
+        static STATE: OnceLock<Mutex<Plan>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(Plan::default()))
     }
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
@@ -470,10 +546,9 @@ impl Bench {
         let mut revision = u64::MAX;
         while !done.load(Ordering::Relaxed) {
             let state = progress.get();
-            let (run, panel, estimate, remaining, total) = self.plan_state().lock().map(|s| s.clone())
-                .unwrap_or_default();
-            let eta = (remaining - estimate * state.fraction).max(0.0);
-            let fraction = (1.0 - eta / total.max(1.0)).clamp(0.0, 1.0);
+            let plan = self.plan_state().lock().map(|s| s.clone()).unwrap_or_default();
+            let eta = (plan.remaining - plan.estimate * state.fraction).max(0.0);
+            let fraction = (1.0 - eta / plan.total.max(1.0)).clamp(0.0, 1.0);
             self.update_active(|a| {
                 a.eta_s = eta;
                 a.fraction = fraction;
@@ -497,31 +572,59 @@ impl Bench {
                     Some(t["requests_admitted"].as_u64()?.saturating_sub(t["requests_retired"].as_u64()?))
                 });
             }
-            let title = if panel == "baseline" { "Basic card + quick quality".to_string() }
-                else { panels::find(&panel).map_or(panel.clone(), |p| p.title().to_string()) };
-            if run.is_empty() {
+            let title = if plan.panel == "baseline" { "Basic card + quick quality".to_string() }
+                else { panels::find(&plan.panel).map_or(plan.panel.clone(), |p| p.title().to_string()) };
+            if plan.run.is_empty() {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            self.emit(json!({"type": "progress", "run": run, "panel": panel, "title": title, "label": state.label,
-                "panel_fraction": state.fraction, "fraction": fraction, "eta_s": eta,
-                "live": {"tok_s": tok_s, "active": active_requests}}));
+            let panel_eta = panel_eta_s(plan.estimate, plan.pass, plan.passes, state.fraction,
+                plan.started.elapsed().as_secs_f64());
+            self.emit(json!({"type": "progress", "run": plan.run, "panel": plan.panel, "title": title,
+                "label": state.label, "panel_fraction": state.fraction, "panel_eta_s": panel_eta,
+                "fraction": fraction, "eta_s": eta, "live": {"tok_s": tok_s, "active": active_requests}}));
             if state.revision != revision {
                 revision = state.revision;
                 if let Some(partial) = state.partial {
                     if let Ok(mut r) = report.lock() {
-                        if panel == "baseline" {
+                        if plan.panel == "baseline" {
                             if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
                                 r.baseline = Some(b);
                             }
-                        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == panel) {
+                        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == plan.panel) {
                             p.partial = Some(partial.clone());
                         }
                     }
-                    self.emit(json!({"type": "partial", "run": run, "panel": panel, "value": partial}));
+                    self.emit(json!({"type": "partial", "run": plan.run, "panel": plan.panel, "value": partial}));
                 }
             }
             std::thread::sleep(Duration::from_millis(1000));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panel_eta_s;
+
+    fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
+
+    #[test]
+    fn panel_eta_uses_the_estimate_before_a_pass_has_data() {
+        // Three passes of 100 s, a fifth through the first: the estimate, and nothing measured yet.
+        assert!(close(panel_eta_s(100.0, 1, 3, 0.2, 0.0), 80.0 + 200.0));
+    }
+
+    #[test]
+    fn panel_eta_follows_the_measured_pace_once_a_pass_is_under_way() {
+        // 25 s into a pass that is half done: 25 s left, plus the later passes.
+        assert!(close(panel_eta_s(100.0, 1, 2, 0.5, 25.0), 25.0 + 100.0));
+        // The last pass has no later passes to price in.
+        assert!(close(panel_eta_s(100.0, 2, 2, 0.25, 30.0), 90.0));
+    }
+
+    #[test]
+    fn panel_eta_never_goes_negative() {
+        assert!(close(panel_eta_s(0.0, 1, 1, 1.0, 10.0), 0.0));
     }
 }

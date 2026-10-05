@@ -45,7 +45,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
   if(NOT entry MATCHES ":(fp8|nvfp4|nvfp4a4)$")
     continue()
   endif()
-  if(entry MATCHES "^(mimo|mimop|glm|glmf|qwen4):fp8$")
+  if(entry MATCHES "^(mimo|mimop|mimof|glm|glmf|qwen4):fp8$")
     set(geometry "${CMAKE_MATCH_1}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
   elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
@@ -55,7 +55,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     set(geometry "${CMAKE_MATCH_1}_${CMAKE_MATCH_2}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
-    message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|glm|glmf|qwen4):fp8 (mimop: MXFP4 weights) \
+    message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|mimof|glm|glmf|qwen4):fp8 (mimof/mimop: MXFP4 weights) \
 or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
   endif()
   # Spark packages also carry exact layouts (tp<n>-w<width>: ranks own whole

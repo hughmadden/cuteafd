@@ -363,10 +363,11 @@ def test_invalid_glm_drafter_quantization_rejects_before_starting_containers(tmp
 
 
 @pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
-@pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
-def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):
+@pytest.mark.parametrize("store, geometry, ranks, hidden", [("fp8", "mimo", 4, 4096), ("mxfp4", "mimop", 6, 6144),
+                                                        ("mxfp4", "mimof", 2, 4096), ("mxfp4", "mimof", 4, 4096)])
+def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks, hidden):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
-              "quantization_config": {"store_dtype": store}}
+              "hidden_size": hidden, "quantization_config": {"store_dtype": store}}
     keys = f"EXPERT_INPUT={mode}\nSPARK_COUNT={ranks}\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n"
     keys += "".join(f"SPARK_{r}_HOST=h{r}\nSPARK_{r}_LANE_A=10.0.0.{r + 1}\n" for r in range(ranks))
     result = _family_launch_result(tmp_path, config, "test/mimo", keys)
@@ -686,6 +687,42 @@ def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
     assert result.returncode == 0 and result.stdout == "32", result.stderr
     for file in ("run.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
         assert 'args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")' in (ROOT / file).read_text()
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
+    ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("DRAFT_FP8=off\n", "bf16"), ("SPECULATOR=off\n", "off"),
+    ("MTP=0\n", "off"), ("DFLASH=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
+])
+def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str) -> None:
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
+    model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
+    result = _family_launch_result(tmp_path, config, model, keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
+    if expected in ("off", "mtp"):
+        assert "--draft" not in launch
+        assert ("--mtp 1" in launch) == (expected == "mtp")
+    else:
+        assert "--draft /root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        if expected == "checkpoint":
+            assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
+        else:
+            assert f"--draft-fp8 {'true' if expected == 'fp8' else 'false'}" in launch
+
+
+def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path: Path) -> None:
+    _snapshot(tmp_path / "hf", "test/external-draft", {})
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2", "num_hidden_layers": 2,
+                                  "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+                                  "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/external-draft\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "models--test--external-draft/snapshots/abc" in launch
+    assert "--draft-fp8" not in launch
 
 
 def test_family_config_reads_share_the_stop_key_grammar() -> None:

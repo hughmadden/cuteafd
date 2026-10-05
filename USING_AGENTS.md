@@ -66,6 +66,7 @@ but bounded engineering still goes to Sol.
   with a resume note pointing at its STATUS.md (its background jobs keep
   running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
+- **Transient 429s:** a stream cut off after `response.created` with HTTP 429 (no `usage_limit_reached`) is OpenAI-side capacity, not a subscription limit, so switching subscription doesn't help (TJ, 2026-10-05). Resume the agent after a few minutes from its STATUS.md; keep briefs and STATUS current so a mid-task death costs little.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
@@ -75,6 +76,15 @@ but bounded engineering still goes to Sol.
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
   than Claude.
+- **DeepSeek Flash track record (2026-10-05):** four tasks, all correct on
+  the first pass: a 7-host image audit and cleanup that followed the keep
+  rules exactly; a bench-console fix with unit tests and an unprompted
+  headless-browser render check; and a `max`-effort change threading the
+  console hub through six serve paths with a drop guard, where it flagged
+  its own edge case. Strong at bounded, well-specified, checkable work;
+  not yet tried on numerics, kernels, or noisy hardware measurement.
+  Stretching it next to multi-file platform items (build hygiene,
+  readiness/health).
 - Don't drop a numerics or kernel task to DeepSeek to save time; review cost
   outweighs it. Give DeepSeek work whose result is easy to check.
 
@@ -228,7 +238,7 @@ DeepSeek and MiMo are not available in this environment.
 
 These apply to every agent and are also in `AGENTS.md`.
 
-- **Locks:** take `sparks.lock` before `gpu1.lock`, only around actual runs,
+- **Locks:** take `sparks.lock`, then `gpu0.lock` when using GPU0 (TJ may hold it for an interactive server), then `gpu1.lock`, only around actual runs,
   each run one blocking command with a timeout. Reversed lock order
   deadlocked the cluster with both GPUs idle and ~30 jobs queued.
 - **Teardown:** stop servers, containers and Spark workers before releasing
@@ -299,5 +309,6 @@ duplicating it. Record the lesson in the table below.
 | Restart lost agents' watchers | STATUS.md checkpoints before restarts |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
 | Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
+| Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |

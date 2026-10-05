@@ -49,6 +49,11 @@ resident local MTP3 on one RTX. The grid contains four refreshed RC2 cards
 and 24 retained RC1 cards. See [qualification and known limits](PLAN.md#v1-regression-follow-up-rc2-2026-10-05)
 and the [release scope](PLAN.md#release-v1-scope-decided-2026-10-04).
 
+MiMo V2.6 Flash MOPD replaces the legacy Flash current rows after text-only
+qualification on a task overlay, not a new release cut. Its cards cover 16K
+context / 32K pool; [conditions and limits](docs/models/mimo_v2.md#flash-mopd-qualification-2026-10-05)
+include the separate three-run C1/C4 comparison and reasoning-on completion gate.
+
 <!-- results:begin -->
 <table>
 <tr><th>Model · quant</th><th>Minimum hardware</th><th>Maximum hardware</th></tr>
@@ -103,9 +108,9 @@ and the [release scope](PLAN.md#release-v1-scope-decided-2026-10-04).
 <td width="40%" valign="top"><a href="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max/card.svg"><img src="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max/card.svg" alt="brandonmusic/GLM-5.3-Flash-tr3-4bpw on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
-<td width="20%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2-Flash</sub><br><sub>fp8-block128x128/f32</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/card.svg"><img src="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/card.svg" alt="XiaomiMiMo/MiMo-V2-Flash on 1× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/card.svg"><img src="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/card.svg" alt="XiaomiMiMo/MiMo-V2-Flash on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
+<td width="20%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Flash-MOPD</sub><br><sub>mxfp4-g32</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-1rtx-2spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-1rtx-2spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Flash-MOPD on 1× RTX PRO 6000 @ 325 W + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-2rtx-4spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-2rtx-4spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Flash-MOPD on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Pro-MOPD</sub><br><sub>mxfp4-g32</sub></td>
@@ -146,8 +151,8 @@ and the [release scope](PLAN.md#release-v1-scope-decided-2026-10-04).
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-NVFP4 (nvfp4-g16) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 115 | 85.1 | 129 | 7,239 | 1.11 s | ✓ KL 0.039 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc2](benchmarks/glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-tr3-4bpw (exl3-k4) | 1× RTX + 2× Spark (min) | 2M tok / 8 req | 71.8 | 57.4 | 83.8 | 4,615 | 1.74 s | ✓ KL 0.037 · top-1 87.5% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-tr3-4bpw (exl3-k4) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 111 | 90.9 | 126 | 5,159 | 1.56 s | ✓ KL 0.036 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max/report.svg) |
-| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 1× RTX + 4× Spark (min) | 2M tok / 8 req | 71.2 | 55.0 | 89.0 | 6,618 | 1.22 s | ✓ KL 0.092 · top-1 83.2% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/report.svg) |
-| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 72.7 | 61.0 | 93.0 | 6,951 | 1.16 s | ✓ KL 0.096 · top-1 82.6% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/report.svg) |
+| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Flash-MOPD (mxfp4-g32) | 1× RTX + 2× Spark (min) | 32K tok / 4 req | 89.7 | 49.1 | 82.2 | 5,325 | 1.52 s | ✓ KL 0.022 · top-1 89.8% ✓ exact cache ✓ lossless spec | [2026-10-05 · 03f3ddb17ce0](benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-1rtx-2spark/report.svg) |
+| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Flash-MOPD (mxfp4-g32) | 2× RTX + 4× Spark (max) | 32K tok / 4 req | 122 | 74.1 | 130 | 7,395 | 1.09 s | ✓ KL 0.026 · top-1 88.7% ✓ exact cache ✓ lossless spec | [2026-10-05 · 03f3ddb17ce0](benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-2rtx-4spark/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 1× RTX + 6× Spark (min) | 2M tok / 8 req | 50.0 | 37.1 | 76.7 | 2,631 | 3.06 s | ✓ KL 0.020 · top-1 90.2% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 2× RTX + 6× Spark (max) | 2M tok / 8 req | 71.7 | 41.0 | 86.9 | 3,470 | 2.32 s | ✓ KL 0.025 · top-1 88.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg) |
 | [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX (32 GiB budget) + 1× Spark (min) | 32K tok / 4 req | 121 | 82.2 | 132 | 3,698 | 2.16 s | ✓ KL 0.036 · top-1 88.5% ✓ exact cache ✓ lossless spec | [2026-10-05 · cdf793385d86](benchmarks/qwen4/2026-10-05-smoke-qwen38-exl3-32gib-1rtx-1spark-mtp3/report.svg) |

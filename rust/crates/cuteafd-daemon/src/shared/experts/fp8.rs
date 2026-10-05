@@ -72,6 +72,13 @@ unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
     Ok(module)
 }
 
+fn package_family(family: Option<&'static str>, format: ExpertFormat) -> &'static str {
+    match (family, format) {
+        (Some("mimo"), ExpertFormat::Mxfp4) => "mimof",
+        (family, _) => family.unwrap_or("unknown"),
+    }
+}
+
 /// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
 /// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
 /// releases share their geometry with the FP8 ones and get packages of their
@@ -80,7 +87,7 @@ unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
 /// default when built; `CUTEAFD_NVFP4_ACTIVATIONS=a16` keeps W4A16 (GLM 5.3
 /// Flash: KL vs golden 0.0589 W4A16, 0.0791 W4A4; 8K prefill 1.33x).
 pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
-    let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
+    let family = package_family(cuteafd_core::expert_geometry().family(), format);
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
     let layout = format!("tp{tp}");
     if format == ExpertFormat::Nvfp4 && nvfp4_activations() == Nvfp4Activations::A4 {
@@ -362,6 +369,17 @@ mod tests {
     use super::{resident_admission, validate_bf16_package};
     use clap::Parser;
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
+
+    #[test]
+    fn package_family_includes_format_without_changing_existing_families() {
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        assert_eq!(super::package_family(Some("mimo"), ExpertFormat::Mxfp4), "mimof");
+        for family in ["mimo", "mimop", "glm", "glmf", "qwen4", "dsv4f"] {
+            assert_eq!(super::package_family(Some(family), ExpertFormat::Fp8Block128), family);
+            assert_eq!(super::package_family(Some(family), ExpertFormat::Nvfp4), family);
+            if family != "mimo" { assert_eq!(super::package_family(Some(family), ExpertFormat::Mxfp4), family); }
+        }
+    }
 
     #[derive(Parser)]
     struct QwenArgs {

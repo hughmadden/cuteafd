@@ -2624,7 +2624,8 @@ pub(super) fn graph_capture_watch() {
     static ROUNDS: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicU64 = AtomicU64::new(0);
     let rounds = ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
-    if rounds % 512 == 0 {
+    let interval = if tracing::enabled!(target: "cuteafd::graph_capture", tracing::Level::DEBUG) { 32 } else { 512 };
+    if rounds % interval == 0 {
         let captures = cuteafd_ffi::graph_captures();
         let previous = LAST.swap(captures, Ordering::Relaxed);
         static SITES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -2633,9 +2634,8 @@ pub(super) fn graph_capture_watch() {
         let mut delta: Vec<_> = now.iter().map(|(site, n)| (site.rsplit('/').next().unwrap_or(site).to_string(),
             n - before.iter().find(|(s, _)| s == site).map_or(0, |(_, m)| *m))).filter(|(_, n)| *n > 0).collect();
         delta.sort_by(|a, b| b.1.cmp(&a.1));
-        delta.truncate(6);
         *before = now;
-        tracing::info!(rounds, captures = captures - previous, sites = ?delta,
-            "graph captures in the last 512 verification rounds");
+        tracing::info!(rounds, interval, captures = captures - previous, sites = ?delta,
+            "graph captures in recent verification rounds");
     }
 }
