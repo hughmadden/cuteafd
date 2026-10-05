@@ -1024,7 +1024,7 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     let dir = snapshot(config, &tensors);
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1, ..Default::default()
-    }), ..sparks(4) };
+    }), ..sparks(1) };
     let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let lead = &with_mtp.devices[0];
     assert!(lead.items.iter().any(|i| i.group == "native MTP expert arena" && i.bytes > 0), "{}", with_mtp.render());
