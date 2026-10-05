@@ -1,6 +1,7 @@
 //! Token initialization and image replacement before the first target mHC block.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_layer_graphs::RowGraphs;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::{ffi::c_void, marker::PhantomData};
@@ -24,7 +25,7 @@ pub(crate) struct TargetEmbeddingWave<'w, 'a> {
     image_features: DeviceAllocation<'a>,
     image_indices: DeviceAllocation<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize)>,
+    graphs: RowGraphs<'a>,
     tokens: Vec<u32>,
     positions: Vec<u64>,
     ready: bool,
@@ -70,7 +71,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             image_features: DeviceAllocation::new(library, capacity * 10240)?,
             image_indices: DeviceAllocation::new(library, capacity * 4)?,
             capacity,
-            graph: None,
+            graphs: RowGraphs::new(library, "target_embedding"),
             tokens: Vec::with_capacity(capacity),
             positions: Vec::with_capacity(capacity),
             ready: false,
@@ -98,7 +99,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     }
     /// Initializes text rows in caller order. Positions may repeat across
     /// requests; request ownership remains the scheduler's responsibility.
-    /// Captures when the live shape changes, then reuses stable graph storage.
+    /// Retains decode row shapes over the same fixed weights and stable storage.
     pub fn execute(&mut self, tokens: &[u32], positions: &[u64]) -> Result<TargetEmbedding<'_>> {
         self.invalidate();
         let rows = tokens.len();
@@ -112,8 +113,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         );
         let bytes: Vec<u8> = tokens.iter().flat_map(|id| id.to_ne_bytes()).collect();
         self.stream.library.copy_h2d(self.ids.buffer, &bytes)?;
-        if self.graph.as_ref().is_none_or(|(_, n)| *n != rows) {
-            self.clear_graph()?;
+        if self.graphs.get(rows).is_none() {
             let warmup = unsafe { self.enqueue(rows) };
             warmup.and(self.synchronize())?;
             unsafe {
@@ -124,7 +124,14 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             let launched = unsafe { self.enqueue(rows) };
             let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
             match (launched, captured) {
-                (Ok(()), Ok(graph)) => self.graph = Some((graph, rows)),
+                (Ok(()), Ok(graph)) => {
+                    // SAFETY: eager warmup drained; capture has not been launched.
+                    if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                        // SAFETY: this new graph has no queued launches.
+                        unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
+                        return Err(error);
+                    }
+                },
                 (Err(e), Ok(graph)) => {
                     unsafe {
                         self.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -134,7 +141,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
                 (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
             }
         }
-        let graph = self.graph.context("target embedding graph missing")?.0;
+        let graph = self.graphs.get(rows).context("target embedding graph missing")?;
         let launched = unsafe {
             self.stream
                 .library
@@ -212,12 +219,8 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.synchronize()?;
-        if let Some((graph, _)) = self.graph.take() {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
-        Ok(())
+        // SAFETY: synchronize completed all uses of the fixed embedding storage.
+        unsafe { self.graphs.clear() }
     }
 }
 impl Drop for TargetEmbeddingWave<'_, '_> {

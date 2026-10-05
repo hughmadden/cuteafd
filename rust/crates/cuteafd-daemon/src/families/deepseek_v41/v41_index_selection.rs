@@ -13,6 +13,11 @@ const BLOCKS: usize = WIDTH / 8;
 // Index fingerprints include request layouts; retain a bounded recent set.
 // Per-layer projection graphs have a separate residency limit.
 const MAX_RETAINED_DECODE_GRAPHS: usize = 512;
+const DECODE_WIDTH_BUCKET: usize = 512;
+
+fn tile_width(max_length: usize, bucket: usize) -> usize {
+    max_length.max(1).div_ceil(bucket).saturating_mul(bucket).min(WIDTH)
+}
 
 pub(crate) struct SelectionRequest<'a> {
     pub proposal: &'a IndexProposal<'a>,
@@ -494,14 +499,9 @@ impl<'a> IndexSelectionWave<'a> {
                 "candidate source is unexpected for this layer"
             );
         }
-        // Device-ordered passes (`CUTEAFD_V41_DEVICE`) round the tile width up to
-        // 512 candidates: rows already mask positions past their own length, and
-        // a width per 8 compressed tokens re-captured these graphs while serving.
-        let width = if crate::shared::memory::chain::device_enabled() {
-            (max_length as usize).max(1).div_ceil(512).saturating_mul(512).min(WIDTH)
-        } else {
-            (max_length as usize).max(1).div_ceil(8).min(WIDTH / 8) * 8
-        };
+        // Causal scoring masks padded candidates to -inf; top-k excludes them.
+        // Width buckets keep context growth inside the bounded decode graph bank.
+        let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
         let use_candidates = query.layer > 20 && max_length > WIDTH as u64;
         let tiles = (max_length as usize).div_ceil(width).max(1);
         fingerprint.extend([width, usize::from(use_candidates)]);
@@ -591,6 +591,19 @@ impl Drop for IndexSelectionWave<'_> {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+
+    #[test]
+    fn tile_buckets_cover_causal_rows_without_unaligned_tiles() {
+        for bucket in [8, DECODE_WIDTH_BUCKET] {
+            for length in 0..=1_048_576usize {
+                let width = tile_width(length, bucket);
+                assert!((bucket..=WIDTH).contains(&width) && width % 8 == 0);
+                assert!(width >= length.min(WIDTH));
+                if length <= WIDTH { assert!(width - length < bucket || length == 0); }
+                else { assert_eq!(width, WIDTH); }
+            }
+        }
+    }
 
     #[test]
     fn peer_selection_preserves_query_snapshot_validation() -> Result<()> {

@@ -110,10 +110,110 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
 }
 // Destruction is explicit in the containing wave after its stream drains.
 
+/// Fixed-weight owners retain the finite decode row set and one large shape.
+/// The containing wave keeps all captured buffers alive and drains before insert/clear.
+pub(crate) struct RowGraphs<'a> {
+    library: &'a NativeLibrary,
+    small: [Option<*mut c_void>; MAX_DECODE_ROWS as usize],
+    large: Option<(*mut c_void, usize)>,
+    site: &'static str,
+}
+impl<'a> RowGraphs<'a> {
+    pub fn new(library: &'a NativeLibrary, site: &'static str) -> Self {
+        Self { library, small: [None; MAX_DECODE_ROWS as usize], large: None, site }
+    }
+    pub fn get(&self, rows: usize) -> Option<*mut c_void> {
+        if (1..=MAX_DECODE_ROWS as usize).contains(&rows) { self.small[rows - 1] }
+        else { self.large.filter(|(_, count)| *count == rows).map(|(graph, _)| graph) }
+    }
+    /// # Safety
+    /// All launches on this owner's buffers have drained. On success the bank
+    /// owns graph; it captures only the containing wave's fixed weights/storage.
+    pub unsafe fn insert(&mut self, rows: usize, graph: *mut c_void) -> Result<()> {
+        ensure!((1..=4096).contains(&rows) && !graph.is_null(), "invalid row graph binding");
+        let old = if rows <= MAX_DECODE_ROWS as usize {
+            self.small[rows - 1].take()
+        } else { self.large.take().map(|(graph, _)| graph) };
+        if let Some(old) = old {
+            // SAFETY: the containing wave drained every launch before replacement.
+            unsafe { self.library.cuda_graph_exec_destroy(old)?; }
+        }
+        if rows <= MAX_DECODE_ROWS as usize { self.small[rows - 1] = Some(graph); }
+        else { self.large = Some((graph, rows)); }
+        tracing::debug!(target: "cuteafd::graph_capture", site=self.site, rows,
+            bank=self as *const Self as usize,
+            retained=self.small.iter().flatten().count()+usize::from(self.large.is_some()),
+            "native row graph captured");
+        Ok(())
+    }
+    /// # Safety
+    /// The containing wave drained every queued use before releasing graphs/storage.
+    pub unsafe fn clear(&mut self) -> Result<()> {
+        let mut failure = None;
+        for graph in self.small.iter_mut().filter_map(Option::take)
+            .chain(self.large.take().map(|(graph, _)| graph)) {
+            // SAFETY: every queued use completed before the containing wave called clear.
+            if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn cuda_row_bank_preserves_decode_handles_over_prefill() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
+            eprintln!("skip CUDA row bank test: library unset");
+            return Ok(());
+        };
+        // SAFETY: this fixture uses the task's native library and owns all buffers.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let input = DeviceAllocation::new(&library, 128 * 4)?;
+        let output = DeviceAllocation::new(&library, 128 * 4)?;
+        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let mut bank = RowGraphs::new(&library, "fixture");
+        let mut handles = BTreeMap::new();
+        for (cycle, rows) in (1..=MAX_DECODE_ROWS as usize)
+            .chain([80, 128, 2, 6, 3, 48, 64, 56, 63, 64]).enumerate() {
+            let expected = vec![(cycle + 1) as u8; 128 * 4];
+            library.copy_h2d(input.buffer, &expected)?;
+            if bank.get(rows).is_none() {
+                // SAFETY: the previous iteration drained all work before capture.
+                unsafe {
+                    library.cuda_graph_begin_capture(stream.raw)?;
+                    library.copy_d2d_async(output.buffer, input.buffer, rows * 4, stream.raw)?;
+                    let graph = library.cuda_graph_end_capture(stream.raw)?;
+                    bank.insert(rows, graph)?;
+                }
+            }
+            let graph = bank.get(rows).unwrap();
+            if rows <= MAX_DECODE_ROWS as usize {
+                assert_eq!(*handles.entry(rows).or_insert(graph), graph);
+            }
+            // SAFETY: buffers remain owned and exclusive until this launch drains.
+            unsafe {
+                library.cuda_graph_launch(graph, stream.raw)?;
+                library.cuda_stream_synchronize(stream.raw)?;
+            }
+            let mut actual = vec![0; rows * 4];
+            let mut view = output.buffer; view.bytes = actual.len();
+            library.copy_d2h(&mut actual, view)?;
+            assert_eq!(actual, expected[..actual.len()]);
+        }
+        assert!(bank.get(80).is_none());
+        assert!(bank.get(128).is_some());
+        assert_eq!(bank.small.iter().flatten().count(), MAX_DECODE_ROWS as usize);
+        // SAFETY: every fixture launch was synchronized before destruction.
+        unsafe { bank.clear()?; bank.clear()?; }
+        assert!(bank.small.iter().all(Option::is_none) && bank.large.is_none());
+        Ok(())
+    }
 
     #[test]
     fn cuda_small_shape_bank_replays_changes_and_bounds_large_shapes() -> Result<()> {
