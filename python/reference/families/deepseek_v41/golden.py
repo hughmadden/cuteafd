@@ -25,6 +25,75 @@ import torch
 from safetensors import safe_open
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+
+
+def run_windows(a, ref, args, backend, weights):
+    manifest = load_set(a.windows, "deepseek_v41")
+    identity = verify_snapshot(manifest, a.snapshot)
+    args.max_seq_len = max(len(w["tokens"]) for w in manifest["windows"])
+    started, rows = time.time(), []
+    layout = ref.EngramLayout.from_args(args)
+
+    class Wrapped:
+        backend_tokenizer = backend
+
+        def __len__(self):
+            return backend.get_vocab_size(with_added_tokens=True)
+
+    # Stage streams on CPU between window visits, not all attention masks on GPU.
+    # Each layer's weights are loaded once; start_pos=0 resets its prefill caches.
+    states = []
+    with torch.inference_mode():
+        embed = ref.ParallelEmbedding(args.vocab_size, args.dim)
+        load_module(embed, weights, "embed.")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], dtype=torch.long)
+            hashes = ref.NgramHashState(args, layout, Wrapped())(ids, 0) if layout is not None else None
+            h = embed(ids).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+            states.append((h.cpu(), ref.make_identity_pre_mix(h, args.hc_mult).cpu(),
+                           hashes.cpu() if hashes is not None else None))
+            del h, ids, hashes
+        del embed
+        times = []
+        for layer_id in range(args.n_layers):
+            start = time.time()
+            layer = ref.Block(layer_id, args, layout)
+            load_module(layer, weights, f"layers.{layer_id}.")
+            for i, w in enumerate(manifest["windows"]):
+                host_h, host_mix, hashes = states[i]
+                h, pre_mix = host_h.cuda(), host_mix.cuda()
+                if layer.engram is not None:
+                    h = layer.engram(h, hashes.cuda()[:, :, layer.engram.layer_hash_index, :], None)
+                h, pre_mix = layer(h, 0, pre_mix, None)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    h[0].contiguous().view(torch.int16).cpu().numpy().tofile(folder / f"layer{layer_id:02d}.bin")
+                if layer_id == args.n_layers - 1:
+                    # Collapse only the hidden rows predicting scored token positions.
+                    first, last = w["score_from"] - 1, len(w["tokens"]) - 1
+                    h = layer.hc_pre(h[:, first:last], pre_mix[:, first:last])
+                states[i] = (h.cpu(), pre_mix.cpu(), hashes)
+                del h, pre_mix
+            del layer
+            torch.cuda.empty_cache()
+            times.append(time.time() - start)
+            print(f"layer {layer_id}: {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        norm = ref.RMSNorm(args.dim, args.norm_eps)
+        load_module(norm, weights, "norm.")
+        head = ref.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
+        load_module(head, weights, "head.")
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][0].cuda()
+            logits = head(norm(h), full_logits=True)[0].float()
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        reference="official inference/model.py (kernel_torch, mapped engram tables)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
 
 
 def import_reference(snapshot: Path):
@@ -129,6 +198,8 @@ def main() -> None:
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--text-file", type=Path, help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--tokens", type=int, nargs="+", help="explicit token ids")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits only")
+    p.add_argument("--layers", type=int, nargs="*", help="window-mode streams to save; default none")
     p.add_argument("--max-tokens", type=int, default=0, help="truncate the prompt to this many tokens")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
@@ -142,7 +213,10 @@ def main() -> None:
     config = json.loads((a.snapshot / "inference" / "config.json").read_text())
     from tokenizers import Tokenizer
     backend = Tokenizer.from_file(str(a.snapshot / "tokenizer.json"))
-    tokens = a.tokens or backend.encode(a.text_file.read_text(), add_special_tokens=False).ids
+    if a.windows and (a.tokens or a.text_file or a.max_tokens):
+        p.error("--windows cannot be combined with legacy token/text/truncation options")
+    manifest = load_set(a.windows, "deepseek_v41") if a.windows else None
+    tokens = manifest["windows"][0]["tokens"] if manifest else a.tokens or backend.encode(a.text_file.read_text(), add_special_tokens=False).ids
     if a.max_tokens:
         tokens = tokens[: a.max_tokens]
     args = ref.ModelArgs(**config)
@@ -160,6 +234,9 @@ def main() -> None:
 
     weights = Weights(a.snapshot)
     a.out.mkdir(parents=True, exist_ok=True)
+    if a.windows:
+        run_windows(a, ref, args, backend, weights)
+        return
     ids = torch.tensor([tokens], dtype=torch.long)
     started = time.time()
     with torch.inference_mode():

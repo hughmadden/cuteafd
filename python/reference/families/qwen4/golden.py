@@ -55,6 +55,92 @@ from safetensors import safe_open
 PREFIX = "model.language_model."
 SHARD_ROWS = 2_500_012
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+
+
+def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
+    manifest = load_set(a.windows, "qwen4")
+    identity = verify_snapshot(manifest, a.snapshot)
+    if PREFIX + "norm.weight" in dense:
+        raise ValueError("unexpected final norm: model feeds stream mixer into lm_head")
+    started, times, rows, states = time.time(), [], [], []
+    with torch.inference_mode():
+        embed_weight = dense.get(PREFIX + "embed_tokens.weight")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], device="cuda")
+            states.append(torch.nn.functional.embedding(ids, embed_weight).repeat(1, 1, config.hc_count).cpu())
+        del embed_weight, ids
+        rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
+        for layer_id in range(config.num_hidden_layers):
+            start = time.time()
+            kind = config.layer_types[layer_id]
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.Qwen4ExpTextDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            skip = {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                table_rows, dim = emb.ngram_embedding.num_embeddings, emb.ngram_embedding.embedding_dim
+                if table_rows != 128 * SHARD_ROWS:
+                    raise ValueError("unexpected n-gram table shape")
+                emb.ngram_embedding = torch.nn.Identity()
+            layer = layer.to_empty(device="cuda")
+            if layer.ple is not None:
+                prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
+                layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, prefix, table_rows, dim)
+            load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
+            load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size, emb.ple_layer_index, emb.seed)
+                if not (torch.equal(emb.layer_multipliers.cpu(), expected)
+                        and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
+                        and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
+                    raise ValueError("checkpoint n-gram hash buffers differ from module")
+            for i, w in enumerate(manifest["windows"]):
+                h = states[i].cuda()
+                ids = torch.tensor([w["tokens"]], device="cuda")
+                t = len(w["tokens"])
+                positions = torch.arange(t, device="cuda").view(1, 1, -1).expand(4, 1, -1)
+                # Masks/rotary depend on shape, not on the embedding values; one
+                # hidden-width view matches the original embedding's geometry.
+                embed_shape = h[..., :config.hidden_size]
+                causal = create_causal_mask(config=config, inputs_embeds=embed_shape, attention_mask=None,
+                    past_key_values=None, position_ids=positions[0], allow_is_causal_skip=False)
+                position_embeddings = rotary(embed_shape, positions[1:])
+                h = layer(h, position_embeddings=position_embeddings, attention_mask=causal, conv_mask=None,
+                          past_key_values=None, ple_input_ids=ids)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+                states[i] = h.cpu()
+                del h, ids, positions, embed_shape, causal, position_embeddings
+            del layer
+            torch.cuda.empty_cache()
+            times.append(time.time() - start)
+            print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            mixer = ref.Qwen4ExpTextGatedResidual(config, use_combine=False)
+        torch.set_default_dtype(torch.float32)
+        mixer = mixer.to_empty(device="cuda")
+        load_module(mixer, dense, PREFIX + "hyper_connection_mixer.", set())
+        head = dense.get("lm_head.weight").float()
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            logits = mixer(h)[0].float() @ head.T
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        experts_snapshot=str(a.experts_snapshot or a.snapshot),
+        reference="transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
+
 
 class Weights:
     def __init__(self, snapshot: Path):
@@ -166,6 +252,7 @@ def main() -> None:
     p.add_argument("--experts-snapshot", type=Path,
                    help="routed experts (FP8 per-expert or BF16 fused; not EXL3); default --snapshot")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
@@ -185,6 +272,14 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
+    if a.windows:
+        if a.text or a.text_file or a.max_tokens or a.stop_after is not None:
+            p.error("--windows cannot be combined with legacy text/truncation/stop options")
+        a.out.mkdir(parents=True, exist_ok=True)
+        dense = Weights(a.snapshot)
+        experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
+        run_windows(a, config, ref, dense, experts_src, create_causal_mask)
+        return
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     if a.max_tokens:

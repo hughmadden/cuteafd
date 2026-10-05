@@ -17,6 +17,105 @@ import json
 import pathlib
 
 import numpy as np
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "python/reference"))
+from fidelity_windows import canonical, load_set
+
+
+def convert_windows(args) -> None:
+    manifest = load_set(args.windows)
+    meta = json.loads((args.golden / "meta.json").read_text())
+    if (meta.get("set_sha256") != manifest["set_sha256"] or meta.get("checkpoint") != manifest["checkpoint"]
+            or meta.get("family") != manifest["family"]):
+        raise ValueError("golden/set checkpoint or set hash mismatch")
+    entries = {entry["id"]: entry for entry in meta["windows"]}
+    if set(entries) != {w["id"] for w in manifest["windows"]}:
+        raise ValueError("golden must contain exactly the set's windows")
+    if not args.rows_dir:
+        raise ValueError("--rows-dir is required with --windows (full-vocabulary f16 rows)")
+    args.rows_dir.mkdir(parents=True, exist_ok=True)
+    windows, row_manifest, vocab = [], [], None
+    k = args.top_k if args.top_k is not None else 32
+    for w in manifest["windows"]:
+        entry = entries[w["id"]]
+        positions = list(range(w["score_from"], len(w["tokens"])))
+        if entry["positions"] != positions:
+            raise ValueError("golden positions differ from the pinned set")
+        folder = (args.golden / entry["path"]).resolve()
+        if not folder.is_relative_to(args.golden.resolve()):
+            raise ValueError("golden path escapes its directory")
+        pinned = np.fromfile(folder / "tokens.bin", dtype="<i4").tolist()
+        if pinned != w["tokens"]:
+            raise ValueError("golden tokens differ from the pinned set")
+        current_vocab = entry["vocab"]
+        if vocab is not None and current_vocab != vocab:
+            raise ValueError("mixed vocabularies in golden")
+        vocab = current_vocab
+        if not 1 <= k <= vocab:
+            raise ValueError("top-k must be in [1,vocab]")
+        logits = np.memmap(folder / "logits.bin", dtype="<f4", mode="r")
+        if logits.size != len(positions) * vocab:
+            raise ValueError("scored logits shape does not match metadata")
+        logits = logits.reshape(len(positions), vocab)
+        row_path = args.rows_dir / (w["id"] + ".bin")
+        compact = []
+        with row_path.open("wb") as full:
+            for row, pos in zip(logits, positions):
+                row = row.astype(np.float64)
+                if not np.isfinite(row).all():
+                    raise ValueError("non-finite golden logits")
+                logp = row - (row.max() + np.log(np.exp(row - row.max()).sum()))
+                logp.astype("<f2").tofile(full)
+                # Include the exact legacy ordering/rounding when logits are not tied.
+                # Boundary ties use the lower token id, independent of argpartition.
+                threshold = np.partition(row, vocab - k)[vocab - k]
+                better = np.flatnonzero(row > threshold)
+                ties = np.flatnonzero(row == threshold)[:k - len(better)]
+                order = np.concatenate((better, ties))
+                order = order[np.lexsort((order, -row[order]))]
+                mass = np.exp(logp[order]).sum()
+                nxt = w["tokens"][pos]
+                if nxt >= vocab:
+                    raise ValueError("next token outside golden vocabulary")
+                compact.append({"pos": pos, "next": nxt, "next_lp": round(float(logp[nxt]), 5),
+                    "top": [{"id": int(i), "lp": round(float(logp[i]), 5)} for i in order],
+                    "tail_lp": round(float(np.log(max(1.0 - mass, 1e-30))), 5)})
+        windows.append({**{key: w[key] for key in ("id", "block", "bucket", "tokens", "roles", "score_from")},
+                        "positions": compact, "top_k": k,
+                        "nll": round(-float(np.mean([r["next_lp"] for r in compact])), 6)})
+        row_manifest.append({"id": w["id"], "path": row_path.name,
+            "sha256": file_hash(row_path), "positions": positions, "shape": [len(positions), vocab]})
+    reference = {"schema": "cuteafd.fidelity.reference/2", "name": args.name or args.model[0],
+        "models": args.model, "model": manifest["model"], "family": manifest["family"],
+        "checkpoint": manifest["checkpoint"], "set_sha256": manifest["set_sha256"], "vocab": vocab,
+        "tokenizer_sha256": manifest.get("tokenizer_sha256"), "generation_arm": manifest["generation_arm"],
+        "generation_server": manifest.get("generation_server", {}), "set_version": manifest.get("version"),
+        "source": {"golden": args.golden.name, "snapshot": meta.get("snapshot"),
+                   "reference": meta.get("reference"), "experts_snapshot": meta.get("experts_snapshot"),
+                   "snapshot_identity": meta.get("snapshot_identity")},
+        "expect": {"kl_max": args.kl_max if args.kl_max is not None else 0.06,
+                   "top1_min": args.top1_min if args.top1_min is not None else 0.90},
+        "quick_windows": manifest["quick_windows"], "windows": windows}
+    rows = {"schema": "cuteafd.fidelity.rows/1", "family": manifest["family"],
+            "checkpoint": manifest["checkpoint"], "set_sha256": manifest["set_sha256"],
+            "vocab": vocab, "dtype": "<f2", "kind": "log_softmax", "windows": row_manifest}
+    (args.rows_dir / "rows.json").write_bytes(canonical(rows) + b"\n")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_bytes(canonical(reference) + b"\n")
+    if args.quick_out:
+        quick = {**reference, "windows": [w for w in windows if w["id"] in manifest["quick_windows"]]}
+        args.quick_out.parent.mkdir(parents=True, exist_ok=True)
+        args.quick_out.write_bytes(canonical(quick) + b"\n")
+    print(f"{args.out}: {len(windows)} windows, {sum(len(w['positions']) for w in windows)} positions, top-{k}")
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for data in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(data)
+    return digest.hexdigest()
 
 
 def main() -> None:
@@ -28,10 +127,19 @@ def main() -> None:
     parser.add_argument("--name", help="display name (default: the first pattern)")
     parser.add_argument("--positions", type=int, default=512, help="scored positions from --from")
     parser.add_argument("--from", dest="start", type=int, default=1)
-    parser.add_argument("--top-k", type=int, default=12)
-    parser.add_argument("--kl-max", type=float, default=0.15)
-    parser.add_argument("--top1-min", type=float, default=0.80)
+    parser.add_argument("--top-k", type=int, help="default: 12 legacy, 32 schema 2")
+    parser.add_argument("--kl-max", type=float)
+    parser.add_argument("--top1-min", type=float)
+    parser.add_argument("--windows", type=pathlib.Path, help="pinned fidelity set manifest (schema 2 output)")
+    parser.add_argument("--rows-dir", type=pathlib.Path, help="full f16 log-softmax row directory, e.g. on sparknest")
+    parser.add_argument("--quick-out", type=pathlib.Path, help="optional compact quick-subset reference")
     args = parser.parse_args()
+    if args.windows:
+        convert_windows(args)
+        return
+    args.top_k = args.top_k if args.top_k is not None else 12
+    args.kl_max = args.kl_max if args.kl_max is not None else 0.15
+    args.top1_min = args.top1_min if args.top1_min is not None else 0.80
 
     meta = json.loads((args.golden / "meta.json").read_text())
     tokens = np.fromfile(args.golden / "tokens.bin", dtype=np.int32)

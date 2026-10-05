@@ -51,6 +51,63 @@ from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mimo_v2.golden import masks  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from fidelity_windows import load_set, write_scored_logits, finish_golden, verify_snapshot
+
+
+def run_windows(a, config, Layer, Rotary, Norm, weights):
+    manifest = load_set(a.windows, "mimo_v2")
+    identity = verify_snapshot(manifest, a.snapshot)
+    started, rows, times = time.time(), [], []
+    states = []
+    with torch.inference_mode():
+        embed = weights.get("model.embed_tokens.weight")
+        for w in manifest["windows"]:
+            ids = torch.tensor([w["tokens"]], device="cuda")
+            states.append(torch.nn.functional.embedding(ids, embed).cpu())
+        del embed, ids
+        for layer_id in range(config.num_hidden_layers):
+            start = time.time()
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = Layer(config, layer_id, attention_projection_layout=config.attention_projection_layout)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda").eval()
+            gate = getattr(layer.mlp, "gate", None)
+            if gate is not None:
+                gate.e_score_correction_bias.data = gate.e_score_correction_bias.data.float()
+            load_layer(layer, weights, f"model.layers.{layer_id}.", layer_id)
+            kind = layer.attention_type
+            rotary = Rotary(config=config, is_swa=kind == "sliding_window_attention").cuda()
+            for i, w in enumerate(manifest["windows"]):
+                h = states[i].cuda()
+                positions = torch.arange(len(w["tokens"]), device="cuda")[None]
+                mask = masks(len(w["tokens"]), config.sliding_window)
+                selected_mask = mask["sliding_attention" if kind == "sliding_window_attention" else "full_attention"]
+                h = layer(h, attention_mask=selected_mask, position_ids=positions,
+                          position_embeddings=rotary(h, positions))
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+                states[i] = h.cpu()
+                del h, mask, selected_mask, positions
+            del layer, rotary
+            torch.cuda.empty_cache()
+            times.append(time.time() - start)
+            print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+        norm = Norm(config.hidden_size, eps=config.layernorm_epsilon).cuda().to(torch.bfloat16)
+        norm.weight.copy_(weights.get("model.norm.weight"))
+        head = weights.get("lm_head.weight").float()
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            logits = norm(h).float()[0] @ head.T
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        reference="snapshot modeling_mimo_v2.py (trust_remote_code, eager); qkv de-interleaved from TP8 shards; MXFP4 experts widened exactly",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity)
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -138,6 +195,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
     p.add_argument("--max-tokens", type=int, help="keep the first N tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
@@ -156,6 +214,13 @@ def main() -> None:
     config._attn_implementation = "eager"
     cls = lambda name: get_class_from_dynamic_module(f"modeling_mimo_v2.{name}", str(a.snapshot))  # noqa: E731
     Layer, Rotary, Norm = cls("MiMoV2DecoderLayer"), cls("MiMoV2RotaryEmbedding"), cls("MiMoV2RMSNorm")
+    if a.windows:
+        if a.text or a.text_file or a.max_tokens or a.stop_after is not None:
+            p.error("--windows cannot be combined with legacy text/truncation/stop options")
+        weights = Weights(a.snapshot, config)
+        a.out.mkdir(parents=True, exist_ok=True)
+        run_windows(a, config, Layer, Rotary, Norm, weights)
+        return
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     tokens = tokens[:a.max_tokens] if a.max_tokens else tokens

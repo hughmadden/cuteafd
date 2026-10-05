@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Pin the deterministic 64-window fidelity recipe using a checkpoint-precision arm.
+
+Requires the authenticated POST /v1/bench/probe endpoint. No external teachers,
+local assistant transcripts, or benchmark answers are read. Generation provenance
+is an explicit --arm-manifest (checkpoint, head='bf16', activations/kv/state
+='bf16' or 'family_native' or 'checkpoint', speculation=false, prefix_cache=false).
+This is attestation, not hardware validation; fixed family-native formats stay native.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import pathlib
+import sys
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "python/reference"))
+from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
+
+LEGACY = {"deepseek_v41": "deepseek-v4.1-flash", "mimo_v2": "mimo-v2.6-pro", "qwen4": "qwen3.8-flash-next"}
+REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
+              "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
+              "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
+              "rust/crates/cuteafd-bench/src/panels/agentic.rs", "rust/crates/cuteafd-bench/src/panels/quality.rs",
+              "rust/crates/cuteafd-daemon/src/shared/probe.rs", "native/shared/cuda/norm.cu"]
+ADDED_TASKS = [
+    "Add a focused regression test documenting the tie-breaking rule for negative half-cent scaling; use the tools to inspect and edit the fixture.",
+    "Add a CSV regression test for an escaped quote in a description, and confirm the parser handles the case.",
+    "Inspect the exchange-rate cache and add tests documenting behavior exactly at the expiry boundary.",
+    "Add tests for leap-year February and a December-to-January month transition in the fixture date helpers.",
+    "Use the fixture tools to explain how money arithmetic and reporting interact; identify one small safe improvement and test it.",
+    "Inspect all fixture importers and propose a minimal patch preserving quoted fields; add tests and run the suite.",
+]
+MATH = ["Explain and prove why binary search terminates, including the integer boundary cases.",
+        "Derive the variance of a paired difference of two Bernoulli outcomes.",
+        "Prove an amortized bound for a dynamic array that doubles capacity.",
+        "Explain the log-sum-exp identity and derive its numerically stable implementation."]
+STRUCTURED = ["Invent a fictional person and describe them.",
+              "Create an example e-commerce order with several line items.",
+              "Classify this support message: 'My invoice shows a double charge for March and I need a refund before Friday.' Give category, priority, a summary and follow-up actions."]
+
+
+def load_agentic():
+    spec = importlib.util.spec_from_file_location("fidelity_agentic", ROOT / "scripts/bench/bench-agentic-session.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class BucketMismatch(ValueError):
+    pass
+
+
+class ProbeClient:
+    def __init__(self, base: str, token: str | None, timeout: float):
+        self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", token, timeout
+
+    def __call__(self, body: dict) -> dict:
+        spec = {"cold": True, "no_speculation": True, "record_rows": 0, "top_k": 1}
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["x-cuteafd-bench"] = self.token
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(self.url, canonical({"body": body, "spec": spec}), headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            chat = json.load(response)
+        record = chat.get("probe")
+        if not record or record.get("error") or not record.get("engine"):
+            raise ValueError("server did not honor the generation probe")
+        if not record.get("cold") or not record.get("no_speculation") or record.get("cached_tokens", 0):
+            raise ValueError("generation must be cold, speculation-free")
+        if not record.get("prompt_ids") or not record.get("generated"):
+            raise ValueError("probe must return prompt_ids and generated token IDs")
+        return chat
+
+
+def arm_policy(arm: dict, checkpoint: str) -> None:
+    if arm.get("checkpoint") != checkpoint:
+        raise ValueError("arm checkpoint differs from requested checkpoint")
+    if arm.get("head") != "bf16" or any(arm.get(k) not in ("bf16", "family_native", "checkpoint") for k in ("activations", "kv", "state")):
+        raise ValueError("generation arm requires a BF16 head and checkpoint-precision/native activations/kv/state")
+    if arm.get("speculation") is not False or arm.get("prefix_cache") is not False:
+        raise ValueError("generation arm must disable speculation and prefix cache")
+
+
+def source(root: pathlib.Path, path: str) -> dict:
+    resolved = (root / path).resolve()
+    if pathlib.Path(path).is_absolute() or not resolved.is_relative_to(root.resolve()):
+        raise ValueError("source paths must stay inside the repository")
+    data = resolved.read_bytes()
+    return {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
+              tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
+              files: list[str] | None = None) -> dict:
+    arm_policy(arm, checkpoint)
+    agentic = load_agentic()
+    files = files or REPO_FILES
+    sources = [source(root, path) for path in files]
+    corpus = "\n\n".join(f"File: {path}\n{(root / path).read_text()}" for path in files)
+    corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids
+    if len(corpus_ids) < 4096:
+        raise ValueError("repository source list needs at least 4096 tokens")
+    legacy_path = root / "rust/crates/cuteafd-bench/references" / (LEGACY[family] + ".json")
+    legacy = json.loads(legacy_path.read_text())
+    end = legacy["score_from"] + 512
+    if len(legacy["tokens"]) < end:
+        raise ValueError("legacy reference has fewer than 512 positions")
+    windows = [{"id": "legacy", "block": "E", "bucket": bucket(legacy["score_from"]),
+                "tokens": legacy["tokens"][:end], "roles": ["ctx"] * end,
+                "score_from": legacy["score_from"], "provenance": source(root, str(legacy_path.relative_to(root)))}]
+    snapshots = []
+    for recording in recordings or []:
+        if recording.get("model") != model or recording.get("mode") != "record":
+            raise ValueError("recordings must be our record runner's output for the selected model")
+        for session in recording["sessions"]:
+            for turn in session["turns"]:
+                snapshots.append((session["messages"][:turn["messages"]], recording.get("tools", agentic.TOOLS)))
+
+    def generate(name, block, messages, target, tools=None, extra=None):
+        # Size by rendered IDs, never truncate a chat template or original history.
+        base = copy.deepcopy(messages)
+        base.insert(0, {"role": "system", "content": f"Fidelity fixture {name}; think carefully and use the repository tools when appropriate."})
+        count = max(0, target * 3 - len(canonical(base)))
+        for attempt in range(8):
+            body = {"model": model, "messages": copy.deepcopy(base), "temperature": 0,
+                    "seed": 0, "max_tokens": 1, "reasoning_effort": "high", "stream": False}
+            if count:
+                body["messages"].insert(0, {"role": "system", "content": "Repository context:\n" + (corpus * (count // len(corpus) + 1))[:count]})
+            if tools:
+                body.update(tools=tools, tool_choice="auto")
+            body.update(extra or {})
+            sample = probe(body)
+            n = len(sample["probe"]["prompt_ids"])
+            if target <= n < target + 384:
+                break
+            if not count and n >= target:
+                if n + 1024 > MAX_TOKENS:
+                    raise ValueError(f"{name}: original history exceeds 16K cap")
+                break
+            count = max(0, count + (target + 96 - n) * 3)
+        else:
+            raise ValueError(f"{name}: could not size rendered prompt to target {target}")
+        if n + 1024 > MAX_TOKENS:
+            raise ValueError(f"{name}: rendered prompt plus generation exceeds 16K cap")
+        body["max_tokens"] = 1024
+        chat = probe(body)
+        server = chat.get("server", {})
+        if server.get("model", checkpoint) != checkpoint or server.get("family", family) != family:
+            raise ValueError("probe server checkpoint/family differs from generation manifest")
+        settings = server.get("settings", [])
+        if family == "deepseek_v41" and isinstance(settings, list):
+            for setting in settings:
+                if setting.get("name") == "CUTEAFD_V41_FP8_HEAD" and str(setting.get("value")).lower() not in ("off", "false", "0", "none", "bf16"):
+                    raise ValueError("server reports an enabled FP8 head, not the checkpoint-precision arm")
+        prompt, generated = chat["probe"]["prompt_ids"], chat["probe"]["generated"]
+        if prompt != sample["probe"]["prompt_ids"] or len(generated) > 1024:
+            raise ValueError("unstable prompt rendering or max_tokens was not honored")
+        tokens = prompt + generated
+        roles = ["ctx"] * len(prompt) + ["gen"] * len(generated)
+        start = len(prompt) + max(0, len(generated) - 512)
+        # Short turns remain short: trailing human code supplies ctx rows, not
+        # fabricated assistant output. These rows never carry the gen bar.
+        padding = max(0, 512 - len(generated))
+        tokens += corpus_ids[:padding]
+        roles += ["ctx"] * padding
+        expected_bucket = "0-2K" if target < 2048 else "2-8K" if target < 8192 else "8-16K"
+        if block in ("A", "B") and bucket(start) != expected_bucket:
+            raise BucketMismatch(f"{name}: history lands in {bucket(start)}, expected {expected_bucket}; supply a shorter recording/history")
+        windows.append({"id": name, "block": block, "bucket": bucket(start),
+                        "tokens": tokens, "roles": roles, "score_from": start,
+                        "provenance": {"prompt_sha256": hashlib.sha256(canonical(body)).hexdigest(),
+                                       "engine": chat["probe"]["engine"], "server": server,
+                                       "generated_tokens": len(generated),
+                                       "trailing_ctx": padding}})
+        return chat
+
+    def fresh_task(i):
+        workspace = agentic.Workspace()
+        tasks = [task["prompt"] for task in agentic.TASKS] + ADDED_TASKS
+        if i < 8:
+            # Tool schemas also consume tokens: the short stratum uses the same
+            # fixture instructions and tree, without the bundled README/docs.
+            system = agentic.SYSTEM_TEMPLATE.split("Repository layout:")[0].format(nonce="fidelity")
+            system += "Repository layout:\n" + agentic.tree(workspace.files)
+        else:
+            system = agentic.system_prompt(workspace.files)
+        return workspace, [{"role": "system", "content": system},
+                           {"role": "user", "content": tasks[i % len(tasks)]}]
+
+    workspace, messages = None, None
+    for i in range(26):
+        if snapshots:
+            messages, tools = snapshots[i % len(snapshots)]
+        else:
+            if messages is None:
+                workspace, messages = fresh_task(i)
+            tools = agentic.TOOLS
+        target = 1024 if i < 8 else 4096 if i < 20 else 10240
+        try:
+            chat = generate(f"a{i:02d}", "A", messages, target, tools)
+        except BucketMismatch:
+            if snapshots:
+                raise
+            # A growing tool history can leave the scheduled length stratum.
+            # Start the next deterministic fixture task instead of truncating it.
+            workspace, messages = fresh_task(i)
+            chat = generate(f"a{i:02d}", "A", messages, target, tools)
+        if not snapshots:
+            calls = chat.get("tool_calls", [])
+            assistant = {"role": "assistant", "content": chat.get("content", ""),
+                         "reasoning_content": chat.get("reasoning", "")}
+            if calls:
+                assistant["tool_calls"] = calls
+                messages.append(assistant)
+                for call in calls:
+                    output, error = workspace.execute(call["function"]["name"], call["function"]["arguments"])
+                    if error:
+                        raise ValueError(f"fixture tool call failed: {error}")
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+            else:
+                messages = None
+    for i in range(12):
+        generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
+    for i in range(10):
+        ids = tokenizer.encode((root / files[i % len(files)]).read_text(), add_special_tokens=False).ids
+        if len(ids) < 1024:
+            raise ValueError(f"{files[i % len(files)]}: plain code needs >=1024 tokens; choose a longer file")
+        start = min(len(ids) - 512, 512 + (i % 4) * 512)
+        tokens = ids[:start + 512]
+        windows.append({"id": f"c{i:02d}", "block": "C", "bucket": bucket(start), "tokens": tokens,
+                        "roles": ["ctx"] * len(tokens), "score_from": start, "provenance": sources[i % len(files)]})
+    for i in range(6):
+        prompt = STRUCTURED[i] + " Reply in JSON." if i < 3 else "Select and call the correct tool to read, search or edit the fixture repository. " + agentic.TASKS[(i - 3) % len(agentic.TASKS)]["prompt"]
+        generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], 1024 + (i % 3) * 512,
+                 agentic.TOOLS if i >= 3 else None,
+                 {"response_format": {"type": "json_object"}} if i < 3 else None)
+    for i, prompt in enumerate(MATH + [f"Explain the repository design in {files[j]} in detail." for j in range(5)]):
+        generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], 768 + (i % 3) * 512)
+    quick = ["legacy", "a00", "a04", "a08", "a12", "a20", "a24", "b00", "b08", "c00", "d00", "e00"]
+    servers = [w["provenance"]["server"] for w in windows if "server" in w["provenance"]]
+    if servers and any(server != servers[0] for server in servers):
+        raise ValueError("server identity/settings changed during set generation")
+    manifest = {"schema": SET_SCHEMA, "family": family, "model": model, "checkpoint": checkpoint,
+                "version": version, "quick_windows": quick, "generation_arm": arm,
+                "generation_server": servers[0] if servers else {}, "precision_policy": "attested; recognized server head setting cross-checked if present",
+                "builder_sha256": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+                "sources": sources + [source(root, "scripts/bench/bench-agentic-session.py"),
+                    source(root, "rust/crates/cuteafd-bench/src/panels/quality.rs")],
+                "recording_sha256": [hashlib.sha256(canonical(r)).hexdigest() for r in recordings or []],
+                "recipe": {"windows": 64, "positions_per_window": 512, "max_tokens": 1024,
+                    "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
+                    "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
+                    "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+    manifest["set_sha256"] = set_hash(manifest)
+    validate_set(manifest)
+    return manifest
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--family", required=True, choices=LEGACY)
+    p.add_argument("--version", required=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--tokenizer", required=True, type=pathlib.Path)
+    p.add_argument("--arm-manifest", required=True, type=pathlib.Path)
+    p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
+    p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
+    p.add_argument("--base-url", default="http://127.0.0.1:8000")
+    p.add_argument("--bench-token")
+    p.add_argument("--timeout", type=float, default=1800)
+    p.add_argument("--out", type=pathlib.Path)
+    a = p.parse_args(argv)
+    if not a.version or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in a.version):
+        p.error("version must be a safe directory name")
+    if a.file_list:
+        import subprocess
+        files = json.loads(a.file_list.read_text())
+        tracked = set(subprocess.check_output(["git", "-C", str(ROOT), "ls-files"], text=True).splitlines())
+        if any(path not in tracked or pathlib.Path(path).suffix not in (".rs", ".py", ".cu", ".cuh") for path in files):
+            p.error("--file-list may contain only tracked first-party Rust, Python or CUDA files")
+        if any(path.startswith("third_party/") for path in files):
+            p.error("third-party sources are not part of the fidelity recipe")
+    from tokenizers import Tokenizer
+    manifest = build_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
+        arm=json.loads(a.arm_manifest.read_text()), tokenizer=Tokenizer.from_file(str(a.tokenizer)),
+        probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
+        recordings=[json.loads(path.read_text()) for path in a.recording],
+        files=json.loads(a.file_list.read_text()) if a.file_list else None)
+    manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
+    manifest["set_sha256"] = set_hash(manifest)
+    out = a.out or ROOT / "set" / a.family / a.version / "windows.json"
+    if out.exists():
+        p.error("set versions are immutable; choose a new --version/output")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(canonical(manifest) + b"\n")
+    print(f"{out}: 64 windows, 32768 rows, sha256 {manifest['set_sha256']}")
+
+
+if __name__ == "__main__":
+    main()
