@@ -524,7 +524,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let mut placement = admitted.placement;
                 let mut state = (&mut placement, transport.as_deref_mut());
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, &mut state,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), &mut state,
                     |(placement, transport), chunk, _| engine.prefill_device(placement, chunk,
                         transport.as_deref_mut().map(|t| (t, runtime))),
                     |(placement, transport), chunk| engine.verify_device(&mut [(&mut **placement, chunk.len())], chunk,

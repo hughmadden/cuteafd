@@ -76,12 +76,29 @@ pub(crate) fn host_row(probe: &ProbeRef, position: usize, logits: &[f32]) {
 pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &DeviceLogits, first: usize, n: usize,
     position: usize) -> Result<()> {
     let Some(probe) = probe else { return Ok(()) };
+    anyhow::ensure!(logits.vocab > 0 && logits.stride >= logits.vocab, "invalid scoring vocabulary/stride");
+    anyhow::ensure!(first.checked_add(n).is_some_and(|end| end <= logits.rows),
+        "scoring needs {n} logits rows at {first}, got {}", logits.rows);
     let host = logits.to_host(library)?;
     for j in 0..n {
         let row = &host[(first + j) * logits.vocab..][..logits.vocab];
         probe.row(position + j, row);
     }
     Ok(())
+}
+
+pub(crate) fn verify_rows(probe: &ProbeRef) -> Option<usize> {
+    probe.as_ref().and_then(|p| p.spec.verify_rows)
+}
+
+/// Keep the family's existing scoring width unless explicitly overridden.
+/// Reject unsupported widths before prefill or any device work is queued.
+fn scoring_width(capacity: usize, requested: Option<usize>) -> Result<usize> {
+    anyhow::ensure!(capacity > 0, "scoring verify capacity must be positive");
+    let rows = requested.unwrap_or(capacity);
+    anyhow::ensure!((1..=capacity).contains(&rows),
+        "unsupported probe verify_rows={rows}; family supports 1..={capacity}");
+    Ok(rows)
 }
 
 /// A teacher-forced scoring pass over `tokens` from `from` (clamped to
@@ -91,9 +108,11 @@ pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &De
 /// Returns the number of rows scored.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32], from: usize, prefill_rows: usize,
-    verify_rows: usize, state: &mut S, mut prefill: impl FnMut(&mut S, &[u32], bool) -> Result<Option<DeviceLogits>>,
+    verify_capacity: usize, requested_verify_rows: Option<usize>, state: &mut S,
+    mut prefill: impl FnMut(&mut S, &[u32], bool) -> Result<Option<DeviceLogits>>,
     mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
     anyhow::ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
+    let verify_rows = scoring_width(verify_capacity, requested_verify_rows)?;
     let from = from.clamp(1, tokens.len() - 1);
     let mut done = 0;
     let mut scored = 0;
@@ -102,6 +121,7 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
         let logits = prefill(state, &tokens[done..end], end == from)?;
         if end == from {
             let logits = logits.ok_or_else(|| anyhow::anyhow!("scoring prefill produced no logits"))?;
+            anyhow::ensure!(logits.rows > 0, "scoring prefill produced empty logits");
             device_rows(library, probe, &logits, logits.rows - 1, 1, from)?;
             scored += 1;
         }
@@ -117,4 +137,26 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
         p = end;
     }
     Ok(scored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_api::openai::probe::ProbeSpec;
+
+    #[test]
+    fn scoring_width_defaults_and_override_bounds() {
+        for capacity in [1, 8, 48] {
+            assert_eq!(scoring_width(capacity, None).unwrap(), capacity);
+            assert_eq!(scoring_width(capacity, Some(1)).unwrap(), 1);
+            assert_eq!(scoring_width(capacity, Some(capacity)).unwrap(), capacity);
+            assert!(scoring_width(capacity, Some(0)).is_err());
+            assert!(scoring_width(capacity, Some(capacity + 1)).is_err());
+            assert!(scoring_width(capacity, Some(usize::MAX)).is_err());
+        }
+        assert!(scoring_width(0, None).is_err());
+        assert_eq!(verify_rows(&None), None);
+        let probe = Some(Probe::new(ProbeSpec { verify_rows: Some(5), ..ProbeSpec::default() }));
+        assert_eq!(verify_rows(&probe), Some(5));
+    }
 }

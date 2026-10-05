@@ -520,7 +520,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             }));
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
-                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows, DECODE_ROWS,
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows, DECODE_ROWS, probe::verify_rows(&job.probe),
                     &mut placement,
                     |placement, chunk, logit| engine.prefill_device(placement, chunk, None, None, usize::from(logit)),
                     |placement, chunk| engine.verify_device(&mut [(placement, chunk)], false)?

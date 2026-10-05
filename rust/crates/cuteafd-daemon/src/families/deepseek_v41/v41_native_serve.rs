@@ -768,6 +768,8 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
+    ensure!(probe.spec.verify_rows.is_none(),
+        "unsupported probe verify_rows for deepseek_v41: scoring currently uses prefill-shaped chunks, not decode-shaped verify");
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     let from = from.clamp(1, tokens.len() - 1);
     let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, lease, &tokens[..from],

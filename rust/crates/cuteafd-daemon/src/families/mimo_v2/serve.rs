@@ -500,7 +500,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, &mut placement,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), &mut placement,
                     |placement, chunk, _| engine.prefill_device(placement, chunk, false, None, None),
                     |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, None)?
                         .context("scoring needs every layer"));

@@ -577,7 +577,7 @@ fn schedule(
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows,
+                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe),
                     &mut (&mut placement, &mut *transports),
                     |(placement, transports), chunk, logit| engine.prefill_device(placement, chunk, transports, runtime,
                         usize::from(logit)),
