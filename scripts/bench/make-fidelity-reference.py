@@ -135,9 +135,12 @@ def main() -> None:
     parser.add_argument("--kl-max", type=float)
     parser.add_argument("--top1-min", type=float)
     parser.add_argument("--windows", type=pathlib.Path, help="pinned fidelity set manifest (schema 2 output)")
+    parser.add_argument("--legacy-window", help="emit schema 1 from one qualified scored-row window, e.g. legacy")
     parser.add_argument("--rows-dir", type=pathlib.Path, help="full f16 log-softmax row directory, e.g. on sparknest")
     parser.add_argument("--quick-out", type=pathlib.Path, help="optional compact quick-subset reference")
     args = parser.parse_args()
+    if args.windows and args.legacy_window:
+        parser.error("--windows and --legacy-window select different output schemas")
     if args.windows:
         convert_windows(args)
         return
@@ -146,13 +149,46 @@ def main() -> None:
     args.top1_min = args.top1_min if args.top1_min is not None else 0.80
 
     meta = json.loads((args.golden / "meta.json").read_text())
-    tokens = np.fromfile(args.golden / "tokens.bin", dtype=np.int32)
-    t = len(tokens)
-    logits = np.memmap(args.golden / "logits.bin", dtype=np.float32, mode="r")
-    vocab = logits.size // t
-    assert vocab * t == logits.size, "logits.bin is not [T, vocab]"
-    logits = logits.reshape(t, vocab)
-    end = min(t, args.start + args.positions)
+    if args.legacy_window:
+        manifest = load_set(args.golden / "windows.json")
+        if (meta.get("set_sha256") != manifest["set_sha256"] or meta.get("checkpoint") != manifest["checkpoint"]
+                or meta.get("family") != manifest["family"]):
+            raise ValueError("golden/set checkpoint or set hash mismatch")
+        validate_qualification(meta.get("prefix_qualification"), manifest, meta.get("snapshot_identity"))
+        windows = [w for w in manifest["windows"] if w["id"] == args.legacy_window]
+        entries = [w for w in meta["windows"] if w["id"] == args.legacy_window]
+        if len(windows) != 1 or len(entries) != 1:
+            raise ValueError("expected exactly one selected legacy window")
+        window, entry = windows[0], entries[0]
+        args.start = window["score_from"]
+        positions = list(range(args.start, len(window["tokens"])))
+        if entry["positions"] != positions:
+            raise ValueError("golden positions differ from the pinned set")
+        folder = (args.golden / entry["path"]).resolve()
+        if not folder.is_relative_to(args.golden.resolve()):
+            raise ValueError("golden path escapes its directory")
+        tokens = np.fromfile(folder / "tokens.bin", dtype="<i4")
+        if tokens.tolist() != window["tokens"]:
+            raise ValueError("golden tokens differ from the pinned set")
+        vocab = entry["vocab"]
+        if vocab != meta["prefix_qualification"]["vocab"]:
+            raise ValueError("prefix qualification vocabulary differs from golden")
+        logits = np.memmap(folder / "logits.bin", dtype="<f4", mode="r")
+        if logits.size != len(positions) * vocab:
+            raise ValueError("scored logits shape does not match metadata")
+        logits = logits.reshape(len(positions), vocab)
+        row_offset = args.start
+    else:
+        tokens = np.fromfile(args.golden / "tokens.bin", dtype=np.int32)
+        t = len(tokens)
+        logits = np.memmap(args.golden / "logits.bin", dtype=np.float32, mode="r")
+        vocab = logits.size // t
+        assert vocab * t == logits.size, "logits.bin is not [T, vocab]"
+        logits = logits.reshape(t, vocab)
+        row_offset = 1
+    if not 1 <= args.top_k < vocab or args.positions < 1:
+        raise ValueError("invalid top-k or number of positions")
+    end = min(len(tokens), args.start + args.positions)
     snapshot = pathlib.Path(meta.get("snapshot", ""))
     # Goldens run in containers that mount the hub at /root/.cache/huggingface/hub.
     container_hub = pathlib.Path("/root/.cache/huggingface/hub")
@@ -161,12 +197,20 @@ def main() -> None:
     tokenizer = local / "tokenizer.json"
     ids, lps, tail, nxt = [], [], [], []
     for p in range(args.start, end):
-        # Row p - 1 predicts token p.
-        row = logits[p - 1].astype(np.float64)
+        # Panel goldens store only selected prediction rows, unlike old full-T goldens.
+        row = logits[p - row_offset].astype(np.float64)
+        if not np.isfinite(row).all() or not 0 <= tokens[p] < vocab:
+            raise ValueError("non-finite logits or next token outside golden vocabulary")
         top = row.max()
         lse = top + np.log(np.exp(row - top).sum())
         logp = row - lse
-        order = np.argpartition(-row, args.top_k)[: args.top_k]
+        if args.legacy_window:
+            threshold = np.partition(row, vocab - args.top_k)[vocab - args.top_k]
+            better = np.flatnonzero(row > threshold)
+            ties = np.flatnonzero(row == threshold)[:args.top_k - len(better)]
+            order = np.concatenate((better, ties))
+        else:
+            order = np.argpartition(-row, args.top_k)[: args.top_k]
         order = order[np.lexsort((order, -row[order]))]
         mass = np.exp(logp[order]).sum()
         ids.append([int(i) for i in order])
@@ -195,6 +239,9 @@ def main() -> None:
         "nll": round(-float(np.mean(nxt)), 6),
         "expect": {"kl_max": args.kl_max, "top1_min": args.top1_min},
     }
+    if args.legacy_window:
+        reference["source"].update(window=args.legacy_window, set_sha256=manifest["set_sha256"],
+            snapshot_identity=meta["snapshot_identity"], prefix_qualification=meta["prefix_qualification"])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(reference, separators=(",", ":")) + "\n")
     print(f"{args.out}: {end - args.start} positions, top-{args.top_k}, ref NLL {reference['nll']:.4f}, "

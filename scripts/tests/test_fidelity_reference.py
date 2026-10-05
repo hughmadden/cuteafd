@@ -147,6 +147,54 @@ def test_legacy_output_is_byte_identical_to_base_script(tmp_path, monkeypatch):
     assert [p["next_lp"] for p in window["positions"]] == legacy["next_lp"]
 
 
+def test_qualified_scored_window_regenerates_schema1_without_fake_rows(tmp_path, monkeypatch):
+    manifest, golden, _ = fixture_golden(tmp_path)
+    args = options(tmp_path, golden)
+    converter.convert_windows(args)
+    window = json.loads(args.out.read_text())["windows"][0]
+    out = tmp_path / "qualified-legacy.json"
+    monkeypatch.setattr(sys, "argv", ["make", "--golden", str(golden), "--legacy-window", "legacy",
+        "--model", "test-model", "--out", str(out)])
+    converter.main()
+    legacy = json.loads(out.read_text())
+    assert legacy["schema"] == "cuteafd.bench.reference/1"
+    assert legacy["tokens"] == manifest["windows"][0]["tokens"]
+    assert legacy["score_from"] == 2
+    assert legacy["ids"] == [[t["id"] for t in p["top"]] for p in window["positions"]]
+    assert legacy["lps"] == [[t["lp"] for t in p["top"]] for p in window["positions"]]
+    assert legacy["tail_lp"] == [p["tail_lp"] for p in window["positions"]]
+    assert legacy["next_lp"] == [p["next_lp"] for p in window["positions"]]
+    assert legacy["source"]["prefix_qualification"]["set_sha256"] == manifest["set_sha256"]
+
+
+@pytest.mark.parametrize("change", ["proof", "positions", "tokens", "extent", "nonfinite", "duplicate", "path"])
+def test_qualified_legacy_conversion_fails_closed(tmp_path, monkeypatch, change):
+    _, golden, logits = fixture_golden(tmp_path)
+    meta = json.loads((golden / "meta.json").read_text())
+    if change == "proof":
+        meta["prefix_qualification"]["passed"] = False
+    elif change == "positions":
+        meta["windows"][0]["positions"] = [1, 2, 3]
+    elif change == "tokens":
+        np.array([1, 2, 7, 4, 5], dtype="<i4").tofile(golden / "windows/legacy/tokens.bin")
+    elif change == "extent":
+        logits[:2].tofile(golden / "windows/legacy/logits.bin")
+    elif change == "nonfinite":
+        logits[0, 0] = np.nan
+        logits.tofile(golden / "windows/legacy/logits.bin")
+    elif change == "duplicate":
+        meta["windows"].append(dict(meta["windows"][0]))
+    else:
+        meta["windows"][0]["path"] = "../escape"
+    (golden / "meta.json").write_text(json.dumps(meta))
+    out = tmp_path / "legacy.json"
+    monkeypatch.setattr(sys, "argv", ["make", "--golden", str(golden), "--legacy-window", "legacy",
+        "--model", "test-model", "--out", str(out)])
+    with pytest.raises(ValueError):
+        converter.main()
+    assert not out.exists()
+
+
 @pytest.mark.parametrize("mutation", ["length", "mask", "id", "bucket", "duplicate", "quick"])
 def test_window_contract_failures(mutation):
     m = tiny_set()
