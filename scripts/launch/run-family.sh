@@ -633,7 +633,9 @@ if [[ "$restart" == 1 ]]; then
   fi
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
+    # Workers are cuteafd-spark-expert-HOST-PORT; the persistent ./wip.sh container
+    # (cuteafd-spark-expert-wip) and its build cache stay.
+    ssh "$host" 'ids=$(docker ps -aq --filter "name=^cuteafd-spark-expert-.+-[0-9]+$"); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
   done
 fi
 # FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
