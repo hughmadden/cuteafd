@@ -85,7 +85,8 @@ manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
 (config / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
 # The per-config card is outside the sealed manifest; shared root files are untouched.
 readme = (SOURCE / 'README.md').read_text()
-start = readme.index('This is a numerical-fidelity panel')
+readme = readme.replace('Fidelity Draft', 'Fidelity Reference')
+start = readme.index('This is a numerical-fidelity panel') if 'This is a numerical-fidelity panel' in readme else readme.index('DRAFT:')
 end = readme.index('## Config')
 readme = readme[:start] + ('This is a qualified numerical-fidelity reference, not a training corpus or a general\n'
     'quality ranking. Both full scoring shapes preserve paired full-vocabulary versus\n'
@@ -94,8 +95,8 @@ readme = readme[:start] + ('This is a qualified numerical-fidelity reference, no
     'review and upload remain required; no publication revision is claimed.\n\n') + readme[end:]
 readme = readme.replace('`qualification.json` currently records preparation checks, not a paired PASS.',
                        '`qualification.json` records actual paired repeatability and compact/full equivalence evidence.')
-start = readme.index('The first checkpoint-precision baseline')
-end = readme.index('## Public-source and privacy policy')
+start = readme.index('The first checkpoint-precision baseline') if 'The first checkpoint-precision baseline' in readme else readme.index('## Pending Calibration')
+end = readme.index('## Public-source and privacy policy') if '## Public-source and privacy policy' in readme else readme.index('## Provenance And Privacy')
 body = ['Two default-precision baseline repeats completed for each full scoring shape, with',
         f"`FULL_PREFILL_LOGITS=on`; primary count is {report['shapes']['decode']['positions']:,}",
         'generated positions per run (see qualification.json for this config). Quick remains decode-only.', '',
