@@ -152,7 +152,7 @@ int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
 /* Replicated-group compact reduction: sum `ranks` BF16 [rows,5120] physical-rank
  * partial planes in rank order in FP32, add optional BF16 shared exactly once,
- * then round once to BF16. ranks must be 2, 3, 4 or 6. planes is a host array of
+ * then round once to BF16. ranks must be 1, 2, 3, 4 or 6. planes is a host array of
  * six device pointers: entries [0,ranks) must be non-null and aligned; entries
  * [ranks,6) must be null. No group-local reduction is performed: every physical
  * rank contributes one plane directly. Same alias/lifetime rules as the fixed

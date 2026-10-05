@@ -270,7 +270,7 @@ impl FamilyModel for QwenModel {
             return Some(ExpertContract {
                 package: "qwen4:exl3-k45".into(),
                 block: 128,
-                spark_worlds: exl3_spark_worlds(moe.intermediate),
+                spark_worlds: std::iter::once(1).chain(exl3_spark_worlds(moe.intermediate)).collect(),
                 local: Ok("serve-qwen4 --local-experts (TP1 EXL3 package)".into()),
             });
         }

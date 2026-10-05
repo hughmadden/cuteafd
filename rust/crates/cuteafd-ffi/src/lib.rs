@@ -28,6 +28,23 @@ pub use shared::v41_experts::{
 };
 mod cuda_runtime;
 pub mod memory_ledger;
+
+static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());
+
+/// Set once before coordinator startup. Worker processes never install this
+/// ceiling; zero/unset preserves physical CUDA admission with no extra queries.
+pub fn set_coordinator_gpu_budget(bytes: u64) -> Result<()> {
+    anyhow::ensure!(bytes > 0, "coordinator GPU budget must be positive");
+    COORDINATOR_GPU_BUDGET.compare_exchange(0, bytes, Ordering::Relaxed, Ordering::Relaxed)
+        .map_err(|_| anyhow::anyhow!("coordinator GPU budget is already installed"))?;
+    Ok(())
+}
+
+pub fn coordinator_gpu_budget() -> Option<cuteafd_core::serving_capacity::GpuMemoryBudget> {
+    let bytes = COORDINATOR_GPU_BUDGET.load(Ordering::Relaxed);
+    (bytes != 0).then_some(cuteafd_core::serving_capacity::GpuMemoryBudget(bytes))
+}
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -1683,14 +1700,56 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_free_host_buffer", status)
     }
 
-    /// Free and total bytes on the current CUDA device, including other processes.
-    pub fn cuda_memory_info(&self) -> Result<(usize, usize)> {
+    /// Physical free and total bytes, including other processes and CUDA's
+    /// untracked graph/module allocations. Audits can distinguish this from
+    /// the logical admission sample returned by `cuda_memory_info`.
+    pub fn cuda_physical_memory_info(&self) -> Result<(usize, usize)> {
         let info: Symbol<unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus> =
             unsafe { self.lib.get(b"cuteafd_cuda_memory_info")? };
         let (mut free, mut total) = (0, 0);
         self.status_to_result("cuteafd_cuda_memory_info", unsafe { info(&mut free, &mut total) })?;
         anyhow::ensure!(free <= total && total > 0, "invalid CUDA memory information");
         Ok((free, total))
+    }
+
+    /// Effective free/total bytes under the coordinator's logical ceiling.
+    /// Subtract physical usage, not the min of physical free and the budget:
+    /// otherwise every successive owner would spend the same budget again.
+    pub fn cuda_memory_info(&self) -> Result<(usize, usize)> {
+        let (free, total) = self.cuda_physical_memory_info()?;
+        let Some(budget) = coordinator_gpu_budget() else { return Ok((free, total)) };
+        let device = self.cuda_get_device()?;
+        let sample = cuteafd_core::serving_capacity::DeviceMemory {
+            device: u32::try_from(device)?, total_bytes: total as u64, baseline_free_bytes: free as u64,
+        };
+        // Managed pages may remain on the host and escape cudaMemGetInfo.
+        // Reserve their full ownership conservatively, even when CUDA already
+        // charges resident pages; current families use device allocations.
+        let managed = memory_ledger::current_bytes(memory_ledger::Space::Managed, device) as u64;
+        budget.admit(sample, managed)?;
+        let mut effective = budget.apply(sample)?;
+        effective.baseline_free_bytes -= managed;
+        static LOGGED: std::sync::OnceLock<Mutex<std::collections::HashSet<i32>>> = std::sync::OnceLock::new();
+        if LOGGED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(device) {
+            tracing::info!(device, physical_total_bytes = total, physical_free_bytes = free,
+                requested_budget_bytes = budget.0, effective_total_bytes = effective.total_bytes,
+                effective_free_bytes = effective.baseline_free_bytes, managed_reserve_bytes = managed,
+                "coordinator GPU memory budget (logical ceiling; no guard allocation)");
+        }
+        Ok((usize::try_from(effective.baseline_free_bytes)?, usize::try_from(effective.total_bytes)?))
+    }
+
+    fn admit_gpu_allocation(&self, bytes: usize) -> Result<Option<std::sync::MutexGuard<'static, ()>>> {
+        let Some(budget) = coordinator_gpu_budget() else { return Ok(None) };
+        // Serialize sample + allocation across loading threads so concurrent
+        // owners cannot each admit against the same remaining logical bytes.
+        let guard = GPU_BUDGET_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
+        let (free, total) = self.cuda_memory_info()?;
+        budget.admit(cuteafd_core::serving_capacity::DeviceMemory {
+            device: u32::try_from(self.cuda_get_device()?)?, total_bytes: total as u64,
+            baseline_free_bytes: free as u64,
+        }, bytes as u64)?;
+        Ok(Some(guard))
     }
 
     pub fn cuda_get_device(&self) -> Result<i32> {
@@ -1753,6 +1812,7 @@ impl NativeLibrary {
     }
 
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+        let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: Symbol<AllocDeviceBufferFn> =
             unsafe { self.lib.get(b"cuteafd_alloc_device_buffer")? };
         let mut buffer = CuteafdDeviceBuffer::default();
@@ -1763,6 +1823,7 @@ impl NativeLibrary {
     }
 
     pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+        let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: Symbol<AllocManagedDeviceBufferFn> =
             unsafe { self.lib.get(b"cuteafd_alloc_managed_device_buffer")? };
         let mut buffer = CuteafdDeviceBuffer::default();
@@ -1901,11 +1962,21 @@ impl NativeLibrary {
     }
 
     pub unsafe fn cuda_graph_end_capture(&self, cuda_stream: *mut c_void) -> Result<*mut c_void> {
+        let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
+            .unwrap_or_else(|e| e.into_inner()));
         let end_capture_fn: Symbol<CudaGraphEndCaptureFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_graph_end_capture")? };
         let mut cuda_graph_exec = std::ptr::null_mut();
         let status = unsafe { end_capture_fn(cuda_stream, &mut cuda_graph_exec) };
         self.status_to_result("cuteafd_cuda_graph_end_capture", status)?;
+        if coordinator_gpu_budget().is_some() {
+            if let Err(error) = self.cuda_memory_info() {
+                // SAFETY: capture ended and this executable has never launched;
+                // destroying it cannot invalidate queued graph work.
+                unsafe { self.cuda_graph_exec_destroy(cuda_graph_exec)? };
+                return Err(error.context("graph executable exceeds coordinator GPU budget"));
+            }
+        }
         Ok(cuda_graph_exec)
     }
 

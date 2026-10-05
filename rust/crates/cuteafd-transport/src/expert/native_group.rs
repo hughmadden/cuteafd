@@ -973,6 +973,9 @@ mod tests {
             assert_eq!(client.capacity(), 80);
             client.reset_connections();
         }
+        let one = SparkExperts::new_ranks(&peers[..1], &[33], 80, config.clone())?;
+        assert_eq!(one.world_size(), 1);
+        assert_eq!(one.topology(), None);
         let three = SparkExperts::new_ranks(&peers[..3], &[7, 8, 9], 80, config.clone())?;
         assert_eq!(three.world_size(), 3);
         assert_eq!(three.topology(), None);

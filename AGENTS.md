@@ -153,7 +153,8 @@ before → after tables with conditions.
   acceptance. Profiling perturbs timing.
 - Benchmark each model on two reference configs only: the natural minimum
   (1× RTX + the fewest Sparks it fits) and the maximum (2× RTX + 4 or 6
-  Sparks, whichever divides the model sensibly). Other layouts need
+  Sparks, whichever divides the model sensibly). Qwen's natural minimum is
+  a 32 GB RTX + 1 Spark; maximum one RTX PRO 6000. Other layouts need
   correctness gates, not perf tables; the planner's estimates cover them.
 - Until the first official release, be frugal: measure only what a decision
   needs, one launch per arm, no repeat sessions unless a number is borderline.

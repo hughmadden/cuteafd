@@ -244,6 +244,43 @@ async fn native_tcp_cancelled_receive_discards_partial_wave() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn implicit_tp1_round_trips_chunks_and_reuses_connection() -> Result<()> {
+    let executor = super::v41_spark_executor_id(1, 0)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let peer = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        for _ in 0..2 {
+            let frame = read_request(&mut stream).await?;
+            let native = BackboneRequest::parse(&frame, 2)?;
+            let id = ExpertProtocolV2Request::decode(&frame)?.header.request_id;
+            for row in 0..native.rows() {
+                let payload = vec![(id + row as u64) as u8; V41_PARTIAL_ROW_BYTES as usize];
+                let mut indices = [0u32];
+                let response = native.response_chunk(executor, row, &payload, &mut indices, FRAME)?;
+                stream.write_all(&response.to_owned()?.encode()?).await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut transport = V41Tp4Tcp::new_ranks(&[peer], &[executor], 2, config())?;
+    assert_eq!(transport.world_size(), 1);
+    for cycle in 0..2 {
+        let mut req = request(2);
+        req.header.request_id += cycle;
+        let mut chunks = 0;
+        transport.execute(&req, |rank, row, bytes| {
+            assert_eq!(rank, 0);
+            chunks += 1;
+            check_chunk(req.header.request_id, rank, row, bytes)
+        }).await?;
+        assert_eq!(chunks, 2);
+    }
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
 #[test]
 fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
     let peers: Vec<SocketAddr> = (0..6)

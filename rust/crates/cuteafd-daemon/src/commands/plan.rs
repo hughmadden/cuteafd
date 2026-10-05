@@ -11,13 +11,14 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let options = PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
-        coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?,
+        coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?
+            .min(if args.layout { budget_bytes("--rtx-budget-gib", args.rtx_gib)? } else { u64::MAX }),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
-                rtx_bytes: vec![budget_bytes("--rtx-gib", args.rtx_gib)?; args.rtx],
+                rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
                 pool_tokens: args.pool_tokens,
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
@@ -108,6 +109,43 @@ mod tests {
     }
 
     #[test]
+    fn rtx_budget_flag_and_legacy_alias_bound_every_layout_gpu() {
+        use clap::Parser;
+        for flag in ["--rtx-budget-gib", "--rtx-gib"] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2", flag, "32"])
+                .unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let options = options(&args).unwrap();
+            assert_eq!(options.layout.unwrap().rtx_bytes, vec![32 << 30; 2]);
+            assert_eq!(options.coordinator_budget_bytes, 32 << 30);
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read"]).unwrap();
+        let crate::cli::Commands::Plan(plan_args) = cli.command else { panic!("plan") };
+        assert!(options(&plan_args).unwrap().layout.is_none());
+        for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let dir = tempfile::tempdir().unwrap();
+            let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
+            assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
+        }
+    }
+
+    #[test]
+    fn layout_refuses_full_storage_shortfall_even_when_weights_fit() {
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        let tiny = PlanArgs { rtx_gib: 2.0, ..args(snapshot.path(), 4, true) };
+        let mut weight_only = options(&tiny).unwrap();
+        weight_only.layout = None;
+        assert!(plan(snapshot.path(), &weight_only).unwrap().executable(), "weight inventory fits");
+        let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
+        assert!(!report.fits && !report.executable());
+        assert!(report.hints.iter().any(|h| h.what.contains("full memory layout")
+            && h.what.contains("shortfall") && h.what.contains("bytes")));
+        let error = run_plan(tiny).unwrap_err();
+        assert!(error.to_string().contains("is not servable"), "{error:#}");
+    }
+
+    #[test]
     fn require_ready_exits_by_verdict_and_options_fail_typed() {
         let flash = tempfile::tempdir().unwrap();
         write_snapshot(flash.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
@@ -122,7 +160,7 @@ mod tests {
         let error = run_plan(args(pro.path(), 4, true)).unwrap_err();
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
-        for (ranks, budget) in [(1, 100.0), (5, 100.0), (8, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
+        for (ranks, budget) in [(5, 100.0), (8, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
             let error = run_plan(PlanArgs { spark_budget_gib: budget, ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
                 "{ranks} ranks, {budget} GiB: {error:#}");

@@ -780,15 +780,15 @@ fn spark_rank_options_follow_transport_and_packages() {
         t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
     for ranks in 0..=8 {
         let options = sparks(ranks);
-        if !matches!(ranks, 0 | 2 | 3 | 4 | 6) {
+        if !matches!(ranks, 0 | 1 | 2 | 3 | 4 | 6) {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
         }
-        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 2/3/4; V4.1: Sparks 2/3/4/6 only.
-        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, ranks != 3, "mimo {ranks}");
+        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
+        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, !matches!(ranks, 1 | 3), "mimo {ranks}");
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, ranks != 6, "qwen {ranks}");
-        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, ranks != 0, "v41 {ranks}");
+        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, !matches!(ranks, 0 | 1), "v41 {ranks}");
     }
 }
 
@@ -1010,6 +1010,33 @@ fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
     assert_eq!(plan_preferred(dir.path(), &oversized_pool).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
     let unsupported = qwen_snapshot(3);
     assert_eq!(plan_preferred(unsupported.path(), &sparks(4)).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+}
+
+#[test]
+fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
+    use cuteafd_core::memory_layout::Category;
+    let (mut tensors, _) = qwen4_exl3(1, 4);
+    let draft: Vec<Tensor> = tensors.iter().map(|(name, dtype, shape)|
+        (name.replace("model.language_model.layers.0", "mtp.layers.0"), *dtype, shape.clone())).collect();
+    tensors.extend(draft);
+    let mut config = qwen4_config(1);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let dir = snapshot(config, &tensors);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1, ..Default::default()
+    }), ..sparks(1) };
+    let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let lead = &with_mtp.devices[0];
+    assert!(lead.items.iter().any(|i| i.group == "native MTP expert arena" && i.bytes > 0), "{}", with_mtp.render());
+    assert!(!lead.items.iter().any(|i| i.group == "routed expert arenas"));
+    assert!(lead.items.iter().any(|i| i.group == "local EXL3 workspace" && i.bytes > 0));
+    assert!(with_mtp.notes.iter().any(|n| n.contains("MTP experts stay on rtx0")));
+    options.layout.as_mut().unwrap().native_mtp_layers = 0;
+    let without_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "native MTP expert arena"));
+    assert!(lead.by_category()[&Category::Kv] > without_mtp.devices[0].by_category()[&Category::Kv]);
+    assert_eq!(with_mtp.devices[1].by_category()[&Category::Experts],
+        without_mtp.devices[1].by_category()[&Category::Experts]);
 }
 
 #[test]

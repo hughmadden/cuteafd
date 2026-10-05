@@ -429,7 +429,7 @@ impl FamilyModel for DeepSeekModel {
         Some(ExpertContract {
             package: format!("{geometry}:{format} (expertd-native)"),
             block: 128,
-            spark_worlds: TRANSPORT_WORLDS.to_vec(),
+            spark_worlds: TRANSPORT_WORLDS.into_iter().filter(|&world| world != 1).collect(),
             local: Err(format!("{serve} runs routed experts on 2, 3, 4 or 6 Spark ranks (its local expert layers \
                 supplement them)")),
         })

@@ -54,9 +54,19 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
     Ok(placed)
 }
 
+fn coordinator_budget(report: &Report) -> Option<u64> {
+    report.server.configuration.settings.iter()
+        .find(|s| s.name == "coordinator-gpu-budget-gib")
+        .and_then(|s| s.value.as_deref())
+        .and_then(|v| v.parse().ok())
+}
+
 fn short_hardware(report: &Report) -> String {
     let hw = &report.server.hardware;
     let mut out = format!("{}× RTX", hw.used_gpus());
+    if let Some(gib) = coordinator_budget(report) {
+        out.push_str(&format!(" ({gib} GiB budget)"));
+    }
     if !hw.sparks.is_empty() {
         out.push_str(&format!(" + {}× Spark", hw.sparks.len()));
     }
@@ -93,7 +103,11 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
         }
         let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
         let order = FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len());
-        newest.entry((order, family, checkpoint(r), r.server.hardware.slug())).or_insert(p);
+        let mut hardware = r.server.hardware.slug();
+        if let Some(gib) = coordinator_budget(r) {
+            hardware.push_str(&format!("-budget{gib}"));
+        }
+        newest.entry((order, family, checkpoint(r), hardware)).or_insert(p);
     }
     // Per checkpoint: the smallest layout is its minimum, the largest its maximum
     // (a family without a two-RTX split has its maximum on one RTX).
@@ -104,6 +118,18 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
     let size = |p: &Placed| (p.report.server.hardware.used_gpus(), p.report.server.hardware.sparks.len());
     let mut rows = Vec::new();
     for ((_, family, name), mut reports) in groups {
+        // Qwen's small RTX + one Spark is the minimum; the larger RTX with
+        // resident experts is its maximum, regardless of Spark count.
+        let budget_min = (family == "qwen4").then(|| reports.iter().find(|p|
+            size(p) == (1, 1) && coordinator_budget(&p.report) == Some(32))).flatten().copied();
+        if let Some(minimum) = budget_min {
+            rows.push((family.clone(), name.clone(), 0, minimum));
+            if let Some(maximum) = reports.iter().find(|p|
+                size(p) == (1, 0) && coordinator_budget(&p.report).is_none()) {
+                rows.push((family, name, 1, *maximum));
+            }
+            continue;
+        }
         reports.sort_by_key(|p| size(p));
         let (first, last) = (reports[0], reports[reports.len() - 1]);
         rows.push((family.clone(), name.clone(), 0, first));
@@ -296,6 +322,45 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_budget_minimum_replaces_legacy_spark_reference_ordering() {
+        let placed = |id: &str, sparks: usize, budget: Option<&str>| {
+            let mut report = crate::sample::report(false);
+            report.id = id.into();
+            report.server.family = Some("qwen4".into());
+            report.server.model = "org/Qwen3.8-EXL3".into();
+            report.server.configuration.snapshot = None;
+            report.server.configuration.quant[1].formats = vec!["exl3-k4".into(), "exl3-k5".into()];
+            report.server.hardware.sparks.truncate(sparks);
+            if let Some(value) = budget {
+                report.server.configuration.settings.push(crate::report::Setting {
+                    name: "coordinator-gpu-budget-gib".into(), value: Some(value.into()),
+                    default: None, source: "cli".into(),
+                });
+            }
+            Placed { dir: PathBuf::from(format!("benchmarks/qwen4/{id}")), report }
+        };
+        let legacy = placed("legacy", 4, None);
+        let maximum = placed("maximum", 0, None);
+        let unbudgeted = placed("unbudgeted", 1, None);
+        let minimum = placed("minimum", 1, Some("32"));
+        let reports = vec![unbudgeted, minimum, maximum, legacy];
+        let rows = reference_rows(&reports);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].2, rows[0].3.report.id.as_str()), (0, "minimum"));
+        assert_eq!((rows[1].2, rows[1].3.report.id.as_str()), (1, "maximum"));
+        assert!(short_hardware(&rows[0].3.report).contains("32 GiB budget"));
+        assert!(crate::render::card::card_svg(&rows[0].3.report).contains("32 GiB budget"));
+        let html = results(&reports);
+        assert!(html.contains("benchmarks/qwen4/minimum/card.svg"));
+        assert!(html.contains("benchmarks/qwen4/maximum/card.svg"));
+        assert!(!html.contains("benchmarks/qwen4/legacy/card.svg"));
+        // Before a budgeted minimum is published, preserve the previous rows.
+        let legacy_rows = reference_rows(&reports[2..]);
+        assert_eq!((legacy_rows[0].2, legacy_rows[0].3.report.id.as_str()), (0, "maximum"));
+        assert_eq!((legacy_rows[1].2, legacy_rows[1].3.report.id.as_str()), (1, "legacy"));
+    }
 
     #[test]
     fn publish_rebuilds_the_table_and_index() {

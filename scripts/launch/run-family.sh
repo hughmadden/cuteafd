@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch a DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 or Qwen 3.8 Flash Next
 # checkpoint (the family's serve command on one RTX, routed experts on the first
-# SPARK_COUNT Sparks) from the release images named in the config. ./run.sh
+# SPARK_COUNT Sparks, or SPARK_HOSTS in explicit rank order) from the release images named in the config. ./run.sh
 # starts this for every family but DeepSeek V4.1; the family comes from the
 # snapshot's config.json (scripts/lib/checkpoint-family.py), or --family.
 # Containers use run.sh's names, so ./stop.sh stops them.
@@ -26,6 +26,10 @@ while IFS='=' read -r key value; do
   cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
+release_validate_coordinator_gpu_budget "$coordinator_budget"
+coordinator_budget_args=()
+[[ -z "$coordinator_budget" ]] || coordinator_budget_args=(--coordinator-gpu-budget-gib "$coordinator_budget")
 # Validate the name before it is used to identify allocations during admission.
 instance="$(get INSTANCE)"
 [[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
@@ -64,6 +68,14 @@ esac
 # the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
 ranks="$(get SPARK_COUNT 4)"
 configured_ranks="$ranks"
+if [[ -n "$(get SPARK_HOSTS)" ]]; then
+  host_rows="$(release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks")" || exit 2
+  while read -r rank host lane_a lane_b; do
+    cfg[SPARK_${rank}_HOST]="$host"
+    cfg[SPARK_${rank}_LANE_A]="$lane_a"
+    cfg[SPARK_${rank}_LANE_B]="$lane_b"
+  done <<<"$host_rows"
+fi
 backend="$(get EXPERT_BACKEND auto)"
 case "$backend" in
   auto|spark) ;;
@@ -91,6 +103,17 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       fi
     fi
     free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
+    if [[ -n "$coordinator_budget" ]]; then
+      total_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+      # Credit this launch's restart above, but charge other physical usage
+      # against the simulated smaller card, just as runtime admission does.
+      if [[ "$total_mib" =~ ^[0-9]+$ ]]; then
+        free_gib="$(python3 -c 'import sys; free,total,budget=map(float,sys.argv[1:]); print(max(0,min(free,budget-total+free)))' \
+          "$free_gib" "$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$total_mib")" "$coordinator_budget")"
+      else
+        free_gib=0 # No trustworthy sample: keep the Spark fallback.
+      fi
+    fi
     pool="$(get POOL_TOKENS 32768)"
     if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
       # CPU-only preflight reads checkpoint headers in the selected serving image.
@@ -167,10 +190,7 @@ if [[ -z "$speculator" ]]; then
   fi
 fi
 case "$family:$speculator" in
-  qwen4:mtp)
-    # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
-    [[ "$ranks" == 0 ]] ||
-      { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
+  qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
   *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
@@ -212,7 +232,7 @@ case "$speculator" in
     fi ;;
   mtp)
     mtp_depth=1
-    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 || $ranks != 0 ]] || mtp_depth=3
+    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
@@ -608,7 +628,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
+  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

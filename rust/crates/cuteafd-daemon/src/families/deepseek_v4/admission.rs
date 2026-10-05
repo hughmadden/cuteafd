@@ -59,9 +59,15 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
         devices, host_prefix_bytes: 0 })
 }
 
+#[cfg(test)]
 pub(crate) fn resolve(profile: &CapacityProfile, memory: &[DeviceMemory], sequences: usize) -> Result<ResolvedCapacity> {
+    resolve_pool(profile, memory, sequences, None)
+}
+
+pub(crate) fn resolve_pool(profile: &CapacityProfile, memory: &[DeviceMemory], sequences: usize,
+    pool_tokens: Option<u64>) -> Result<ResolvedCapacity> {
     let capacity = resolve_capacity(CapacityPolicy { concurrency: u32::try_from(sequences)?,
-        gpu_occupancy_percent: 100, ..Default::default() }, profile, memory)?;
+        gpu_occupancy_percent: 100, pool_tokens, ..Default::default() }, profile, memory)?;
     ensure!(capacity.allocated_gpu_kv_tokens > 0, "V4 automatic pool has no allocation unit that fits");
     Ok(capacity)
 }
@@ -86,6 +92,8 @@ mod tests {
         let resolved = resolve(&profile, &memory, 8).unwrap();
         assert!(resolved.allocated_gpu_kv_tokens < cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
         assert_eq!(resolved.allocated_gpu_kv_tokens % 256, 0);
+        assert_eq!(resolve_pool(&profile, &memory, 8, Some(257)).unwrap().allocated_gpu_kv_tokens, 512);
+        assert!(resolve_pool(&profile, &memory, 8, Some(resolved.allocated_gpu_kv_tokens + 256)).is_err());
         let mut exhausted = memory.clone();
         exhausted[1].baseline_free_bytes = 1 << 30;
         assert!(resolve(&profile, &exhausted, 8).is_err());
