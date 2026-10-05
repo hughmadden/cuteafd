@@ -794,7 +794,20 @@ Work, in priority order:
     slice × route slot, where MXFP4 takes pre-quantized FP8 wire rows; try a
     quantize-once input stage or an FP8 wire first. Wide-row M32 tiles lost
     on both GPUs. Official MXFP4 stays the recommended V4.1 checkpoint.
-12. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
+12. **V4.1 C1 after request history (open, 2026-10-05):** after smoke +
+    golden-probe requests, work/p0 decodes C1 ~1.7–2% slower than v1.0.0 on
+    2 RTX + 4 Sparks (warm C1 190.4 → 187.2, ratio 0.983; fixed card 0.990;
+    output byte-identical). On a fresh server C1 is equal. GPU code is
+    byte-identical (all CUDA fatbins and embedded CuTe cubins); the
+    difference is in the Rust daemon and needs the history. Ruled out:
+    native pin, host snapshot arena (identical 7.2 GB, no evictions), Engram
+    page-cache residency (±20 MB of 3.2 GB), copy-window bookkeeping (a
+    copy-off fast path changed nothing, 0.999). Clue: dSpark's fitted draft
+    cost after history is ~1,547+40 µs vs v1.0.0's ~1,492+37 µs. Next, if
+    pursued: bisect the policy merges since v1.0.0 (569f4f6 draft policy
+    core and verify-cost fit) under the same smoke-conditioned protocol.
+    Harness: ~/.cache/cuteafd/builds/c1bisect.
+13. **Parked:** EXL3 × A8 (fails KL), MXFP4 tails, V4.1 exact slices,
    Spark-side reduce, split intake.
 
 ## Release v1 scope (decided 2026-10-04)
