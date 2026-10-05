@@ -583,6 +583,8 @@ pub(crate) struct GlmfEngine<'a> {
     /// CUTEAFD_GLMF_PREFILL_LANES=subset: lanes even with a `--layers`
     /// subset (timing runs against loopback ranks that hold only those layers).
     subset_lanes: bool,
+    /// Opt-in matched-token/route evidence; never adds a device readback.
+    split_audit: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
     ops: Option<RefCell<OpTimes>>,
@@ -635,6 +637,19 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
+fn audit_token_hash(tokens: &[u32]) -> u64 {
+    tokens.iter().flat_map(|token| token.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325,
+        |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections::BTreeMap<u32, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for route in routes {
+        *counts.entry(route.expert_id).or_insert(0) += 1;
+    }
+    counts
+}
+
 impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
@@ -664,6 +679,7 @@ impl<'a> GlmfEngine<'a> {
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
+            split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
@@ -1256,6 +1272,10 @@ impl<'a> GlmfEngine<'a> {
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool, device: bool)
         -> Result<Option<StepLogits>> {
         let (t, start) = (tokens.len(), placement.len);
+        if self.split_audit && t >= 256 {
+            tracing::info!(rows = t, start, token_hash = format_args!("{:016x}", audit_token_hash(tokens)),
+                "GLM Flash split audit prefill");
+        }
         if on_layer.is_none() && forced.is_none() && self.pipelined() {
             return self.prefill_lanes(placement, tokens, all_logits, device);
         }
@@ -2484,6 +2504,12 @@ impl<'a> GlmfEngine<'a> {
             }).collect(),
             routes, wire)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        if self.split_audit && !decode && t >= 256 {
+            let counts = audit_route_counts(&request.routes);
+            tracing::info!(layer = index, rows = t, distinct = counts.len(),
+                max_routes = counts.values().max().copied().unwrap_or(0),
+                histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
+        }
         transport.dispatch(&request)
     }
 
@@ -2737,6 +2763,17 @@ impl Drop for GlmfEngine<'_> {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn split_audit_counts_routes_and_hashes_token_bytes_in_order() {
+        let routes: Vec<_> = [7, 2, 7, 9, 2, 7].into_iter().enumerate().map(|(i, expert_id)|
+            super::ExpertProtocolV2RouteEntry { row_index: i as u32 / 2, expert_id, gate_weight: 0.5 }).collect();
+        assert_eq!(super::audit_route_counts(&routes), [(2, 2), (7, 3), (9, 1)].into_iter().collect());
+        assert!(super::audit_route_counts(&[]).is_empty());
+        assert_eq!(super::audit_token_hash(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::audit_token_hash(&[1, 2]), 0xc9c2_8939_c996_68c6);
+        assert_ne!(super::audit_token_hash(&[1, 2]), super::audit_token_hash(&[2, 1]));
+    }
 
     #[test]
     fn joined_mla_values_fit_at_a_capacity_fixed_tail_for_both_token_owners() {
