@@ -36,6 +36,11 @@ def fake_server():
             body, probe_spec = request["body"], request["spec"]
             assert probe_spec["cold"] and probe_spec["no_speculation"]
             assert body["temperature"] == 0 and body["reasoning_effort"] == "high"
+            if state["mode"] == "http_error":
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":"native library not found"}')
+                return
             text = json.dumps(body["messages"], sort_keys=True)
             ids = FakeTokenizer().encode(text).ids
             probe = {"engine": "fake-bf16", "cold": True, "no_speculation": True, "cached_tokens": 0,
@@ -135,6 +140,12 @@ def test_short_assistant_turns_get_context_padding_not_fake_gen(fake_server):
 def test_probe_fails_closed(fake_server, mode):
     fake_server["mode"] = mode
     with pytest.raises(ValueError):
+        make(fake_server)
+
+
+def test_probe_reports_server_rejection(fake_server):
+    fake_server["mode"] = "http_error"
+    with pytest.raises(ValueError, match="HTTP 400: .*native library not found"):
         make(fake_server)
 
 

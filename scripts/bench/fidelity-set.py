@@ -16,6 +16,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -68,11 +69,16 @@ class ProbeClient:
             headers["x-cuteafd-bench"] = self.token
             headers["Authorization"] = "Bearer " + self.token
         request = urllib.request.Request(self.url, canonical({"body": body, "spec": spec}), headers)
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            chat = json.load(response)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                chat = json.load(response)
+        except urllib.error.HTTPError as error:
+            detail = error.read(4096).decode("utf-8", errors="replace")
+            raise ValueError(f"generation probe HTTP {error.code}: {detail}") from error
         record = chat.get("probe")
         if not record or record.get("error") or not record.get("engine"):
-            raise ValueError("server did not honor the generation probe")
+            detail = record.get("error") if record else "missing probe record"
+            raise ValueError(f"server did not honor the generation probe: {detail}")
         if not record.get("cold") or not record.get("no_speculation") or record.get("cached_tokens", 0):
             raise ValueError("generation must be cold, speculation-free")
         if not record.get("prompt_ids") or not record.get("generated"):
