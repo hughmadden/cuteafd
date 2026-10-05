@@ -31,7 +31,9 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 vision="$(get VISION auto)"
 audio="$(get AUDIO off)"
-case "$vision" in auto|off) ;; *) release_die "VISION must be auto or off" ;; esac
+vision_replicas="$(get VISION_REPLICAS 1)"
+[[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
+[[ "$vision" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$vision" != auto:* && "$vision" != off:* ) ]] || release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
 case "$audio" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
@@ -584,6 +586,50 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
+# Resolve cold placement before starting or removing containers. Off skips the
+# planner and tower startup entirely; text-only families keep their old path.
+vision_peers=()
+encoder_ranks=()
+encoder_hash=""
+encoder_port=$((port + 1))
+if [[ "$family" == mimo_v2 && "$vision" != off ]] &&
+   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
+  plan_rtx=1; ((head_split == 0)) || plan_rtx=2
+  plan_pool="$(get POOL_TOKENS 32768)"; [[ "$plan_pool" != auto ]] || plan_pool=0
+  plan_gib="${coordinator_budget:-95.5}"
+  plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
+    "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
+    --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
+    --rtx "$plan_rtx" --rtx-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas")"
+  selected="$(python3 -c '
+import json,sys
+p=json.load(sys.stdin); e=p.get("encoder"); assert e is not None, "image checkpoint lacks encoder plan"
+assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
+k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
+if kind=="spark":
+    ranks=[k["rank"]]+e["replicas"]
+    assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
+    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
+elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
+elif kind=="off": print("off",h,"-")
+else: raise ValueError("idle-host launch needs an explicit inventory")
+' <<<"$plan_json")"
+  read -r vision encoder_hash rank_csv <<<"$selected"
+  if [[ "$vision" == spark:* ]]; then
+    IFS=, read -r -a encoder_ranks <<<"$rank_csv"
+    for encoder_rank in "${encoder_ranks[@]}"; do
+      vision_peers+=("$(get "SPARK_${encoder_rank}_LANE_A"):$encoder_port")
+    done
+    family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
+  fi
+elif [[ "$vision" == spark* || "$vision" == rtx* ]]; then
+  release_die "explicit encoder placement requires a supported MiMo vision checkpoint"
+fi
+# Replace the original policy with the selected placement, without duplicated flags.
+for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
+  [[ "${family_args[arg]}" != --vision ]] || family_args[arg+1]="$vision"
+done
 peers=()
 # --restart removes this launcher's containers; stop.sh accepts the same keys.
 # One model is served at a time: every expert worker on these hosts goes, whatever
@@ -628,17 +674,26 @@ for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
   peers+=("$lane:$port")
+  encoder_args=""
+  for encoder_rank in "${encoder_ranks[@]}"; do
+    if [[ "$rank" == "$encoder_rank" ]]; then
+      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens 4096"
+    fi
+  done
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
-    --listen 0.0.0.0:$port >/dev/null" &
+    --listen 0.0.0.0:$port $encoder_args >/dev/null" &
 done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
+  # Expert readiness follows synchronous encoder startup in the same process.
+  ready_deadline=$((SECONDS + 900))
   until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q 'worker ready'"; do
+    ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }
     ssh "$host" "docker ps -q -f name=cuteafd-spark-expert-$host-$port | grep -q ." ||
       { echo "$host expert worker exited:" >&2; ssh "$host" "docker logs --tail 20 cuteafd-spark-expert-$host-$port" >&2; exit 1; }
     sleep 2

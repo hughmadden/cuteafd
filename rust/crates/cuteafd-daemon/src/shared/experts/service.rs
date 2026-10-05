@@ -14,6 +14,21 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
+    let encoder = if args.encoder || args.encoder_only {
+        Some(crate::shared::vision::worker::EncoderWorkerConfig {
+            listen: args.encoder_listen.clone(),
+            plan_hash: crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref().context("--encoder-plan-hash required")?)?,
+            revision: args.encoder_revision.clone().or_else(|| args.snapshot.file_name().and_then(|s| s.to_str()).map(str::to_owned)).context("encoder revision required")?,
+            max_tokens: args.encoder_max_tokens as usize,
+        })
+    } else { None };
+    if args.encoder_only {
+        let encoder = encoder.context("encoder-only config")?;
+        return tokio::task::spawn_blocking(move || -> Result<()> {
+            let (_server, _) = crate::shared::vision::worker::start(&encoder, &args.snapshot, args.native_lib, args.device_budget_bytes as u64)?;
+            loop { thread::park(); }
+        }).await.context("encoder-only owner failed")?;
+    }
     let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
@@ -43,6 +58,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         max_frame_bytes: args.max_frame_bytes,
         topology,
         native_spark_tp2: false,
+        encoder,
     };
     tokio::task::spawn_blocking(move || local::run(config, &args.listen))
         .await
@@ -50,6 +66,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
 }
 
 pub(crate) struct NativeExpertServiceConfig {
+    pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
     pub library: PathBuf,
     pub exl3_aot_dir: Option<PathBuf>,
     /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
@@ -454,6 +471,7 @@ mod tests {
             max_frame_bytes: 64 << 20,
             topology,
             native_spark_tp2: false,
+            encoder: None,
         }
     }
 

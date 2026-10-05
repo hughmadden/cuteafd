@@ -167,6 +167,8 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct PlanArgs {
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
+    pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub(crate) vision: cuteafd_loader::plan::MediaMode,
@@ -258,6 +260,22 @@ pub(crate) struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeExpertDaemonArgs {
+    /// Load the checkpoint vision tower in this expert process.
+    #[arg(long, conflicts_with = "encoder_only")]
+    pub(crate) encoder: bool,
+    /// Serve only vision, without reading or allocating routed experts.
+    #[arg(long)]
+    pub(crate) encoder_only: bool,
+    #[arg(long, default_value = "0.0.0.0:9200")]
+    pub(crate) encoder_listen: String,
+    /// Coordinator's encoder placement SHA-256; checked in the TCP handshake.
+    #[arg(long, required_if_eq_any = [("encoder", "true"), ("encoder_only", "true")])]
+    pub(crate) encoder_plan_hash: Option<String>,
+    /// Explicit checkpoint revision (defaults to snapshot directory name).
+    #[arg(long)]
+    pub(crate) encoder_revision: Option<String>,
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    pub(crate) encoder_max_tokens: u32,
     /// First resident backbone layer; use 20 when both RTX GPUs host the encoder.
     /// Checked against the checkpoint's layer count at startup.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..256))]

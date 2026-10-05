@@ -1,6 +1,10 @@
 //! Cold-path tower description, resident runtime and bounded local owner service.
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
+pub mod local;
+pub mod remote;
+pub mod worker;
+
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
@@ -278,6 +282,16 @@ impl TowerSpec {
         native.weight_bytes = (cursor + 64) as u64;
         Ok(Self { native, reads })
     }
+    /// Canonical header extents, sorted by tensor name; no tower payload is read.
+    pub fn encoder_id(&self, revision: &str, sm: u32) -> cuteafd_loader::media::EncoderId {
+        let headers = self.reads.iter().map(|read| {
+            let m = &read.metadata;
+            (m.name.clone(), serde_json::json!({"dtype": format!("{:?}", m.dtype),
+                "shape": m.shape, "byte_offset": m.byte_offset, "byte_length": m.byte_length}))
+        }).collect();
+        cuteafd_loader::media::EncoderId::derive("mimo_v2", revision, &headers, 1, sm)
+    }
+
     fn load_weights(&self) -> Result<Vec<u8>> {
         let mut weights = vec![0u8; self.native.weight_bytes as usize];
         for read in &self.reads {
@@ -304,6 +318,15 @@ impl TowerSpec {
         }
         Ok(weights)
     }
+}
+
+/// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
+pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
+    Arc::new(std::array::from_fn(|i| {
+        let c = i / 256;
+        let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
+        (pixel - config.mean[c] as f32) / config.std[c] as f32
+    }))
 }
 
 pub struct VitRuntime {

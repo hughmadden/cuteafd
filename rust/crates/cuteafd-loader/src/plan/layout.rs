@@ -22,6 +22,8 @@ const MIB: u64 = 1 << 20;
 pub struct LayoutOptions {
     /// Usable bytes of each coordinator GPU (1 or 2).
     pub rtx_bytes: Vec<u64>,
+    /// Number of Spark vision tower replicas (default one).
+    pub vision_replicas: usize,
     /// One mapped pinned token embedding instead of a device allocation.
     pub host_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
@@ -61,6 +63,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             rtx_bytes: vec![95 * GIB + 512 * MIB],
+            vision_replicas: 1,
             host_embedding: false,
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
@@ -229,9 +232,10 @@ fn share_of(family: &str, component: Component) -> Share {
 }
 
 /// Lays out `report` (a `plan` of the checkpoint) on the inventory.
-pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
     options: &LayoutOptions) -> MemoryLayout {
-    let family = report.family.as_deref().unwrap_or("unknown");
+    let family_name = report.family.clone().unwrap_or_else(|| "unknown".into());
+    let family = family_name.as_str();
     let discovered_native_layers = match model.spec().speculator.as_ref() {
         Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
         Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
@@ -338,7 +342,8 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     for component in report.components.iter()
         .filter(|c| (c.owner == Owner::Rtx
             || (c.owner == Owner::SparkSliced && report.placement == ExpertPlacement::Local))
-            && c.status != Status::Unused && !covered(c.component)) {
+            && c.status != Status::Unused && c.status != Status::Disabled
+            && !(family != "deepseek_v41" && c.component == Component::Vision) && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -542,6 +547,53 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             if exl3_workspace.is_some() { Basis::Formula } else { Basis::Estimated }));
     }
 
+    let mut spark_devices = Vec::new();
+    // Spark ranks.
+    if let ExpertPlacement::Sparks { ranks } = report.placement {
+        let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.component != Component::SpeculatorExpert).map(|c| c.bytes).sum::<u64>().saturating_sub(if family == "deepseek_v41" { local_bytes } else { 0 });
+        let stored = (routed as f64 * report.spark_rank_share) as u64;
+        let even = routed / ranks.max(1) as u64;
+        // EXL3 packages and FP8/MXFP4/NVFP4 packages with exact layouts store each
+        // rank's own whole 128-row blocks; other packages (V4.1 native) pad every
+        // rank to the widest slice.
+        let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
+        let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
+        let exact = !package.starts_with("v41") && intermediate % 128 == 0 && intermediate / 128 >= ranks;
+        let rank_bytes = |rank: usize| -> u64 {
+            if !exact {
+                return stored;
+            }
+            let blocks = intermediate / 128;
+            let own = blocks / ranks + usize::from(rank < blocks % ranks);
+            (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
+        };
+        for rank in 0..ranks {
+            let stored = rank_bytes(rank);
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
+                items: Vec::new(), kv_tokens: 0 };
+            if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
+                // Recover physical memory from the legacy usable inventory
+                // (13 GiB excluded), then charge the family's observed host
+                // footprint separately from expert allocations.
+                device.capacity_bytes += 13 * GIB;
+                device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", costs.spark_host_bytes, allowance_basis));
+            }
+            let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
+                .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
+            device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
+            let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
+            device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, allowance_basis));
+            device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, allowance_basis));
+            device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, allowance_basis));
+            spark_devices.push(device);
+        }
+        if !exact && report.spark_rank_share * ranks as f64 > 1.001 {
+            waste.push(Waste { device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
+                128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
+                bytes: (stored - even) * ranks as u64 });
+        }
+    }
+
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
@@ -588,6 +640,12 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
                     devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));
                 }
             }
+            if family != "deepseek_v41" {
+                let target = options.pool_tokens.filter(|&tokens| tokens != 0)
+                    .unwrap_or_else(|| if options.rtx_bytes[0] <= 32 * GIB { 1_000_000 } else { options.target_pool_tokens });
+                let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
+                resolve_encoder(report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
+            }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
                 .unwrap_or_else(|| size_pool(&free, &per_token, unit, if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS } else { options.target_pool_tokens }));
@@ -622,52 +680,22 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
-
-    // Spark ranks.
-    if let ExpertPlacement::Sparks { ranks } = report.placement {
-        let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.component != Component::SpeculatorExpert).map(|c| c.bytes).sum::<u64>().saturating_sub(if family == "deepseek_v41" { local_bytes } else { 0 });
-        let stored = (routed as f64 * report.spark_rank_share) as u64;
-        let even = routed / ranks.max(1) as u64;
-        // EXL3 packages and FP8/MXFP4/NVFP4 packages with exact layouts store each
-        // rank's own whole 128-row blocks; other packages (V4.1 native) pad every
-        // rank to the widest slice.
-        let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
-        let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
-        let exact = !package.starts_with("v41") && intermediate % 128 == 0 && intermediate / 128 >= ranks;
-        let rank_bytes = |rank: usize| -> u64 {
-            if !exact {
-                return stored;
+    // V4.1 auto-selects local experts after KV sizing. Preserve its original
+    // Spark slice accounting even though generic encoder placement needs the
+    // Spark inventory earlier.
+    if family == "deepseek_v41" {
+        let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.component != Component::SpeculatorExpert).map(|c| c.bytes).sum();
+        for spark in &mut spark_devices {
+            if let Some(experts) = spark.items.iter_mut().find(|i| i.category == Category::Experts) {
+                experts.bytes = (routed.saturating_sub(local_bytes) as f64 * report.spark_rank_share) as u64;
             }
-            let blocks = intermediate / 128;
-            let own = blocks / ranks + usize::from(rank < blocks % ranks);
-            (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
-        };
-        for rank in 0..ranks {
-            let stored = rank_bytes(rank);
-            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
-                items: Vec::new(), kv_tokens: 0 };
-            if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
-                // Recover physical memory from the legacy usable inventory
-                // (13 GiB excluded), then charge the family's observed host
-                // footprint separately from expert allocations.
-                device.capacity_bytes += 13 * GIB;
-                device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", costs.spark_host_bytes, allowance_basis));
-            }
-            let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
-                .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
-            device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
-            let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
-            device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, allowance_basis));
-            device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, allowance_basis));
-            device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, allowance_basis));
-            devices.push(device);
-        }
-        if !exact && report.spark_rank_share * ranks as f64 > 1.001 {
-            waste.push(Waste { device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
-                128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
-                bytes: (stored - even) * ranks as u64 });
         }
     }
+
+    if family != "deepseek_v41" && report.encoder.is_none() {
+        resolve_encoder(report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options.vision_replicas, &mut notes);
+    }
+    devices.extend(spark_devices);
     MemoryLayout { devices, pool_tokens, waste, notes }
 }
 
@@ -833,4 +861,55 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
         }
         groups.into_iter().map(|((g, f), b)| (g, f, b)).collect()
     }).collect())
+}
+
+fn resolve_encoder(report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], replicas: usize, notes: &mut Vec<String>) {
+    use super::encoder::*;
+    let source = report.components.iter().find(|c| c.component == Component::Vision);
+    let source_bytes = source.map_or(0, |c| c.bytes);
+    // MiMo resident vectors are FP32. The measured 4096-token native ledger
+    // includes the fixed 4096-row GEMM staging and 4 MiB BLAS workspace.
+    let (weights, scratch) = if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
+        let width = model.spec().hidden as u64;
+        (1_458_170_944 + width.saturating_sub(4096) * 5120 * 2, mimo_scratch_bytes(width))
+    } else { (source_bytes, 512 * MIB) };
+    let hardware = EncoderHardware { v41: false,
+        gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
+        sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
+            expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: d.free_bytes().max(0) as u64 }).collect() };
+    let placement = encoder_placement(report.vision, &hardware, weights, scratch, replicas);
+    let add = |d: &mut DeviceLayout| {
+        d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
+        d.items.push(Item::new(Category::Workspace, "vision scratch", "resident", placement.scratch, Basis::Formula));
+    };
+    match placement.kind {
+        EncoderKind::Rtx { gpu } => add(&mut rtx[gpu]),
+        EncoderKind::Spark { rank } => {
+            for d in sparks.iter_mut().filter(|d| d.index as usize == rank || placement.replicas.contains(&(d.index as usize))) { add(d); }
+        }
+        EncoderKind::Off if matches!(report.vision, super::MediaMode::Rtx(_) | super::MediaMode::Spark(_)) => {
+            report.placement_supported = false;
+            report.hints.push(super::Hint {
+                what: format!("requested vision placement unavailable: {}", placement.reason),
+                how: format!("Select an available encoder device with tower/scratch/KV headroom (shortfall {} bytes), or explicitly use --vision=off.", placement.shortfall),
+            });
+        }
+        EncoderKind::Off => {
+            if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Vision) {
+                report.disabled_media_bytes += c.bytes;
+                c.bytes = 0;
+                c.status = Status::Disabled;
+            }
+        }
+        EncoderKind::SparkIdle { .. } => {},
+    }
+    notes.push(format!("vision {:?}: {}; {} bytes admitted; shortfall {} bytes", placement.kind, placement.reason, placement.admitted_bytes(), placement.shortfall));
+    report.encoder = Some(placement);
+}
+
+fn mimo_scratch_bytes(width: u64) -> u64 {
+    let n = 4096 * 4;
+    [n*1280*4,n*1280*4,n*1280*2,n*1536*2,n*2048*2,n*512*2,n*512*2,n*2048*2,4096*width*2,
+     4096*3072*4,4096*1280*4,4096*2*4608*4,4096*4608*2,4096*5120*4,4096*5120*2,4096*width*4,
+     n*16*16*3,3*256*4,n*2*4,n*2*4,4096*4,4096*4,4*MIB].into_iter().map(|b| b.div_ceil(256)*256).sum()
 }

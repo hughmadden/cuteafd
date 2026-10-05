@@ -2,6 +2,7 @@
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
 pub mod experts;
+pub mod encoder;
 pub mod families;
 pub mod family;
 pub mod format;
@@ -24,12 +25,20 @@ pub use spec::{AttentionKind, Component, FfnKind, ModelSpec, TensorRole};
 /// Requested policy; never implies that an encoder has actually been loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaMode { Auto, Off }
+pub enum MediaMode { Auto, Off, Rtx(Option<usize>), Spark(Option<usize>) }
 impl std::str::FromStr for MediaMode {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value { "auto" => Ok(Self::Auto), "off" => Ok(Self::Off),
-            _ => Err("media mode must be auto or off".into()) }
+        match value {
+            "auto" => Ok(Self::Auto), "off" => Ok(Self::Off),
+            "rtx" => Ok(Self::Rtx(None)), "spark" => Ok(Self::Spark(None)),
+            _ => {
+                let (kind, rank) = value.split_once(':').ok_or("media mode must be auto, off, rtx[:gpu] or spark[:rank]")?;
+                let rank = rank.parse::<usize>().map_err(|_| "encoder device must be an unsigned integer")?;
+                match kind { "rtx" => Ok(Self::Rtx(Some(rank))), "spark" => Ok(Self::Spark(Some(rank))),
+                    _ => Err("media mode must be auto, off, rtx[:gpu] or spark[:rank]".into()) }
+            }
+        }
     }
 }
 
@@ -131,6 +140,8 @@ pub struct PlanReport {
     pub vision: MediaMode,
     pub audio: MediaMode,
     pub disabled_media_bytes: u64,
+    pub encoder: Option<encoder::EncoderPlacement>,
+    pub encoder_plan_hash: String,
     pub snapshot: String,
     pub family: Option<String>,
     pub architectures: Vec<String>,
@@ -260,6 +271,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         vision: options.vision,
         audio: options.audio,
         disabled_media_bytes: 0,
+        encoder: None,
+        encoder_plan_hash: String::new(),
         snapshot: snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
@@ -436,7 +449,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
-        let memory = layout::layout(&report, model.as_ref(), &checkpoint, layout_options);
+        let memory = layout::layout(&mut report, model.as_ref(), &checkpoint, layout_options);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -473,6 +486,25 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             how: "Finish the download (hf download) or replicate it (nest replicate hf:ORG/NAME).".into(),
         });
     }
+    if options.layout.is_none() && spec.family != "deepseek_v41" {
+        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes, ..Default::default() };
+        let _ = layout::layout(&mut report, model.as_ref(), &checkpoint, &inventory);
+    }
+    if let Some(encoder) = &report.encoder {
+        let owner = match &encoder.kind {
+            encoder::EncoderKind::Rtx { gpu } => Some(format!("rtx{gpu} vision")),
+            encoder::EncoderKind::Spark { rank } => Some(format!("spark{rank} vision")),
+            encoder::EncoderKind::SparkIdle { host } => Some(format!("{host} vision")),
+            encoder::EncoderKind::Off => None,
+        };
+        if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
+    }
+    use sha2::{Digest, Sha256};
+    let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
+        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision))
+        .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
+    let contract = serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement, report.vision, report.audio, &report.encoder)).expect("plan serializes");
+    report.encoder_plan_hash = format!("{:x}", Sha256::digest(contract));
     report.spec = Some(spec.clone());
     Ok(report)
 }
@@ -483,7 +515,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     let bytes_of = |owner: Owner| -> u64 {
-        report.components.iter().filter(|c| c.owner == owner).map(|c| c.bytes).sum()
+        report.components.iter().filter(|c| c.owner == owner && !(spec.family != "deepseek_v41" && c.component == Component::Vision)).map(|c| c.bytes).sum()
     };
     let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
     for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {
@@ -637,6 +669,11 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
+    if let Some(encoder) = &report.encoder {
+        let arch = if matches!(encoder.kind, encoder::EncoderKind::Rtx { .. }) { "vision.sm120" } else { "vision.sm121" };
+        let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} (MiMo key-0 attention); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
+        let _ = writeln!(out, "media hash {}", report.encoder_plan_hash);
+    }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
     if let Some(quantization) = &report.quantization {
