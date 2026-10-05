@@ -761,7 +761,12 @@ Work, in priority order:
    (64 MiB) after `resolve_capacity`, so an automatic pool that fills the
    budget (466 KB margin) is admitted and then refused at startup
    (shortfall 66.6 MB). Reserve every startup-phase temporary before pool
-   resolution, in every family's admission.
+   resolution, in every family's admission. KV admission bug (2026-10-05,
+   fidelity agent): DeepSeek V4 Pro EXL3-K2 TP4 on one RTX with
+   max-context = pool = 16384 tokens, max-output 1024, max-sequences 1
+   admitted 82 sequential set probes, then the next allocation needed 66
+   pages with 65 of 65 free. Admission must reserve prompt + max_tokens
+   in pages, rounded to page boundaries, before accepting a request.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
