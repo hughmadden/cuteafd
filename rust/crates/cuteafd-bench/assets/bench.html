@@ -291,7 +291,7 @@ function renderPanels() {
     pbar.hidden = !running;
     if (running) {
       pbar.querySelector('span').style.width = `${(100 * progress.panel_fraction).toFixed(1)}%`;
-      pbar.querySelector('.pl').textContent = `${progress.label || ''} · ETA ${secs(progress.eta_s)}`;
+      pbar.querySelector('.pl').textContent = `${progress.label || ''} · ETA ${secs(progress.panel_eta_s ?? progress.eta_s)}`;
     }
     const desc = card.querySelector('.desc');
     desc.textContent = hasData(id) ? '' : (meta.unavailable ? `Unavailable: ${meta.unavailable}` : (meta.description || ''));
