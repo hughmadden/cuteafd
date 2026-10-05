@@ -21,7 +21,8 @@ Base: origin/work/p0 163c3a36
 - Generation media probes implemented: authorized HTTP endpoint holds/relinquishes the benchmark slot; native expanded image spans echo actual prepared keys/grids. Supplied prompt_ids + spec.media validate sources, fixture hashes, complete keys, grids, placeholder rows and boundaries without re-rendering/re-expanding. Cold generation probes never retain prompt snapshots.
 - Generation probe software gates: full cargo workspace zero failures; scripts 998 passed, 2 skipped, 193 subtests passed in 71.49 s, zero failing IDs. Source hash, authorization, API source preparation, native span echo and already-expanded identity regressions pass. Live generation capture and media scoring/swap still pending.
 - No defaults promoted; V4.1 serving untouched; main checkout untouched.
-- No WP-5 hardware job queued or locks held. WP-4 full WIP pair in slot mm-wp4 is available for native reuse; no duplicate full build.
+- Frozen 78e89642 generation daemon/root image built. Bounded eight-fixture native capture running under sparks->gpu0 with BF16 KV, zero prefix entries, speculation off; WP-8 arm live-media-v1/arm.json. WP-4 notified to wait for exact cleanup.
+- WIP feature hook/media scoring: domain-separated admitted override leases, strict metadata/payload/snapshot checks, cold/no-speculation teacher-force only, media-aware prefill/verify and graph bypass. Not tested or qualified yet; no green claim.
 - Standard run.sh/run-family.sh/wip.sh UID behavior remains unchanged. UID1000 applies only to fidelity custom qualification containers.
 
 ## Gates

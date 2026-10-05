@@ -1295,6 +1295,14 @@ impl<'a> MimoEngine<'a> {
     /// [`Self::verify`] leaving every row's logits on the device.
     pub fn verify_device(&self, sequences: &mut [(&mut MimoPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
+        self.verify_media_device(sequences, tokens, on_layer, None)
+    }
+
+    /// A single-sequence diagnostic step may contain teacher-forced image rows.
+    pub fn verify_media_device(&self, sequences: &mut [(&mut MimoPlacement, usize)], tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        ensure!(media.is_none() || sequences.len() == 1, "media verification requires one sequence");
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // With graphs one stride for every step (they bake it in): the pages of a full context.
@@ -1315,7 +1323,7 @@ impl<'a> MimoEngine<'a> {
                 tables.page_table.extend(pages);
             }
         }
-        let logits = self.step(&tables, tokens, rows, on_layer, None, None)?;
+        let logits = self.step(&tables, tokens, rows, on_layer, None, media)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
@@ -1374,7 +1382,7 @@ impl<'a> MimoEngine<'a> {
                 self.put(&w.page_table, &tables.page_table)
             })?;
         }
-        if tables.decode && self.decode_graphs && on_layer.is_none() && forced.is_none() && self.graphable() {
+        if tables.decode && self.decode_graphs && on_layer.is_none() && forced.is_none() && media.is_none() && self.graphable() {
             // The first captured segment gathers the rows from the uploaded ids; the
             // last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();

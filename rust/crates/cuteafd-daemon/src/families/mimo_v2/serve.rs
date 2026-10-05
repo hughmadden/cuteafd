@@ -487,7 +487,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         let events = job.events.clone();
-                        let (prompt, request_media, jobs) = match super::media::prepare(job, tokens, config,
+                        let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, config,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
                             Ok(prepared) => prepared,
                             Err(error) => { let _ = events.send(Err(NativeFailure::BadRequest(format!("{error:#}")))); continue; }
@@ -495,6 +495,11 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         if prompt.tokens.is_empty() || prompt.tokens.len() >= engine.max_context {
                             let _ = events.send(Err(NativeFailure::BadRequest(format!("prompt of {} tokens is outside 1..{}",
                                 prompt.tokens.len(), engine.max_context))));
+                            continue;
+                        }
+                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                            let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
+                            drop(request_media); media.cache.prune_reservations();
                             continue;
                         }
                         let resume = if probe::cold(&prompt.job.probe) { 0 }
@@ -567,8 +572,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
                     DECODE_ROWS, &mut placement,
-                    |placement, chunk, _| engine.prefill_device(placement, chunk, false, None, None),
-                    |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, None)?
+                    |placement, chunk, _last_logits| engine.prefill_media_device(placement, chunk, false, None, None, Some(&request_media)),
+                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }

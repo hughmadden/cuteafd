@@ -126,6 +126,98 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeatureMetadata {
+    schema: String,
+    key: String,
+    grid: [u32; 3],
+    shape: [usize; 2],
+    dtype: String,
+    sha256: String,
+    tower_dtype: String,
+    fixture_sha256: String,
+    snapshot_identity: serde_json::Value,
+}
+
+fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let mut identity = serde_json::json!({"snapshot_revision": snapshot.file_name().and_then(|s| s.to_str())
+        .context("snapshot revision")?});
+    for (key, file) in [("config", "config.json"), ("tokenizer", "tokenizer.json"),
+        ("modeling", "modeling_mimo_v2.py"), ("preprocessor", "preprocessor_config.json")] {
+        identity[format!("{key}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?)).into();
+    }
+    Ok(identity)
+}
+
+fn read_bounded(path: &std::path::Path, limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(file.metadata()?.len() <= limit as u64, "feature file exceeds bound");
+    let mut bytes = Vec::new(); file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= limit, "feature file exceeds bound");
+    Ok(bytes)
+}
+
+/// Strict paired-G4 hook. Only scoring probes bypass the encoder; ordinary
+/// generation remains native. Separate cache identities cannot warm native images.
+pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &std::path::Path) -> Result<()> {
+    let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.media.is_empty()) else {
+        return Ok(());
+    };
+    let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
+    anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
+    probe.spec.validate_media()?;
+    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?)
+}
+
+fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, root: &std::path::Path, identity: &serde_json::Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let probe = prompt.job.probe.as_ref().context("features require a probe")?;
+    anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation && probe.spec.score_from.is_some()
+        && !probe.spec.media.is_empty(), "features require a cold, speculation-free media scoring probe");
+    let root = root.canonicalize()?;
+    let mut provenance = Vec::new();
+    for span in &probe.spec.media {
+        let fixture = span.fixture.as_ref().context("feature probes require fixture identity")?;
+        anyhow::ensure!(cuteafd_api::openai::probe::sha256_hex(&span.key), "invalid feature key");
+        let metadata_path = root.join(format!("{}.json", span.key)).canonicalize()?;
+        let payload_path = root.join(format!("{}.bf16", span.key)).canonicalize()?;
+        anyhow::ensure!(metadata_path.starts_with(&root) && payload_path.starts_with(&root), "feature path escapes root");
+        let raw = read_bounded(&metadata_path, 64 << 10)?;
+        let meta: FeatureMetadata = serde_json::from_slice(&raw)?;
+        anyhow::ensure!(meta.schema == "cuteafd.media.features/1" && meta.key == span.key && meta.grid == span.grid
+            && meta.shape == [span.len, media.row_bytes() / 2] && meta.dtype == "bf16-le"
+            && matches!(meta.tower_dtype.as_str(), "bf16" | "fp32")
+            && cuteafd_api::openai::probe::sha256_hex(&meta.sha256)
+            && meta.fixture_sha256 == fixture.sha256 && meta.snapshot_identity == *identity,
+            "reference feature metadata differs from prepared request/snapshot");
+        let bytes = span.len.checked_mul(media.row_bytes()).context("feature byte extent")?;
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd.probe.feature_override/1\0"); hash.update(span.key.as_bytes()); hash.update(&raw);
+        let override_key = cuteafd_loader::media::ImageKey(hash.finalize().into());
+        let image = prompt.job.media.iter().find(|i| key_hex(i.key) == span.key).context("feature span has no prepared image")?;
+        // Admission precedes payload allocation, including on a warm override-cache hit.
+        let pin = cache.reserve(override_key, bytes)?;
+        let payload = read_bounded(&payload_path, bytes)?;
+        anyhow::ensure!(payload.len() == bytes && format!("{:x}", Sha256::digest(&payload)) == meta.sha256,
+            "reference feature payload length/hash differs");
+        anyhow::ensure!(payload.chunks_exact(2).all(|b| {
+            let bits = u16::from_le_bytes([b[0], b[1]]);
+            (bits & 0x7f80) != 0x7f80
+        }), "reference features contain nonfinite BF16 values");
+        let lease = cache.complete(override_key, Arc::from(payload))?;
+        media.attach_probe_override(image.key, lease)?; drop(pin);
+        provenance.push(serde_json::from_slice::<serde_json::Value>(&raw)?);
+    }
+    probe.provenance(serde_json::json!({"mode": "reference_features", "probe_only": true,
+        "encoder_bypassed": true, "features": provenance}));
+    Ok(())
+}
+
 fn key_hex(key: cuteafd_loader::media::ImageKey) -> String {
     key.0.iter().map(|b| format!("{b:02x}")).collect()
 }
