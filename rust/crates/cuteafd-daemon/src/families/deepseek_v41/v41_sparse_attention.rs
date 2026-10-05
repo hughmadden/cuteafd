@@ -639,6 +639,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if let Some(tail) = tail.as_deref_mut() { unsafe { tail.replay_state()?; } }
             graph
         } else {
+            tracing::debug!(target: "cuteafd::graph_capture", site="sparse_attention", layer, rows,
+                retained=self.graphs[layer].len(), limit=self.graph_limit, key=?fingerprint,
+                "graph cache miss");
             tracing::debug!(target: "cuteafd::timing", layer, rows, batched = batch.is_some(), "sparse graph capture");
             if !defer_warmup { self.synchronize()?; }
             let limit = if batch.is_some() { self.batch_rows } else { self.graph_limit };

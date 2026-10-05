@@ -796,6 +796,11 @@ impl WindowWave<'_, '_> {
         if (1..=self.retained_graphs.len()).contains(&rows) {
             self.graph = self.retained_graphs[rows - 1].take();
         }
+        if self.graph.is_none() {
+            tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
+                rows, owner, bank=self as *const Self as usize,
+                retained=self.retained_graphs.iter().flatten().count(), "graph cache miss");
+        }
         Ok(())
     }
     pub fn clear_graph(&mut self) -> Result<()> {

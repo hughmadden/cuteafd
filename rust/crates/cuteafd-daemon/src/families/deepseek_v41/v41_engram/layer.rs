@@ -2,6 +2,7 @@
 use super::EngramDeviceView;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_layer_graphs::RowGraphs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
@@ -76,10 +77,7 @@ pub(crate) struct EngramGate<'weights, 'library> {
     residual: DeviceAllocation<'library>,
     embeddings: DeviceAllocation<'library>,
     text_mask: DeviceAllocation<'library>,
-    graph: Option<(*mut std::ffi::c_void, usize)>,
-    /// Device-ordered passes keep other row counts' graphs here (a cold row
-    /// count captures with a host wait).
-    retained: Vec<(*mut std::ffi::c_void, usize)>,
+    graphs: RowGraphs<'library>,
     projected: DeviceAllocation<'library>,
     scratch: DeviceAllocation<'library>,
     alpha: DeviceAllocation<'library>,
@@ -94,15 +92,14 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     }
     /// # Safety
     /// Same input ownership and row-order contract as execute. Captures only
-    /// this gate's owned buffers and recaptures when the live shape changes.
+    /// this gate's owned buffers and retains the finite decode shape set.
     pub unsafe fn execute_captured(
         &mut self,
         residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        if self.graph.as_ref().is_none_or(|(_, rows)| *rows != gathered.rows) {
-            self.clear_graph()?;
+        if self.graphs.get(gathered.rows).is_none() {
             unsafe { self.capture(residual, gathered)?; }
         }
         unsafe { self.replay(residual, gathered) }
@@ -145,8 +142,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             residual: DeviceAllocation::new(weights.library, output_bytes)?,
             embeddings: DeviceAllocation::new(weights.library, capacity * 24 * 512)?,
             text_mask: DeviceAllocation::new(weights.library, capacity)?,
-            graph: None,
-            retained: Vec::new(),
+            graphs: RowGraphs::new(weights.library, "engram"),
             projected: DeviceAllocation::new(weights.library, projected_bytes)?,
             scratch: DeviceAllocation::new(weights.library, scratch_bytes)?,
             alpha: DeviceAllocation::new(weights.library, 4)?,
@@ -292,7 +288,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView,
     ) -> Result<()> {
-        ensure!(self.graph.is_none(), "engram graph is already captured");
+        ensure!(self.graphs.get(gathered.rows).is_none(), "engram graph is already captured");
         unsafe {
             self.execute(residual, gathered)?;
         }
@@ -310,7 +306,12 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let captured = unsafe { self.weights.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: eager warmup drained all users; this capture has not launched.
+                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                    // SAFETY: the rejected graph has no queued launches.
+                    unsafe { self.weights.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -331,11 +332,8 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        let (graph, rows) = self.graph.context("engram graph has not been captured")?;
-        ensure!(
-            rows == gathered.rows,
-            "engram replay row count differs from capture"
-        );
+        let rows = gathered.rows;
+        let graph = self.graphs.get(rows).context("engram graph has not been captured for these rows")?;
         let launched = unsafe {
             self.stage_inputs(residual, gathered)?;
             self.weights
@@ -352,29 +350,21 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub async unsafe fn execute_into_cooperative(&mut self, residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView) -> Result<()> {
         self.ready_rows = None;
-        if crate::shared::memory::chain::device_enabled()
-            && self.graph.as_ref().is_some_and(|(_, rows)| *rows != gathered.rows) {
-            // Swap in a retained graph of this row count (or none), keeping the active one.
-            let found = self.retained.iter().position(|(_, rows)| *rows == gathered.rows)
-                .map(|index| self.retained.swap_remove(index));
-            if let Some(active) = std::mem::replace(&mut self.graph, found) {
-                self.retained.push(active);
-            }
-        }
-        let cold = self.graph.as_ref().is_none_or(|(_, rows)| *rows != gathered.rows);
-        if cold && self.graph.is_some() { self.clear_active_graph()?; }
+        let graph = self.graphs.get(gathered.rows);
+        let cold = graph.is_none();
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.weights.library, self.stream.raw)?;
             self.enqueue_inputs(residual, gathered)?;
             if cold { self.enqueue(gathered.rows) } else {
-                self.weights.library.cuda_graph_launch(self.graph.unwrap().0, self.stream.raw)
+                self.weights.library.cuda_graph_launch(graph.unwrap(), self.stream.raw)
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         if cold {
             self.stream.wait().await?;
             unsafe { self.capture_ready(gathered.rows)?; }
-            let launched = unsafe { self.weights.library.cuda_graph_launch(self.graph.unwrap().0, self.stream.raw) };
+            let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;
+            let launched = unsafe { self.weights.library.cuda_graph_launch(graph, self.stream.raw) };
             if let Err(error) = launched { self.synchronize()?; return Err(error); }
         }
         let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.output.buffer,
@@ -410,22 +400,11 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         eprintln!("PASS queued Engram gate {}: exact gate/residual parity, pending cancellation={cancelled}, reuse", self.layer());
         Ok(())
     }
-    fn clear_active_graph(&mut self) -> Result<()> {
-        self.ready_rows = None;
-        self.stream.require_complete()?;
-        if let Some((graph, _)) = self.graph.take() {
-            unsafe {
-                self.weights.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
-        Ok(())
-    }
     pub fn clear_graph(&mut self) -> Result<()> {
-        self.clear_active_graph()?;
-        for (graph, _) in self.retained.drain(..) {
-            unsafe { self.weights.library.cuda_graph_exec_destroy(graph)?; }
-        }
-        Ok(())
+        self.ready_rows = None;
+        self.synchronize()?;
+        // SAFETY: explicit synchronization drains all queued graph/storage uses.
+        unsafe { self.graphs.clear() }
     }
     /// Borrowed BF16 residual; never free or retain across reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
@@ -449,10 +428,9 @@ impl Drop for EngramGate<'_, '_> {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error, "draining native engram residual gate");
         }
-        for (graph, _) in self.graph.take().into_iter().chain(self.retained.drain(..)) {
-            if let Err(error) = unsafe { self.weights.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error, "destroying native engram graph");
-            }
+        // SAFETY: destruction follows the containing stream's drain.
+        if let Err(error) = unsafe { self.graphs.clear() } {
+            tracing::error!(%error, "destroying native engram graphs");
         }
     }
 }

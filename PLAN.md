@@ -1179,7 +1179,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         recompute only. Smoke V4 Flash min and V4.1 min: prompt and turn end
         2 rows byte-identical, cold recompute differs. Deterministic prefill
         stays open: an ordered serial-slice reducer passed component gates
-        on a private codex branch (Flash TP4 only); not merged.
+        on a private codex branch (Flash TP4 only); not merged. V4.1's unchanged
+        base also produces different long-context reasoning across launches
+        with fixed dSpark drafts (34,745-token prompt, 2,048-token output);
+        cold/warm restores match within each launch. Long text comparisons
+        cannot qualify decode graph changes until cold prefill is deterministic.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         Opt-in BF16 expert-input Spark packages (`EXPERT_INPUT=bf16`,
         `CUTEAFD_*_FP8_MOE_BF16_FAMILIES=mimo`) improve it; default stays FP8.
