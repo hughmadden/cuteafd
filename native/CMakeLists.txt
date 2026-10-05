@@ -290,6 +290,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v41/cuda/v41_dspark_attention.cu
     families/deepseek_v41/cuda/v41_compressor.cu
     families/deepseek_v41/cuda/v41_vision.cu
+    shared/cuda/vision_runtime.cu
     families/deepseek_v41/cuda/v41_kv.cu
     families/deepseek_v41/cuda/v41_sparse_attention.cu
     shared/cuda/peer_copy.cu
