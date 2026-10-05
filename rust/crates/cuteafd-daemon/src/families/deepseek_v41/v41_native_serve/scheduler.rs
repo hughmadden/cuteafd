@@ -11,6 +11,7 @@ use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
 use super::console;
+use super::copy_drafts::{self, CopyDrafter};
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
@@ -30,7 +31,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, lane: 0, finished: false, cacheable: false, failed: false,
-        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
+        tokens: tokens.to_vec(), image_keys, next_after_commit: None, copy: None };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
@@ -76,6 +77,8 @@ pub(super) struct Active<'a> {
     tokens: Vec<u32>,
     image_keys: ImageKeys,
     next_after_commit: Option<TokenScores>,
+    /// Copy windows over `tokens`; `None` when copy drafting is off.
+    copy: Option<CopyDrafter>,
 }
 impl Active<'_> {
     /// Why the request left the scheduler, for the live console.
@@ -195,6 +198,7 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
         "host_cache_config": prefixes.host_config(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
+        "copy_drafts": copy_drafts::stats(),
         "totals": console::totals::snapshot(),
     })
 }
@@ -215,6 +219,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut pending: Option<admission::Pending> = None;
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    let copy_windows = draft.is_some() && copy_drafts::enabled();
+    tracing::info!(copy_drafts=copy_windows, window=copy_drafts::WINDOW, "copy-window drafting");
     loop {
         prefixes.tick();
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
@@ -247,7 +253,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let active_count = active.iter().flatten().count();
             if pending.as_ref().is_some_and(|p| p.active_when_blocked == active_count
                 && !p.prepared.job.events.is_closed()) { break; }
-            let prepared = if let Some(pending) = pending.take() { pending.prepared } else {
+            let mut prepared = if let Some(pending) = pending.take() { pending.prepared } else {
                 let job = if active_count == 0 && !closed {
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
@@ -279,7 +285,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let lane = usize::from(loads[1] < loads[0]);
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
-                let admission::Prepared { job, prompt, images } = &prepared;
+                let admission::Prepared { job, prompt, images } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = prefixes.prepare_key(prompt, images)?;
                 if !images.is_empty() {
@@ -298,7 +304,24 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     .collect::<Result<Vec<_>>>()?;
                 capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
                     requests.cache().committed_end(lease)?)?));
-                prefixes.make_room(requests, &capacity)?;
+                if let Err(error) = prefixes.make_room(requests, &capacity) {
+                    if active_count != 0 || hit.is_none()
+                        || error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
+                        return Err(error);
+                    }
+                    let committed = requests.cache().committed_end(lease)?;
+                    let output = admission::fit_output(job.max_tokens, |output| {
+                        let append = admission::remaining_budget(prompt.len(), output, committed)?;
+                        match requests.cache().check_append_capacity(&[(lease, append)]) {
+                            Ok(()) => Ok(true),
+                            Err(error) if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some() => Ok(false),
+                            Err(error) => Err(error),
+                        }
+                    })?.ok_or(error)?;
+                    tracing::info!(request_id=id, requested=job.max_tokens, reserved=output,
+                        "shrinking output reservation to preserve reused device snapshot");
+                    job.max_tokens = output;
+                }
                 Ok((image_keys, hit, restore))
             })();
             let (image_keys, hit, restore) = match admitted {
@@ -392,7 +415,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // The first generated token is emitted-token index 0.
                 let anchor = scores.sample(mask, job.sampling, 0)?;
                 Ok(Active { constraint, id, lease, job, decoder, anchor, generated: 0, buffered: 0, lane,
-                    finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores) })
+                    finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
+                    copy: copy_windows.then(CopyDrafter::default) })
             })();
             match result {
                 Ok(mut request) => {
@@ -1201,6 +1225,41 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
     requests.prepare(&work)
 }
 
+/// Copy-window verify inputs for one lane round, in member order:
+/// `[anchor, copied...]` for a greedy request whose history ends in eight
+/// tokens it has seen before, else `None` and dSpark drafts it. A sampled
+/// request never copies: its draw leaves copied text more often, and a copy
+/// that fails costs the request dSpark's drafts for that round. A copy takes
+/// the same grammar truncation as dSpark drafts; one cut below two tokens goes
+/// to dSpark.
+fn copy_inputs(active: &mut [Option<Active<'_>>], members: &[usize], max_drafts: usize)
+    -> Result<Vec<Option<Vec<u32>>>> {
+    members.iter().map(|&slot| {
+        let request = active[slot].as_mut().unwrap();
+        if !request.job.sampling.is_greedy() || crate::shared::probe::no_speculation(&request.job.probe) { return Ok(None); }
+        let cap = copy_drafts::cap(request.job.max_tokens - request.generated, max_drafts);
+        let Some(copied) = request.copy.as_mut().and_then(|copy| copy.propose(&request.tokens, cap))
+            else { return Ok(None) };
+        let mut input = Vec::with_capacity(copied.len() + 1);
+        input.push(request.anchor);
+        input.extend(copied);
+        if let Some(constraint) = &request.constraint { constraint.truncate_proposal(&mut input)?; }
+        Ok((input.len() > copy_drafts::MIN_DRAFTS).then_some(input))
+    }).collect()
+}
+
+/// Count each copy the round verified, and back off a request whose copy
+/// accepted nothing.
+fn finish_copies(active: &mut [Option<Active<'_>>], members: &[usize], copied: &[bool],
+    inputs: &[Vec<u32>], accepted: &[u32]) {
+    for (((&slot, &copied), input), &accepted) in members.iter().zip(copied).zip(inputs).zip(accepted) {
+        if !copied { continue; }
+        let drafts = accepted.saturating_sub(1) as usize;
+        copy_drafts::record_round(input.len() - 1, drafts);
+        if let Some(copy) = active[slot].as_mut().and_then(|request| request.copy.as_mut()) { copy.observe(drafts); }
+    }
+}
+
 fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     lane: usize, pass: &mut TargetPass<'w, 'a>, requests: &mut Requests<'a>,
     transport: &mut NativeTp4Wave<'a>, active: &mut [Option<Active<'a>>],
@@ -1215,8 +1274,17 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
     }).collect::<Result<Vec<_>>>()?;
     let draft_start = Instant::now();
-    let mut inputs = if let Some(draft) = draft.as_deref_mut() { draft.propose(lib, lane, &seeds)? }
-        else { seeds.iter().map(|r| vec![r.1]).collect() };
+    let copies = copy_inputs(active, members, draft.as_deref().map_or(0, |d| d.max_verify_rows() - 1))?;
+    let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
+    let drafting: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| !**copied).map(|(seed, _)| *seed).collect();
+    if let Some(draft) = draft.as_deref_mut().filter(|_| copied.contains(&true)) {
+        let ids: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| **copied).map(|(seed, _)| seed.0).collect();
+        draft.skip_copied(lane, &ids, !drafting.is_empty())?;
+    }
+    let drafted = if drafting.is_empty() { Vec::new() }
+        else if let Some(draft) = draft.as_deref_mut() { draft.propose(lib, lane, &drafting)? }
+        else { drafting.iter().map(|r| vec![r.1]).collect() };
+    let mut inputs = copy_drafts::merge(copies, drafted)?;
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
@@ -1225,10 +1293,11 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     }
     // This path runs only while the other lane is empty.
     if let Some(draft) = draft.as_deref_mut() {
-        let candidates: Vec<_> = members.iter().zip(&inputs).map(|(&slot, input)|
-            (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+        let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
+            .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
         if let Some(lengths) = draft.select_lengths(lane, &candidates, false)? {
-            for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length+1); }
+            for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
+                            .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
         }
     }
     let draft_us = draft_start.elapsed().as_micros() as u64;
@@ -1273,6 +1342,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
             Some(&round), retain_enabled)?;
+        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         for (&slot, tokens) in members.iter().zip(emissions) {
@@ -1285,7 +1355,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         }
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, started, draft_us);
+            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
@@ -1314,6 +1384,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
+        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         for (&slot, tokens) in members.iter().zip(emissions) {
@@ -1326,7 +1397,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         }
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, started, draft_us);
+            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
@@ -1798,13 +1869,14 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
 
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,
     lane: usize, shared: bool, routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>],
-    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], started: Instant,
-    draft_us: u64,
+    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], copied: &[bool],
+    started: Instant, draft_us: u64,
 ) {
     let Some(draft) = draft else { return };
     if !capture_routes { return; }
-    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).filter_map(|((&slot, input), &count)|
-        active[slot].as_ref().map(|r| (r.id, input.len(), count))).collect();
+    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
+        .filter_map(|(((&slot, input), &count), &copied)|
+            active[slot].as_ref().map(|r| (r.id, input.len(), count, copied))).collect();
     if requests.len() != members.len() { return; }
     draft.observe_round(lane, shared, routes, layer_us, &requests, started.elapsed().as_micros() as u64, draft_us);
 }

@@ -191,6 +191,70 @@ fn eviction_order_is_prompts_before_turns_oldest_first() {
     assert_eq!(evicted, vec![p1, p2, t1]);
 }
 
+fn lru_snapshots() -> cuteafd_hostcache::snapshot::Snapshots {
+    let (pool, _memory) = cuteafd_hostcache::pool::testing::pool(1 << 30);
+    cuteafd_hostcache::snapshot::Snapshots::with_rule(pool, cuteafd_core::prefix::ReuseRule::V41,
+        cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent)
+}
+
+#[test]
+fn eviction_order_is_least_recently_used_first_across_banks() {
+    let mut store = lru_snapshots();
+    let p1 = store
+        .plan_store(meta(SnapshotKind::Prompt, &[1], false), &pages(&[id(1)]))
+        .expect("plan");
+    let p1 = store.commit_store(p1, 0);
+    let p2 = store
+        .plan_store(meta(SnapshotKind::Prompt, &[2], false), &pages(&[id(2)]))
+        .expect("plan");
+    let p2 = store.commit_store(p2, 1);
+    let t1 = store
+        .plan_store(meta(SnapshotKind::Turn, &[3], false), &pages(&[id(3)]))
+        .expect("plan");
+    let t1 = store.commit_store(t1, 2);
+    assert!(store.lookup(&[2], 3).is_some());
+    let (evicted, _) = store.evict_to(0);
+    assert_eq!(evicted, vec![p1, t1, p2]);
+}
+
+#[test]
+fn a_fresh_prompt_snapshot_outlives_a_stale_turn_snapshot() {
+    // Two conversations, each a prompt snapshot plus a turn snapshot that shares its pages; A
+    // is older than B. Evict down to exactly B's footprint.
+    let mut store = lru_snapshots();
+    let mut now = 0;
+    let mut commit = |kind, tokens: &[u32], ids: &[u32]| {
+        let ids: Vec<DevicePageId> = ids.iter().map(|&page| id(page)).collect();
+        let plan = store
+            .plan_store(meta(kind, tokens, false), &pages(&ids))
+            .expect("plan");
+        now += 1;
+        store.commit_store(plan, now)
+    };
+    let a_prompt = commit(SnapshotKind::Prompt, &[1, 2, 3, 4], &[1, 2]);
+    let a_turn = commit(SnapshotKind::Turn, &[1, 2, 3, 4, 5, 6], &[1, 2, 3]);
+    let b_prompt = commit(SnapshotKind::Prompt, &[11, 12, 13, 14], &[11, 12]);
+    commit(SnapshotKind::Turn, &[11, 12, 13, 14, 15, 16], &[11, 12, 13]);
+    let layout = cuteafd_hostcache::pool::testing::layout();
+    let b_bytes = 2 * (layout.tail + layout.scores) as u64 + 3 * layout.page as u64;
+
+    // Deleting A's prompt snapshot frees its tail only (its pages are A's turn's too), so A's
+    // turn snapshot goes next. The bank order deleted B's fresh prompt snapshot before A's
+    // stale turn ([a_prompt, b_prompt, a_turn]) and left only B's turn.
+    let (evicted, _) = store.evict_to(b_bytes);
+    assert_eq!(evicted, vec![a_prompt, a_turn]);
+    assert_eq!(store.bytes_used(), b_bytes);
+
+    // An exact repeat of B's prompt still restores from RAM instead of prefilling.
+    let hit = store
+        .lookup(&[11, 12, 13, 14], 5)
+        .expect("fresh prompt snapshot resident");
+    assert_eq!(hit.key, b_prompt);
+    assert_eq!(hit.kind, SnapshotKind::Prompt);
+    assert_eq!((hit.common, hit.frontier), (4, 4));
+    assert!(store.lookup(&[1, 2, 3, 4], 6).is_none());
+}
+
 #[test]
 fn remove_reports_whether_the_key_was_present() {
     let mut store = snapshots(1 << 30);

@@ -619,7 +619,8 @@ impl<'a> HostCacheBinding<'a> {
             return Ok(None);
         }
         let engine = CudaCopyEngine::new(library, template)?;
-        let cache = HostCache::new(config, Layout::engine(0), engine)?;
+        let cache = HostCache::with_rule(config, Layout::engine(0), engine,
+            cuteafd_core::prefix::ReuseRule::V41, cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent)?;
         tracing::info!(target: "cuteafd::host_cache", config = ?cache.config(), "host snapshot cache enabled");
         Ok(Some(Self { cache }))
     }

@@ -64,6 +64,11 @@ impl SourcePrefix {
     pub fn pages(&self) -> &[u32] {
         &self.pages
     }
+    /// Whether dropping this prefix cannot release any source page because live
+    /// request tables own every page. References from other snapshots do not count.
+    pub fn held_by(&self, active: &std::collections::HashSet<u32>) -> bool {
+        self.pages.iter().all(|page| active.contains(page))
+    }
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -93,6 +98,45 @@ impl Drop for SourcePrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_readmission_keeps_a_snapshot_larger_than_half_the_pool() {
+        use cuteafd_core::prefix::{Retention, SnapshotKind};
+        let pool = Rc::new(RefCell::new(PagePool::new(10)));
+        let pages = pool.borrow_mut().allocate(7).unwrap();
+        let mut retained = Retention::new(2);
+        retained.bank_mut(SnapshotKind::Prompt).insert(&[1, 2, 3], SourcePrefix {
+            pool: pool.clone(), pages: pages.clone(), rows: 7 * super::super::PAGE_ROWS,
+        });
+        // The lookup borrow pins the source until the fresh lease owns its pages,
+        // as in PrefixCache::restore. Re-admission needs only new output pages.
+        let (_, _, hit) = retained.lookup_reusable(&[1, 2, 3]).unwrap();
+        pool.borrow_mut().retain(hit.pages());
+        let active = hit.pages().iter().copied().collect();
+        assert!(retained.evict_one_where(&|prefix| prefix.held_by(&active)).is_none());
+        let output = pool.borrow_mut().allocate(2).unwrap();
+        assert!(retained.lookup_reusable(&[1, 2, 3]).is_some());
+        assert_eq!(pool.borrow().free.len(), 1);
+        pool.borrow_mut().release(&output);
+        pool.borrow_mut().release(&pages);
+        let (_, snapshot) = retained.evict_one_where(&|prefix| prefix.held_by(&Default::default())).unwrap();
+        drop(snapshot);
+        assert_eq!(pool.borrow().free.len(), 10);
+    }
+
+    #[test]
+    fn sharing_with_other_snapshots_does_not_protect_an_inactive_snapshot() {
+        let pool = Rc::new(RefCell::new(PagePool::new(4)));
+        let pages = pool.borrow_mut().allocate(3).unwrap();
+        let first = SourcePrefix { pool: pool.clone(), pages, rows: 3 * super::super::PAGE_ROWS };
+        let second = first.truncate(first.rows()).unwrap();
+        assert!(!first.held_by(&Default::default()));
+        let active = first.pages()[..2].iter().copied().collect();
+        assert!(!first.held_by(&active), "one unshared page is reclaimable");
+        drop(first);
+        drop(second);
+        assert_eq!(pool.borrow().free.len(), 4);
+    }
+
     #[test]
     fn prefix_eviction_frees_only_pages_without_active_owners() {
         let pool = Rc::new(RefCell::new(PagePool::new(3)));

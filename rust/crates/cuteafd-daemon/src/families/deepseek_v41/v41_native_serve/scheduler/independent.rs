@@ -71,17 +71,31 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                     Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
                 }).collect::<Result<Vec<_>>>()?
             };
-            let (mut inputs, draft_us) = loop {
+            // A request that copies from its own history skips this round's dSpark draft.
+            let copies = {
+                let max_drafts = draft.borrow().as_ref().map_or(0, |d| d.max_verify_rows() - 1);
+                copy_inputs(&mut active.borrow_mut(), &members, max_drafts)?
+            };
+            let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
+            let drafting: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| !**copied)
+                .map(|(seed, _)| *seed).collect();
+            if let Some(draft) = draft.borrow_mut().as_deref_mut().filter(|_| copied.contains(&true)) {
+                let ids: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| **copied)
+                    .map(|(seed, _)| seed.0).collect();
+                draft.skip_copied(lane, &ids, !drafting.is_empty())?;
+            }
+            let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
-                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &seeds)? }
-                    else { Some((seeds.iter().map(|r| vec![r.1]).collect(), 0)) }
+                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &drafting)? }
+                    else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
                 };
                 if let Some(inputs) = proposed { break inputs; }
                 // Even when a peer requests a cohort drain, finish our pending
                 // draft and transaction before retirement can recycle its slots.
                 tokio::task::yield_now().await;
-            };
+            } };
+            let mut inputs = copy_drafts::merge(copies, drafted)?;
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane != lane);
             let (inputs, mut batch, capture_routes) = {
@@ -96,10 +110,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 // Lengths are chosen from this lane's proposals and routes only;
                 // the peer lane's activity selects the shared-regime fit.
                 if let Some(draft) = draft.as_deref_mut() {
-                    let candidates: Vec<_> = members.iter().zip(&inputs).map(|(&slot, input)|
-                        (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+                    let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
+                        .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
                     if let Some(lengths) = draft.select_lengths(lane, &candidates, shared)? {
-                        for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length+1); }
+                        for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
+                            .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
                     }
                 }
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
@@ -214,6 +229,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 }
                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
                     &members, &mut batch, decision)?;
+                finish_copies(&mut active.borrow_mut(), &members, &copied, &inputs, &accepted_inputs);
                 let live = console::live();
                 let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id,
@@ -245,7 +261,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 let layer_us = pass.captured_layer_us();
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), capture_routes, lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
-                    &accepted_inputs, started, draft_us);
+                    &accepted_inputs, &copied, started, draft_us);
                 if let Some(live) = live {
                     let active = active.borrow();
                     live.push(console_round(tally, lane, shared, started, draft_us,

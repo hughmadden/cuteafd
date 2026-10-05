@@ -626,6 +626,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if streaming {
         let stream = async_stream::stream! {
             futures::pin_mut!(chunks);
+            let mut usage_chunk = None;
             loop {
                 // A comment line keeps proxies and clients from timing out while
                 // nothing is emitted: a long prefill, or a tool call the parser
@@ -641,13 +642,29 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 }
                 match chunk {
                     Ok(chunk) => {
-                        yield Ok(format!("data: {}\n\n",serde_json::to_string(&chunk).unwrap()));
+                        let mut value = serde_json::to_value(&chunk).unwrap();
+                        if include_usage {
+                            let taken = value.get_mut("usage").map(Value::take);
+                            if let Some(usage) = taken.filter(Value::is_object) {
+                                // Spec-shaped clients discard usage on chunks with choices.
+                                usage_chunk = Some(json!({
+                                    "id": value["id"], "object": value["object"],
+                                    "created": value["created"], "model": value["model"],
+                                    "system_fingerprint": value["system_fingerprint"],
+                                    "choices": [], "usage": usage,
+                                }));
+                            }
+                        }
+                        yield Ok(format!("data: {}\n\n", serde_json::to_string(&value).unwrap()));
                     },
                     Err(e) => { yield Ok(sse_error(e)); return; }
                 }
             }
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(sse_error(message)); return; }
+            if let Some(usage) = usage_chunk {
+                yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
+            }
             yield Ok("data: [DONE]\n\n".to_owned());
         };
         return (
@@ -741,6 +758,56 @@ mod tests {
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
     }
+    #[tokio::test]
+    async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
+        let profiles = [ModelProfile::default(),
+            ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
+            ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))];
+        for profile in profiles {
+            for include_usage in [true, false] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    for event in [
+                        InferenceChunk::Ready { system_fingerprint: Some("fp-test".into()),
+                            prompt_usage: PromptUsage { prompt_tokens: 18, prompt_cache_hit_tokens: 7 } },
+                        InferenceChunk::Text { content: "4".into(), content_tokens: 1 },
+                        InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                    ] { job.events.send(Ok(event)).unwrap(); }
+                });
+                let body = json!({"model": profile.id, "messages": [{"role": "user", "content": "2+2?"}],
+                    "thinking": {"type": "disabled"}, "max_tokens": 16, "stream": true,
+                    "stream_options": {"include_usage": include_usage}});
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile.clone());
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{}", profile.id);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                let events: Vec<Value> = text.split("data: ")
+                    .filter_map(|s| s.trim_end().parse::<Value>().ok()).collect();
+                let finish = events.iter().find(|e| e["choices"][0]["finish_reason"] == "stop").unwrap();
+                let usage_chunks: Vec<_> = events.iter().filter(|e| e["choices"] == json!([])).collect();
+                if include_usage {
+                    assert!(finish["usage"].is_null());
+                    assert_eq!(usage_chunks.len(), 1);
+                    assert_eq!(events.last().unwrap(), usage_chunks[0]);
+                    let usage = &usage_chunks[0]["usage"];
+                    assert_eq!(usage["prompt_tokens"], 18);
+                    assert_eq!(usage["completion_tokens"], 1);
+                    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 7);
+                    assert_eq!(usage["prompt_cache_hit_tokens"], 7);
+                } else {
+                    assert!(usage_chunks.is_empty());
+                    assert_eq!(finish["usage"]["prompt_tokens_details"]["cached_tokens"], 7);
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+
     pub(super) fn terminal_sse_error(bytes: &[u8]) -> Value {
         let text = std::str::from_utf8(bytes).unwrap();
         assert!(!text.split("\n\n").any(|frame| frame == "data: [DONE]"),
