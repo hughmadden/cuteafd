@@ -245,6 +245,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a locally prepared family dataset and saved paired rows"]
+    fn prepared_family_dataset_and_saved_pair() {
+        use crate::fidelity::{compare, Run};
+        let root = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_CONFIG_DIR").unwrap());
+        let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        if std::env::var_os("CUTEAFD_FIDELITY_EXPECT_DRAFT").is_some() {
+            assert!(load(&root, &manifest).unwrap_err().to_string().contains("unqualified"));
+            return;
+        }
+        let reference = load(&root, &manifest).unwrap();
+        assert_eq!(reference.windows.len(), 64);
+        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
+        let validation = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_VALIDATION_DIR").unwrap());
+        let arms = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_ARMS_DIR").unwrap());
+        let expected: Value = serde_json::from_slice(&std::fs::read(validation.join("report.json")).unwrap()).unwrap();
+        for shape in ["decode", "prefill"] {
+            let mut runs = Vec::new();
+            for arm in 0..2 {
+                let path = validation.join(format!("baseline-{arm}-compact-{shape}.json"));
+                let mut run: Run = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                let window = &reference.windows[0];
+                let mut actual = crate::reference::Fidelity::from_records(run.score.records.iter()
+                    .filter(|p| p.window == window.id).cloned().collect());
+                let dump = arms.join(format!("baseline-{arm}/dump-{shape}/window-000"));
+                crate::fidelity_rows::score_compact(reference.vocab, window, &dump, &mut actual).unwrap();
+                let rows: Vec<_> = run.score.records.iter().filter(|p| p.window == window.id).collect();
+                assert_eq!(actual.records.len(), rows.len());
+                for (got, want) in actual.records.iter().zip(rows) {
+                    assert!((got.kl - want.kl).abs() < 1e-10);
+                    assert!((got.nll - want.nll).abs() < 1e-10);
+                }
+                run.kl_kind = "qualified-top1024-plus-tail".into();
+                run.dataset = Some(json!({"repository":REPOSITORY,"config":manifest["config"],"revision":"0".repeat(40)}));
+                runs.push(run);
+            }
+            let got = compare(&runs[1], &runs[0], 0.005, 0.005, 5000, 20260829).unwrap();
+            assert_eq!(got.pass, expected["shapes"][shape]["pass_verdict"].as_bool().unwrap());
+            assert!(got.pass && got.absolute_pass && got.tripwires.is_empty());
+            for (value, field) in [(got.kl_delta, "kl_delta"), (got.kl_upper95, "kl_upper95"),
+                (got.top1_upper95, "top1_upper95")] {
+                assert!((value - expected["shapes"][shape][field].as_f64().unwrap()).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn cache_checksums_and_unqualified_panels_fail_closed() {
         let temporary = tempfile::tempdir().unwrap();
         let commit = "a".repeat(40);
