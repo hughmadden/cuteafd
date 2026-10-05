@@ -230,10 +230,23 @@ pub fn glm_flash_cache_geometry(
     cfg: &GlmNextConfig,
     layers: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    glm_flash_rank_cache_geometry(cfg, layers, 1)
+}
+
+/// MLA records remain replicated; recurrent KDA state and replay follow each
+/// coordinator's head partition, as in the GLM Flash engine's Caches.
+pub fn glm_flash_rank_cache_geometry(
+    cfg: &GlmNextConfig,
+    layers: usize,
+    ranks: usize,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("glm5_flash", cfg.layers, layers)?;
-    if cfg.kv_lora_rank != 512
+    if ![1, 2].contains(&ranks)
+        || cfg.kv_lora_rank != 512
         || cfg.kda_head_dim != 128
         || cfg.kda_heads == 0
+        || cfg.kda_heads % ranks != 0
+        || cfg.heads % ranks != 0
         || cfg.index_kpool != 4
         || cfg.attention.len() != cfg.layers
     {
@@ -249,7 +262,7 @@ pub fn glm_flash_cache_geometry(
     let kda = layers as u64 - mla;
     let channels = product(
         "KDA channels",
-        &[cfg.kda_heads as u64, cfg.kda_head_dim as u64],
+        &[(cfg.kda_heads / ranks) as u64, cfg.kda_head_dim as u64],
     )?;
     let state = sum(
         "KDA state",
@@ -266,16 +279,16 @@ pub fn glm_flash_cache_geometry(
         &[
             product(
                 "KDA recurrent replay",
-                &[64, cfg.kda_heads as u64, 3, 128, 4],
+                &[64, (cfg.kda_heads / ranks) as u64, 3, 128, 4],
             )?,
-            product("KDA beta replay", &[64, cfg.kda_heads as u64, 4])?,
+            product("KDA beta replay", &[64, (cfg.kda_heads / ranks) as u64, 4])?,
             product("KDA conv replay", &[64, 3, channels, 2])?,
         ],
     )?;
     let per_layer_unit = sum("GLM Flash MLA unit", &[256 * (528 + 512), 64 * 132])?;
     Ok(FamilyCacheGeometry {
         logical_unit_rows: 256,
-        placement: KvPlacement::SingleDevice,
+        placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::Replicated },
         ranks: vec![RankCacheGeometry {
             persistent_unit_bytes: product("GLM Flash MLA pools", &[mla, per_layer_unit])?,
             pool_metadata_unit_bytes: 4,
@@ -284,7 +297,7 @@ pub fn glm_flash_cache_geometry(
             speculative_replay_bytes: product("GLM Flash replay", &[kda, replay])?,
             fixed_state_bytes: 3 * 64 * 4,
             context_table_bytes_per_token: 0,
-        }],
+        }; ranks],
     })
 }
 
@@ -561,6 +574,17 @@ mod tests {
             geometry.ranks[0].active_state_per_sequence_bytes,
             geometry.ranks[0].retained_mark_bytes
         );
+        let split = glm_flash_rank_cache_geometry(&cfg, 45, 2).unwrap();
+        assert_eq!(split.placement, KvPlacement::Replicated);
+        assert_eq!(split.ranks[0], split.ranks[1]);
+        assert_eq!(split.ranks[0].persistent_unit_bytes, geometry.ranks[0].persistent_unit_bytes);
+        assert_eq!(split.ranks[0].pool_metadata_unit_bytes, geometry.ranks[0].pool_metadata_unit_bytes);
+        assert_eq!(split.ranks[0].fixed_state_bytes, geometry.ranks[0].fixed_state_bytes);
+        assert_eq!(split.ranks[0].retained_mark_bytes * 2, geometry.ranks[0].retained_mark_bytes);
+        assert_eq!(split.ranks[0].speculative_replay_bytes * 2, geometry.ranks[0].speculative_replay_bytes);
+        for ranks in [0, 3] {
+            assert!(glm_flash_rank_cache_geometry(&cfg, 45, ranks).is_err());
+        }
     }
 
     #[test]
@@ -700,8 +724,8 @@ mod tests {
         let indexed = plan(dir.path(), &PlanOptions::default()).unwrap();
         let requirements = indexed.cache_requirements.as_ref().unwrap();
         assert!(requirements.compiled_index_extent_required);
-        assert_eq!(requirements.target_only_layouts.len(), 1);
-        assert_eq!(requirements.unavailable_layouts[0].coordinator_ranks, 2);
+        assert_eq!(requirements.target_only_layouts.len(), 2);
+        assert!(requirements.unavailable_layouts.is_empty());
         assert!(
             render(&indexed).contains("serving manifest must provide the compiled index extent")
         );

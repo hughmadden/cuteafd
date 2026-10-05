@@ -202,6 +202,15 @@ fn admission_cache_ranks(geometry: &cuteafd_loader::serving_capacity::FamilyCach
 pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path, devices: &[i32],
     drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
     requested: Option<u64>, future_expert_bytes: u64) -> anyhow::Result<usize> {
+    planned_pool_tokens_with_extra(library, snapshot, devices, drafter, prefill_rows, slots, requested,
+        future_expert_bytes, 0)
+}
+
+/// As `planned_pool_tokens`, also reserving a family's optional per-GPU
+/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool.
+pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
+    devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
+    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64) -> anyhow::Result<usize> {
     use anyhow::Context;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
@@ -230,7 +239,7 @@ pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot
             device,
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
             reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 } + if index == 0 { draft } else { 0 }
-                + state + marks + costs.graph_bytes[role] + headroom
+                + state + marks + costs.graph_bytes[role] + headroom + extra_reserve_bytes
                 + if index == 0 { future_expert_bytes } else { 0 },
         }
     }).collect();

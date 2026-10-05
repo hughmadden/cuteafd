@@ -1286,6 +1286,32 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     measurement is one matched D/F launch with identical 8K token IDs,
     worker timing/route distributions and Spark clocks, plus KDA/head
     precision ablation if quality remains below the split promotion bar.
+    **Fresh split profiling:** a warmed matched launch per arm did not
+    reproduce the large prefill/C4 losses, while the golden quality delta
+    reproduced exactly. Nsight timelines confirm half-head FP8 KDA on both
+    GPUs, with unchanged peer traffic and synchronization counts. W8A16
+    KDA projection compute is locally slower at wide prefill and verification
+    shapes. Row128 head slices preserve whole-weight payloads and scales
+    byte for byte. KDA-only/head-only ablations localize most extra KL to
+    KDA. Golden scoring uses a one-token prefix and 64-row verification
+    chunks, so the half-head GEMV tuning and chunked-recurrence window do
+    not explain that delta. KDA partial rounding is being tested independently;
+    MLA and dense/shared FFN partials also round before the peer sum.
+    Measurements and conditions are recorded in the profiling audit commit.
+    **Split investigation handoff (2026-10-05):** three interleaved BF16
+    versus full-K KDA token-row FP8 launches qualify the measured EXL3 K3.25
+    two-RTX/TP4 opt-in under TJ's paired quality/C1 bar. Recommend promotion
+    to Hugh/TJ, but leave defaults unchanged. C1 consistently improves;
+    C4/prefill are parity to modest gains, agentic was not measured. Original
+    large prefill loss does not reproduce in FP8; synchronized ~440 ms
+    worker-response gaps instead occur in a BF16 launch with identical routes
+    and near-stable expert execution. No overlapping serving/build container
+    found in retained lifecycle logs; incomplete host/fabric history means
+    contention is not completely excluded. Coordinator/transport stalls
+    remain a separate open issue, not a precision verdict. Full-MLA/full-FFN
+    row prototypes are retired. Conditions, medians/spreads, paired quality,
+    opt-ins and limits: `docs/models/glm5_flash.md`. Hugh owns further GLM
+    Flash work (issue #1); no new broad experiments in this task.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`

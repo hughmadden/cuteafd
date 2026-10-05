@@ -27,6 +27,9 @@
 //! every rank the mHC weights, norms, the replicated low-rank KDA gates (`f_a`, `g_a`), the MLA
 //! latent projection (`q_a | kv_a`) and the DSA indexer; rank 0 the router. A ModelOpt NVFP4
 //! dense MLP stays whole on rank 0 (its package has no half geometry).
+//! With `kda_output_shard`, the output projection instead splits live token rows:
+//! each rank owns one full FP8 `[H, D]` matrix and consumes complete gathered
+//! KDA activations for its token rows. Quantization runs once before replication.
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
@@ -130,6 +133,8 @@ pub(crate) struct GlmfLoader<'a> {
     /// 128x128 blocks) come from it when given, else from primary native FP8.
     pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
+    /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
+    pub kda_output_shard: bool,
     pub fp8_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
@@ -159,6 +164,36 @@ fn kmajor_scales(scales: &[u8], n: usize, kb: usize) -> Vec<u8> {
         }
     }
     kmajor
+}
+
+fn validate_kda_output_shard(ranks: usize, fp8: super::fp8::KdaFp8, output_shard: bool) -> Result<()> {
+    ensure!(!output_shard || (ranks == 2 && fp8 != super::fp8::KdaFp8::Off),
+        "KDA token-row output sharding requires two GPUs and FP8 KDA projections");
+    Ok(())
+}
+
+/// Check the complete checkpoint header; `None` keeps the full matrix on each rank.
+fn kda_output_geometry(hidden: usize, width: usize, shape: &[usize], ranks: usize, output_shard: bool)
+    -> Result<(Option<Axis>, usize, usize)> {
+    ensure!(ranks > 0 && hidden > 0 && width > 0 && shape == [hidden, width],
+        "KDA o_proj: expected [{hidden}, {width}], found {shape:?}");
+    let (axis, rows, cols) = if output_shard {
+        ensure!(ranks == 2 && hidden % ranks == 0,
+            "KDA token-row output sharding requires two GPUs and even hidden, got {ranks} GPUs / hidden={hidden}");
+        (None, hidden, width)
+    } else {
+        ensure!(width % ranks == 0, "KDA o_proj: [{hidden}, {width}] does not split columns over {ranks} GPUs");
+        (Some(Axis::Cols), hidden, width / ranks)
+    };
+    ensure!(cols % 128 == 0, "KDA o_proj: each rank's K={cols} must contain whole 128-K scale blocks");
+    Ok((axis, rows, cols))
+}
+
+/// Quantize one KDA slice using the whole weight's per-row rule, with `[kb,n]` scales.
+fn quantize_kda_part(bytes: &[u8], rows: usize, cols: usize, layout: super::fp8::Layout,
+    rule: crate::shared::fp8_linear::Fp8Scales) -> (Vec<u8>, Vec<u8>) {
+    let (values, scales) = super::fp8::quantize(bytes, rows, cols, layout, rule);
+    (values, kmajor_scales(&f32_bytes(&scales), rows, cols / 128))
 }
 
 impl<'a> GlmfLoader<'a> {
@@ -419,6 +454,7 @@ impl<'a> GlmfLoader<'a> {
     }
 
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
+        ensure!(!self.kda_output_shard, "KDA output sharding loads through the two-GPU layer shares");
         let p = format!("{PREFIX}layers.{layer}");
         let attention = cfg.attention[layer];
         let dense = cfg.dense[layer];
@@ -658,6 +694,7 @@ impl<'a> GlmfLoader<'a> {
     /// docstring); without a split, [`Self::layer`] alone.
     pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize) -> Result<Vec<GlmfLayer<'a>>> {
         let ranks = self.ranks();
+        validate_kda_output_shard(ranks, self.kda_fp8, self.kda_output_shard)?;
         if ranks == 1 {
             return Ok(vec![self.layer(cfg, layer)?]);
         }
@@ -690,12 +727,17 @@ impl<'a> GlmfLoader<'a> {
                     .map(|(n, split)| (a(&format!("{n}.weight")), *split)).collect();
                 let w_in = self.bf16_parts(&w_in, ranks)?;
                 let (bytes, dtype, shape) = self.raw(&a("o_proj.weight"))?;
-                ensure!(dtype == DType::Bf16 && shape.len() == 2 && shape[1] % ranks == 0,
-                    "{}: a head split slices a BF16 [H, D] o_proj, found {dtype:?} {shape:?}", a("o_proj.weight"));
-                let w_o: Vec<Vec<u8>> = (0..ranks)
-                    .map(|rank| slice_2d(&bytes, shape[0], shape[1], 2, Axis::Cols, rank, ranks)).collect();
-                // Single-copy FP8 (--kda-fp8): each rank's slices quantized per row and 128-K block
-                // (Row128: the same bytes as the whole weight's copy) with K-major scales; no BF16.
+                ensure!(dtype == DType::Bf16,
+                    "{}: a head split requires a BF16 [H, D] o_proj source, found {dtype:?} {shape:?}", a("o_proj.weight"));
+                let (axis, o_rows, o_cols) = kda_output_geometry(cfg.hidden, cfg.kda_heads * cfg.kda_head_dim,
+                    &shape, ranks, self.kda_output_shard)?;
+                let w_o: Vec<Vec<u8>> = match axis {
+                    Some(axis) => (0..ranks)
+                        .map(|rank| slice_2d(&bytes, shape[0], shape[1], 2, axis, rank, ranks)).collect(),
+                    None => Vec::new(), // The full FP8 copy below is quantized and uploaded once.
+                };
+                // Single-copy FP8 (--kda-fp8), with K-major scales and no BF16 residency.
+                // Row128 column slices retain the same bytes as the whole weight's copy.
                 let layout = match self.kda_fp8 {
                     super::fp8::KdaFp8::Off => None,
                     super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
@@ -703,22 +745,21 @@ impl<'a> GlmfLoader<'a> {
                 };
                 if let Some(layout) = layout {
                     let h = cfg.hidden;
-                    for (parts, key, cols) in [(&w_in, "w_in", h), (&w_o, "w_o", shape[1] / ranks)] {
+                    for (parts, key, cols) in [(&w_in, "w_in", h), (&w_o, "w_o", o_cols)] {
+                        let (fp8, kscale) = if key == "w_in" { ("w_in_fp8", "w_in_kscale") } else { ("w_o_fp8", "w_o_kscale") };
+                        if key == "w_o" && axis.is_none() {
+                            let (q, k) = quantize_kda_part(&bytes, o_rows, o_cols, layout, self.fp8_scales);
+                            put(&mut ops, fp8, self.replicate(self.upload(&q)?)?);
+                            put(&mut ops, kscale, self.replicate(self.upload(&k)?)?);
+                            continue;
+                        }
                         let (mut values, mut kmajor) = (Vec::new(), Vec::new());
                         for part in parts {
                             let n = part.len() / 2 / cols;
-                            let (q, s) = super::fp8::quantize(part, n, cols, layout, self.fp8_scales);
-                            let kb = cols / 128;
-                            let mut k = vec![0f32; s.len()];
-                            for row in 0..n {
-                                for b in 0..kb {
-                                    k[b * n + row] = s[row * kb + b];
-                                }
-                            }
+                            let (q, k) = quantize_kda_part(part, n, cols, layout, self.fp8_scales);
                             values.push(q);
-                            kmajor.push(f32_bytes(&k));
+                            kmajor.push(k);
                         }
-                        let (fp8, kscale) = if key == "w_in" { ("w_in_fp8", "w_in_kscale") } else { ("w_o_fp8", "w_o_kscale") };
                         put(&mut ops, fp8, self.upload_ranks(values)?);
                         put(&mut ops, kscale, self.upload_ranks(kmajor)?);
                     }
@@ -786,6 +827,7 @@ impl<'a> GlmfLoader<'a> {
     /// layer shares, the norm and head) and with a head split the other rank's layer shares.
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
+        validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer)?) {
@@ -810,6 +852,11 @@ impl<'a> GlmfLoader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::{kda_output_geometry, quantize_kda_part, validate_kda_output_shard};
+    use crate::families::glm5_flash::fp8::{quantize, KdaFp8, Layout};
+    use crate::shared::fp8_linear::Fp8Scales;
+    use crate::shared::peer_split::{slice_2d, Axis};
+
     #[test]
     fn split_reads_bf16_blocks_without_a_companion_or_scale_tensors() {
         use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
@@ -844,5 +891,100 @@ mod tests {
         let out: Vec<f32> = super::kmajor_scales(&bytes, 3, 2).chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         assert_eq!(out, [0.0, 2.0, 4.0, 1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn kda_token_row_output_checks_geometry_and_resident_bytes() {
+        let (hidden, width) = (4096, 8192);
+        let old = kda_output_geometry(hidden, width, &[hidden, width], 2, false).unwrap();
+        let shard = kda_output_geometry(hidden, width, &[hidden, width], 2, true).unwrap();
+        assert_eq!(old, (Some(Axis::Cols), 4096, 4096));
+        assert_eq!(shard, (None, 4096, 8192));
+        let bytes = |(_, n, k): (Option<Axis>, usize, usize)| (n * k, n * (k / 128) * 4);
+        assert_eq!(bytes(old), (16_777_216, 524_288));
+        assert_eq!(bytes(shard), (33_554_432, 1_048_576));
+        let old_bytes = bytes(old).0 + bytes(old).1;
+        let full_bytes = bytes(shard).0 + bytes(shard).1;
+        assert_eq!(full_bytes - old_bytes, 17_301_504);
+        assert_eq!((full_bytes - old_bytes) * 34, 588_251_136); // 561 MiB per GPU.
+        for shape in [&[4096, 4096][..], &[2048, 8192], &[4096, 8192, 1], &[]] {
+            assert!(kda_output_geometry(hidden, width, shape, 2, true).is_err());
+        }
+        assert!(kda_output_geometry(hidden, width, &[hidden, width], 3, true).is_err());
+        assert!(kda_output_geometry(hidden, width, &[hidden, width], 0, true).is_err());
+        assert!(kda_output_geometry(hidden, 8193, &[hidden, 8193], 2, true).is_err());
+        assert!(kda_output_geometry(4095, width, &[4095, width], 2, true).is_err());
+        assert_eq!(kda_output_geometry(hidden, width, &[hidden, width], 1, false).unwrap(),
+            (Some(Axis::Cols), hidden, width));
+    }
+
+    #[test]
+    fn kda_output_shard_requires_two_fp8_ranks() {
+        for fp8 in [KdaFp8::Row128, KdaFp8::Channel] {
+            assert!(validate_kda_output_shard(2, fp8, true).is_ok());
+            for ranks in [0, 1, 3, 4] {
+                assert!(validate_kda_output_shard(ranks, fp8, true).is_err());
+            }
+        }
+        assert!(validate_kda_output_shard(2, KdaFp8::Off, true).is_err());
+        assert!(validate_kda_output_shard(1, KdaFp8::Off, false).is_ok());
+        assert!(validate_kda_output_shard(2, KdaFp8::Off, false).is_ok());
+    }
+
+    #[test]
+    fn kda_token_rows_keep_whole_weight_fp8_payload_and_kmajor_scale_bits() {
+        // Non-128-aligned N catches confusing output rows with scale blocks.
+        let (rows, cols) = (34, 512);
+        let bytes: Vec<u8> = (0..rows * cols).flat_map(|at| {
+            let (row, col) = (at / cols, at % cols);
+            let x = ((row * 37 + col * 19) % 101) as f32 - 50.0;
+            let x = x * (1 + row + 7 * (col / 128)) as f32 * 0.01;
+            ((x.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect();
+        let (axis, n, k) = kda_output_geometry(rows, cols, &[rows, cols], 2, true).unwrap();
+        assert!(axis.is_none());
+        for layout in [Layout::Row128, Layout::Channel] {
+            for rule in [Fp8Scales::Amax, Fp8Scales::Pow2, Fp8Scales::Best] {
+                let (whole, scales) = quantize(&bytes, rows, cols, layout, rule);
+                let (values, kmajor) = quantize_kda_part(&bytes, n, k, layout, rule);
+                assert_eq!(values, whole, "whole payload: {layout:?} {rule:?}");
+                assert_eq!((values.len(), kmajor.len()), (rows * cols, rows * (cols / 128) * 4));
+                for row in 0..rows {
+                    for block in 0..cols / 128 {
+                        let offset = (block * rows + row) * 4;
+                        assert_eq!(&kmajor[offset..offset + 4], &scales[row * (cols / 128) + block].to_le_bytes(),
+                            "whole scale bits: {layout:?} {rule:?} row {row} block {block}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kda_column_split_keeps_row128_blocks_and_scale_bits() {
+        let (rows, cols) = (6, 512);
+        let bytes: Vec<u8> = (0..rows * cols).flat_map(|at| {
+            let x = ((at * 37) % 127) as f32 - 63.0;
+            let x = x * (1 + at / cols + 9 * (at % cols / 128)) as f32 * 0.01;
+            ((x.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect();
+        let (axis, n, k) = kda_output_geometry(rows, cols, &[rows, cols], 2, false).unwrap();
+        assert_eq!(axis, Some(Axis::Cols));
+        for rule in [Fp8Scales::Amax, Fp8Scales::Pow2, Fp8Scales::Best] {
+            let (whole, scales) = quantize(&bytes, rows, cols, Layout::Row128, rule);
+            for rank in 0..2 {
+                let part = slice_2d(&bytes, rows, cols, 2, axis.unwrap(), rank, 2);
+                let (values, kmajor) = quantize_kda_part(&part, n, k, Layout::Row128, rule);
+                assert_eq!(values, slice_2d(&whole, rows, cols, 1, Axis::Cols, rank, 2));
+                for row in 0..rows {
+                    for block in 0..k / 128 {
+                        let offset = (block * rows + row) * 4;
+                        let whole_block = rank * (k / 128) + block;
+                        assert_eq!(&kmajor[offset..offset + 4], &scales[row * (cols / 128) + whole_block].to_le_bytes(),
+                            "column scale bits: {rule:?} rank {rank} row {row} block {block}");
+                    }
+                }
+            }
+        }
     }
 }
