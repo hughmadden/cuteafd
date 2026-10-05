@@ -80,6 +80,11 @@ def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
         validate_public_text(text, scored_text=True)
 
 
+def test_measured_dataset_validator_self_tests():
+    subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
+                    "--self-test"], check=True, timeout=60)
+
+
 def test_public_text_allows_public_fabric_without_mutating_tokens():
     from fidelity_windows import validate_public_text
     text = "ostrich dodo emu kiwi rhea moa raptor sparknest 10.55.1.22"
