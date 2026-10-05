@@ -870,7 +870,8 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
 
-@pytest.mark.parametrize("mode,kind", [("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
+@pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark", "spark"), ("spark:0", "spark"),
+                                        ("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
 def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     placement = {"kind": kind}
@@ -886,16 +887,8 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     assert ("--encoder-listen" in worker) == (kind == "spark")
     assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
     assert f"--vision {kind}" in launch
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in worker
+        assert f"--encoder-plan-hash {'ab' * 32}" in launch
+        assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off": assert "cuteafd plan" not in result.stderr
-
-
-@pytest.mark.parametrize("mode", ["auto", "spark", "spark:0", "spark:5"])
-def test_mimo_unwired_spark_encoder_rejected_before_restart(tmp_path, mode):
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
-    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={mode}\nSPECULATOR=off\n", restart=True)
-    assert result.returncode == 2
-    assert "Spark encoder placement not yet wired into MiMo serving; use VISION=rtx or off" in result.stderr
-    assert "cuteafd plan" not in result.stderr
-    assert "docker rm" not in result.stderr
-    assert "cuteafd expertd-native" not in result.stderr
-    assert "cuteafd serve-mimo" not in result.stderr

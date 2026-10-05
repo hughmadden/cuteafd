@@ -473,6 +473,9 @@ impl EncoderService {
             }
         }
     }
+    pub fn healthy(&self) -> bool {
+        self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
+    }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));

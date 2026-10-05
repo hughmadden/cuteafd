@@ -77,6 +77,8 @@ pub fn set_media_input_policy(vision: bool, audio: bool) {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    /// Live readiness for remote vision; absent on existing local serving paths.
+    pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
     pub capabilities: MediaCapabilities,
@@ -92,7 +94,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None }
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None }
     }
 
     /// Install only after the matching encoder is loaded and ready. A processor
@@ -145,11 +147,12 @@ pub use limits::{NativeLimits, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS};
 #[derive(Debug, Clone)]
 pub enum NativeFailure {
     BadRequest(String),
+    Unavailable(String),
     Worker(String),
 }
 impl std::fmt::Display for NativeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::BadRequest(message) | Self::Worker(message) => f.write_str(message) }
+        match self { Self::BadRequest(message) | Self::Unavailable(message) | Self::Worker(message) => f.write_str(message) }
     }
 }
 impl std::error::Error for NativeFailure {}
@@ -252,11 +255,14 @@ async fn models(State(state): State<NativeState>) -> Json<Value> {
     Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":owner,
         "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
 }
-async fn health(State(state): State<NativeState>) -> StatusCode {
-    if state.queue.is_closed() {
+async fn health(State(state): State<NativeState>) -> Response {
+    let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));
+    let status = if state.queue.is_closed() || vision == Some(false) {
         StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
+    } else { StatusCode::OK };
+    match vision {
+        Some(healthy) => (status, Json(json!({"vision": if healthy { "ready" } else { "failed" }}))).into_response(),
+        None => status.into_response(),
     }
 }
 fn error_body(message: impl ToString) -> Value {
@@ -388,6 +394,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         },
         None => Vec::new(),
     };
+    if (!media_sources.is_empty() || probe.as_ref().is_some_and(|p| !p.spec.media.is_empty()))
+        && state.profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "vision encoder unavailable");
+    }
     if !matches!(state.profile.encoding, ModelEncoding::DeepseekV41) && state.profile.capabilities.vision
         && state.profile.media_preparer.is_none() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "vision image processor unavailable");
@@ -680,6 +690,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let first = match receive.recv().await {
         Some(Ok(chunk)) => chunk,
         Some(Err(NativeFailure::BadRequest(message))) => return error(StatusCode::BAD_REQUEST, message),
+        Some(Err(NativeFailure::Unavailable(message))) => return error(StatusCode::SERVICE_UNAVAILABLE, message),
         Some(Err(message)) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
         None => return error(StatusCode::INTERNAL_SERVER_ERROR, "native worker ended without completion"),
     };
@@ -992,6 +1003,66 @@ mod tests {
         let response = router(tx).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         worker.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_vision_failure_rejects_images_but_keeps_text_and_live_health() {
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        use std::sync::atomic::AtomicBool;
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Mimo),
+            EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let healthy = Arc::new(AtomicBool::new(true));
+        let mut profile = ModelProfile::new(MODEL, ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))
+            .with_loaded_vision(preparer);
+        profile.vision_health = Some(healthy.clone());
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let response = app.clone().oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        healthy.store(false, Ordering::Release);
+        let response = app.clone().oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["vision"], "failed");
+        for stream in [false, true] {
+            let body = json!({"model": MODEL, "messages":[{"role":"user","content":[{"type":"image_url",
+                "image_url":{"url":"data:image/png;base64,not-decoded"}}]}],"stream":stream});
+            let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"], "vision encoder unavailable");
+            assert!(rx.try_recv().is_err(), "failed vision never reaches admission");
+        }
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert!(job.media.is_empty());
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).unwrap();
+        });
+        let body = json!({"model": MODEL, "messages":[{"role":"user","content":"hello"}],"max_tokens":1});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encoder_failure_during_admission_keeps_503_for_streams() {
+        for stream in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into()))).unwrap();
+            });
+            let body = json!({"model": MODEL, "messages":[{"role":"user","content":"hello"}],"stream":stream});
+            let response = router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            worker.await.unwrap();
+        }
     }
 
     #[tokio::test]

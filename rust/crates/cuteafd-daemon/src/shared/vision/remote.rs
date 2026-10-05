@@ -130,6 +130,10 @@ struct Replica {
     failed: Arc<AtomicBool>,
     owner: Option<JoinHandle<()>>,
 }
+struct OwnerHealth(Arc<AtomicBool>);
+impl Drop for OwnerHealth {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
 struct Pending {
     result: mpsc::Receiver<Result<EncodeOutput>>,
     cancelled: Arc<AtomicBool>,
@@ -137,6 +141,7 @@ struct Pending {
 /// A persistent connection and bounded owner queue per replica. The constructor
 /// is a readiness barrier: all EncoderIds are verified before API vision is enabled.
 pub struct RemoteEncoder {
+    healthy: Arc<AtomicBool>,
     handshake: EncoderHandshake,
     replicas: Vec<Replica>,
     pending: HashMap<EncoderTicket, Pending>,
@@ -147,7 +152,7 @@ impl RemoteEncoder {
     pub fn connect(addresses: Vec<SocketAddr>, expected: EncoderHandshake, timeout: Duration) -> Result<Self> {
         expected.validate()?;
         if addresses.is_empty() || addresses.len() > 6 { return Err(error("vision needs 1..6 replicas")); }
-        let mut this = Self { handshake: expected.clone(), replicas: vec![], pending: HashMap::new(), next: 0, round_robin: 0 };
+        let mut this = Self { healthy: Arc::new(AtomicBool::new(true)), handshake: expected.clone(), replicas: vec![], pending: HashMap::new(), next: 0, round_robin: 0 };
         for address in addresses {
             let mut stream = Wire::new(TcpStream::connect_timeout(&address, timeout).map_err(error)?, timeout)?;
             EncoderHandshake::read(&mut stream)?.compatible(&expected)?;
@@ -156,21 +161,24 @@ impl RemoteEncoder {
             let socket = stream.socket.try_clone().map_err(error)?;
             let failed = Arc::new(AtomicBool::new(false));
             let failure = failed.clone();
+            let health = this.healthy.clone();
             let (queue, jobs) = mpsc::sync_channel::<Work>(128);
             let owner = thread::Builder::new().name("remote-vision-owner".into()).spawn(move || {
+                // Any owner exit (including panic) permanently closes vision admission.
+                let _health = OwnerHealth(health);
                 loop {
                     let work = match jobs.recv_timeout(Duration::from_secs(2)) {
                         Ok(work) => work,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if !failure.load(Ordering::Acquire) && ping(&mut stream).is_err() { failure.store(true, Ordering::Release); }
+                            if !failure.load(Ordering::Acquire) && ping(&mut stream).is_err() { failure.store(true, Ordering::Release); _health.0.store(false, Ordering::Release); }
                             continue;
                         }
                     };
                     if work.cancelled.load(Ordering::Acquire) { continue; }
                     let result = if failure.load(Ordering::Acquire) { Err(error("vision encoder unavailable")) }
                         else { exchange(&mut stream, &work.job) };
-                    if result.is_err() { failure.store(true, Ordering::Release); }
+                    if result.is_err() { failure.store(true, Ordering::Release); _health.0.store(false, Ordering::Release); }
                     if !work.cancelled.load(Ordering::Acquire) { let _ = work.reply.send(result); }
                 }
             }).map_err(error)?;
@@ -179,11 +187,14 @@ impl RemoteEncoder {
         Ok(this)
     }
     /// Image requests fail closed after a wire error; text needs no encoder.
-    pub fn healthy(&self) -> bool { self.replicas.iter().all(|r| !r.failed.load(Ordering::Acquire)) }
+    pub fn healthy(&self) -> bool { self.healthy.load(Ordering::Acquire) }
+    /// Live health without a scheduler lock, including while it sleeps.
+    pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn ready(&self) -> bool { !self.replicas.is_empty() && self.healthy() }
 }
 impl EncoderClient for RemoteEncoder {
     fn submit(&mut self, job: EncodeJob) -> Result<EncoderTicket> {
+        if !self.healthy() { return Err(error("vision encoder unavailable")); }
         self.handshake.validate_job(&job)?;
         let replica = self.round_robin % self.replicas.len();
         self.round_robin = self.round_robin.wrapping_add(1);
@@ -258,7 +269,9 @@ pub struct EncoderServer {
 impl EncoderServer {
     pub fn start(address: SocketAddr, handshake: EncoderHandshake, service: EncoderService, lut: Arc<[f32; 768]>, timeout: Duration) -> Result<Self> {
         handshake.validate()?;
-        Self::start_backend(address, handshake, timeout, move |job| {
+        let service = Arc::new(service);
+        let health = service.clone();
+        Self::start_backend(address, handshake, timeout, move || health.healthy(), move |job| {
             let started = Instant::now();
             let ticket = service.submit(NativeJob { rgb: job.rgb8.clone(), grid: [job.grid[1] as usize, job.grid[2] as usize], lut: lut.clone(), output: vec![0; job.tokens * job.hidden_width] }).map_err(error)?;
             // The owner retains all buffers until its stream has drained, even
@@ -271,8 +284,8 @@ impl EncoderServer {
             Ok(EncodeOutput { key: job.key, features: bytes.into(), elapsed_ms: started.elapsed().as_secs_f64() * 1000.0 })
         })
     }
-    fn start_backend<F>(address: SocketAddr, handshake: EncoderHandshake, timeout: Duration, mut encode: F) -> Result<Self>
-    where F: FnMut(&EncodeJob) -> Result<EncodeOutput> + Send + 'static {
+    fn start_backend<F, H>(address: SocketAddr, handshake: EncoderHandshake, timeout: Duration, healthy: H, mut encode: F) -> Result<Self>
+    where F: FnMut(&EncodeJob) -> Result<EncodeOutput> + Send + 'static, H: Fn() -> bool + Send + 'static {
         handshake.validate()?;
         let listener = TcpListener::bind(address).map_err(error)?;
         listener.set_nonblocking(true).map_err(error)?;
@@ -289,8 +302,11 @@ impl EncoderServer {
                         let result = Wire::new(stream, timeout).and_then(|mut stream| { handshake.write(&mut stream)
                             .and_then(|()| EncoderHandshake::read(&mut stream))
                             .and_then(|expected| handshake.compatible(&expected))
-                            .and_then(|()| put_u32(&mut stream, 0))
-                            .and_then(|()| serve_connection(&mut stream, &handshake, &stopped, &mut encode)) });
+                            .and_then(|()| {
+                                if !healthy() { return Err(error("vision encoder unavailable")); }
+                                put_u32(&mut stream, 0)
+                            })
+                            .and_then(|()| serve_connection(&mut stream, &handshake, &stopped, &healthy, &mut encode)) });
                         if let Err(e) = result { tracing::debug!(%e, "vision peer closed/failed"); }
                         active.lock().unwrap().take();
                     }
@@ -309,11 +325,13 @@ impl Drop for EncoderServer {
         if let Some(owner) = self.owner.take() { let _ = owner.join(); }
     }
 }
-fn serve_connection<F>(s: &mut Wire, handshake: &EncoderHandshake, stop: &AtomicBool, encode: &mut F) -> Result<()>
-where F: FnMut(&EncodeJob) -> Result<EncodeOutput> {
+fn serve_connection<F, H>(s: &mut Wire, handshake: &EncoderHandshake, stop: &AtomicBool, healthy: &H, encode: &mut F) -> Result<()>
+where F: FnMut(&EncodeJob) -> Result<EncodeOutput>, H: Fn() -> bool {
     while !stop.load(Ordering::Acquire) {
         s.frame();
-        match get_u32(s)? { 0 => { put_u32(s, 0)?; continue; }, 1 => {}, _ => return Err(error("invalid vision opcode")) }
+        let opcode = get_u32(s)?;
+        if !healthy() { return Err(error("vision encoder unavailable")); }
+        match opcode { 0 => { put_u32(s, 0)?; continue; }, 1 => {}, _ => return Err(error("invalid vision opcode")) }
         let key = ImageKey(read_array(s)?);
         let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
         let tokens = get_u64(s)?;
@@ -360,7 +378,7 @@ mod tests {
         EncodeJob { key: ImageKey([value; 32]), grid: [1, 4, 4], rgb8: vec![value; 4*4*768].into(), tokens: 4, hidden_width: 4096 }
     }
     fn server() -> EncoderServer {
-        EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake(), Duration::from_secs(2), |job| Ok(EncodeOutput { key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0 })).unwrap()
+        EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake(), Duration::from_secs(2), || true, |job| Ok(EncodeOutput { key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0 })).unwrap()
     }
     fn wait(client: &mut RemoteEncoder, ticket: EncoderTicket) -> Result<EncodeOutput> {
         let started = Instant::now();
@@ -409,6 +427,51 @@ mod tests {
             let server = server(); let mut expected = handshake();
             match field { 0 => expected.encoder_id.0[0] ^= 1, 1 => expected.plan_hash[0] ^= 1, _ => expected.output_width += 1 }
             assert!(RemoteEncoder::connect(vec![server.address], expected, Duration::from_secs(1)).is_err());
+        }
+    }
+    #[test]
+    fn idle_replica_failure_reaches_shared_health_and_fails_all_images() {
+        let a = server(); let b = server();
+        let mut client = RemoteEncoder::connect(vec![a.address, b.address], handshake(), Duration::from_millis(500)).unwrap();
+        let health = client.health_handle();
+        assert!(health.load(Ordering::Acquire));
+        drop(b);
+        let start = Instant::now();
+        while health.load(Ordering::Acquire) {
+            assert!(start.elapsed() < Duration::from_secs(4));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!client.ready());
+        assert!(client.submit(job(1)).is_err(), "the surviving replica cannot reopen image admission");
+    }
+    #[test]
+    fn native_owner_failure_closes_idle_heartbeat() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let server_alive = alive.clone();
+        let server = EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake(), Duration::from_secs(2),
+            move || server_alive.load(Ordering::Acquire), |job| Ok(EncodeOutput {
+                key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0 })).unwrap();
+        let client = RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_millis(500)).unwrap();
+        let health = client.health_handle();
+        alive.store(false, Ordering::Release);
+        let start = Instant::now();
+        while health.load(Ordering::Acquire) {
+            assert!(start.elapsed() < Duration::from_secs(4));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!client.ready());
+    }
+    #[test]
+    fn owner_exit_and_panic_fail_closed() {
+        for panic in [false, true] {
+            let health = Arc::new(AtomicBool::new(true));
+            let owner_health = health.clone();
+            let result = thread::spawn(move || {
+                let _health = OwnerHealth(owner_health);
+                if panic { panic!("injected owner failure"); }
+            }).join();
+            assert_eq!(result.is_err(), panic);
+            assert!(!health.load(Ordering::Acquire));
         }
     }
     #[test]
