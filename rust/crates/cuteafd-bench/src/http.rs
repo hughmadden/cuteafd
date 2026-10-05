@@ -314,6 +314,18 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn probe_control_requires_authorization_before_execution() {
+        use tower::ServiceExt;
+        let bench = Bench::new(crate::store::Store::memory().unwrap());
+        let request = axum::http::Request::builder().method("POST").uri("/v1/bench/probe")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"body":{"messages":[]},"spec":{}}"#)).unwrap();
+        let response = routes(bench.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(bench.active().is_none());
+    }
+
     #[test]
     fn local_networks() {
         for ip in ["127.0.0.1", "10.55.0.3", "192.168.1.9", "172.20.0.1", "::1", "fd00::1", "fe80::1",

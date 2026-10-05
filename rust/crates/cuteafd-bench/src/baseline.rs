@@ -207,7 +207,8 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     for window in &windows {
         let end = window.positions.last().context("empty reference window")?.pos + 1;
         let spec = ProbeSpec { prompt_ids: Some(window.tokens[..end].to_vec()), score_from: Some(window.score_from),
-            top_k: window.top_k, want: window.want(), cold: true, no_speculation: true, ..ProbeSpec::default() };
+            top_k: window.top_k, want: window.want(), cold: true, no_speculation: true,
+            score_path: Some("decode".into()), ..ProbeSpec::default() };
         let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
         let record = probe_of(&chat)?;
         if !honoured(record) { unsupported(check); return Ok(()); }

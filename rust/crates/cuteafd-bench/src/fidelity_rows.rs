@@ -152,6 +152,34 @@ mod tests {
         assert!(normalize(&mut [f64::NAN]).is_err());
     }
     #[test]
+    fn full_rows_match_probe_and_reject_corrupt_reference() {
+        use crate::reference::{CompactPosition, Top};
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = root.join("reference.bin");
+        // Rounded f16 log probabilities normalize to an exactly uniform distribution.
+        std::fs::write(&path, [0xb98bu16.to_le_bytes(), 0xb98bu16.to_le_bytes()].concat()).unwrap();
+        let rows = RowsManifest { schema: "cuteafd.fidelity.rows/1".into(), set_sha256: "set".into(),
+            checkpoint: "checkpoint".into(), vocab: 2, dtype: "<f2".into(), kind: "log_softmax".into(),
+            windows: vec![RowsWindow { id: "A1".into(), path: "reference.bin".into(), sha256: sha256(&path).unwrap(),
+                positions: vec![1], shape: vec![1, 2] }] };
+        let window = Window { id: "A1".into(), block: "A".into(), bucket: "0-2K".into(), tokens: vec![0, 0],
+            roles: vec!["ctx".into(), "gen".into()], score_from: 1, top_k: 2,
+            positions: vec![CompactPosition { pos: 1, next: 0, next_lp: -2.0f64.ln(),
+                top: vec![Top { id: 0, lp: -2.0f64.ln() }, Top { id: 1, lp: -2.0f64.ln() }],
+                tail_lp: f64::NEG_INFINITY }] };
+        let dump = root.join("dump");
+        let probe = Probe::new(ProbeSpec { dump_rows: Some(dump.clone()), want: window.want(), top_k: 2,
+            ..ProbeSpec::default() });
+        probe.row(1, &[0.0, 0.0]);
+        let mut f = window.score(&probe.record().rows);
+        score(root, &rows, &window, &dump, &mut f).unwrap();
+        assert_eq!(f.kl, 0.0); assert_eq!(f.top1, 1.0);
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        assert!(score(root, &rows, &window, &dump, &mut f).unwrap_err().to_string().contains("checksum"));
+    }
+    #[test]
     fn paths_do_not_escape_row_root() {
         assert!(beneath(Path::new("/rows"), Path::new("../bad")).is_err());
         assert!(beneath(Path::new("/rows"), Path::new("/bad")).is_err());

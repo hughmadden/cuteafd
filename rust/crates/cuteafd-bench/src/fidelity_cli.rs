@@ -50,6 +50,9 @@ pub struct RunArgs {
     /// New directory on server-local NVMe, also visible to this client for scoring.
     #[arg(long)]
     pub dump_dir: Option<PathBuf>,
+    /// Kernel shape to score; quick tier always uses decode.
+    #[arg(long, value_parser = ["decode", "prefill"], default_value = "decode")]
+    pub score_path: String,
     #[arg(long)]
     pub verify_rows: Option<usize>,
     #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
@@ -68,6 +71,7 @@ fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -
 
 pub fn run(args: &RunArgs) -> Result<Run> {
     ensure!(matches!(args.tier.as_str(), "quick" | "full"), "unknown tier");
+    ensure!(args.tier != "quick" || args.score_path == "decode", "quick tier must be decode-shaped");
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(900)).build();
     let base = args.url.trim_end_matches('/');
@@ -97,7 +101,8 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         let end = window.positions.last().context("empty window")?.pos + 1;
         let dump = args.dump_dir.as_ref().map(|d| d.join(format!("window-{i:03}")));
         let mut spec = json!({"prompt_ids": window.tokens[..end], "score_from": window.score_from,
-            "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true});
+            "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true,
+            "score_path": args.score_path});
         if rows.is_some() { spec["dump_rows"] = json!(dump); }
         if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
         let response = request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key,
@@ -110,10 +115,13 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         ensure!(probe.prompt_ids == window.tokens[..end], "engine ran different prompt tokens");
         ensure!(response["server"]["model"] == model, "checkpoint changed during scoring");
         let this_engine = probe.engine.clone().unwrap();
-        // V4.1's initial probe uses prefill_logits chunks, unlike the other verify-based families.
-        let this_shape = if this_engine.contains("v41") || this_engine.contains("deepseek-v4") {
-            "prefill-shaped"
-        } else { "decode-shaped" };
+        let actual_path = probe.score_path.as_deref().context("engine did not report its scoring path")?;
+        ensure!(actual_path == args.score_path, "engine did not honor requested scoring path");
+        let this_shape = match actual_path {
+            "prefill" => "prefill-shaped",
+            "decode" => "decode-shaped",
+            _ => bail!("unsupported reported scoring path: {actual_path}"),
+        };
         if i == 0 {
             engine = this_engine; settings = response["server"].clone(); shape = this_shape.into();
         } else {
