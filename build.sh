@@ -284,6 +284,30 @@ release_build_container_user_args_render() {
 }
 # release-build-container-user:end
 
+# release-build-budget:start
+# Settings that only size waits and guards, resolved before the dry-run so
+# --dry-run reports the plan this build would follow. Nothing here takes a lock,
+# a device or a container.
+release_build_lock_timeout="${CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS:-1200}"
+[[ "$release_build_lock_timeout" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS must be positive seconds"
+release_idle_wait_seconds="${CUTEAFD_RELEASE_IDLE_WAIT_SECONDS:-300}"
+[[ "$release_idle_wait_seconds" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_IDLE_WAIT_SECONDS must be positive seconds"
+release_idle_gpu_limit_mib="${CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB:-512}"
+[[ "$release_idle_gpu_limit_mib" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB must be positive MiB"
+export_gpu_limit_mib="${CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB:-8192}"
+[[ "$export_gpu_limit_mib" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB must be positive MiB"
+release_export_gpu_poll_seconds="${CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS:-15}"
+[[ "$release_export_gpu_poll_seconds" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS must be positive seconds"
+spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
+[[ "$spark_export_min_free_gib" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB must be positive GiB"
+# release-build-budget:end
+
 if ((dry_run)); then
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
@@ -297,6 +321,9 @@ if ((dry_run)); then
   echo "  release build root: ${release_build_root:-<container /tmp>}"
   echo "  build container user: $(id -un) ($(id -u):$(id -g))"
   echo "  build container home: $(release_build_container_home "$release_build_root")"
+  echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
+  echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB"
+  echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB free CUDA memory, same wait"
   exit 0
 fi
 
@@ -339,9 +366,6 @@ release_need timeout
 # through image assembly and distribution: the slot isolation that keeps
 # artifacts apart does not cover the shared checkout or the docker daemon.
 release_build_lock_dir="$HOME/.cache/cuteafd"
-release_build_lock_timeout="${CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS:-1200}"
-[[ "$release_build_lock_timeout" =~ ^[1-9][0-9]*$ ]] ||
-  release_die "CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS must be positive seconds"
 mkdir -p "$release_build_lock_dir"
 exec 9>"$release_build_lock_dir/build.lock"
 echo "== waiting for the release build lock (${release_build_lock_timeout}s): $release_build_lock_dir/build.lock =="
@@ -368,22 +392,6 @@ export_container="cuteafd-release-export-$(hostname)-$$"
 # onto another device. A watchdog then stops the export if its own device is
 # taken over mid-compile. Host, device and time are logged so a concurrent
 # measurement that saw an unexpected export can be explained after the fact.
-release_idle_wait_seconds="${CUTEAFD_RELEASE_IDLE_WAIT_SECONDS:-300}"
-[[ "$release_idle_wait_seconds" =~ ^[1-9][0-9]*$ ]] ||
-  release_die "CUTEAFD_RELEASE_IDLE_WAIT_SECONDS must be positive seconds"
-release_idle_gpu_limit_mib="${CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB:-512}"
-[[ "$release_idle_gpu_limit_mib" =~ ^[1-9][0-9]*$ ]] ||
-  release_die "CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB must be positive MiB"
-# The export's own ceiling: a device below the idle limit that later grows past
-# this has a second job on it, and the export must yield rather than compete.
-export_gpu_limit_mib="${CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB:-8192}"
-[[ "$export_gpu_limit_mib" =~ ^[1-9][0-9]*$ ]] ||
-  release_die "CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB must be positive MiB"
-
-release_export_gpu_poll_seconds="${CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS:-15}"
-[[ "$release_export_gpu_poll_seconds" =~ ^[1-9][0-9]*$ ]] ||
-  release_die "CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS must be positive seconds"
-
 release_select_idle_export_gpu() {
   local deadline=$((SECONDS + release_idle_wait_seconds))
   local last_report="" index uuid used best_index="" best_uuid="" best_used
