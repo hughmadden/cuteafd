@@ -1,7 +1,7 @@
 //! Paired fidelity reports and window-clustered non-inferiority statistics.
 //! Statistics ported from Hugh Madden's MIT glm53f-afd v1.1.0 harness/klgate.py.
 use crate::reference::{Fidelity, Position};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -153,6 +153,27 @@ fn absolute(run: &Run) -> bool {
         && score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80)
 }
 
+fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut normalized = server.clone();
+    ensure!(normalized.is_object(), "missing server settings");
+    if let Some(settings) = normalized.get_mut("settings") {
+        let mut names = std::collections::BTreeSet::new();
+        let mut fixed = BTreeMap::new();
+        for setting in settings.as_array().context("server settings must be an array")? {
+            let name = setting.get("name").and_then(|v| v.as_str()).context("setting name missing")?;
+            ensure!(!name.is_empty() && names.insert(name), "empty or duplicate server setting {name}");
+            let value = setting.get("value").context("setting value missing")?;
+            // Only precision switches may differ; scheduling, layout and unknown knobs stay fixed.
+            if !matches!(name, "CUTEAFD_V41_FP8_HEAD" | "fp8-head" | "kda-fp8" | "fp8-prefill"
+                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "expert-input") {
+                fixed.insert(name.to_owned(), value.clone());
+            }
+        }
+        *settings = serde_json::to_value(fixed)?;
+    }
+    Ok(normalized)
+}
+
 pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: usize, seed: u64) -> Result<Comparison> {
     ensure!(top1_margin.is_finite() && top1_margin > 0.0 && kl_margin.is_finite() && kl_margin > 0.0,
         "margins must be positive and finite");
@@ -164,6 +185,8 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(a.engine == b.engine && a.settings.get("build") == b.settings.get("build")
         && a.settings.get("snapshot") == b.settings.get("snapshot"), "runs use different engines, builds or snapshots");
+    ensure!(comparison_settings(&a.settings)? == comparison_settings(&b.settings)?,
+        "runs use different nonprecision server settings");
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
     ensure!(a.tier != "quick" || a.path_shape == "decode-shaped", "quick tier must be decode-shaped");
     ensure!(matches!(a.tier.as_str(), "quick" | "full"), "unknown tier");
@@ -297,6 +320,37 @@ mod tests {
         a = b.clone(); a.tier = "quick".into(); a.path_shape = "prefill-shaped".into();
         assert!(compare(&a, &a, 0.01, 0.01, 100, 1).is_err());
     }
+    #[test]
+    fn pairing_allows_only_precision_switches_to_change() {
+        let mut b = run(3, 8);
+        b.settings = serde_json::json!({"model": "checkpoint", "settings": [
+            {"name": "concurrency", "value": "1", "source": "cli"},
+            {"name": "CUTEAFD_V41_FP8_HEAD", "value": "off", "source": "env"}]});
+        let mut a = b.clone();
+        a.settings["settings"][1]["value"] = serde_json::json!("all");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass);
+        a.settings["settings"].as_array_mut().unwrap().reverse();
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass);
+        a.settings["settings"][1]["source"] = serde_json::json!("default");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass);
+        a.settings["settings"][1]["value"] = serde_json::json!("4");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+        a = b.clone();
+        a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": "CUTEAFD_UNKNOWN_FP8", "value": "on"}));
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+        for name in ["concurrency", "CUTEAFD_V41_FP8_HEAD"] {
+            a = b.clone();
+            a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": name, "value": "1"}));
+            assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
+        }
+        a = b.clone(); a.settings["settings"][0].as_object_mut().unwrap().remove("value");
+        assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
+        a = b.clone(); a.settings["settings"] = serde_json::json!({});
+        assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
+        a = b.clone(); a.settings["family"] = serde_json::json!("other");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
     #[test]
     fn tripwires_cannot_pass_a_numerically_identical_pair() {
         let mut r = run(3, 100);

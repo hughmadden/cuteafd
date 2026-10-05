@@ -62,6 +62,21 @@ pub fn manifest(root: &Path, checkpoint: &str, set_sha256: &str, vocab: usize) -
     Ok(rows)
 }
 
+pub fn coverage(rows: &RowsManifest, windows: &[Window]) -> Result<()> {
+    let by_id: BTreeMap<_, _> = rows.windows.iter().map(|w| (w.id.as_str(), w)).collect();
+    ensure!(by_id.len() == rows.windows.len() && by_id.len() == windows.len(),
+        "full-row manifest window coverage differs from panel");
+    let expected: std::collections::BTreeSet<_> = windows.iter().map(|w| w.id.as_str()).collect();
+    ensure!(expected.len() == windows.len(), "duplicate panel window");
+    for window in windows {
+        let row = by_id.get(window.id.as_str()).context("full-row panel window missing")?;
+        ensure!(row.positions == window.positions.iter().map(|p| p.pos).collect::<Vec<_>>()
+            && row.shape == [row.positions.len(), rows.vocab],
+            "full-row manifest positions or shape differ for {}", window.id);
+    }
+    Ok(())
+}
+
 fn half(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = (bits >> 10) & 31;
@@ -107,6 +122,8 @@ pub fn score(root: &Path, rows: &RowsManifest, window: &Window, dump: &Path, sco
     ensure!(w.shape == [w.positions.len(), rows.vocab], "reference row shape mismatch");
     let p_map: BTreeMap<_, _> = w.positions.iter().enumerate().map(|(i, &p)| (p, i)).collect();
     ensure!(p_map.len() == w.positions.len(), "duplicate full reference position");
+    ensure!(w.positions == window.positions.iter().map(|p| p.pos).collect::<Vec<_>>(),
+        "full reference position coverage differs from panel");
     let ref_path = beneath(root, &w.path)?;
     ensure!(sha256(&ref_path)? == w.sha256, "full reference checksum mismatch");
     let mut reference = File::open(ref_path)?;
@@ -117,6 +134,8 @@ pub fn score(root: &Path, rows: &RowsManifest, window: &Window, dump: &Path, sco
         ensure!(row.vocab_size == rows.vocab && row.dtype == "F32" && row.byte_order == "little", "engine row format mismatch");
         ensure!(dumps.insert(row.position, row).is_none(), "duplicate dump position");
     }
+    ensure!(dumps.keys().copied().collect::<Vec<_>>() == window.positions.iter().map(|p| p.pos).collect::<Vec<_>>(),
+        "engine full-row position coverage differs from panel");
     ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(), "incomplete compact score");
     let mut bytes = vec![0u8; rows.vocab * 2];
     for p in &mut score.records {
@@ -160,7 +179,7 @@ mod tests {
         let path = root.join("reference.bin");
         // Rounded f16 log probabilities normalize to an exactly uniform distribution.
         std::fs::write(&path, [0xb98bu16.to_le_bytes(), 0xb98bu16.to_le_bytes()].concat()).unwrap();
-        let rows = RowsManifest { schema: "cuteafd.fidelity.rows/1".into(), set_sha256: "set".into(),
+        let mut rows = RowsManifest { schema: "cuteafd.fidelity.rows/1".into(), set_sha256: "set".into(),
             checkpoint: "checkpoint".into(), vocab: 2, dtype: "<f2".into(), kind: "log_softmax".into(),
             windows: vec![RowsWindow { id: "A1".into(), path: "reference.bin".into(), sha256: sha256(&path).unwrap(),
                 positions: vec![1], shape: vec![1, 2] }] };
@@ -169,6 +188,21 @@ mod tests {
             positions: vec![CompactPosition { pos: 1, next: 0, next_lp: -2.0f64.ln(),
                 top: vec![Top { id: 0, lp: -2.0f64.ln() }, Top { id: 1, lp: -2.0f64.ln() }],
                 tail_lp: f64::NEG_INFINITY }] };
+        coverage(&rows, &[window.clone()]).unwrap();
+        assert!(coverage(&rows, &[]).is_err());
+        let mut other = window.clone(); other.id = "other".into();
+        assert!(coverage(&rows, &[other]).is_err());
+        assert!(coverage(&rows, &[window.clone(), window.clone()]).is_err());
+        rows.windows[0].positions[0] = 2;
+        assert!(coverage(&rows, &[window.clone()]).is_err());
+        rows.windows[0].positions[0] = 1;
+        rows.windows[0].shape = vec![2, 2];
+        assert!(coverage(&rows, &[window.clone()]).is_err());
+        rows.windows[0].shape = vec![1, 2];
+        rows.windows.push(RowsWindow { id: "A1".into(), path: "reference.bin".into(),
+            sha256: String::new(), positions: vec![1], shape: vec![1, 2] });
+        assert!(coverage(&rows, &[window.clone()]).is_err());
+        rows.windows.pop();
         let dump = root.join("dump");
         let probe = Probe::new(ProbeSpec { dump_rows: Some(dump.clone()), want: window.want(), top_k: 2,
             ..ProbeSpec::default() });
@@ -176,6 +210,12 @@ mod tests {
         let mut f = window.score(&probe.record().rows);
         score(root, &rows, &window, &dump, &mut f).unwrap();
         assert_eq!(f.kl, 0.0); assert_eq!(f.top1, 1.0);
+        let extra_dump = root.join("extra-dump");
+        let extra = Probe::new(ProbeSpec { dump_rows: Some(extra_dump.clone()), want: window.want(), top_k: 2,
+            ..ProbeSpec::default() });
+        extra.row(1, &[0.0, 0.0]); extra.row(2, &[0.0, 0.0]);
+        let mut extra_score = window.score(&extra.record().rows);
+        assert!(score(root, &rows, &window, &extra_dump, &mut extra_score).unwrap_err().to_string().contains("coverage"));
         std::fs::write(&path, [0u8; 4]).unwrap();
         assert!(score(root, &rows, &window, &dump, &mut f).unwrap_err().to_string().contains("checksum"));
     }

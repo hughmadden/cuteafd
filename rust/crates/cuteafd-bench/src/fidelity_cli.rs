@@ -108,7 +108,9 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let rows = if args.tier == "full" {
         let dir = args.rows.as_ref().context("full tier needs --rows / CUTEAFD_FIDELITY_ROWS")?;
         ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe");
-        Some(crate::fidelity_rows::manifest(dir, &reference.checkpoint, &reference.set_sha256, reference.vocab)?)
+        let rows = crate::fidelity_rows::manifest(dir, &reference.checkpoint, &reference.set_sha256, reference.vocab)?;
+        crate::fidelity_rows::coverage(&rows, &windows)?;
+        Some(rows)
     } else { None };
     let started = Instant::now();
     let mut records = Vec::new();
