@@ -77,7 +77,7 @@ pub fn coverage(rows: &RowsManifest, windows: &[Window]) -> Result<()> {
     Ok(())
 }
 
-fn half(bits: u16) -> f64 {
+pub(crate) fn half(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = (bits >> 10) & 31;
     let mantissa = bits & 1023;
@@ -106,7 +106,7 @@ fn safetensors(path: &Path, tensor: &str, vocab: usize) -> Result<Vec<f64>> {
 }
 
 /// Normalize rounded log-probabilities before KL; f16 rounding otherwise changes total mass.
-fn normalize(log_probs: &mut [f64]) -> Result<()> {
+pub(crate) fn normalize(log_probs: &mut [f64]) -> Result<()> {
     ensure!(log_probs.iter().all(|x| x.is_finite() || *x == f64::NEG_INFINITY), "invalid log probability");
     let max = log_probs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     ensure!(max.is_finite(), "empty probability distribution");
@@ -154,6 +154,44 @@ pub fn score(root: &Path, rows: &RowsManifest, window: &Window, dump: &Path, sco
             .context("empty engine row")?.0 as u32;
         ensure!(argmax == p.argmax, "dump argmax differs from in-band row");
         p.kl = kl.max(0.0);
+    }
+    *score = Fidelity::from_records(std::mem::take(&mut score.records));
+    Ok(())
+}
+
+/// Compute the engine tail directly from its full row, avoiding rounded top-mass cancellation.
+pub fn score_compact(vocab: usize, window: &Window, dump: &Path, score: &mut Fidelity) -> Result<()> {
+    let mut dumps = BTreeMap::new();
+    for line in BufReader::new(File::open(dump.join("manifest.jsonl"))?).lines() {
+        let row: DumpRow = serde_json::from_str(&line?)?;
+        ensure!(row.vocab_size == vocab && row.dtype == "F32" && row.byte_order == "little", "engine row format mismatch");
+        ensure!(dumps.insert(row.position, row).is_none(), "duplicate dump position");
+    }
+    ensure!(dumps.keys().copied().collect::<Vec<_>>() == window.positions.iter().map(|p| p.pos).collect::<Vec<_>>()
+        && score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+        "incomplete compact dataset score");
+    for (record, reference) in score.records.iter_mut().zip(&window.positions) {
+        ensure!(record.position == reference.pos, "compact record order differs");
+        let row = &dumps[&record.position];
+        let mut engine = safetensors(&beneath(dump, &row.file)?, &row.tensor, vocab)?;
+        normalize(&mut engine)?;
+        let argmax = engine.iter().enumerate().max_by(|(ia,a),(ib,b)| a.total_cmp(b).then_with(|| ib.cmp(ia)))
+            .context("empty engine row")?.0 as u32;
+        ensure!(argmax == record.argmax, "dump argmax differs from in-band row");
+        let mut chosen = vec![false; vocab];
+        let mut kl = 0.0;
+        for t in &reference.top {
+            chosen[t.id as usize] = true;
+            kl += t.lp.exp() * (t.lp - engine[t.id as usize]);
+        }
+        let peak = engine.iter().zip(&chosen).filter(|(_, selected)| !**selected)
+            .map(|(lp,_)| *lp).fold(f64::NEG_INFINITY, f64::max);
+        let tail = peak + engine.iter().zip(&chosen).filter(|(_,selected)| !**selected)
+            .map(|(lp,_)| (lp - peak).exp()).sum::<f64>().ln();
+        if reference.tail_lp.is_finite() { kl += reference.tail_lp.exp() * (reference.tail_lp - tail); }
+        ensure!(kl.is_finite() && kl >= -1e-10, "invalid compact KL");
+        record.kl = kl.max(0.0);
+        record.nll = -engine[reference.next as usize];
     }
     *score = Fidelity::from_records(std::mem::take(&mut score.records));
     Ok(())
@@ -210,6 +248,14 @@ mod tests {
         let mut f = window.score(&probe.record().rows);
         score(root, &rows, &window, &dump, &mut f).unwrap();
         assert_eq!(f.kl, 0.0); assert_eq!(f.top1, 1.0);
+        // A one-id support plus actual engine tail matches the full uniform row.
+        let mut compact = window.clone();
+        compact.positions[0].top.truncate(1);
+        compact.positions[0].tail_lp = -2.0f64.ln();
+        let mut compact_score = compact.score(&probe.record().rows);
+        score_compact(2, &compact, &dump, &mut compact_score).unwrap();
+        assert_eq!(compact_score.kl, 0.0);
+        assert!((compact_score.nll - 2.0f64.ln()).abs() < 1e-12);
         let extra_dump = root.join("extra-dump");
         let extra = Probe::new(ProbeSpec { dump_rows: Some(extra_dump.clone()), want: window.want(), top_k: 2,
             ..ProbeSpec::default() });

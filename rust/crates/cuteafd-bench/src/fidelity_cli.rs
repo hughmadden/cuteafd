@@ -61,6 +61,15 @@ pub struct RunArgs {
     pub out: PathBuf,
     #[arg(long)]
     pub reference: Option<PathBuf>,
+    /// Public HF dataset repository; always fetched at an immutable commit.
+    #[arg(long, conflicts_with_all = ["reference", "rows"])]
+    pub dataset: Option<String>,
+    #[arg(long, requires = "dataset")]
+    pub dataset_revision: Option<String>,
+    #[arg(long, default_value = crate::fidelity_dataset::CONFIG)]
+    pub dataset_config: String,
+    #[arg(long)]
+    pub dataset_cache: Option<PathBuf>,
     /// Full-reference directory (rows.json and sealed f16 files), visible to this client.
     #[arg(long, env = "CUTEAFD_FIDELITY_ROWS")]
     pub rows: Option<PathBuf>,
@@ -94,18 +103,26 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let base = args.url.trim_end_matches('/');
     let models: Value = agent.get(&format!("{base}/v1/models")).call()?.into_json()?;
     let model = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let (reference, digest) = if let Some(path) = &args.reference {
+    let (reference, digest, dataset_identity) = if let Some(repo) = &args.dataset {
+        ensure!(args.tier == "full", "qualified compact dataset requires the full tier");
+        let commit = args.dataset_revision.as_deref().context("--dataset requires --dataset-revision")?;
+        let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
+            std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
+        let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, &args.dataset_config)?;
+        (reference, digest, Some(identity))
+    } else if let Some(path) = &args.reference {
         let bytes = std::fs::read(path)?;
-        (serde_json::from_slice::<Reference>(&bytes)?, format!("{:x}", Sha256::digest(&bytes)))
+        (serde_json::from_slice::<Reference>(&bytes)?, format!("{:x}", Sha256::digest(&bytes)), None)
     } else {
         let r = Reference::find(model).context("no family reference; use --reference")?;
         let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&r)?));
-        (r, digest)
+        (r, digest, None)
     };
     ensure!(reference.models.iter().any(|pattern| crate::reference::glob(pattern, model)), "reference does not match served model");
     ensure!(reference.windows.is_empty() || reference.checkpoint == model, "reference checkpoint differs from served checkpoint");
     let windows = reference.selected_windows(args.tier == "full")?;
-    let rows = if args.tier == "full" {
+    if args.tier == "full" { ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe"); }
+    let rows = if args.tier == "full" && dataset_identity.is_none() {
         let dir = args.rows.as_ref().context("full tier needs --rows / CUTEAFD_FIDELITY_ROWS")?;
         ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe");
         let rows = crate::fidelity_rows::manifest(dir, &reference.checkpoint, &reference.set_sha256, reference.vocab)?;
@@ -122,7 +139,7 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         let mut spec = json!({"prompt_ids": window.tokens[..end], "score_from": window.score_from,
             "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true,
             "score_path": args.score_path});
-        if rows.is_some() { spec["dump_rows"] = json!(dump); }
+        if args.tier == "full" { spec["dump_rows"] = json!(dump); }
         if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
         let response = request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key,
             &json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
@@ -151,6 +168,9 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         if let Some(rows) = &rows {
             crate::fidelity_rows::score(args.rows.as_ref().unwrap(), rows, window, dump.as_ref().unwrap(), &mut f)?;
         }
+        if dataset_identity.is_some() {
+            crate::fidelity_rows::score_compact(reference.vocab, window, dump.as_ref().unwrap(), &mut f)?;
+        }
         missing += f.missing;
         eprintln!("{}: {} rows, top1 {:.2}%, KL {:.6}", window.id, f.positions, 100.0 * f.top1, f.kl);
         records.extend(f.records);
@@ -159,7 +179,9 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
         set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
         reference_sha256: digest, tier: args.tier.clone(), path_shape: shape,
-        kl_kind: if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
+        kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
+            else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
+        dataset: dataset_identity,
         verify_rows: args.verify_rows, engine, settings, seconds: started.elapsed().as_secs_f64(), score,
         floor_top1: reference.expect.top1_min, floor_kl: reference.expect.kl_max };
     std::fs::write(&args.out, serde_json::to_vec_pretty(&run)?)?;

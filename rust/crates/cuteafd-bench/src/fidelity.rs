@@ -17,6 +17,8 @@ pub struct Run {
     pub path_shape: String,
     pub kl_kind: String,
     pub verify_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<serde_json::Value>,
     pub engine: String,
     pub settings: serde_json::Value,
     pub seconds: f64,
@@ -66,7 +68,7 @@ pub fn compare_full(
             "full decision requires decode and prefill scoring paths");
         ensure!(decode.arm == prefill.arm && decode.checkpoint == prefill.checkpoint
             && decode.set_sha256 == prefill.set_sha256 && decode.reference_sha256 == prefill.reference_sha256
-            && decode.engine == prefill.engine && decode.settings == prefill.settings,
+            && decode.engine == prefill.engine && decode.settings == prefill.settings && decode.dataset == prefill.dataset,
             "scoring paths use different arms, references or server settings");
     }
     let decode = compare(a_decode, b_decode, 0.005, 0.005, bootstrap, seed)?;
@@ -181,7 +183,7 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(!a.checkpoint.is_empty() && !a.set_sha256.is_empty() && !a.reference_sha256.is_empty(), "missing provenance");
     ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
         "runs use different checkpoints, sets or references");
-    ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows,
+    ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(a.engine == b.engine && a.settings.get("build") == b.settings.get("build")
         && a.settings.get("snapshot") == b.settings.get("snapshot"), "runs use different engines, builds or snapshots");
@@ -190,7 +192,12 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
     ensure!(a.tier != "quick" || a.path_shape == "decode-shaped", "quick tier must be decode-shaped");
     ensure!(matches!(a.tier.as_str(), "quick" | "full"), "unknown tier");
-    if a.tier == "full" { ensure!(a.kl_kind == "full-vocabulary", "full tier cannot gate compact KL"); }
+    if a.tier == "full" {
+        ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
+            && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
+                r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())))),
+            "full tier requires full-vocabulary or revision-pinned qualified top1024 KL");
+    }
     let (pa, pb) = (pairs(a)?, pairs(b)?);
     ensure!(pa.keys().collect::<Vec<_>>() == pb.keys().collect::<Vec<_>>(), "runs score different rows");
     let mut by_window: BTreeMap<String, ([f64; 2], usize)> = BTreeMap::new();
@@ -255,7 +262,7 @@ mod tests {
         })).collect();
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
-            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8),
+            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06 }
     }

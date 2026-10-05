@@ -25,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ureq = "=2.12.1"
+tempfile.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

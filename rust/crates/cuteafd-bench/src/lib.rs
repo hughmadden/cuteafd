@@ -12,6 +12,7 @@ pub mod client;
 pub mod context;
 pub mod fidelity;
 pub mod fidelity_cli;
+pub mod fidelity_dataset;
 pub mod fidelity_rows;
 pub mod http;
 pub mod panels;

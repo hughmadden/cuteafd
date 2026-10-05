@@ -282,8 +282,18 @@ KL. Saved V4.1 FP8-head decode/prefill paired deltas and upper95 bounds agree
 with full-vocabulary results within 1.18e-7 nat (required <=1e-4), with both
 PASS verdicts unchanged; f16 entries and f32 tail were included. Full-vocab
 rows remain local validation evidence, not a required download. The bench
-fetches approved datasets pinned by immutable HF commit revision; no upload
-until TJ approves the first publication. Set/reference hashes, file hashes,
+fetches datasets with `--dataset tpurtell/cuteafd-fidelity --dataset-config
+FAMILY-VERSION --dataset-revision IMMUTABLE_40_HEX_COMMIT`; branches and tags
+are rejected. The revision/config/repository and manifest SHA are retained
+in run results and must match across arms. It checks the index, manifest,
+window, qualification and safetensors hashes before scoring. Engine full-row
+dumps remain local and provide the actual omitted mass, avoiding subtraction
+of rounded top probabilities. Actual Rust absolute and tripwire gates have
+also revalidated the saved compact pair, with both PASS verdicts unchanged.
+Publication provenance carries artifact hashes/fork pins and rank topology,
+not host paths, addresses or credentials; decoded source text is audited too.
+The coordinator handles the public upload; the immutable published revision
+is pinned after Hub-copy checksum verification. Set/reference hashes, file hashes,
 root/generation provenance and per-checkpoint licence terms accompany each
 config. Text is ours, with source-file licence obligations preserved; logits
 derive from the named official checkpoint and do not erase its terms.
