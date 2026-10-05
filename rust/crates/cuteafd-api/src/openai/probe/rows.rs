@@ -37,8 +37,11 @@ impl RowDump {
             return Err(io::Error::other("row dump requires a nonempty normalizable vocabulary"));
         }
         if self.files.is_none() {
-            // Claim the directory exclusively: concurrent probes cannot overwrite
-            // one another or accidentally mix arms from an earlier run.
+            // Parents may be new on the server's shared mount. Only the leaf is
+            // exclusive: concurrent probes must never mix rows or overwrite arms.
+            if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)?;
+            }
             fs::create_dir(&self.path)?;
             let manifest = match OpenOptions::new().write(true).create_new(true).open(self.path.join("manifest.jsonl")) {
                 Ok(file) => file,
@@ -123,6 +126,21 @@ mod tests {
         assert!(!path.join("row-00000001.safetensors.partial").exists());
         assert_eq!(fs::read_dir(&path).unwrap().count(), 2);
         assert_eq!(fs::read_to_string(path.join("manifest.jsonl")).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn nested_dump_parents_are_created_without_overwriting_the_leaf() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("arm/decode/window-000");
+        let logits = [1.0, 2.0];
+        let softmax = LogSoftmax::new(&logits);
+        let mut dump = RowDump::new(path.clone());
+        dump.write(1, &logits, &softmax).unwrap();
+        let original = fs::read(path.join("manifest.jsonl")).unwrap();
+        let mut duplicate = RowDump::new(path.clone());
+        assert_eq!(duplicate.write(2, &logits, &softmax).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(path.join("manifest.jsonl")).unwrap(), original);
+        assert!(!path.join("row-00000001.safetensors").exists());
     }
 
     #[test]
