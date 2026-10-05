@@ -10,7 +10,7 @@ import sys
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
-from fidelity_windows import validate_public_text
+from fidelity_windows import validate_public_metadata, validate_public_text
 from tokenizers import Tokenizer
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -127,6 +127,11 @@ for window in json.loads((config / 'windows.json').read_text())['windows']:
     validate_public_text(tokenizer.decode(window['tokens'], skip_special_tokens=False), scored_text=True)
 for path in OUT.rglob('*'):
     if path.is_file() and path.suffix != '.safetensors':
-        validate_public_text(path.read_text())
+        if path.suffix == '.json':
+            validate_public_metadata(json.loads(path.read_text()))
+        elif path.name == 'README.md':
+            validate_public_text(path.read_text(), scored_text=True)
+        else:
+            validate_public_text(path.read_text())
 print('Qualified config folder', config, 'manifestSHA', digest(config / 'manifest.json'))
 print('No upload performed; production loader and coordinator audit still required')

@@ -80,6 +80,22 @@ def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
         validate_public_text(text, scored_text=True)
 
 
+def test_public_metadata_allows_only_narrow_generated_synthetic_email_audit():
+    from fidelity_windows import validate_public_metadata
+    audit = {"synthetic_email_exemptions": [{"window": "d01", "role": "gen",
+        "address": "customer@example.com", "basis": "synthetic generated record"}]}
+    validate_public_metadata(audit)
+    with pytest.raises(ValueError, match="email"):
+        validate_public_metadata({"contact": "customer@example.com"})
+    audit["synthetic_email_exemptions"][0]["address"] = "customer@gmail.com"
+    with pytest.raises(ValueError, match="non-reserved"):
+        validate_public_metadata(audit)
+    audit["synthetic_email_exemptions"][0]["address"] = "customer@example.com"
+    audit["synthetic_email_exemptions"][0]["role"] = "ctx"
+    with pytest.raises(ValueError, match="generated"):
+        validate_public_metadata(audit)
+
+
 def test_dataset_finalizer_refuses_unqualified_evidence_before_copy(tmp_path):
     validation = tmp_path / "validation"
     validation.mkdir()

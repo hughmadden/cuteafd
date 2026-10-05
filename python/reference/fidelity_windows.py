@@ -37,6 +37,35 @@ def validate_public_text(text: str, *, scored_text: bool = False) -> None:
             raise ValueError("email publication blocker")
 
 
+def validate_public_metadata(value, *, synthetic_exemption: bool = False) -> None:
+    """Permit reserved-email audit records without exempting arbitrary metadata."""
+    if isinstance(value, str):
+        validate_public_text(value, scored_text=synthetic_exemption)
+    elif isinstance(value, list):
+        for item in value:
+            validate_public_metadata(item, synthetic_exemption=synthetic_exemption)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            validate_public_text(key)
+            if key == "synthetic_email_exemptions":
+                if not isinstance(item, list):
+                    raise ValueError("invalid synthetic-email audit records")
+                for record in item:
+                    if not isinstance(record, dict) or record.get("role") != "gen":
+                        raise ValueError("synthetic-email audit must name generated text")
+                    address = record.get("address")
+                    if not isinstance(address, str) or "@" not in address:
+                        raise ValueError("synthetic-email audit lacks address")
+                    domain = address.rsplit("@", 1)[1].lower()
+                    if domain not in ("example.com", "example.org", "example.net") and not domain.endswith(".example"):
+                        raise ValueError("non-reserved synthetic-email audit address")
+                    for field, content in record.items():
+                        validate_public_text(field)
+                        validate_public_metadata(content, synthetic_exemption=field == "address")
+            else:
+                validate_public_metadata(item)
+
+
 def rss_bytes() -> int:
     """Current Linux RSS, not ru_maxrss's irreversible peak."""
     return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
