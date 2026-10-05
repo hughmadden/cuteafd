@@ -156,6 +156,33 @@ def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro
     assert (tmp_path / "README.md").read_text() == root_card
 
 
+@pytest.mark.parametrize("has_checkpoint_notice", [True, False])
+def test_dataset_finalizer_can_omit_optional_checkpoint_licence(tmp_path, has_checkpoint_notice):
+    import shutil
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "LICENSE").write_text("MIT project licence\n")
+    manifest = {"licence_files": [{"path": "LICENSE", "sha256": "project"}],
+                "checkpoint": "vendor/model", "root_checkpoint": {"snapshot_revision": "a" * 40}}
+    if has_checkpoint_notice:
+        (source / "CHECKPOINT_LICENSE").write_text("Official checkpoint notice\n")
+        manifest["licence_files"].append({"path": "CHECKPOINT_LICENSE", "sha256": "vendor"})
+    output = tmp_path / "output"
+    shutil.copytree(source, output)
+    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "omit_checkpoint_license")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "optional-licence", "exec"), namespace)
+    namespace["omit_checkpoint_license"](output, manifest)
+    assert not (output / "CHECKPOINT_LICENSE").exists()
+    assert (source / "CHECKPOINT_LICENSE").exists() == has_checkpoint_notice
+    assert (output / "LICENSE").read_bytes() == (source / "LICENSE").read_bytes()
+    assert manifest["licence_files"] == [{"path": "LICENSE", "sha256": "project"}]
+    assert manifest["checkpoint"] == "vendor/model"
+    assert manifest["root_checkpoint"]["snapshot_revision"] == "a" * 40
+
+
 def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_path):
     from fidelity_windows import validate_public_metadata, validate_public_text
     tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())

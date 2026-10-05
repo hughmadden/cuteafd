@@ -19,6 +19,8 @@ for name in ("source", "out", "validation", "arms", "tokenizer"):
 parser.add_argument("--config", required=True)
 parser.add_argument("--comparison-policy-commit", required=True)
 parser.add_argument("--validator-source-commit", required=True)
+parser.add_argument("--omit-checkpoint-license", action="store_true",
+                    help="Omit CHECKPOINT_LICENSE for this config; preserve other licence files")
 args = parser.parse_args()
 SOURCE, OUT, NAME, VALIDATION = args.source, args.out, args.config, args.validation
 assert Path(NAME).name == NAME and NAME not in (".", "..")
@@ -31,6 +33,13 @@ def digest(path):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+
+
+def omit_checkpoint_license(config, manifest):
+    """Remove only the optional checkpoint notice from a fresh output config."""
+    (config / 'CHECKPOINT_LICENSE').unlink(missing_ok=True)
+    manifest['licence_files'] = [entry for entry in manifest.get('licence_files', [])
+                                 if entry['path'] != 'CHECKPOINT_LICENSE']
 
 
 report = json.loads((VALIDATION / 'report.json').read_text())
@@ -51,6 +60,8 @@ assert not OUT.exists(), 'Preserve immutable output attempts'
 OUT.mkdir()
 config = OUT / NAME
 shutil.copytree(SOURCE / NAME, config)
+if args.omit_checkpoint_license:
+    omit_checkpoint_license(config, manifest)
 preparation = json.loads((config / 'qualification.json').read_text())
 report['prefix_qualification'] = preparation['prefix_qualification']
 report['source_audit'] = preparation['source_audit']
