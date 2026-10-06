@@ -316,6 +316,7 @@ def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     ("GLMF_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
     ("GLM5_FLASH_FP8_PREFILL", "kda-o,ffn", "GLM5_FLASH_KDA_FP8=row128"),
     ("GLM5_FLASH_FP8_HEAD", "maybe", "GLM5_FLASH_FP8_HEAD must be"),
+    ("GLM5_FLASH_INDEX_CACHE", "tails", "GLM5_FLASH_INDEX_CACHE must be"),
 ])
 def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
@@ -369,6 +370,19 @@ def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys,
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,compact", [("", False), ("GLM5_FLASH_INDEX_CACHE=keys\n", False),
+                                         ("GLM5_FLASH_INDEX_CACHE=compact\n", True)])
+def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--index-cache compact" in launch) == compact, launch
+    assert "--index-cache keys" not in launch
 
 
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
