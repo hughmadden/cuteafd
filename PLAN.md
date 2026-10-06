@@ -753,14 +753,16 @@ Work, in priority order:
    1024-token image, measured), and history images come from the
    embedding and prefix caches. That beats spending RTX memory or a whole
    Spark on the tower. The −91% decode under back-to-back 4096-token
-   encodes is a stress case, not a gate for this default. `VISION=auto`
-   becomes the default once the item below lands; until then
-   generic-family launches default to `VISION=off`. Keep V4.1 vision
-   unchanged.
-   **Open integration item:** wire `RemoteEncoder` into MiMo serving
-   (`vision_peers`, `encoder_plan_hash`). Until then, MiMo launches with
-   `VISION=auto` or `spark` fail closed with a clear `rtx`/`off` hint; the
-   placement planner remains available for explicit policy inspection.
+   encodes is a stress case, not a gate for this default. MiMo launches
+   now default to `VISION=auto`; other generic families stay `off` until
+   their towers are qualified. Keep V4.1 vision unchanged.
+   **Remote integration qualified:** MiMo serving uses `RemoteEncoder`
+   with checked `vision_peers`, revision and `encoder_plan_hash`; readiness
+   waits for every replica. Remote failure marks `/health` vision failed
+   and rejects cached/new images with 503 while text continues. Flash-min
+   C1 three-arm parity, chart/G6, exact G7 a/e, single-image interference
+   and vision-only connection-loss gates pass. Explicit `VISION=off` skips
+   tower startup; checkpoints without a tower remain text-only.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop

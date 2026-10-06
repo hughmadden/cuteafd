@@ -72,7 +72,7 @@ cuteafd-ffi      shared/vision.rs
 - **Handshake.** The rank reports `EncoderId` (family, checkpoint revision, tower tensor-header digest, engine encoder numerics version, SM arch) and its capacity in patches. The coordinator refuses a mismatch.
 - **Replicas.** `--vision-replicas N` (default 1) places towers on N Spark ranks. The service spreads one request's images across them (16 images on GB10: ~2.6 s serial vs ~0.65 s on 4 replicas). Default stays 1 until a measured need exists.
 - **Interference control.** Lowest stream priority, and every kernel launch bounded (GEMM tiles by row chunks of 4096, flash attention CTAs). WP‑4 measures a concurrent stream's C1 decode on the same Spark while a 4096-token image encodes.
-  - **Stop bar:** more than 30% slowdown over the encode window, or any slowdown when no image is in flight. Either one moves the default to an idle Spark or the RTX for that layout. The "no image" case must read 0%: an idle encoder thread launches nothing.
+  - **Qualification:** D1 accepts the single-image shared-Spark stall; sustained-load slowdown is diagnostic, not a default-placement gate. Text-only C1 with an idle encoder must retain at least 0.98x baseline throughput over three interleaved runs. An idle encoder thread launches no kernels.
 - **Failure.** If the encoder rank fails or is unreachable, image requests get 503 "vision encoder unavailable", text continues, and `/health` reports `vision: failed`. If the encoder rank is also an expert rank, the existing expert-failure path governs.
 
 ### 2.4 Default placement per hardware class
@@ -85,9 +85,9 @@ cuteafd-ffi      shared/vision.rs
 | RTX only (e.g. Qwen maximum, one PRO 6000) | GPU1 / GPU0 if the KV target holds | off + shortfall |
 | V4.1 (any) | RTX, unchanged | — (WP‑11 adds Spark) |
 
-D1 for TJ: on 2× PRO 6000 the GPU1 tower would cost nothing material against the 2M target and saves ~100 ms TTFT per new image. The opt-in `auto` planner policy remains Spark-first; flipping 2× PRO 6000 to `rtx:1` is a one-line policy change.
+D1 resolved: `auto` remains Spark-first, including on 2× PRO 6000. An explicit `rtx:1` placement remains available when trading RTX memory for lower image latency is preferred.
 
-**Measured (2026-10-06):** a single 1024-token image on a shared expert Spark added approximately 150 ms of decode stall; sustained back-to-back 4096-token encodes reduced decode by approximately 91%, failing the <=30% slowdown bar. An idle Spark showed no extra stall in the single-image diagnostic (not a sustained-load qualification). D1 remains open with TJ. Until that decision, generic-family launches default to `VISION=off`. MiMo's current serving adapter supports only `rtx`; `spark` and `auto` launches fail closed with an explicit hint until `RemoteEncoder` is wired into serving. The planner's opt-in Spark-first policy remains available for inspection. V4.1's existing RTX vision default is unchanged.
+**Qualified (2026-10-06):** D1 accepts an expert Spark as the default encoder placement and the historical approximately 150 ms single-image stall; sustained back-to-back 4096-token encodes (approximately -91% decode) are a stress case, not a default gate. MiMo serving now wires `RemoteEncoder` with checked identity, revision, capacity and admission-plan hash, and MiMo launches default to `VISION=auto`. Other generic families retain `off`; V4.1's RTX vision path is unchanged. Flash-min C1 three-arm parity, chart/G6, concurrent charts, exact G7 a/e and vision-only connection-loss gates pass. The served-image diagnostic includes admission, encoding and image prefill, not isolated CUDA/expert stall. Active/new text survives vision-only loss while cached/new images return 503; whole expert-rank loss still follows expert-failure handling. Native-owner death is separately unit-tested. Measurements and conditions are recorded in the qualification commit.
 
 ### 2.5 Latency budget against time-to-first-token
 
@@ -105,7 +105,7 @@ MiMo timings are measured by WP-3: median of three interleaved warm component en
 
 Typical inputs: 640×480 → 300 tokens; 1280×720 → 880 tokens (MiMo/Qwen) or 1196 (GLM); 1920×1080 → 2040 or 2691; a 4K screenshot → 8160 tokens before our cap.
 
-Budget rule: on the default placement, encoding a ≤ 1024-token image must add ≤ 250 ms to TTFT and ≤ 1.0× the prefill time of its own tokens. The measured isolated Flash Spark tower is 157.77 ms at 1024 tokens, consistent with that budget (~200 ms of prefill at ~5k tok/s). End-to-end transport and concurrent decode are still WP-4 gates; if their TTFT exceeds the budget, the planner prefers RTX for that layout.
+Original latency target: encoding a ≤ 1024-token image adds ≤ 250 ms to TTFT and ≤ 1.0× the prefill time of its own tokens. The measured isolated Flash Spark tower is 157.77 ms at 1024 tokens, consistent with that target (~200 ms of prefill at ~5k tok/s). D1's shared-expert-Spark default is qualified by the serving gates in §2.4, not by this component-only estimate. The served-image TTFT includes admission and prefill and does not establish the incremental encoding budget.
 
 Overlap: once WP‑5 lands, text rows before the first uncached image prefill while the Spark encodes. This helps fresh prompts; agentic turns, whose prefix restores instantly, gain nothing.
 

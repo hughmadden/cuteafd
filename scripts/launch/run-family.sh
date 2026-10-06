@@ -72,7 +72,10 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Explicit MiMo auto/spark placement is resolved by the encoder plan below.
+# MiMo's qualified remote encoder uses Spark-first auto unless explicitly off.
+# Other generic families keep off until their towers are qualified.
+if [[ "$family" == mimo_v2 && -z "$(get VISION)" ]]; then vision=auto; fi
+# Auto/spark placement is resolved by the encoder plan below.
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
 # the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.

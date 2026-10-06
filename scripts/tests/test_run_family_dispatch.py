@@ -871,7 +871,7 @@ def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, p
     assert "filter name=^cuteafd-spark-expert-" not in result.stderr
 
 @pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark", "spark"), ("spark:0", "spark"),
-                                        ("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
+                                        ("rtx", "rtx"), ("rtx:0", "rtx"), ("off", "off"), (None, "spark")])
 def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     placement = {"kind": kind}
@@ -891,4 +891,34 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
         assert f"--encoder-plan-hash {'ab' * 32}" in worker
         assert f"--encoder-plan-hash {'ab' * 32}" in launch
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
-    if kind == "off": assert "cuteafd plan" not in result.stderr
+    if kind == "off":
+        assert "cuteafd plan" not in result.stderr
+    else:
+        preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+        assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("family_config,serve", [
+    ({"model_type": "deepseek_v4"}, "serve-dsv4"),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
+    ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+      "layer_types": ["linear_attention", "deepseek_sparse_attention"]}, "serve-glmf"),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+      "layer_types": ["linear_attention", "full_attention"]}}, "serve-qwen4"),
+])
+def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_config, serve):
+    model = "zai-org/GLM-5.3-Flash" if serve == "serve-glmf" else "test/model"
+    result = _family_launch_result(tmp_path, family_config, model, "SPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
+    assert "--vision off" in launch
+    assert "--encoder-listen" not in result.stderr and "--vision-peers" not in launch
+
+
+def test_text_only_mimo_auto_default_does_not_start_a_tower(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "SPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--vision auto" in launch
+    assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
