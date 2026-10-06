@@ -762,6 +762,9 @@ Work, in priority order:
    replay executor it contains. When merging both, resolve it to the union
    `mimo_v2|qwen4|glm5_flash`, with positive tests for all three. Never
    list a family whose executor isn't present.
+   The same applies to `scripts/launch/run-family.sh:279`, where
+   MEDIA_CACHE_BYTES is forwarded: WP-9 has `mimo_v2 || glm5_flash` and WP-7
+   adds `qwen4`, so resolve that to all three.
    **Remote integration qualified:** MiMo serving uses `RemoteEncoder`
    with checked `vision_peers`, revision and `encoder_plan_hash`; readiness
    waits for every replica. Remote failure marks `/health` vision failed
