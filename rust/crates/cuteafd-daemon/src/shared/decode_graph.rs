@@ -23,8 +23,34 @@ pub(crate) fn masked_row(row: usize) -> MaskedRow {
         seq_first: row as i32, cache_length: 0 }
 }
 
+/// Real-row expert work must finish before clearing the padding tail: quantizers
+/// may borrow the output as scratch. Families own the buffers and stream ordering.
+pub(crate) fn real_row_moe(
+    real: usize, bucket: usize,
+    run: impl FnOnce(usize) -> anyhow::Result<()>,
+    clear: impl FnOnce(std::ops::Range<usize>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(real > 0 && real <= bucket, "invalid real-row MoE extent {real}/{bucket}");
+    run(real)?;
+    if real < bucket { clear(real..bucket)?; }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn real_row_experts_precede_tail_clear() {
+        let events = std::cell::RefCell::new(Vec::new());
+        super::real_row_moe(17, 32, |rows| { events.borrow_mut().push(("run", rows, rows)); Ok(()) },
+            |tail| { events.borrow_mut().push(("clear", tail.start, tail.end)); Ok(()) }).unwrap();
+        assert_eq!(*events.borrow(), [("run", 17, 17), ("clear", 17, 32)]);
+        super::real_row_moe(8, 8, |_| Ok(()), |_| panic!("no tail")).unwrap();
+        assert!(super::real_row_moe(0, 8, |_| panic!("invalid"), |_| panic!("invalid")).is_err());
+        assert!(super::real_row_moe(9, 8, |_| panic!("invalid"), |_| panic!("invalid")).is_err());
+        assert!(super::real_row_moe(3, 4, |_| anyhow::bail!("expert failure"),
+            |_| panic!("cannot clear failed work")).is_err());
+    }
+
     #[test]
     fn canonical_rows_and_mask() {
         use super::*;
