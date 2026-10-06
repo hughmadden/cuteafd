@@ -12,6 +12,10 @@ use thiserror::Error;
 mod deepseek;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
+mod glmf_workspace;
+pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
+    glmf_temporary_bytes, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions, GlmfStepShape,
+    GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK};
 mod v4_workspace;
 pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
