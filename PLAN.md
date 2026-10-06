@@ -730,8 +730,17 @@ Policy decisions:
   cannot be reconstructed from current dumps:
   per-layer K/V history and the MLA query/cache were not saved. Quantization
   amplification is a hypothesis, not an engine-correctness verdict; no
-  further hardware run is scheduled. This open finding does not block
-  dataset upload, which still needs the d03 reference check and TJ approval.
+  further causal-debug hardware run is scheduled. Cross-architecture
+  reference sensitivity is also observed: d03 scored 1403 (input 1402)
+  gives token 6337 at p=0.94066 in the original SM121 golden, versus 7388
+  at p=0.68815 from the truncated SM120 residual with CPU official-head
+  replay (KL 2.37465). The neighboring d03 scored 1404 reproduces token
+  1419 (KL 0.00003495); d04 scored 2214 reproduces token 2638 (KL 0.001403,
+  not below 1e-4). Architecture, truncation and CPU head arithmetic differ;
+  this is reference sensitivity evidence, not an isolated architecture
+  cause or an engine-error exemption. Coordinator adjudication retains
+  qualification and fidelity-side upload readiness with this note; upload
+  still requires TJ's license decision and explicit approval.
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.
