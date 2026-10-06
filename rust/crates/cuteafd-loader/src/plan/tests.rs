@@ -1206,3 +1206,42 @@ fn explicit_encoder_failure_and_small_pool_admission() {
         assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
     }
 }
+
+#[test]
+fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
+    use super::encoder::EncoderKind;
+    let mut cfg = qwen4_config(1);
+    cfg["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+        "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
+        "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+    let tensors = [t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
+        t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])];
+    let dir = snapshot(cfg.clone(), &tensors);
+    let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96<<30], pool_tokens: Some(32768), target_pool_tokens: 32768,
+        ..Default::default()
+    }), ..Default::default() };
+    let auto = plan(dir.path(), &options).unwrap();
+    assert_eq!(auto.max_image_tokens, Some(1024));
+    assert_eq!(serde_json::to_value(&auto).unwrap()["max_image_tokens"], 1024);
+    assert!(render(&auto).contains("image cap  1024 merged tokens per image (detail=low 256)"));
+    assert_eq!(auto.spark_ranks, 0);
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
+    assert_eq!(auto.encoder.as_ref().unwrap().weights, 898_680_904);
+    assert_eq!(auto.encoder.as_ref().unwrap().scratch, 447_778_048);
+    assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, 32768);
+    let vision = auto.components.iter().find(|c| c.component == Component::Vision).unwrap();
+    assert_eq!(vision.status, Status::Ready);
+    let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    assert_eq!(off.max_image_tokens, Some(1024));
+    assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert_ne!(auto.encoder_plan_hash, off.encoder_plan_hash);
+    cfg["vision_config"]["intermediate_size"] = json!(4305);
+    let invalid = snapshot(cfg, &tensors);
+    let invalid = plan(invalid.path(), &options).unwrap();
+    assert!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap()
+        .rejections.iter().any(|r| r.reason.contains("intermediate_size")));
+}

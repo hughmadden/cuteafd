@@ -33,7 +33,7 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     let ledger = NativeVision::required(&library, &spec.native)?;
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
-    let handshake = EncoderHandshake { encoder_id: id, max_patches: (config.max_tokens * 4) as u32,
+    let handshake = EncoderHandshake { encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
         output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
     let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))

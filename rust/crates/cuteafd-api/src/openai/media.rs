@@ -166,7 +166,9 @@ impl MediaPreparer {
             .get()
             .copied()
             .unwrap_or((4096, ImageUrlFetch::Public));
-        config.max_image_tokens = cap;
+        config.max_image_tokens = if config.family == cuteafd_loader::media::ImageFamily::Qwen {
+            cap.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)
+        } else { cap };
         Self::new(config, encoder, fetch, slots)
     }
     pub fn new(

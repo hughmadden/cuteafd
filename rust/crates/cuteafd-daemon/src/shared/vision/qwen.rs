@@ -22,7 +22,7 @@ impl TowerSpec {
             || cfg["text_config"]["hc_count"] != 4
             || v["hidden_act"] != "gelu_pytorch_tanh"
             || !v["deepstack_visual_indexes"].as_array().is_some_and(Vec::is_empty)
-            || !(1..=4096).contains(&max_tokens)
+            || !(1..=cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS).contains(&max_tokens)
         {
             return Err(VisionError::Unsupported("Qwen tower config/merger geometry or image capacity".into()));
         }
@@ -151,6 +151,8 @@ mod tests {
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Qwen);
         assert_eq!(spec.reads.len(), 333);
         assert_eq!(spec.native.head_dim, 72);
+        assert_eq!(spec.native.max_tokens, 1024);
+        assert!(TowerSpec::qwen(dir.path(), 1025).is_err());
         assert_eq!(spec.native.merger_width, 4608);
         assert_eq!(spec.native.weight_bytes % 256, 72);
         assert_ne!(spec.encoder_id("revision", 120), spec.encoder_id("revision", 121));
@@ -160,7 +162,7 @@ mod tests {
         let mut cfg: serde_json::Value = serde_json::from_reader(File::open(&p).unwrap()).unwrap();
         cfg["vision_config"]["intermediate_size"] = 4305.into();
         std::fs::write(&p, serde_json::to_vec(&cfg).unwrap()).unwrap();
-        assert!(TowerSpec::qwen(dir.path(), 4096).unwrap_err().to_string().contains("intermediate_size"));
+        assert!(TowerSpec::qwen(dir.path(), 1024).unwrap_err().to_string().contains("intermediate_size"));
     }
     #[test]
     fn qwen_rejects_unknown_shards_and_inconsistent_norm_shape() {

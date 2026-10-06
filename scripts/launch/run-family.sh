@@ -597,6 +597,7 @@ fi
 vision_peers=()
 encoder_ranks=()
 encoder_hash=""
+encoder_max_tokens=4096
 encoder_port=$((port + 1))
 if [[ "$family" =~ ^(mimo_v2|qwen4)$ && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
@@ -612,16 +613,18 @@ import json,sys
 p=json.load(sys.stdin); e=p.get("encoder"); assert e is not None, "image checkpoint lacks encoder plan"
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
 k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+cap=p.get("max_image_tokens") or (1024 if sys.argv[1]=="qwen4" else 4096)
+assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]
     assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
-    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
-elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
-elif kind=="off": print("off",h,"-")
+    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)),cap)
+elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-",cap)
+elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
-' <<<"$plan_json")"
-  read -r vision encoder_hash rank_csv <<<"$selected"
+' "$family" <<<"$plan_json")"
+  read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
   if [[ "$vision" == spark:* ]]; then
     IFS=, read -r -a encoder_ranks <<<"$rank_csv"
     for encoder_rank in "${encoder_ranks[@]}"; do
@@ -683,7 +686,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   encoder_args=""
   for encoder_rank in "${encoder_ranks[@]}"; do
     if [[ "$rank" == "$encoder_rank" ]]; then
-      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens 4096"
+      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens $encoder_max_tokens"
     fi
   done
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \

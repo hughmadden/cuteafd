@@ -81,7 +81,8 @@ impl Family for Qwen {
             },
         };
         let programs = cfg.check_programs().map_err(|e| format!("{e:#}"));
-        Ok(Box::new(QwenModel { cfg, spec, programs }))
+        let vision = vision_geometry(&checkpoint.config);
+        Ok(Box::new(QwenModel { cfg, spec, programs, vision }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -154,8 +155,10 @@ impl Family for Qwen {
                     .to_string(),
             ),
             Component::Vision => (
-                "the vision tower is not run".to_string(),
-                "Text only; images would need the Qwen4Exp vision encoder and mRoPE positions.".to_string(),
+                "Qwen resident BF16 ViT with native-id M-RoPE".to_string(),
+                format!("27 blocks, H1152, 16 heads of 72, I4304, patch16x16x2, merge2; output H2560. \
+                    Explicit VISION=auto/rtx/spark admits up to {} image tokens (detail=low 256); LM qualification remains required.",
+                    crate::media::QWEN_MAX_IMAGE_TOKENS),
             ),
             Component::MappedTable | Component::TableProjection => (
                 "PLE n-gram table in a format other than BF16 or E4M3 with one scale".to_string(),
@@ -202,6 +205,7 @@ struct QwenModel {
     spec: ModelSpec,
     /// `Qwen4Config::check_programs`: the shapes the qwen4 programs are built for.
     programs: Result<(), String>,
+    vision: Result<(), String>,
 }
 
 impl FamilyModel for QwenModel {
@@ -224,7 +228,12 @@ impl FamilyModel for QwenModel {
             Component::Speculator | Component::SpeculatorExpert => {
                 return Err("the MTP drafter is not part of the plain serve path".into());
             }
-            Component::Vision => return Err("text-only: the vision tower is not run".into()),
+            Component::Vision => {
+                self.vision.clone()?;
+                let shape = vision_shape(stem).ok_or_else(|| format!("{stem} is not read by the resident Qwen tower"))?;
+                return require(operand.is_plain(&[Encoding::Bf16]) && operand.logical == shape, ||
+                    format!("{stem} needs BF16 {shape:?}, found {}", describe(operand)));
+            },
             _ => {}
         }
         self.programs.clone()?;
@@ -289,4 +298,42 @@ impl FamilyModel for QwenModel {
             local: Ok("serve-qwen4 --local-experts (fp8-qwen4 tp1)".into()),
         })
     }
+}
+
+fn vision_geometry(config: &serde_json::Value) -> Result<(), String> {
+    let v = config.get("vision_config").ok_or("checkpoint has no vision_config")?;
+    for (name, expected) in [("depth", 27), ("hidden_size", 1152), ("intermediate_size", 4304),
+        ("num_heads", 16), ("num_position_embeddings", 2304), ("out_hidden_size", 2560),
+        ("patch_size", 16), ("temporal_patch_size", 2), ("spatial_merge_size", 2)] {
+        require(v[name].as_u64() == Some(expected), ||
+            format!("vision_config.{name} needs {expected}; add a Qwen tower exporter/kernel"))?;
+    }
+    require(config["model_type"] == "qwen4_exp" && config["text_config"]["hidden_size"] == 2560
+        && config["text_config"]["hc_count"] == 4 && v["hidden_act"] == "gelu_pytorch_tanh"
+        && v["deepstack_visual_indexes"].as_array().is_some_and(Vec::is_empty), ||
+        "Qwen tower config/merger geometry unsupported".into())
+}
+
+fn vision_shape(stem: &str) -> Option<Vec<usize>> {
+    let name = stem.strip_prefix("model.visual.").or_else(|| stem.strip_prefix("visual."))?;
+    let shape: &[usize] = match name {
+        "patch_embed.proj" => &[1152, 3, 2, 16, 16],
+        "pos_embed" => &[2304, 1152],
+        "merger.norm" => &[1152],
+        "merger.linear_fc1" => &[4608, 4608],
+        "merger.linear_fc2" => &[2560, 4608],
+        _ => {
+            let (block, rest) = indexed(name, "blocks.")?;
+            if block >= 27 { return None; }
+            match rest {
+                "attn.qkv" => &[3456, 1152],
+                "attn.proj" => &[1152, 1152],
+                "mlp.linear_fc1" => &[4304, 1152],
+                "mlp.linear_fc2" => &[1152, 4304],
+                "norm1" | "norm2" => &[1152],
+                _ => return None,
+            }
+        }
+    };
+    Some(shape.to_vec())
 }

@@ -77,6 +77,16 @@ def test_qwen_pointwise_launches_cover_every_element():
         assert kernel in test
 
 
+@pytest.mark.parametrize("tokens", [256,1024,2048,4096])
+def test_qwen_diagnostic_fixture_geometry(tokens):
+    gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_fixture_gate")
+    gh,gw,rgb = gate.fixture(tokens)
+    assert gh*gw == tokens*4
+    assert gh%2 == gw%2 == 0
+    assert rgb.shape == (gh*16,gw*16,3)
+    assert rgb.dtype == np.uint8 and rgb.flags.c_contiguous
+
+
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     # At rectangular sizes a precomputed ratio changes taps by an FP32 ULP.
     positions = np.arange(256,dtype=np.float32)

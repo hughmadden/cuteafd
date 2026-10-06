@@ -945,6 +945,7 @@ def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
     if kind == "spark":
         assert f"--encoder-plan-hash {'ab' * 32}" in worker
         assert f"--encoder-plan-hash {'ab' * 32}" in launch
+        assert "--encoder-max-tokens 1024" in worker
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off":
         assert "cuteafd plan" not in result.stderr

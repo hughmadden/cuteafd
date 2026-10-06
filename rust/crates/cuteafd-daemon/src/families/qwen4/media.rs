@@ -46,8 +46,9 @@ impl ReadyVision {
         cache_bytes: Option<u64>, remote: Option<RemoteVision>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
         let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Qwen)?;
+        let max_tokens = cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS;
         // Header-only on the coordinator: remote tower payload stays on its Spark.
-        let spec = crate::shared::vision::TowerSpec::qwen(&args.snapshot, 4096)?;
+        let spec = crate::shared::vision::TowerSpec::qwen(&args.snapshot, max_tokens)?;
         let width = config["text_config"]["hidden_size"].as_u64().context("Qwen hidden_size")? as usize;
         let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
         if let Some(remote) = remote {
@@ -55,9 +56,9 @@ impl ReadyVision {
                 "--vision-peers requires Spark/auto vision placement");
             let id = spec.encoder_id(&remote.revision, 121);
             let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
-            anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "Qwen tower capacity is 4096 tokens per image");
+            anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
-                encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
+                encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), output_width: spec.native.output_width,
                 patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "Qwen tower/LM output width mismatch");
@@ -80,7 +81,7 @@ impl ReadyVision {
         let sm = u32::try_from(info.compute_capability_major * 10 + info.compute_capability_minor)?;
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
-        anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "Qwen tower capacity is 4096 tokens per image");
+        anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         library.cuda_set_device(gpu)?;
         let admitted = ledger.total_bytes();
@@ -97,7 +98,7 @@ impl ReadyVision {
         let service = loaded?;
         restored?;
         tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "Qwen resident vision encoder ready");
-        Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
+        Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, max_tokens)),
             preparer, cache_bytes }), prefix))
     }
 }

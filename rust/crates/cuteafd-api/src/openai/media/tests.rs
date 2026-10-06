@@ -19,6 +19,14 @@ fn preparer() -> MediaPreparer {
     .unwrap()
 }
 #[test]
+fn qwen_startup_policy_cannot_exceed_qualified_family_cap() {
+    let config = ProcessorConfig::for_family(ImageFamily::Qwen);
+    let preparer = MediaPreparer::for_loaded_encoder(config, EncoderId([1; 32]), 1).unwrap();
+    assert_eq!(preparer.config().max_image_tokens, 1024);
+    assert_eq!(preparer.config().with_detail(true).max_image_tokens, 256);
+    assert_eq!(ProcessorConfig::for_family(ImageFamily::Mimo).max_image_tokens, 4096);
+}
+#[test]
 fn probe_fixture_hash_is_checked_before_memo_reuse() {
     let preparer = preparer();
     let correct = format!("{:x}", Sha256::digest(PNG));

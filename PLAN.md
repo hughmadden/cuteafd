@@ -763,6 +763,15 @@ Work, in priority order:
    C1 three-arm parity, chart/G6, exact G7 a/e, single-image interference
    and vision-only connection-loss gates pass. Explicit `VISION=off` skips
    tower startup; checkpoints without a tower remain text-only.
+   **Qwen image capacity:** 1024 merged tokens per image, `detail=low` 256,
+   BF16 residual; explicit `VISION=auto` still enables the tower (RTX on the
+   zero-Spark minimum). Qwen tower >1024 tokens: BF16 fails calibrated G2 at
+   2048/4096; FP32 residual fixes 4096 but regresses 256/1024 worst-row.
+   Bounded diagnostic: patch row 863 has dominant channel 514; block-27 cosine
+   0.99997 collapses at merger LayerNorm (0.588 versus BF16's 0.870).
+   Hypothesis: a massive-activation outlier and LN amplification, not a
+   demonstrated row-handling bug. Serving gates remain required before changing
+   the Qwen launcher default.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop

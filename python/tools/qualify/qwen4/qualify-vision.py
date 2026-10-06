@@ -102,6 +102,16 @@ def pack_spec(cfg, tensors):
     return spec, b"".join(chunks)
 
 
+def fixture(tokens):
+    if tokens != 2048:
+        return common.fixture(tokens)
+    gh, gw = 32, 256
+    yy, xx = np.indices((gh*16, gw*16), dtype=np.uint32)
+    rgb = np.stack([(xx*7+yy*3)%256, (xx//8+yy*11)%256,
+        ((xx//32)^(yy//16))*31%256], axis=-1).astype(np.uint8)
+    return gh, gw, np.ascontiguousarray(rgb)
+
+
 def normalization_lut():
     # Host processor: f64 rescale then f32 subtraction/division, not f32 rescale.
     values = (np.arange(256, dtype=np.float64) * (1.0 / 255.0)).astype(np.float32)
@@ -169,7 +179,7 @@ def run(args):
         model = None if args.native_only else reference_model(cfg, tensors)
         del tensors
         def encode(tokens, observing=False):
-            gh, gw, rgb = common.fixture(tokens)
+            gh, gw, rgb = fixture(tokens)
             out = np.empty((tokens,2560), np.uint16); stages, errors = {}, []
             def observe(_ctx, stage, ptr, rows, width, _col):
                 try:
@@ -190,7 +200,7 @@ def run(args):
             encode(tokens)
             native, stages, _ = encode(tokens, model is not None); saved[tokens] = native
             if model is None: continue
-            gh, gw, rgb = common.fixture(tokens)
+            gh, gw, rgb = fixture(tokens)
             grid = torch.tensor([[1,gh,gw]], device="cuda")
             refs, hooks = {}, []
             def hook(stage):
@@ -214,6 +224,13 @@ def run(args):
                 floor = model(torch.from_numpy(common.patches(rgb,lut)).cuda(),grid).pooler_output.float().cpu().numpy()
             yardstick = {str(stage): common.metrics(value,fp32_refs[stage]) for stage,value in refs.items()}
             yardstick["30"] = common.metrics(floor,ref)
+            if args.dump_stages is not None:
+                args.dump_stages.mkdir(parents=True, exist_ok=True)
+                np.savez(args.dump_stages / f"stages-{tokens}.npz",
+                    **{f"native_{stage}": value for stage, value in stages.items()},
+                    **{f"fp32_{stage}": value for stage, value in fp32_refs.items()},
+                    **{f"bf16_{stage}": value for stage, value in refs.items()},
+                    native_30=(native.astype(np.uint32)<<16).view(np.float32), fp32_30=ref, bf16_30=floor)
             result["bf16_yardstick"][str(tokens)] = yardstick
             result["g2"][str(tokens)] = {stage: calibrated_metrics(value,yardstick[stage],final_output=stage=="30") for stage,value in measured.items()}
             model.float(); model.rotary_pos_emb.inv_freq.copy_(inv)
@@ -244,6 +261,7 @@ def run(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot","library","output"): p.add_argument("--"+name,type=Path,required=True)
-    p.add_argument("--tokens",type=int,nargs="+",choices=(256,1024,4096),default=[256,1024,4096])
+    p.add_argument("--tokens",type=int,nargs="+",choices=(256,1024,2048,4096),default=[256,1024,4096])
+    p.add_argument("--dump-stages",type=Path,help="diagnostic-only native/FP32/BF16 observer arrays")
     p.add_argument("--native-only",action="store_true")
     raise SystemExit(run(p.parse_args()))

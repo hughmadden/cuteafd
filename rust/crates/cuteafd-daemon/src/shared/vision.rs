@@ -189,7 +189,7 @@ impl TowerSpec {
         let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
         match cfg["model_type"].as_str() {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
-            Some("qwen4_exp") => Self::qwen(snapshot, max_tokens),
+            Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
