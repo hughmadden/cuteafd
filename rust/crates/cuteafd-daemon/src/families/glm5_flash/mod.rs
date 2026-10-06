@@ -205,7 +205,9 @@ pub(crate) struct EngineArgs {
     /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    /// Context slots: one ring per sequence under serve-glmf (--max-sequences; the draft batch
+    /// then takes at most that many), max(20, draft_sequences) for glmf-golden. The target head
+    /// is shared.
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
     /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
