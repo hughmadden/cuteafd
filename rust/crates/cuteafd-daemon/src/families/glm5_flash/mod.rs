@@ -635,6 +635,12 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Diagnostic for --resume-at with --prefix-marks pool: fill the reserved unit 0's first MLA
+    /// record with 0xFF in every MLA layer before the continuations and report the non-finite
+    /// logits instead of failing on them (non-zero: a kernel reads that record for masked
+    /// candidates).
+    #[arg(long, hide = true, requires = "resume_at")]
+    pub resume_poison_unit0: bool,
     /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
     /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
     /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
@@ -954,6 +960,17 @@ impl Opened {
             Some(experts)
         } else { None };
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
+        // Pool marks keep `GLMF_POOL_MARK_RESERVED_UNITS` units beside the admitted pool, never
+        // handed out (see `prefix`): the admission reserves their bytes like any fixed cost and the
+        // engine allocates them past the pool's tokens, so the pool admitted is the pool usable.
+        let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
+            cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
+        let reserved_bytes = if reserved_units == 0 { 0 } else {
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry_rows(&self.cfg, layers, 1,
+                index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?;
+            let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
+            reserved_units * (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
+        };
         // Eager admission (an automatic or budgeted pool on one GPU, its experts on Sparks or
         // admitted under the budget): the drafter, the Spark transports and intake, the dense
         // package, the token selector and every step workspace exist before the pool is sized, so
@@ -1006,7 +1023,7 @@ impl Opened {
             // The prefix mark arena the caller allocates once the engine exists (none with pool marks).
             let marks = args.planner_mark_slots as u64 * rank.retained_mark_bytes;
             let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
-                graphs: graph_reserve(args), later: state + marks + future_expert_bytes };
+                graphs: graph_reserve(args), later: state + marks + future_expert_bytes + reserved_bytes };
             let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
                 (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
@@ -1041,16 +1058,16 @@ impl Opened {
                 + crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS, self.cfg.vocab_size);
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + wide,
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + wide + reserved_bytes,
                 index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?
         } else {
             args.pool_tokens
         };
-        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, args.decode_row_buckets)?;
-        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, decode_rows = engine.decode_rows,
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, reserved_units, decode_rows = engine.decode_rows,
             "GLM 5.3 Flash DSA index cache");
         tracing::info!(decode_rows = engine.decode_rows, verify_rows = engine.verify_rows,
             sms = self.library.sm_count()?, "GLM 5.3 Flash verify budget: the most rows a verify step schedules");
@@ -1292,7 +1309,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat, args.engine.prefix_marks);
+            args.resume_repeat, args.engine.prefix_marks, args.resume_poison_unit0);
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);

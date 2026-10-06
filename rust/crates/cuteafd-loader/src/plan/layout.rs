@@ -43,6 +43,9 @@ pub struct LayoutOptions {
     /// GLM 5.3 Flash's KDA replay records in the prefill lanes' scratch (`--replay-records shared`,
     /// one GPU): out of the state, and the scratch holds at least them.
     pub glmf_shared_replay: bool,
+    /// GLM 5.3 Flash's prefix marks in pool units (`--prefix-marks pool`): no mark arena, and
+    /// `GLMF_POOL_MARK_RESERVED_UNITS` units allocated beside the pool and never handed out.
+    pub glmf_pool_marks: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -82,6 +85,7 @@ impl Default for LayoutOptions {
             prefill_lanes: 0,
             glmf_decode_rows: 0,
             glmf_shared_replay: false,
+            glmf_pool_marks: false,
             graph_budget_bytes: None,
             spark_capacity_rows: 4096,
             pool_tokens: None,
@@ -660,13 +664,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     _ => 0,
                 };
             }
-            let marks = options.prefix_slots.unwrap_or_else(|| {
+            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks;
+            let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 if family == "deepseek_v41" { costs.mark_slots } else {
                     // A generic family's arena, as its server sizes it at the default knobs.
                     let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                     default_mark_slots(concurrency, bytes)
                 }
-            });
+            }) };
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
@@ -681,6 +686,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
+                }
+                // Pool marks: the reserved units beside the pool (never handed out, so outside its tokens).
+                if pool_marks {
+                    device.items.push(Item::new(Category::Prefix, "reserved units", "",
+                        (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
+                            * crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
                 }
             }
             if family == "deepseek_v41" {

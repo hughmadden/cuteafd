@@ -17,7 +17,13 @@ pub enum MarkStore {
     /// `pages` pages of the shared page pool per mark: taken at capture (evicting like any
     /// snapshot's rows), released with the snapshot, written and read by
     /// [`PrefixFamily::capture_pages`] and [`PrefixFamily::restore_pages`].
-    Pool { pages: usize },
+    ///
+    /// A mark writes arbitrary bytes into its pages, whereas rows only ever hold records. The
+    /// pool's first `reserved` pages are therefore never handed out, to marks or rows: a family
+    /// whose kernels read page 0 as the stand-in for masked entries (GLM 5.3 Flash's decode
+    /// sparse MLA reads record slot 0 for every masked candidate and weights it by zero, and
+    /// 0 x NaN is NaN) keeps it as it was zeroed at start-up.
+    Pool { pages: usize, reserved: usize },
 }
 
 impl MarkStore {
@@ -25,7 +31,15 @@ impl MarkStore {
     pub fn pages(self) -> usize {
         match self {
             Self::Arena => 0,
-            Self::Pool { pages } => pages,
+            Self::Pool { pages, .. } => pages,
+        }
+    }
+
+    /// Leading pool pages no allocation hands out (none with arena marks).
+    pub fn reserved(self) -> usize {
+        match self {
+            Self::Arena => 0,
+            Self::Pool { reserved, .. } => reserved,
         }
     }
 }
