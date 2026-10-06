@@ -8,7 +8,7 @@ import json
 import os
 import re
 from pathlib import Path
-import tempfile
+import secrets
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -80,8 +80,9 @@ def require_media_flag(manifest, enabled, family):
 @contextmanager
 def _feature_lock(root):
     root.mkdir(parents=True, exist_ok=True)
-    # A persistent lock inode serializes all feature pairs and indices in a set.
-    with (root / ".features.lock").open("a+b") as lock:
+    # Directory-authorized writers need only read access to the persistent lock.
+    fd = os.open(root / ".features.lock", os.O_RDONLY | os.O_CREAT, 0o666)
+    with os.fdopen(fd, "rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             yield
@@ -101,8 +102,18 @@ def _publish_locked(contents):
     for path, data in missing:
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".feature-", delete=False) as output:
-                temporary = Path(output.name)
+            for _ in range(100):
+                candidate = path.parent / (".feature-" + secrets.token_hex(16))
+                try:
+                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                except FileExistsError:
+                    continue
+                temporary = candidate
+                break
+            else:
+                raise FileExistsError("cannot allocate an exclusive feature staging file")
+            # Ordinary creation permissions preserve the caller's umask, unlike mkstemp.
+            with os.fdopen(fd, "wb") as output:
                 output.write(data)
                 output.flush()
                 os.fsync(output.fileno())

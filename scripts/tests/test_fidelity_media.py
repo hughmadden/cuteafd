@@ -2,7 +2,9 @@
 import copy
 import hashlib
 import multiprocessing
+import os
 import pathlib
+import stat
 import sys
 
 import numpy as np
@@ -183,6 +185,37 @@ def test_immutable_publish_preserves_existing_inode_and_complete_bytes(tmp_path)
     with pytest.raises(ValueError, match="immutable"):
         publish_immutable(path, b"different")
     assert path.read_bytes() == content and not list(tmp_path.glob(".feature-*"))
+
+
+@pytest.mark.parametrize("mask,mode", [(0o022, 0o644), (0o027, 0o640), (0o077, 0o600)])
+def test_atomic_feature_creation_preserves_ordinary_umask_permissions(tmp_path, mask, mode):
+    previous = os.umask(mask)
+    try:
+        write_features(tmp_path, span(), np.full((4, 8), 0x3f80, dtype=np.uint16),
+                       tower_dtype="bf16", identity={})
+        publish_immutable(tmp_path / "features.json", b"index")
+    finally:
+        os.umask(previous)
+    for name in (span()["key"] + ".bf16", span()["key"] + ".json", "features.json", ".features.lock"):
+        assert stat.S_IMODE((tmp_path / name).stat().st_mode) == mode
+
+
+def test_feature_lock_can_be_reused_without_write_permission(tmp_path, monkeypatch):
+    import fidelity_media
+    lock = tmp_path / ".features.lock"
+    lock.touch(mode=0o444)
+    actual_open = os.open
+    flags = []
+
+    def checked_open(path, flag, *args):
+        if pathlib.Path(path) == lock:
+            flags.append(flag)
+        return actual_open(path, flag, *args)
+
+    monkeypatch.setattr(fidelity_media.os, "open", checked_open)
+    publish_immutable(tmp_path / "features.json", b"index")
+    assert len(flags) == 1 and flags[0] & os.O_ACCMODE == os.O_RDONLY
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o444
 
 
 def _feature_racing_writer(root, barrier, results, kind, variant):
