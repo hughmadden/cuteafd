@@ -14,9 +14,9 @@ mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
-    glmf_table_pages, glmf_temporary_bytes, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions, GlmfStepShape,
-    GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS, GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE,
-    GLMF_SPARSE_TOPK};
+    glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch,
+    GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
+    GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK};
 mod v4_workspace;
 pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
@@ -70,6 +70,8 @@ pub struct CacheOptions {
     pub prefill_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
     pub glmf_index: GlmfIndexCache,
+    /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
+    pub kda_state_bytes: u64,
 }
 
 impl Default for CacheOptions {
@@ -80,6 +82,7 @@ impl Default for CacheOptions {
             mimo_kv: MimoKvCache::Int8,
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
+            kda_state_bytes: 4,
         }
     }
 }
@@ -254,21 +257,24 @@ pub fn glm_flash_cache_geometry(
     cfg: &GlmNextConfig,
     layers: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
-    glm_flash_rank_cache_geometry(cfg, layers, 1, GlmfIndexCache::Keys)
+    glm_flash_rank_cache_geometry(cfg, layers, 1, GlmfIndexCache::Keys, 4)
 }
 
 /// MLA records remain replicated; recurrent KDA state and replay follow each
 /// coordinator's head partition, as in the GLM Flash engine's Caches. The
 /// compact index cache drops the per-token index keys from the units and adds
 /// each sequence's index tails to its state and marks (one GPU only for now).
+/// The recurrent state takes `state_bytes` per element: 4 (FP32) or 2 (BF16).
 pub fn glm_flash_rank_cache_geometry(
     cfg: &GlmNextConfig,
     layers: usize,
     ranks: usize,
     index: GlmfIndexCache,
+    state_bytes: u64,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("glm5_flash", cfg.layers, layers)?;
     if ![1, 2].contains(&ranks)
+        || ![2, 4].contains(&state_bytes)
         || cfg.kv_lora_rank != 512
         || cfg.kda_head_dim != 128
         || cfg.kda_heads == 0
@@ -296,7 +302,7 @@ pub fn glm_flash_rank_cache_geometry(
         &[
             product(
                 "KDA recurrent state",
-                &[channels, cfg.kda_head_dim as u64, 4],
+                &[channels, cfg.kda_head_dim as u64, state_bytes],
             )?,
             product("KDA short-conv state", &[3, 3, channels, 2])?,
         ],
@@ -619,7 +625,7 @@ mod tests {
             geometry.ranks[0].active_state_per_sequence_bytes,
             geometry.ranks[0].retained_mark_bytes
         );
-        let split = glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Keys).unwrap();
+        let split = glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Keys, 4).unwrap();
         assert_eq!(split.placement, KvPlacement::Replicated);
         assert_eq!(split.ranks[0], split.ranks[1]);
         assert_eq!(split.ranks[0].persistent_unit_bytes, geometry.ranks[0].persistent_unit_bytes);
@@ -628,8 +634,25 @@ mod tests {
         assert_eq!(split.ranks[0].retained_mark_bytes * 2, geometry.ranks[0].retained_mark_bytes);
         assert_eq!(split.ranks[0].speculative_replay_bytes * 2, geometry.ranks[0].speculative_replay_bytes);
         for ranks in [0, 3] {
-            assert!(glm_flash_rank_cache_geometry(&cfg, 45, ranks, GlmfIndexCache::Keys).is_err());
+            assert!(glm_flash_rank_cache_geometry(&cfg, 45, ranks, GlmfIndexCache::Keys, 4).is_err());
         }
+        // A BF16 recurrent state: 34 KDA layers x (64 x 128 x 128 x 2 + the BF16 conv windows)
+        // per sequence and per mark; the MLA pools and the FP32 replay records are unchanged.
+        let bf16 = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Keys, 2).unwrap();
+        assert_eq!(bf16.ranks[0].retained_mark_bytes, 76_316_672);
+        assert_eq!(bf16.ranks[0].active_state_per_sequence_bytes, 76_316_672);
+        assert_eq!(geometry.ranks[0].retained_mark_bytes - bf16.ranks[0].retained_mark_bytes, 34 * 64 * 128 * 128 * 2);
+        assert_eq!(bf16.ranks[0].persistent_unit_bytes, geometry.ranks[0].persistent_unit_bytes);
+        assert_eq!(bf16.ranks[0].speculative_replay_bytes, geometry.ranks[0].speculative_replay_bytes);
+        assert!(glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Keys, 8).is_err());
+        // Both: the BF16 state with the compact cache's 11 index tails in every slot and mark, the
+        // compact units and the index key records.
+        let compact = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Compact, 4).unwrap();
+        let both = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Compact, 2).unwrap();
+        assert_eq!(both.ranks[0].retained_mark_bytes, 76_316_672 + 11 * GLMF_INDEX_TAIL_BYTES);
+        assert_eq!(both.ranks[0].active_state_per_sequence_bytes, both.ranks[0].retained_mark_bytes);
+        assert_eq!((both.ranks[0].persistent_unit_bytes, both.ranks[0].speculative_replay_bytes),
+            (compact.ranks[0].persistent_unit_bytes, compact.ranks[0].speculative_replay_bytes));
     }
 
     #[test]
@@ -643,9 +666,9 @@ mod tests {
             })
             .collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
-        let keys = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Keys).unwrap();
+        let keys = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Keys, 4).unwrap();
         assert_eq!(keys, glm_flash_cache_geometry(&cfg, 45).unwrap());
-        let compact = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Compact).unwrap();
+        let compact = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Compact, 4).unwrap();
         let (k, c) = (&keys.ranks[0], &compact.ranks[0]);
         // 11 MLA layers x (256 x 528 + 64 x 132) per 256-token unit.
         assert_eq!(c.persistent_unit_bytes, 1_579_776);
@@ -658,7 +681,7 @@ mod tests {
         assert_eq!(c.retained_mark_bytes - k.retained_mark_bytes, 11 * 1_552);
         assert_eq!(c.speculative_replay_bytes - k.speculative_replay_bytes, 11 * 64 * 512);
         assert_eq!(c.fixed_state_bytes, k.fixed_state_bytes);
-        assert!(glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Compact).is_err());
+        assert!(glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Compact, 4).is_err());
     }
 
     #[test]

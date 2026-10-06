@@ -10,9 +10,10 @@
 //!
 //! Mark: the KDA layers' recurrent state is per sequence and overwritten by every step, so a
 //! snapshot copies it whole: every KDA slot region the engine hands out (`slot_regions_on`:
-//! each KDA layer's FP32 state `[64, 128, 128]` and conv window, the last three q/k/v inputs,
-//! and with the compact index cache every MLA layer's index tail, the key | gate rows of its
-//! open pool, 11 x 1,552 B), 34 layers = 140.8 MiB. A restore copies the mark back into the new
+//! each KDA layer's state `[64, 128, 128]`, FP32 or with `--kda-state bf16` BF16, and conv
+//! window, the last three q/k/v inputs, and with the compact index cache every MLA layer's index
+//! tail, the key | gate rows of its open pool, 11 x 1,552 B), 34 layers = 140.8 MiB with an FP32
+//! state, 72.8 MiB with a BF16 one. A restore copies the mark back into the new
 //! sequence's own KDA slot and maps its pool pages; nothing else of the state is positional.
 //! `--prefix-marks` picks where marks live:
 //! - `arena` (default): a device arena sized by decoding lanes (2C + 2 marks), the host tier
@@ -676,12 +677,13 @@ mod tests {
     }
 
     /// The KV admission reserves the engine's own state: the planner's mark and replay bytes
-    /// are the engine's slot regions and replay records (per GPU of a head split too, and with
-    /// the compact index cache's tails and key | gate records), and the arena slots it reserves
-    /// are the ones `prefix_cache` allocates (2C + 2 for 147.6 MB marks).
+    /// are the engine's slot regions and replay records (per GPU of a head split too, with the
+    /// compact index cache's tails and key | gate records, and with a BF16 KDA state), and the
+    /// arena slots it reserves are the ones `prefix_cache` allocates (2C + 2 for 147.6 MB marks;
+    /// a BF16 state's 76.3 MB marks fit 28 in the 2 GiB budget).
     #[test]
     fn the_planner_reserves_the_marks_and_replay_records_the_engine_allocates() {
-        use super::super::engine::{kda_layer_bytes, IndexCache, KEY_BYTES, TAIL_BYTES};
+        use super::super::engine::{kda_layer_bytes, IndexCache, KdaState, KEY_BYTES, TAIL_BYTES};
         use crate::shared::prefix::PrefixArgs;
         use clap::Parser;
         use cuteafd_loader::families::glm5_flash::GlmNextAttention;
@@ -694,9 +696,10 @@ mod tests {
         let cfg = glm53_flash();
         let kda = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Kda).count();
         let mla = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Mla).count();
-        for ranks in [1, 2] {
-            let geometry = glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks, GlmfIndexCache::Keys).unwrap();
-            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks);
+        for (ranks, state) in [(1, KdaState::F32), (2, KdaState::F32), (1, KdaState::Bf16)] {
+            let geometry = glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks, GlmfIndexCache::Keys,
+                state.bytes() as u64).unwrap();
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks, state);
             let rank = &geometry.ranks[0];
             assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes),
                 ((kda * (state + conv)) as u64, (kda * (state + conv)) as u64));
@@ -704,25 +707,35 @@ mod tests {
         }
         // The compact index cache (one GPU): `Caches::new` adds every MLA layer's tail to a slot's
         // regions (so to every mark) and a 64-row (`REPLAY_ROWS`) key | gate record per MLA layer.
-        let compact = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, GlmfIndexCache::Compact).unwrap();
-        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads);
-        let rank = &compact.ranks[0];
-        let slot = kda * (state + conv) + mla * TAIL_BYTES;
-        assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes), (slot as u64, slot as u64));
-        assert_eq!(rank.speculative_replay_bytes, (kda * replay + mla * 64 * KEY_BYTES) as u64);
+        for state in [KdaState::F32, KdaState::Bf16] {
+            let compact = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, GlmfIndexCache::Compact,
+                state.bytes() as u64).unwrap();
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, state);
+            let rank = &compact.ranks[0];
+            let slot = kda * (state + conv) + mla * TAIL_BYTES;
+            assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes), (slot as u64, slot as u64));
+            assert_eq!(rank.speculative_replay_bytes, (kda * replay + mla * 64 * KEY_BYTES) as u64);
+        }
+        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::F32);
         let mark = kda * (state + conv);
-        assert_eq!((mark, kda * replay), (147_619_840, 321_421_312));
+        let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16).0 + conv);
+        assert_eq!((mark, bf16, kda * replay), (147_619_840, 76_316_672, 321_421_312));
         let prefix = Cli::parse_from(["serve"]).prefix;
-        for (lanes, slots) in [(4, 14), (8, 18), (16, 34), (64, 130)] {
-            for (index, mark) in [(IndexCache::Keys, mark), (IndexCache::Compact, slot)] {
-                let planned = super::super::serve::arena_mark_slots(&prefix, &cfg, cfg.layers, lanes, index).unwrap();
+        for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 18, 28), (16, 34, 34), (64, 130, 130)] {
+            for (index, state, mark, slots) in [(IndexCache::Keys, KdaState::F32, mark, f32_slots),
+                (IndexCache::Compact, KdaState::F32, mark + mla * TAIL_BYTES, f32_slots),
+                (IndexCache::Keys, KdaState::Bf16, bf16, bf16_slots),
+                (IndexCache::Compact, KdaState::Bf16, bf16 + mla * TAIL_BYTES, bf16_slots)] {
+                let planned = super::super::serve::arena_mark_slots(&prefix, &cfg, cfg.layers, lanes, index, state)
+                    .unwrap();
                 let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
                     prefix.prefix_cache_mark_mib << 20);
-                assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes, {index:?}");
+                assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes, {index:?}, {state:?}");
             }
         }
         let off = PrefixArgs { prefix_cache_entries: 0, ..prefix };
-        assert_eq!(super::super::serve::arena_mark_slots(&off, &cfg, cfg.layers, 16, IndexCache::Keys).unwrap(), 0);
+        assert_eq!(super::super::serve::arena_mark_slots(&off, &cfg, cfg.layers, 16, IndexCache::Keys, KdaState::F32)
+            .unwrap(), 0);
     }
 
     /// Pool marks off the GPU: a mark laid out buffer by buffer over its units round trips

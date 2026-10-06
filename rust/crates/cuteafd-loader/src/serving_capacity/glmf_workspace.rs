@@ -64,6 +64,31 @@ pub struct GlmfScratchOptions {
     /// The compact DSA index cache (`--index-cache compact`): the `glmf_index_producer_c_*`
     /// producers, whose scratch also holds the step's key | gate rows.
     pub index_compact: bool,
+    /// The KDA recurrent state (`--kda-state`): which KDA programs the steps launch.
+    pub kda_state: GlmfKdaState,
+}
+
+/// The KDA recurrent state the step programs keep (the engine's `--kda-state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GlmfKdaState {
+    #[default]
+    F32,
+    /// BF16, rounded where each chunked-prefill window stores it.
+    Bf16,
+    /// BF16, the chunked prefill rounded after every 16-row tile.
+    Bf16Tile,
+}
+
+impl GlmfKdaState {
+    /// The `glmf_kda_*` program (without the prefix) of capacity `cap` (`m64`, `m4096`): the FP32
+    /// state's, or the BF16 state's `kda_s16_*` (`kda_s16t_m4096` for the tile-rounded prefill).
+    pub fn program(self, cap: &str) -> String {
+        match (self, cap) {
+            (Self::F32, _) => format!("kda_{cap}"),
+            (Self::Bf16Tile, "m4096") => format!("kda_s16t_{cap}"),
+            _ => format!("kda_s16_{cap}"),
+        }
+    }
 }
 
 /// A step's scratch: the largest of its programs' (with the KDA output shard's
@@ -94,7 +119,7 @@ pub fn glmf_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConf
     let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
     let required = |name: String| lookup(&name).ok_or(GlmfMissingProgram(name));
     let mut scratch = 0;
-    for name in [format!("mhc_post_pre_{cap}"), format!("kda_{cap}"), format!("mla_producer_{cap}"),
+    for name in [format!("mhc_post_pre_{cap}"), options.kda_state.program(cap), format!("mla_producer_{cap}"),
         format!("sparse_mla_{mode}_{cap}"), format!("o_{cap}"), format!("ffn_i2048_{cap}"),
         format!("ffn_i12288_{cap}"), format!("index_producer_{cap}"), "mhc_pre".into()] {
         scratch = scratch.max(required(format!("glmf_{name}"))?);
@@ -417,6 +442,28 @@ mod tests {
         // A build without the compact producers cannot run the compact cache.
         assert_eq!(glmf_step_scratch(lookup, &cfg, compact, 64, true).unwrap_err(),
             GlmfMissingProgram("glmf_index_producer_c_m64".into()));
+    }
+
+    #[test]
+    fn a_bf16_kda_state_charges_its_programs_and_needs_them() {
+        let cfg = glm53_flash();
+        let bf16 = GlmfScratchOptions { kda_state: GlmfKdaState::Bf16, ..Default::default() };
+        let tile = GlmfScratchOptions { kda_state: GlmfKdaState::Bf16Tile, ..Default::default() };
+        // A build whose BF16-state programs take the FP32 programs' scratch.
+        let with = |name: &str| match name {
+            "glmf_kda_s16_m64" => lookup("glmf_kda_m64"),
+            "glmf_kda_s16_m4096" | "glmf_kda_s16t_m4096" => lookup("glmf_kda_m4096"),
+            _ => lookup(name),
+        };
+        assert_eq!(glmf_step_scratch(with, &cfg, bf16, 64, true).unwrap(), scratch(&cfg, 64, true));
+        assert_eq!(glmf_step_scratch(with, &cfg, tile, 4096, false).unwrap(), scratch(&cfg, 4096, false));
+        // The steps get the scratch of the program they launch.
+        let larger = |name: &str| if name == "glmf_kda_s16t_m4096" { Some(900_000_000) } else { with(name) };
+        assert_eq!(glmf_step_scratch(larger, &cfg, tile, 4096, false).unwrap().programs, 900_000_000);
+        assert_eq!(glmf_step_scratch(larger, &cfg, bf16, 4096, false).unwrap(), scratch(&cfg, 4096, false));
+        // A build without them cannot run a BF16 state.
+        assert_eq!(glmf_step_scratch(lookup, &cfg, bf16, 64, true).unwrap_err(),
+            GlmfMissingProgram("glmf_kda_s16_m64".into()));
     }
 
     #[test]

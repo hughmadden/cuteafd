@@ -417,6 +417,15 @@ fi
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
 # COORDINATOR_TRACE is its pre-rename key; images older than the rename read
 # the family variables, which are set too for one release.
+# PROBE_DUMP_ROOT=/abs/host/dir: benchmark probes (POST /v1/bench/probe) may stream
+# full-vocabulary rows (dump_rows) into new leaves under it (CUTEAFD_PROBE_DUMP_ROOT, mounted
+# at the same path); unset, remote probes cannot write rows.
+probe_args=()
+probe_root="$(get PROBE_DUMP_ROOT)"
+if [[ -n "$probe_root" ]]; then
+  [[ "$probe_root" == /* && -d "$probe_root" ]] || { echo "PROBE_DUMP_ROOT must be an existing absolute directory" >&2; exit 2; }
+  probe_args=(-v "$probe_root:$probe_root" -e "CUTEAFD_PROBE_DUMP_ROOT=$probe_root")
+fi
 trace_args=()
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
@@ -626,6 +635,21 @@ if [[ $family == glm5_flash ]]; then
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
   [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
+  # GLM5_FLASH_KDA_STATE: the KDA recurrent state, f32 (default) or bf16: half the state and
+  # prefix-mark bytes, computed in FP32 and rounded after every decode/verify/commit row and at
+  # each chunked-prefill window end (bf16-tile: after every 16-row prefill tile). It runs the
+  # BF16-projection KDA programs on one GPU (GLM5_FLASH_KDA_FP8=off, no head split).
+  kda_state="$(get GLM5_FLASH_KDA_STATE f32)"
+  case "$kda_state" in
+    ""|f32) ;;
+    bf16|bf16-tile)
+      if [[ $kda_fp8 != off || $head_split != 0 ]]; then
+        echo "GLM5_FLASH_KDA_STATE=$kda_state runs the BF16-projection KDA programs on one GPU; set GLM5_FLASH_KDA_FP8=off without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--kda-state "$kda_state") ;;
+    *) echo "GLM5_FLASH_KDA_STATE must be f32, bf16 or bf16-tile" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -861,7 +885,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${device_map_args[@]}" "${wip_mount_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

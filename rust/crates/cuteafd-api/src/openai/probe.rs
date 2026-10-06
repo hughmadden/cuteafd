@@ -54,6 +54,10 @@ pub struct ProbeSpec {
     /// are rejected rather than overwritten. No dump is written when absent.
     #[serde(default)]
     pub dump_rows: Option<PathBuf>,
+    /// Record (and dump) only the rows predicting these positions: a scorer whose reference
+    /// holds a subsample of a window's rows. Absent, every row is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_positions: Option<Vec<usize>>,
     /// Record the row the first generated token is selected from.
     #[serde(default)]
     pub record_first: bool,
@@ -218,12 +222,21 @@ pub struct Probe {
     pub spec: ProbeSpec,
     record: Mutex<ProbeRecord>,
     dump: Mutex<Option<rows::RowDump>>,
+    /// `spec.score_positions` as a set.
+    positions: Option<std::collections::HashSet<usize>>,
 }
 
 impl Probe {
     pub fn new(spec: ProbeSpec) -> Arc<Self> {
         let dump = spec.dump_rows.as_ref().map(|path| rows::RowDump::new(path.clone()));
-        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()), dump: Mutex::new(dump) })
+        let positions = spec.score_positions.as_ref().map(|positions| positions.iter().copied().collect());
+        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()), dump: Mutex::new(dump), positions })
+    }
+
+    /// Whether the row predicting `position` is recorded (`score_positions`); an engine may skip
+    /// computing the others.
+    pub fn wants(&self, position: usize) -> bool {
+        self.positions.as_ref().is_none_or(|set| set.contains(&position))
     }
 
     fn with(&self, f: impl FnOnce(&mut ProbeRecord)) {
@@ -255,8 +268,11 @@ impl Probe {
         self.with(|r| r.provenance = Some(value));
     }
 
-    /// Records one host logits row predicting token `position`.
+    /// Records one host logits row predicting token `position` (unless `score_positions` leaves it out).
     pub fn row(&self, position: usize, logits: &[f32]) {
+        if !self.wants(position) {
+            return;
+        }
         let want = self.spec.want.get(&position).map(Vec::as_slice).unwrap_or(&[]);
         let softmax = LogSoftmax::new(logits);
         let row = summarize_with(position, logits, self.spec.top_k.max(1), want, &softmax);
@@ -460,6 +476,30 @@ mod tests {
     }
 
     #[test]
+    fn score_positions_select_the_recorded_and_dumped_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("subset");
+        let probe = Probe::new(ProbeSpec { dump_rows: Some(path.clone()), score_from: Some(1),
+            score_positions: Some(vec![2, 4]), ..ProbeSpec::default() });
+        assert!(!probe.wants(1) && probe.wants(2) && !probe.wants(3) && probe.wants(4));
+        for position in 1..=4 {
+            probe.row(position, &[position as f32, 0.5, -1.0]);
+        }
+        let record = probe.record();
+        assert!(record.error.is_none(), "{:?}", record.error);
+        assert_eq!(record.rows.iter().map(|r| r.position).collect::<Vec<_>>(), [2, 4]);
+        assert_eq!(record.scored, 2);
+        let manifest = std::fs::read_to_string(path.join("manifest.jsonl")).unwrap();
+        let positions: Vec<u64> = manifest.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["position"].as_u64().unwrap()).collect();
+        assert_eq!(positions, [2, 4]);
+        assert_eq!(dumped_row(&path.join("row-00000001.safetensors"))[0].to_bits(),
+            record.rows[1].top[0].1.to_bits(), "position 4's row, its log-probabilities as recorded");
+        // Absent, every row is wanted.
+        assert!(Probe::new(ProbeSpec::default()).wants(7));
+    }
+
+    #[test]
     fn dump_rejects_existing_paths_and_vocabulary_changes_without_orphans() {
         let temporary = tempfile::tempdir().unwrap();
         let probe = Probe::new(ProbeSpec { dump_rows: Some(temporary.path().to_owned()), ..ProbeSpec::default() });
@@ -510,7 +550,10 @@ mod tests {
         let legacy: ProbeSpec = serde_json::from_str("{}").unwrap();
         assert!(legacy.dump_rows.is_none() && legacy.verify_rows.is_none());
         assert!(legacy.score_path.is_none());
-        let configured: ProbeSpec = serde_json::from_value(serde_json::json!({ "dump_rows": "arm", "verify_rows": 5, "score_path": "decode" })).unwrap();
+        assert!(legacy.score_positions.is_none() && serde_json::to_value(&legacy).unwrap().get("score_positions").is_none());
+        let configured: ProbeSpec = serde_json::from_value(serde_json::json!({ "dump_rows": "arm", "verify_rows": 5,
+            "score_path": "decode", "score_positions": [3, 9] })).unwrap();
+        assert_eq!(configured.score_positions.as_deref(), Some(&[3, 9][..]));
         assert_eq!(configured.dump_rows.as_deref(), Some(std::path::Path::new("arm")));
         assert_eq!(configured.verify_rows, Some(5));
         assert_eq!(configured.score_path.as_deref(), Some("decode"));

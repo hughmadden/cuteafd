@@ -218,12 +218,21 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
     Ok(())
 }
 
-/// Bytes that differ and the largest FP32 difference over the recurrent part
-/// (`fp32_bytes`) of two slot-state copies.
-fn state_delta(a: &[u8], b: &[u8], fp32_bytes: usize) -> (usize, f32) {
+/// Element `i` of a recurrent state of `element`-byte values (FP32 or BF16).
+fn state_value(state: &[u8], i: usize, element: usize) -> f32 {
+    if element == 4 {
+        f32::from_le_bytes(state[i * 4..i * 4 + 4].try_into().unwrap())
+    } else {
+        f32::from_bits(u32::from(u16::from_le_bytes(state[i * 2..i * 2 + 2].try_into().unwrap())) << 16)
+    }
+}
+
+/// Bytes that differ and the largest difference over the recurrent part (`recurrent_bytes` of
+/// `element`-byte values) of two slot-state copies.
+fn state_delta(a: &[u8], b: &[u8], recurrent_bytes: usize, element: usize) -> (usize, f32) {
     let differ = a.iter().zip(b).filter(|(x, y)| x != y).count();
-    let word = |s: &[u8], i: usize| f32::from_le_bytes(s[i * 4..i * 4 + 4].try_into().unwrap());
-    let worst = (0..fp32_bytes / 4).map(|i| (word(a, i) - word(b, i)).abs()).fold(0f32, f32::max);
+    let worst = (0..recurrent_bytes / element)
+        .map(|i| (state_value(a, i, element) - state_value(b, i, element)).abs()).fold(0f32, f32::max);
     (differ, worst)
 }
 
@@ -235,12 +244,13 @@ fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>) -> Result<u
     Ok(prefill)
 }
 
-fn finite_state(state: &[u8], fp32_bytes: usize) -> Result<()> {
-    ensure!(fp32_bytes <= state.len() && fp32_bytes % 4 == 0, "invalid recurrent state layout");
-    for (i, word) in state[..fp32_bytes].chunks_exact(4).enumerate() {
-        ensure!(f32::from_le_bytes(word.try_into().unwrap()).is_finite(), "non-finite KDA recurrent word {i}");
+fn finite_state(state: &[u8], recurrent_bytes: usize, element: usize) -> Result<()> {
+    ensure!(recurrent_bytes <= state.len() && matches!(element, 2 | 4) && recurrent_bytes % element == 0,
+        "invalid recurrent state layout");
+    for i in 0..recurrent_bytes / element {
+        ensure!(state_value(state, i, element).is_finite(), "non-finite KDA recurrent word {i}");
     }
-    for (i, word) in state[fp32_bytes..].chunks_exact(2).enumerate() {
+    for (i, word) in state[recurrent_bytes..].chunks_exact(2).enumerate() {
         ensure!(f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16).is_finite(),
             "non-finite KDA convolution word {i}");
     }
@@ -298,7 +308,9 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
     let kda_layers = engine.weights.layers.iter()
         .filter(|l| l.attention == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda).count();
-    let fp32_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * 4;
+    // The recurrent part of a slot's state (FP32 or BF16, `--kda-state`), then its conv windows.
+    let element = engine.kda_state.bytes();
+    let recurrent_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * element;
     let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
     let fresh = || -> Result<GlmfPlacement> {
         let mut placement = allocator.borrow_mut().admit(prefill + rows + 1)?;
@@ -317,7 +329,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         let mut spec = fresh()?;
         let start = spec.len;
         let initial = engine.slot_state(spec.slot)?;
-        finite_state(&initial, fp32_bytes)?;
+        finite_state(&initial, recurrent_bytes, element)?;
         let logits = engine.verify_spec(&mut [(&mut spec, rows)], embed)?.context("replay check needs every layer")?;
         finite_logits(&logits)?;
         ensure!(engine.slot_state(spec.slot)? == initial, "{rows}-row speculative verify changed uncommitted KDA state");
@@ -325,8 +337,8 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         spec.len = start + keep;
         spec.kda_len = spec.len;
         let retained = engine.slot_state(spec.slot)?;
-        finite_state(&retained, fp32_bytes)?;
-        let (differ, worst) = state_delta(&engine.slot_state(serial.slot)?, &retained, fp32_bytes);
+        finite_state(&retained, recurrent_bytes, element)?;
+        let (differ, worst) = state_delta(&engine.slot_state(serial.slot)?, &retained, recurrent_bytes, element);
         let logit = (0..serial_logits.len()).map(|j|
             max_logit(&logits[j * logits.len() / rows..][..logits.len() / rows], &serial_logits[j])).fold(0f32, f32::max);
         let serial_flat: Vec<f32> = serial_logits.iter().flatten().copied().collect();
@@ -334,7 +346,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         let vocab = engine.cfg.vocab_size;
         let kl = super::mean_kl(&logits[..keep * vocab], &serial_flat, 0, vocab);
         println!("keep {keep}/{rows}: speculative verify + commit vs {keep} serial steps: {differ} state bytes differ \
-            (max FP32 |delta| {worst:.3e}); kept-row logits max |delta| {logit:.3e}, mean KL(serial || verify) \
+            (max |delta| {worst:.3e}); kept-row logits max |delta| {logit:.3e}, mean KL(serial || verify) \
             {kl:.6} nat (geometry diagnostic)");
         // Keep the execution geometry fixed. A later rejected token may change
         // neither an earlier logit nor the committed recurrent/paged state.
@@ -350,12 +362,12 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         alternate.len = start + keep;
         alternate.kda_len = alternate.len;
         let alternate_state = engine.slot_state(alternate.slot)?;
-        finite_state(&alternate_state, fp32_bytes)?;
-        let (differ, worst) = state_delta(&retained, &alternate_state, fp32_bytes);
+        finite_state(&alternate_state, recurrent_bytes, element)?;
+        let (differ, worst) = state_delta(&retained, &alternate_state, recurrent_bytes, element);
         ensure!(exact_logits(&logits[..keep * vocab], &alternate_logits[..keep * vocab]),
             "keep {keep}/{rows}: rejected suffix changed kept-row logits (same geometry)");
         ensure!(differ == 0, "keep {keep}/{rows}: rejected suffix changed {differ} committed KDA state bytes \
-            (max FP32 |delta| {worst:.3e}, first byte {:?})", retained.iter().zip(&alternate_state).position(|(a, b)| a != b));
+            (max |delta| {worst:.3e}, first byte {:?})", retained.iter().zip(&alternate_state).position(|(a, b)| a != b));
         ensure!(super::prefix::paged_rows(&family, &spec, spec.len)?
             == super::prefix::paged_rows(&family, &alternate, alternate.len)?,
             "keep {keep}/{rows}: rejected suffix changed committed MLA cache rows");
@@ -365,10 +377,10 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
                 .context("replay check needs every layer")?;
             finite_logits(&plain_logits)?;
             let plain_state = engine.slot_state(plain.slot)?;
-            finite_state(&plain_state, fp32_bytes)?;
-            let (differ, worst) = state_delta(&plain_state, &retained, fp32_bytes);
+            finite_state(&plain_state, recurrent_bytes, element)?;
+            let (differ, worst) = state_delta(&plain_state, &retained, recurrent_bytes, element);
             println!("keep {keep}/{rows}: speculative verify + commit vs a plain {rows}-row verify: {differ} state bytes \
-                differ (max FP32 |delta| {worst:.3e})");
+                differ (max |delta| {worst:.3e})");
             ensure!(differ == 0 && exact_logits(&plain_logits, &logits),
                 "full {rows}-row replay commit differs from plain verify (same geometry)");
             allocator.borrow_mut().release(plain);
@@ -379,8 +391,8 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         finite_logits(&a)?;
         finite_logits(&b)?;
         let (a_state, b_state) = (engine.slot_state(spec.slot)?, engine.slot_state(alternate.slot)?);
-        finite_state(&a_state, fp32_bytes)?;
-        finite_state(&b_state, fp32_bytes)?;
+        finite_state(&a_state, recurrent_bytes, element)?;
+        finite_state(&b_state, recurrent_bytes, element)?;
         ensure!(exact_logits(&a, &b) && a_state == b_state
             && super::prefix::paged_rows(&family, &spec, spec.len)?
                 == super::prefix::paged_rows(&family, &alternate, alternate.len)?,
@@ -438,10 +450,15 @@ mod tests {
 
     #[test]
     fn replay_check_does_not_accept_non_finite_state_or_logits() {
-        assert!(super::finite_state(&f32::NAN.to_le_bytes(), 4).is_err());
-        assert!(super::finite_state(&0x7f80u16.to_le_bytes(), 0).is_err());
+        assert!(super::finite_state(&f32::NAN.to_le_bytes(), 4, 4).is_err());
+        assert!(super::finite_state(&0x7f80u16.to_le_bytes(), 0, 4).is_err());
         assert!(super::finite_logits(&[f32::INFINITY]).is_err());
-        assert!(super::finite_state(&1f32.to_le_bytes(), 4).is_ok());
+        assert!(super::finite_state(&1f32.to_le_bytes(), 4, 4).is_ok());
+        // A BF16 recurrent state: its words are BF16 too.
+        assert!(super::finite_state(&[0x7f80u16.to_le_bytes(), 0x3f80u16.to_le_bytes()].concat(), 2, 2).is_err());
+        assert!(super::finite_state(&[0x3f80u16.to_le_bytes(), 0x3f80u16.to_le_bytes()].concat(), 2, 2).is_ok());
+        let (a, b) = ([0x3f80u16.to_le_bytes(), 0u16.to_le_bytes()].concat(), [0x4000u16.to_le_bytes(), 0u16.to_le_bytes()].concat());
+        assert_eq!(super::state_delta(&a, &b, 2, 2), (2, 1.0));
         assert!(super::finite_logits(&[1.0, -2.0]).is_ok());
         assert!(!super::exact_logits(&[0.0], &[-0.0]));
     }
