@@ -333,17 +333,78 @@ def test_glm_spans_use_actual_checkpoint_markers(bad):
         validate_spans(manifest, config)
 
 
-def test_glm_source_identity_hashes_loaded_code_and_nested_processor(tmp_path):
+@pytest.mark.parametrize("token", [1, 2, 9])
+@pytest.mark.parametrize("where", ["context", "generated", "text_window"])
+def test_glm_rejects_unbound_image_tokens_in_full_sequence(token, where):
+    from glm_flash_media import validate_spans
+    window = {"tokens": [1] + [9] * 4 + [2, 3], "media": [span()]}
+    if where == "context":
+        window["tokens"].insert(0, token)
+        window["media"][0]["start"] += 1
+    elif where == "generated":
+        window["tokens"].append(token)
+    else:
+        window = {"tokens": [3, token, 3], "media": []}
+    with pytest.raises(ValueError, match="pinned span list"):
+        validate_spans({"windows": [window]}, glm_config())
+
+
+def mock_glm_sources(tmp_path, monkeypatch):
+    from types import ModuleType, SimpleNamespace
+    import glm_flash_media as media
+    root = tmp_path / "checkout/src/transformers"
+    modules, originals = {}, {}
+    for name in media.SOURCE_MODULES:
+        path = root / (name.replace(".", "/") + ".py")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# " + name + "\n")
+        modules["transformers." + name] = SimpleNamespace(__file__=str(path))
+        originals[name] = path.read_bytes()
+    package = ModuleType("transformers.models.glm5_next")
+    package.modeling_glm5_next = modules["transformers.models.glm5_next.modeling_glm5_next"]
+    package.image_processing_pil_glm5_next = modules["transformers.models.glm5_next.image_processing_pil_glm5_next"]
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setattr(media.importlib, "import_module", modules.__getitem__)
+    state = {"revision": media.TRANSFORMERS_REVISION, "changes": ""}
+    def git(command, **kwargs):
+        assert command[:3] == ["git", "-C", str(root.parent.parent)] and kwargs["timeout"] == 10
+        if command[3] == "rev-parse": return state["revision"] + "\n"
+        if command[3] == "status": return state["changes"]
+        assert command[3] == "show"
+        relative = command[4].split(":src/transformers/")[1]
+        return originals[relative.removesuffix(".py").replace("/", ".")]
+    monkeypatch.setattr(media.subprocess, "check_output", git)
+    return media, package, modules, state
+
+
+def test_glm_source_identity_hashes_loaded_code_and_nested_processor(tmp_path, monkeypatch):
     import json
-    from glm_flash_media import snapshot_identity
-    for name in ("config.json", "tokenizer.json", "processor_config.json", "model.safetensors.index.json",
-                 "modeling.py", "processing.py"):
+    media, package, _modules, _state = mock_glm_sources(tmp_path, monkeypatch)
+    for name in ("config.json", "tokenizer.json", "processor_config.json", "model.safetensors.index.json"):
         (tmp_path / name).write_text(json.dumps({"source": name}))
-    identity = snapshot_identity(tmp_path, tmp_path / "modeling.py", tmp_path / "processing.py")
-    for key, name in (("modeling", "modeling.py"), ("image_processing", "processing.py"),
-                      ("preprocessor", "processor_config.json"), ("index", "model.safetensors.index.json")):
-        assert identity[key + "_sha256"] == hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
-    assert "tensor_bytes_sha256" not in identity
+    identity = media.snapshot_identity(tmp_path)
+    for key, path in (("modeling", pathlib.Path(package.modeling_glm5_next.__file__)),
+                      ("image_processing", pathlib.Path(package.image_processing_pil_glm5_next.__file__)),
+                      ("preprocessor", tmp_path / "processor_config.json"),
+                      ("index", tmp_path / "model.safetensors.index.json")):
+        assert identity[key + "_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert set(identity) == {"snapshot_revision", "config_sha256", "tokenizer_sha256", "preprocessor_sha256",
+                             "modeling_sha256", "image_processing_sha256", "index_sha256"}
+
+
+@pytest.mark.parametrize("change", ["revision", "dirty", "shadow", "bytes", "git"])
+def test_glm_source_admission_rejects_changed_pin_or_loaded_helper(tmp_path, monkeypatch, change):
+    media, package, modules, state = mock_glm_sources(tmp_path, monkeypatch)
+    helper = modules["transformers.vision_utils"]
+    if change == "revision": state["revision"] = "0" * 40
+    if change == "dirty": state["changes"] = " M src/transformers/image_transforms.py\n"
+    if change == "shadow": helper.__file__ = str(tmp_path / "site-packages/vision_utils.py")
+    if change == "bytes": pathlib.Path(helper.__file__).write_text("# modified while Git ignores changes\n")
+    if change == "git":
+        def fail(*args, **kwargs): raise OSError("unavailable checkout")
+        monkeypatch.setattr(media.subprocess, "check_output", fail)
+    with pytest.raises(ValueError, match="pinned"):
+        media.verify_sources(package.modeling_glm5_next, package.image_processing_pil_glm5_next)
 
 
 def test_glm_processor_uses_nested_config_and_cap(tmp_path, monkeypatch):
@@ -470,18 +531,27 @@ def fake_torch(monkeypatch):
     for name, module in (("torch", torch), ("torch.nn", nn), ("torch.nn.functional", F)):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.delitem(sys.modules, "shape_invariant", raising=False)
+    from PIL import ImageOps
+    image_utils = ModuleType("transformers.image_utils")
+    image_utils.load_image = lambda image: ImageOps.exif_transpose(image).convert("RGB")
+    monkeypatch.setitem(sys.modules, image_utils.__name__, image_utils)
     return torch
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
-def test_glm_encode_uses_pooler_not_last_hidden_state(tmp_path, monkeypatch, dtype):
+@pytest.mark.parametrize("orientation", [None, 3, 6])
+def test_glm_encode_uses_pooler_not_last_hidden_state(tmp_path, monkeypatch, dtype, orientation):
     import io
     from types import SimpleNamespace
     from PIL import Image
     from glm_flash_media import encode_span
     torch = fake_torch(monkeypatch)
     data = io.BytesIO()
-    Image.new("RGBA", (4, 4), (10, 20, 30, 128)).save(data, format="PNG")
+    source = Image.new("RGBA", (4, 4), (10, 20, 30, 128))
+    source.putpixel((0, 0), (100, 110, 120, 128))
+    exif = Image.Exif()
+    if orientation is not None: exif[274] = orientation
+    source.save(data, format="PNG", exif=exif)
     (tmp_path / "code.png").write_bytes(data.getvalue())
     image_span = span()
     image_span["fixture"]["sha256"] = hashlib.sha256(data.getvalue()).hexdigest()
@@ -496,7 +566,9 @@ def test_glm_encode_uses_pooler_not_last_hidden_state(tmp_path, monkeypatch, dty
     value = Tensor(np.arange(32).reshape(4, 8))
     torch.isfinite = lambda features: np.isfinite(features.data)
     def process(*, images, return_tensors):
-        assert images.mode == "RGB" and images.getpixel((0, 0)) == (10, 20, 30)
+        assert images.mode == "RGB" and images.size == (4, 4)
+        corner = {None: (0, 0), 3: (3, 3), 6: (3, 0)}[orientation]
+        assert images.getpixel(corner) == (100, 110, 120) and images.getpixel((1, 1)) == (10, 20, 30)
         assert return_tensors == "pt"
         return {"image_grid_thw": Tensor([[1, 4, 4]]), "pixel_values": Tensor([[0.]])}
     class Tower:
@@ -510,7 +582,8 @@ def test_glm_encode_uses_pooler_not_last_hidden_state(tmp_path, monkeypatch, dty
 
 
 @pytest.mark.parametrize("change", [None, "missing", "dtype", "shape"])
-def test_glm_tower_loader_consumes_only_bf16_visual_parameters(tmp_path, monkeypatch, change):
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+def test_glm_tower_loader_consumes_only_bf16_visual_parameters(tmp_path, monkeypatch, change, dtype):
     import json
     from contextlib import nullcontext
     from types import ModuleType, SimpleNamespace
@@ -525,13 +598,17 @@ def test_glm_tower_loader_consumes_only_bf16_visual_parameters(tmp_path, monkeyp
         dtype = "bf16" if change != "dtype" else "fp32"
         shape = (2, 2) if change != "shape" else (3, 2)
         def copy_(self, value): events.append(("copy", value))
+    class ParameterData:
+        def to(self, actual): events.append(("parameter_to", actual)); return self
+    frequencies = np.array([1.0, 0.316227766, 0.1], dtype=np.float32)
     class Tower:
         def __init__(self, config):
             assert torch.get_default_dtype() == "fp32" and config._attn_implementation == "sdpa"
-            self.parameter = SimpleNamespace(shape=(2, 2), copy_=lambda value: events.append(("copy", value)))
-            self.buffer = object()
+            self.parameter = SimpleNamespace(shape=(2, 2), data=ParameterData(),
+                                             copy_=lambda value: events.append(("copy", value)))
+            self.inv_freq, self.original_inv_freq = frequencies.copy(), frequencies.copy()
         def named_parameters(self): return [("weight", self.parameter)]
-        def to(self, dtype): events.append(("to", dtype)); return self
+        def to(self, dtype): pytest.fail("whole-model dtype conversion rounds canonical RoPE buffers")
         def cuda(self): events.append("cuda"); return self
         def eval(self): events.append("eval"); return self
     config_module = ModuleType("transformers.models.glm5_next.configuration_glm5_next")
@@ -553,11 +630,13 @@ def test_glm_tower_loader_consumes_only_bf16_visual_parameters(tmp_path, monkeyp
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
     if change:
         with pytest.raises(ValueError, match="missing|dtype/shape"):
-            load_tower(tmp_path)
+            load_tower(tmp_path, dtype)
     else:
-        model, _config = load_tower(tmp_path)
-        assert model.buffer is not None and events[-2:] == ["cuda", "eval"]
-        assert [entry for entry in events if isinstance(entry, tuple) and entry[0] == "to"] == [("to", "bf16")]
+        model, _config = load_tower(tmp_path, dtype)
+        assert model.inv_freq.dtype == model.original_inv_freq.dtype == np.float32
+        assert model.inv_freq.tobytes() == model.original_inv_freq.tobytes() == frequencies.tobytes()
+        assert events[-2:] == ["cuda", "eval"]
+        assert [entry for entry in events if isinstance(entry, tuple) and entry[0] == "parameter_to"] == [("parameter_to", dtype)]
     assert defaults[-1] == "bf16"
 
 

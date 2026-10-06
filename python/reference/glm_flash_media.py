@@ -4,26 +4,64 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import io
+import importlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import struct
 
 from fidelity_media import publish_immutable, read_fixture, write_features
 
 PREFIX = "model.visual."
+TRANSFORMERS_REVISION = "62d7ebd7de4938e072b7aaeb881593b79dc56835"
+SOURCE_MODULES = (
+    "models.glm5_next.modeling_glm5_next", "models.glm5_next.image_processing_pil_glm5_next",
+    "models.glm5_next.configuration_glm5_next", "vision_utils", "modeling_utils",
+    "integrations.sdpa_attention", "image_utils", "image_processing_backends", "image_transforms",
+    "image_processing_utils", "image_processing_base", "processing_utils", "configuration_utils",
+    "activations", "initialization", "utils.generic", "utils.output_capturing",
+)
 
 
-def snapshot_identity(snapshot, modeling=None, processing=None):
-    if modeling is None or processing is None:
-        from transformers.models.glm5_next import modeling_glm5_next, image_processing_pil_glm5_next
-        modeling = modeling or Path(modeling_glm5_next.__file__)
-        processing = processing or Path(image_processing_pil_glm5_next.__file__)
+def verify_sources(modeling, processing):
+    """Admit only actual imports from the complete clean pinned source checkout."""
+    root = Path(modeling.__file__).resolve().parents[2]
+    checkout = root.parent.parent
+    try:
+        revision = subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True, timeout=10).strip()
+        changes = subprocess.check_output(
+            ["git", "-C", str(checkout), "status", "--porcelain", "--untracked-files=no"],
+            text=True, timeout=10)
+        if revision != TRANSFORMERS_REVISION or changes:
+            raise ValueError("GLM media requires the clean pinned Transformers source checkout")
+        modules = {"models.glm5_next.modeling_glm5_next": modeling,
+                   "models.glm5_next.image_processing_pil_glm5_next": processing}
+        for name in SOURCE_MODULES:
+            module = modules.get(name) or importlib.import_module("transformers." + name)
+            actual = Path(module.__file__).resolve()
+            relative = name.replace(".", "/") + ".py"
+            if actual != root / relative:
+                raise ValueError(f"GLM media requires the pinned imported {name} source")
+            expected = subprocess.check_output(
+                ["git", "-C", str(checkout), "show", f"{TRANSFORMERS_REVISION}:src/transformers/{relative}"],
+                timeout=10)
+            if hashlib.sha256(actual.read_bytes()).digest() != hashlib.sha256(expected).digest():
+                raise ValueError(f"GLM media requires the pinned imported {name} source")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise ValueError("GLM media requires the pinned Transformers source checkout") from error
+
+
+def snapshot_identity(snapshot):
+    from transformers.models.glm5_next import modeling_glm5_next, image_processing_pil_glm5_next
+    verify_sources(modeling_glm5_next, image_processing_pil_glm5_next)
     return {"snapshot_revision": snapshot.name, **{key + "_sha256": hashlib.sha256(
         path.read_bytes()).hexdigest() for key, path in (
         ("config", snapshot / "config.json"), ("tokenizer", snapshot / "tokenizer.json"),
-        ("preprocessor", snapshot / "processor_config.json"), ("modeling", Path(modeling)),
-        ("image_processing", Path(processing)), ("index", snapshot / "model.safetensors.index.json"))}}
+        ("preprocessor", snapshot / "processor_config.json"), ("modeling", Path(modeling_glm5_next.__file__)),
+        ("image_processing", Path(image_processing_pil_glm5_next.__file__)),
+        ("index", snapshot / "model.safetensors.index.json"))}}
 
 
 def shard_path(snapshot, shard):
@@ -102,14 +140,21 @@ def validate_spans(manifest, config):
         raise ValueError("checkpoint image token ids are absent or invalid")
     placeholder, begin, end = ids
     for window in manifest["windows"]:
+        tokens, covered, starts, ends = window["tokens"], set(), [], []
         for span in window.get("media", []):
             start, stop = span["start"], span["start"] + span["len"]
-            tokens = window["tokens"]
             if (start < 1 or stop >= len(tokens) or tokens[start - 1] != begin
                     or tokens[stop] != end or any(n != placeholder for n in tokens[start:stop])):
                 raise ValueError("GLM media span differs from checkpoint image markers")
             if span["len"] > 4096:
                 raise ValueError("GLM image exceeds qualified tower capacity")
+            covered.update(range(start, stop))
+            starts.append(start - 1)
+            ends.append(stop)
+        if ({i for i, token in enumerate(tokens) if token == placeholder} != covered
+                or [i for i, token in enumerate(tokens) if token == begin] != starts
+                or [i for i, token in enumerate(tokens) if token == end] != ends):
+            raise ValueError("GLM native image tokens differ from the pinned span list")
 
 
 @contextmanager
@@ -147,9 +192,10 @@ def load_tower(snapshot, dtype="bf16"):
         model = Glm5NextVisionModel(vision)
     finally:
         torch.set_default_dtype(default)
-    # Retain constructor-initialized nonpersistent axial rotary buffers.
-    model = model.to(torch.float32 if dtype == "fp32" else torch.bfloat16)
+    # HF loading casts checkpoint parameters, not canonical FP32 nonpersistent RoPE buffers.
     expected = dict(model.named_parameters())
+    for parameter in expected.values():
+        parameter.data = parameter.data.to(torch.float32 if dtype == "fp32" else torch.bfloat16)
     missing = set(expected)
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
     for shard in sorted({v for k, v in index.items() if k.startswith(PREFIX)}):
@@ -183,10 +229,10 @@ def processor(snapshot):
 def encode_span(model, image_processor, root, span, *, dtype="bf16"):
     import torch
     from PIL import Image
+    from transformers.image_utils import load_image
     with Image.open(io.BytesIO(read_fixture(root, span))) as image:
-        # Match the qualified host path's alpha-dropping behavior.
-        image = image.convert("RGB")
-        prepared = image_processor(images=image, return_tensors="pt")
+        # Official loading normalizes EXIF orientation before dropping alpha to RGB.
+        prepared = image_processor(images=load_image(image), return_tensors="pt")
     if prepared["image_grid_thw"].tolist() != [span["grid"]]:
         raise ValueError("official GLM processor grid differs from engine media span")
     pixels = prepared["pixel_values"].cuda().to(torch.float32 if dtype == "fp32" else torch.bfloat16)
