@@ -933,6 +933,13 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert_eq!(steps(2, 4096), allowance + 2 * 4 * 4096 * 4096 * 2);
     assert_eq!(steps(4, 2048), allowance + 4 * 4 * 2048 * 4096 * 2);
     assert_eq!(steps(4, 4096), 2 * allowance + 4 * 4 * 4096 * 4096 * 2);
+    // A graph budget replaces the graph allowance, as the engine's admission reserves it.
+    let mut budgeted = options(2, 4096);
+    budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);
+    let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
+    let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
+        .collect();
+    assert_eq!(graphs, [("graph budget", 512 << 20)]);
 }
 
 #[test]

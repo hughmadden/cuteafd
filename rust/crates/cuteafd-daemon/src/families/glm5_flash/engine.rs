@@ -33,6 +33,7 @@
 //! other's and adds the two (the same bits in either order), so both residual streams stay
 //! identical. Router, routed experts, LM head and drafter stay on rank 0; rank 1 is queued a
 //! layer ahead of rank 0's expert exchange.
+use super::graphs::{GraphCache, GraphStats};
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use super::head::GlmfHead;
@@ -746,7 +747,7 @@ pub(crate) struct GlmfPeer<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Its prefill lanes (a serial prefill runs in the first).
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<GraphCache<GraphKey, GraphExec<'a>>>,
     /// L2 prefetch of its next layer's weights while it waits for rank 0's expert exchange.
     l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
 }
@@ -820,10 +821,16 @@ pub(crate) struct GlmfEngine<'a> {
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     pub full_prefill_logits: bool,
-    /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly).
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
+    /// budget when one is set.
+    graphs: RefCell<GraphCache<GraphKey, GraphExec<'a>>>,
+    /// Executables evicted from either rank's cache (rank, executable): destroyed at the next
+    /// decode step, once every rank's stream has drained.
+    retired: RefCell<Vec<(usize, GraphExec<'a>)>>,
     use_graphs: bool,
-    startup_graphs: bool,
+    /// Every serving decode graph captured at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless 0);
+    /// a graph budget (`--graph-budget-mib`) captures lazily within it instead.
+    pub(crate) startup_graphs: bool,
     warming_graphs: std::cell::Cell<bool>,
     logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,
     /// Spark prefill runs in lanes (CUTEAFD_GLMF_PREFILL_LANES, default on).
@@ -1028,6 +1035,16 @@ struct GraphKey {
     pool_stride: usize,
 }
 
+/// What the decode graph caches did and hold.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraphCounts {
+    pub stats: GraphStats,
+    /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
+    pub held: usize,
+    pub shapes: usize,
+    pub bytes: u64,
+}
+
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
 
 impl Drop for GraphExec<'_> {
@@ -1086,7 +1103,8 @@ impl<'a> GlmfEngine<'a> {
             kda_ordinal, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
+            experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphCache::new(None)),
+            retired: RefCell::new(Vec::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -1151,7 +1169,7 @@ impl<'a> GlmfEngine<'a> {
                 let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
                 let end = if rank == 0 { segments } else { segments - 1 };
                 for segment in 0..end {
-                    ensure!(graphs.borrow().contains_key(&GraphKey { segment, rows, spec, long: geometry.long,
+                    ensure!(graphs.borrow().contains(&GraphKey { segment, rows, spec, long: geometry.long,
                         pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                         pool_stride: geometry.pool_stride }), "startup graph coverage missing");
                 }
@@ -1257,7 +1275,7 @@ impl<'a> GlmfEngine<'a> {
                 self.caches.kda_heads)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-                graphs: RefCell::new(std::collections::HashMap::new()), l2: None })
+                graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -2360,6 +2378,7 @@ impl<'a> GlmfEngine<'a> {
     /// this layer's expert exchange.
     fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize, rows: Scalar,
         logit_rows: usize) -> Result<Option<DeviceLogits>> {
+        self.release_retired_graphs()?;
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
@@ -2512,23 +2531,28 @@ impl<'a> GlmfEngine<'a> {
         self.replay_on(0, key, segment)
     }
 
-    /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs). A capture measures its
+    /// executable's device bytes (free memory before the capture and after its instantiation);
+    /// executables evicted past the graph budget retire until the next decode step.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
-        let graphs = match (rank, &self.peer) {
-            (1, Some(peer)) => &peer.graphs,
-            _ => &self.graphs,
-        };
+        let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow().get(&key) {
+        let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.0);
+        if let Some(exec) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) });
         }
         let geometry = GraphGeometry { pool_width: key.pool_width, page_stride: key.page_stride,
             pool_stride: key.pool_stride, long: key.long };
-        if !self.warming_graphs.get() && self.logged_graph_shapes.borrow_mut().insert((rank, key.rows, key.spec, geometry)) {
+        // Lazily captured graphs (a graph budget) capture unseen shapes by design.
+        if !self.warming_graphs.get() && self.startup_graphs
+            && self.logged_graph_shapes.borrow_mut().insert((rank, key.rows, key.spec, geometry)) {
             tracing::warn!(rank, rows = key.rows, spec = key.spec, long = key.long, pool_width = key.pool_width,
                 page_stride = key.page_stride, pool_stride = key.pool_stride, "GLM Flash unseen serving graph geometry");
         }
+        let calibrating = graphs.borrow().calibrating();
+        let free = || self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free));
+        let before = if calibrating { Some(free()?) } else { None };
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
@@ -2536,11 +2560,81 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: ends the capture begun above on the same stream.
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
-        let exec = exec?;
+        let exec = GraphExec(exec?, self.library);
+        let measured = match before {
+            Some(before) => Some(before.saturating_sub(free()?) as u64),
+            None => None,
+        };
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
-        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;
+        let (recaptured, evicted, held, stats) = {
+            let mut graphs = graphs.borrow_mut();
+            let recaptured = graphs.seen(&key);
+            let evicted = graphs.insert(key, exec, measured);
+            (recaptured, evicted, graphs.bytes(), graphs.stats())
+        };
+        if recaptured {
+            tracing::debug!(rank, ?key, recaptures = stats.recaptures, "decode graph recaptured");
+        }
+        if calibrating && !graphs.borrow().calibrating() {
+            tracing::info!(rank, executables = stats.captures, each_bytes = graphs.borrow().each(),
+                budget = ?graphs.borrow().budget(), "decode graph size calibrated at the first eviction");
+        }
+        if !evicted.is_empty() {
+            tracing::info!(rank, evicted = evicted.len(), held = graphs.borrow().len(), held_bytes = held,
+                budget = ?graphs.borrow().budget(),
+                captures = stats.captures, recaptures = stats.recaptures, evictions = stats.evictions,
+                "decode graphs past the budget retire");
+            self.retired.borrow_mut().extend(evicted.into_iter().map(|exec| (rank, exec)));
+        }
         Ok(())
+    }
+
+    fn graphs_of(&self, rank: usize) -> &RefCell<GraphCache<GraphKey, GraphExec<'a>>> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.graphs,
+            _ => &self.graphs,
+        }
+    }
+
+    /// Destroys retired decode graphs once every rank's stream has drained (none of them can be
+    /// in flight). Called between decode steps: a sync inside one could wait on a peer push the
+    /// host has not queued yet.
+    fn release_retired_graphs(&self) -> Result<()> {
+        if self.retired.borrow().is_empty() {
+            return Ok(());
+        }
+        self.synchronize()?;
+        for (rank, exec) in self.retired.borrow_mut().drain(..) {
+            self.on(rank, || {
+                drop(exec);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The decode graph budget of every rank (None: unbounded).
+    pub(crate) fn set_graph_budget(&self, budget: Option<u64>) {
+        for rank in 0..self.ranks() {
+            self.graphs_of(rank).borrow_mut().set_budget(budget);
+        }
+    }
+
+    /// Decode graph captures, recaptures and evictions, and the measured bytes held (every rank).
+    pub(crate) fn graph_stats(&self) -> GraphCounts {
+        (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
+            let graphs = self.graphs_of(rank).borrow();
+            let stats = graphs.stats();
+            GraphCounts {
+                stats: GraphStats { captures: total.stats.captures + stats.captures,
+                    recaptures: total.stats.recaptures + stats.recaptures,
+                    evictions: total.stats.evictions + stats.evictions },
+                held: total.held + graphs.len(),
+                shapes: total.shapes + graphs.count(|key| key.segment == 0),
+                bytes: total.bytes + graphs.bytes(),
+            }
+        })
     }
 
     /// Attention-site collapse and input norm of `layer` from `streams`.

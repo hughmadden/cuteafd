@@ -8,6 +8,7 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
+mod graphs;
 mod lane_check;
 mod header;
 pub(crate) mod head;
@@ -67,6 +68,11 @@ pub(crate) struct EngineArgs {
     /// cache state. The planner's default; 1 suits a 32 GB card.
     #[arg(long, default_value_t = 2.0)]
     pub headroom_gib: f64,
+    /// Device memory (MiB) the captured decode graphs may hold: past it the least recently
+    /// launched executables are destroyed between steps and recaptured when needed. Unset:
+    /// unbounded. An automatic pool keeps this much free for them (unset: the planner's 1.5 GiB).
+    #[arg(long)]
+    pub graph_budget_mib: Option<u64>,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -276,6 +282,11 @@ mod draft_cli_tests {
         assert_eq!(parse(&["--headroom-gib", "1"]).headroom_bytes().unwrap(), 1 << 30);
         assert!(parse(&["--headroom-gib=-1"]).headroom_bytes().is_err());
         assert_eq!(graph_reserve(&defaults), 1_610_612_736);
+        let budgeted = parse(&["--graph-budget-mib", "512"]);
+        assert_eq!((budgeted.graph_budget_mib, graph_reserve(&budgeted)), (Some(512), 512 << 20));
+        // A graph budget captures lazily within it: never at startup, whatever the environment.
+        assert!(!budgeted.startup_graphs());
+        assert_eq!(defaults.startup_graphs(), engine::startup_graphs_enabled());
     }
 
     #[test]
@@ -443,6 +454,12 @@ fn check_options(args: &EngineArgs) -> Result<()> {
 }
 
 impl EngineArgs {
+    /// Whether serving captures every decode graph at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless
+    /// 0): a graph budget (`--graph-budget-mib`) bounds lazily captured graphs instead.
+    pub(crate) fn startup_graphs(&self) -> bool {
+        engine::startup_graphs_enabled() && self.graph_budget_mib.is_none()
+    }
+
     /// `--headroom-gib` in bytes.
     pub(crate) fn headroom_bytes(&self) -> Result<u64> {
         ensure!(self.headroom_gib.is_finite() && self.headroom_gib >= 0.0, "--headroom-gib must be a size in GiB");
@@ -457,9 +474,10 @@ fn step_settings(args: &EngineArgs) -> engine::StepSettings {
         max_context: args.max_context }
 }
 
-/// What a measured admission keeps free for decode graph executables: the planner's allowance.
-fn graph_reserve(_args: &EngineArgs) -> u64 {
-    cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0]
+/// What a measured admission keeps free for decode graph executables: the graph budget, else the
+/// planner's allowance.
+fn graph_reserve(args: &EngineArgs) -> u64 {
+    args.graph_budget_mib.map_or(cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0], |mib| mib << 20)
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -642,7 +660,12 @@ impl Opened {
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
         // Startup decode graphs (`CUTEAFD_GLMF_STARTUP_GRAPHS`, the default): every graph a serving
         // loop launches is captured before readiness, so the pool leaves their reserve free (per rank).
-        let startup_graphs = engine::startup_graphs_enabled();
+        // A graph budget (`--graph-budget-mib`) asks for lazily captured graphs within it instead.
+        let startup_graphs = args.startup_graphs();
+        if engine::startup_graphs_enabled() && !startup_graphs {
+            tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
+                "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
+        }
         let startup_reserve = if startup_graphs {
             let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, true));
             // An automatic pool can only shrink this geometry, never exceed the 2M cap.
@@ -680,7 +703,7 @@ impl Opened {
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes;
-            // Graphs: the startup set's reserve, else the planner's allowance.
+            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance).
             let graphs = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied())
                 .unwrap_or_else(|| graph_reserve(args));
             let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
@@ -742,6 +765,8 @@ impl Opened {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
         }
+        engine.startup_graphs = startup_graphs;
+        engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
