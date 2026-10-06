@@ -1426,6 +1426,18 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
   C1 with EXL3 local experts, NVFP4 W4A4 8K prefill ~9.5K tok/s). Outside the
   usual scope; reference configs for it in spirit: min = simulated RTX 5090
   (32 GB) + 1 Spark, max = 2x RTX with no Sparks.
+- Media encoder on a separate host (TJ, 2026-10-06: not for several
+  versions; the expert Spark is fine for now). The encoder is already a
+  self-contained TCP service with an identity handshake. Traffic per
+  1024-token image is ~3 MiB of RGB in and 8–12 MiB of BF16 embeddings out,
+  so 1–10 GbE is enough. Needs:
+  - a planner placement kind for an external host;
+  - a native build for that GPU's arch (SM86 for TJ's RTX 3090 in another
+    box, the test plan);
+  - its own EncoderId and G2/G3/G4 qualification, since bytes are exact
+    only within an arch.
+  Budget ~2.3 GiB of GPU memory. Expect ~100–200 ms per 1024-token image on
+  a 3090 (estimate).
 
 ## Decisions (2026-09-28)
 
