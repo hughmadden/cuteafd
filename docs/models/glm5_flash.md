@@ -42,7 +42,10 @@ Attention (KDA), a minority run MLA + DSA.
   indexer and shared experts quantize to FP8 blocks at load by default
   (`CUTEAFD_GLM_BF16=native` keeps them BF16 at a coordinator-step cost).
 - KV format: FP8 MLA latent record on the MLA+DSA layers; a recurrent FP32
-  state per KDA layer plus short-convolution state.
+  state per KDA layer plus short-convolution state. `GLM5_FLASH_KDA_STATE=bf16`
+  (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
+  recurrent state in BF16, rounded after every decode, verify and commit row
+  and at each chunked-prefill window end: half the state and prefix-mark bytes.
 - RTX/Spark layouts: scales from 1 RTX with local experts up through
   multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
   two-GPU head split when both coordinator GPUs are available;

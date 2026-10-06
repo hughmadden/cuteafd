@@ -317,6 +317,32 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
+                                             ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
+                                             ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
+def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, forwarded):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if forwarded is None:
+        assert "--kda-state" not in launch
+    else:
+        assert f"--kda-state {forwarded}" in launch and launch.count("--kda-state") == 1
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_STATE=bf16\n", "GLM5_FLASH_KDA_FP8=off"),
+    ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
+])
+def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,

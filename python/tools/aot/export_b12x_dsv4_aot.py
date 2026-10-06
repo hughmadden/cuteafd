@@ -286,6 +286,18 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
                         lambda r=rows, i=inter, m=mode: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r,
                                                                                   fp8_only=m)))
+    # BF16 KDA recurrent state (serve --kda-state bf16): the BF16-projection KDA programs and the
+    # replay commit over a BF16 state, computed in FP32 and rounded after every decode, verify and
+    # commit row and where each chunked-prefill window stores it (``s16t``: after every 16-row
+    # tile). New stems: the FP32 programs above, and their objects, are unchanged.
+    for rows, f8, tag, rounding in ((decode_rows, True, "s16", "window"), (prefill_rows, "prefill", "s16", "window"),
+                                    (prefill_rows, "prefill", "s16t", "tile")):
+        out.append((f"kda_{tag}_m{rows}", "kda",
+                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding},
+                    lambda r=rows, f=f8, sr=rounding: glmf.compile_glmf_kda_aot(
+                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr)))
+    out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
+                lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
     return out
 
 
@@ -300,7 +312,9 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     keep = ("kda_m", "kda_w8_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
     from b12x.integration.cuteafd import glmf
 
-    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    # The head split keeps an FP32 KDA state (no BF16-state ``_s16`` programs yet).
+    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context)
+                if item[0].startswith(keep) and "_s16" not in item[0]]
     programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
     programs.append(("join_heads", "join", {"half_width": g.kda_width},
                      lambda: glmf.compile_glmf_join_aot(g.kda_width)))
