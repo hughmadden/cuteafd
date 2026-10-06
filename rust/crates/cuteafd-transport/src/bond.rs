@@ -11,9 +11,12 @@
 //! rank's flow lands becomes a function of (rank address, label) alone. The
 //! switch's hash is unknown, so [`Placement`] measures where a candidate label
 //! lands (a short RDMA read, judged by [`classify`] on the members' received
-//! bytes) and keeps a label that puts each new flow on the member its rank and
-//! the whole bond use least: every rank's lanes alternate between the members
-//! and the members carry equal flow counts.
+//! bytes) and keeps a label that puts each new flow on the member its
+//! transport uses least, then its rank, then the whole bond. The transport is
+//! the unit that bursts: a GLM Flash lane sends one wave to every rank at
+//! once, and the ranks' answers converge on the coordinator together, so each
+//! transport's flows must split evenly on their own (two lanes of four ranks:
+//! 2+2 each). Equal totals are not enough: 4+0 and 0+4 also add up to half.
 //!
 //! `CUTEAFD_RDMA_BOND_BALANCE` selects the behaviour ([`BondBalance`]); the
 //! default `off` leaves every label at 0.
@@ -142,6 +145,8 @@ pub fn quiet(before: &[u64], after: &[u64], probe_bytes: u64) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub peer: IpAddr,
+    /// The transport (one GLM Flash lane) the flow belongs to.
+    pub transport: u64,
     pub label: u32,
     pub port: Option<usize>,
     /// Probes this assignment took (0: reused a measured label).
@@ -166,12 +171,14 @@ pub struct Placement {
     ports: usize,
     load: Vec<u32>,
     peers: BTreeMap<IpAddr, PeerFlows>,
+    /// Live measured flows per member of each transport.
+    transports: BTreeMap<u64, Vec<u32>>,
 }
 
 impl Placement {
     pub fn new(ports: usize) -> Self {
         let ports = ports.max(1);
-        Self { ports, load: vec![0; ports], peers: BTreeMap::new() }
+        Self { ports, load: vec![0; ports], peers: BTreeMap::new(), transports: BTreeMap::new() }
     }
 
     pub fn ports(&self) -> usize {
@@ -188,11 +195,19 @@ impl Placement {
         self.peers.get(&peer).map_or_else(|| vec![0; self.ports], |flows| flows.load.clone())
     }
 
-    /// The member a new flow of `peer` should use: the one this peer uses
-    /// least, then the one the bond uses least, then the lowest index.
-    pub fn target(&self, peer: IpAddr) -> usize {
-        let peer_load = self.peer_load(peer);
-        (0..self.ports).min_by_key(|&port| (peer_load[port], self.load[port], port)).expect("ports >= 1")
+    /// Live measured flows per member of `transport`.
+    pub fn transport_load(&self, transport: u64) -> Vec<u32> {
+        self.transports.get(&transport).cloned().unwrap_or_else(|| vec![0; self.ports])
+    }
+
+    /// The member a new flow of `peer` on `transport` should use: the one
+    /// this transport uses least (its wave's answers arrive together), then
+    /// the one this peer uses least, then the one the bond uses least, then
+    /// the lowest index.
+    pub fn target(&self, peer: IpAddr, transport: u64) -> usize {
+        let lane = self.transport_load(transport);
+        let own = self.peer_load(peer);
+        (0..self.ports).min_by_key(|&port| (lane[port], own[port], self.load[port], port)).expect("ports >= 1")
     }
 
     fn flows(&mut self, peer: IpAddr) -> &mut PeerFlows {
@@ -200,18 +215,20 @@ impl Placement {
         self.peers.entry(peer).or_insert_with(|| PeerFlows { load: vec![0; ports], ..PeerFlows::default() })
     }
 
-    /// Measured placement of a new flow of `peer`: a label already measured
-    /// on [`Self::target`] if there is one, else fresh candidates, each
-    /// `probe`d, until one lands there (at most `max_probes`). Without a hit
-    /// the flow takes the least-shared measured label (its member recorded),
-    /// or candidate 1 unmeasured when no probe was conclusive.
+    /// Measured placement of a new flow of `peer` on `transport`: a label
+    /// already measured on [`Self::target`] if there is one, else fresh
+    /// candidates, each `probe`d, until one lands there (at most
+    /// `max_probes`). Without a hit the flow takes the least-shared measured
+    /// label (its member recorded), or candidate 1 unmeasured when no probe
+    /// was conclusive.
     pub fn acquire(
         &mut self,
         peer: IpAddr,
+        transport: u64,
         max_probes: u32,
         mut probe: impl FnMut(u32) -> Result<ProbeResult>,
     ) -> Result<Assignment> {
-        let target = self.target(peer);
+        let target = self.target(peer, transport);
         let ports = self.ports;
         let flows = self.flows(peer);
         let least_shared = |flows: &PeerFlows, on: Option<usize>| {
@@ -223,7 +240,7 @@ impl Placement {
                 .min_by_key(|&(label, _)| (flows.live.get(&label).copied().unwrap_or(0), label))
         };
         if let Some((label, port)) = least_shared(flows, Some(target)) {
-            return Ok(self.commit(peer, label, Some(port), 0));
+            return Ok(self.commit(peer, transport, label, Some(port), 0));
         }
         let mut probes = 0;
         while probes < max_probes {
@@ -238,37 +255,39 @@ impl Placement {
                     ensure!(port < ports, "probe of label {label} reported member {port} of {ports}");
                     flows.seen.insert(label, port);
                     if port == target {
-                        return Ok(self.commit(peer, label, Some(port), probes));
+                        return Ok(self.commit(peer, transport, label, Some(port), probes));
                     }
                 }
                 ProbeResult::Inconclusive => {}
             }
         }
         match least_shared(flows, None) {
-            Some((label, port)) => Ok(self.commit(peer, label, Some(port), probes)),
-            None => Ok(self.commit(peer, candidate_label(0), None, probes)),
+            Some((label, port)) => Ok(self.commit(peer, transport, label, Some(port), probes)),
+            None => Ok(self.commit(peer, transport, candidate_label(0), None, probes)),
         }
     }
 
     /// Unmeasured placement: the lowest candidate label `peer` has no live flow
     /// on, so a rank's flows get labels 1, 2, … in the order they connect.
-    pub fn fixed(&mut self, peer: IpAddr) -> Assignment {
+    pub fn fixed(&mut self, peer: IpAddr, transport: u64) -> Assignment {
         let flows = self.flows(peer);
         let label = (0..CANDIDATE_LABELS)
             .map(candidate_label)
             .find(|label| !flows.live.contains_key(label))
             .unwrap_or_else(|| candidate_label(0));
-        self.commit(peer, label, None, 0)
+        self.commit(peer, transport, label, None, 0)
     }
 
-    fn commit(&mut self, peer: IpAddr, label: u32, port: Option<usize>, probes: u32) -> Assignment {
+    fn commit(&mut self, peer: IpAddr, transport: u64, label: u32, port: Option<usize>, probes: u32) -> Assignment {
+        let ports = self.ports;
         let flows = self.flows(peer);
         *flows.live.entry(label).or_insert(0) += 1;
         if let Some(port) = port {
             flows.load[port] += 1;
             self.load[port] += 1;
+            self.transports.entry(transport).or_insert_with(|| vec![0; ports])[port] += 1;
         }
-        Assignment { peer, label, port, probes }
+        Assignment { peer, transport, label, port, probes }
     }
 
     /// Returns a flow's share of the counts; its measurement stays known.
@@ -283,6 +302,12 @@ impl Placement {
         if let Some(port) = assignment.port.filter(|&port| port < self.ports) {
             flows.load[port] = flows.load[port].saturating_sub(1);
             self.load[port] = self.load[port].saturating_sub(1);
+            if let Some(lane) = self.transports.get_mut(&assignment.transport) {
+                lane[port] = lane[port].saturating_sub(1);
+                if lane.iter().all(|&flows| flows == 0) {
+                    self.transports.remove(&assignment.transport);
+                }
+            }
         }
     }
 }
@@ -674,30 +699,60 @@ mod tests {
         }
     }
 
+    /// Places `order`'s (lane, rank) flows, each measured against `hash`.
+    fn place(
+        placement: &mut Placement,
+        hash: &impl Fn(IpAddr, u32) -> usize,
+        order: &[(u64, IpAddr)],
+    ) -> Vec<Assignment> {
+        order
+            .iter()
+            .map(|&(lane, peer)| {
+                placement.acquire(peer, lane, 64, |label| Ok(ProbeResult::Port(hash(peer, label)))).unwrap()
+            })
+            .collect()
+    }
+
     #[test]
-    fn two_lanes_of_four_ranks_split_four_four_under_any_hash() {
+    fn two_lanes_of_four_ranks_split_two_two_per_lane_under_any_hash() {
         let ranks: Vec<IpAddr> = [1, 2, 4, 5].into_iter().map(rank).collect();
+        let order: Vec<(u64, IpAddr)> = (0..2).flat_map(|lane| ranks.iter().map(move |&peer| (lane, peer))).collect();
         for seed in 0..500 {
             let hash = switch_hash(seed);
             let mut placement = Placement::new(2);
-            let mut lanes = Vec::new();
-            for _lane in 0..2 {
-                let lane: Vec<Assignment> = ranks
-                    .iter()
-                    .map(|&peer| placement.acquire(peer, 64, |label| Ok(ProbeResult::Port(hash(peer, label)))).unwrap())
-                    .collect();
-                lanes.push(lane);
+            let placed = place(&mut placement, &hash, &order);
+            for lane in 0..2 {
+                assert_eq!(placement.transport_load(lane), vec![2, 2], "seed {seed}: lane {lane} 2+2");
             }
             assert_eq!(placement.load(), &[4, 4], "seed {seed}");
-            for lane in &lanes {
-                let on_zero = lane.iter().filter(|a| a.port == Some(0)).count();
-                assert_eq!(on_zero, 2, "seed {seed}: every lane 2+2");
-                for a in lane {
-                    assert_eq!(a.port, Some(hash(a.peer, a.label)), "the recorded member is the hash's");
-                }
-            }
             for &peer in &ranks {
                 assert_eq!(placement.peer_load(peer), vec![1, 1], "seed {seed}: each rank one flow per member");
+            }
+            for a in &placed {
+                assert_eq!(a.port, Some(hash(a.peer, a.label)), "the recorded member is the hash's");
+            }
+        }
+    }
+
+    #[test]
+    fn lanes_split_evenly_in_any_connection_order() {
+        // Lazily connected transports interleave: the lane comes first, so each
+        // lane still ends 2+2 however its flows and the other lane's alternate.
+        let ranks: Vec<IpAddr> = [1, 2, 4, 5].into_iter().map(rank).collect();
+        for seed in 0..500 {
+            let hash = switch_hash(seed);
+            let mut order: Vec<(u64, IpAddr)> =
+                (0..2).flat_map(|lane| ranks.iter().map(move |&peer| (lane, peer))).collect();
+            // A seeded shuffle.
+            let mut state = mix(seed ^ 0x5eed);
+            for i in (1..order.len()).rev() {
+                state = mix(state);
+                order.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            let mut placement = Placement::new(2);
+            place(&mut placement, &hash, &order);
+            for lane in 0..2 {
+                assert_eq!(placement.transport_load(lane), vec![2, 2], "seed {seed} order {order:?}: lane {lane}");
             }
         }
     }
@@ -709,37 +764,50 @@ mod tests {
         let targets: Vec<usize> = ranks
             .iter()
             .map(|&peer| {
-                let target = placement.target(peer);
-                placement.acquire(peer, 16, |label| Ok(ProbeResult::Port((label as usize + target + 1) % 2))).unwrap();
+                let target = placement.target(peer, 0);
+                placement.acquire(peer, 0, 16, |label| Ok(ProbeResult::Port((label as usize + target + 1) % 2))).unwrap();
                 target
             })
             .collect();
         assert_eq!(targets, vec![0, 1, 0, 1]);
-        let second: Vec<usize> = ranks.iter().map(|&peer| placement.target(peer)).collect();
-        assert_eq!(second, vec![1, 0, 1, 0]);
+        let second: Vec<usize> = ranks.iter().map(|&peer| placement.target(peer, 1)).collect();
+        assert_eq!(second, vec![1, 0, 1, 0], "the second lane: each rank's other member");
     }
 
     #[test]
-    fn four_lanes_and_six_ranks_stay_even() {
-        for (lanes, world) in [(4, 4), (2, 3), (2, 6), (3, 4)] {
+    fn more_lanes_and_ranks_stay_even_per_lane() {
+        for (lanes, world) in [(4_u64, 4_u32), (2, 3), (2, 6), (3, 4), (1, 4)] {
             let ranks: Vec<IpAddr> = (1..=world).map(|r| rank(r as u8)).collect();
+            let order: Vec<(u64, IpAddr)> =
+                (0..lanes).flat_map(|lane| ranks.iter().map(move |&peer| (lane, peer))).collect();
             for seed in 0..100 {
                 let hash = switch_hash(seed);
                 let mut placement = Placement::new(2);
-                for _ in 0..lanes {
-                    for &peer in &ranks {
-                        placement.acquire(peer, 64, |label| Ok(ProbeResult::Port(hash(peer, label)))).unwrap();
-                    }
+                place(&mut placement, &hash, &order);
+                for lane in 0..lanes {
+                    let own = placement.transport_load(lane);
+                    assert!(own[0].abs_diff(own[1]) <= world % 2, "{lanes}x{world} seed {seed} lane {lane}: {own:?}");
                 }
-                let flows = (lanes * world) as u32;
                 let load = placement.load();
-                assert_eq!(load[0] + load[1], flows);
-                assert!(load[0].abs_diff(load[1]) <= flows % 2, "{lanes}x{world} seed {seed}: {load:?}");
-                for &peer in &ranks {
-                    let own = placement.peer_load(peer);
-                    assert!(own[0].abs_diff(own[1]) <= (lanes as u32) % 2, "{lanes}x{world} seed {seed}: {own:?}");
-                }
+                assert_eq!(load[0] + load[1], lanes as u32 * world);
+                assert!(load[0].abs_diff(load[1]) <= (lanes as u32 * world) % 2, "{lanes}x{world} seed {seed}: {load:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_lane_works_around_a_rank_whose_hash_ignores_the_port() {
+        // Rank 1's every label lands on member 1: the lane's other ranks take
+        // the members it cannot, so the lane still splits 2+2.
+        let ranks: Vec<IpAddr> = [1, 2, 4, 5].into_iter().map(rank).collect();
+        let hash = switch_hash(11);
+        let stuck = |peer: IpAddr, label: u32| if peer == rank(1) { 1 } else { hash(peer, label) };
+        let mut placement = Placement::new(2);
+        let order: Vec<(u64, IpAddr)> = (0..2).flat_map(|lane| ranks.iter().map(move |&peer| (lane, peer))).collect();
+        place(&mut placement, &stuck, &order);
+        assert_eq!(placement.peer_load(rank(1)), vec![0, 2]);
+        for lane in 0..2 {
+            assert_eq!(placement.transport_load(lane), vec![2, 2], "lane {lane}");
         }
     }
 
@@ -750,7 +818,7 @@ mod tests {
         let mut placement = Placement::new(2);
         let mut probes = 0;
         let first = placement
-            .acquire(peer, 16, |label| {
+            .acquire(peer, 0, 16, |label| {
                 probes += 1;
                 Ok(ProbeResult::Port(hash(peer, label)))
             })
@@ -758,7 +826,8 @@ mod tests {
         assert!(probes >= 1);
         placement.release(&first);
         assert_eq!(placement.load(), &[0, 0]);
-        let again = placement.acquire(peer, 16, |_| panic!("no probe for a known label")).unwrap();
+        assert_eq!(placement.transport_load(0), vec![0, 0]);
+        let again = placement.acquire(peer, 0, 16, |_| panic!("no probe for a known label")).unwrap();
         assert_eq!((again.label, again.port, again.probes), (first.label, first.port, 0));
     }
 
@@ -767,42 +836,44 @@ mod tests {
         let stuck = rank(9);
         let mut placement = Placement::new(2);
         // Every label of this rank lands on member 1 though member 0 is the target.
-        let a = placement.acquire(stuck, 5, |_| Ok(ProbeResult::Port(1))).unwrap();
+        let a = placement.acquire(stuck, 0, 5, |_| Ok(ProbeResult::Port(1))).unwrap();
         assert_eq!((a.port, a.probes), (Some(1), 5));
-        let b = placement.acquire(stuck, 5, |_| Ok(ProbeResult::Port(1))).unwrap();
+        let b = placement.acquire(stuck, 1, 5, |_| Ok(ProbeResult::Port(1))).unwrap();
         assert_eq!(b.port, Some(1));
         assert_ne!(a.label, b.label, "the least-shared measured label");
         assert_eq!(placement.peer_load(stuck), vec![0, 2]);
-        // The next rank's flow goes to the emptier member.
-        assert_eq!(placement.target(rank(10)), 0);
+        // The next flow on either lane goes to the emptier member.
+        assert_eq!(placement.target(rank(10), 0), 0);
+        assert_eq!(placement.target(rank(10), 1), 0);
     }
 
     #[test]
     fn inconclusive_probes_end_unmeasured() {
         let mut placement = Placement::new(2);
-        let a = placement.acquire(rank(3), 4, |_| Ok(ProbeResult::Inconclusive)).unwrap();
+        let a = placement.acquire(rank(3), 0, 4, |_| Ok(ProbeResult::Inconclusive)).unwrap();
         assert_eq!((a.label, a.port, a.probes), (1, None, 4));
         assert_eq!(placement.load(), &[0, 0]);
+        assert_eq!(placement.transport_load(0), vec![0, 0]);
         placement.release(&a);
     }
 
     #[test]
     fn probe_errors_propagate_and_bad_members_are_refused() {
         let mut placement = Placement::new(2);
-        assert!(placement.acquire(rank(1), 4, |_| bail!("worker refused the probe")).is_err());
-        assert!(placement.acquire(rank(2), 4, |_| Ok(ProbeResult::Port(2))).is_err());
+        assert!(placement.acquire(rank(1), 0, 4, |_| bail!("worker refused the probe")).is_err());
+        assert!(placement.acquire(rank(2), 0, 4, |_| Ok(ProbeResult::Port(2))).is_err());
     }
 
     #[test]
     fn fixed_labels_count_up_per_rank_and_are_reused() {
         let mut placement = Placement::new(2);
-        let a = placement.fixed(rank(1));
-        let b = placement.fixed(rank(1));
-        let c = placement.fixed(rank(2));
+        let a = placement.fixed(rank(1), 0);
+        let b = placement.fixed(rank(1), 1);
+        let c = placement.fixed(rank(2), 0);
         assert_eq!((a.label, b.label, c.label), (1, 2, 1));
         assert_eq!((a.port, b.port), (None, None));
         placement.release(&a);
-        assert_eq!(placement.fixed(rank(1)).label, 1);
+        assert_eq!(placement.fixed(rank(1), 0).label, 1);
     }
 
     #[test]

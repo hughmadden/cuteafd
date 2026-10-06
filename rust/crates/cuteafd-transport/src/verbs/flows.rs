@@ -2,7 +2,11 @@
 //! see [`crate::bond`]): one process-wide [`Placement`], the probe exchange
 //! that measures which bond member a label's traffic arrives on, and the
 //! per-transport [`FlowSlots`] that hold each rank's label for as long as the
-//! transport lives, so a reconnect keeps its member.
+//! transport lives, so a reconnect keeps its member. Each transport (a GLM
+//! Flash lane) is split across the members on its own: its ranks answer one
+//! wave together, so four flows on one member overrun it however the other
+//! lane sits. Every placement logs its transport's member counts, and each
+//! transport logs one line saying whether its flows split evenly.
 //!
 //! A probe is its own small QP pair on the worker's ordinary listener: the
 //! worker connects its side with the label, exposes 4 MiB for remote reads,
@@ -12,6 +16,7 @@
 use super::*;
 use crate::bond::{self, Assignment, BondBalance, BondPorts, EthtoolCounters, Placement, PortCounters, ProbeResult};
 use std::collections::BTreeSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 
 const FLOW_PROBE_START: &str = "rdma_flow_probe_start";
@@ -299,21 +304,21 @@ impl Balancer {
         Ok(Some(Measure { bond, counters: Box::new(counters), library }))
     }
 
-    fn acquire(&mut self, peer: SocketAddr) -> Result<Assignment> {
+    fn acquire(&mut self, peer: SocketAddr, transport: u64) -> Result<Assignment> {
         if !self.initialized {
             self.initialize();
         }
         let ip = peer.ip();
         let Some(measure) = self.measure.as_mut().filter(|_| !self.unsupported.contains(&ip)) else {
             if self.unsupported.contains(&ip) {
-                return Ok(Assignment { peer: ip, label: 0, port: None, probes: 0 });
+                return Ok(Assignment { peer: ip, transport, label: 0, port: None, probes: 0 });
             }
-            return Ok(self.placement.fixed(ip));
+            return Ok(self.placement.fixed(ip, transport));
         };
         let (library, probe_bytes) = (Arc::clone(&measure.library), self.probe_bytes);
         let counters = measure.counters.as_mut();
         let deadline = Instant::now() + PLACEMENT_BUDGET;
-        let result = self.placement.acquire(ip, self.max_probes, |label| {
+        let result = self.placement.acquire(ip, transport, self.max_probes, |label| {
             for _ in 0..PROBE_ATTEMPTS {
                 if Instant::now() >= deadline {
                     // Out of time (a fabric that never goes quiet): settle
@@ -333,7 +338,7 @@ impl Balancer {
                 tracing::warn!(peer = %peer, error = %format!("{error:#}"),
                     "RDMA bond balance: worker does not serve flow probes; its flows keep the kernel's label");
                 self.unsupported.insert(ip);
-                Ok(Assignment { peer: ip, label: 0, port: None, probes: 0 })
+                Ok(Assignment { peer: ip, transport, label: 0, port: None, probes: 0 })
             }
             Err(error) => Err(error),
         }
@@ -346,7 +351,20 @@ impl Balancer {
             (None, _) => "unmeasured".to_owned(),
         }
     }
+
+    /// "member:flows,member:flows" for one transport's measured flows.
+    fn members(&self, load: &[u32]) -> String {
+        load.iter()
+            .enumerate()
+            .map(|(port, flows)| format!("{}:{flows}", self.member(Some(port))))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
+
+/// Identifies each transport (one per GLM Flash lane, numbered in the order
+/// they are built) so its flows are split among themselves.
+static NEXT_TRANSPORT: AtomicU64 = AtomicU64::new(0);
 
 fn balancer() -> Result<&'static Mutex<Balancer>> {
     static BALANCER: OnceLock<std::result::Result<Mutex<Balancer>, String>> = OnceLock::new();
@@ -363,18 +381,19 @@ pub(crate) struct FlowSlot {
 }
 
 impl FlowSlot {
-    fn acquire(peer: SocketAddr) -> Result<Self> {
+    fn acquire(peer: SocketAddr, transport: u64) -> Result<Self> {
         let mut balancer = balancer()?.lock().map_err(|_| anyhow::anyhow!("RDMA flow placement lock poisoned"))?;
-        let assignment = balancer.acquire(peer)?;
+        let assignment = balancer.acquire(peer, transport)?;
         let sport = bond::flow_label_to_udp_sport(assignment.label);
         let member = balancer.member(assignment.port);
         if balancer.measure.is_some() && assignment.label != 0 && assignment.port.is_none() {
-            tracing::warn!(peer = %peer, label = assignment.label, sport = %format_args!("{sport:#06x}"),
+            tracing::warn!(peer = %peer, transport, label = assignment.label, sport = %format_args!("{sport:#06x}"),
                 probes = assignment.probes, "RDMA flow label placed unmeasured: every probe was inconclusive");
         } else {
-            tracing::info!(peer = %peer, label = assignment.label, sport = %format_args!("{sport:#06x}"),
+            let lane = balancer.members(&balancer.placement.transport_load(transport));
+            tracing::info!(peer = %peer, transport, label = assignment.label, sport = %format_args!("{sport:#06x}"),
                 member = %member, probes = assignment.probes, mode = balancer.mode.name(),
-                load = ?balancer.placement.load(), "RDMA flow label");
+                transport_members = %lane, "RDMA flow label");
         }
         Ok(Self { assignment })
     }
@@ -398,6 +417,7 @@ impl Drop for FlowSlot {
 /// `CUTEAFD_RDMA_BOND_BALANCE` is set.
 pub(crate) struct FlowSlots {
     enabled: bool,
+    transport: u64,
     slots: Vec<Option<FlowSlot>>,
 }
 
@@ -413,17 +433,37 @@ impl FlowSlots {
                 true
             }
         };
-        let mut slots = Self { enabled, slots: peers.iter().map(|_| None).collect() };
+        let transport = NEXT_TRANSPORT.fetch_add(1, Ordering::Relaxed);
+        let mut slots = Self { enabled, transport, slots: peers.iter().map(|_| None).collect() };
         if enabled {
             for (rank, peer) in peers.iter().enumerate() {
-                match FlowSlot::acquire(*peer) {
+                match FlowSlot::acquire(*peer, transport) {
                     Ok(slot) => slots.slots[rank] = Some(slot),
-                    Err(error) => tracing::warn!(peer = %peer, error = %format!("{error:#}"),
+                    Err(error) => tracing::warn!(peer = %peer, transport, error = %format!("{error:#}"),
                         "RDMA flow label deferred to the first connection"),
                 }
             }
+            slots.log_placement();
         }
         slots
+    }
+
+    /// One line per transport: how its flows sit on the bond's members.
+    fn log_placement(&self) {
+        let Ok(balancer) = balancer() else { return };
+        let Ok(balancer) = balancer.lock() else { return };
+        if balancer.measure.is_none() {
+            return;
+        }
+        let load = balancer.placement.transport_load(self.transport);
+        let placed = self.slots.iter().filter(|slot| slot.as_ref().is_some_and(|s| s.assignment.port.is_some())).count();
+        let even = load.iter().max().zip(load.iter().min()).is_some_and(|(max, min)| max - min <= 1);
+        if placed == self.slots.len() && even {
+            tracing::info!(transport = self.transport, members = %balancer.members(&load), "RDMA transport flows split");
+        } else {
+            tracing::warn!(transport = self.transport, members = %balancer.members(&load), placed,
+                flows = self.slots.len(), "RDMA transport flows not evenly split");
+        }
     }
 
     /// The label rank `rank`'s next session connects with (0 when off). An
@@ -437,7 +477,7 @@ impl FlowSlots {
         let slot = self.slots.get_mut(rank).context("RDMA flow slot rank out of range")?;
         if slot.is_none() {
             balancer()?;
-            match FlowSlot::acquire(peer) {
+            match FlowSlot::acquire(peer, self.transport) {
                 Ok(placed) => *slot = Some(placed),
                 Err(error) => {
                     tracing::warn!(peer = %peer, error = %format!("{error:#}"),
@@ -580,6 +620,23 @@ mod tests {
         assert_eq!(serde_json::from_value::<VerbsHostProtocolV2PersistentReady>(old).unwrap().flow_label, 0);
         let echoed = serde_json::to_value(ready(7)).unwrap();
         assert_eq!(serde_json::from_value::<VerbsHostProtocolV2PersistentReady>(echoed).unwrap().flow_label, 7);
+    }
+
+    #[test]
+    fn a_transport_reports_its_members_compactly() {
+        let balancer = Balancer {
+            mode: BondBalance::Probe,
+            max_probes: bond::DEFAULT_PROBES,
+            probe_bytes: bond::DEFAULT_PROBE_BYTES,
+            placement: Placement::new(2),
+            measure: None,
+            initialized: true,
+            unsupported: BTreeSet::new(),
+        };
+        // Without a measured bond the members are numbered; the gate tooling
+        // greps "members=<member>:<flows>,...".
+        assert_eq!(balancer.members(&[2, 2]), "0:2,1:2");
+        assert_eq!(balancer.member(None), "unmeasured");
     }
 
     #[test]

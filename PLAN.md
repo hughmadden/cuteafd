@@ -772,8 +772,10 @@ Work, in priority order:
    coordinator key `RDMA_BOND_BALANCE=probe` the expert QPs connect with
    RoCE v2 flow labels (the UDP source port) the coordinator chooses; it reads
    4 MiB from each candidate label's worker QP, sees which bond member's
-   `rx_bytes_phy` received it, and gives each rank's lanes alternating members
-   (`cuteafd-transport/src/bond.rs`). Default `off` keeps the kernel's
+   `rx_bytes_phy` received it, and splits every transport's (lane's) flows
+   evenly across the members, then each rank's (`cuteafd-transport/src/bond.rs`):
+   a lane's ranks answer a wave together, so a lane whose flows share a member
+   overruns it even when the two lanes' totals balance. Default `off` keeps the kernel's
    QP-number labels, which re-roll the split at every start; `labels` fixes
    labels without measuring. Hardware A/B pending. Readiness bug (2026-10-05, fidelity
    agent): `/v1/models` reports ready before the Spark experts finish
