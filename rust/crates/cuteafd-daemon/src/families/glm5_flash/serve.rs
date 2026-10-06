@@ -386,8 +386,44 @@ fn media_digest(tokens: &[u32], spans: &[cuteafd_loader::media::MediaSpan]) -> u
     state
 }
 
+fn cold_replay_plan(probe: &probe::ProbeRef, plan: PointPlan, retained_logits: bool) -> PointPlan {
+    if let Some(probe) = probe.as_ref().filter(|p| !p.spec.cold_steps.is_empty()) {
+        // Validation precedes admission; replay the source's exact prefill/decode boundaries.
+        PointPlan { chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new() }
+    } else if retained_logits { PointPlan::default() } else { plan }
+}
+
+fn cold_replay_decode(probe: &probe::ProbeRef, chunk: usize) -> bool {
+    probe.as_ref().and_then(|p| p.spec.cold_steps.get(chunk)).is_some_and(|step| step.decode)
+}
+
 #[cfg(test)]
 mod media_tests {
+    #[test]
+    fn cold_replay_keeps_source_geometry_and_disables_snapshot_points() {
+        use cuteafd_api::openai::probe::{Probe, ProbeColdStep, ProbeSpec};
+        use cuteafd_engine::prefix::PointPlan;
+        let spec = ProbeSpec { cold: true, no_speculation: true,
+            cold_steps: vec![ProbeColdStep { end: 8, decode: false },
+                ProbeColdStep { end: 9, decode: true }, ProbeColdStep { end: 12, decode: false }],
+            ..Default::default() };
+        spec.validate_cold_steps(12, 8, 2).unwrap();
+        let probe = Some(Probe::new(spec));
+        let ordinary = || PointPlan { chunks: vec![8, 12], points: vec![(0, 8)] };
+        let plan = super::cold_replay_plan(&probe, ordinary(), false);
+        assert_eq!(plan.chunks, [8, 9, 12]);
+        assert!(plan.points.is_empty());
+        assert!(!super::cold_replay_decode(&probe, 0));
+        assert!(super::cold_replay_decode(&probe, 1));
+        assert!(!super::cold_replay_decode(&probe, 2));
+        assert!(!super::cold_replay_decode(&probe, 3));
+        let plan = super::cold_replay_plan(&None, ordinary(), false);
+        assert_eq!(plan.chunks, [8, 12]);
+        assert_eq!(plan.points, [(0, 8)]);
+        assert!(!super::cold_replay_decode(&None, 1));
+        assert!(super::cold_replay_plan(&None, ordinary(), true).chunks.is_empty());
+    }
+
     #[test]
     fn speculation_digest_keeps_text_and_binds_full_image_identity() {
         use cuteafd_loader::media::{ImageKey, MediaSpan};
@@ -672,7 +708,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             };
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
-            let plan = if logits.is_some() { PointPlan::default() } else { plan };
+            let plan = cold_replay_plan(&job.probe, plan, logits.is_some());
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, phases: [0.0; 3], ticket });
@@ -693,7 +729,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let chunk = &p.tokens[p.done..end];
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
-                    let logits = engine.prefill_media_device(&mut p.placement, chunk, &p.media)?;
+                    let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
+                        engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+                    } else {
+                        engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
+                    };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let logits = logits.context("prefill produced no logits")?;
