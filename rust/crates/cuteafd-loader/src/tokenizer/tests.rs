@@ -142,3 +142,235 @@ fn official_unicode_roundtrip_and_every_token_cut() {
         cases.len()
     );
 }
+
+// ---------------------------------------------------------------- long texts by pieces
+
+/// GLM 5.3's pre-tokenizer split.
+const GLM_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The test tokenizer's added tokens: GLM-like markers, two that overlap (`<a>b` is longer than
+/// `<a>`) and one that ends in a letter.
+const ADDED: [&str; 8] = ["<|user|>", "<|assistant|>", "<think>", "</think>", "[gMASK]", "<a>", "<a>b", "/nothink"];
+
+/// A byte-level BPE tokenizer shaped like GLM 5.3's (its split, `ignore_merges`, byte-level
+/// pieces), with merges that build a few words and numbers, and [`ADDED`]. `lstrip`: the first
+/// added token takes the spaces on its left.
+fn bpe_tokenizer(lstrip: bool) -> tempfile::TempDir {
+    let mut extra = 256u32;
+    let chars: Vec<char> = (0..=255u32).map(|byte| {
+        if (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174 {
+            char::from_u32(byte).unwrap()
+        } else {
+            extra += 1;
+            char::from_u32(extra - 1).unwrap()
+        }
+    }).collect();
+    let mut vocab = serde_json::Map::new();
+    for (id, c) in chars.iter().enumerate() {
+        vocab.insert(c.to_string(), serde_json::json!(id));
+    }
+    let mut merges: Vec<String> = Vec::new();
+    for word in ["the", " the", "amber", " amber", " vault", "code", "123", "45"] {
+        let bytes: Vec<String> = word.bytes().map(|b| chars[b as usize].to_string()).collect();
+        let mut built = bytes[0].clone();
+        for byte in &bytes[1..] {
+            let merge = format!("{built} {byte}");
+            built.push_str(byte);
+            if !merges.contains(&merge) {
+                merges.push(merge);
+            }
+            if !vocab.contains_key(&built) {
+                let id = vocab.len();
+                vocab.insert(built.clone(), serde_json::json!(id));
+            }
+        }
+    }
+    let added: Vec<serde_json::Value> = ADDED.iter().enumerate().map(|(i, content)| serde_json::json!({
+        "id": vocab.len() + i, "content": content, "single_word": false, "lstrip": lstrip && i == 0,
+        "rstrip": false, "normalized": false, "special": content.starts_with("<|") || content.starts_with('[')}))
+        .collect();
+    let value = serde_json::json!({"version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": GLM_SPLIT}, "behavior": "Isolated", "invert": false},
+            {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]},
+        "post_processor": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true},
+        "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+        "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": true,
+            "vocab": vocab, "merges": merges}});
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+    dir
+}
+
+/// Deterministic text of at least `len` bytes: words, numbers, punctuation, whitespace runs and
+/// other scripts, with an added token (or a near miss of one) about every `spacing` bytes.
+fn mixed_text(seed: u64, len: usize, spacing: usize) -> String {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let parts: &[&str] = &["the", " the", " amber", " basalt", " vault", "code", " 12345", " 6", "123456789", ".",
+        ", ", "!?", "...", "'s", "'LL", " (", ")", "\n", "\r\n", "\t", "   ", "  \n  ", " 台北", " café", " e\u{301}",
+        " 👩🏽\u{200d}💻", "über"];
+    let near: &[&str] = &["<|use", "<a", "a>b", "/noth", "<think", "<|assistant|"];
+    let mut text = String::with_capacity(len + 64);
+    let mut since = 0;
+    while text.len() < len {
+        if since >= spacing && next(4) == 0 {
+            text.push_str(if next(3) == 0 { near[next(near.len())] } else { ADDED[next(ADDED.len())] });
+            since = 0;
+        } else {
+            let part = parts[next(parts.len())];
+            text.push_str(part);
+            since += part.len();
+        }
+    }
+    text
+}
+
+#[test]
+fn long_texts_encode_by_pieces_as_the_tokenizer_does() {
+    let dir = bpe_tokenizer(false);
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    let reference = |text: &str| tokenizer.tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+    let pieces = tokenizer.pieces.as_ref().expect("added tokens that match by content alone");
+    let long = |seed| mixed_text(seed, 6_000, usize::MAX);
+    let cases = [
+        mixed_text(1, pieces::LONG_TEXT + 4_000, 2_000),
+        mixed_text(2, pieces::LONG_TEXT + 8_000, 9_000),
+        // Added tokens first, last, adjacent and overlapping (`<a>b` over `<a>`).
+        format!("[gMASK]<|user|>{}<a>b{}<a>{}/nothink{}<|assistant|><think>{}", long(3), long(4), long(5), long(6),
+            mixed_text(7, pieces::LONG_TEXT, 3_000)),
+        // No added token at all: one piece.
+        mixed_text(8, pieces::LONG_TEXT + 1_000, usize::MAX),
+    ];
+    for (case, text) in cases.iter().enumerate() {
+        assert!(text.len() >= pieces::LONG_TEXT);
+        let expected = reference(text);
+        assert_eq!(tokenizer.encode_ids(text).unwrap(), expected, "case {case}");
+        assert_eq!(tokenizer.encode_ids(text).unwrap(), expected, "case {case}, kept pieces");
+        // A character added in the middle never brings back kept ids.
+        let middle = (text.len() / 2..).find(|&i| text.is_char_boundary(i)).unwrap();
+        let mut changed = text.clone();
+        changed.insert(middle, 'Z');
+        assert_eq!(tokenizer.encode_ids(&changed).unwrap(), reference(&changed), "case {case}, changed");
+        assert_eq!(tokenizer.encode_text(text, false).unwrap().token_ids, expected, "case {case}, encode_text");
+    }
+    assert!(pieces.kept_pieces() > 0);
+}
+
+#[test]
+fn a_growing_conversation_encodes_only_its_new_pieces() {
+    let dir = bpe_tokenizer(false);
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    let reference = |text: &str| tokenizer.tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+    let pieces = tokenizer.pieces.as_ref().unwrap();
+    let mut text = format!("[gMASK]<|user|>{}<|assistant|><think>", mixed_text(11, pieces::LONG_TEXT, usize::MAX));
+    assert_eq!(tokenizer.encode_ids(&text).unwrap(), reference(&text));
+    assert_eq!(pieces.kept_pieces(), 1);
+    for turn in 0..3u64 {
+        text.push_str(&format!("Plan {turn}.</think>Answer {turn}.<|user|>{}<|assistant|><think>",
+            mixed_text(20 + turn, 5_000, usize::MAX)));
+        assert_eq!(tokenizer.encode_ids(&text).unwrap(), reference(&text), "turn {turn}");
+    }
+    // The first message was kept and reused; each turn's long message was kept once.
+    assert_eq!(pieces.kept_pieces(), 4);
+}
+
+#[test]
+fn added_tokens_that_strip_spaces_encode_whole() {
+    let dir = bpe_tokenizer(true);
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    assert!(tokenizer.pieces.is_none());
+    let text = mixed_text(31, pieces::LONG_TEXT + 2_000, 1_500);
+    assert_eq!(tokenizer.encode_ids(&text).unwrap(), tokenizer.tokenizer.encode(text.as_str(), false).unwrap().get_ids());
+}
+
+/// A GLM-shaped conversation: `[gMASK]<sop>`, a system turn, a long first user message, then
+/// `turns` assistant turns with reasoning and tool output.
+fn glm_conversation(seed: u64, first: usize, turns: u64) -> String {
+    let mut text = format!("[gMASK]<sop><|system|>You are terse.<|user|>{}", mixed_text(seed, first, 50_000));
+    for turn in 0..turns {
+        text.push_str(&format!("<|assistant|><think>Plan {turn}.</think>Calling.<tool_call>read<arg_key>path</arg_key>\
+            <arg_value>a{turn}.rs</arg_value></tool_call><|observation|><tool_response>{}</tool_response>",
+            mixed_text(seed + 1 + turn, 20_000, 7_000)));
+    }
+    text + "<|assistant|><think>"
+}
+
+#[test]
+#[ignore = "requires an official tokenizer via CUTEAFD_LONG_PROMPT_MODEL"]
+fn official_long_prompts_encode_by_pieces_as_the_tokenizer_does() {
+    let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_LONG_PROMPT_MODEL").expect("model path"));
+    let tokenizer = LoadedTokenizer::from_snapshot(&snapshot).unwrap();
+    assert!(tokenizer.pieces.is_some(), "this tokenizer encodes long texts whole");
+    let reference = |text: &str| tokenizer.tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+    for turns in 0..4 {
+        let text = glm_conversation(41, 300_000, turns);
+        let expected = reference(&text);
+        assert_eq!(tokenizer.encode_ids(&text).unwrap(), expected, "{turns} turns");
+        assert_eq!(tokenizer.encode_ids(&text).unwrap(), expected, "{turns} turns, kept pieces");
+    }
+}
+
+/// needle1m.py's prompt shape, as the M3 gate sends it: `[salt] `, `items` words with a running
+/// index, the vault code at 37% depth and the question. Its words are drawn by another generator
+/// than the gate's, so its tokens differ slightly; `CUTEAFD_LONG_PROMPT_TEXT` sends a given text.
+fn haystack(items: usize) -> String {
+    const WORDS: [&str; 20] = ["amber", "basalt", "cedar", "delta", "ember", "fjord", "granite", "harbor", "iris",
+        "juniper", "kelp", "lagoon", "meadow", "nectar", "orchid", "pebble", "quartz", "reef", "sable", "tundra"];
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut body: Vec<String> = (0..items).map(|i| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        format!("{}-{i}", WORDS[(state % 20) as usize])
+    }).collect();
+    body.insert(items * 37 / 100, "(The vault code is 51767.)".into());
+    format!("[173313487] {}\nWhat is the vault code mentioned above? Answer with the number only.", body.join(" "))
+}
+
+/// CPU benchmark of a long prompt's encoding on the serve path: the tokenizer's whole encoding
+/// (the path before pieces), then by pieces on first sight, from the kept pieces, and with a new
+/// turn appended. The prompt is the M3 gate's shape (about a million GLM 5.3 tokens) in the GLM
+/// chat format. Run it optimized:
+/// `CUTEAFD_LONG_PROMPT_MODEL=<snapshot> cargo test --release -p cuteafd-loader --lib long_prompt_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark; requires CUTEAFD_LONG_PROMPT_MODEL"]
+fn long_prompt_benchmark() {
+    use std::time::Instant;
+    let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_LONG_PROMPT_MODEL").expect("model path"));
+    let message = match std::env::var_os("CUTEAFD_LONG_PROMPT_TEXT") {
+        Some(path) => std::fs::read_to_string(path).unwrap(),
+        None => haystack(186_805),
+    };
+    let prompt = format!("[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>{message}<|assistant|><think>");
+    let next = format!("{prompt}The code is given.</think>51767<|user|>And the first word?<|assistant|><think>");
+    let tokenizer = LoadedTokenizer::from_snapshot(&snapshot).unwrap();
+    let whole = |text: &str| tokenizer.tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+    let timed = |encode: &dyn Fn() -> Vec<u32>, runs: usize| {
+        let mut best = f64::INFINITY;
+        let mut ids = Vec::new();
+        for _ in 0..runs {
+            let started = Instant::now();
+            ids = encode();
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        (ids, best)
+    };
+    let (expected, whole_s) = timed(&|| whole(&prompt), 3);
+    let (first, first_s) = timed(&|| tokenizer.encode_ids(&prompt).unwrap(), 1);
+    let (kept, kept_s) = timed(&|| tokenizer.encode_ids(&prompt).unwrap(), 5);
+    let (grown, grown_s) = timed(&|| tokenizer.encode_ids(&next).unwrap(), 1);
+    assert_eq!(first, expected);
+    assert_eq!(kept, expected);
+    assert_eq!(grown, whole(&next));
+    eprintln!("{} bytes, {} tokens: whole (before) {:.1} ms; by pieces: first sight {:.1} ms, kept {:.2} ms, \
+        a new turn {:.2} ms (best of 3, 1, 5, 1 runs)", prompt.len(), expected.len(), whole_s * 1e3, first_s * 1e3,
+        kept_s * 1e3, grown_s * 1e3);
+}
