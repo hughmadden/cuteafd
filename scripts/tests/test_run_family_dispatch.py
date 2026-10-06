@@ -731,6 +731,31 @@ def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,tensor", [("GLM5_FLASH_FP8_HEAD=off\n", False),
+                                        ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=exact\n", False),
+                                        ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=tensor\n", True),
+                                        ("GLM5_FLASH_TARGET_HEAD=exact\n", False)])
+def test_glmf_target_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--target-head tensor" in launch) == tensor, launch
+    assert ("--target-head" in launch) == tensor, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=fp8\n", "GLM5_FLASH_TARGET_HEAD must be exact or tensor"),
+    # The launcher's FP8 head default (auto) is on: the tensor target head needs the BF16 head.
+    ("GLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+    ("GLM5_FLASH_FP8_HEAD=on\nGLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+])
+def test_glmf_target_head_rejects_bad_values_and_the_fp8_head_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()

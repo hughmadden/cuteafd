@@ -187,6 +187,14 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
     pub fp8_head: bool,
+    /// The target's logits through the BF16 head: `exact` (default), the pedantic FP32 cuBLAS GEMM
+    /// on CUDA cores at every row count (127 verify rows at 16 sequences: about 4.5 ms on an RTX
+    /// 5090), or `tensor`: steps of up to 8 rows (one sequence) as `exact`, wider ones (verify
+    /// steps of two or more sequences, prefill-path scoring, --nll) as a BF16 tensor-core GEMM with
+    /// FP32 accumulation, which reads the head once. It changes the target's numerics past 8 rows:
+    /// gate it with the KL gate. Needs the BF16 head (no --fp8-head).
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_TARGET_HEAD", default_value = "exact")]
+    pub target_head: head::TargetHeadMode,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
     /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
     #[arg(long, hide = true)]
@@ -319,6 +327,20 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn target_head_defaults_to_exact_and_takes_tensor_with_the_bf16_head_only() {
+        assert_eq!(parse(&[]).target_head, head::TargetHeadMode::Exact);
+        assert_eq!(parse(&["--target-head", "exact"]).target_head, head::TargetHeadMode::Exact);
+        let tensor = parse(&["--target-head", "tensor"]);
+        assert_eq!(tensor.target_head, head::TargetHeadMode::Tensor);
+        check_options(&tensor).unwrap();
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--target-head", "fp8"]).is_err());
+        let error = check_options(&parse(&["--target-head", "tensor", "--fp8-head"])).unwrap_err().to_string();
+        assert!(error.contains("--target-head tensor") && error.contains("--fp8-head"), "{error}");
+        check_options(&parse(&["--target-head", "exact", "--fp8-head"])).unwrap();
+    }
+
+    #[test]
     fn draft_head_defaults_to_exact_and_takes_tensor() {
         use crate::families::glm5::DraftHead;
         assert_eq!(parse(&[]).draft_head, DraftHead::Exact);
@@ -348,6 +370,8 @@ mod draft_cli_tests {
         // The drafter's head runs as the target's, its FP8 GEMMs on the W8A16 GEMV.
         assert_eq!(defaults.draft_head, crate::families::glm5::DraftHead::Exact);
         assert_eq!(defaults.draft_linear, crate::shared::fp8_linear::Fp8Rows::W8a16);
+        // The target's head runs the pedantic GEMM at every row count.
+        assert_eq!(defaults.target_head, head::TargetHeadMode::Exact);
         assert!(wide_decode_programs(&defaults, false).is_empty() && wide_decode_programs(&defaults, true).is_empty());
         check_options(&defaults).unwrap();
     }
@@ -735,6 +759,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
         "--decode-rows {} runs the wide decode programs on one GPU: the head split's programs take {} rows \
         (drop --split-device or keep --decode-rows {})", args.decode_rows, engine::DECODE_ROWS, engine::DECODE_ROWS);
+    ensure!(args.target_head == head::TargetHeadMode::Exact || !args.fp8_head,
+        "--target-head tensor runs the BF16 head; the FP8 head (--fp8-head) has its own program");
     Ok(())
 }
 
@@ -1123,6 +1149,9 @@ impl Opened {
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
+        engine.target_head = args.target_head;
+        tracing::info!(target_head = ?args.target_head, tensor_from_rows = head::TARGET_HEAD_TENSOR_ROWS,
+            fp8_head = args.fp8_head, "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");

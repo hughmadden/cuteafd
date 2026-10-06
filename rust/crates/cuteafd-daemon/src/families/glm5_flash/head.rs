@@ -6,6 +6,11 @@
 //! quantized at load; no BF16 copy is kept, and every row count (decode,
 //! verify, prefill tails, `--nll` full prefill, draft blocks) runs the
 //! `glmf_head_fp8` program in [`FP8_HEAD_ROWS`]-row spans.
+//!
+//! The target's logits through the BF16 head ([`TargetHeadMode`], `--target-head`): `exact` runs
+//! the pedantic FP32 cuBLAS GEMM (CUDA cores) at every row count; `tensor` keeps steps of up to
+//! [`TARGET_HEAD_TENSOR_ROWS`]` - 1` rows on it and runs wider ones as a BF16 tensor-core GEMM with
+//! FP32 accumulation, which reads the head once for every row count.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};
@@ -13,6 +18,28 @@ use std::ffi::c_void;
 
 /// Rows one `glmf_head_fp8` launch takes (its GEMV's M tile).
 pub(crate) const FP8_HEAD_ROWS: usize = 16;
+
+/// How the target's logits run through the BF16 head (`--target-head`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum TargetHeadMode {
+    /// The pedantic FP32 cuBLAS GEMM (FP32 products and sums on CUDA cores) at every row count.
+    #[default]
+    Exact,
+    /// Up to 8 rows as `exact` (a one-sequence step: one token and up to seven drafts); from
+    /// [`TARGET_HEAD_TENSOR_ROWS`] rows a BF16 tensor-core GEMM with FP32 accumulation and logits.
+    Tensor,
+}
+
+/// Rows from which [`TargetHeadMode::Tensor`] takes tensor cores: one sequence's decode or verify
+/// step (its token and a DFlash2 block's seven drafts) keeps its bits.
+pub(crate) const TARGET_HEAD_TENSOR_ROWS: usize = 9;
+
+impl TargetHeadMode {
+    /// Whether `rows` logit rows run on tensor cores.
+    pub fn tensor_cores(self, rows: usize) -> bool {
+        self == TargetHeadMode::Tensor && rows >= TARGET_HEAD_TENSOR_ROWS
+    }
+}
 
 /// `(first row, rows)` spans of at most [`FP8_HEAD_ROWS`] covering `0..rows`.
 pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
@@ -80,6 +107,22 @@ impl<'a> GlmfHead<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `exact` never takes tensor cores; `tensor` takes them from 9 rows, so steps of one
+    /// sequence (up to 8 rows) keep the pedantic GEMM's bits.
+    #[test]
+    fn the_target_head_takes_tensor_cores_from_nine_rows_only_when_asked() {
+        assert_eq!(TargetHeadMode::default(), TargetHeadMode::Exact);
+        for rows in [1, 8, 9, 64, 127, 128, 4096] {
+            assert!(!TargetHeadMode::Exact.tensor_cores(rows), "{rows}");
+        }
+        for rows in 1..=8 {
+            assert!(!TargetHeadMode::Tensor.tensor_cores(rows), "{rows}");
+        }
+        for rows in [9, 16, 56, 64, 127, 128, 4096] {
+            assert!(TargetHeadMode::Tensor.tensor_cores(rows), "{rows}");
+        }
+    }
 
     #[test]
     fn spans_cover_every_row_count_without_a_fallback() {
