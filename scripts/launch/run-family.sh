@@ -105,17 +105,24 @@ esac
 # head (every compact measurement ran at checkpoint precision), prefix marks in the pool with a 64 GiB
 # host tier, the embedding in host RAM, 1 GiB of headroom, a 512 MiB graph budget with row buckets,
 # replay records in the prefill scratch, 128-row decode steps, the gb10 Spark schedule, the probed
-# bond split and the tensor-core W8A8 drafter (1,683,456 KV tokens beside 131,072-token requests, and
-# one 1,048,576-token request). auto lays the standard settings out with `cuteafd plan --layout` on the
-# coordinator GPU's free memory for CONCURRENCY sequences and MAX_CONTEXT_TOKENS, keeps them when that
-# pool holds one MAX_CONTEXT_TOKENS request and 65,536 tokens for each other sequence, and takes
-# compact when it cannot. GLM5_FLASH_PROFILE=rtx5090 names compact. A key the config sets keeps its
-# value: the profile fills in the others, and the launch notes each value it sets and each it keeps.
+# bond split, the tensor-core W8A8 drafter and the tensor-core target head past 8 rows (1,683,456 KV
+# tokens beside 131,072-token requests, and one 1,048,576-token request). auto lays the standard
+# settings out with `cuteafd plan --layout` on the coordinator GPU's free memory for CONCURRENCY
+# sequences and MAX_CONTEXT_TOKENS, keeps them when that pool holds one MAX_CONTEXT_TOKENS request and
+# 65,536 tokens for each other sequence, and takes compact when it cannot. GLM5_FLASH_PROFILE=rtx5090
+# names compact. A key the config sets keeps its value: the profile fills in the others (the BF16 KDA
+# state and the tensor-core target head only over the BF16 KDA projections and head they run on), and
+# the launch notes each value it sets, keeps or leaves unset.
 glmf_compact=(GLM5_FLASH_KDA_FP8=off GLM5_FLASH_FP8_HEAD=off GLM5_FLASH_FP8_PREFILL=off GLM5_FLASH_INDEX_CACHE=compact
   GLM5_FLASH_KDA_STATE=bf16 GLM5_FLASH_PREFIX_MARKS=pool HOST_CACHE_BYTES=64GiB EMBEDDING=host GLM5_FLASH_HEADROOM_GIB=1
   GLM5_FLASH_GRAPH_BUDGET_MIB=512 GLM5_FLASH_DECODE_ROW_BUCKETS=on GLM5_FLASH_REPLAY_RECORDS=shared
   GLM5_FLASH_DECODE_ROWS=128 GLM5_FLASH_EXL3_SCHEDULE=gb10 GLM5_FLASH_EXL3_WORKER_PATH=async RDMA_BOND_BALANCE=probe
-  GLM5_FLASH_DRAFT_HEAD=tensor GLM5_FLASH_DRAFT_LINEAR=w8a8)
+  GLM5_FLASH_DRAFT_HEAD=tensor GLM5_FLASH_DRAFT_LINEAR=w8a8 GLM5_FLASH_TARGET_HEAD=tensor)
+# KEY=VALUE of a GLM 5.3 Flash precision key as the config sets it, under its current or pre-rename name.
+glmf_configured() {
+  local old="GLMF_${1#GLM5_FLASH_}"
+  if [[ -n "${cfg[$1]:-}" ]]; then printf '%s=%s' "$1" "${cfg[$1]}"; else printf '%s=%s' "$old" "${cfg[$old]:-}"; fi
+}
 glmf_memory="$(get GLM5_FLASH_MEMORY)"
 glmf_profile="$(get GLM5_FLASH_PROFILE)"
 if [[ -n "$glmf_memory$glmf_profile" && "$family" != glm5_flash ]]; then
@@ -149,6 +156,12 @@ if [[ "$glmf_memory" == compact ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact keeps $glmf_key=${cfg[$glmf_key]} as configured (compact: $glmf_value)" >&2
     elif [[ -n "$glmf_old" && -n "${cfg[$glmf_old]:-}" ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact keeps $glmf_old=${cfg[$glmf_old]} as configured (compact: $glmf_key=$glmf_value)" >&2
+    elif [[ "$glmf_key" == GLM5_FLASH_KDA_STATE && "$(glmf_configured GLM5_FLASH_KDA_FP8)" != *=off ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the BF16 state runs over the" \
+        "BF16 KDA projections, and the config keeps $(glmf_configured GLM5_FLASH_KDA_FP8)" >&2
+    elif [[ "$glmf_key" == GLM5_FLASH_TARGET_HEAD && "$(glmf_configured GLM5_FLASH_FP8_HEAD)" != *=off ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the tensor-core target head" \
+        "runs the BF16 head, and the config keeps $(glmf_configured GLM5_FLASH_FP8_HEAD)" >&2
     else
       cfg[$glmf_key]="$glmf_value"
       echo "note: GLM5_FLASH_MEMORY=compact sets $glmf_key=$glmf_value" >&2

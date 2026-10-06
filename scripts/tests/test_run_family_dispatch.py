@@ -1482,11 +1482,12 @@ _GLMF_PROFILE_KEYS = ("GLM5_FLASH_INDEX_CACHE=compact\nGLM5_FLASH_KDA_STATE=bf16
                       "GLM5_FLASH_HEADROOM_GIB=1\nGLM5_FLASH_GRAPH_BUDGET_MIB=512\nEMBEDDING=host\n"
                       "GLM5_FLASH_REPLAY_RECORDS=shared\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\nHOST_CACHE_BYTES=64GiB\n"
                       "GLM5_FLASH_DECODE_ROWS=128\nGLM5_FLASH_EXL3_SCHEDULE=gb10\nRDMA_BOND_BALANCE=probe\n"
-                      "GLM5_FLASH_EXL3_WORKER_PATH=async\nGLM5_FLASH_DRAFT_HEAD=tensor\nGLM5_FLASH_DRAFT_LINEAR=w8a8\n")
+                      "GLM5_FLASH_EXL3_WORKER_PATH=async\nGLM5_FLASH_DRAFT_HEAD=tensor\nGLM5_FLASH_DRAFT_LINEAR=w8a8\n"
+                      "GLM5_FLASH_TARGET_HEAD=tensor\n")
 _GLMF_MODELS = ("zai-org/GLM-5.3-Flash", "incoai/GLM-5.3-Flash-DFlash2")
 _HUB = "/root/.cache/huggingface/hub"
-# The measured profile's serve-glmf command line (1 RTX 5090 + 4 DGX Sparks, 131,072 tokens), with
-# this fixture's snapshots and its one Spark rank.
+# The measured profile's serve-glmf command line (1 RTX 5090 + 4 DGX Sparks, 131,072 tokens, with the
+# tensor-core target head), with this fixture's snapshots and its one Spark rank.
 _GLMF_PROFILE_COMMAND = [
     "--snapshot", f"{_HUB}/models--test--glmf/snapshots/abc", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
     "--peers", "10.0.0.1:19495", "--listen", "0.0.0.0:8400", "--max-sequences", "16", "--max-context", "131072",
@@ -1496,7 +1497,8 @@ _GLMF_PROFILE_COMMAND = [
     "--headroom-gib", "1", "--graph-budget-mib", "512", "--index-cache", "compact", "--fp8-head", "false",
     "--fp8-prefill", "none", "--prefix-marks", "pool", "--kda-state", "bf16", "--decode-rows", "128",
     "--replay-records", "shared", "--decode-row-buckets", "--draft-head", "tensor", "--draft-linear", "w8a8",
-    "--draft", f"{_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc", "--model-id", "glm-5.3-flash"]
+    "--target-head", "tensor", "--draft", f"{_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc",
+    "--model-id", "glm-5.3-flash"]
 
 
 def _glmf_launch(tmp_path: Path, keys: str, **options) -> subprocess.CompletedProcess[str]:
@@ -1534,8 +1536,8 @@ def test_glmf_compact_reproduces_the_measured_profile_command(tmp_path, switch):
     assert serve[serve.index("serve-glmf") + 1:] == _GLMF_PROFILE_COMMAND
     assert "-e CUTEAFD_RDMA_BOND_BALANCE=probe" in coordinator
     assert "--exl3-schedule gb10" in workers[0] and "CUTEAFD_EXL3_WORKER_PATH" not in workers[0]
-    # The base configuration already sets the three precision keys; the profile sets the other fifteen.
-    assert len([n for n in notes if " sets " in n]) == 15, notes
+    # The base configuration already sets the three precision keys; the profile sets the other sixteen.
+    assert len([n for n in notes if " sets " in n]) == 16, notes
     assert len([n for n in notes if " keeps " in n]) == 3, notes
     assert "note: GLM5_FLASH_MEMORY=compact keeps GLM5_FLASH_KDA_FP8=off as configured (compact: off)" in notes
 
@@ -1566,6 +1568,9 @@ def test_glmf_compact_fills_in_only_what_the_config_leaves_unset(tmp_path):
     assert ("note: GLM5_FLASH_MEMORY=compact keeps GLMF_FP8_HEAD=on as configured (compact: GLM5_FLASH_FP8_HEAD=off)"
             in notes)
     assert "note: GLM5_FLASH_MEMORY=compact keeps EMBEDDING=gpu as configured (compact: host)" in notes
+    # The tensor-core target head runs the BF16 head: with the FP8 head kept, compact leaves it out.
+    assert ("note: GLM5_FLASH_MEMORY=compact leaves GLM5_FLASH_TARGET_HEAD unset (compact: tensor): the tensor-core "
+            "target head runs the BF16 head, and the config keeps GLMF_FP8_HEAD=on") in notes
     for setting in ("GLM5_FLASH_KDA_FP8=off", "GLM5_FLASH_FP8_PREFILL=off", "GLM5_FLASH_INDEX_CACHE=compact",
                     "GLM5_FLASH_KDA_STATE=bf16", "GLM5_FLASH_PREFIX_MARKS=pool", "HOST_CACHE_BYTES=64GiB",
                     "GLM5_FLASH_HEADROOM_GIB=1", "GLM5_FLASH_GRAPH_BUDGET_MIB=512", "GLM5_FLASH_DECODE_ROW_BUCKETS=on",
@@ -1573,8 +1578,8 @@ def test_glmf_compact_fills_in_only_what_the_config_leaves_unset(tmp_path):
                     "GLM5_FLASH_EXL3_WORKER_PATH=async", "RDMA_BOND_BALANCE=probe", "GLM5_FLASH_DRAFT_HEAD=tensor",
                     "GLM5_FLASH_DRAFT_LINEAR=w8a8"):
         assert f"note: GLM5_FLASH_MEMORY=compact sets {setting}" in notes, setting
-    assert len(notes) == 18, notes
-    assert "--decode-rows" not in coordinator and "--fp8-head true" in coordinator
+    assert len(notes) == 19, notes
+    assert "--decode-rows" not in coordinator and "--fp8-head true" in coordinator and "--target-head" not in coordinator
     assert "--embedding-placement gpu" in coordinator and "--kda-fp8 off" in coordinator
     assert "--index-cache compact" in coordinator and "--kda-state bf16" in coordinator
     # The command line's --embedding-placement is explicit too.
@@ -1640,7 +1645,7 @@ def test_glmf_auto_takes_compact_when_standard_cannot_hold_one_request_and_64k_p
         assert len(notes) == 1 and "--index-cache" not in coordinator
     else:
         assert notes[1] == "note: GLM5_FLASH_MEMORY=auto runs compact, as planned"
-        assert len([n for n in notes if " sets " in n]) == 15
+        assert len([n for n in notes if " sets " in n]) == 16
         assert serve[serve.index("serve-glmf") + 1:] == _GLMF_PROFILE_COMMAND
 
 
@@ -1733,6 +1738,20 @@ def test_glmf_auto_plans_a_wip_slot_with_its_own_planner_and_programs(tmp_path):
     assert ":/opt/cuteafd-plan:ro --entrypoint /opt/cuteafd-plan/cuteafd dev-image plan " in plan
     assert "--workspace-manifest /opt/cuteafd-plan/PROGRAMS.json" in plan
     assert "note: GLM5_FLASH_MEMORY=auto keeps standard" in result.stderr
+
+
+@pytest.mark.parametrize("kept", ["GLM5_FLASH_KDA_FP8=row128", "GLMF_KDA_FP8=channel", "GLM5_FLASH_KDA_FP8=auto"])
+def test_glmf_compact_leaves_the_bf16_state_to_bf16_kda_projections(tmp_path, kept):
+    """FP8 KDA projections the config keeps have no BF16-state programs: compact leaves the state FP32 (and
+    sets the rest, the tensor-core target head over its BF16 head included)."""
+    result = _glmf_launch(tmp_path, f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_MEMORY=compact\n{kept}\n")
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    assert (f"note: GLM5_FLASH_MEMORY=compact leaves GLM5_FLASH_KDA_STATE unset (compact: bf16): the BF16 state runs "
+            f"over the BF16 KDA projections, and the config keeps {kept}") in notes
+    assert "--kda-state" not in coordinator and "--target-head tensor" in coordinator
+    assert f"--kda-fp8 {'row128' if kept.endswith('auto') else kept.split('=')[1]}" in coordinator
+    assert len([n for n in notes if " sets " in n]) == 17
 
 
 @pytest.mark.parametrize("allocations,used,free_mib", [

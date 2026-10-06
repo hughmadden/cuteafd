@@ -199,8 +199,9 @@ names `compact`.
   `GLM5_FLASH_GRAPH_BUDGET_MIB=512` with `GLM5_FLASH_DECODE_ROW_BUCKETS=on`,
   `GLM5_FLASH_REPLAY_RECORDS=shared`, `GLM5_FLASH_DECODE_ROWS=128`,
   `GLM5_FLASH_EXL3_SCHEDULE=gb10`, `GLM5_FLASH_EXL3_WORKER_PATH=async`,
-  `RDMA_BOND_BALANCE=probe`, `GLM5_FLASH_DRAFT_HEAD=tensor` and
-  `GLM5_FLASH_DRAFT_LINEAR=w8a8`. It admitted 1,683,456 KV tokens beside
+  `RDMA_BOND_BALANCE=probe`, `GLM5_FLASH_DRAFT_HEAD=tensor`,
+  `GLM5_FLASH_DRAFT_LINEAR=w8a8` and `GLM5_FLASH_TARGET_HEAD=tensor` (KL gate
+  against `exact`: −7e-8 nats, no top-1 flips). It admitted 1,683,456 KV tokens beside
   131,072-token requests (1,676,288 with the 1,048,576-token extent) and serves
   one 1,048,576-token request. It needs one GPU, Spark experts and an automatic
   pool.
@@ -215,7 +216,9 @@ names `compact`.
   planned, 16 sequences of 131,072 tokens take `compact` on an RTX 5090 and
   `standard` on an RTX PRO 6000. A head split or local experts keep `standard`.
 - A key the configuration sets keeps its value; the profile fills in the
-  others and the launch notes each value it sets and each it keeps.
+  others and the launch notes each value it sets and each it keeps. The BF16
+  KDA state and the tensor-core target head run over the BF16 KDA projections
+  and head: with FP8 ones kept, compact leaves them unset and says so.
 
 `cuteafd plan --layout` takes serve-glmf's memory flags under their own names
 (`--index-cache`, `--kda-state`, `--kda-fp8`, `--fp8-head`, `--prefix-marks`,
