@@ -722,8 +722,12 @@ Policy decisions:
   the engine keeps copy-source token 1103 at every full-index layer after
   physical-cache-slot IDs are mapped to logical positions. Late selected
   sets overlap the reference by about 94.5-97.2% (c03: 97.4-98.5%);
-  selection drift is within about 5.5%, not a copy-source drop. A forced
-  layer-50 attention check cannot be reconstructed from current dumps:
+  selection drift is within about 5.5%, not a copy-source drop. A quant-ladder
+  lead: the EXL3 K4 package stores indexer wq_b/wk as FP8 E4M3, versus BF16
+  in the official checkpoint (weights_proj is BF16 in both). Queued, not
+  run: repack those indexer weights in BF16, rescore d03/d04/a25 and
+  controls, and compare context KL. A forced layer-50 attention check
+  cannot be reconstructed from current dumps:
   per-layer K/V history and the MLA query/cache were not saved. Quantization
   amplification is a hypothesis, not an engine-correctness verdict; no
   further hardware run is scheduled. This open finding does not block
