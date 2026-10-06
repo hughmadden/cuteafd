@@ -568,6 +568,37 @@ def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,context", [("", "8192"), ("MAX_CONTEXT_TOKENS=131072\n", "131072"),
+                                          ("MAX_CONTEXT_TOKENS=1048576\n", "1048576")])
+def test_glmf_max_context_reaches_the_engine_up_to_1m(tmp_path, keys, context):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--max-context {context} " in launch and launch.count("--max-context") == 1, launch
+
+
+@pytest.mark.parametrize("value", ["1048577", "0", "2097152", "12345678901234567890", "1m"])
+def test_glmf_max_context_past_1m_fails_before_launch(tmp_path, value):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nMAX_CONTEXT_TOKENS={value}\n")
+    assert result.returncode == 2 and "MAX_CONTEXT_TOKENS must be 1 to 1048576" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,note", [
+    ("MAX_CONTEXT_TOKENS=1048576\nGLM5_FLASH_PREFIX_MARKS=pool\n", True),
+    ("MAX_CONTEXT_TOKENS=1048576\nHOST_CACHE_BYTES=auto\n", True),
+    ("MAX_CONTEXT_TOKENS=1048576\nGLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", False),
+    ("MAX_CONTEXT_TOKENS=131072\nGLM5_FLASH_PREFIX_MARKS=pool\n", False),
+])
+def test_glmf_1m_context_notes_an_automatic_host_tier(tmp_path, keys, note):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    assert ("note: HOST_CACHE_BYTES=auto sizes the RAM tier" in result.stderr) == note, result.stderr
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()
