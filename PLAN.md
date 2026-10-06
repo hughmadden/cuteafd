@@ -801,6 +801,16 @@ Work, in priority order:
    on GPU0 + 4 Sparks completed full fidelity scoring over RDMA. All of its
    dump files were owned by uid 1000, and its decode results were identical
    to the root-run baseline.
+   **V4 Flash decode differs between launches (2026-10-06, fidelity):** two
+   launches of the same config with identical settings (GPU0 + 2 Sparks,
+   TP2, release native, `--full-prefill-logits`) scored the 17,401-position
+   decode-shaped panel at 96.552% and 96.937% top-1: 67 net agreements,
+   hundreds of per-position flips. MiMo Flash, GLM Flash and Qwen repeat
+   their aggregates exactly under the same harness. The DSA index top-k is
+   already deterministic (315b821). Suspects: atomic or unordered
+   accumulation in V4 expert combine or exchange, and launch-time kernel or
+   split choices. This widens paired precision noise for V4 Flash and
+   blocks byte-exact speculation there.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
