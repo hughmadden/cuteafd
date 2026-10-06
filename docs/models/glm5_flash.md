@@ -53,8 +53,9 @@ Attention (KDA), a minority run MLA + DSA.
 - Spark EXL3 decode schedule: `GLM5_FLASH_EXL3_SCHEDULE=gb10`
   (`expertd-native --exl3-schedule gb10`, opt-in) runs the TP4 decode exports
   `m1-gb10` and `m80-gb10`: the default exports' products and sums, so the
-  same bits, with the weight words staged L2 evict-first and every tile's
-  first weight K tiles prefetched into L2 (the b12x `gb10` decode schedule).
+  same bits, with the weight words staged L2 evict-first (the b12x `gb10`
+  decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
+  an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 - Context: the DSA index top-k is the one program with an extent compiled in
