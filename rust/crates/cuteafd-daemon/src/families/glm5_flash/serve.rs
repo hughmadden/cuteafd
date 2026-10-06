@@ -496,7 +496,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
     let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
-    let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
+    let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {

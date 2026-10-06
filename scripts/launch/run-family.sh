@@ -593,6 +593,16 @@ if [[ $family == glm5_flash ]]; then
     partials) ;;
     *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_INDEX_CACHE: the DSA index cache, keys (default: every token's BF16 key | gate
+  # row beside its latent record, 11,804 B per token) or compact (the pooled keys plus each
+  # sequence's open pool, 6,172 B per token, the same pooled keys bit for bit; one GPU only,
+  # a head split keeps keys).
+  index_cache="$(get GLM5_FLASH_INDEX_CACHE keys)"
+  case "$index_cache" in
+    ""|keys) ;;
+    compact) family_args+=(--index-cache compact) ;;
+    *) echo "GLM5_FLASH_INDEX_CACHE must be keys or compact" >&2; exit 2 ;;
+  esac
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
