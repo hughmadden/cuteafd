@@ -14,11 +14,13 @@ pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
 pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
 pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
 pub const QWEN_CONFIG: &str = "qwen4-v2_20261005_fp8";
+pub const V4FLASH_REVISION: &str = "de92b14a7dabecd4d5dd4f7c799920842a5c3834";
+pub const V4FLASH_CONFIG: &str = "deepseek_v4-v2_20261005_v4flash";
 
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"] {
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash-0731"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
             suffix.starts_with('-') && !suffix.to_ascii_lowercase().contains("speculator")
                 && !suffix.to_ascii_lowercase().contains("dflash")) {
@@ -36,6 +38,7 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
     match base_model(model) {
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
         Some("GLM-5.3-Flash") => return Some((GLMF_REVISION, GLMF_CONFIG)),
+        Some("DeepSeek-V4-Flash-0731") => return Some((V4FLASH_REVISION, V4FLASH_CONFIG)),
         _ => {},
     }
     match model {

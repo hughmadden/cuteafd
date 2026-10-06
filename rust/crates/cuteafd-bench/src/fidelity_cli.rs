@@ -346,6 +346,38 @@ mod tests {
     }
 
     #[test]
+    fn v4_flash_publication_default_matches_the_pinned_base_and_quants() {
+        let model = "deepseek-ai/DeepSeek-V4-Flash-0731";
+        let full = parse(&["--tier", "full"]);
+        assert_eq!(dataset_source(&full, model).unwrap(),
+            Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::V4FLASH_REVISION,
+                crate::fidelity_dataset::V4FLASH_CONFIG)));
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        for local_flag in ["--reference", "--rows"] {
+            assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
+        }
+        for quant in ["wrldsuksgo2mars/DeepSeek-V4-Flash-0731-EXL3-K2-calibrated-v1",
+            "wrldsuksgo2mars--DeepSeek-V4-Flash-0731-EXL3-K2-calibrated-v1",
+            "wrldsuksgo2mars/DeepSeek-V4-Flash-0731-NVFP4-v1"] {
+            assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
+        }
+        for other in ["deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Pro-0731",
+            "deepseek-ai/DeepSeek-V4.1-Flashlight", "deepseek-ai/DeepSeek-V4-Flash-07310",
+            "RedHatAI/DeepSeek-V4-Flash-0731-speculator", "other/DeepSeek-V4-Flash-0731-DFlash2"] {
+            assert!(dataset_source(&full, other).is_err(), "{other}");
+        }
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset", "other/repo"]), model).is_err());
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset-config", "other-config"]), model).is_err());
+        let reference: Reference = serde_json::from_value(json!({"name":"test", "models":[model],
+            "checkpoint":model, "vocab":129280, "expect":{"top1_min":0.94,"kl_max":0.04}})).unwrap();
+        let quant = "wrldsuksgo2mars/DeepSeek-V4-Flash-0731-EXL3-K2-calibrated-v1";
+        assert!(validate_served_reference(&reference, quant, true).is_ok());
+        assert!(validate_served_reference(&reference, quant, false).is_err());
+        assert!(validate_served_reference(&reference, "deepseek-ai/DeepSeek-V4-Pro-0731", true).is_err());
+        assert!(validate_served_reference(&reference, "deepseek-ai/DeepSeek-V4.1-Flash", true).is_err());
+    }
+
+    #[test]
     fn published_model_level_reference_accepts_quants_but_local_sources_remain_exact() {
         let qwen: Reference = serde_json::from_value(json!({"name":"test", "models":["Qwen/Qwen3.8-Flash-Next-FP8"],
             "checkpoint":"Qwen/Qwen3.8-Flash-Next-FP8", "vocab":248320,
