@@ -237,6 +237,14 @@ pub(crate) struct EngineArgs {
     /// FP8 head (--fp8-head) runs its own program either way.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_HEAD", default_value = "exact")]
     pub draft_head: crate::families::glm5::DraftHead,
+    /// The FP8 drafter's GEMMs (DFlash2 and dSpark): `w8a16` (default: BF16 activations, exact
+    /// in f16, on the W8A16 GEMV in passes of 64 rows), `wide` (the same bits in passes of 128
+    /// rows: one read of the weights at 16 sequences), or `w8a8`: one draft block (8 rows) as
+    /// `w8a16`, more as E4M3 activations per row and 128-wide K block (amax / 448) on FP8 tensor
+    /// cores, half the MMAs, in passes of 128 rows. Drafts only: the target verifies every
+    /// proposal. The BF16 drafter (--draft-fp8 false) ignores it.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_LINEAR", default_value = "w8a16")]
+    pub draft_linear: crate::shared::fp8_linear::Fp8Rows,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
     /// projections, LM head, drafter): amax / 448, the smallest power of two
     /// >= it (pow2), or per block whichever of the two leaves the smaller
@@ -300,6 +308,17 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn draft_linear_defaults_to_w8a16_and_takes_wide_and_w8a8() {
+        use crate::shared::fp8_linear::Fp8Rows;
+        assert_eq!(parse(&[]).draft_linear, Fp8Rows::W8a16);
+        for (value, mode) in [("w8a16", Fp8Rows::W8a16), ("wide", Fp8Rows::Wide), ("w8a8", Fp8Rows::W8a8)] {
+            assert_eq!(parse(&["--draft-linear", value]).draft_linear, mode);
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-linear", "w4a16"]).is_err());
+    }
+
+    #[test]
     fn draft_head_defaults_to_exact_and_takes_tensor() {
         use crate::families::glm5::DraftHead;
         assert_eq!(parse(&[]).draft_head, DraftHead::Exact);
@@ -326,8 +345,9 @@ mod draft_cli_tests {
         assert_eq!(defaults.decode_rows, engine::DECODE_ROWS);
         // The replay records keep their own allocation.
         assert_eq!(defaults.replay_records, engine::ReplayRecords::Own);
-        // The drafter's head runs as the target's.
+        // The drafter's head runs as the target's, its FP8 GEMMs on the W8A16 GEMV.
         assert_eq!(defaults.draft_head, crate::families::glm5::DraftHead::Exact);
+        assert_eq!(defaults.draft_linear, crate::shared::fp8_linear::Fp8Rows::W8a16);
         assert!(wide_decode_programs(&defaults, false).is_empty() && wide_decode_programs(&defaults, true).is_empty());
         check_options(&defaults).unwrap();
     }
@@ -1141,10 +1161,11 @@ impl Opened {
             ::from_fp8_option(args.draft_fp8);
         let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales)?;
+            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
+            args.draft_linear)?;
         drafter.set_draft_head(args.draft_head);
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
-            "{} drafter resident", drafter.name());
+            draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());
         Ok(Some(drafter))
     }
 

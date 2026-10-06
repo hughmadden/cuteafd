@@ -348,6 +348,8 @@ pub(crate) struct GlmDrafter<'a> {
     /// How the borrowed BF16 head runs past one draft block ([`super::DraftHead`]; GLM 5.3
     /// Flash's --draft-head). [`super::DraftHead::Exact`] unless the target sets it.
     head_mode: Cell<super::DraftHead>,
+    /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear; the FP8 scratch serves it).
+    fp8_rows: Cell<fp8_linear::Fp8Rows>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -474,11 +476,11 @@ impl<'a> GlmDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the target embedding of
-    /// the mask token.
+    /// the mask token. `fp8_rows` is how the FP8 GEMMs run.
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
-        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
@@ -504,7 +506,7 @@ impl<'a> GlmDrafter<'a> {
         let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
             let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
-            fp8_linear::scratch(library, scratch.rows, &shapes)
+            fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)
         }).transpose()?;
         let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
@@ -592,6 +594,7 @@ impl<'a> GlmDrafter<'a> {
             representation,
             fp8_workspace,
             head_mode: Cell::new(super::DraftHead::Exact),
+            fp8_rows: Cell::new(fp8_rows),
             cfg,
         })
     }
@@ -619,8 +622,10 @@ impl<'a> GlmDrafter<'a> {
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
                 // SAFETY: scratch covers every selected matrix and up to
-                // max(TAP_ROWS, max_batch_sequences*block) input rows.
-                unsafe { w.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) }
+                // max(TAP_ROWS, max_batch_sequences*block) input rows in this
+                // mode (the load sized it for its mode).
+                unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
+                    self.fp8_rows.get()) }
             }
         }
     }

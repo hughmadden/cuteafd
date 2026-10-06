@@ -10,6 +10,17 @@
 // scaled by a power of two into f16 range (exact within it) and packed in
 // B-fragment order once per call. Rows beyond 64 run in chunks of 64.
 // Split-K (a deterministic second pass) keeps narrow outputs busy.
+//
+// cuteafd_fp8_linear adds two modes over the same packed weights (GLM 5.3
+// Flash's drafters, --draft-linear): `wide` runs chunks of 128 rows, the same
+// bits as chunks of 64 (every output element's MMA and sum order is its own)
+// with one pass over the weights and one launch chain where 64-row chunks take
+// two; `w8a8` also takes E4M3 activations past 8 rows (per row and 128-wide K
+// block, amax / 448, the checkpoint's dynamic scheme) on mma.m16n8k32: half
+// the MMAs of the f16 path at twice the rate. Its B fragments follow the
+// packed weights' K order, so the weights are read as packed: a lane's 16
+// bytes of a 16 x 32 tile hold k c, c + 1, c + 8, c + 9 (+16) of rows g and
+// g + 8, which byte permutes turn into the k32 A fragment of the same K order.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -20,6 +31,10 @@ namespace {
 
 constexpr int kWarps = 4;
 constexpr int kMaxRows = 64;
+// Rows per pass of the wide and W8A8 modes.
+constexpr int kWideRows = 128;
+// Most rows the W8A8 mode keeps on the W8A16 path (one draft block).
+constexpr int kW8a16Rows = 8;
 
 // Smallest power of two >= x (x > 0).
 __device__ __forceinline__ float pow2_ceil(float x) {
@@ -110,8 +125,10 @@ __global__ void pack_kernel(const __nv_bfloat16* __restrict__ w, uint8_t* __rest
 }
 
 // Per activation row: a power of two that brings its absolute maximum to at
-// most 2^14 (f16 holds it exactly), and its inverse for the output.
-__global__ void row_scale_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ sx, int rows, int k) {
+// most 2^14 (f16 holds it exactly), and its inverse for the output (at
+// sx[stride + m], stride the pass's row capacity).
+__global__ void row_scale_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ sx, int rows, int k,
+                                 int stride) {
   const int m = blockIdx.x;
   float amax = 0.0f;
   if (m < rows) {
@@ -127,7 +144,7 @@ __global__ void row_scale_kernel(const __nv_bfloat16* __restrict__ x, float* __r
     // amax * s <= 2^14; a zero (or padding) row keeps 1.
     const float s = amax > 0.0f ? 16384.0f / pow2_ceil(amax) : 1.0f;
     sx[m] = s;
-    sx[kMaxRows + m] = 1.0f / s;
+    sx[stride + m] = 1.0f / s;
   }
 }
 
@@ -180,7 +197,7 @@ template <int GROUPS>
 __global__ void __launch_bounds__(kWarps * 32) gemv_kernel(
     const uint4* __restrict__ wp, const float* __restrict__ scale, const uint4* __restrict__ xp,
     const float* __restrict__ sx, void* __restrict__ out, float* __restrict__ partial, int out_f32, int rows, int n,
-    int k, int kb_per_split, int splits) {
+    int k, int kb_per_split, int splits, int stride) {
   const int lane = threadIdx.x & 31;
   const int warp = blockIdx.x * kWarps + threadIdx.x / 32;
   const int tiles = n / 16;
@@ -248,7 +265,7 @@ __global__ void __launch_bounds__(kWarps * 32) gemv_kernel(
       if (splits > 1) {
         partial[(size_t(split) * rows + m) * n + col] = acc[i][j];
       } else {
-        const float v = acc[i][j] * sx[kMaxRows + m];
+        const float v = acc[i][j] * sx[stride + m];
         if (out_f32) {
           static_cast<float*>(out)[size_t(m) * n + col] = v;
         } else {
@@ -259,17 +276,157 @@ __global__ void __launch_bounds__(kWarps * 32) gemv_kernel(
   }
 }
 
-__global__ void reduce_kernel(const float* __restrict__ partial, const float* __restrict__ sx, void* __restrict__ out,
-                              int out_f32, int rows, int n, int splits) {
+// Sums the K splits in split order; `inverse` (per row; null for W8A8, whose
+// partials are scaled) undoes the activations' power-of-two scale.
+__global__ void reduce_kernel(const float* __restrict__ partial, const float* __restrict__ inverse,
+                              void* __restrict__ out, int out_f32, int rows, int n, int splits) {
   const size_t total = size_t(rows) * n;
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
     float v = 0.0f;
     for (int s = 0; s < splits; ++s) v += partial[size_t(s) * total + i];
-    v *= sx[kMaxRows + int(i / n)];
+    if (inverse) v *= inverse[int(i / n)];
     if (out_f32) {
       static_cast<float*>(out)[i] = v;
     } else {
       static_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16(v);
+    }
+  }
+}
+
+// Four floats to E4M3 (round to nearest, saturating), first in the low byte.
+__device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
+  const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+  return lo | (hi << 16);
+}
+
+// W8A8 activations: per row and 128-wide K block, E4M3 at amax / 448 (1 for a
+// zero block) in mma.m16n8k32 B-fragment order under the packed weights' K
+// order: per 32-wide k tile and 8-row group, 32 lanes x 8 bytes, lane l (row
+// group * 8 + l / 4, c = 2 (l % 4)) holding k c, c + 1, c + 8, c + 9, then the
+// same + 16. Scales go to sxa [k / 128][stride] (padding rows: 1). One warp per
+// (128-wide K block, 8-row group); the four lanes of a row hold its 128 values.
+__global__ void pack_x_e4m3_kernel(const __nv_bfloat16* __restrict__ x, uint2* __restrict__ xq,
+                                   float* __restrict__ sxa, int rows, int k, int groups, int stride) {
+  const int kb = blockIdx.x, group = blockIdx.y, lane = threadIdx.x;
+  const int m = group * 8 + lane / 4, c = (lane % 4) * 2;
+  float v[4][8];
+  float amax = 0.0f;
+#pragma unroll
+  for (int kt = 0; kt < 4; ++kt) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      float lo = 0.0f, hi = 0.0f;
+      if (m < rows) {
+        const __nv_bfloat162 pair =
+            *reinterpret_cast<const __nv_bfloat162*>(x + size_t(m) * k + kb * 128 + kt * 32 + c + 8 * p);
+        lo = __low2float(pair);
+        hi = __high2float(pair);
+      }
+      v[kt][2 * p] = lo;
+      v[kt][2 * p + 1] = hi;
+      amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
+    }
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  const float s = amax > 0.0f ? amax / 448.0f : 1.0f;
+  if (lane % 4 == 0) sxa[size_t(kb) * stride + m] = s;
+#pragma unroll
+  for (int kt = 0; kt < 4; ++kt) {
+    uint2 q;
+    q.x = e4m3x4(v[kt][0] / s, v[kt][1] / s, v[kt][2] / s, v[kt][3] / s);
+    q.y = e4m3x4(v[kt][4] / s, v[kt][5] / s, v[kt][6] / s, v[kt][7] / s);
+    xq[(size_t(kb * 4 + kt) * groups + group) * 32 + lane] = q;
+  }
+}
+
+__device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// gemv_kernel with E4M3 activations: one m16n8k32 per k tile and group, the
+// A fragment (row g: k c, c + 1, c + 8, c + 9 | +16; row g + 8 the same)
+// permuted from the packed bytes. Each 128-wide K block's sums take the weight
+// row's and the activation row's scales before they join the FP32 total.
+template <int GROUPS>
+__global__ void __launch_bounds__(kWarps * 32) gemv_w8a8_kernel(
+    const uint4* __restrict__ wp, const float* __restrict__ scale, const uint2* __restrict__ xq,
+    const float* __restrict__ sxa, void* __restrict__ out, float* __restrict__ partial, int out_f32, int rows, int n,
+    int k, int kb_per_split, int splits, int stride) {
+  const int lane = threadIdx.x & 31;
+  const int warp = blockIdx.x * kWarps + threadIdx.x / 32;
+  const int tiles = n / 16;
+  if (warp >= tiles * splits) return;
+  const int rt = warp % tiles, split = warp / tiles;
+  const int kbs = k / 128;
+  const int kb0 = split * kb_per_split, kb1 = min(kbs, kb0 + kb_per_split);
+  const int g = lane / 4, c = (lane % 4) * 2;
+  float acc[GROUPS][4];
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+  const uint4* wrow = wp + size_t(rt) * (k / 32) * 32 + lane;
+  const float* s_lo = scale + size_t(rt * 16 + g) * kbs;
+  const float* s_hi = scale + size_t(rt * 16 + g + 8) * kbs;
+  uint4 a[4];
+  if (kb0 < kb1) {
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) a[kt] = load_stream(wrow + size_t(kb0 * 4 + kt) * 32);
+  }
+  for (int kb = kb0; kb < kb1; ++kb) {
+    uint4 next[4];
+    if (kb + 1 < kb1) {
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) next[kt] = load_stream(wrow + size_t((kb + 1) * 4 + kt) * 32);
+    }
+    float blk[GROUPS][4];
+#pragma unroll
+    for (int i = 0; i < GROUPS; ++i) blk[i][0] = blk[i][1] = blk[i][2] = blk[i][3] = 0.0f;
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) {
+      const uint32_t af[4] = {__byte_perm(a[kt].x, a[kt].y, 0x5410), __byte_perm(a[kt].x, a[kt].y, 0x7632),
+                              __byte_perm(a[kt].z, a[kt].w, 0x5410), __byte_perm(a[kt].z, a[kt].w, 0x7632)};
+      const uint2* b = xq + (size_t(kb * 4 + kt) * GROUPS) * 32 + lane;
+#pragma unroll
+      for (int i = 0; i < GROUPS; ++i) {
+        const uint2 bv = __ldg(b + i * 32);
+        mma_e4m3(blk[i], af, bv.x, bv.y);
+      }
+    }
+    const float lo = __ldg(s_lo + kb), hi = __ldg(s_hi + kb);
+    const float* sk = sxa + size_t(kb) * stride + c;
+#pragma unroll
+    for (int i = 0; i < GROUPS; ++i) {
+      const float2 sa = __ldg(reinterpret_cast<const float2*>(sk + i * 8));
+      acc[i][0] += blk[i][0] * (lo * sa.x);
+      acc[i][1] += blk[i][1] * (lo * sa.y);
+      acc[i][2] += blk[i][2] * (hi * sa.x);
+      acc[i][3] += blk[i][3] * (hi * sa.y);
+    }
+    if (kb + 1 < kb1) {
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) a[kt] = next[kt];
+    }
+  }
+  const int row_lo = rt * 16 + g, row_hi = row_lo + 8;
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int m = i * 8 + c + (j & 1);
+      const int col = j < 2 ? row_lo : row_hi;
+      if (m >= rows) continue;
+      if (splits > 1) {
+        partial[(size_t(split) * rows + m) * n + col] = acc[i][j];
+      } else if (out_f32) {
+        static_cast<float*>(out)[size_t(m) * n + col] = acc[i][j];
+      } else {
+        static_cast<__nv_bfloat16*>(out)[size_t(m) * n + col] = __float2bfloat16(acc[i][j]);
+      }
     }
   }
 }
@@ -295,6 +452,79 @@ void split_plan(int n, int k, int* kb_per_split, int* splits) {
 
 size_t align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 
+// Scratch of one call: the row scales and inverses (2 x chunk FP32), the f16
+// B fragments (k x chunk x 2 bytes; the E4M3 ones take its first half), with
+// W8A8 the activation scales ([k / 128][chunk] FP32), and the split partials.
+size_t layout_bytes(int rows, int k, int n, int chunk, bool w8a8) {
+  const int m = rows < chunk ? rows : chunk;
+  int kb_per_split, splits;
+  split_plan(n, k, &kb_per_split, &splits);
+  return align256(2 * size_t(chunk) * sizeof(float)) + align256(size_t(k) * chunk * 2) +
+         (w8a8 ? align256(size_t(k / 128) * chunk * sizeof(float)) : 0) +
+         (splits > 1 ? align256(size_t(splits) * m * n * sizeof(float)) : 0);
+}
+
+// out = x @ W^T in passes of `chunk` rows (64: the plain entry point; 128: the
+// wide and W8A8 modes), W8A8 for passes past kW8a16Rows rows when `w8a8`.
+int32_t run_linear(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32, int32_t rows,
+                   int32_t k, int32_t n, int chunk, bool w8a8, void* workspace, size_t workspace_bytes,
+                   void* stream) {
+  if (rows < 1 || n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
+  if (workspace_bytes < layout_bytes(rows, k, n, chunk, w8a8)) return cudaErrorInvalidValue;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  uint8_t* ws = static_cast<uint8_t*>(workspace);
+  float* sx = reinterpret_cast<float*>(ws);
+  uint8_t* fragments = ws + align256(2 * size_t(chunk) * sizeof(float));
+  uint4* xp = reinterpret_cast<uint4*>(fragments);
+  uint2* xq = reinterpret_cast<uint2*>(fragments);
+  float* sxa = reinterpret_cast<float*>(fragments + align256(size_t(k) * chunk * 2));
+  float* partial = reinterpret_cast<float*>(fragments + align256(size_t(k) * chunk * 2) +
+                                            (w8a8 ? align256(size_t(k / 128) * chunk * sizeof(float)) : 0));
+  int kb_per_split, splits;
+  split_plan(n, k, &kb_per_split, &splits);
+  const size_t out_row = size_t(n) * (out_f32 ? 4 : 2);
+  for (int first = 0; first < rows; first += chunk) {
+    const int m = rows - first < chunk ? rows - first : chunk;
+    const int groups = m <= 8 ? 1 : m <= 16 ? 2 : m <= 32 ? 4 : m <= 64 ? 8 : 16;
+    const __nv_bfloat16* xm = static_cast<const __nv_bfloat16*>(x) + size_t(first) * k;
+    void* om = static_cast<uint8_t*>(out) + size_t(first) * out_row;
+    const int warps = (n / 16) * splits;
+    const dim3 grid((warps + kWarps - 1) / kWarps), block(kWarps * 32);
+    const uint4* wp = static_cast<const uint4*>(packed);
+    const float* sc = static_cast<const float*>(scale);
+    const bool e4m3 = w8a8 && m > kW8a16Rows;
+    if (e4m3) {
+      pack_x_e4m3_kernel<<<dim3(k / 128, groups), 32, 0, s>>>(xm, xq, sxa, m, k, groups, chunk);
+      switch (groups) {
+        case 2: gemv_w8a8_kernel<2><<<grid, block, 0, s>>>(wp, sc, xq, sxa, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        case 4: gemv_w8a8_kernel<4><<<grid, block, 0, s>>>(wp, sc, xq, sxa, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        case 8: gemv_w8a8_kernel<8><<<grid, block, 0, s>>>(wp, sc, xq, sxa, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        default: gemv_w8a8_kernel<16><<<grid, block, 0, s>>>(wp, sc, xq, sxa, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+      }
+    } else {
+      row_scale_kernel<<<groups * 8, 256, 0, s>>>(xm, sx, m, k, chunk);
+      pack_x_kernel<<<dim3(k / 32, groups), 32, 0, s>>>(xm, sx, xp, m, k, groups);
+      switch (groups) {
+        case 1: gemv_kernel<1><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        case 2: gemv_kernel<2><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        case 4: gemv_kernel<4><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        case 8: gemv_kernel<8><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+        default: gemv_kernel<16><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits, chunk); break;
+      }
+    }
+    if (splits > 1) {
+      const size_t total = size_t(m) * n;
+      const int blocks = int((total + 255) / 256 < 4096 ? (total + 255) / 256 : 4096);
+      reduce_kernel<<<blocks, 256, 0, s>>>(partial, e4m3 ? nullptr : sx + chunk, om, out_f32, m, n, splits);
+    }
+  }
+  return cudaGetLastError();
+}
+
+// cuteafd_fp8_linear's modes and the rows of their passes.
+constexpr int kModePlain = 0, kModeWide = 1, kModeW8a8 = 2;
+constexpr int chunk_rows(int mode) { return mode == kModeWide || mode == kModeW8a8 ? kWideRows : kMaxRows; }
+
 }  // namespace
 
 // Packs a BF16 [n, k] weight (n % 16 == 0, k % 128 == 0) into `packed`
@@ -311,11 +541,7 @@ extern "C" int32_t cuteafd_fp8_w8a16_pack(const void* w, void* packed, void* sca
 // Scratch bytes cuteafd_fp8_w8a16_linear needs for these shapes.
 extern "C" size_t cuteafd_fp8_w8a16_workspace(int32_t rows, int32_t k, int32_t n) {
   if (n < 16 || k < 128) return 0;
-  const int chunk = rows < kMaxRows ? rows : kMaxRows;
-  int kb_per_split, splits;
-  split_plan(n, k, &kb_per_split, &splits);
-  return align256(2 * kMaxRows * sizeof(float)) + align256(size_t(k) * kMaxRows * 2) +
-         (splits > 1 ? align256(size_t(splits) * chunk * n * sizeof(float)) : 0);
+  return layout_bytes(rows, k, n, kMaxRows, false);
 }
 
 // out [rows, n] (BF16, or FP32 with out_f32) = x [rows, k] BF16 @ W^T for a
@@ -323,39 +549,22 @@ extern "C" size_t cuteafd_fp8_w8a16_workspace(int32_t rows, int32_t k, int32_t n
 extern "C" int32_t cuteafd_fp8_w8a16_linear(const void* x, const void* packed, const void* scale, void* out,
                                             int32_t out_f32, int32_t rows, int32_t k, int32_t n, void* workspace,
                                             size_t workspace_bytes, void* stream) {
-  if (rows < 1 || n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
-  if (workspace_bytes < cuteafd_fp8_w8a16_workspace(rows, k, n)) return cudaErrorInvalidValue;
-  const cudaStream_t s = static_cast<cudaStream_t>(stream);
-  uint8_t* ws = static_cast<uint8_t*>(workspace);
-  float* sx = reinterpret_cast<float*>(ws);
-  uint4* xp = reinterpret_cast<uint4*>(ws + align256(2 * kMaxRows * sizeof(float)));
-  float* partial = reinterpret_cast<float*>(ws + align256(2 * kMaxRows * sizeof(float)) +
-                                            align256(size_t(k) * kMaxRows * 2));
-  int kb_per_split, splits;
-  split_plan(n, k, &kb_per_split, &splits);
-  const size_t out_row = size_t(n) * (out_f32 ? 4 : 2);
-  for (int first = 0; first < rows; first += kMaxRows) {
-    const int m = rows - first < kMaxRows ? rows - first : kMaxRows;
-    const int groups = m <= 8 ? 1 : m <= 16 ? 2 : m <= 32 ? 4 : 8;
-    const __nv_bfloat16* xm = static_cast<const __nv_bfloat16*>(x) + size_t(first) * k;
-    void* om = static_cast<uint8_t*>(out) + size_t(first) * out_row;
-    row_scale_kernel<<<groups * 8, 256, 0, s>>>(xm, sx, m, k);
-    pack_x_kernel<<<dim3(k / 32, groups), 32, 0, s>>>(xm, sx, xp, m, k, groups);
-    const int warps = (n / 16) * splits;
-    const dim3 grid((warps + kWarps - 1) / kWarps), block(kWarps * 32);
-    const uint4* wp = static_cast<const uint4*>(packed);
-    const float* sc = static_cast<const float*>(scale);
-    switch (groups) {
-      case 1: gemv_kernel<1><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits); break;
-      case 2: gemv_kernel<2><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits); break;
-      case 4: gemv_kernel<4><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits); break;
-      default: gemv_kernel<8><<<grid, block, 0, s>>>(wp, sc, xp, sx, om, partial, out_f32, m, n, k, kb_per_split, splits); break;
-    }
-    if (splits > 1) {
-      const size_t total = size_t(m) * n;
-      const int blocks = int((total + 255) / 256 < 4096 ? (total + 255) / 256 : 4096);
-      reduce_kernel<<<blocks, 256, 0, s>>>(partial, sx, om, out_f32, m, n, splits);
-    }
-  }
-  return cudaGetLastError();
+  return run_linear(x, packed, scale, out, out_f32, rows, k, n, kMaxRows, false, workspace, workspace_bytes, stream);
+}
+
+// Scratch bytes cuteafd_fp8_linear needs in `mode` (0 the plain W8A16 passes of
+// 64 rows, 1 wide: passes of 128 rows, the same bits, 2 W8A8 past 8 rows in
+// passes of 128); 0 for an unknown mode or shape.
+extern "C" size_t cuteafd_fp8_linear_workspace(int32_t rows, int32_t k, int32_t n, int32_t mode) {
+  if (n < 16 || k < 128 || mode < kModePlain || mode > kModeW8a8) return 0;
+  return layout_bytes(rows, k, n, chunk_rows(mode), mode == kModeW8a8);
+}
+
+// cuteafd_fp8_w8a16_linear in `mode` (see cuteafd_fp8_linear_workspace).
+extern "C" int32_t cuteafd_fp8_linear(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32,
+                                      int32_t rows, int32_t k, int32_t n, int32_t mode, void* workspace,
+                                      size_t workspace_bytes, void* stream) {
+  if (mode < kModePlain || mode > kModeW8a8) return cudaErrorInvalidValue;
+  return run_linear(x, packed, scale, out, out_f32, rows, k, n, chunk_rows(mode), mode == kModeW8a8, workspace,
+                    workspace_bytes, stream);
 }
