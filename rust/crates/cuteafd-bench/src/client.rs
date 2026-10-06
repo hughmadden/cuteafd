@@ -37,6 +37,14 @@ pub struct Chat {
 #[error("benchmark cancelled")]
 pub struct Cancelled;
 
+/// An upstream rejection retains its status through the benchmark API.
+#[derive(Debug, thiserror::Error)]
+#[error("HTTP {code}: {body}")]
+pub struct UpstreamHttpError {
+    pub code: u16,
+    pub body: String,
+}
+
 impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
@@ -96,7 +104,7 @@ impl Client {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();
-                bail!("HTTP {code}: {}", text.chars().take(400).collect::<String>());
+                return Err(UpstreamHttpError { code, body: text.chars().take(400).collect() }.into());
             }
             Err(error) => return Err(error).context("chat request"),
         };
@@ -198,6 +206,36 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_rejection_has_a_typed_upstream_status() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8(request).unwrap();
+            let length: usize = headers.lines().find_map(|line| line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse().unwrap())).unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 26\r\nConnection: close\r\n\r\nvision encoder unavailable").unwrap();
+        });
+        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        let error = client.chat(json!({"messages": []}), None).unwrap_err();
+        server.join().unwrap();
+        let upstream = error.downcast_ref::<UpstreamHttpError>().unwrap();
+        assert_eq!(upstream.code, 503);
+        assert_eq!(upstream.body, "vision encoder unavailable");
+    }
 
     #[test]
     fn tool_call_deltas_merge_by_index() {
