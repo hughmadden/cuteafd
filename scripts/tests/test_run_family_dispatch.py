@@ -433,8 +433,8 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
 
 
 def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
-    """Packed admission prefill and the chain verify policy are opt-in: a launch without their
-    keys passes none of their options (one prefill pass per prompt, the cost verify policy)."""
+    """A launch without the admission and verify keys passes none of their options: the engine's
+    defaults, packed admission prefill and the cost verify policy."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -443,13 +443,13 @@ def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("GLM5_FLASH_PREFILL_BATCH=off\n", (), ("--prefill-batch",)),
-    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
+    ("GLM5_FLASH_PREFILL_BATCH=off\n", ("--prefill-batch false",), ()),
+    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch true",), ()),
     ("GLM5_FLASH_VERIFY_POLICY=cost\n", (), ("--verify-policy",)),
     ("GLM5_FLASH_VERIFY_POLICY=chain\n", ("--verify-policy chain",), ("--spec-tau",)),
     ("GLM5_FLASH_VERIFY_POLICY=chain\nGLM5_FLASH_SPEC_TAU=0.5\n", ("--verify-policy chain", "--spec-tau 0.5"), ()),
     ("GLM5_FLASH_SPEC_TAU=1\n", ("--spec-tau 1",), ("--verify-policy",)),
-    ("GLM5_FLASH_PREFILL_BATCH=on\nGLM5_FLASH_VERIFY_POLICY=chain\n", ("--prefill-batch", "--verify-policy chain"), ()),
+    ("GLM5_FLASH_PREFILL_BATCH=off\nGLM5_FLASH_VERIFY_POLICY=chain\n", ("--prefill-batch false", "--verify-policy chain"), ()),
 ])
 def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, absent):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")

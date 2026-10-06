@@ -652,13 +652,14 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--kda-state "$kda_state") ;;
     *) echo "GLM5_FLASH_KDA_STATE must be f32, bf16 or bf16-tile" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_PREFILL_BATCH: off (default: one prefill pass per prompt) or on (the prompts that
-  # wait together prefill in one pass, each sequence's own programs over its rows, one Spark wave
-  # per MoE layer for all of them).
-  prefill_batch="$(get GLM5_FLASH_PREFILL_BATCH off)"
+  # GLM5_FLASH_PREFILL_BATCH: on (the engine's default: the prompts that wait together prefill in
+  # one pass, each sequence's own programs over its rows, the bits of its own pass, one Spark wave
+  # per MoE layer for all of them) or off (one prefill pass per prompt). Unset passes nothing.
+  prefill_batch="$(get GLM5_FLASH_PREFILL_BATCH)"
   case "$prefill_batch" in
-    ""|off) ;;
-    on) family_args+=(--prefill-batch) ;;
+    "") ;;
+    on) family_args+=(--prefill-batch true) ;;
+    off) family_args+=(--prefill-batch false) ;;
     *) echo "GLM5_FLASH_PREFILL_BATCH must be on or off" >&2; exit 2 ;;
   esac
   # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under its decode rows

@@ -68,12 +68,15 @@ Attention (KDA), a minority run MLA + DSA.
   programs; shorter steps keep the 131,072-token ones and their bits. With
   `--max-context` past 131,072 their scratch adds 33.5 MB to the prefill
   temporaries and 0.5 MB to the decode workspace (1 MB at `--decode-rows 128`).
-- Admission and verify rows (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
-  (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
-  prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head
-  run over its own rows as its own pass would, the rest over all rows, with one Spark wave per
-  MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
-  pass). `GLM5_FLASH_VERIFY_POLICY=chain` (`--verify-policy chain`, `GLM5_FLASH_SPEC_TAU`,
+- Admission and verify rows. By default the prompts that wait together prefill in one pass, up to
+  the first prefill lane's rows (`--prefill-batch`, `GLM5_FLASH_PREFILL_BATCH`; `off` for one
+  pass per prompt): each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head run
+  over its own rows as its own pass would, the rest over all rows, with one Spark wave per MoE
+  layer for the burst. `glmf-golden --packed-check N` compares every sequence with its own pass,
+  logits, KDA state and paged bytes: identical with the Sparks, keys/FP32 and compact/BF16. On 1
+  RTX 5090 + 4 Sparks with the 2 x 4,096-lane 5090 profile at 16 sequences it gave code C16 +4.0%,
+  mixed C16 +2.7%, C4 +2.2-5.0% and C16 time to first token 2.27 -> 0.85 s at max, C1 level.
+  `GLM5_FLASH_VERIFY_POLICY=chain` (`--verify-policy chain`, `GLM5_FLASH_SPEC_TAU`,
   default 0.7) cuts each sequence's drafts at that cumulative draft probability and drops the
   least likely drafts across sequences when a step exceeds the 64 verify rows, in place of the
   same room for every sequence.

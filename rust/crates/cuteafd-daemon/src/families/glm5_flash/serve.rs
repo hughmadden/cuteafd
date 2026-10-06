@@ -82,10 +82,11 @@ pub(crate) struct ServeArgs {
     /// The chain cut of --verify-policy chain (0 < tau <= 1).
     #[arg(long, env = "CUTEAFD_GLMF_SPEC_TAU", default_value_t = verify::DEFAULT_TAU)]
     pub spec_tau: f64,
-    /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
-    /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
-    /// layer for all of them. Off: one pass per prompt.
-    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = false, num_args = 0..=1,
+    /// Prefill the prompts that wait together in one pass (the default): each prompt's next chunk, up
+    /// to the first prefill lane's rows, every per-sequence program over its own rows (the bits of
+    /// its own pass), and one Spark wave per MoE layer for all of them. `--prefill-batch false`: one
+    /// pass per prompt.
+    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = true, num_args = 0..=1,
         default_missing_value = "true", action = clap::ArgAction::Set)]
     pub prefill_batch: bool,
     #[command(flatten)]
@@ -1296,12 +1297,13 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn admission_and_verify_rows_default_to_todays_policies() {
+    fn packed_admission_is_the_default_and_the_cost_verify_policy_stays() {
         let defaults = parse(&[]).unwrap();
         assert_eq!((defaults.verify_policy, defaults.spec_tau, defaults.prefill_batch),
-            (VerifyPolicy::Cost, verify::DEFAULT_TAU, false));
-        let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch"]).unwrap();
-        assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, true));
+            (VerifyPolicy::Cost, verify::DEFAULT_TAU, true));
+        let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch", "false"]).unwrap();
+        assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, false));
+        assert!(parse(&["--prefill-batch"]).unwrap().prefill_batch);
         assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
         assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
         assert!(parse(&["--verify-policy", "greedy"]).is_err());
