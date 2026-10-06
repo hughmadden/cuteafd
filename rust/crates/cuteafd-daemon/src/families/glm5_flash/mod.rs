@@ -51,6 +51,12 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
+    /// The DSA index cache: `keys` keeps every token's BF16 key | gate row beside its latent
+    /// record (11,804 B per token over the 11 MLA layers); `compact` keeps only the pooled keys
+    /// and each sequence's open pool (at most three rows), 6,172 B per token, with the same
+    /// pooled keys bit for bit. A two-GPU head split keeps `keys`.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
+    pub index_cache: engine::IndexCache,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
@@ -178,6 +184,16 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn index_cache_defaults_to_keys_and_takes_compact() {
+        let parse_cache = |extra: &[&str]| Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib",
+            "/native"].into_iter().chain(extra.iter().copied())).map(|p| p.engine.index_cache);
+        assert_eq!(parse_cache(&[]).unwrap(), engine::IndexCache::Keys);
+        assert_eq!(parse_cache(&["--index-cache", "compact"]).unwrap(), engine::IndexCache::Compact);
+        assert_eq!(parse_cache(&["--index-cache", "keys"]).unwrap(), engine::IndexCache::Keys);
+        assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
     #[test]
@@ -474,6 +490,9 @@ impl Opened {
         if args.fp8_head {
             needed.push("glmf_head_fp8");
         }
+        if args.index_cache == engine::IndexCache::Compact {
+            needed.extend(["glmf_index_producer_c_m64", "glmf_index_producer_c_m4096", "glmf_kda_commit_c"]);
+        }
         if args.kda_fp32_partials {
             needed.extend(["glmf2_kda_w8_f32_m64", "glmf2_kda_w8_f32_m4096"]);
             needed.push("glmf2_add_fp32");
@@ -493,7 +512,7 @@ impl Opened {
             if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
         }
         for name in needed {
-            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
+            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
         programs.load_all()?;
@@ -511,6 +530,14 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
+        // Both GPUs of a head split run the indexer; their index tails are not built yet.
+        let index_cache = match (args.index_cache, split_device) {
+            (engine::IndexCache::Compact, Some(device)) => {
+                tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
+                engine::IndexCache::Keys
+            }
+            (cache, _) => cache,
+        };
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -588,7 +615,8 @@ impl Opened {
         let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers);
         let workspace_reserve = engine::workspace_reserve(&programs, &self.cfg, &model, args.prefill_rows, pool_bound,
             engine::WorkspaceOptions { fp32_partials: args.kda_fp32_partials, output_shard: args.kda_output_shard,
-                expanded: args.kda_prefill_expanded, full_logits: args.full_prefill_logits },
+                expanded: args.kda_prefill_expanded, full_logits: args.full_prefill_logits,
+                index_compact: index_cache == engine::IndexCache::Compact },
             lanes, peer_stream.is_some(), args.draft.is_some())?;
         let workspace_allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").workspace_bytes[0]
             * args.prefill_rows.max(1) as u64 / 4096;
@@ -608,13 +636,15 @@ impl Opened {
                     if args.kda_fp32_partials { 4 } else { 2 }) };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra + workspace_extra)?
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes,
+                extra + graph_extra + workspace_extra, index_cache.into())?
         } else {
             args.pool_tokens
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+            args.max_context, args.prefill_rows, pages, args.slots, embedding, index_cache)?;
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
