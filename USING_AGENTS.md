@@ -295,6 +295,7 @@ duplicating it. Record the lesson in the table below.
 
 | What happened | Rule now |
 |---|---|
+| Containers run as host uid 1000/1001 with no passwd row; torch/Inductor `getpass` crashed (3 times) | Every torch-importing container gets `USER`/`LOGNAME`/`HOME`/`TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` set (in codex-preamble) |
 | Codex plugin tasks all blocked (sandbox) | Plain: `scripts/agents/codex-launch.sh`; enhanced: Agent tool with a Codex model |
 | `bwrap` launcher broke SSH, sudo and `/mnt` writes for every agent | Launcher selects credentials with `CLAUDE_SECURESTORAGE_CONFIG_DIR`, no namespace |
 | Killed launcher, orphaned Codex kept editing | Stop with `codex-stop.sh` / `TaskStop` |
