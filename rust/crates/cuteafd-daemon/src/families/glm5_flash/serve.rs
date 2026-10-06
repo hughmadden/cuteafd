@@ -74,11 +74,17 @@ pub(crate) struct ServeArgs {
     pub draft_fixed: Option<usize>,
     /// Which drafts a speculative step verifies under its verify budget (--decode-rows; with 128,
     /// whole sparse MLA waves, 127 rows on an RTX 5090): `cost` (every sequence the same room, rows
-    /// / sequences - 1 drafts, the cost model's depth within it) or `chain` (each sequence's drafts
+    /// / sequences - 1 drafts, the cost model's depth within it), `chain` (each sequence's drafts
     /// cut where the product of the drafter's probabilities falls below --spec-tau, then the least
-    /// likely drafts across sequences dropped first).
-    #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
+    /// likely drafts across sequences dropped first), or `auto`, the default: `chain` from
+    /// --verify-chain-min-sequences active sequences, `cost` below.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "auto")]
     pub verify_policy: VerifyPolicy,
+    /// With --verify-policy auto: run `chain` from this many active sequences. Unset: where the even
+    /// split of the verify budget gives a sequence fewer drafts than the drafter proposes (rows /
+    /// sequences - 1 < drafts): 9 sequences at 64 rows and 16 at 127 with DFlash2's seven.
+    #[arg(long, env = "CUTEAFD_GLMF_VERIFY_CHAIN_MIN_SEQUENCES")]
+    pub verify_chain_min_sequences: Option<usize>,
     /// The chain cut of --verify-policy chain (0 < tau <= 1).
     #[arg(long, env = "CUTEAFD_GLMF_SPEC_TAU", default_value_t = verify::DEFAULT_TAU)]
     pub spec_tau: f64,
@@ -98,13 +104,14 @@ pub(crate) struct ServeArgs {
 }
 
 /// Speculation and admission settings: copy-window draft cap (0 disables), a fixed DFlash2 draft
-/// count replacing the adaptive policy, the verify-row policy and its chain cut, and packed
-/// admission prefill.
+/// count replacing the adaptive policy, the verify-row policy (with `auto`'s sequence count, when
+/// given) and its chain cut, and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     copy: usize,
     fixed: Option<usize>,
     verify: VerifyPolicy,
+    chain_from: Option<usize>,
     tau: f64,
     batch: bool,
 }
@@ -134,8 +141,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     anyhow::ensure!(args.spec_tau > 0.0 && args.spec_tau <= 1.0, "--spec-tau must be in (0, 1], got {}", args.spec_tau);
+    anyhow::ensure!(args.verify_chain_min_sequences != Some(0), "--verify-chain-min-sequences must be at least 1");
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
-        verify: args.verify_policy, tau: args.spec_tau, batch: args.prefill_batch };
+        verify: args.verify_policy, chain_from: args.verify_chain_min_sequences, tau: args.spec_tau,
+        batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
@@ -194,6 +203,9 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
         (Some(n), _) => format!("fixed {n}"),
         (None, VerifyPolicy::Chain) => format!("chain tau {}", args.spec_tau),
         (None, VerifyPolicy::Cost) => "adaptive".to_string(),
+        (None, VerifyPolicy::Auto) => args.verify_chain_min_sequences.map_or_else(
+            || format!("auto, chain tau {} when the split binds", args.spec_tau),
+            |n| format!("auto, chain tau {} from {n} sequences", args.spec_tau)),
     };
     let drafter = args.engine.draft.as_deref()
         .map(|snapshot| if super::dspark::is_dspark(snapshot) { "dSpark" } else { "DFlash2" });
@@ -575,6 +587,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         _ => GLMF_TP2_STEP_MS.to_vec(),
     };
     let mut cost = dflash_policy::step_cost(&table, verify_rows);
+    // `auto` runs the chain cut and the row budget from this many active sequences: where the even
+    // split gives a sequence fewer drafts than the drafter proposes (DFlash2 and copy windows: 7).
+    let chain_from = policy.chain_from.unwrap_or_else(||
+        verify::chain_min_sequences(verify_rows, drafter.map_or(COPY_DRAFT, |d| d.drafts())));
+    tracing::info!(verify_policy = ?policy.verify, chain_from, verify_rows, prefill_batch = policy.batch,
+        "GLM 5.3 Flash verify rows and admission");
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -832,11 +850,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
         // Rows each sequence may add after its next token: the same room for every sequence (cost),
-        // or the whole verify budget, the step's rows budgeted after drafting (chain).
-        let room = match policy.verify {
-            VerifyPolicy::Cost => (verify_rows / active.len()).max(1) - 1,
-            VerifyPolicy::Chain => verify_rows - 1,
-        };
+        // or the whole verify budget, the step's rows budgeted after drafting (chain; `auto` from
+        // `chain_from` sequences).
+        let chain = verify::uses_chain(policy.verify, active.len(), chain_from);
+        let room = if chain { verify_rows - 1 } else { (verify_rows / active.len()).max(1) - 1 };
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
 
@@ -890,9 +907,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
-        let mut planned = match (policy.verify, policy.fixed) {
+        let mut planned = match (chain, policy.fixed) {
             // The chain cut on the drafter's own probabilities.
-            (VerifyPolicy::Chain, None) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
+            (true, None) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
                 .map_or(0, |d| verify::chain_length(&draft_probs(d), limit, policy.tau))).collect(),
             _ => dflash_policy::plan_counts(&inputs, policy.fixed, &cost),
         };
@@ -926,8 +943,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
-        if policy.verify == VerifyPolicy::Chain {
-            // The step under the decode programs' rows: the least likely drafts across sequences go
+        if chain {
+            // The step under the verify budget: the least likely drafts across sequences go
             // first (a copy-window token the drafter also proposed keeps the drafter's probability).
             let probs: Vec<Vec<f32>> = sequences.iter().zip(&drafted).zip(&used_copy).map(|((rows, draft), &copy)| {
                 let probs = draft.as_ref().map(draft_probs).unwrap_or_default();
@@ -1297,16 +1314,19 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn packed_admission_is_the_default_and_the_cost_verify_policy_stays() {
+    fn packed_admission_and_the_auto_verify_policy_are_the_defaults() {
         let defaults = parse(&[]).unwrap();
-        assert_eq!((defaults.verify_policy, defaults.spec_tau, defaults.prefill_batch),
-            (VerifyPolicy::Cost, verify::DEFAULT_TAU, true));
+        assert_eq!((defaults.verify_policy, defaults.verify_chain_min_sequences, defaults.spec_tau,
+            defaults.prefill_batch), (VerifyPolicy::Auto, None, verify::DEFAULT_TAU, true));
         let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch", "false"]).unwrap();
         assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, false));
+        assert_eq!(parse(&["--verify-policy", "cost"]).unwrap().verify_policy, VerifyPolicy::Cost);
+        let auto = parse(&["--verify-policy", "auto", "--verify-chain-min-sequences", "4"]).unwrap();
+        assert_eq!((auto.verify_policy, auto.verify_chain_min_sequences), (VerifyPolicy::Auto, Some(4)));
         assert!(parse(&["--prefill-batch"]).unwrap().prefill_batch);
         assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
-        assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
         assert!(parse(&["--verify-policy", "greedy"]).is_err());
+        assert!(parse(&["--verify-chain-min-sequences", "many"]).is_err());
     }
 
     #[test]

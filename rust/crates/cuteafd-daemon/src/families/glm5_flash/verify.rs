@@ -1,17 +1,25 @@
-//! Likelihood-ranked verify rows (`serve-glmf --verify-policy chain`), after glm53f-afd's
-//! verify-length policy (hughmadden/glm53f-afd v1.1.0, MIT: `crates/glm53f-coordinator/src/spec.rs`).
+//! Likelihood-ranked verify rows (`serve-glmf --verify-policy chain`, and `auto`, the default), after
+//! glm53f-afd's verify-length policy (hughmadden/glm53f-afd v1.1.0, MIT:
+//! `crates/glm53f-coordinator/src/spec.rs`).
 //!
-//! The default policy (`cost`) gives every sequence the same room under the step's verify budget
-//! (`--decode-rows`, 64 by default: `64 / sequences - 1` drafts, 3 at 16 sequences; with 128, whole
-//! sparse MLA waves, `GlmfEngine::verify_rows`) and lets the cost model choose a depth within it.
-//! `chain` spends those rows by draft likelihood instead: each sequence's drafts are cut where the
-//! product of the drafter's probabilities through the draft (the chain's own estimate that the
-//! draft is kept) falls below tau, 0.7; when the step's rows still exceed the budget, the least
-//! likely drafts across all sequences are dropped first. A confident sequence verifies up to its
-//! seven drafts while a doubtful one verifies few, so the rows go to the drafts most likely to be
-//! kept.
+//! `cost` gives every sequence the same room under the step's verify budget (`--decode-rows`, 64
+//! by default: `64 / sequences - 1` drafts, 3 at 16 sequences; with 128, whole sparse MLA waves,
+//! `GlmfEngine::verify_rows`) and lets the cost model choose a depth within it. `chain` spends
+//! those rows by draft likelihood instead: each sequence's drafts are cut where the product of the
+//! drafter's probabilities through the draft (the chain's own estimate that the draft is kept)
+//! falls below tau, 0.7; when the step's rows still exceed the budget, the least likely drafts
+//! across all sequences are dropped first. A confident sequence verifies up to its seven drafts
+//! while a doubtful one verifies few, so the rows go to the drafts most likely to be kept.
 //!
 //! It changes only which drafts a step verifies: verification decides what is kept.
+//!
+//! `auto` takes `chain` where the even split binds, from the sequence count at which `rows /
+//! sequences - 1` falls below the drafts a sequence proposes ([`chain_min_sequences`]: 9 at 64 rows
+//! and 16 at 127 with DFlash2's seven; there the rows `cost` hands out past the even split no
+//! longer reach every sequence either), and `cost` below it, where the room never binds and only
+//! the depth rule differs. Measured on our 1x RTX 5090 + 4x DGX Spark setup at 64 rows, `chain`
+//! gave +5.9% at 16 code streams; at one stream it moved the bench both ways (512-token streams
+//! +7%, 1,024-token runs 1-3% slower), which `auto` leaves to the cost model.
 //!
 //! The drafter's probability of a draft is its selector's softmax over the position's 16
 //! candidates (DFlash2: the `best probability` feature, as glm53f-afd's `conf`), or a dSpark
@@ -29,13 +37,33 @@ pub(crate) const COPY_TOKEN_P: f32 = 0.94;
 /// Which drafts a speculative step verifies (`--verify-policy`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum VerifyPolicy {
+    /// `chain` from [`chain_min_sequences`] active sequences (or
+    /// `--verify-chain-min-sequences`), `cost` below.
+    #[default]
+    Auto,
     /// Every sequence the same room (`verify rows / sequences - 1` drafts), the cost model's depth
     /// within it.
-    #[default]
     Cost,
     /// Each sequence's drafts cut at `--spec-tau` cumulative probability, then the least likely
-    /// drafts across sequences dropped first until the step fits the decode programs' rows.
+    /// drafts across sequences dropped first until the step fits the verify budget.
     Chain,
+}
+
+/// The fewest active sequences at which the even split of `rows` verify rows gives each sequence
+/// fewer than its `drafts` (`rows / sequences - 1 < drafts`), where `auto` turns to `chain`: 9 at 64
+/// rows and 16 at 127 for DFlash2's seven drafts.
+pub(crate) fn chain_min_sequences(rows: usize, drafts: usize) -> usize {
+    rows / (drafts + 1) + 1
+}
+
+/// Whether a step of `sequences` active sequences runs the chain cut and the row budget: always
+/// under `chain`, never under `cost`, from `min_sequences` under `auto`.
+pub(crate) fn uses_chain(policy: VerifyPolicy, sequences: usize, min_sequences: usize) -> bool {
+    match policy {
+        VerifyPolicy::Auto => sequences >= min_sequences,
+        VerifyPolicy::Cost => false,
+        VerifyPolicy::Chain => true,
+    }
 }
 
 /// A drafter probability as a likelihood: clamped to [0, 1], 0 when it is not a number.
@@ -212,6 +240,67 @@ mod tests {
             Some(*q)
         }).sum::<f64>()).sum();
         assert!(ranked > even, "expected kept drafts: ranked {ranked:.2} against even {even:.2}");
+    }
+
+    /// The even split's room per sequence (`cost`).
+    fn room(rows: usize, sequences: usize) -> usize {
+        (rows / sequences).max(1) - 1
+    }
+
+    #[test]
+    fn auto_turns_to_chain_where_the_even_split_binds_at_64_rows() {
+        assert_eq!(chain_min_sequences(64, 7), 9);
+        // At 8 sequences the room is 7 drafts, all of DFlash2's; at 9 it is 6.
+        assert_eq!((room(64, 8), room(64, 9)), (7, 6));
+        for sequences in 1..=64 {
+            assert_eq!(uses_chain(VerifyPolicy::Auto, sequences, chain_min_sequences(64, 7)), room(64, sequences) < 7,
+                "{sequences}");
+        }
+    }
+
+    #[test]
+    fn auto_turns_to_chain_where_the_even_split_binds_at_127_rows() {
+        // Whole-wave decode rows (127 on a 170-SM card): the room stays at 7 drafts through 15
+        // sequences.
+        assert_eq!(chain_min_sequences(127, 7), 16);
+        assert_eq!((room(127, 15), room(127, 16)), (7, 6));
+        for sequences in 1..=127 {
+            assert_eq!(uses_chain(VerifyPolicy::Auto, sequences, chain_min_sequences(127, 7)), room(127, sequences) < 7,
+                "{sequences}");
+        }
+        // 128 rows: 16 sequences still get 7 drafts each.
+        assert_eq!(chain_min_sequences(128, 7), 17);
+        // A drafter of eight drafts per step binds one sequence earlier at 64 rows.
+        assert_eq!(chain_min_sequences(64, 8), 8);
+    }
+
+    #[test]
+    fn auto_turns_to_chain_where_the_rows_left_over_no_longer_reach_every_sequence() {
+        // With the wide programs `cost` hands the rows its even share leaves over to the first
+        // sequences that can draft once more (127 rows at 16 sequences: 15 draft 7, one 6). Below
+        // the number every sequence still verifies DFlash2's seven drafts, from it at least one
+        // verifies fewer, at 64, 99, 127 and 128 rows.
+        for rows in [64, 99, 127, 128] {
+            let from = chain_min_sequences(rows, 7);
+            for sequences in 1..=rows {
+                let even = room(rows, sequences);
+                let mut limits = vec![even; sequences];
+                super::super::engine::hand_out_remainder(&mut limits, even, rows, |_| true);
+                assert_eq!(limits.iter().all(|&limit| limit >= 7), sequences < from, "{rows} rows, {sequences}");
+            }
+        }
+    }
+
+    #[test]
+    fn cost_and_chain_ignore_the_sequence_count_and_an_override_moves_auto() {
+        for sequences in [1, 8, 9, 16, 64] {
+            assert!(!uses_chain(VerifyPolicy::Cost, sequences, 9));
+            assert!(uses_chain(VerifyPolicy::Chain, sequences, 9));
+        }
+        // --verify-chain-min-sequences 4: chain from four sequences, 1 always.
+        assert!(!uses_chain(VerifyPolicy::Auto, 3, 4) && uses_chain(VerifyPolicy::Auto, 4, 4));
+        assert!(uses_chain(VerifyPolicy::Auto, 1, 1));
+        assert_eq!(VerifyPolicy::default(), VerifyPolicy::Auto);
     }
 
     #[test]

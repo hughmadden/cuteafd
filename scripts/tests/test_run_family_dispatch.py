@@ -433,23 +433,25 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
 
 
 def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
-    """A launch without the admission and verify keys passes none of their options: the engine's
-    defaults, packed admission prefill and the cost verify policy."""
+    """Packed admission prefill and the auto verify policy are the engine's defaults: a launch without
+    their keys passes none of their options."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    for option in ("--prefill-batch", "--verify-policy", "--spec-tau"):
+    for option in ("--prefill-batch", "--verify-policy", "--verify-chain-min-sequences", "--spec-tau"):
         assert option not in launch, (option, launch)
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
     ("GLM5_FLASH_PREFILL_BATCH=off\n", ("--prefill-batch false",), ()),
     ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch true",), ()),
-    ("GLM5_FLASH_VERIFY_POLICY=cost\n", (), ("--verify-policy",)),
+    ("GLM5_FLASH_VERIFY_POLICY=auto\n", ("--verify-policy auto",), ("--verify-chain-min-sequences",)),
+    ("GLM5_FLASH_VERIFY_POLICY=cost\n", ("--verify-policy cost",), ()),
     ("GLM5_FLASH_VERIFY_POLICY=chain\n", ("--verify-policy chain",), ("--spec-tau",)),
     ("GLM5_FLASH_VERIFY_POLICY=chain\nGLM5_FLASH_SPEC_TAU=0.5\n", ("--verify-policy chain", "--spec-tau 0.5"), ()),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=12\n", ("--verify-chain-min-sequences 12",), ("--verify-policy",)),
     ("GLM5_FLASH_SPEC_TAU=1\n", ("--spec-tau 1",), ("--verify-policy",)),
-    ("GLM5_FLASH_PREFILL_BATCH=off\nGLM5_FLASH_VERIFY_POLICY=chain\n", ("--prefill-batch false", "--verify-policy chain"), ()),
+    ("GLM5_FLASH_PREFILL_BATCH=off\nGLM5_FLASH_VERIFY_POLICY=cost\n", ("--prefill-batch false", "--verify-policy cost"), ()),
 ])
 def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, absent):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
@@ -464,6 +466,8 @@ def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, 
 @pytest.mark.parametrize("keys,message", [
     ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
     ("GLM5_FLASH_VERIFY_POLICY=greedy\n", "GLM5_FLASH_VERIFY_POLICY must be"),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=0\n", "GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES must be"),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=nine\n", "GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES must be"),
     ("GLM5_FLASH_SPEC_TAU=0\n", "GLM5_FLASH_SPEC_TAU must be"),
     ("GLM5_FLASH_SPEC_TAU=0.0\n", "GLM5_FLASH_SPEC_TAU must be"),
     ("GLM5_FLASH_SPEC_TAU=1.5\n", "GLM5_FLASH_SPEC_TAU must be"),

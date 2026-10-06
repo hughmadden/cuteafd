@@ -662,17 +662,24 @@ if [[ $family == glm5_flash ]]; then
     off) family_args+=(--prefill-batch false) ;;
     *) echo "GLM5_FLASH_PREFILL_BATCH must be on or off" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under its decode rows
-  # (GLM5_FLASH_DECODE_ROWS, 64 by default): cost (default: the same room for every sequence, the
-  # cost model's depth within it) or chain (each sequence's drafts cut at GLM5_FLASH_SPEC_TAU,
-  # default 0.7, of cumulative draft probability, then the least likely drafts across sequences
-  # dropped first).
-  verify_policy="$(get GLM5_FLASH_VERIFY_POLICY cost)"
+  # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under its verify budget
+  # (GLM5_FLASH_DECODE_ROWS: 64 rows, or 127 on an RTX 5090 at 128): auto (the engine's default:
+  # chain from GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES active sequences, 9 at 64 rows and 16 at 127
+  # unless set, cost below), cost (the same room for every sequence, the cost model's depth within
+  # it) or chain (each sequence's drafts cut at GLM5_FLASH_SPEC_TAU, default 0.7, of cumulative
+  # draft probability, then the least likely drafts across sequences dropped first). Unset passes
+  # nothing.
+  verify_policy="$(get GLM5_FLASH_VERIFY_POLICY)"
   case "$verify_policy" in
-    ""|cost) ;;
-    chain) family_args+=(--verify-policy chain) ;;
-    *) echo "GLM5_FLASH_VERIFY_POLICY must be cost or chain" >&2; exit 2 ;;
+    "") ;;
+    auto|cost|chain) family_args+=(--verify-policy "$verify_policy") ;;
+    *) echo "GLM5_FLASH_VERIFY_POLICY must be auto, cost or chain" >&2; exit 2 ;;
   esac
+  chain_from="$(get GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES)"
+  if [[ -n "$chain_from" ]]; then
+    [[ "$chain_from" =~ ^[1-9][0-9]*$ ]] || { echo "GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES must be a positive whole number" >&2; exit 2; }
+    family_args+=(--verify-chain-min-sequences "$chain_from")
+  fi
   spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
   if [[ -n "$spec_tau" ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
