@@ -12,14 +12,18 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def test_capture_retains_http_error_body(tmp_path, monkeypatch):
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_capture_retains_http_error_body(tmp_path, monkeypatch, family):
     import io
     import urllib.error
     from types import SimpleNamespace
     window = {"id": "vision00", "tokens": [9, 2], "score_from": 1,
               "media": [{"fixture": {"path": "image.png", "sha256": "a" * 64}}]}
-    panel = {"checkpoint": "model", "quick_windows": ["vision00"], "windows": [window]}
-    monkeypatch.setattr(module, "load_set", lambda *args: panel)
+    panel = {"family": family, "checkpoint": "model", "quick_windows": ["vision00"], "windows": [window]}
+    def load_set(path, expected):
+        assert expected == family
+        return panel
+    monkeypatch.setattr(module, "load_set", load_set)
     monkeypatch.setattr(module, "read_fixture", lambda *args: b"png")
     def http(url, token, body=None, timeout=240):
         if body is None:
@@ -28,7 +32,7 @@ def test_capture_retains_http_error_body(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "http", http)
     args = SimpleNamespace(windows=tmp_path / "windows", out=tmp_path / "out", url="http://localhost",
         bench_token=None, mode="native", features=None, quick=False, media_root=tmp_path,
-        host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10)
+        host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10, family=family)
     with pytest.raises(urllib.error.HTTPError):
         module.capture(args)
     saved = json.loads((args.out / "vision00.http-error.json").read_text())
@@ -73,6 +77,10 @@ def test_record_requires_native_identity_and_override_metadata(tmp_path):
               "rows": [{"position": 1, "finite": True}], "scored": 1}
     response = {"probe": record, "server": {"model": "model"}}
     module.check_record(window, response, "model", "native")
+    response["server"]["family"] = "mimo_v2"
+    module.check_record(window, response, "model", "native", family="mimo_v2")
+    with pytest.raises(ValueError, match="identity"):
+        module.check_record(window, response, "model", "native", family="qwen4")
     record["media"] = []
     with pytest.raises(ValueError, match="echo"):
         module.check_record(window, response, "model", "native")
@@ -101,12 +109,13 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
         module.normalize([0, float("nan")])
 
 
-def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
     from fidelity_windows import canonical, set_hash
-    panel = {"schema": "cuteafd.fidelity.set/1", "family": "mimo_v2", "checkpoint": "model",
+    panel = {"schema": "cuteafd.fidelity.set/1", "family": family, "checkpoint": "model",
              "quick_windows": ["w0", "w1"], "windows": []}
     span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
             "fixture": {"path": "image.png", "sha256": "b" * 64}}
@@ -121,7 +130,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
     proof = {"schema": "cuteafd.fidelity.prefix/1", "passed": True, "finite": True,
              "rows": 512, "different_rows": [], "argmax_disagreements": 0,
              "lengths": [576, 640], "score_from": 64, "fixed_rows": 128,
-             "family": "mimo_v2", "set_sha256": panel["set_sha256"], "snapshot_identity": identity,
+             "family": family, "set_sha256": panel["set_sha256"], "snapshot_identity": identity,
              "source_window": "w0", "media": [span], "vocab": 2}
     golden = tmp_path / "golden"
     golden.mkdir()
@@ -139,7 +148,10 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
     (golden / "meta.json").write_bytes(canonical(meta))
     (golden / "windows.json").write_bytes(canonical(panel))
     seal = tmp_path / "golden-seal.json"
-    seal.write_bytes(canonical(module.golden_seal(golden, panel)))
+    monkeypatch.setattr("sys.argv", ["media-paired-probe.py", "seal", "--family", family,
+        "--windows", str(windows), "--golden", str(golden), "--out", str(seal)])
+    module.main()
+    assert json.loads(seal.read_text()) == module.golden_seal(golden, panel)
     features = tmp_path / "features"
     features.mkdir()
     metadata = {"key": span["key"], "sha256": "c" * 64}
@@ -149,7 +161,8 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
         root.mkdir()
         capture = {"schema": "cuteafd.media.paired.capture/1", "mode": mode, "set_sha256": panel["set_sha256"],
                    "checkpoint": "model", "quick": False,
-                   "server": {"model": "model", "build": {"commit": "same", "image": mode}}, "windows": []}
+                   "server": {"model": "model", "family": family,
+                              "build": {"commit": "same", "image": mode}}, "windows": []}
         for window in panel["windows"]:
             dump = root / window["id"]
             dump.mkdir()
@@ -177,6 +190,10 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path):
     out = tmp_path / "g4.json"
     args = SimpleNamespace(windows=windows, golden=golden, golden_seal=seal, native=tmp_path / "native",
                            reference=tmp_path / "reference", features=features, out=out, bootstrap=100, seed=7)
+    if family != "mimo_v2":
+        with pytest.raises(ValueError, match="set family"):
+            module.compare(args)
+        args.family = family
     assert module.compare(args)
     result = json.loads(out.read_text())
     assert result["kl_increase_upper95"] == pytest.approx(0)

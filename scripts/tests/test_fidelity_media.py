@@ -1,7 +1,10 @@
 """Media fidelity contracts: CPU-only, no checkpoint or GPU needed."""
 import copy
 import hashlib
+import multiprocessing
+import os
 import pathlib
+import stat
 import sys
 
 import numpy as np
@@ -9,7 +12,7 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_media import read_fixture, require_media_flag, validate_media, write_features
+from fidelity_media import publish_immutable, read_fixture, require_media_flag, validate_media, write_features
 
 
 def load_script(name):
@@ -176,6 +179,105 @@ def test_feature_writer_binds_immutable_bytes(tmp_path):
         write_features(tmp_path, s, np.full((4, 8), 0x7f80, dtype=np.uint16), tower_dtype="bf16", identity={})
 
 
+def test_immutable_publish_preserves_existing_inode_and_complete_bytes(tmp_path):
+    path = tmp_path / "features.json"
+    content = b'{"features":["first"]}\n'
+    publish_immutable(path, content)
+    before = path.stat()
+    publish_immutable(path, content)
+    assert path.stat().st_ino == before.st_ino and path.stat().st_mtime_ns == before.st_mtime_ns
+    with pytest.raises(ValueError, match="immutable"):
+        publish_immutable(path, b"different")
+    assert path.read_bytes() == content and not list(tmp_path.glob(".feature-*"))
+
+
+@pytest.mark.parametrize("mask,mode", [(0o022, 0o644), (0o027, 0o640), (0o077, 0o600)])
+def test_atomic_feature_creation_preserves_ordinary_umask_permissions(tmp_path, mask, mode):
+    previous = os.umask(mask)
+    try:
+        write_features(tmp_path, span(), np.full((4, 8), 0x3f80, dtype=np.uint16),
+                       tower_dtype="bf16", identity={})
+        publish_immutable(tmp_path / "features.json", b"index")
+    finally:
+        os.umask(previous)
+    for name in (span()["key"] + ".bf16", span()["key"] + ".json", "features.json", ".features.lock"):
+        assert stat.S_IMODE((tmp_path / name).stat().st_mode) == mode
+
+
+def test_feature_lock_can_be_reused_without_write_permission(tmp_path, monkeypatch):
+    import fidelity_media
+    lock = tmp_path / ".features.lock"
+    lock.touch(mode=0o444)
+    actual_open = os.open
+    flags = []
+
+    def checked_open(path, flag, *args):
+        if pathlib.Path(path) == lock:
+            flags.append(flag)
+        return actual_open(path, flag, *args)
+
+    monkeypatch.setattr(fidelity_media.os, "open", checked_open)
+    publish_immutable(tmp_path / "features.json", b"index")
+    assert len(flags) == 1 and flags[0] & os.O_ACCMODE == os.O_RDONLY
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o444
+
+
+def _feature_racing_writer(root, barrier, results, kind, variant):
+    try:
+        barrier.wait(timeout=10)
+        if kind == "index":
+            publish_immutable(root / "features.json", b'{"set":' + str(variant).encode() + b'}\n')
+        else:
+            write_features(root, span(), np.full((4, 8), 0x3f80 + variant, dtype=np.uint16),
+                           tower_dtype="bf16", identity={"snapshot_revision": "pinned"})
+        results.put((variant, True))
+    except ValueError:
+        results.put((variant, False))
+
+
+@pytest.mark.parametrize("kind,equal", [("index", False), ("index", True), ("rows", False), ("rows", True)])
+def test_feature_writers_race_without_replacing_identity(tmp_path, kind, equal):
+    import json
+    context = multiprocessing.get_context("spawn")
+    barrier, results = context.Barrier(2), context.Queue()
+    variants = [0, 0 if equal else 1]
+    children = [context.Process(target=_feature_racing_writer, args=(tmp_path, barrier, results, kind, v))
+                for v in variants]
+    try:
+        for child in children:
+            child.start()
+        outcomes = [results.get(timeout=15) for _ in children]
+        for child in children:
+            child.join(timeout=15)
+            assert child.exitcode == 0
+    finally:
+        for child in children:
+            if child.is_alive():
+                child.terminate()
+                child.join()
+        results.close()
+        results.join_thread()
+    assert sum(success for _, success in outcomes) == (2 if equal else 1)
+    winner = next(v for v, success in outcomes if success)
+    if kind == "index":
+        assert json.loads((tmp_path / "features.json").read_text()) == {"set": winner}
+    else:
+        data = (tmp_path / (span()["key"] + ".bf16")).read_bytes()
+        meta = json.loads((tmp_path / (span()["key"] + ".json")).read_text())
+        assert np.frombuffer(data, dtype="<u2").tolist() == [0x3f80 + winner] * 32
+        assert meta["sha256"] == hashlib.sha256(data).hexdigest()
+    assert not list(tmp_path.glob(".feature-*"))
+
+
+def test_feature_pair_conflict_does_not_publish_other_member(tmp_path):
+    key = span()["key"]
+    (tmp_path / (key + ".json")).write_bytes(b"conflicting metadata")
+    with pytest.raises(ValueError, match="identity reused"):
+        write_features(tmp_path, span(), np.full((4, 8), 0x3f80, dtype=np.uint16),
+                       tower_dtype="bf16", identity={})
+    assert not (tmp_path / (key + ".bf16")).exists()
+
+
 def test_fixture_hash_and_family_fail_closed(tmp_path):
     s = span()
     (tmp_path / "code.png").write_bytes(b"fixture")
@@ -190,6 +292,7 @@ def test_fixture_hash_and_family_fail_closed(tmp_path):
         read_fixture(tmp_path, s)
     manifest = {"windows": [{"media": [s]}]}
     assert require_media_flag(manifest, True, "mimo_v2")
-    for family, flag in [("mimo_v2", False), ("qwen4", True), ("glm5_flash", True)]:
+    assert require_media_flag(manifest, True, "qwen4")
+    for family, flag in [("mimo_v2", False), ("qwen4", False), ("glm5_flash", True)]:
         with pytest.raises(ValueError):
             require_media_flag(manifest, flag, family)

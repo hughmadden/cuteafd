@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import types
 
-from fidelity_media import read_fixture, write_features
+from fidelity_media import publish_immutable, read_fixture, write_features
 
 
 def snapshot_identity(snapshot):
@@ -140,7 +140,5 @@ def window_features(args, manifest):
             "set_sha256": manifest["set_sha256"], "features": [entry["key"] for entry in entries]}
         path = args.media_features_out / "features.json"
         encoded = canonical(index) + b"\n"
-        if path.exists() and path.read_bytes() != encoded:
-            raise ValueError("feature index is immutable")
-        path.write_bytes(encoded)
+        publish_immutable(path, encoded)
     return {key: value[1] for key, value in features.items()}, identity

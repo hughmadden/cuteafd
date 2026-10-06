@@ -38,12 +38,23 @@ def http(url, token, body=None, timeout=240):
         return json.load(response)
 
 
-def check_record(window, response, checkpoint, mode, features_root=None):
+FAMILIES = ("mimo_v2", "qwen4", "glm5_flash")
+
+
+def load_panel(a):
+    family = getattr(a, "family", "mimo_v2")
+    if family not in FAMILIES:
+        raise ValueError("unsupported paired media family")
+    return load_set(a.windows, family)
+
+
+def check_record(window, response, checkpoint, mode, features_root=None, family=None):
     record = response.get("probe", {})
     if (record.get("error") or not record.get("engine") or not record.get("cold")
             or not record.get("no_speculation") or record.get("cached_tokens") != 0
             or record.get("score_path") != "decode" or record.get("prompt_ids") != window["tokens"]
-            or response.get("server", {}).get("model") != checkpoint):
+            or response.get("server", {}).get("model") != checkpoint
+            or family is not None and response.get("server", {}).get("family") != family):
         raise ValueError("media scoring identity/cold/path contract not honored")
     fields = ("start", "len", "kind", "key", "grid")
     expected = [{k: span[k] for k in fields} for span in window["media"]]
@@ -67,7 +78,7 @@ def check_record(window, response, checkpoint, mode, features_root=None):
 
 
 def capture(a):
-    panel = load_set(a.windows, "mimo_v2")
+    panel = load_panel(a)
     if a.out.exists():
         raise ValueError("capture output must be new")
     models = http(a.url.rstrip("/") + "/v1/models", a.bench_token)
@@ -101,7 +112,7 @@ def capture(a):
             raise
         # Retain an invalid response too; it is evidence of a failed live gate.
         write_new(a.out / (leaf + ".json"), response)
-        check_record(window, response, panel["checkpoint"], a.mode, a.features)
+        check_record(window, response, panel["checkpoint"], a.mode, a.features, panel["family"])
         current = response["server"]
         if server is not None and current != server:
             raise ValueError("server build/settings changed during capture")
@@ -190,7 +201,7 @@ def golden_seal(root, panel):
 
 
 def compare(a):
-    panel = load_set(a.windows, "mimo_v2")
+    panel = load_panel(a)
     seal = json.loads(a.golden_seal.read_text())
     if seal != golden_seal(a.golden, panel):
         raise ValueError("golden files differ from immutable seal")
@@ -248,7 +259,7 @@ def compare(a):
             if hashlib.sha256(response_path.read_bytes()).hexdigest() != sealed["response_sha256"]:
                 raise ValueError("capture response changed")
             response = json.loads(response_path.read_text())
-            check_record(window, response, panel["checkpoint"], mode, a.features)
+            check_record(window, response, panel["checkpoint"], mode, a.features, panel["family"])
             if response["server"] != captures[0 if mode == "native" else 1]["server"]:
                 raise ValueError("capture server differs from manifest")
             root = Path(sealed["path"])
@@ -310,11 +321,14 @@ def main():
         compare_parser.add_argument("--" + flag, type=Path, required=True)
     compare_parser.add_argument("--bootstrap", type=int, default=5000)
     compare_parser.add_argument("--seed", type=int, default=20260829)
+    for command in (capture_parser, seal_parser, compare_parser):
+        command.add_argument("--family", choices=FAMILIES, default="mimo_v2",
+                             help="require this family in the pinned set and probe responses")
     args = parser.parse_args()
     if args.action == "capture":
         capture(args)
     elif args.action == "seal":
-        write_new(args.out, golden_seal(args.golden, load_set(args.windows, "mimo_v2")))
+        write_new(args.out, golden_seal(args.golden, load_panel(args)))
     elif not compare(args):
         raise SystemExit(3)
 

@@ -7,8 +7,9 @@ out of every layer as a full-sequence prefill without a cache. Gated DeltaNet
 layers take the chunked path; full-attention layers run the real QSA indexer
 (every token is selected up to 2051 visible tokens, so shorter prompts are
 dense causal GQA) and eager attention. Positions, rotary embeddings and the
-causal mask are built as Qwen4ExpTextModel.forward builds them for a
-text-only prompt. The final collapse is ``hyper_connection_mixer``
+causal mask follow Qwen4ExpTextModel.forward; media windows use the pinned
+Qwen4ExpModel.get_rope_index T/H/W axes and native ids for PLE. The official
+BF16 tower replaces embeddings before their four HC copies. The final collapse is ``hyper_connection_mixer``
 (Qwen4ExpTextGatedResidual without the injection); there is no final norm,
 ``lm_head`` runs in FP32.
 
@@ -68,8 +69,13 @@ from fidelity_windows import CheckpointStorage, LayerCheckpoints, release_checkp
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     manifest = load_set(a.windows, "qwen4")
     from fidelity_media import require_media_flag
-    require_media_flag(manifest, getattr(a, "media", False), "qwen4")
+    media = require_media_flag(manifest, getattr(a, "media", False), "qwen4")
     identity = verify_snapshot(manifest, a.snapshot)
+    if media:
+        from qwen_media import snapshot_identity, validate_window
+        identity.update(snapshot_identity(a.snapshot))
+        for window in manifest["windows"]:
+            validate_window(window)
     from shape_invariant import qualify
     diagnostic_stop = getattr(a, "diagnostic_stop_after", None)
     proof = None if diagnostic_stop is not None else qualify(
@@ -79,6 +85,15 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     if PREFIX + "norm.weight" in dense:
         raise ValueError("unexpected final norm: model feeds stream mixer into lm_head")
     started, times, rows, states = time.time(), [], [], []
+    features, window_positions = {}, []
+    if media:
+        from qwen_media import window_features, rope_positions, inject_embeddings
+        features, _ = window_features(a, manifest)
+    for w in manifest["windows"]:
+        if media:
+            window_positions.append(rope_positions(w, a.snapshot, device="cpu"))
+        else:
+            window_positions.append(torch.arange(len(w["tokens"])).view(1, 1, -1).expand(4, 1, -1))
     checkpoints = None
     if getattr(a, "checkpoint_layers", False) and not getattr(a, "_prefix_probe", False):
         shapes = {w["id"]: [1, len(w["tokens"]), config.hc_count * config.hidden_size] for w in manifest["windows"]}
@@ -102,8 +117,13 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             embed_weight = dense.get(PREFIX + "embed_tokens.weight")
             for w in manifest["windows"]:
                 ids = torch.tensor([w["tokens"]], device="cuda")
-                states.append(torch.nn.functional.embedding(ids, embed_weight).repeat(1, 1, config.hc_count).cpu())
-            del embed_weight, ids
+                embed = torch.nn.functional.embedding(ids, embed_weight)
+                if media:
+                    states.append(inject_embeddings(embed, w, features, config.hc_count).cpu())
+                else:
+                    states.append(embed.repeat(1, 1, config.hc_count).cpu())
+            del embed_weight, ids, embed
+        del features
         rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
         memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(first_layer, config.num_hidden_layers):
@@ -143,8 +163,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             for i, w in enumerate(manifest["windows"]):
                 h = states[i].cuda()
                 ids = torch.tensor([w["tokens"]], device="cuda")
-                t = len(w["tokens"])
-                positions = torch.arange(t, device="cuda").view(1, 1, -1).expand(4, 1, -1)
+                positions = window_positions[i].cuda()
                 # Masks/rotary depend on shape, not on the embedding values; one
                 # hidden-width view matches the original embedding's geometry.
                 embed_shape = h[..., :config.hidden_size]
@@ -371,14 +390,16 @@ def main() -> None:
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
     p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
-    p.add_argument("--media", action="store_true", help="reserved official tower hook; currently fails closed")
+    p.add_argument("--media", action="store_true", help="inject the pinned official BF16 Qwen tower for media windows")
+    p.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
+    p.add_argument("--media-features-out", type=Path, help="write immutable BF16 paired-probe feature files")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
-    if a.media and not a.windows:
-        p.error("--media requires --windows (official media hook not implemented)")
+    if (a.media or a.media_root or a.media_features_out) and not (a.media and a.windows):
+        p.error("media options require --media --windows")
 
     if a.checkpoint_layers and (not a.windows or a.prefix_only or a.diagnostic_stop_after is not None
             or not a.source_seal_sha256 or len(a.source_seal_sha256) != 64

@@ -1,10 +1,14 @@
 """Host-only media identity, fixture and probe-feature contracts."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
+import secrets
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -68,9 +72,68 @@ def require_media_flag(manifest, enabled, family):
         raise ValueError("media windows require explicit --media; refusing text-only scoring")
     if enabled and not present:
         raise ValueError("--media requires pinned media windows")
-    if present and family != "mimo_v2":
+    if present and family not in ("mimo_v2", "qwen4"):
         raise ValueError(f"{family} official media golden is not implemented")
     return present
+
+
+@contextmanager
+def _feature_lock(root):
+    root.mkdir(parents=True, exist_ok=True)
+    # Directory-authorized writers need only read access to the persistent lock.
+    fd = os.open(root / ".features.lock", os.O_RDONLY | os.O_CREAT, 0o666)
+    with os.fdopen(fd, "rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _publish_locked(contents):
+    """Validate every existing member before publishing any new member."""
+    missing = []
+    for path, data in contents:
+        if path.exists():
+            if path.read_bytes() != data:
+                raise ValueError("feature identity reused with different bytes or metadata; feature index is immutable")
+        else:
+            missing.append((path, data))
+    for path, data in missing:
+        temporary = None
+        try:
+            for _ in range(100):
+                candidate = path.parent / (".feature-" + secrets.token_hex(16))
+                try:
+                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                except FileExistsError:
+                    continue
+                temporary = candidate
+                break
+            else:
+                raise FileExistsError("cannot allocate an exclusive feature staging file")
+            # Ordinary creation permissions preserve the caller's umask, unlike mkstemp.
+            with os.fdopen(fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            # Readers see complete bytes; the held lock prevents writer replacement.
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    if missing:
+        directory = os.open(missing[0][0].parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def publish_immutable(path: Path, content: bytes):
+    """Publish complete immutable bytes under the shared feature-set writer lock."""
+    with _feature_lock(path.parent):
+        _publish_locked([(path, content)])
 
 
 def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity: dict):
@@ -91,13 +154,7 @@ def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity
             "sha256": hashlib.sha256(data).hexdigest(), "tower_dtype": tower_dtype,
             "fixture_sha256": span["fixture"]["sha256"], "snapshot_identity": identity}
     encoded = json.dumps(meta, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
-    root.mkdir(parents=True, exist_ok=True)
-    for suffix, content in ((".bf16", data), (".json", encoded)):
-        path = root / (span["key"] + suffix)
-        if path.exists():
-            if path.read_bytes() != content:
-                raise ValueError("feature identity reused with different bytes or metadata")
-        else:
-            with path.open("xb") as output:
-                output.write(content)
+    with _feature_lock(root):
+        _publish_locked([(root / (span["key"] + ".bf16"), data),
+                         (root / (span["key"] + ".json"), encoded)])
     return meta
