@@ -2,10 +2,11 @@
 //!
 //! The context mirrors what Transformers (and vLLM) hand the checkpoint's
 //! template: raw messages with tool-call arguments decoded to objects, the
-//! OpenAI `tools` list, `reasoning_effort` and `clear_thinking`. Two glmrt
-//! behaviors are kept on top of the template: disabled thinking closes the
-//! generation prompt's `<think>` immediately, and `tool_choice` or
-//! `response_format` requirements are stated in leading system messages.
+//! OpenAI `tools` list, `reasoning_effort` and `clear_thinking`. The template
+//! has no off switch, so a request that turns thinking off renders the
+//! server's [`GlmThinkingOff`] form, Low effort by default. As in glmrt,
+//! `tool_choice` and `response_format` requirements are stated in leading
+//! system messages.
 use serde_json::{json, Map, Value};
 
 /// Tool selection after `tool_choice` normalization.
@@ -19,11 +20,46 @@ pub enum GlmToolChoice {
     Named(String),
 }
 
+/// How a request that turns thinking off renders. The checkpoint template
+/// has no off switch: it always opens `<think>`, and of `reasoning_effort`
+/// it reads only "low" and "high", rendering Max for anything else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GlmThinkingOff {
+    /// The template's Low effort with `<think>` left open: the model writes
+    /// a short plan as reasoning, then answers.
+    #[default]
+    Low,
+    /// glmrt's form: an empty `<think></think>` after the default Max effort.
+    Empty,
+}
+
+impl std::str::FromStr for GlmThinkingOff {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "low" => Ok(Self::Low),
+            "empty" => Ok(Self::Empty),
+            _ => Err("thinking off must be low or empty"),
+        }
+    }
+}
+
+/// A GLM request's thinking switch and the effort its template renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlmThinking {
+    /// The prompt opens `<think>`: output starts as reasoning.
+    pub enabled: bool,
+    /// The template's `reasoning_effort` (lowercase), when enabled.
+    pub effort: Option<String>,
+}
+
 /// Request-level prompt settings resolved by the API layer.
 #[derive(Debug, Clone)]
 pub struct GlmPromptOptions {
     /// Open a reasoning block (`<think>`) for the new assistant turn.
     pub thinking: bool,
+    /// The template's `reasoning_effort` when thinking ([`resolve_glm_thinking`]).
+    pub reasoning_effort: Option<String>,
     /// Names of the tools the prompt declares, in request order. Empty when
     /// tools are absent or `tool_choice` is `none`.
     pub tool_names: Vec<String>,
@@ -37,10 +73,19 @@ pub struct GlmPromptOptions {
 /// `reasoning_effort` (`none` disables). Thinking is on by default, matching
 /// the checkpoint's template and the other native profiles.
 pub fn resolve_thinking(body: &Value) -> Result<bool, String> {
+    match thinking_switch(body)? {
+        Some(enabled) => Ok(enabled),
+        None => Ok(reasoning_effort(body)?.as_deref() != Some("none")),
+    }
+}
+
+/// The explicit switch: `thinking.type`, `enable_thinking`, then
+/// `chat_template_kwargs.enable_thinking`.
+fn thinking_switch(body: &Value) -> Result<Option<bool>, String> {
     if let Some(kind) = body.get("thinking").filter(|v| !v.is_null()).map(|v| &v["type"]) {
         return match kind.as_str().map(str::to_ascii_lowercase).as_deref() {
-            Some("enabled" | "adaptive") => Ok(true),
-            Some("disabled") => Ok(false),
+            Some("enabled" | "adaptive") => Ok(Some(true)),
+            Some("disabled") => Ok(Some(false)),
             _ => Err("thinking.type must be enabled, adaptive or disabled".into()),
         };
     }
@@ -48,11 +93,30 @@ pub fn resolve_thinking(body: &Value) -> Result<bool, String> {
         ("chat_template_kwargs.enable_thinking", body.get("chat_template_kwargs").and_then(|v| v.get("enable_thinking")))] {
         match value {
             None | Some(Value::Null) => {}
-            Some(Value::Bool(enabled)) => return Ok(*enabled),
+            Some(Value::Bool(enabled)) => return Ok(Some(*enabled)),
             Some(_) => return Err(format!("{path} must be boolean")),
         }
     }
-    Ok(reasoning_effort(body)?.as_deref() != Some("none"))
+    Ok(None)
+}
+
+/// Resolve a GLM request's thinking switch and template effort. The switch
+/// is [`resolve_thinking`]'s, with two more spellings of off:
+/// `chat_template_kwargs.thinking` false (a boolean alias, after
+/// `enable_thinking`; other values are no switch) and `reasoning_effort`
+/// "minimal", like "none". Off renders as `off` says. On passes the effort
+/// through, but "none" and "minimal", the names of the lowest effort, become
+/// "low": the template would render them as Max.
+pub fn resolve_glm_thinking(body: &Value, off: GlmThinkingOff) -> Result<GlmThinking, String> {
+    let effort = reasoning_effort(body)?;
+    let lowest = matches!(effort.as_deref(), Some("none" | "minimal"));
+    let alias = body.get("chat_template_kwargs").and_then(|v| v.get("thinking")).and_then(Value::as_bool);
+    let low = || Some("low".to_owned());
+    Ok(match (thinking_switch(body)?.or(alias).unwrap_or(!lowest), off) {
+        (true, _) => GlmThinking { enabled: true, effort: if lowest { low() } else { effort } },
+        (false, GlmThinkingOff::Low) => GlmThinking { enabled: true, effort: low() },
+        (false, GlmThinkingOff::Empty) => GlmThinking { enabled: false, effort: None },
+    })
 }
 
 pub(crate) fn reasoning_effort(body: &Value) -> Result<Option<String>, String> {
@@ -108,8 +172,8 @@ pub fn template_context(body: &Value, options: &GlmPromptOptions) -> Result<Valu
     }
     context.insert("add_generation_prompt".into(), Value::Bool(true));
     if options.thinking {
-        if let Some(effort) = reasoning_effort(body)? {
-            context.insert("reasoning_effort".into(), Value::String(effort));
+        if let Some(effort) = &options.reasoning_effort {
+            context.insert("reasoning_effort".into(), Value::String(effort.clone()));
         }
     }
     if let Some(clear) = clear_thinking(body)? {
@@ -205,6 +269,42 @@ mod tests {
     }
 
     #[test]
+    fn glm_thinking_off_forms_render_low_or_empty() {
+        let low = || Ok((true, Some("low".to_owned())));
+        for (body, by_low, by_empty) in [
+            (json!({}), Ok((true, None)), Ok((true, None))),
+            // Every off form: Low with the block open, or the empty block.
+            (json!({"thinking": {"type": "disabled"}}), low(), Ok((false, None))),
+            (json!({"enable_thinking": false}), low(), Ok((false, None))),
+            (json!({"chat_template_kwargs": {"enable_thinking": false}}), low(), Ok((false, None))),
+            (json!({"chat_template_kwargs": {"thinking": false}}), low(), Ok((false, None))),
+            (json!({"reasoning_effort": "none"}), low(), Ok((false, None))),
+            (json!({"reasoning_effort": "minimal"}), low(), Ok((false, None))),
+            (json!({"chat_template_kwargs": {"reasoning_effort": "Minimal"}}), low(), Ok((false, None))),
+            // An off switch wins over the effort.
+            (json!({"thinking": {"type": "disabled"}, "reasoning_effort": "high"}), low(), Ok((false, None))),
+            // Other efforts pass through; the lowest effort's names never reach the template.
+            (json!({"reasoning_effort": "low"}), low(), low()),
+            (json!({"reasoning_effort": "High"}), Ok((true, Some("high".into()))), Ok((true, Some("high".into())))),
+            (json!({"reasoning_effort": "max"}), Ok((true, Some("max".into()))), Ok((true, Some("max".into())))),
+            (json!({"thinking": {"type": "enabled"}, "reasoning_effort": "minimal"}), low(), low()),
+            (json!({"chat_template_kwargs": {"thinking": true}, "reasoning_effort": "none"}), low(), low()),
+            // The alias follows `enable_thinking`; a value that is not boolean is no switch.
+            (json!({"chat_template_kwargs": {"enable_thinking": true, "thinking": false}}), Ok((true, None)), Ok((true, None))),
+            (json!({"chat_template_kwargs": {"thinking": {"type": "disabled"}}}), Ok((true, None)), Ok((true, None))),
+            (json!({"enable_thinking": "no"}), Err(()), Err(())),
+        ] {
+            for (off, expected) in [(GlmThinkingOff::Low, by_low), (GlmThinkingOff::Empty, by_empty)] {
+                let resolved = resolve_glm_thinking(&body, off).map(|t| (t.enabled, t.effort)).map_err(|_| ());
+                assert_eq!(resolved, expected, "{off:?} {body}");
+            }
+        }
+        assert_eq!("low".parse::<GlmThinkingOff>(), Ok(GlmThinkingOff::Low));
+        assert_eq!("empty".parse::<GlmThinkingOff>(), Ok(GlmThinkingOff::Empty));
+        assert!("none".parse::<GlmThinkingOff>().is_err());
+    }
+
+    #[test]
     fn arguments_decode_and_null_content_normalizes() {
         let body = json!({"messages": [
             {"role": "user", "content": "go"},
@@ -212,8 +312,8 @@ mod tests {
                 {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{\"x\": 1}"}},
                 {"id": "b", "type": "function", "function": {"name": "g", "arguments": ""}}]},
             {"role": "tool", "tool_call_id": "a", "content": "1"}]});
-        let options = GlmPromptOptions { thinking: false, tool_names: vec![], tool_choice: GlmToolChoice::Auto,
-            response_format: None };
+        let options = GlmPromptOptions { thinking: false, reasoning_effort: None, tool_names: vec![],
+            tool_choice: GlmToolChoice::Auto, response_format: None };
         let context = template_context(&body, &options).unwrap();
         assert_eq!(context, json!({"messages": [
             {"role": "user", "content": "go"},
@@ -233,8 +333,9 @@ mod tests {
             "reasoning_effort": "High", "thinking": {"type": "enabled", "clear_thinking": true}});
         let format = json!({"type": "json_schema", "json_schema": {"name": "out", "description": "Why",
             "schema": {"type": "object"}}});
-        let options = GlmPromptOptions { thinking: true, tool_names: vec!["b".into()],
-            tool_choice: GlmToolChoice::Named("b".into()), response_format: Some(format) };
+        let thinking = resolve_glm_thinking(&body, GlmThinkingOff::Low).unwrap();
+        let options = GlmPromptOptions { thinking: thinking.enabled, reasoning_effort: thinking.effort,
+            tool_names: vec!["b".into()], tool_choice: GlmToolChoice::Named("b".into()), response_format: Some(format) };
         let context = template_context(&body, &options).unwrap();
         assert_eq!(context["messages"][0]["content"],
             "Return only one valid JSON object matching the JSON Schema named out: {\"type\":\"object\"}\nSchema purpose: Why");

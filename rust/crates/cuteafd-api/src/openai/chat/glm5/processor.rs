@@ -40,7 +40,8 @@ impl<G: ChunkGenerator, P: TextParser> GlmStreamProcessor<G, P> {
     /// Consume inference chunks until a finish chunk, a turn marker or client
     /// stop sequence in the text, or EOF. Completion usage sums the
     /// `content_tokens` of every processed text chunk. A stop by marker or
-    /// backend `Stop` after a tool call finishes with `tool_calls`.
+    /// backend `Stop` after a parsed tool call finishes with `tool_calls`; a
+    /// call returned as content does not count.
     /// `InferenceChunk::Token` is unsupported (the engines send text).
     pub fn process(
         self,

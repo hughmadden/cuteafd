@@ -3,10 +3,23 @@
 //! calls, emitted as protocol-neutral [`OutputChunk`]s.
 //!
 //! Ported from glmrt's `GlmAssistantOutputFilter` and
-//! `GlmToolCallStreamParser`: schema-declared string arguments stream as they
-//! arrive (JSON-escaped), other values wait for `</arg_value>` to keep their
-//! JSON type, text after the first call is dropped, and GLM turn markers end
-//! the output. Results are independent of how the text is chunked.
+//! `GlmToolCallStreamParser`: schema-declared string arguments are
+//! JSON-escaped as they arrive, other values wait for `</arg_value>` to keep
+//! their JSON type, text after the first parsed call is dropped, and GLM turn
+//! markers end the output. A call is held until its closing tag (the SSE
+//! keepalive covers the wait), so a client never sees part of a call that
+//! turns out malformed:
+//!
+//! - a call that cannot be read (closing tag missing, markup in the name,
+//!   arguments without a name, or empty) is returned as content from its
+//!   opening tag;
+//! - a name followed by stray closing tags (`bash</arg_key>`) is recovered
+//!   when what is left is a declared tool;
+//! - an argument that cannot be read (markup in its key, no value) and
+//!   stray text between arguments are dropped from their call, and a
+//!   repeated key keeps its last value, in the place of its first.
+//!
+//! Each case is logged. Results are independent of how the text is chunked.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
@@ -19,6 +32,9 @@ const ARG_KEY: &str = "<arg_key>";
 const ARG_KEY_END: &str = "</arg_key>";
 const ARG_VALUE: &str = "<arg_value>";
 const ARG_VALUE_END: &str = "</arg_value>";
+/// What ends a call's name or stray text in a call: an argument, the
+/// closing tag, or a new call (the closing tag was missing).
+const CALL_TAGS: [&str; 3] = [ARG_KEY, TOOL_CALL_END, TOOL_CALL];
 /// Turn markers that end the assistant message when decoded as text.
 pub const STOP_MARKERS: [&str; 8] = ["<|endoftext|>", "<eop>", "<|system|>", "<|user|>", "<|assistant|>",
     "<|observation|>", "<tool_response>", "</tool_response>"];
@@ -33,6 +49,8 @@ pub struct GlmParserOptions {
     pub tools: Option<Vec<ToolDefinition>>,
     /// Client stop sequences, matched in visible content only.
     pub stop_sequences: Vec<String>,
+    /// The completion id, naming the request in log lines.
+    pub id: String,
 }
 
 /// Why the parser stopped consuming text.
@@ -45,13 +63,27 @@ pub enum GlmStop {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode { Reasoning, Content, Name, Key, ValueStart, Value, KeyOrEnd, Discard, Done }
+enum Mode { Reasoning, Content, Name, Key, ValueStart, Value, KeyOrEnd, Skip, Lost(&'static str), Done }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Marker { ThinkOpen, ThinkClose, Call, Stop, Sequence }
 
-#[derive(Debug)]
-struct Call { name: String, key: Option<String>, arguments: usize, string_open: bool, emitted: bool }
+/// A call being read; nothing of it goes out before its closing tag.
+#[derive(Debug, Default)]
+struct Call {
+    name: String,
+    key: Option<String>,
+    /// Each argument's `"key":value` JSON in pieces (a string value is
+    /// escaped piece by piece as it arrives), in the order keys first appear.
+    arguments: Vec<(String, Vec<String>)>,
+    /// The pieces of the argument being read.
+    value: Vec<String>,
+    string_open: bool,
+    /// The call's text from its opening tag, content again if the call is lost.
+    text: String,
+    /// Whitespace held before the opening tag, kept with a lost call's text.
+    before: String,
+}
 
 #[derive(Debug)]
 pub struct GlmOutputParser {
@@ -60,7 +92,6 @@ pub struct GlmOutputParser {
     pending: String,
     call: Option<Call>,
     calls: usize,
-    saw_tool_call: bool,
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
@@ -70,8 +101,8 @@ impl GlmOutputParser {
     pub fn new(mut options: GlmParserOptions) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
-        Self { options, mode, pending: String::new(), call: None, calls: 0, saw_tool_call: false,
-            content_started: false, held_whitespace: String::new(), stop: None }
+        Self { options, mode, pending: String::new(), call: None, calls: 0, content_started: false,
+            held_whitespace: String::new(), stop: None }
     }
 
     /// Consume generated text; returns the chunks it completes.
@@ -83,17 +114,17 @@ impl GlmOutputParser {
         out
     }
 
-    /// Flush held text at end of output. An open call is closed so its
-    /// arguments stay a JSON object.
+    /// Flush held text at end of output. A call still open never closed: its
+    /// text is returned as content.
     pub fn finish(&mut self) -> Vec<OutputChunk> {
         let mut out = Vec::new();
         if self.mode != Mode::Done {
             while self.step(true, &mut out) {}
-            if self.mode == Mode::Value && self.call.as_ref().is_some_and(|call| call.string_open) {
-                let fragment = std::mem::take(&mut self.pending);
-                out.push(arguments(json_string_contents(&fragment)));
+            if self.call.is_some() {
+                let reason = if let Mode::Lost(reason) = self.mode { reason } else { "closing tag missing" };
+                self.take(self.pending.len());
+                self.lose(reason, &mut out);
             }
-            self.close_call(&mut out);
             self.mode = Mode::Done;
         }
         self.held_whitespace.clear();
@@ -103,7 +134,7 @@ impl GlmOutputParser {
     /// The reason the parser stopped early, if it did.
     pub fn stop(&self) -> Option<&GlmStop> { self.stop.as_ref() }
 
-    /// Tool calls started so far (each produced a `ToolCall` chunk).
+    /// Tool calls parsed so far (each sent its chunks).
     pub fn tool_calls(&self) -> usize { self.calls }
 
     fn tools_enabled(&self) -> bool { self.options.tools.is_some() }
@@ -112,11 +143,12 @@ impl GlmOutputParser {
         match self.mode {
             Mode::Reasoning | Mode::Content => self.step_text(finishing, out),
             Mode::Name => self.step_name(out),
-            Mode::Key => self.step_key(out),
-            Mode::ValueStart => self.step_value_start(out),
-            Mode::Value => self.step_value(out),
+            Mode::Key => self.step_key(),
+            Mode::ValueStart => self.step_value_start(),
+            Mode::Value => self.step_value(),
             Mode::KeyOrEnd => self.step_key_or_end(out),
-            Mode::Discard => self.step_discard(),
+            Mode::Skip => self.step_skip(),
+            Mode::Lost(reason) => self.step_lost(reason, out),
             Mode::Done => false,
         }
     }
@@ -159,9 +191,8 @@ impl GlmOutputParser {
             Marker::ThinkOpen => self.mode = Mode::Reasoning,
             Marker::ThinkClose => self.mode = Mode::Content,
             Marker::Call => {
-                self.held_whitespace.clear();
-                self.saw_tool_call = true;
-                self.call = Some(Call { name: String::new(), key: None, arguments: 0, string_open: false, emitted: false });
+                let before = std::mem::take(&mut self.held_whitespace);
+                self.call = Some(Call { text: TOOL_CALL.into(), before, ..Call::default() });
                 self.mode = Mode::Name;
             }
             Marker::Stop => self.halt(GlmStop::Marker(marker)),
@@ -183,8 +214,13 @@ impl GlmOutputParser {
             out.push(OutputChunk::Reasoning { content: text });
             return;
         }
-        if self.saw_tool_call { return; }
-        let text = if self.content_started { text.as_str() } else { text.trim_start() };
+        if self.calls == 0 { self.emit_content(&text, out); }
+    }
+
+    /// Visible content: leading whitespace is dropped, trailing whitespace
+    /// waits for more content.
+    fn emit_content(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
+        let text = if self.content_started { text } else { text.trim_start() };
         if text.is_empty() { return; }
         self.content_started = true;
         let body = text.trim_end();
@@ -196,36 +232,65 @@ impl GlmOutputParser {
         self.held_whitespace.push_str(trailing);
     }
 
+    /// Consume `length` bytes of pending text; an open call keeps them.
+    fn take(&mut self, length: usize) -> String {
+        let text: String = self.pending.drain(..length).collect();
+        if let Some(call) = self.call.as_mut() { call.text.push_str(&text); }
+        text
+    }
+
+    fn take_whitespace(&mut self) {
+        self.take(self.pending.len() - self.pending.trim_start().len());
+    }
+
+    /// Whether the request declared a tool named `name`.
+    fn offered(&self, name: &str) -> bool {
+        !name.is_empty() && self.options.tools.iter().flatten().any(|tool| tool.name == name)
+    }
+
     fn step_name(&mut self, out: &mut Vec<OutputChunk>) -> bool {
-        let key = self.pending.find(ARG_KEY);
-        let end = self.pending.find(TOOL_CALL_END);
-        let (offset, has_arguments) = match (key, end) {
-            (Some(key), Some(end)) => if key <= end { (key, true) } else { (end, false) },
-            (Some(key), None) => (key, true),
-            (None, Some(end)) => (end, false),
-            (None, None) => return false,
-        };
-        let name = self.pending[..offset].trim().to_owned();
-        if name.is_empty() || name.contains('<') {
-            self.mode = Mode::Discard;
+        let Some((offset, tag)) = first_of(&self.pending, &CALL_TAGS) else { return false; };
+        if tag == TOOL_CALL {
+            self.take(offset);
+            self.lose("closing tag missing before the next call", out);
             return true;
         }
-        self.pending.drain(..offset + if has_arguments { ARG_KEY.len() } else { TOOL_CALL_END.len() });
-        let call = self.call.as_mut().expect("a call is open");
-        call.name = name.clone();
-        call.emitted = true;
-        self.calls += 1;
-        out.push(OutputChunk::ToolCall { tool_name: name, arguments: if has_arguments { "{" } else { "{}" }.into() });
-        if has_arguments { self.mode = Mode::Key; } else { self.call = None; self.mode = Mode::Content; }
+        let written = self.pending[..offset].trim();
+        let name = without_closing_tags(written);
+        let lost = if written.is_empty() {
+            Some(if tag == ARG_KEY { "arguments without a name" } else { "empty call" })
+        } else if written.contains(['<', '>']) && !self.offered(name) {
+            Some("markup in the name")
+        } else {
+            None
+        };
+        if let Some(reason) = lost {
+            self.mode = Mode::Lost(reason);
+            return true;
+        }
+        if name.len() != written.len() {
+            tracing::warn!(id = %self.options.id, tool = name, text = %excerpt(written), "GLM tool call name recovered");
+        }
+        let name = name.to_owned();
+        self.take(offset + tag.len());
+        if tag == TOOL_CALL_END {
+            self.call = None;
+            self.calls += 1;
+            out.push(OutputChunk::ToolCall { tool_name: name, arguments: "{}".into() });
+            self.mode = Mode::Content;
+            return true;
+        }
+        self.call.as_mut().expect("a call is open").name = name;
+        self.mode = Mode::Key;
         true
     }
 
-    fn step_key(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+    fn step_key(&mut self) -> bool {
         let Some(end) = self.pending.find(ARG_KEY_END) else { return false; };
         let key = self.pending[..end].trim().to_owned();
-        self.pending.drain(..end + ARG_KEY_END.len());
-        if key.is_empty() || key.contains('<') {
-            self.enter_discard(out);
+        self.take(end + ARG_KEY_END.len());
+        if key.is_empty() || key.contains(['<', '>']) {
+            self.skip("unreadable argument key", excerpt(&key));
             return true;
         }
         self.call.as_mut().expect("a call is open").key = Some(key);
@@ -233,97 +298,131 @@ impl GlmOutputParser {
         true
     }
 
-    fn step_value_start(&mut self, out: &mut Vec<OutputChunk>) -> bool {
-        trim_start(&mut self.pending);
+    fn step_value_start(&mut self) -> bool {
+        self.take_whitespace();
         if self.pending.starts_with(ARG_VALUE) {
-            self.pending.drain(..ARG_VALUE.len());
+            self.take(ARG_VALUE.len());
             let call = self.call.as_mut().expect("a call is open");
             let key = call.key.as_deref().expect("a key precedes its value");
             if accepts_string(&call.name, key, self.options.tools.as_deref().unwrap_or_default()) {
-                let separator = if call.arguments == 0 { "" } else { "," };
-                call.arguments += 1;
+                call.value.push(format!("{}:\"", serde_json::to_string(key).expect("string key")));
                 call.string_open = true;
-                out.push(arguments(format!("{separator}{}:\"", serde_json::to_string(key).expect("string key"))));
             }
             self.mode = Mode::Value;
             return true;
         }
         if ARG_VALUE.starts_with(self.pending.as_str()) { return false; }
-        self.enter_discard(out);
+        let key = self.call.as_ref().and_then(|call| call.key.as_deref()).map(excerpt).unwrap_or_default();
+        self.skip("argument without a value", key);
         true
     }
 
-    fn step_value(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+    fn step_value(&mut self) -> bool {
         let string_open = self.call.as_ref().expect("a call is open").string_open;
         let Some(end) = self.pending.find(ARG_VALUE_END) else {
             if !string_open { return false; }
             let emit = self.pending.len() - held_prefix(&self.pending, ARG_VALUE_END);
             if emit == 0 { return false; }
-            let fragment: String = self.pending.drain(..emit).collect();
-            out.push(arguments(json_string_contents(&fragment)));
+            let fragment = self.take(emit);
+            self.call.as_mut().expect("a call is open").value.push(json_string_contents(&fragment));
             return true;
         };
-        let raw: String = self.pending.drain(..end).collect();
-        self.pending.drain(..ARG_VALUE_END.len());
+        let raw = self.take(end);
+        self.take(ARG_VALUE_END.len());
         let tools = self.options.tools.as_deref().unwrap_or_default();
         let call = self.call.as_mut().expect("a call is open");
         let key = call.key.take().expect("a key precedes its value");
-        let delta = if call.string_open {
+        let last = if call.string_open {
             call.string_open = false;
             format!("{}\"", json_string_contents(&raw))
         } else {
             let value = parse_value(&call.name, &key, &raw, tools);
-            let separator = if call.arguments == 0 { "" } else { "," };
-            call.arguments += 1;
-            format!("{separator}{}:{}", serde_json::to_string(&key).expect("string key"),
+            format!("{}:{}", serde_json::to_string(&key).expect("string key"),
                 serde_json::to_string(&value).expect("JSON value"))
         };
-        out.push(arguments(delta));
+        call.value.push(last);
+        let value = std::mem::take(&mut call.value);
+        match call.arguments.iter_mut().find(|argument| argument.0 == key) {
+            Some(argument) => {
+                tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
+                    "GLM tool call argument repeated; the last value is kept");
+                argument.1 = value;
+            }
+            None => call.arguments.push((key, value)),
+        }
         self.mode = Mode::KeyOrEnd;
         true
     }
 
     fn step_key_or_end(&mut self, out: &mut Vec<OutputChunk>) -> bool {
-        trim_start(&mut self.pending);
+        self.take_whitespace();
         if self.pending.starts_with(ARG_KEY) {
-            self.pending.drain(..ARG_KEY.len());
+            self.take(ARG_KEY.len());
             self.mode = Mode::Key;
             return true;
         }
         if self.pending.starts_with(TOOL_CALL_END) {
-            self.pending.drain(..TOOL_CALL_END.len());
-            self.close_call(out);
-            self.mode = Mode::Content;
+            self.take(TOOL_CALL_END.len());
+            self.release(out);
             return true;
         }
-        if ARG_KEY.starts_with(self.pending.as_str()) || TOOL_CALL_END.starts_with(self.pending.as_str()) {
-            return false;
+        if self.pending.starts_with(TOOL_CALL) {
+            self.lose("closing tag missing before the next call", out);
+            return true;
         }
-        self.enter_discard(out);
+        if CALL_TAGS.iter().any(|tag| tag.starts_with(self.pending.as_str())) { return false; }
+        self.skip("stray text", excerpt(&self.pending));
         true
     }
 
-    /// Drop malformed call text through `</tool_call>`. A call whose name was
-    /// already streamed is closed so clients never see unbalanced JSON.
-    fn step_discard(&mut self) -> bool {
-        let Some(end) = self.pending.find(TOOL_CALL_END) else { return false; };
-        self.pending.drain(..end + TOOL_CALL_END.len());
-        self.call = None;
+    /// The call closed: send it, a comma before each argument but the first.
+    fn release(&mut self, out: &mut Vec<OutputChunk>) {
+        let call = self.call.take().expect("a call is open");
+        out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
+        for (index, (_, mut pieces)) in call.arguments.into_iter().enumerate() {
+            if index > 0 { pieces[0].insert(0, ','); }
+            out.extend(pieces.into_iter().map(arguments));
+        }
+        out.push(arguments("}".into()));
+        self.calls += 1;
         self.mode = Mode::Content;
+    }
+
+    /// Drop an unreadable argument, or stray text, up to the call's next tag.
+    fn skip(&mut self, reason: &'static str, text: String) {
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = None;
+        tracing::warn!(id = %self.options.id, tool = %call.name, reason, %text, "GLM tool call text dropped");
+        self.mode = Mode::Skip;
+    }
+
+    fn step_skip(&mut self) -> bool {
+        if let Some((index, _)) = first_of(&self.pending, &CALL_TAGS) {
+            self.take(index);
+            self.mode = Mode::KeyOrEnd;
+            return true;
+        }
+        let held = CALL_TAGS.iter().map(|tag| held_prefix(&self.pending, tag)).max().unwrap_or(0);
+        self.take(self.pending.len() - held);
+        false
+    }
+
+    /// A lost call runs through its closing tag, or up to a new call.
+    fn step_lost(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) -> bool {
+        let Some((index, tag)) = first_of(&self.pending, &[TOOL_CALL_END, TOOL_CALL]) else { return false; };
+        self.take(if tag == TOOL_CALL_END { index + tag.len() } else { index });
+        self.lose(reason, out);
         true
     }
 
-    fn enter_discard(&mut self, out: &mut Vec<OutputChunk>) {
-        self.close_call(out);
-        self.mode = Mode::Discard;
-    }
-
-    fn close_call(&mut self, out: &mut Vec<OutputChunk>) {
-        if let Some(call) = self.call.take() {
-            if call.emitted {
-                out.push(arguments(if call.string_open { "\"}" } else { "}" }.into()));
-            }
-        }
+    /// Return a call that cannot be read as content, from its opening tag
+    /// (after the whitespace that preceded it), and log it.
+    fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
+        let call = self.call.take().expect("a call is open");
+        tracing::warn!(id = %self.options.id, reason, text = %excerpt(&call.text), "GLM tool call returned as content");
+        self.held_whitespace = call.before;
+        self.emit_content(&call.text, out);
+        self.mode = Mode::Content;
     }
 }
 
@@ -340,9 +439,29 @@ fn held_prefix(text: &str, marker: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn trim_start(text: &mut String) {
-    let whitespace = text.len() - text.trim_start().len();
-    text.drain(..whitespace);
+/// The earliest of `tags` in `text`: (index, tag).
+fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
+    tags.iter().filter_map(|&tag| text.find(tag).map(|index| (index, tag))).min_by_key(|&(index, _)| index)
+}
+
+/// `name` without the closing tags (`</...>`) and whitespace at its end.
+fn without_closing_tags(name: &str) -> &str {
+    let mut name = name.trim_end();
+    while let Some(head) = name.strip_suffix('>') {
+        match head.rfind("</") {
+            Some(start) if !head[start + 2..].contains(['<', '>']) => name = head[..start].trim_end(),
+            _ => break,
+        }
+    }
+    name
+}
+
+/// A short excerpt of model text for a log line.
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(80) {
+        Some((cut, _)) => format!("{:?}...", &text[..cut]),
+        None => format!("{text:?}"),
+    }
 }
 
 fn json_string_contents(value: &str) -> String {
