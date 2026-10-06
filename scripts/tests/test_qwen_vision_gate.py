@@ -120,7 +120,21 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert "logits.rows = rows;" in engine
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
     assert "Qwen serving graph was not captured at startup" in engine
-    assert "index < layers.len() && !self.warming_graphs.get()" in engine
+    graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]
+    assert "tables.positions.iter().take_while(|&&position| position >= 0).count()" in graphed
+    assert 'if self.startup_graphs { Ok(()) } else { self.moe_front(' in graphed
+    host_experts = graphed[graphed.index("            cur ^= if index") :]
+    assert 'ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked")' in host_experts
+    assert "clear_tail(0..t)?" in host_experts
+    assert "real_row_moe(real_rows, t, |real_rows|" in host_experts
+    assert "self.moe_front(w, index, &layers[index], real_rows, expert_rows)?" in host_experts
+    assert "self.moe_experts(w, index, real_rows, expert_rows, true)" in host_experts
+    assert "}, clear_tail)?" in host_experts
+    assert "self.moe_experts(w, index, t, rows, true)?" in host_experts
+    assert "tail.start * self.cfg.hidden * 2" in host_experts
+    assert "tail.len() * self.cfg.hidden * 2" in host_experts
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/decode_graph.rs").read_text()
+    assert shared.index("run(real)?;") < shared.index("clear(real..bucket)?;")
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     assert 'get QWEN_STARTUP_GRAPHS' in launcher
     assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher

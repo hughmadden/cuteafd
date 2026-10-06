@@ -36,7 +36,7 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use std::cell::{Cell, RefCell};
-use crate::shared::decode_graph::{masked_row, row_bucket as decode_bucket, ROW_BUCKETS as DECODE_BUCKETS};
+use crate::shared::decode_graph::{masked_row, real_row_moe, row_bucket as decode_bucket, ROW_BUCKETS as DECODE_BUCKETS};
 use std::ffi::c_void;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -1886,6 +1886,13 @@ impl<'a> Qwen4Engine<'a> {
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
+        // Bucket tails are a contiguous suffix; expert batches must retain native geometry.
+        let real_rows = if self.startup_graphs {
+            tables.positions.iter().take_while(|&&position| position >= 0).count()
+        } else { t };
+        ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0),
+            "Qwen decode mask is not a contiguous tail");
+        let expert_rows = Scalar::I32(real_rows as i32);
         let mut cur = 0usize;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
@@ -1923,12 +1930,31 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                self.moe_front(w, index, layer, t, rows)
+                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
-            if index < layers.len() && !self.warming_graphs.get() {
-                self.moe_experts(w, index, t, rows, true)?;
-                crate::shared::console::layer_mark(index);
+            if index < layers.len() {
+                if self.startup_graphs {
+                    let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
+                        let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
+                            tail.len() * self.cfg.hidden * 2);
+                        // SAFETY: the masked suffix is inside persistent delta; the next graph
+                        // consumes it on this same stream after the zero and expert output.
+                        unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.stream) }
+                    };
+                    if self.warming_graphs.get() {
+                        ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked");
+                        clear_tail(0..t)?;
+                    } else {
+                        real_row_moe(real_rows, t, |real_rows| {
+                            self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
+                            self.moe_experts(w, index, real_rows, expert_rows, true)
+                        }, clear_tail)?;
+                    }
+                } else if !self.warming_graphs.get() {
+                    self.moe_experts(w, index, t, rows, true)?;
+                }
+                if !self.warming_graphs.get() { crate::shared::console::layer_mark(index); }
             }
         }
         self.last_streams.set((true, cur));
