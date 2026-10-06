@@ -565,10 +565,53 @@ impl VerifyStats {
     }
 }
 
+fn first_prefill_sample<T>(seen: &std::cell::Cell<[bool; 2]>, has_media: bool,
+    sample: impl FnOnce() -> T) -> Option<T> {
+    let index = usize::from(has_media);
+    let mut kinds = seen.get();
+    if kinds[index] { return None; }
+    kinds[index] = true;
+    seen.set(kinds);
+    Some(sample())
+}
+
+#[cfg(test)]
+mod memory_diagnostics_tests {
+    use super::first_prefill_sample;
+    use std::cell::Cell;
+
+    #[test]
+    fn samples_each_prefill_kind_once_even_when_query_is_unavailable() {
+        let seen = Cell::new([false; 2]);
+        let calls = Cell::new(0);
+        for has_media in [false, false, true, true, false, true] {
+            let before = calls.get();
+            let sample = first_prefill_sample(&seen, has_media, || {
+                calls.set(calls.get() + 1);
+                None::<u64>
+            });
+            assert_eq!(sample.is_some(), calls.get() != before);
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(seen.get(), [true, true]);
+    }
+}
+
+fn prefill_memory_sample() -> serde_json::Value {
+    use cuteafd_ffi::memory_ledger::{snapshot, Space};
+    let runtime = cuteafd_ffi::memory_ledger::current_cuda_memory_snapshot();
+    let ledger = snapshot();
+    let device = runtime.as_ref().and_then(|r| r["device"].as_i64());
+    let tracked = device.map(|device| ledger.total(Space::Device, device as i32)
+        + ledger.total(Space::Managed, device as i32));
+    serde_json::json!({"cuda_runtime": runtime, "tracked_device_and_managed_bytes": tracked})
+}
+
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
+    memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
@@ -584,6 +627,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
                 "device_by_scope": ledger.by_scope(Space::Device, device),
                 "managed_by_scope": ledger.by_scope(Space::Managed, device)})).collect();
             stats["memory_ledger"] = serde_json::json!({"devices": devices,
+                "cuda_runtime": cuteafd_ffi::memory_ledger::current_cuda_memory_snapshot(),
+                "first_prefill_boundaries": memory_boundaries.borrow().as_slice(),
                 "pinned_bytes": ledger.rows.iter().filter(|r| r.key.space == Space::Pinned).map(|r| r.bytes).sum::<usize>(),
                 "scope": "idle live allocations tracked through NativeLibrary; runtime contexts, modules, cuBLAS and graph executables excluded"});
         }
@@ -622,12 +667,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
+    let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
+    let first_prefill_seen = std::cell::Cell::new([false; 2]);
     // Per request window: verify steps, and host seconds drafting, verifying
     // (engine step + commit) and selecting/streaming tokens.
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
-    publish(stats, requests, generated_total, 0, 0, &cache, media, preparer, &verify_stats);
+    publish(stats, requests, generated_total, 0, 0, &cache, media, preparer, &verify_stats, &memory_boundaries);
     ready();
     loop {
         while active.len() + prefills.len() < max_sequences {
@@ -644,7 +691,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats, &memory_boundaries);
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -813,6 +860,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
+                // One sample around the first text and first media prefill only;
+                // no extra synchronization and no steady-state decode sampling.
+                let media_index = usize::from(!p.media.spans().is_empty());
+                let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
                     let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
@@ -843,6 +894,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     }
                     Ok(())
                 });
+                if let Some(before) = memory_before {
+                    let boundary = serde_json::json!({"kind": if media_index == 0 { "first-text-prefill" } else { "first-media-prefill" },
+                        "rows": chunk.len(), "success": result.is_ok(), "before": before,
+                        "after": prefill_memory_sample(),
+                        "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
+                    tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
+                    memory_boundaries.borrow_mut().push(boundary);
+                }
                 p.done += chunk.len();
                 add_phases(&mut p.phases, phases);
                 p.busy += timer.elapsed().as_secs_f64();
@@ -1209,7 +1268,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats, &memory_boundaries);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }

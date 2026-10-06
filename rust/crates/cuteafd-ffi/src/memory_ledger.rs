@@ -306,25 +306,74 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
-/// Free and total bytes of `device` from the CUDA runtime already in the
-/// process image (never loads a second runtime), queried on the calling
-/// thread: callers that use the device themselves must restore their device.
-/// `None` before the native library has loaded the runtime.
-pub fn device_memory(device: i32) -> Option<(usize, usize)> {
-    use libloading::os::unix::{Library, Symbol};
-    type SetDevice = unsafe extern "C" fn(i32) -> i32;
-    type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
+    use libloading::os::unix::Library;
     static RUNTIME: OnceLock<Library> = OnceLock::new();
-    let runtime = match RUNTIME.get() {
-        Some(runtime) => runtime,
+    match RUNTIME.get() {
+        Some(runtime) => Some(runtime),
         None => {
             let found = ["libcudart.so.13", "libcudart.so.12"].iter().find_map(|soname| {
                 // SAFETY: RTLD_NOLOAD only binds a runtime that is already loaded.
                 unsafe { Library::open(Some(*soname), 2 | 0x4).ok() }
             })?;
-            RUNTIME.get_or_init(|| found)
+            Some(RUNTIME.get_or_init(|| found))
         }
-    };
+    }
+}
+
+fn cuda_pool_snapshot(mut query: impl FnMut(i32) -> Option<u64>) -> Option<serde_json::Value> {
+    // CUDA 12/13 cudaMemPoolAttr IDs; report a failed query as unknown, not zero.
+    Some(serde_json::json!({
+        "reserved_current_bytes": query(5)?,
+        "reserved_high_bytes": query(6)?,
+        "used_current_bytes": query(7)?,
+        "used_high_bytes": query(8)?,
+    }))
+}
+
+/// Current-device physical memory and CUDA pool telemetry. No device allocation,
+/// synchronization, device switch or runtime loading; unsupported pool queries
+/// remain null, never zero. Call only at idle or a bounded diagnostic boundary.
+pub fn current_cuda_memory_snapshot() -> Option<serde_json::Value> {
+    use libloading::os::unix::Symbol;
+    type GetDevice = unsafe extern "C" fn(*mut i32) -> i32;
+    type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+    type GetPool = unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> i32;
+    type PoolAttribute = unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut std::ffi::c_void) -> i32;
+    let runtime = loaded_cuda_runtime()?;
+    // SAFETY: signatures and attribute IDs match CUDA 12/13's runtime API.
+    // Pointers name local outputs; queries do not mutate stream or pool state.
+    unsafe {
+        let device_fn: Symbol<GetDevice> = runtime.get(b"cudaGetDevice").ok()?;
+        let info: Symbol<MemGetInfo> = runtime.get(b"cudaMemGetInfo").ok()?;
+        let (mut device, mut free, mut total) = (0i32, 0usize, 0usize);
+        if device_fn(&mut device) != 0 || info(&mut free, &mut total) != 0 { return None; }
+        let mut pool_data = serde_json::Value::Null;
+        if let (Ok(get_pool), Ok(attribute)) = (runtime.get::<GetPool>(b"cudaDeviceGetMemPool"),
+            runtime.get::<PoolAttribute>(b"cudaMemPoolGetAttribute")) {
+            let mut pool = std::ptr::null_mut();
+            if get_pool(&mut pool, device) == 0 && !pool.is_null() {
+                pool_data = cuda_pool_snapshot(|id| {
+                    let mut value = 0u64;
+                    (attribute(pool, id, (&mut value as *mut u64).cast()) == 0).then_some(value)
+                }).unwrap_or(serde_json::Value::Null);
+            }
+        }
+        Some(serde_json::json!({"device": device, "physical_free_bytes": free,
+            "physical_total_bytes": total, "cuda_current_pool": pool_data,
+            "scope": "current process/device CUDA runtime queries; no synchronization or pool trimming; CUDA pool bytes are physical telemetry, not additional tracked allocations"}))
+    }
+}
+
+/// Free and total bytes of `device` from the CUDA runtime already in the
+/// process image (never loads a second runtime), queried on the calling
+/// thread: callers that use the device themselves must restore their device.
+/// `None` before the native library has loaded the runtime.
+pub fn device_memory(device: i32) -> Option<(usize, usize)> {
+    use libloading::os::unix::Symbol;
+    type SetDevice = unsafe extern "C" fn(i32) -> i32;
+    type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+    let runtime = loaded_cuda_runtime()?;
     // SAFETY: symbol types match the CUDA runtime API; both calls only touch
     // this thread's device selection and write two integers.
     unsafe {
@@ -369,6 +418,28 @@ mod tests {
         }
         assert_eq!(snapshot().total(Space::Device, 9), 0);
         assert_eq!(snapshot().peak[&(Space::Device, 9)], 3015);
+    }
+
+    #[test]
+    fn cuda_pool_queries_preserve_current_high_and_real_zero() {
+        let mut ids = Vec::new();
+        let pool = cuda_pool_snapshot(|id| {
+            ids.push(id);
+            Some([4096, 8192, 0, 2048][(id - 5) as usize])
+        }).unwrap();
+        assert_eq!(ids, [5, 6, 7, 8]);
+        assert_eq!(pool["reserved_current_bytes"], 4096);
+        assert_eq!(pool["reserved_high_bytes"], 8192);
+        assert_eq!(pool["used_current_bytes"], 0);
+        assert_eq!(pool["used_high_bytes"], 2048);
+    }
+
+    #[test]
+    fn cuda_pool_failed_attribute_is_unknown_not_zero() {
+        for failed in 5..=8 {
+            assert!(cuda_pool_snapshot(|id| (id != failed).then_some(0)).is_none());
+        }
+        assert!(cuda_pool_snapshot(|_| None).is_none());
     }
 
     #[test]

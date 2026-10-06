@@ -108,3 +108,36 @@ def test_glm_g1_reads_actual_nested_processor(tmp_path):
         (tmp_path / "processor_config.json").write_text(json.dumps(invalid))
         with pytest.raises(ValueError):
             module.glm_processor_config(tmp_path)
+
+
+def test_glm_memory_diagnostics_do_not_change_cuda_state():
+    source = (ROOT / "rust/crates/cuteafd-ffi/src/memory_ledger.rs").read_text()
+    binding = source.split("fn loaded_cuda_runtime()", 1)[1].split("fn cuda_pool_snapshot", 1)[0]
+    assert "RTLD_NOLOAD" in binding and "2 | 0x4" in binding
+    query = source.split("pub fn current_cuda_memory_snapshot()", 1)[1].split("pub fn device_memory", 1)[0]
+    for symbol in ("cudaGetDevice", "cudaMemGetInfo", "cudaDeviceGetMemPool", "cudaMemPoolGetAttribute"):
+        assert symbol in query
+    for forbidden in ("cudaSetDevice", "cudaDeviceSynchronize", "cudaStreamSynchronize",
+                      "cudaMemPoolTrimTo", "cudaMalloc", "cudaFree"):
+        assert forbidden not in query
+    assert "serde_json::Value::Null" in query
+    serving = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/serve.rs").read_text()
+    idle = serving.split("fn publish(", 1)[1].split("fn schedule(", 1)[0]
+    assert idle.index("if active == 0 && prefilling == 0") < idle.index("current_cuda_memory_snapshot()")
+    assert '"first_prefill_boundaries"' in idle
+    assert "first_prefill_sample(&first_prefill_seen" in serving
+    assert "media encoder preparation precedes this boundary" in serving
+
+
+def test_blas_handle_diagnostics_log_only_after_successful_creation():
+    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    logging = source.split("void log_blas_handle_created(", 1)[1].split("cuteafd_status_t cublas_handle", 1)[0]
+    assert "pthread_getname_np" in logging
+    assert "configured_workspace=runtime-default configured_workspace_bytes=unknown" in logging
+    assert "cuda" not in logging and "cublas" not in logging
+    blas = source.split("cuteafd_status_t cublas_handle(", 1)[1].split("\n}", 1)[0]
+    lt = source.split("cublasLtHandle_t cublaslt_handle()", 1)[1].split("\n}", 1)[0]
+    assert blas.index("cublasCreate(&handle)") < blas.index("return status_from_cublas(status)") < blas.index('log_blas_handle_created("cublas")')
+    assert lt.index("cublasLtCreate(&handle)") < lt.index("return nullptr") < lt.index('log_blas_handle_created("cublasLt")')
+    assert "static thread_local" in blas and "static thread_local" in lt
+    assert "cublasSetWorkspace" not in blas + lt
