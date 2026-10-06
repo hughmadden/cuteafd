@@ -777,6 +777,25 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--decode-row-buckets) ;;
     *) echo "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_DRAFT_HEAD: the drafter's vocabulary head over the BF16 head, exact (default: as the
+  # target's own head, FP32 products and sums on CUDA cores) or tensor (from two draft blocks of 8
+  # rows, a BF16 tensor-core GEMM with FP32 accumulation that reads the head once). Drafts only:
+  # the target verifies every proposal.
+  draft_head="$(get GLM5_FLASH_DRAFT_HEAD exact)"
+  case "$draft_head" in
+    ""|exact) ;;
+    tensor) family_args+=(--draft-head tensor) ;;
+    *) echo "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_DRAFT_LINEAR: the FP8 drafter's GEMMs, w8a16 (default: the W8A16 GEMV in passes of
+  # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
+  # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
+  draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR w8a16)"
+  case "$draft_linear" in
+    ""|w8a16) ;;
+    wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
+    *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
