@@ -50,6 +50,10 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
+    /// Slots of the prefix mark arena the command allocates on every GPU (serve: its prefix
+    /// cache; golden: the --resume-at check), reserved before an automatic pool is sized.
+    #[arg(skip)]
+    pub planner_mark_slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
@@ -573,7 +577,7 @@ impl Opened {
                 else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 }) };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, args.slots,
+                args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra)?
         } else {
             args.pool_tokens
@@ -716,6 +720,8 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
+    // --resume-at captures into two arena marks (`prefix::resume_check`).
+    args.engine.planner_mark_slots = if args.resume_at.is_some() { 2 } else { 0 };
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 

@@ -29,7 +29,7 @@ use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
-use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::families::glm5::dflash_policy::{self, DraftHistory, Shape};
 use super::{open, Opened};
@@ -167,10 +167,15 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs) -> Result<()> {
-    let opened = match open(&args) {
+    // The planner reserves the mark arena `prefix_cache` will allocate.
+    let opened = match open(&args).and_then(|opened| {
+        let layers = args.layers.unwrap_or(opened.cfg.layers).min(opened.cfg.layers);
+        args.planner_mark_slots = arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(DECODE_ROWS))?;
+        Ok(opened)
+    }) {
         Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(anyhow::anyhow!("{error:#}")));
@@ -188,7 +193,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
-            decode_share, &prefix, args.token_io.token_select)
+            decode_share, &prefix, args.planner_mark_slots, args.token_io.token_select)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -355,14 +360,24 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// The mark arena slots [`prefix_cache`] allocates for `lanes` decoding sequences over the
+/// first `layers` layers, from the checkpoint alone: the planner reserves them before the pool.
+pub(crate) fn arena_mark_slots(args: &PrefixArgs, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig,
+    layers: usize, lanes: usize) -> Result<usize> {
+    let geometry = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(cfg, layers)?;
+    Ok(args.mark_slots(lanes, usize::try_from(geometry.ranks[0].retained_mark_bytes)?))
+}
+
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
-/// its mark arena sized for `lanes` decoding sequences.
-fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: usize)
+/// its mark arena sized for `lanes` decoding sequences: the `planned` slots the KV admission
+/// reserved ([`arena_mark_slots`]).
+fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: usize, planned: usize)
     -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
-    let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
+    let family = GlmfPrefix::new(engine, |mark| args.mark_slots(lanes, mark))?;
+    anyhow::ensure!(family.slots() == planned, "the prefix mark arena holds {} marks of {} B, the KV admission \
+        reserved {planned}", family.slots(), family.mark_bytes());
     let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
@@ -412,9 +427,9 @@ pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assis
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement)
-    -> Result<()> {
-    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
+    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, mark_slots: usize,
+    select: SelectPlacement) -> Result<()> {
+    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences, mark_slots)?;
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
     let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();

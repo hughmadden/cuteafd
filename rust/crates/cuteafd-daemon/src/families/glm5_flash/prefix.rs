@@ -398,6 +398,62 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
 mod tests {
     use super::super::engine::{Allocator, GlmfPlacement};
 
+    /// GLM-5.3-Flash's text config: 34 KDA layers (64 heads of 128) and 11 MLA layers.
+    fn glm53_flash() -> cuteafd_loader::families::glm5_flash::GlmNextConfig {
+        let types: Vec<&str> = (0..45).map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" })
+            .collect();
+        let mlp: Vec<&str> = (0..45).map(|l| if l < 3 { "dense" } else { "sparse" }).collect();
+        cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&serde_json::json!({
+            "model_type": "glm5_next", "text_config": {
+                "model_type": "glm5_next_text", "vocab_size": 154880, "hidden_size": 4096, "num_hidden_layers": 45,
+                "layer_types": types, "mlp_layer_types": mlp, "intermediate_size": 12288, "n_routed_experts": 288,
+                "num_experts_per_tok": 8, "moe_intermediate_size": 2048, "routed_scaling_factor": 2.5,
+                "swiglu_limit": 10.0, "rms_norm_eps": 1e-5, "hc_mult": 4, "mla_use_nope": true,
+                "qk_rope_head_dim": 0, "num_attention_heads": 64, "q_lora_rank": 1536, "kv_lora_rank": 512,
+                "qk_nope_head_dim": 256, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4,
+                "eos_token_id": [154820, 154827, 154829],
+                "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4,
+                                       "gate_lower_bound": -5.0}}})).unwrap()
+    }
+
+    /// The KV admission reserves the engine's own state: the planner's mark and replay bytes
+    /// are the engine's slot regions and replay records (per GPU of a head split too), and the
+    /// arena slots it reserves are the ones `prefix_cache` allocates (2C + 2 for 147.6 MB marks).
+    #[test]
+    fn the_planner_reserves_the_marks_and_replay_records_the_engine_allocates() {
+        use super::super::engine::kda_layer_bytes;
+        use crate::shared::prefix::PrefixArgs;
+        use clap::Parser;
+        use cuteafd_loader::families::glm5_flash::GlmNextAttention;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            prefix: PrefixArgs,
+        }
+        let cfg = glm53_flash();
+        let kda = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Kda).count();
+        for ranks in [1, 2] {
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks)
+                .unwrap();
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks);
+            let rank = &geometry.ranks[0];
+            assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes),
+                ((kda * (state + conv)) as u64, (kda * (state + conv)) as u64));
+            assert_eq!(rank.speculative_replay_bytes, (kda * replay) as u64);
+        }
+        let mark = kda * (kda_layer_bytes(&cfg, cfg.kda_heads).0 + kda_layer_bytes(&cfg, cfg.kda_heads).1);
+        assert_eq!((mark, kda * kda_layer_bytes(&cfg, cfg.kda_heads).2), (147_619_840, 321_421_312));
+        let prefix = Cli::parse_from(["serve"]).prefix;
+        for (lanes, slots) in [(4, 14), (8, 18), (16, 34), (64, 130)] {
+            let planned = super::super::serve::arena_mark_slots(&prefix, &cfg, cfg.layers, lanes).unwrap();
+            let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
+                prefix.prefix_cache_mark_mib << 20);
+            assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes");
+        }
+        let off = PrefixArgs { prefix_cache_entries: 0, ..prefix };
+        assert_eq!(super::super::serve::arena_mark_slots(&off, &cfg, cfg.layers, 16).unwrap(), 0);
+    }
+
     #[test]
     fn units_expand_to_mla_and_pool_pages_and_forks_share_whole_units() {
         let p = GlmfPlacement::new(vec![2, 0], 1);

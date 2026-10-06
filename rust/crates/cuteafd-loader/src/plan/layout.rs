@@ -111,7 +111,8 @@ pub struct FamilyCosts {
     pub exchange_bytes: u64,
     /// The family's default drafter (weights and its buffers) on the lead GPU.
     pub drafter_bytes: u64,
-    /// Prefix-cache mark slots resident on the device (per GPU).
+    /// V4.1's snapshot arena slots, and Qwen's admission fallback for commands without a
+    /// serving arena. Generic families' serving arenas follow [`default_mark_slots`].
     pub mark_slots: u64,
     /// Native MTP layers stay resident (false: the default drafter replaces them).
     pub mtp_resident: bool,
@@ -170,7 +171,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             workspace_bytes: [gib(290), gib(249), gib(120)],
             exchange_bytes: gib(38),
             drafter_bytes: gib(321),
-            mark_slots: 42,
             mtp_resident: false,
             spark_workspace_bytes: gib(51),
             spark_ring_bytes: gib(117),
@@ -182,7 +182,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             graph_bytes: [gib(150), gib(150), gib(150)],
             workspace_bytes: [gib(472), gib(472), gib(472)],
             drafter_bytes: gib(324),
-            mark_slots: 18,
             mtp_resident: false,
             spark_workspace_bytes: gib(56),
             spark_ring_bytes: gib(78),
@@ -193,7 +192,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             graph_bytes: [gib(35), gib(40), gib(25)],
             workspace_bytes: [gib(480), gib(414), gib(355)],
             exchange_bytes: gib(31),
-            mark_slots: 18,
             spark_workspace_bytes: gib(35),
             spark_ring_bytes: gib(52),
             ..generic
@@ -219,6 +217,16 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         },
         _ => generic,
     }
+}
+
+/// The device mark arena a generic family's server allocates for `concurrency` decoding
+/// sequences at the default prefix knobs ([`cuteafd_core::prefix::mark_slots`], the rule the
+/// runtime's `MarkArena` sizes by), for marks of `mark_bytes` over every rank.
+pub fn default_mark_slots(concurrency: u64, mark_bytes: u64) -> u64 {
+    use cuteafd_core::prefix::{mark_slots, DEFAULT_ENTRIES, DEFAULT_MARK_BUDGET_MIB};
+    let lanes = usize::try_from(concurrency).unwrap_or(usize::MAX);
+    let bytes = usize::try_from(mark_bytes).unwrap_or(usize::MAX);
+    mark_slots(lanes, DEFAULT_ENTRIES, bytes, DEFAULT_MARK_BUDGET_MIB << 20) as u64
 }
 
 fn share_of(family: &str, component: Component) -> Share {
@@ -514,7 +522,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         if let Ok(Some(cache)) = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
             native_mtp_layers: cache_native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
             let mark_bytes: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-            let slots = options.prefix_slots.unwrap_or(42.min(2 * GIB / mark_bytes.max(1)).max(2 * concurrency + 2));
+            let slots = options.prefix_slots.unwrap_or_else(|| default_mark_slots(concurrency, mark_bytes));
             let state = cache.ranks[0].active_state_per_sequence_bytes * options.state_slots.unwrap_or(concurrency)
                 + cache.ranks[0].fixed_state_bytes + cache.ranks[0].context_table_bytes_per_token * context_tokens;
             let role = if active_gpus == 1 { 0 } else { 1 };
@@ -609,10 +617,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 };
             }
             let marks = options.prefix_slots.unwrap_or_else(|| {
-                if matches!(family, "deepseek_v4" | "qwen4") {
+                if family == "deepseek_v41" { costs.mark_slots } else {
+                    // A generic family's arena, as its server sizes it at the default knobs.
                     let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                    42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
-                } else { costs.mark_slots }
+                    default_mark_slots(concurrency, bytes)
+                }
             });
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)

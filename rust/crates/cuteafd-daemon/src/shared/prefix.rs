@@ -13,12 +13,12 @@ pub(crate) use budget::HostBudget;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct PrefixArgs {
     /// Retained snapshots per bank (prompts, completed turns); 0 turns the prefix cache off.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = cuteafd_core::prefix::DEFAULT_ENTRIES)]
     pub prefix_cache_entries: usize,
     /// Device memory for retained positional marks (SWA rows, MTP hidden rows, recurrent
     /// state), MiB; the arena holds two marks per entry pair while they fit, and never fewer
     /// than two per decoding sequence plus two.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = 2048)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = cuteafd_core::prefix::DEFAULT_MARK_BUDGET_MIB)]
     pub prefix_cache_mark_mib: usize,
     /// Shortest prompt or turn worth a snapshot.
     #[arg(long, default_value_t = 64)]
@@ -58,6 +58,14 @@ pub(crate) enum Toggle {
 }
 
 impl PrefixArgs {
+    /// Slots of the device mark arena for marks of `mark_bytes` (every rank's part) and `lanes`
+    /// decoding sequences: what the runtime allocates and what its planner reserves
+    /// ([`cuteafd_core::prefix::mark_slots`]).
+    pub fn mark_slots(&self, lanes: usize, mark_bytes: usize) -> usize {
+        cuteafd_core::prefix::mark_slots(lanes, self.prefix_cache_entries, mark_bytes,
+            self.prefix_cache_mark_mib.saturating_mul(1 << 20))
+    }
+
     pub fn points(&self) -> PointPolicy {
         PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
             per_request: self.prefix_points_per_request }
