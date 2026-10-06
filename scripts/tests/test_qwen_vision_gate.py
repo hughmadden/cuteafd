@@ -87,6 +87,18 @@ def test_qwen_diagnostic_fixture_geometry(tokens):
     assert rgb.dtype == np.uint8 and rgb.flags.c_contiguous
 
 
+def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
+    api = (ROOT / "rust/crates/cuteafd-api/src/openai/probe.rs").read_text()
+    assert serve.index("probe.spec.validate_cold_steps(") < serve.index('probe::admitted(&job.probe, "qwen4"')
+    assert "probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new()" in serve
+    assert "probe.spec.cold_steps.get(p.chunks)" in serve
+    assert "let logits = if decode {\n                        engine.verify_device" in serve
+    assert "} else { engine.prefill_device(&mut p.placement, chunk, None, None, 1)? };" in serve
+    assert 'matches!(engine, "mimo_v2" | "qwen4")' in api
+    assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
+
+
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     # At rectangular sizes a precomputed ratio changes taps by an FP32 ULP.
     positions = np.arange(256,dtype=np.float32)
