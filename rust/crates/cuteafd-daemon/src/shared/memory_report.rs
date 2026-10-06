@@ -203,14 +203,17 @@ pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot
     drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
     requested: Option<u64>, future_expert_bytes: u64) -> anyhow::Result<usize> {
     planned_pool_tokens_with_extra(library, snapshot, devices, drafter, prefill_rows, slots, requested,
-        future_expert_bytes, 0)
+        future_expert_bytes, 0, Default::default())
 }
 
 /// As `planned_pool_tokens`, also reserving a family's optional per-GPU
-/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool.
+/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool,
+/// with GLM Flash's DSA index cache layout `glmf_index`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
     devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
-    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64) -> anyhow::Result<usize> {
+    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64,
+    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache) -> anyhow::Result<usize> {
     use anyhow::Context;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
@@ -220,7 +223,7 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
     let glmf = family.id() == "glm5_flash";
     let cache_ranks = if glmf { 1 } else { devices.len() };
     let geometry = model.cache_geometry(cuteafd_loader::serving_capacity::CacheOptions {
-        coordinator_ranks: cache_ranks, ..Default::default() })?
+        coordinator_ranks: cache_ranks, glmf_index, ..Default::default() })?
         .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
     let costs = cuteafd_loader::plan::layout::family_costs(family.id());
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
