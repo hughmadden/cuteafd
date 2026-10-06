@@ -471,6 +471,58 @@ mod tests {
 }
 
 /// See `GoldenArgs::bench_verify`.
+/// glmf-golden --bucket-check N: every speculative verify step of 17..=N rows (one sequence)
+/// that a row bucket pads runs padded and unpadded from the same prefilled state; the real rows'
+/// logits, the committed KDA state and the sequence's paged rows must be the same bits.
+pub(super) fn bucket_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
+    ensure!(engine.row_buckets_available(), "--bucket-check needs --decode-row-buckets (the scratch page)");
+    let sequence = tokens(args)?;
+    let max_rows = max_rows.min(engine.decode_rows);
+    let prefill = replay_bounds(sequence.len(), max_rows, args.prefill, engine.decode_rows)?;
+    let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
+    let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
+    let fresh = || -> Result<GlmfPlacement> {
+        let mut placement = allocator.borrow_mut().admit(prefill + max_rows + 1)?;
+        engine.prefill(&mut placement, &sequence[..prefill], None)?;
+        Ok(placement)
+    };
+    let (mut padded_steps, mut identical) = (0usize, 0usize);
+    for rows in 17..=max_rows {
+        let bucket = super::engine::row_bucket_within(rows, engine.verify_rows);
+        if bucket == rows {
+            continue;
+        }
+        padded_steps += 1;
+        let embed = &sequence[prefill..prefill + rows];
+        let mut arms = Vec::new();
+        for padded in [false, true] {
+            engine.set_row_buckets(padded)?;
+            let mut placement = fresh()?;
+            let start = placement.len;
+            let logits = engine.verify_spec(&mut [(&mut placement, rows)], embed)?
+                .context("--bucket-check needs every layer")?;
+            finite_logits(&logits)?;
+            engine.commit(&[(placement.slot, 0, rows)])?;
+            placement.len = start + rows;
+            placement.kda_len = placement.len;
+            let state = engine.slot_state(placement.slot)?;
+            let paged = super::prefix::paged_rows(&family, &placement, placement.len)?;
+            arms.push((logits, state, paged));
+            allocator.borrow_mut().release(placement);
+        }
+        engine.set_row_buckets(true)?;
+        let (logits, state, paged) = (exact_logits(&arms[0].0, &arms[1].0), arms[0].1 == arms[1].1,
+            arms[0].2 == arms[1].2);
+        let verdict = |same: bool| if same { "identical" } else { "DIFFER" };
+        println!("{rows} rows padded to {bucket}: logits {}, committed KDA state {}, paged rows {}",
+            verdict(logits), verdict(state), verdict(paged));
+        identical += usize::from(logits && state && paged);
+    }
+    println!("bucket check: {identical}/{padded_steps} padded steps identical to their unpadded steps");
+    ensure!(identical == padded_steps, "padded decode steps differ from their unpadded steps");
+    Ok(())
+}
+
 pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
     let count = args.bench_sequences.max(1);

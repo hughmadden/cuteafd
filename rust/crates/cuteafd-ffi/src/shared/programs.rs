@@ -222,12 +222,26 @@ impl<'a> Programs<'a> {
     /// Loads every program's kernels on the current device (startup, before
     /// the first request pays for it).
     pub fn load_all(&self) -> Result<()> {
+        self.load_matching(|_| true).map(|_| ())
+    }
+
+    /// Loads the kernels of the programs whose names `keep` accepts on the current device, and
+    /// returns how many it loaded and skipped. A skipped program still loads when it is first
+    /// resolved ([`Self::program`]), so `keep` must accept every program a caller launches where
+    /// a lazy load cannot happen (inside a stream capture).
+    pub fn load_matching(&self, keep: impl Fn(&str) -> bool) -> Result<(usize, usize)> {
+        let (mut loaded, mut skipped) = (0, 0);
         for (name, (index, _)) in &self.programs {
+            if !keep(name) {
+                skipped += 1;
+                continue;
+            }
             // SAFETY: loading reads the static table and loads a CUDA library.
             let status = unsafe { (self.load)(*index) };
             ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+            loaded += 1;
         }
-        Ok(())
+        Ok((loaded, skipped))
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {

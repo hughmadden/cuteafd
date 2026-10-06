@@ -717,6 +717,33 @@ if [[ $family == glm5_flash ]]; then
     echo "note: HOST_CACHE_BYTES=auto sizes the RAM tier for $(get PREFIX_CACHE_ENTRIES 20) snapshots a bank of" \
       "MAX_CONTEXT_TOKENS=$glmf_context tokens, up to all but 10% of free RAM; set HOST_CACHE_BYTES (e.g. 64GiB) to bound it" >&2
   fi
+  # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
+  # own 321 MB at 64 decode rows, 643 MB at 128) or shared (the prefill lanes' scratch, which no
+  # decode step reads). One GPU with an automatic pool and Spark experts.
+  replay_records="$(get GLM5_FLASH_REPLAY_RECORDS own)"
+  case "$replay_records" in
+    ""|own) ;;
+    shared)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--replay-records shared) ;;
+    *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_DECODE_ROW_BUCKETS: on pads every speculative step past 16 rows to a row bucket (4-row
+  # steps to 64, 8-row steps to 128), so the decode graphs hold a few row shapes. One GPU; off by default.
+  row_buckets="$(get GLM5_FLASH_DECODE_ROW_BUCKETS off)"
+  case "$row_buckets" in
+    ""|off) ;;
+    on)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_DECODE_ROW_BUCKETS=on pads one GPU's decode steps; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--decode-row-buckets) ;;
+    *) echo "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

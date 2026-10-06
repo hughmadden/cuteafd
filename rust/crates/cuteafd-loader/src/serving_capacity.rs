@@ -285,6 +285,28 @@ pub fn glm_flash_rank_cache_geometry(
 /// (`--decode-rows`, at least the `_m64` programs' 64): the speculative replay records (every
 /// KDA layer's, and the compact index cache's key | gate records) and the commit tables hold
 /// that many rows.
+/// GLM 5.3 Flash's KDA speculative replay records on one GPU (`ranks` 1) or on each GPU of a
+/// head split: every KDA layer's record of `decode_rows` rows (k | decay | v and beta FP32 per
+/// row and head, the q/k/v in-projection row BF16). The KDA part of the geometry's
+/// `speculative_replay_bytes` (the compact index cache adds its key | gate records); what the
+/// engine places in the prefill lanes' scratch with `--replay-records shared`.
+pub fn glm_flash_kda_replay_bytes(cfg: &GlmNextConfig, layers: usize, ranks: usize, decode_rows: u64)
+    -> Result<u64, CacheGeometryError> {
+    selected("glm5_flash", cfg.layers, layers)?;
+    if ![1, 2].contains(&ranks) || cfg.kda_heads % ranks != 0 || cfg.attention.len() != cfg.layers {
+        return Err(CacheGeometryError::Unsupported { family: "glm5_flash", what: "KDA replay geometry" });
+    }
+    let kda = cfg.attention[..layers].iter().filter(|&&a| a == GlmNextAttention::Kda).count() as u64;
+    let heads = (cfg.kda_heads / ranks) as u64;
+    let channels = product("KDA channels", &[heads, cfg.kda_head_dim as u64])?;
+    let replay = sum("KDA replay", &[
+        product("KDA recurrent replay", &[decode_rows, heads, 3, 128, 4])?,
+        product("KDA beta replay", &[decode_rows, heads, 4])?,
+        product("KDA conv replay", &[decode_rows, 3, channels, 2])?,
+    ])?;
+    product("GLM Flash KDA replay", &[kda, replay])
+}
+
 pub fn glm_flash_rank_cache_geometry_rows(
     cfg: &GlmNextConfig,
     layers: usize,
@@ -738,6 +760,18 @@ mod tests {
         // 34 x 9,453,568 B of KDA records at 64 rows (the base ledger's 321,421,312), twice that at 128.
         let keys = glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, GlmfIndexCache::Keys, 4, 128).unwrap();
         assert_eq!(keys.ranks[0].speculative_replay_bytes, 642_842_624);
+        // The KDA part on its own: every geometry's replay bytes less the compact index's records.
+        for (rows, ranks, bytes) in [(64, 1, 321_421_312), (128, 1, 642_842_624), (64, 2, 160_710_656)] {
+            assert_eq!(glm_flash_kda_replay_bytes(&cfg, 45, ranks, rows).unwrap(), bytes);
+            // The compact index cache is one GPU's.
+            let caches: &[(GlmfIndexCache, u64)] = if ranks == 1 {
+                &[(GlmfIndexCache::Keys, 0), (GlmfIndexCache::Compact, 11 * rows * 512)]
+            } else { &[(GlmfIndexCache::Keys, 0)] };
+            for &(index, records) in caches {
+                let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 45, ranks, index, 4, rows).unwrap();
+                assert_eq!(geometry.ranks[0].speculative_replay_bytes, bytes + records);
+            }
+        }
         let compact = glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, GlmfIndexCache::Compact, 4, 128).unwrap();
         assert_eq!(compact.ranks[0].speculative_replay_bytes, 642_842_624 + 11 * 128 * 512);
         // The head split halves the KDA records at either width.
