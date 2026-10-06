@@ -189,9 +189,10 @@ def main() -> int:
 
     failures = 0
     # One zeroed scratch per capacity, as large as either program's, never zeroed again (the engine's).
-    scratch = {key[:2]: torch.zeros((max(programs[(key[0], key[1], p)].scratch_bytes(key[1])["scratch"]
-                                        for p in (base_pages, long_pages)),), dtype=torch.uint8, device=device)
-               for key in programs}
+    scratch = {}
+    for mode, rows in {key[:2] for key in programs}:
+        size = max(programs[(mode, rows, pages)].scratch_bytes(rows)["scratch"] for pages in (base_pages, long_pages))
+        scratch[(mode, rows)] = torch.zeros((size,), dtype=torch.uint8, device=device)
     cases = [("decode", 64, 1, False), ("decode", 64, 64, True), ("decode", 128, 128, False),
              ("prefill", 4096, 1, False), ("prefill", 4096, 512 if args.quick else 4096, True)]
     for seed, (mode, cap, rows, high) in enumerate(cases):
