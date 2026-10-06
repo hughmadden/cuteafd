@@ -13,6 +13,8 @@ restart=0
 family=""
 embedding_override=""
 wip_slot=""
+# GLM5_FLASH_MEMORY=auto re-runs this launch with the arguments it was given (below).
+launch_args=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
@@ -41,15 +43,6 @@ coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
 coordinator_budget_args=()
 [[ -z "$coordinator_budget" ]] || coordinator_budget_args=(--coordinator-gpu-budget-gib "$coordinator_budget")
-# RDMA_BOND_BALANCE: the coordinator's expert QPs connect with RoCE v2 flow labels it chooses,
-# so a coordinator port that is an LACP bond carries as many of them on each member: off
-# (default: the kernel's per-QP labels, re-rolled at every start), labels (fixed labels, the
-# same placement at every start) or probe (labels measured onto alternating members; see
-# rust/crates/cuteafd-transport/src/bond.rs). Workers need no setting.
-bond_balance="$(get RDMA_BOND_BALANCE off)"
-case "$bond_balance" in off|labels|probe) ;; *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;; esac
-bond_args=()
-[[ "$bond_balance" == off ]] || bond_args=(-e "CUTEAFD_RDMA_BOND_BALANCE=$bond_balance")
 # Validate the name before it is used to identify allocations during admission.
 instance="$(get INSTANCE)"
 [[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
@@ -106,6 +99,101 @@ case "$backend" in
   local) ranks=0 ;;
   *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
 esac
+# GLM5_FLASH_MEMORY (GLM 5.3 Flash): standard (the default: the settings as configured), compact or
+# auto. compact is the profile measured on 1 RTX 5090 + 4 DGX Sparks at 16 sequences, each setting
+# gated: the compact DSA index and a BF16 KDA state over the checkpoint-precision KDA projections and
+# head (every compact measurement ran at checkpoint precision), prefix marks in the pool with a 64 GiB
+# host tier, the embedding in host RAM, 1 GiB of headroom, a 512 MiB graph budget with row buckets,
+# replay records in the prefill scratch, 128-row decode steps, the gb10 Spark schedule, the probed
+# bond split and the tensor-core W8A8 drafter (1,683,456 KV tokens beside 131,072-token requests, and
+# one 1,048,576-token request). auto lays the standard settings out with `cuteafd plan --layout` on the
+# coordinator GPU's free memory for CONCURRENCY sequences and MAX_CONTEXT_TOKENS, keeps them when that
+# pool holds one MAX_CONTEXT_TOKENS request and 65,536 tokens for each other sequence, and takes
+# compact when it cannot. GLM5_FLASH_PROFILE=rtx5090 names compact. A key the config sets keeps its
+# value: the profile fills in the others, and the launch notes each value it sets and each it keeps.
+glmf_compact=(GLM5_FLASH_KDA_FP8=off GLM5_FLASH_FP8_HEAD=off GLM5_FLASH_FP8_PREFILL=off GLM5_FLASH_INDEX_CACHE=compact
+  GLM5_FLASH_KDA_STATE=bf16 GLM5_FLASH_PREFIX_MARKS=pool HOST_CACHE_BYTES=64GiB EMBEDDING=host GLM5_FLASH_HEADROOM_GIB=1
+  GLM5_FLASH_GRAPH_BUDGET_MIB=512 GLM5_FLASH_DECODE_ROW_BUCKETS=on GLM5_FLASH_REPLAY_RECORDS=shared
+  GLM5_FLASH_DECODE_ROWS=128 GLM5_FLASH_EXL3_SCHEDULE=gb10 GLM5_FLASH_EXL3_WORKER_PATH=async RDMA_BOND_BALANCE=probe
+  GLM5_FLASH_DRAFT_HEAD=tensor GLM5_FLASH_DRAFT_LINEAR=w8a8)
+glmf_memory="$(get GLM5_FLASH_MEMORY)"
+glmf_profile="$(get GLM5_FLASH_PROFILE)"
+if [[ -n "$glmf_memory$glmf_profile" && "$family" != glm5_flash ]]; then
+  echo "GLM5_FLASH_MEMORY and GLM5_FLASH_PROFILE apply to GLM 5.3 Flash checkpoints, not $family" >&2
+  exit 2
+fi
+case "$glmf_profile" in
+  "") ;;
+  rtx5090)
+    [[ -z "$glmf_memory" || "$glmf_memory" == compact ]] ||
+      { echo "GLM5_FLASH_PROFILE=rtx5090 is GLM5_FLASH_MEMORY=compact; set one of them, not GLM5_FLASH_MEMORY=$glmf_memory" >&2; exit 2; }
+    glmf_memory=compact ;;
+  *) echo "GLM5_FLASH_PROFILE must be rtx5090" >&2; exit 2 ;;
+esac
+case "$glmf_memory" in
+  "") glmf_memory=standard ;;
+  standard|compact|auto) ;;
+  *) echo "GLM5_FLASH_MEMORY must be auto, compact or standard" >&2; exit 2 ;;
+esac
+if [[ "$glmf_memory" == auto && "${CUTEAFD_GLMF_MEMORY_CHOSEN:-}" == compact ]]; then
+  echo "note: GLM5_FLASH_MEMORY=auto runs compact, as planned" >&2
+  glmf_memory=compact
+fi
+if [[ "$glmf_memory" == compact ]]; then
+  [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_MEMORY=compact runs the routed experts on Sparks, as measured; this launch" \
+    "runs them on the GPU (SPARK_COUNT=0 or EXPERT_BACKEND=local)" >&2; exit 2; }
+  for glmf_setting in "${glmf_compact[@]}"; do
+    glmf_key="${glmf_setting%%=*}" glmf_value="${glmf_setting#*=}" glmf_old=""
+    case "$glmf_key" in GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL) glmf_old="GLMF_${glmf_key#GLM5_FLASH_}" ;; esac
+    if [[ -n "${cfg[$glmf_key]:-}" ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact keeps $glmf_key=${cfg[$glmf_key]} as configured (compact: $glmf_value)" >&2
+    elif [[ -n "$glmf_old" && -n "${cfg[$glmf_old]:-}" ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact keeps $glmf_old=${cfg[$glmf_old]} as configured (compact: $glmf_key=$glmf_value)" >&2
+    else
+      cfg[$glmf_key]="$glmf_value"
+      echo "note: GLM5_FLASH_MEMORY=compact sets $glmf_key=$glmf_value" >&2
+    fi
+  done
+fi
+# RDMA_BOND_BALANCE: the coordinator's expert QPs connect with RoCE v2 flow labels it chooses,
+# so a coordinator port that is an LACP bond carries as many of them on each member: off
+# (default: the kernel's per-QP labels, re-rolled at every start), labels (fixed labels, the
+# same placement at every start) or probe (labels measured onto alternating members; see
+# rust/crates/cuteafd-transport/src/bond.rs). Workers need no setting.
+bond_balance="$(get RDMA_BOND_BALANCE off)"
+case "$bond_balance" in off|labels|probe) ;; *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;; esac
+bond_args=()
+[[ "$bond_balance" == off ]] || bond_args=(-e "CUTEAFD_RDMA_BOND_BALANCE=$bond_balance")
+# The free memory of coordinator GPU $1 in GiB as an admission would see it: nvidia-smi's free MiB,
+# with --restart crediting this launch's own coordinator on it (removed after validation; never
+# another launch's memory), within COORDINATOR_GPU_BUDGET_GIB when set (0 without a total to charge
+# against). Empty when nvidia-smi gives no sample.
+selected_gpu_free_gib() {
+  local selected="$1" free_mib own_pids own_mib free_gib total_mib
+  free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+  [[ "$free_mib" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$restart" == 1 ]]; then
+    own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
+    if [[ -n "$own_pids" ]]; then
+      own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
+        | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
+      [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
+    fi
+  fi
+  free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
+  if [[ -n "$coordinator_budget" ]]; then
+    total_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+    # Credit this launch's restart above, but charge other physical usage
+    # against the simulated smaller card, just as runtime admission does.
+    if [[ "$total_mib" =~ ^[0-9]+$ ]]; then
+      free_gib="$(python3 -c 'import sys; free,total,budget=map(float,sys.argv[1:]); print(max(0,min(free,budget-total+free)))' \
+        "$free_gib" "$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$total_mib")" "$coordinator_budget")"
+    else
+      free_gib=0 # No trustworthy sample.
+    fi
+  fi
+  printf '%s' "$free_gib"
+}
 qwen_exl3=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
@@ -114,30 +202,9 @@ if [[ "$family" == qwen4 ]]; then
 fi
 if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
   selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
-  free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
-  if [[ "$free_mib" =~ ^[0-9]+$ ]]; then
-    if [[ "$restart" == 1 ]]; then
-      # --restart will release this container's allocations after validation.
-      # Credit only its host PIDs on this GPU, never another launch's memory.
-      own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
-      if [[ -n "$own_pids" ]]; then
-        own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
-          | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
-        [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
-      fi
-    fi
-    free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
-    if [[ -n "$coordinator_budget" ]]; then
-      total_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
-      # Credit this launch's restart above, but charge other physical usage
-      # against the simulated smaller card, just as runtime admission does.
-      if [[ "$total_mib" =~ ^[0-9]+$ ]]; then
-        free_gib="$(python3 -c 'import sys; free,total,budget=map(float,sys.argv[1:]); print(max(0,min(free,budget-total+free)))' \
-          "$free_gib" "$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$total_mib")" "$coordinator_budget")"
-      else
-        free_gib=0 # No trustworthy sample: keep the Spark fallback.
-      fi
-    fi
+  # Without a total under a budget the free memory reads 0: the Spark fallback stays.
+  free_gib="$(selected_gpu_free_gib "$selected")"
+  if [[ -n "$free_gib" ]]; then
     pool="$(get POOL_TOKENS 32768)"
     if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
       # CPU-only preflight reads checkpoint headers in the selected serving image.
@@ -529,6 +596,11 @@ if [[ -n "$second" && "$split" != off ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
+if [[ "$glmf_memory" == compact && "$head_split" == 1 ]]; then
+  echo "GLM5_FLASH_MEMORY=compact serves from one GPU, and this launch splits heads over GPUs $gpu and $second;" \
+    "set RTX_GPUS=1 (or COORDINATOR_SPLIT=off)" >&2
+  exit 2
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
@@ -770,6 +842,13 @@ if [[ $family == glm5_flash ]]; then
         echo "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split" >&2
         exit 2
       fi
+      # The engine sizes such a pool after the step workspaces: an automatic pool beside Spark
+      # experts, or any pool under a coordinator GPU budget.
+      if [[ -z "$coordinator_budget" && ( "$glmf_pool" != 0 || "$ranks" == 0 ) ]]; then
+        echo "GLM5_FLASH_REPLAY_RECORDS=shared needs the step workspaces allocated before the pool: an automatic pool" \
+          "(POOL_TOKENS=auto) with Spark experts, or COORDINATOR_GPU_BUDGET_GIB" >&2
+        exit 2
+      fi
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
   esac
@@ -805,6 +884,71 @@ if [[ $family == glm5_flash ]]; then
     wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
     *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
   esac
+fi
+# GLM5_FLASH_MEMORY=auto: lay out what this launch would serve with the standard settings (the flags
+# resolved above), on the free memory of the GPU it serves from, before any container changes. When
+# the pool falls short, the launch runs again with the compact profile.
+if [[ "$glmf_memory" == auto ]]; then
+  glmf_sequences="$(get CONCURRENCY 8)"
+  [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive whole number" >&2; exit 2; }
+  glmf_need=$((glmf_context + 65536 * (glmf_sequences - 1)))
+  if [[ "$head_split" == 1 ]]; then
+    echo "note: GLM5_FLASH_MEMORY=auto keeps standard: compact serves from one GPU, and this launch splits heads over two" >&2
+  elif [[ "$ranks" == 0 ]]; then
+    echo "note: GLM5_FLASH_MEMORY=auto keeps standard: compact runs the routed experts on Sparks, and this launch runs" \
+      "them on the GPU" >&2
+  else
+    glmf_free_gib="$(selected_gpu_free_gib "$gpu")"
+    [[ -n "$glmf_free_gib" && ! "$glmf_free_gib" =~ ^0(\.0+)?$ ]] ||
+      { echo "GLM5_FLASH_MEMORY=auto needs GPU $gpu's free memory from nvidia-smi (read: ${glmf_free_gib:-nothing} GiB);" \
+        "set GLM5_FLASH_MEMORY=compact or standard" >&2; exit 2; }
+    # The flags `cuteafd plan --layout` takes under serve-glmf's names, as this launch passes them.
+    glmf_plan=(--vision "$vision" --audio "$audio" --json --layout --rtx 1 --rtx-gib "$glmf_free_gib"
+      --coordinator-budget-gib "$glmf_free_gib" --spark-ranks "$ranks"
+      --spark-budget-gib "$(python3 -c 'import sys; print(int(sys.argv[1]) / 2**30)' "$budget")"
+      --concurrency "$glmf_sequences" --context-tokens "$glmf_context")
+    for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
+      case "${family_args[arg]}" in
+        --embedding-placement|--kda-fp8|--fp8-head|--index-cache|--kda-state|--prefix-marks|--replay-records|\
+        --decode-rows|--prefill-lanes|--prefill-lane-rows|--headroom-gib|--graph-budget-mib|--pool-tokens|--draft-fp8|\
+        --draft-linear|--draft-context-slots|--draft-sequences)
+          glmf_plan+=("${family_args[arg]}" "${family_args[arg + 1]}"); arg=$((arg + 1)) ;;
+        --decode-row-buckets) glmf_plan+=(--decode-row-buckets) ;;
+      esac
+    done
+    [[ "${draft_args[0]:-}" != --draft ]] || glmf_plan+=(--draft "${draft_args[1]}")
+    # A WIP slot plans with its own binary and program manifest, copied apart from the layout a
+    # running launch may hold.
+    glmf_plan_run=(cuteafd plan "$snapshot") glmf_plan_mounts=() glmf_plan_dir=""
+    if [[ -n "$wip_slot" ]]; then
+      glmf_plan_dir="$(mktemp -d)"
+      for glmf_file in cuteafd PROGRAMS.json; do
+        docker cp "cuteafd-coordinator-wip:/wip/slots/$wip_slot/coordinator/workspace/.cuteafd-wip/$glmf_file" \
+          "$glmf_plan_dir/$glmf_file" >/dev/null ||
+          { rm -rf "$glmf_plan_dir"; echo "GLM5_FLASH_MEMORY=auto: WIP slot $wip_slot has no coordinator $glmf_file" \
+            "(build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
+      done
+      glmf_plan_mounts=(-v "$glmf_plan_dir:/opt/cuteafd-plan:ro" --entrypoint /opt/cuteafd-plan/cuteafd)
+      glmf_plan_run=(plan "$snapshot" --workspace-manifest /opt/cuteafd-plan/PROGRAMS.json)
+    fi
+    glmf_plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${glmf_plan_mounts[@]}" \
+      "$coordinator_image" "${glmf_plan_run[@]}" "${glmf_plan[@]}")" || glmf_plan_json=""
+    [[ -z "$glmf_plan_dir" ]] || rm -rf "$glmf_plan_dir"
+    glmf_planned="$(python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("memory_layout") or {}
+print(int(m.get("pool_tokens") or 0) if d.get("fits") else 0)' <<<"$glmf_plan_json" 2>/dev/null || true)"
+    [[ "$glmf_planned" =~ ^[0-9]+$ ]] ||
+      { echo "GLM5_FLASH_MEMORY=auto could not lay out the standard settings with $coordinator_image (cuteafd plan" \
+        "--layout); set GLM5_FLASH_MEMORY=compact or standard" >&2; exit 2; }
+    glmf_why="the standard settings admit $glmf_planned KV tokens on GPU $gpu ($glmf_free_gib GiB free) for"
+    glmf_why+=" $glmf_sequences sequences; one $glmf_context-token request and 65,536 tokens for each other sequence"
+    glmf_why+=" need $glmf_need"
+    if ((glmf_planned >= glmf_need)); then
+      echo "note: GLM5_FLASH_MEMORY=auto keeps standard: $glmf_why" >&2
+    else
+      echo "note: GLM5_FLASH_MEMORY=auto takes compact: $glmf_why" >&2
+      exec env CUTEAFD_GLMF_MEMORY_CHOSEN=compact bash "${BASH_SOURCE[0]}" "${launch_args[@]}"
+    fi
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
