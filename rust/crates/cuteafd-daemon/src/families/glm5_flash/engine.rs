@@ -598,9 +598,33 @@ pub(crate) struct Fp8Prefill {
 
 // Serving uses exact canonical row buckets; teacher-forced probe spans run eagerly
 // and do not enlarge the startup graph set. Counters still count every capture.
-use crate::shared::decode_graph::{masked_row, row_bucket as plain_decode_bucket, ROW_BUCKETS as PLAIN_DECODE_BUCKETS};
+use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
+const PLAIN_DECODE_BUCKETS: [usize; 6] = [1, 4, 8, 16, 32, 64];
 const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
+// Inclusive arithmetic crossovers audited against the pinned AOT exporter.
+// Full/half-head shapes share these thresholds; MoE projections use real rows.
+const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
+    ProjectionThreshold { name: "index.iq[4096,1536].bf16", skinny_rows: 8 },
+    ProjectionThreshold { name: "index.ik[288,4096].bf16", skinny_rows: 160 },
+    ProjectionThreshold { name: "kda.in[24896|12608,4096].bf16", skinny_rows: 8 },
+    ProjectionThreshold { name: "kda.out[4096,8192|4096].bf16", skinny_rows: 8 },
+    ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "kda.half.in.out.fp8.wide", skinny_rows: 32 },
+    ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "mla.q_b[16384|8192,1536].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "mla.out[4096,16384|8192].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "dense.gate_up[24576|12288,4096].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: 16 },
+];
+
+fn check_decode_thresholds(sequences: usize, speculation: bool) -> Result<()> {
+    let cap = decode_bucket(sequences.clamp(16, DECODE_ROWS), false);
+    let plain: Vec<_> = PLAIN_DECODE_BUCKETS.into_iter().filter(|&rows| rows <= cap).collect();
+    check_bucket_thresholds(&plain, DECODE_PROJECTION_THRESHOLDS)?;
+    if speculation { check_bucket_thresholds(&SPEC_DECODE_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?; }
+    Ok(())
+}
 // WP9 official-startup-dflash2-20261006-v1, SM120 RTX PRO 6000, 2026-10-06:
 // 11,040 TP1 graphs, 1,616,904,192 physical bytes after fixed workspaces
 // (146,458.713 B/graph).
@@ -616,7 +640,7 @@ pub(crate) fn startup_graphs_enabled() -> bool {
 
 fn decode_bucket(rows: usize, spec: bool) -> usize {
     if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
-    else { plain_decode_bucket(rows) }
+    else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
 }
 
 pub(crate) fn graph_reserve_bytes(graphs: usize) -> u64 {
@@ -669,7 +693,7 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
 
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
+    let plain = decode_bucket(sequences.clamp(16, DECODE_ROWS), false);
     graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
         PLAIN_DECODE_BUCKETS.into_iter().filter(move |&rows| rows <= plain)
             .map(move |rows| (rows, false, geometry))
@@ -773,6 +797,7 @@ impl<'a> GlmfEngine<'a> {
     /// Capture the complete serving key set on masked rows, without expert traffic.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
         if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        check_decode_thresholds(sequences, speculation)?;
         let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
         let segments = self.weights.layers.len() + 1;
         let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
@@ -820,13 +845,52 @@ impl<'a> GlmfEngine<'a> {
         Ok(graphs)
     }
 
-    /// One-GPU real-row byte gate; speculative steps leave the prefilled KDA state intact.
+    /// One-GPU real-row byte gate; plain steps restore the complete persistent state.
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
         ensure!(self.ranks() == 1 && self.use_graphs && self.startup_graphs,
             "padding check needs one GPU, graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
         ensure!(tokens.len() >= 65 && self.max_context >= 65, "padding check needs 65 tokens of context");
         let mut placement = GlmfPlacement::new(vec![0], 0);
         self.prefill_device(&mut placement, &tokens[..32])?;
+        let caches = self.caches_of(0);
+        let buffers: Vec<_> = [caches.kda_state.buffer, caches.kda_conv.buffer, caches.kda_replay.buffer]
+            .into_iter().chain(self.paged_buffers().into_iter().flatten()).collect();
+        let snapshot = || -> Result<Vec<Vec<u8>>> {
+            self.synchronize()?;
+            buffers.iter().map(|&buffer| {
+                let mut bytes = vec![0; buffer.bytes];
+                self.library.copy_d2h(&mut bytes, buffer)?;
+                Ok(bytes)
+            }).collect()
+        };
+        let restore = |state: &[Vec<u8>]| -> Result<()> {
+            self.synchronize()?;
+            for (&buffer, bytes) in buffers.iter().zip(state) { self.library.copy_h2d(buffer, bytes)?; }
+            Ok(())
+        };
+        let original = placement.clone();
+        let before = snapshot()?;
+        for rows in [5, 9] {
+            let input = &tokens[32..32 + rows];
+            restore(&before)?;
+            placement = original.clone();
+            let exact = self.decode_step(&mut [(&mut placement, rows)], input, None, false, None, None, true)?
+                .context("padding check needs all layers")?.to_host(self.library)?;
+            let exact_state = snapshot()?;
+            let exact_placement = (placement.len, placement.kda_len);
+            restore(&before)?;
+            placement = original.clone();
+            let padded = self.verify_device(&mut [(&mut placement, rows)], input, false)?
+                .context("padding check needs all layers")?.to_host(self.library)?;
+            ensure!(exact.len() == padded.len() && exact.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "plain decode padding {rows}->{} changed real-row logits", decode_bucket(rows, false));
+            ensure!(snapshot()? == exact_state && (placement.len, placement.kda_len) == exact_placement,
+                "plain decode padding {rows}->{} changed persistent state", decode_bucket(rows, false));
+            tracing::info!(rows, bucket = decode_bucket(rows, false), bytes = exact.len() * 4,
+                "GLM Flash plain padded decode real-row logits and persistent state byte-exact");
+        }
+        restore(&before)?;
+        placement = original;
         for rows in [3, 9, 17, 33] {
             let start = placement.len;
             let input = &tokens[32..32 + rows];
@@ -2913,6 +2977,35 @@ mod prefill_lane_tests {
     }
 
     #[test]
+    fn decode_projection_registry_matches_audited_pinned_sources() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
+        // Any exporter change requires re-auditing shapes and arithmetic routes.
+        for (path, expected) in [
+            ("integration/cuteafd/glmf.py", 0x975b_8158_3e61_8bca_u64),
+            ("integration/cuteafd/_glm_kernels.py", 0xabb3_5df9_3a4c_9796),
+            ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
+            ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
+            ("integration/cuteafd/_common.py", 0x74ad_1b69_f557_a0a5),
+            ("gemm/bf16_gemv/_skinny.py", 0x26cd_c0f9_cb63_d3a9),
+        ] {
+            let bytes = std::fs::read(root.join(path)).unwrap();
+            let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
+                |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3));
+            assert_eq!(hash, expected, "re-audit GLM decode projection thresholds after {path} source drift");
+        }
+        assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
+            [8, 160, 8, 8, 16, 32, 16, 16, 16, 16, 16]);
+        for sequences in [1, 8, 16, 17, 32, 64] {
+            super::check_decode_thresholds(sequences, false).unwrap();
+            super::check_decode_thresholds(sequences, true).unwrap();
+        }
+        let error = super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS)
+            .unwrap_err().to_string();
+        assert!(error.contains("index.iq"));
+        assert!(super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).is_err());
+    }
+
+    #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
         use super::{decode_bucket, serving_graph_shapes, GraphGeometry, UNIT_PAGES, UNIT_ROWS};
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
@@ -2940,8 +3033,8 @@ mod prefill_lane_tests {
                 }
             }
         }
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 360);
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 120);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 400);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 160);
     }
 
     #[test]
@@ -2952,16 +3045,19 @@ mod prefill_lane_tests {
         }
         assert_eq!(super::decode_bucket(8, true), 8);
         assert_eq!(super::decode_bucket(32, true), 32);
-        assert_eq!(super::decode_bucket(8, false), 16);
-        assert_eq!(super::decode_bucket(17, false), 64);
+        assert_eq!(super::decode_bucket(5, false), 8);
+        assert_eq!(super::decode_bucket(8, false), 8);
+        assert_eq!(super::decode_bucket(9, false), 16);
+        assert_eq!(super::decode_bucket(17, false), 32);
         for sequences in [8, 16] {
             let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true);
-            assert_eq!(shapes.len() * 46, 16560);
+            assert_eq!(shapes.len() * 46, 18400);
             let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true);
-            assert_eq!(reserve, [2_977_542_112, super::graph_reserve_bytes(16200)]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 5520);
+            assert_eq!(reserve, [3_300_923_584, super::graph_reserve_bytes(18000)]);
+            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 7360);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 18400);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 20240);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 22080);
     }
 
     #[test]
