@@ -502,3 +502,39 @@ def test_glm_feature_export_and_prefix_probe_immutability(tmp_path, monkeypatch)
     conflict["media"][0]["fixture"]["sha256"] = "c" * 64
     manifest["windows"] = [window, conflict]
     with pytest.raises(ValueError, match="different fixtures/grids"): media.window_features(args, manifest)
+
+
+@pytest.mark.parametrize("family", [None, "glm5_flash"])
+def test_official_tower_export_family_dispatch_preserves_mimo_default(tmp_path, monkeypatch, family):
+    import json
+    from types import ModuleType, SimpleNamespace
+    import golden_media as exporter
+    expected = family or "mimo_v2"
+    manifest = {"family": expected, "windows": [{"media": [span()]}], "checkpoint": "test",
+                "set_sha256": "b" * 64}
+    monkeypatch.setattr(exporter, "load_set", lambda _path, actual: manifest if actual == expected else pytest.fail("wrong family"))
+    monkeypatch.setattr(exporter, "verify_snapshot", lambda *_args: {"snapshot_revision": "test"})
+    seen = []
+    module = ModuleType("glm_flash_media" if family else "mimo_media")
+    def features(args, panel):
+        assert panel is manifest and args.family == expected and args.tower_dtype == "bf16"
+        assert args.media_features_out == tmp_path / "features"
+        args.out.mkdir()
+        seen.append(expected)
+        return {span()["key"]: SimpleNamespace(shape=(4, 8))}, {"modeling_sha256": "a" * 64}
+    module.window_features = features
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    torch = fake_torch(monkeypatch)
+    torch.cuda.set_device = lambda value: seen.append(value)
+    argv = ["golden_media", "--snapshot", str(tmp_path), "--windows", str(tmp_path / "input.json"),
+            "--out", str(tmp_path / "features")]
+    if family: argv += ["--family", family]
+    monkeypatch.setattr(sys, "argv", argv)
+    exporter.main()
+    output = json.loads((tmp_path / "features/export.json").read_text())
+    assert seen == [0, expected] and output["feature_shapes"] == {span()["key"]: [4, 8]}
+    assert output["scope"] == "tower only; not an LM prefix qualification"
+    assert output["snapshot_identity"] == {"snapshot_revision": "test", "modeling_sha256": "a" * 64}
+    if family: assert output["family"] == family
+    else: assert "family" not in output
+    with pytest.raises(ValueError, match="not implemented"): exporter.family_features("deepseek_v4")
