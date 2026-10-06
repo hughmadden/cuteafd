@@ -922,3 +922,31 @@ def test_text_only_mimo_auto_default_does_not_start_a_tower(tmp_path):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert "--vision auto" in launch
     assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
+
+
+_GLMF = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+         "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+@pytest.mark.parametrize("keys,mode", [("", None), ("RDMA_BOND_BALANCE=off\n", None),
+                                      ("RDMA_BOND_BALANCE=labels\n", "labels"),
+                                      ("RDMA_BOND_BALANCE=probe\n", "probe")])
+def test_rdma_bond_balance_reaches_only_the_coordinator(tmp_path, keys, mode):
+    """The flow-label switch is the coordinator's: forwarded only when not off. Workers get
+    nothing; they connect with whatever label each coordinator connection asks for."""
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert ("CUTEAFD_RDMA_BOND_BALANCE" in launch) == (mode is not None), launch
+    if mode:
+        assert f"-e CUTEAFD_RDMA_BOND_BALANCE={mode}" in launch, launch
+    workers = [line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line]
+    assert workers and not any("CUTEAFD_RDMA_BOND_BALANCE" in line for line in workers)
+
+
+def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf",
+                                   "GLM5_FLASH_FP8_MODEL_ID=off\nRDMA_BOND_BALANCE=yes\n")
+    assert result.returncode == 2 and "RDMA_BOND_BALANCE must be off, labels or probe" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())

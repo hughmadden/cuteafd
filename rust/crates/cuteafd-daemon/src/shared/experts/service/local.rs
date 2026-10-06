@@ -130,6 +130,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                                     tracing::warn!("native RoCE admission queue full or stopped");
                                 }
                             }
+                            // A coordinator placing its flows on a bonded port
+                            // probes, then connects its sessions separately.
+                            Err(error) if error.is::<cuteafd_transport::FlowProbesOnly>() => {
+                                tracing::debug!("served RDMA flow probes")
+                            }
                             Err(error) => tracing::warn!(%error, "native RoCE bootstrap failed"),
                         }
                     }

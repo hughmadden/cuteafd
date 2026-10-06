@@ -508,6 +508,13 @@ rdma_env_args=()
 for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_TP2_TOKEN_SUMS CUTEAFD_CONSOLE_TEXT CUTEAFD_V41_DEVICE CUTEAFD_V41_DEVICE_LANES CUTEAFD_SPARK_WRITE CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_STAGING_FENCE; do
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
+# RDMA_BOND_BALANCE (off, labels or probe): the coordinator's RoCE flow labels on a
+# bonded port; see scripts/launch/run-family.sh.
+case "${RDMA_BOND_BALANCE:-off}" in
+  off) ;;
+  labels|probe) rdma_env_args+=(-e "CUTEAFD_RDMA_BOND_BALANCE=$RDMA_BOND_BALANCE") ;;
+  *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;;
+esac
 for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
   [[ -n "${!rdma_env_name:-}" ]] && rdma_env_args+=(-e "$rdma_env_name=${!rdma_env_name}")
 done
