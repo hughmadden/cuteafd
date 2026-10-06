@@ -28,6 +28,9 @@ pub struct TokenizerDecodeSummary {
 pub struct LoadedTokenizer {
     tokenizer_path: String,
     tokenizer: tokenizers::Tokenizer,
+    /// Long texts by pieces between added tokens; `None` when this tokenizer does not extract
+    /// its added tokens by content alone.
+    pieces: Option<pieces::Pieces>,
 }
 
 /// Stateful decoder for token-by-token generation.
@@ -80,10 +83,31 @@ impl LoadedTokenizer {
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| {
             anyhow::anyhow!("loading tokenizer {}: {err}", tokenizer_path.display())
         })?;
+        let pieces = pieces::Pieces::new(&tokenizer);
         Ok(Self {
             tokenizer_path: tokenizer_path.display().to_string(),
             tokenizer,
+            pieces,
         })
+    }
+
+    /// `text`'s token ids without special tokens, byte-identical to the tokenizer's own
+    /// encoding. A long text goes by its pieces between added tokens, and a long piece seen
+    /// before keeps its ids (module `pieces`): a repeated or growing long prompt encodes only
+    /// what is new.
+    pub fn encode_ids(&self, text: &str) -> Result<Vec<u32>> {
+        let whole = |text: &str| -> Result<Vec<u32>> {
+            Ok(self
+                .tokenizer
+                .encode_fast(text, false)
+                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .get_ids()
+                .to_vec())
+        };
+        match &self.pieces {
+            Some(pieces) if text.len() >= pieces::LONG_TEXT => pieces.encode(text, whole),
+            _ => whole(text),
+        }
     }
 
     pub fn encode_text(
@@ -91,11 +115,15 @@ impl LoadedTokenizer {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<TokenizerEncodingSummary> {
-        let encoding = self
-            .tokenizer
-            .encode(text.to_owned(), add_special_tokens)
-            .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?;
-        let token_ids = encoding.get_ids().to_vec();
+        let token_ids = if add_special_tokens {
+            self.tokenizer
+                .encode(text.to_owned(), true)
+                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .get_ids()
+                .to_vec()
+        } else {
+            self.encode_ids(text)?
+        };
         Ok(TokenizerEncodingSummary {
             tokenizer_path: self.tokenizer_path.clone(),
             text: text.to_owned(),
@@ -179,6 +207,8 @@ pub fn streaming_token_decoder(
         prefix_index: 0,
     })
 }
+
+mod pieces;
 
 #[cfg(test)]
 mod tests;

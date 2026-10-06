@@ -24,6 +24,7 @@ axum = { version = "0.7", features = ["macros", "ws"] }
 bincode = "1.3"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+daachorse = "3.0.3"
 futures = "0.3"
 io-uring = "0.7"
 image = { version = "0.25.10", default-features = false, features = ["png", "webp", "gif"] }
