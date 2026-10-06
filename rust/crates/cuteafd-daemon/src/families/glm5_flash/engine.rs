@@ -197,6 +197,57 @@ impl KdaState {
     }
 }
 
+/// Where the KDA speculative replay records live (`--replay-records`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub(crate) enum ReplayRecords {
+    /// Their own allocation beside the KDA state.
+    #[default]
+    Own,
+    /// In the prefill lanes' shared scratch, which no decode step reads. A record lives only
+    /// from a speculative verify to its commit, and nothing prefills in between (the serving
+    /// loop verifies, selects, emits and commits before its next prefill round; `RecordGuard`
+    /// refuses a commit otherwise). One GPU, with the step workspaces allocated before the KV
+    /// pool (eager start-up).
+    Shared,
+}
+
+/// With the replay records in the prefill lanes' scratch, a prefill between a speculative verify
+/// and its commit would overwrite the records the commit reads. Every use of rank 0's prefill
+/// lanes and every speculative verify is counted, and a commit of records a prefill may have
+/// overwritten fails instead of applying them.
+#[derive(Debug, Default)]
+pub(crate) struct RecordGuard {
+    shared: bool,
+    /// Uses of the prefill lanes so far, and their count when a speculative verify last recorded.
+    prefills: std::cell::Cell<u64>,
+    recorded_at: std::cell::Cell<Option<u64>>,
+}
+
+impl RecordGuard {
+    fn new(records: ReplayRecords) -> Self {
+        Self { shared: records == ReplayRecords::Shared, ..Self::default() }
+    }
+
+    /// The prefill lanes (and their scratch) are in use.
+    fn prefilled(&self) {
+        self.prefills.set(self.prefills.get() + 1);
+    }
+
+    /// A speculative verify recorded its rows.
+    fn recorded(&self) {
+        self.recorded_at.set(Some(self.prefills.get()));
+    }
+
+    /// Whether a commit may read the records: always with records of their own; with shared ones,
+    /// only when no prefill has run since the last speculative verify.
+    fn check_commit(&self) -> Result<()> {
+        ensure!(!self.shared || self.recorded_at.get() == Some(self.prefills.get()),
+            "a prefill ran between a speculative verify and its commit, over the replay records the commit \
+            reads (--replay-records shared): commit every verify before the next prefill");
+        Ok(())
+    }
+}
+
 impl From<KdaState> for cuteafd_loader::serving_capacity::GlmfKdaState {
     fn from(state: KdaState) -> Self {
         match state {
@@ -623,6 +674,9 @@ pub(crate) struct StepPlan<'p, 'a> {
     shape: GlmfStepShape,
     /// Rows of the decode workspace (`--decode-rows`).
     decode_rows: usize,
+    /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
+    /// scratch is at least this large. 0 with records of their own.
+    shared_records: u64,
 }
 
 /// The engine settings a step plan depends on besides its layers and experts.
@@ -641,6 +695,8 @@ pub(crate) struct StepSettings {
     /// The most rows of a decode or verify step: the decode workspace's rows, over the `_m64`
     /// programs (and the wide `_m128` ones with 128).
     pub decode_rows: usize,
+    /// Where the KDA replay records live.
+    pub replay_records: ReplayRecords,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -652,6 +708,12 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
         let index_compact = settings.index_cache == IndexCache::Compact
             && layers.iter().any(|layer| layer.attention == GlmNextAttention::Mla);
+        // Every KDA layer's record at the decode rows, over this GPU's KDA heads (as `Caches::new`).
+        let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
+        let kda_layers = layers.iter().filter(|layer| layer.attention == GlmNextAttention::Kda).count();
+        let shared_records = if settings.replay_records == ReplayRecords::Shared {
+            (kda_layers * replay_bytes(kda_heads, 3 * kda_heads * cfg.kda_head_dim, settings.decode_rows)) as u64
+        } else { 0 };
         Self {
             library,
             programs,
@@ -672,11 +734,12 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 table_pool_pages,
             },
             decode_rows: settings.decode_rows,
+            shared_records,
         }
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize) {
-        (self.scratch, self.shape, self.decode_rows)
+    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64) {
+        (self.scratch, self.shape, self.decode_rows, self.shared_records)
     }
 
     /// Routed experts as the plan's shape will have them (a plan made before its experts exist:
@@ -709,11 +772,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape, usize),
+    key: (GlmfScratchOptions, GlmfStepShape, usize, u64),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
 }
+
+/// Rank 0's prefill lanes' shared temporaries, whose scratch holds the KDA replay records with
+/// `--replay-records shared` (the caches keep it alive with them).
+pub(crate) struct PrefillScratch<'a>(Rc<Temporaries<'a>>);
 
 impl<'a> StepWorkspaces<'a> {
     /// The decode workspace (`plan`'s decode rows) and `lanes` prefill lanes of `rows` rows of `plan`,
@@ -723,6 +790,11 @@ impl<'a> StepWorkspaces<'a> {
         let temps = Rc::new(plan.temporaries(0, rows, false)?);
         let lanes = (0..lanes).map(|_| plan.lane(0, rows, false, temps.clone())).collect::<Result<_>>()?;
         Ok(Self { key: plan.key(), rows, decode, lanes })
+    }
+
+    /// The prefill lanes' shared temporaries (their scratch).
+    pub(crate) fn prefill_scratch(&self) -> Option<PrefillScratch<'a>> {
+        self.lanes.first().map(|lane| PrefillScratch(lane.temps.clone()))
     }
 }
 
@@ -747,7 +819,11 @@ impl<'a> StepPlan<'_, 'a> {
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        let mut scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        if rank == 0 && !decode {
+            // The prefill scratch also holds the replay records (`--replay-records shared`).
+            scratch.programs = scratch.programs.max(self.shared_records);
+        }
         let bytes = glmf_temporary_bytes(self.cfg, rows as u64, decode, &shape, scratch);
         let head_workspace = self.alloc(bytes.head_workspace)?;
         Ok(Temporaries {
@@ -862,6 +938,13 @@ pub(crate) struct PagedLayer {
     pub pools: cuteafd_ffi::CuteafdDeviceBuffer,
 }
 
+/// What keeps the replay records' memory: their own allocation, or the prefill temporaries
+/// whose scratch holds them.
+enum RecordsOwner<'a> {
+    Own { _records: Dev<'a> },
+    Shared { _temporaries: Rc<Temporaries<'a>> },
+}
+
 /// One GPU's caches. Per MLA layer (None for KDA): the latent record pool and its DSA index
 /// cache. Every KDA layer's pools back to back: FP32 or BF16 (`--kda-state`) recurrent state
 /// `[layers, slots, heads, 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]` and the
@@ -879,7 +962,9 @@ struct Caches<'a> {
     index: Vec<Option<IndexLayer<'a>>>,
     kda_state: Dev<'a>,
     kda_conv: Dev<'a>,
-    kda_replay: Dev<'a>,
+    /// The replay records: their own allocation, or a region of rank 0's prefill scratch.
+    kda_replay: cuteafd_ffi::CuteafdDeviceBuffer,
+    _kda_replay_owner: RecordsOwner<'a>,
     /// Compact index cache: (tails, speculative key | gate records).
     index_tails: Option<(Dev<'a>, Dev<'a>)>,
     commit_tables: Dev<'a>,
@@ -890,11 +975,13 @@ struct Caches<'a> {
 
 impl<'a> Caches<'a> {
     /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads, and replay
-    /// records and commit tables for steps of up to `decode_rows` rows.
+    /// records and commit tables for steps of up to `decode_rows` rows. The replay records take
+    /// their own allocation, or the start of `records`' scratch (written by every speculative
+    /// verify before its commit reads them, so they start unzeroed).
     #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
-        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize)
-        -> Result<Self> {
+        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
+        records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -924,9 +1011,22 @@ impl<'a> Caches<'a> {
         let index_tails = if keys || mla_layers == 0 { None } else {
             Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * decode_rows * KEY_BYTES)?))
         };
+        let (kda_replay, owner) = match records {
+            Some(PrefillScratch(temps)) => {
+                let scratch = temps.scratch.buffer;
+                ensure!(scratch.bytes >= (kda_layers * replay).max(256), "{} bytes of replay records do not fit the \
+                    {}-byte prefill scratch", kda_layers * replay, scratch.bytes);
+                (cuteafd_ffi::CuteafdDeviceBuffer { bytes: (kda_layers * replay).max(256), ..scratch },
+                    RecordsOwner::Shared { _temporaries: temps })
+            }
+            None => {
+                let own = zeroed(kda_layers * replay)?;
+                (own.buffer, RecordsOwner::Own { _records: own })
+            }
+        };
         Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
-            kda_replay: zeroed(kda_layers * replay)?, index_tails,
+            kda_replay, _kda_replay_owner: owner, index_tails,
             commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }
 }
@@ -987,6 +1087,10 @@ pub(crate) struct GlmfEngine<'a> {
     /// Rows per layer the last speculative step recorded (its programs' capacity, see
     /// `replay_rows_of`): the commit that follows reads records of that many rows.
     replay_rows: std::cell::Cell<usize>,
+    /// Where the replay records live, and the check that no prefill overwrites shared ones
+    /// between a verify and its commit.
+    pub replay_records: ReplayRecords,
+    records: RecordGuard,
     /// Per layer: its index among the KDA layers (None for MLA).
     kda_ordinal: Vec<Option<usize>>,
     /// Per layer: its index among the MLA layers (None for KDA).
@@ -1153,7 +1257,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState,
-        decode_rows: usize) -> Result<Self> {
+        decode_rows: usize, records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -1180,13 +1284,16 @@ impl<'a> GlmfEngine<'a> {
         let split = weights.layers.first().is_some_and(|l| l.split);
         ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
+        ensure!(records.is_none() || !split, "a head split keeps the replay records of its own (--replay-records own)");
+        let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache,
-            kda_state, decode_rows)?;
+            kda_state, decode_rows, records)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots, decode_rows, replay_rows: std::cell::Cell::new(DECODE_ROWS),
+            replay_records, records: RecordGuard::new(replay_records),
             kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -1235,7 +1342,7 @@ impl<'a> GlmfEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows)?;
+                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1457,6 +1564,7 @@ impl<'a> GlmfEngine<'a> {
         if sequences.is_empty() {
             return Ok(());
         }
+        self.records.check_commit()?;
         let recorded = self.replay_rows.get();
         ensure!(sequences.len() <= self.decode_rows && sequences.iter().all(|&(slot, first, keep)|
             slot >= 0 && (slot as usize) < self.slots && first + keep <= recorded), "commit of {sequences:?}");
@@ -1477,7 +1585,7 @@ impl<'a> GlmfEngine<'a> {
             }
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
             let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
-                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.buffer.ptr),
+                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.ptr),
                 ("tables", caches.commit_tables.buffer.ptr)];
             let mut scalars = vec![Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)];
             // The state's commit; with the compact index cache, the one that also rebuilds the tails.
@@ -1585,7 +1693,7 @@ impl<'a> GlmfEngine<'a> {
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
-                decode_rows: self.decode_rows })
+                decode_rows: self.decode_rows, replay_records: self.replay_records })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -1631,7 +1739,11 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_lanes_of(&self, rank: usize, count: usize) -> Result<std::cell::Ref<'_, Vec<Workspace<'a>>>> {
         let cell = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.lane_workspaces,
-            _ => &self.lane_workspaces,
+            _ => {
+                // Their scratch may hold the replay records: a commit after this sees it.
+                self.records.prefilled();
+                &self.lane_workspaces
+            }
         };
         if cell.borrow().len() < count {
             let mut lanes = cell.borrow_mut();
@@ -2002,6 +2114,7 @@ impl<'a> GlmfEngine<'a> {
         if spec {
             // The commit that follows reads records at this step's program capacity.
             self.replay_rows.set(replay_rows_of(decode_cap(rows)));
+            self.records.recorded();
         }
         let logits = self.step(&tables, tokens, rows, on_layer, None, trace)?;
         for (placement, count) in sequences.iter_mut() {
@@ -2647,16 +2760,16 @@ impl<'a> GlmfEngine<'a> {
     fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         spec: bool) -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
-        let at = |pool: &Dev<'_>, per: usize| -> *mut c_void {
+        let at = |pool: cuteafd_ffi::CuteafdDeviceBuffer, per: usize| -> *mut c_void {
             // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
-            unsafe { pool.buffer.ptr.cast::<u8>().add(ordinal * per) }.cast()
+            unsafe { pool.ptr.cast::<u8>().add(ordinal * per) }.cast()
         };
         let caches = self.caches_of(rank);
         let d = caches.kda_heads * self.cfg.kda_head_dim;
-        let conv_state = at(&caches.kda_conv, self.slots * 3 * 3 * d * 2);
-        let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
+        let conv_state = at(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2);
+        let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         // The layer's record at the program's capacity (an `_m64` step packs 64-row records).
-        let replay = at(&caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)));
+        let replay = at(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)));
         let decode = is_decode(cap);
         if layer.has("w_in_fp8") {
             return self.kda_w8(rank, w, layer, rows, cap, spec, [conv_state, state, replay]);
@@ -3550,5 +3663,40 @@ mod graph_key_tests {
         // A tiny pool caps the strides below the floor.
         assert_eq!(decode_strides(5, 2, (32, 8), table), (32, 8));
         assert_eq!(MIN_POOL_STRIDE * super::UNIT_PAGES, MIN_PAGE_STRIDE);
+    }
+}
+
+#[cfg(test)]
+mod replay_record_tests {
+    use super::{RecordGuard, ReplayRecords};
+
+    #[test]
+    fn shared_records_commit_only_what_no_prefill_overwrote() {
+        let guard = RecordGuard::new(ReplayRecords::Shared);
+        // The serving loop: prefill rounds, then a verify and its commit.
+        guard.prefilled();
+        guard.recorded();
+        guard.check_commit().unwrap();
+        // A second commit of the same records (nothing ran in between) reads them intact.
+        guard.check_commit().unwrap();
+        // A prefill between a verify and its commit overwrote the records.
+        guard.recorded();
+        guard.prefilled();
+        let error = guard.check_commit().unwrap_err().to_string();
+        assert!(error.contains("between a speculative verify and its commit"), "{error}");
+        // The next verify records afresh.
+        guard.recorded();
+        guard.check_commit().unwrap();
+        // A commit with no verify at all reads nothing it could trust.
+        assert!(RecordGuard::new(ReplayRecords::Shared).check_commit().is_err());
+    }
+
+    #[test]
+    fn records_of_their_own_are_never_refused() {
+        let guard = RecordGuard::new(ReplayRecords::Own);
+        guard.recorded();
+        guard.prefilled();
+        guard.check_commit().unwrap();
+        assert!(RecordGuard::new(ReplayRecords::Own).check_commit().is_ok());
     }
 }

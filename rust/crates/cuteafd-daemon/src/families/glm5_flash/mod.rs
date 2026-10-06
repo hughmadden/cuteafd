@@ -98,6 +98,14 @@ pub(crate) struct EngineArgs {
     /// unbounded. An automatic pool keeps this much free for them (unset: the planner's 1.5 GiB).
     #[arg(long)]
     pub graph_budget_mib: Option<u64>,
+    /// Where the KDA speculative replay records live: `own`, their own allocation (321 MB at 64
+    /// decode rows, 643 MB at 128), or `shared`, the prefill lanes' scratch, which no decode step
+    /// reads (782 MB with this build's 4,096-row prefill programs). A record lives only from a
+    /// speculative verify to its commit, with no prefill in between; a commit that would read
+    /// records a prefill overwrote fails. One GPU with an automatic pool (`--pool-tokens 0`) and
+    /// Spark experts, where the step workspaces precede the KV pool.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
+    pub replay_records: engine::ReplayRecords,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -281,8 +289,23 @@ mod draft_cli_tests {
             defaults.kda_state.commit_program()), ("kda_m64".to_string(), "kda_m4096".to_string(), "kda_commit"));
         // Decode steps of up to 64 rows: the `_m64` programs alone, no wide program required.
         assert_eq!(defaults.decode_rows, engine::DECODE_ROWS);
+        // The replay records keep their own allocation.
+        assert_eq!(defaults.replay_records, engine::ReplayRecords::Own);
         assert!(wide_decode_programs(&defaults, false).is_empty() && wide_decode_programs(&defaults, true).is_empty());
         check_options(&defaults).unwrap();
+    }
+
+    /// `--replay-records shared` keeps the records in one GPU's prefill scratch.
+    #[test]
+    fn replay_records_take_shared_on_one_gpu() {
+        assert_eq!(parse(&["--replay-records", "shared"]).replay_records, engine::ReplayRecords::Shared);
+        check_options(&parse(&["--replay-records", "shared", "--decode-rows", "128"])).unwrap();
+        check_options(&parse(&["--replay-records", "own", "--split-device", "1"])).unwrap();
+        let error = check_options(&parse(&["--replay-records", "shared", "--split-device", "1"])).unwrap_err()
+            .to_string();
+        assert!(error.contains("--replay-records shared") && error.contains("--split-device"), "{error}");
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--replay-records", "host"]).is_err());
     }
 
     /// `--decode-rows` takes 64 or 128; 128 runs on one GPU and needs the wide programs its
@@ -571,6 +594,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
         "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
+        "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
         "--decode-rows {} runs the wide decode programs on one GPU: the head split's programs take {} rows \
         (drop --split-device or keep --decode-rows {})", args.decode_rows, engine::DECODE_ROWS, engine::DECODE_ROWS);
@@ -590,7 +615,8 @@ impl EngineArgs {
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache, kda_state: args.kda_state, decode_rows: args.decode_rows }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state, decode_rows: args.decode_rows,
+        replay_records: args.replay_records }
 }
 
 /// The wide decode programs (`_m128`) the decode steps of `args` launch past 64 rows, and the
@@ -819,7 +845,10 @@ impl Opened {
         // the pool takes the free memory they leave, less the headroom, the graph reserve and the
         // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`).
         let eager = (args.pool_tokens == 0 || budgeted) && peer_stream.is_none() && (!args.local_experts || budgeted);
+        ensure!(eager || args.replay_records == engine::ReplayRecords::Own, "--replay-records shared needs the step \
+            workspaces before the KV pool: one GPU, an automatic pool (--pool-tokens 0) and Spark experts (--peers)");
         let mut early = None;
+        let mut records = None;
         let pool_tokens = if eager {
             let experts = if moe {
                 match admitted_experts.take() { Some(experts) => experts, None => self.experts(args)? }
@@ -843,8 +872,13 @@ impl Opened {
                 index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
+            // Shared replay records sit in the prefill scratch the workspaces already hold.
+            let shared_records = if args.replay_records == engine::ReplayRecords::Shared {
+                cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes(&self.cfg, layers, 1,
+                    args.decode_rows as u64)?
+            } else { 0 };
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
-                + rank.speculative_replay_bytes;
+                + rank.speculative_replay_bytes - shared_records;
             // The prefix mark arena the caller allocates once the engine exists (none with pool marks).
             let marks = args.planner_mark_slots as u64 * rank.retained_mark_bytes;
             let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
@@ -852,6 +886,9 @@ impl Opened {
             let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
                 (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
+            records = if shared_records > 0 {
+                Some(workspaces.prefill_scratch().context("shared replay records need the prefill lanes")?)
+            } else { None };
             early = Some((experts, drafter, dense, selector, workspaces));
             tokens
         } else if args.pool_tokens == 0 || budgeted {
@@ -887,7 +924,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows)?;
+            args.kda_state, args.decode_rows, records)?;
         tracing::info!(index_cache = ?engine.index_cache, pool_tokens, decode_rows = engine.decode_rows,
             "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;

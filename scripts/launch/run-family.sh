@@ -665,6 +665,20 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--decode-rows 128) ;;
     *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
+  # own 321 MB at 64 decode rows, 643 MB at 128) or shared (the prefill lanes' scratch, which no
+  # decode step reads). One GPU with an automatic pool and Spark experts.
+  replay_records="$(get GLM5_FLASH_REPLAY_RECORDS own)"
+  case "$replay_records" in
+    ""|own) ;;
+    shared)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--replay-records shared) ;;
+    *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
