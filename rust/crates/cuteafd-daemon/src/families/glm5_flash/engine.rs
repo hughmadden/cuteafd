@@ -109,6 +109,43 @@ fn commit_for(name: &str, rows: usize) -> String {
     if rows > DECODE_ROWS { format!("{name}_m{WIDE_DECODE_ROWS}") } else { name.to_string() }
 }
 
+/// Waves the sparse MLA decode's split planner allows (SparkInfer's `_CEIL_WAVES_MAX`), and the
+/// decode kernel's CTAs per row at one split (64 heads in blocks of 16).
+const SPARSE_MLA_WAVES: usize = 3;
+const SPARSE_MLA_HEAD_BLOCKS: usize = 4;
+
+/// The most rows a verify step schedules, up to `decode_rows`. Past the `_m64` programs it is the
+/// largest row count whose one-split sparse MLA launch (4 CTAs a row, one CTA per SM) fits three
+/// waves of the GPU's `sms` multiprocessors: a few rows more start a nearly empty fourth wave. On
+/// an RTX 5090 (170 SMs) the wide sparse MLA takes 313 us a layer at 127 rows (508 CTAs) and 407
+/// us at 128 (512 CTAs). So 127 rows on 170 SMs, 128 on 188, 99 on 132; never fewer than the
+/// `_m64` programs' 64 rows, whose split plans are their own, and `decode_rows` itself at 64.
+pub(crate) fn verify_budget(decode_rows: usize, sms: usize) -> usize {
+    if decode_rows <= DECODE_ROWS {
+        return decode_rows;
+    }
+    (SPARSE_MLA_WAVES * sms / SPARSE_MLA_HEAD_BLOCKS).clamp(DECODE_ROWS, decode_rows)
+}
+
+/// Hands the rows an even share of `verify_rows` leaves over to the first sequences, one each.
+/// `limits` are the drafts each sequence may add after its next token, `room` the even share's:
+/// 127 rows at 16 sequences give 6 each and leave 15 rows, so 15 sequences may draft 7. A
+/// sequence takes one only with the full `room` and `more(i)` (it speculates, and its tokens and
+/// capacity allow another draft). A share that leaves nothing over changes nothing: 64 or 128
+/// rows at 16 sequences, or the `chain` policy's whole budget for every sequence.
+pub(crate) fn hand_out_remainder(limits: &mut [usize], room: usize, verify_rows: usize, more: impl Fn(usize) -> bool) {
+    let mut left = verify_rows.saturating_sub(limits.len() * (room + 1));
+    for (i, limit) in limits.iter_mut().enumerate() {
+        if left == 0 {
+            break;
+        }
+        if *limit == room && more(i) {
+            *limit += 1;
+            left -= 1;
+        }
+    }
+}
+
 /// Bytes per KDA layer over `kda_heads` heads with a `state` recurrent state, as [`Caches::new`]
 /// allocates them: one sequence's FP32 or BF16 recurrent state `[heads, 128, 128]` and BF16 conv
 /// window (the last three q/k/v inputs), the two regions `slot_regions_on` hands out per layer
@@ -984,6 +1021,10 @@ pub(crate) struct GlmfEngine<'a> {
     /// past 64 rows run the wide `_m128` programs (fewer rows keep the `_m64` ones). The row
     /// budget a step's draft allocation spends.
     pub decode_rows: usize,
+    /// The most rows a verify step schedules, the drafts' budget: `decode_rows`, or with the wide
+    /// programs this GPU's whole sparse MLA waves ([`verify_budget`], 127 on an RTX 5090). The
+    /// programs and records keep `decode_rows`.
+    pub verify_rows: usize,
     /// Rows per layer the last speculative step recorded (its programs' capacity, see
     /// `replay_rows_of`): the commit that follows reads records of that many rows.
     replay_rows: std::cell::Cell<usize>,
@@ -1126,6 +1167,7 @@ impl<'a> GlmfEngine<'a> {
             "decode steps of up to {decode_rows} rows: the programs take {DECODE_ROWS} or {WIDE_DECODE_ROWS}");
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
+        let verify_rows = verify_budget(decode_rows, library.sm_count()?);
         // Whole allocation units: four MLA pages and one pool page each.
         let pages = pages.max(1).next_multiple_of(UNIT_PAGES);
         let pool_pages = pages / UNIT_PAGES;
@@ -1149,7 +1191,7 @@ impl<'a> GlmfEngine<'a> {
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
-            pages, slots, decode_rows, replay_rows: std::cell::Cell::new(DECODE_ROWS),
+            pages, slots, decode_rows, verify_rows, replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -3348,6 +3390,61 @@ mod prefill_lane_tests {
         assert_eq!(replay_bytes(heads, channels, 64), 9_453_568);
         assert_eq!(34 * replay_bytes(heads, channels, 64), 321_421_312);
         assert_eq!(34 * replay_bytes(heads, channels, 128), 642_842_624);
+    }
+
+    /// The verify budget: whole waves of the one-split wide sparse MLA (4 CTAs a row, at most three
+    /// waves), 127 rows on 170 SMs, 128 on 188, 99 on 132; never under the `_m64` programs' 64 rows
+    /// or over `--decode-rows`, and 64 at the default.
+    #[test]
+    fn the_verify_budget_keeps_the_wide_sparse_mla_in_three_waves() {
+        use super::{verify_budget, DECODE_ROWS, WIDE_DECODE_ROWS};
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 170), 127);
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 188), 128);
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 132), 99);
+        for sms in [132, 170, 188] {
+            // The largest row count within three waves, or every row.
+            let rows = verify_budget(WIDE_DECODE_ROWS, sms);
+            assert!(4 * rows <= 3 * sms && (rows == WIDE_DECODE_ROWS || 4 * (rows + 1) > 3 * sms), "{sms} SMs");
+        }
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 84), DECODE_ROWS);
+        for sms in [84, 132, 170, 188] {
+            assert_eq!(verify_budget(DECODE_ROWS, sms), DECODE_ROWS);
+        }
+    }
+
+    /// The `cost` policy's even share of a budget it does not divide: the rows left over go to the
+    /// first sequences that can take one more draft.
+    #[test]
+    fn the_rows_an_even_share_leaves_go_to_the_first_sequences() {
+        use super::hand_out_remainder;
+        let room_of = |rows: usize, sequences: usize| (rows / sequences).max(1) - 1;
+        let rows_of = |limits: &[usize]| limits.iter().map(|limit| limit + 1).sum::<usize>();
+        // 127 rows at 16 sequences: 6 drafts each would verify 112 rows; 15 sequences draft a 7th.
+        let room = room_of(127, 16);
+        let mut limits = vec![room; 16];
+        hand_out_remainder(&mut limits, room, 127, |_| true);
+        assert_eq!(limits, [vec![7; 15], vec![6]].concat());
+        assert_eq!(rows_of(&limits), 127);
+        // Passed over: a sequence its tokens or capacity hold under the room (0), and two that
+        // cannot take another draft (1, 2). The 13 after them take 13 of the 15 rows.
+        let mut limits = vec![room; 16];
+        limits[0] = 2;
+        hand_out_remainder(&mut limits, room, 127, |i| i > 2);
+        assert_eq!(limits, [vec![2, 6, 6], vec![7; 13]].concat());
+        // Nothing left over: shares that divide the budget, the chain policy's whole budget for
+        // every sequence, and more sequences than rows (one row each).
+        for (rows, sequences) in [(128, 16), (64, 16), (64, 8), (127, 1)] {
+            let room = room_of(rows, sequences);
+            let mut limits = vec![room; sequences];
+            hand_out_remainder(&mut limits, room, rows, |_| true);
+            assert_eq!(limits, vec![room; sequences], "{rows} rows, {sequences} sequences");
+        }
+        let mut limits = vec![126; 16];
+        hand_out_remainder(&mut limits, 126, 127, |_| true);
+        assert_eq!(limits, vec![126; 16]);
+        let mut limits = vec![0; 130];
+        hand_out_remainder(&mut limits, room_of(127, 130), 127, |_| true);
+        assert_eq!(limits, vec![0; 130]);
     }
 
     #[test]
