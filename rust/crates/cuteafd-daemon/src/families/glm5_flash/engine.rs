@@ -50,12 +50,12 @@ use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding, TokenSelector};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
+use cuteafd_ffi::programs::{ProgramCapacities, Programs, Scalar, VocabularyHead};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_table_pages, glmf_temporary_bytes,
-    GlmfScratchOptions, GlmfStepShape};
+    GlmfScratchOptions, GlmfStepShape, GlmfTopkExtents};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
@@ -717,7 +717,8 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
                 kda_prefill_expanded: settings.kda_prefill_expanded, index_compact,
-                kda_state: settings.kda_state.into() },
+                kda_state: settings.kda_state.into(),
+                topk_long: topk_extents(programs.capacities(), settings.max_context).long },
             shape: GlmfStepShape {
                 lead: true,
                 split,
@@ -762,6 +763,33 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         }
         Ok(self.decode_bytes(self.decode_rows)?.saturating_sub(self.decode_bytes(DECODE_ROWS)?))
     }
+
+    /// What the longer-extent index top-k (a context past the plain programs', `topk_long`) adds
+    /// to the decode workspace's and the prefill temporaries' top-k scratch at `prefill_rows`:
+    /// device bytes the planner's calibrated workspace allowance (measured at the plain extent)
+    /// leaves out.
+    pub(crate) fn longer_topk_bytes(&self, prefill_rows: usize) -> Result<u64> {
+        if self.scratch.topk_long.is_none() {
+            return Ok(0);
+        }
+        let lookup = |name: &str| self.programs.spec(name).ok()
+            .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
+        let plain = GlmfScratchOptions { topk_long: None, ..self.scratch };
+        let mut bytes = 0;
+        for (rows, decode) in [(self.decode_rows, true), (prefill_rows, false)] {
+            let topk = |options| glmf_step_scratch(lookup, self.cfg, options, rows as u64, decode).map(|s| s.topk);
+            bytes += topk(self.scratch)?.saturating_sub(topk(plain)?);
+        }
+        Ok(bytes)
+    }
+}
+
+/// The DSA index top-k extents an engine of `max_context` tokens runs, from its programs'
+/// capacities (`GlmfTopkExtents::for_context`): past the shared extent, GLM 5.3 Flash's longer
+/// one. A manifest without an extent keeps the plain programs for every width.
+pub(crate) fn topk_extents(capacities: ProgramCapacities, max_context: usize) -> GlmfTopkExtents {
+    GlmfTopkExtents::for_context(capacities.max_context.map_or(u64::MAX, |c| c as u64),
+        capacities.glmf_max_context.map(|c| c as u64), max_context as u64)
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
@@ -1032,6 +1060,9 @@ pub(crate) struct GlmfEngine<'a> {
     pub weights: GlmfWeights<'a>,
     pub stream: *mut c_void,
     pub max_context: usize,
+    /// The DSA index top-k extents (`topk_extents`): steps whose pool tables are wider than the
+    /// plain programs' pages run the longer-extent ones.
+    index_topk: GlmfTopkExtents,
     /// Rows of one prefill lane (and of a serial prefill chunk).
     pub prefill_rows: usize,
     /// Prefill lanes (1..=[`MAX_PREFILL_LANES`]): a Spark prefill chunk runs in up to this many.
@@ -1206,7 +1237,8 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
+        let index_topk = topk_extents(programs.capacities(), max_context);
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, index_topk, prefill_rows, prefill_lane_count,
             pages, slots, decode_rows, replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
@@ -2991,11 +3023,14 @@ impl<'a> GlmfEngine<'a> {
             }
             let pools_at = row_at(&w.pools, first, pools * 4);
             if part.long {
-                self.run_on(rank, false, &format!("index_topk_{mode}_{cap}"), &[("q_fp8", q_fp8),
+                // Pool tables wider than the plain top-k's extent (a context past 131,072 tokens) run
+                // the longer-extent program: only those steps, so shorter ones keep today's bits.
+                let (topk, width) = self.index_topk.program(mode, cap, part.pool_width.max(1) as u64)?;
+                self.run_on(rank, false, &topk, &[("q_fp8", q_fp8),
                     ("weights", head_weights), ("index_k_cache", pool_cache.buffer.ptr), ("page_table", part.pool_table),
                     ("cache_lengths", row_at(&w.cache_lengths, first, 4)), ("output_indices", pools_at),
                     ("scratch", w.topk_scratch.buffer.ptr)],
-                    &[rows, Scalar::I32(part.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
+                    &[rows, Scalar::I32(width as i32), Scalar::I32(tables.pool_stride as i32)])?;
             }
             self.run_on(rank, false, "index_expand", &[("positions", positions), ("pools", pools_at),
                 ("pool_logical", caches.pool_logical.buffer.ptr), ("page_table", part.page_table),

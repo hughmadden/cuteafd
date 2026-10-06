@@ -19,12 +19,19 @@ use std::path::Path;
 pub struct ProgramCapacities {
     pub decode_rows: Option<usize>,
     pub prefill_rows: Option<usize>,
+    /// The extent every indexed family's programs cover (`capacities.max_context`).
     pub max_context: Option<usize>,
+    /// GLM 5.3 Flash's own extent (`families.glmf.max_context`, CMake `CUTEAFD_GLMF_MAX_CONTEXT`):
+    /// past `max_context` its index top-k is exported again at this extent (`*_ctx{N}` programs).
+    /// None in manifests that predate it (then `max_context`).
+    pub glmf_max_context: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramCapacityError {
     Invalid { field: &'static str },
+    /// `families.<family>.max_context` is present but not a positive integer.
+    InvalidFamilyContext { family: &'static str },
     MissingContext { family: &'static str },
     ContextExceeded { family: &'static str, requested: usize, compiled: usize },
 }
@@ -33,7 +40,10 @@ impl fmt::Display for ProgramCapacityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid { field } => write!(f, "program manifest capacities.{field} must be a positive integer that fits usize"),
+            Self::InvalidFamilyContext { family } => write!(f, "program manifest families.{family}.max_context must be a positive integer that fits usize"),
             Self::MissingContext { family } => write!(f, "{family}: program manifest lacks capacities.max_context; export matching coordinator programs with an explicit --max-context before loading weights"),
+            // GLM 5.3 Flash's extent is its own build setting (its index top-k at a second extent).
+            Self::ContextExceeded { family: "glm5_flash", requested, compiled } => write!(f, "glm5_flash: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_GLMF_MAX_CONTEXT={requested} (--glmf-max-context {requested}), or lower --max-context to {compiled}"),
             Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context to {compiled}"),
         }
     }
@@ -49,15 +59,29 @@ impl ProgramCapacities {
             Some(value) => value.as_u64().and_then(|v| usize::try_from(v).ok()).filter(|&v| v > 0)
                 .map(Some).ok_or(ProgramCapacityError::Invalid { field: name }),
         };
+        let glmf_max_context = match manifest["families"]["glmf"].get("max_context") {
+            None => None,
+            Some(value) => Some(value.as_u64().and_then(|v| usize::try_from(v).ok()).filter(|&v| v > 0)
+                .ok_or(ProgramCapacityError::InvalidFamilyContext { family: "glmf" })?),
+        };
         Ok(Self { decode_rows: field("decode_rows")?, prefill_rows: field("prefill_rows")?,
-            max_context: field("max_context")? })
+            max_context: field("max_context")?, glmf_max_context })
+    }
+
+    /// The longest context `family`'s programs serve: GLM 5.3 Flash's own extent where the
+    /// manifest records one, else the shared `max_context`.
+    pub fn context_of(self, family: &str) -> Option<usize> {
+        match family {
+            "glm5_flash" => self.glmf_max_context.or(self.max_context),
+            _ => self.max_context,
+        }
     }
 
     /// Indexed families must not send a wider page table than the compiled
     /// top-k route or its scratch can hold. Check before engine allocations.
     pub fn require_context(self, family: &'static str, requested: usize)
         -> std::result::Result<(), ProgramCapacityError> {
-        let compiled = self.max_context.ok_or(ProgramCapacityError::MissingContext { family })?;
+        let compiled = self.context_of(family).ok_or(ProgramCapacityError::MissingContext { family })?;
         if requested > compiled {
             return Err(ProgramCapacityError::ContextExceeded { family, requested, compiled });
         }
@@ -304,7 +328,38 @@ mod tests {
             assert_eq!(error, ProgramCapacityError::ContextExceeded {
                 family, requested: 131073, compiled: 131072,
             });
-            assert!(error.to_string().contains("CUTEAFD_DSV4_MAX_CONTEXT=131073"));
+            // GLM 5.3 Flash names its own build setting.
+            let knob = if family == "glm5_flash" { "CUTEAFD_GLMF_MAX_CONTEXT=131073" } else { "CUTEAFD_DSV4_MAX_CONTEXT=131073" };
+            assert!(error.to_string().contains(knob), "{error}");
+        }
+    }
+
+    /// `families.glmf.max_context` (CUTEAFD_GLMF_MAX_CONTEXT) extends GLM 5.3 Flash alone; a
+    /// manifest without it keeps the shared extent.
+    #[test]
+    fn glm_flash_reads_its_own_extent() {
+        let manifest = serde_json::json!({"capacities": {"max_context": 131072},
+            "families": {"glmf": {"max_context": 1048576, "index_topk": 2048}, "glmf2": {"index_topk": 2048}}});
+        let limits = ProgramCapacities::from_manifest(&manifest).unwrap();
+        assert_eq!((limits.max_context, limits.glmf_max_context), (Some(131072), Some(1048576)));
+        assert_eq!((limits.context_of("glm5_flash"), limits.context_of("glm5")), (Some(1048576), Some(131072)));
+        limits.require_context("glm5_flash", 1048576).unwrap();
+        let error = limits.require_context("glm5_flash", 1048577).unwrap_err();
+        assert_eq!(error, ProgramCapacityError::ContextExceeded { family: "glm5_flash", requested: 1048577,
+            compiled: 1048576 });
+        assert!(error.to_string().contains("CUTEAFD_GLMF_MAX_CONTEXT=1048577"), "{error}");
+        for family in ["glm5", "qwen4"] {
+            assert!(limits.require_context(family, 131073).is_err());
+        }
+        // Older manifests: no GLM Flash extent, the shared one serves it.
+        let old = ProgramCapacities::from_manifest(&serde_json::json!({"capacities": {"max_context": 131072},
+            "families": {"glmf": {"index_topk": 2048}}})).unwrap();
+        assert_eq!((old.glmf_max_context, old.context_of("glm5_flash")), (None, Some(131072)));
+        for value in [serde_json::json!(0), serde_json::json!("1048576"), serde_json::json!(null)] {
+            let manifest = serde_json::json!({"capacities": {"max_context": 131072},
+                "families": {"glmf": {"max_context": value}}});
+            assert_eq!(ProgramCapacities::from_manifest(&manifest),
+                Err(ProgramCapacityError::InvalidFamilyContext { family: "glmf" }));
         }
     }
 

@@ -748,13 +748,16 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
     lanes: u64, rows: u64, context: u64, decode_rows: u64) -> Option<u64> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
-        GlmfScratchOptions, GlmfStepShape};
+        GlmfScratchOptions, GlmfStepShape, GlmfTopkExtents};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
-    // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them.
+    let base = manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072);
+    let context = if context > 0 { context } else { base };
+    // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them. A
+    // context past the plain index top-k's extent runs the longer-extent top-k (GLM 5.3 Flash's own).
+    let topk = GlmfTopkExtents::for_context(base, manifest["families"]["glmf"]["max_context"].as_u64(), context);
     let options = GlmfScratchOptions { kda_w8: lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
-        ..Default::default() };
-    let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
+        topk_long: topk.long, ..Default::default() };
     let (table_pages, table_pool_pages) = glmf_table_pages(context);
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
     let shape = GlmfStepShape { lead: true, split: false, local_experts: !spark, spark, partial_bytes: 2,
