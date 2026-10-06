@@ -276,9 +276,11 @@ case $family in
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
-if [[ $family == mimo_v2 ]]; then
+if [[ $family == mimo_v2 || $family == qwen4 ]]; then
   # Optional host embedding quota; unset retains the engine's admitted default.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
+fi
+if [[ $family == mimo_v2 ]]; then
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
   # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
   # prefill unchanged); a number pins the pool.
