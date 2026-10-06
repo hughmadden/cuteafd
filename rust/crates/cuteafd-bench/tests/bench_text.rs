@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+
 /// True within `timeout` once `done` holds.
 fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -47,7 +48,10 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
         let start = || -> String {
             let started: Value = agent.post(&format!("{base}/v1/bench/runs")).send_json(json!({"profile": "share"}))
                 .unwrap().into_json().unwrap();
-            started["id"].as_str().unwrap().to_string()
+            let id = started["id"].as_str().unwrap().to_string();
+            let report = status(&id);
+            assert_eq!(report["id"], id, "an accepted run must be visible immediately, without retries");
+            id
         };
         // A run that is cancelled: text is allowed while it holds the server
         // and cleared once the cancel lands.
