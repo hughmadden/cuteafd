@@ -704,9 +704,10 @@ if [[ $family == glm5_flash ]]; then
       spark_worker_args+=" --exl3-schedule gb10" ;;
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's routes and waits for its
-  # GPU work. async (the default): pinned staging, one batched asynchronous copy and a polled
-  # stream; blocking: the earlier two synchronous copies and a blocking synchronize. Same bits.
+  # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's inputs and waits for its
+  # GPU work. async (the default): pinned staging, one batched asynchronous copy, the hidden rows
+  # decoded in place and a polled stream; blocking: the earlier copies and a blocking synchronize.
+  # Same bits.
   exl3_worker_path="$(get GLM5_FLASH_EXL3_WORKER_PATH async)"
   case "$exl3_worker_path" in
     async) ;;
