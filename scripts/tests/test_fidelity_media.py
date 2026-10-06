@@ -186,6 +186,7 @@ def test_fixture_hash_and_family_fail_closed(tmp_path):
         read_fixture(tmp_path, s)
     manifest = {"windows": [{"media": [s]}]}
     assert require_media_flag(manifest, True, "mimo_v2")
-    for family, flag in [("mimo_v2", False), ("qwen4", True), ("glm5_flash", True)]:
+    assert require_media_flag(manifest, True, "qwen4")
+    for family, flag in [("mimo_v2", False), ("qwen4", False), ("glm5_flash", True)]:
         with pytest.raises(ValueError):
             require_media_flag(manifest, flag, family)

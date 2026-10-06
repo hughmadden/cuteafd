@@ -68,7 +68,7 @@ def require_media_flag(manifest, enabled, family):
         raise ValueError("media windows require explicit --media; refusing text-only scoring")
     if enabled and not present:
         raise ValueError("--media requires pinned media windows")
-    if present and family != "mimo_v2":
+    if present and family not in ("mimo_v2", "qwen4"):
         raise ValueError(f"{family} official media golden is not implemented")
     return present
 
