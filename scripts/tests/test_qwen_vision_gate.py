@@ -182,6 +182,24 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
 
 
+def test_copy_trim_is_opt_in_and_precedes_verify_width_and_selection():
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+    trim = serve[serve.index("        let mut sequences: Vec<Vec<u32>>"):serve.index("        let starts: Vec<usize>")]
+    assert trim.index("state.truncate_proposal") < trim.index("trim_copy_rows(&mut sequences, limit)")
+    assert trim.index("trim_copy_rows(&mut sequences, limit)") < trim.index("let spec = sequences.iter().any")
+    assert "if matches!(drafts, Drafts::Copy)" in trim
+    route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
+    assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
+    assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route
+    gate = engine[engine.index("// Exercise the serving trim helper"):engine.index("pub(crate) fn copy_verify_row_limit")]
+    assert "super::serve::trim_copy_rows(&mut sequences, limit)" in gate
+    assert "before_rows == 37 && input.len() == 32" in gate
+    assert "self.verify_device_ungraphed" in gate and "self.verify_device(" in gate
+    assert "snapshot(&buffers)? == exact_state" in gate
+    assert "Qwen copy trim logits and cache/state byte-exact" in gate
+
+
 def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()

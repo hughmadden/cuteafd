@@ -70,6 +70,10 @@ Qwen's launcher defaults to MTP3 only for local EXL3 (`ranks == 0`);
 TP4's shipped default uses copy-window drafts. Enabling native MTP on TP4
 with coordinator-local draft experts is a separate policy question, not a
 requirement of vision or decode-bucket qualification.
+Open performance question: Qwen TP4's requested C16 client load can be
+scheduler/EXL3-slot limited to at most seven active plain rows per verify;
+why does this layout not keep sixteen groups active? Investigate separately
+from vision and bucket qualification, using actual verify-width histograms.
 
 ## Architecture
 

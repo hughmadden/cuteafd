@@ -72,6 +72,11 @@ fn decode_bucket(rows: usize, spec: bool) -> usize {
     buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
 }
 
+pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
+    SPEC_BUCKETS.iter().copied().filter(|&bucket| bucket <= rows && bucket >= sequences)
+        .last().unwrap_or(sequences)
+}
+
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 K/V record of one token: K [2, 256] then V [2, 256].
@@ -925,8 +930,8 @@ impl<'a> Qwen4Engine<'a> {
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
         ensure!(self.use_graphs && self.startup_graphs && self.weights.layers.len() == self.cfg.layers,
             "Qwen padding check needs all layers and startup graphs");
-        ensure!(tokens.len() >= 65 && self.max_context >= 65 && self.slots >= 10 && self.pages >= 40,
-            "Qwen padding check needs 65 tokens, ten slots and forty pages");
+        ensure!(tokens.len() >= 69 && self.max_context >= 69 && self.slots >= 10 && self.pages >= 40,
+            "Qwen padding check needs 69 tokens, ten slots and forty pages");
         let snapshot = |buffers: &[cuteafd_ffi::CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
             // SAFETY: drain all writes before reading the live diagnostic regions.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
@@ -984,8 +989,43 @@ impl<'a> Qwen4Engine<'a> {
             tracing::info!(rows, spec, bucket = decode_bucket(rows, spec), bytes = plain.len() * 4,
                 "Qwen padded decode logits and cache/state byte-exact");
         }
+        // Exercise the serving trim helper before comparing exact-width arithmetic.
+        let mut sequences = vec![tokens[32..69].to_vec()];
+        let before_rows = sequences[0].len();
+        let limit = self.copy_verify_row_limit(before_rows, sequences.len(), false);
+        super::serve::trim_copy_rows(&mut sequences, limit);
+        let input = sequences[0].as_slice();
+        ensure!(before_rows == 37 && input.len() == 32 && input == &tokens[32..64],
+            "Qwen copy trim byte gate must preserve the 37->32 proposal prefix");
+        let mut allocator = Allocator::new(self.pages, self.slots, &self.cfg);
+        let mut placement = allocator.admit(69)?;
+        self.prefill_device(&mut placement, &tokens[..32], None, None, 1)?;
+        let original = placement.clone();
+        let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.ple_state]
+            .into_iter().filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+        for [kv, keys, pools] in self.paged_buffers() { buffers.extend([kv, keys, pools]); }
+        let before = snapshot(&buffers)?;
+        let exact = self.verify_device_ungraphed(&mut [(&mut placement, input)], true)?
+            .context("Qwen exact copy-trim logits")?.to_host(self.library)?;
+        let exact_state = snapshot(&buffers)?;
+        for (&buffer, bytes) in buffers.iter().zip(&before) { self.library.copy_h2d(buffer, bytes)?; }
+        placement = original;
+        let trimmed = self.verify_device(&mut [(&mut placement, input)], true)?
+            .context("Qwen bucketed copy-trim logits")?.to_host(self.library)?;
+        ensure!(exact.len() == trimmed.len() && exact.iter().zip(&trimmed).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "Qwen copy trim 37->32 changed exact-width real-row logits");
+        ensure!(snapshot(&buffers)? == exact_state, "Qwen copy trim 37->32 changed persistent cache/state bytes");
+        tracing::info!(before_rows, rows = input.len(), bucket = decode_bucket(input.len(), true),
+            bytes = exact.len() * 4, "Qwen copy trim logits and cache/state byte-exact");
         // SAFETY: finish the diagnostic before releasing its persistent engine buffers.
         unsafe { self.library.cuda_stream_synchronize(self.stream) }
+    }
+
+    /// Copy proposals may shrink to a lower spec bucket, never dropping a sequence.
+    pub(crate) fn copy_verify_row_limit(&self, rows: usize, sequences: usize, diagnostic: bool) -> usize {
+        if self.startup_graphs && self.use_graphs && !diagnostic {
+            copy_row_limit(rows, sequences)
+        } else { rows }
     }
 
     /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.

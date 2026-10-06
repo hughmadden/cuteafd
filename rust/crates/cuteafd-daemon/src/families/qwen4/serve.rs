@@ -374,6 +374,17 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Remove only proposal suffixes, distributing trims across the longest sequences.
+pub(crate) fn trim_copy_rows(sequences: &mut [Vec<u32>], limit: usize) {
+    let mut rows: usize = sequences.iter().map(Vec::len).sum();
+    while rows > limit {
+        let Some((index, _)) = sequences.iter().enumerate().filter(|(_, rows)| rows.len() > 1)
+            .max_by_key(|(_, rows)| rows.len()) else { break };
+        sequences[index].pop();
+        rows -= 1;
+    }
+}
+
 /// An admitted prompt waiting for its remaining prefill chunks.
 struct Prefill<'a> {
     job: NativeRequest,
@@ -499,6 +510,27 @@ impl VerifyStats {
 
 #[cfg(test)]
 mod verify_tests {
+    #[test]
+    fn copy_trim_retains_mandatory_tokens_and_proposal_prefixes() {
+        for sequences in 1..=16 {
+            for extra in 0..=64-sequences {
+                let original: Vec<Vec<u32>> = (0..sequences).map(|i| {
+                    (0..=extra / sequences + usize::from(i < extra % sequences))
+                        .map(|j| (i * 100 + j) as u32).collect()
+                }).collect();
+                let real = original.iter().map(Vec::len).sum::<usize>();
+                let limit = super::super::engine::copy_row_limit(real, sequences);
+                let mut trimmed = original.clone();
+                super::trim_copy_rows(&mut trimmed, limit);
+                assert_eq!(trimmed.iter().map(Vec::len).sum::<usize>(), limit);
+                for (before, after) in original.iter().zip(&trimmed) {
+                    assert!(!after.is_empty());
+                    assert_eq!(after, &before[..after.len()]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn histogram_counts_real_and_physical_rows_at_existing_timing_boundary() {
         let mut stats = super::VerifyStats::default();
@@ -972,7 +1004,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             }
         };
-        let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
+        let mut sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(drafted.iter().copied()).collect();
             // Drafts the grammar rejects could never be kept: verify none of them.
             if let Some(state) = a.constraint.as_ref() {
@@ -980,13 +1012,18 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
+        let diagnostic = active.iter().any(|a| a.job.probe.is_some());
+        if matches!(drafts, Drafts::Copy) {
+            let rows = sequences.iter().map(Vec::len).sum();
+            let limit = engine.copy_verify_row_limit(rows, sequences.len(), diagnostic);
+            trim_copy_rows(&mut sequences, limit);
+        }
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let spec = sequences.iter().any(|rows| rows.len() > 1);
         let draft_us = console::us(cycle);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let histories: Vec<_> = active.iter().map(|a| a.placement.history.clone()).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        let diagnostic = active.iter().any(|a| a.job.probe.is_some());
         let mut rows: Vec<(&mut Qwen4Placement, &[u32])> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
         steps += 1;
