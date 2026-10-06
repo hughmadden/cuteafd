@@ -313,8 +313,9 @@ pub(crate) struct DsparkDrafter<'a> {
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block (--draft-head).
     head_mode: Cell<DraftHead>,
-    /// How the FP8 GEMMs run (--draft-linear; the FP8 scratch serves it).
+    /// How the FP8 GEMMs run (--draft-linear), and the latest mode the FP8 scratch serves.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
+    fp8_admitted: fp8_linear::Fp8Rows,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -446,6 +447,7 @@ impl<'a> DsparkDrafter<'a> {
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
+            fp8_admitted: fp8_rows,
             cfg,
         })
     }
@@ -453,6 +455,14 @@ impl<'a> DsparkDrafter<'a> {
     /// How draft steps run the borrowed BF16 head from now on (the FP8 head launcher ignores it).
     pub fn set_draft_head(&self, mode: DraftHead) {
         self.head_mode.set(mode);
+    }
+
+    /// How the FP8 GEMMs run from now on: the load's mode or one before it.
+    pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
+        ensure!(mode <= self.fp8_admitted, "the dSpark FP8 scratch was admitted for {:?}, not {mode:?}",
+            self.fp8_admitted);
+        self.fp8_rows.set(mode);
+        Ok(())
     }
 
     /// `out` [rows, n] = `x` [rows, k] @ rows `first..first + n` of `weight`^T.
@@ -468,7 +478,7 @@ impl<'a> DsparkDrafter<'a> {
             Weight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
                 // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows
-                // in this mode (the load sized it for its mode).
+                // in this mode (set_draft_linear keeps it within the admitted one).
                 unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
                     self.fp8_rows.get()) }
             }
@@ -815,6 +825,14 @@ impl<'a> Drafter<'a> {
         match self {
             Self::Dflash2(d) => d.set_draft_head(mode),
             Self::Dspark(d) => d.set_draft_head(mode),
+        }
+    }
+
+    /// How the FP8 GEMMs run from now on (--draft-linear): the load's mode or one before it.
+    pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
+        match self {
+            Self::Dflash2(d) => d.set_draft_linear(mode),
+            Self::Dspark(d) => d.set_draft_linear(mode),
         }
     }
 
