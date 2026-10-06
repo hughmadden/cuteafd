@@ -8,6 +8,7 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
+mod lane_check;
 mod header;
 pub(crate) mod head;
 mod precision;
@@ -51,8 +52,15 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
-    #[arg(long, default_value_t = 4096)]
+    /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
+    #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
+    /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
+    /// --prefill-rows rows. The lanes share one set of attention temporaries.
+    #[arg(long, default_value_t = engine::DEFAULT_PREFILL_LANES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_LANES as u64))]
+    pub prefill_lanes: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -246,10 +254,25 @@ mod draft_cli_tests {
         }
         check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", "--kda-fp32-partials",
             "--kda-prefill-expanded", "--fp8-prefill", "kda-in"])).unwrap();
-        assert_eq!(engine::fp32_partial_reserve(4096, 4096), 369_623_040);
-        assert_eq!(engine::fp32_partial_reserve(32, 4096), 6_291_456);
-        assert_eq!(engine::output_shard_reserve(4096, 4096), 134_217_728);
-        assert_eq!(engine::output_shard_reserve(32, 4096), 2_097_152);
+        assert_eq!(engine::fp32_partial_reserve(2, 4096, 4096), 369_623_040);
+        assert_eq!(engine::fp32_partial_reserve(2, 32, 4096), 6_291_456);
+        assert_eq!(engine::output_shard_reserve(2, 4096, 4096), 134_217_728);
+        assert_eq!(engine::output_shard_reserve(2, 32, 4096), 2_097_152);
+        // Four lanes of half the rows hold the same partial rows in flight.
+        assert_eq!(engine::output_shard_reserve(4, 2048, 4096), engine::output_shard_reserve(2, 4096, 4096));
+    }
+
+    #[test]
+    fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
+        let defaults = parse(&[]);
+        assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
+        let four = parse(&["--prefill-lanes", "4", "--prefill-lane-rows", "2048"]);
+        assert_eq!((four.prefill_lanes, four.prefill_rows), (4, 2048));
+        assert_eq!(parse(&["--prefill-rows", "2048"]).prefill_rows, 2048);
+        for lanes in ["0", "5"] {
+            assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--prefill-lanes", lanes]).is_err());
+        }
     }
 }
 
@@ -371,6 +394,11 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
+    /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
+    /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
+    #[arg(long)]
+    pub lane_check: bool,
     /// Token I/O gate after the golden prompt (--prefill N truncates it), then
     /// stop: the resident embedding table against the shard, device against
     /// host greedy selection over this many decode steps, and device against
@@ -585,7 +613,7 @@ impl Opened {
         let pool_bound = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
             else { args.pool_tokens };
         let spark = args.peers.is_some();
-        let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers);
+        let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
         // The step workspaces the engine will allocate: page tables over the pool's bound, and
         // routed-expert rows as `experts` will make them (FP8 experts local, or Spark staging).
         let pages = pool_bound.div_ceil(engine::PAGE_ROWS).max(1).next_multiple_of(engine::UNIT_PAGES);
@@ -609,9 +637,12 @@ impl Opened {
                 std::iter::once(args.device)
                     .chain(peer_stream.map(|(d, _)| d)).collect()
             };
-            let extra = if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
-                else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
-                    if args.kda_fp32_partials { 4 } else { 2 }) };
+            let extra = if args.kda_output_shard {
+                engine::output_shard_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden)
+            } else {
+                engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
+                    if args.kda_fp32_partials { 4 } else { 2 })
+            };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra + workspace_extra)?
@@ -620,7 +651,7 @@ impl Opened {
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding)?;
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
@@ -717,7 +748,7 @@ impl Opened {
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
-        let transports = (0..engine::PREFILL_LANES).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
+        let transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
             &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
@@ -756,7 +787,7 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
+    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -835,6 +866,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);
+    }
+    if args.lane_check {
+        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+        return lane_check::lane_check(engine, &tokens[..n]);
     }
     if engine.drafter.is_some() {
         return speculate::draft_run(args, opened, engine);

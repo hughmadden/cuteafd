@@ -588,6 +588,21 @@ if [[ $family == glm5_flash ]]; then
     partials) ;;
     *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_PREFILL_LANES (1-4) lanes of GLM5_FLASH_PREFILL_LANE_ROWS rows (whole 64-row
+  # pages up to 4096) take each Spark prefill chunk, every lane with its own exchange in flight;
+  # unset keeps the engine's two lanes of 4096.
+  prefill_lanes="$(get GLM5_FLASH_PREFILL_LANES)"
+  if [[ -n "$prefill_lanes" ]]; then
+    [[ "$prefill_lanes" =~ ^[1-4]$ ]] || { echo "GLM5_FLASH_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
+    family_args+=(--prefill-lanes "$prefill_lanes")
+  fi
+  lane_rows="$(get GLM5_FLASH_PREFILL_LANE_ROWS)"
+  if [[ -n "$lane_rows" ]]; then
+    if ! [[ "$lane_rows" =~ ^[1-9][0-9]*$ ]] || ((lane_rows > 4096 || lane_rows % 64 != 0)); then
+      echo "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
+    fi
+    family_args+=(--prefill-lane-rows "$lane_rows")
+  fi
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
