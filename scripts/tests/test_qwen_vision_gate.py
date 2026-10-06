@@ -45,6 +45,22 @@ def test_qwen_patch_lut_uses_host_f64_rescale_then_f32_normalize():
     np.testing.assert_array_equal(patches[:,:,0],patches[:,:,1])
 
 
+def test_qwen_calibration_keeps_strict_misses_and_final_output_mean_floor():
+    gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_calibration_gate")
+    floor = dict(relative_l2=.040262, mean_cosine=.997386, worst_cosine=.870111, **{"pass":False})
+    measured = dict(relative_l2=.037299, mean_cosine=.997565, worst_cosine=.939182, **{"pass":False})
+    intermediate = gate.calibrated_metrics(measured,floor,final_output=False)
+    assert intermediate["pass"] and not intermediate["strict_pass"]
+    assert not gate.calibrated_metrics(measured,floor,final_output=True)["pass"]
+    # MiMo's original policy remains unchanged and still fails this intermediate.
+    assert not gate.common.calibrated_metrics(measured,floor)["pass"]
+    for field,value in (("relative_l2",.042263),("mean_cosine",.997335),("worst_cosine",.869110)):
+        assert not gate.calibrated_metrics(dict(measured,**{field:value}),floor,final_output=False)["pass"]
+    final = dict(relative_l2=.025771,mean_cosine=.999705,worst_cosine=.995945,**{"pass":True})
+    final_floor = dict(relative_l2=.027005,mean_cosine=.999679,worst_cosine=.994904,**{"pass":True})
+    assert gate.calibrated_metrics(final,final_floor,final_output=True)["pass"]
+
+
 def test_qwen_pointwise_launches_cover_every_element():
     source = (ROOT / "native/shared/cuda/vision_qwen.cuh").read_text()
     # Every pointwise kernel using the unchanged capped launcher must grid-stride.

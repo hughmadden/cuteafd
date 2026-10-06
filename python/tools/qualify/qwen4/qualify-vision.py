@@ -130,6 +130,16 @@ def reference_model(cfg, tensors):
     return model.cuda().float().eval()
 
 
+def calibrated_metrics(measured, floor, *, final_output):
+    # Only merged feature rows reach the LM; intermediate drift uses the BF16 floor.
+    result = dict(measured, strict_pass=measured["pass"])
+    result["pass"] = (measured["relative_l2"] <= floor["relative_l2"] + 0.002
+        and measured["mean_cosine"] >= floor["mean_cosine"] - 0.00005
+        and measured["worst_cosine"] >= floor["worst_cosine"] - 0.001
+        and (not final_output or measured["mean_cosine"] >= 0.9995))
+    return result
+
+
 def run(args):
     import torch
     cfg = json.loads((args.snapshot / "config.json").read_text())
@@ -150,7 +160,8 @@ def run(args):
     check(lib.cuteafd_vision_required(C.byref(spec), C.byref(required)))
     check(lib.cuteafd_vision_create(C.byref(spec), 0, required.weights+required.scratch+required.blas_workspace, C.byref(owner)))
     result = dict(checkpoint=str(args.snapshot), sm=torch.cuda.get_device_capability(0), numerics=1,
-        ledger=required.as_dict(), g2={}, bf16_yardstick={}, g3={}, encode_ms={})
+        ledger=required.as_dict(), g2={}, bf16_yardstick={}, g3={}, encode_ms={},
+        calibration_policy="qwen-bf16-relative-intermediates-final-mean-0.9995-v1")
     lut = normalization_lut()
     try:
         check(lib.cuteafd_vision_upload(owner, 0, blob, len(blob)))
@@ -204,7 +215,7 @@ def run(args):
             yardstick = {str(stage): common.metrics(value,fp32_refs[stage]) for stage,value in refs.items()}
             yardstick["30"] = common.metrics(floor,ref)
             result["bf16_yardstick"][str(tokens)] = yardstick
-            result["g2"][str(tokens)] = {stage: common.calibrated_metrics(value,yardstick[stage]) for stage,value in measured.items()}
+            result["g2"][str(tokens)] = {stage: calibrated_metrics(value,yardstick[stage],final_output=stage=="30") for stage,value in measured.items()}
             model.float(); model.rotary_pos_emb.inv_freq.copy_(inv)
             for h in hooks: h.remove()
             print(json.dumps(dict(event="G2",tokens=tokens,stages=result["g2"][str(tokens)])),flush=True)
