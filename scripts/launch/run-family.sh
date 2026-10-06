@@ -884,6 +884,20 @@ if [[ $family == glm5_flash ]]; then
     wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
     *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_TARGET_HEAD: the target's logits through the BF16 head, exact (default: the pedantic
+  # FP32 GEMM at every row count) or tensor (steps past 8 rows on BF16 tensor cores with FP32
+  # accumulation: a change to the target's numerics, KL-gated). Needs GLM5_FLASH_FP8_HEAD=off.
+  target_head="$(get GLM5_FLASH_TARGET_HEAD exact)"
+  case "$target_head" in
+    ""|exact) ;;
+    tensor)
+      if [[ $fp8_head == on ]]; then
+        echo "GLM5_FLASH_TARGET_HEAD=tensor runs the BF16 head; set GLM5_FLASH_FP8_HEAD=off" >&2
+        exit 2
+      fi
+      family_args+=(--target-head tensor) ;;
+    *) echo "GLM5_FLASH_TARGET_HEAD must be exact or tensor" >&2; exit 2 ;;
+  esac
 fi
 # GLM5_FLASH_MEMORY=auto: lay out what this launch would serve with the standard settings (the flags
 # resolved above), on the free memory of the GPU it serves from, before any container changes. When

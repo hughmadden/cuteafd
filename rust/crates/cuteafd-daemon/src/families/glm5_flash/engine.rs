@@ -43,7 +43,7 @@ use super::graphs::{GraphCache, GraphStats};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
-use super::head::GlmfHead;
+use super::head::{GlmfHead, TargetHeadMode};
 use crate::families::glm5::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -1308,6 +1308,9 @@ pub(crate) struct GlmfEngine<'a> {
     pub drafter: Option<super::dspark::Drafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+    /// How the target's logits run through the BF16 head (`--target-head`); set before the
+    /// first step, since decode graphs capture the head's launch.
+    pub target_head: TargetHeadMode,
     /// Host copy of the caches' pool-page map (a shared pool page sits at the same logical
     /// page in every sequence that holds it).
     pool_logical_host: RefCell<Vec<i32>>,
@@ -1511,7 +1514,8 @@ impl<'a> GlmfEngine<'a> {
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
-            kda_prefill_expanded: false, kda_state, l2: None, embedding, selector: RefCell::new(None) })
+            kda_prefill_expanded: false, kda_state, l2: None, target_head: TargetHeadMode::Exact, embedding,
+            selector: RefCell::new(None) })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -2917,7 +2921,8 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// The vocabulary projection of the last `logit_rows` normalized rows into
-    /// `w.logits` through the one resident head: BF16, or the FP8 head
+    /// `w.logits` through the one resident head: BF16 (the pedantic FP32 GEMM, or
+    /// with `--target-head tensor` BF16 tensor cores from 9 rows), or the FP8 head
     /// (--fp8-head) in 16-row spans for every row count.
     fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
@@ -2932,8 +2937,13 @@ impl<'a> GlmfEngine<'a> {
             }),
             // SAFETY: the head's input and operands are live buffers of these shapes.
             GlmfHead::Bf16(head) => unsafe {
-                w.head.as_ref().context("LM head")?.launch(x.cast(), head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32,
-                    self.stream)
+                let program = w.head.as_ref().context("LM head")?;
+                let (x, weight, logits) = (x.cast(), head.buffer.ptr.cast(), w.logits.buffer.ptr.cast());
+                if self.target_head.tensor_cores(logit_rows) {
+                    program.launch_tensor_op(x, weight, logits, logit_rows as u32, self.stream)
+                } else {
+                    program.launch(x, weight, logits, logit_rows as u32, self.stream)
+                }
             },
         }
     }
