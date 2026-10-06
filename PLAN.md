@@ -763,6 +763,25 @@ Work, in priority order:
    C1 three-arm parity, chart/G6, exact G7 a/e, single-image interference
    and vision-only connection-loss gates pass. Explicit `VISION=off` skips
    tower startup; checkpoints without a tower remain text-only.
+   **GLM Flash startup promotion `5e6652d3` (2026-10-07):** the matching
+   SM120/ARM64 SM121 build and five-host installed audit pass. The same-image
+   C1 confirmation is 66.88 -> 70.54 emitted tok/s (1.05483x); startup C16 is
+   176.64 tok/s. Ready-to-text and both ordinary-media passes add zero graph
+   captures; all reachable LM/drafter workspaces are resident at readiness,
+   tracked growth is zero, and the 2 MiB global residual is within 16 MiB.
+   Readiness is 72 -> 78 s: graph capture measures 4.21 s; the remaining
+   approximately 1.8 s is unisolated launch/load/poll variation, not attributed
+   to workspace precreation (both arms precreate the same storage).
+   TJ accepts the 4.21 s graph-capture cost: runtime performance takes priority
+   over readiness, while wasteful load transforms into required tile formats
+   must still be avoided. The readiness-only follow-up is cancelled, not run.
+   Startup graphs are qualified for the `work/p0` merge, subject to the batch
+   V4.1 parity gate. This does not qualify GLM Flash `VISION=auto`: retained
+   G1-G7 evidence comes from prior matching-native builds; the frozen
+   three-arm baseline/off/auto text-parity sessions, default-quota served-image
+   interference at 256/1024/4096 tokens, encoder-only connection loss with
+   cached/new image 503 and text survival, and explicit off-mode runtime
+   verification remain pending. Keep GLM Flash vision off until those pass.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
