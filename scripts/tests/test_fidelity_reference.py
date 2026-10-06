@@ -758,13 +758,19 @@ def test_v41_two_lengths_isolate_module_and_cross_layer_state():
             assert np.array_equal(value.array, np.full(length, length))
 
 
-@pytest.mark.parametrize("family", ["glm5_flash", "glm5"])
-def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
+@pytest.mark.parametrize("family,media", [("glm5_flash", False), ("glm5_flash", True), ("glm5", False)])
+def test_glm_window_dsa_handoff_is_per_window(tmp_path, monkeypatch, family, media):
     from contextlib import nullcontext
     manifest = tiny_set()
     manifest["family"] = family
     w = manifest["windows"][1]
     w["tokens"], w["roles"] = [1, 2, 3, 4, 5, 6, 7], ["ctx"] * 7
+    if media:
+        from test_fidelity_media import span, glm_config
+        for window in manifest["windows"]:
+            window.update(tokens=[1] + [9] * 4 + [2] + [3] * 634, roles=["ctx"] * 640,
+                          score_from=64, media=[span()])
+        (tmp_path / "config.json").write_text(json.dumps(glm_config()))
     manifest["set_sha256"] = set_hash(manifest)
     path = tmp_path / "input.json"
     path.write_bytes(canonical(manifest))
@@ -778,6 +784,8 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
         def cuda(self): return Tensor(self.data.copy())
         def float(self): return self
         def numpy(self): return self.data.astype(np.float32)
+        @property
+        def shape(self): return self.data.shape
         def __getitem__(self, key): return Tensor(self.data[key])
         def unsqueeze(self, axis): return Tensor(np.expand_dims(self.data, axis))
         def repeat(self, *shape): return Tensor(np.tile(self.data, shape))
@@ -790,7 +798,7 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
         def dtype(self): return "bf16"
         def triu(self, diagonal): return Tensor(np.triu(self.data, diagonal))
         def to(self, _dtype): return self
-        def copy_(self, other): self.data = other.data.copy()
+        def copy_(self, other): np.copyto(self.data, other.data)
 
     class Layer:
         def __init__(self, _config, layer_id): self.layer_id = layer_id
@@ -802,6 +810,10 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
             length = h.data.shape[1]
             incoming = None if prev_topk_indices is None else int(prev_topk_indices.data[0, 0, 0])
             calls.append((self.layer_id, length, incoming))
+            np.testing.assert_array_equal(_kwargs["position_ids"].data, np.arange(length)[None])
+            if media:
+                np.testing.assert_array_equal(h.data[0, 1:5], np.full((4, 4, 1), 42))
+                assert h.data[0, 0, 0, 0] == 1 and h.data[0, 5, 0, 0] == 2
             expected = length if self.layer_id == 1 else None
             assert incoming == expected
             topk = Tensor(np.full((1, length, 1), length)) if self.layer_id == 0 else None
@@ -824,8 +836,33 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
             embedding=lambda ids, _weights: Tensor(ids.data[..., None]),
             linear=lambda x, w: Tensor(x.data @ w.data.T))))
     import time
-    scope = dict(torch=torch, time=time, load_set=load_set, verify_snapshot=lambda *_args: {},
-        qualify=lambda *_args: None, write_scored_logits=write_scored_logits, finish_golden=finish_golden,
+    coordinator = {"snapshot_revision": "dense", "modeling_sha256": "a" * 64}
+    expert_identity = {"snapshot_revision": "official-experts", "index_sha256": "b" * 64}
+    events = []
+    if media:
+        import glm_flash_media
+        monkeypatch.setattr(glm_flash_media, "snapshot_identity", lambda *_args: coordinator)
+        def expert_source(path):
+            assert path == tmp_path / "experts"
+            events.append("expert-identity")
+            return expert_identity
+        monkeypatch.setattr(glm_flash_media, "expert_snapshot_identity", expert_source)
+        def features(*_args):
+            assert events == ["expert-identity", "qualify"]
+            events.append("tower")
+            return {"a" * 64: Tensor(np.full((4, 1), 42))}, coordinator
+        monkeypatch.setattr(glm_flash_media, "window_features", features)
+        identity = {**coordinator, "coordinator_tower": coordinator,
+                    "experts": expert_identity, "tower_dtype": "bf16"}
+        proof = fixture_proof(manifest, identity)
+        proof.update(source_window=manifest["windows"][0]["id"], media=manifest["windows"][0]["media"])
+    def qualification(*_args):
+        if media:
+            assert events == ["expert-identity"]
+            events.append("qualify")
+            return proof
+    scope = dict(torch=torch, time=time, json=json, load_set=load_set, verify_snapshot=lambda *_args: {},
+        qualify=qualification, write_scored_logits=write_scored_logits, finish_golden=finish_golden,
         PREFIX="model.language_model.", FP32_KEYS=(), load_layer=lambda *_args: None,
         CheckpointStorage=CheckpointStorage, install_dsa=lambda *_args: None,
         log_checkpoint_reads=lambda *_args: None)
@@ -836,14 +873,29 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
         GlmMoeDsaDecoderLayer=Layer, GlmMoeDsaRMSNorm=lambda *_args: Norm(),
         GlmMoeDsaRotaryEmbedding=lambda **_kwargs: SimpleNamespace(
             cuda=lambda: lambda h, **_kw: (h, h)))
-    args = SimpleNamespace(windows=path, snapshot=tmp_path, out=tmp_path, layers=None, experts_snapshot=None)
+    args = SimpleNamespace(windows=path, snapshot=tmp_path, out=tmp_path, layers=None,
+                           experts_snapshot=tmp_path / "experts" if media else None,
+                           media=media, tower_dtype="bf16")
     if family == "glm5_flash":
         scope["run_windows"](args, config, ref, weights, weights)
     else:
         scope["run_windows"](args, config, ref, weights)
-    assert calls == [(0, 5, None), (0, 7, None), (1, 5, 5), (1, 7, 7), (2, 5, None), (2, 7, None)]
+    if media:
+        assert calls == [(0, 640, None)] * 2 + [(1, 640, 640)] * 2 + [(2, 640, None)] * 2
+    else:
+        assert calls == [(0, 5, None), (0, 7, None), (1, 5, 5), (1, 7, 7), (2, 5, None), (2, 7, None)]
     meta = json.loads((tmp_path / "meta.json").read_text())
-    assert [w["positions"] for w in meta["windows"]] == [list(range(2, 5)), list(range(2, 7))]
+    if media:
+        assert events == ["expert-identity", "qualify", "tower"]
+        assert meta["snapshot_identity"] == meta["prefix_qualification"]["snapshot_identity"] == identity
+        validate_qualification(meta["prefix_qualification"], manifest, identity)
+        changed = {**identity, "experts": {**expert_identity, "snapshot_revision": "other"}}
+        with pytest.raises(ValueError, match="provenance"):
+            validate_qualification(meta["prefix_qualification"], manifest, changed)
+        assert [w["positions"] for w in meta["windows"]] == [list(range(64, 640))] * 2
+        assert "not a full official-model byte-equivalence claim" in meta["reference"]
+    else:
+        assert [w["positions"] for w in meta["windows"]] == [list(range(2, 5)), list(range(2, 7))]
 
 
 @pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "mimo_v2/mimo_v26", "qwen4", "glm5_flash", "glm5"])
