@@ -152,6 +152,11 @@ pub enum GlmfKdaState {
 }
 
 impl GlmfKdaState {
+    /// Bytes of one recurrent-state element: 4 (FP32) or 2 (BF16).
+    pub fn bytes(self) -> u64 {
+        if self == Self::F32 { 4 } else { 2 }
+    }
+
     /// The `glmf_kda_*` program (without the prefix) of capacity `cap` (`m64`, `m4096`): the FP32
     /// state's, or the BF16 state's `kda_s16_*` (`kda_s16t_m4096` for the tile-rounded prefill).
     pub fn program(self, cap: &str) -> String {
@@ -405,6 +410,33 @@ impl GlmfStepWorkspaces {
     pub fn device_bytes(&self) -> u64 {
         self.decode + self.lanes * self.lane + self.prefill_temporaries
     }
+}
+
+/// The token selector of decode steps of `rows` rows (`token_io::TokenSelector`): its greedy
+/// outputs (ids, statuses and log-probabilities, 12 B a row) and the GPU sampler the start-up
+/// reserves for up to 128 of them (`sampler::TargetSamplingWave::device_bytes`: per row 64 B of
+/// parameters and 64 of scratch, two vocabulary bit masks, a 2,048-bucket histogram, 256
+/// rank-ordered ids with their 8-byte staging and 32 B of row outputs).
+pub fn glmf_selector_bytes(rows: u64, vocab: u64) -> u64 {
+    let capacity = rows.clamp(1, 128);
+    let mask = capacity * vocab.div_ceil(32) * 4;
+    rows * 12 + capacity * (64 + 64 + 2048 * 4 + 256 * (4 + 8) + 32) + 2 * mask
+}
+
+/// Rows of one MLA page (64 tokens' latent records).
+pub const GLMF_PAGE_ROWS: u64 = 64;
+/// One token's FP8 MLA latent record, and its BF16 DSA index key | gate row (keys cache only).
+pub const GLMF_RECORD_BYTES: u64 = 528;
+pub const GLMF_KEY_BYTES: u64 = 512;
+
+/// The scratch page decode row buckets add past the pool (`--decode-row-buckets`): one MLA page of
+/// records per MLA layer of the first `layers`, with the token keys of the `index` cache that keeps
+/// them. Padded rows write it, never a pool unit.
+pub fn glmf_bucket_scratch_bytes(cfg: &GlmNextConfig, layers: usize, index: super::GlmfIndexCache) -> u64 {
+    let mla = cfg.attention[..layers.min(cfg.layers)].iter()
+        .filter(|&&a| a == crate::families::glm5_flash::GlmNextAttention::Mla).count() as u64;
+    let keys = if index == super::GlmfIndexCache::Keys { GLMF_KEY_BYTES } else { 0 };
+    mla * GLMF_PAGE_ROWS * (GLMF_RECORD_BYTES + keys)
 }
 
 /// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the decode workspace

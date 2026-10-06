@@ -13,11 +13,12 @@ mod deepseek;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 mod glmf_workspace;
-pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_pool_pages, glmf_step_scratch,
-    glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, glmf_topk_long_program, GlmfKdaState,
-    GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces,
-    GlmfTemporaryBytes, GlmfTopkExtents, GlmfTopkWidth, GLMF_DECODE_ROWS, GLMF_DEFAULT_PREFILL_LANES,
-    GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
+pub use glmf_workspace::{glmf_bucket_scratch_bytes, glmf_lane_bytes, glmf_manifest_scratch, glmf_pool_pages,
+    glmf_selector_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes,
+    glmf_topk_long_program, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions,
+    GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GlmfTopkExtents, GlmfTopkWidth, GLMF_DECODE_ROWS,
+    GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_KEY_BYTES, GLMF_PAGE_ROWS, GLMF_RECORD_BYTES,
+    GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
 mod v4_workspace;
 pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,

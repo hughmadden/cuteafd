@@ -281,6 +281,24 @@ mod draft_cli_tests {
         assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
+    /// `cuteafd plan --layout` sizes GLM 5.3 Flash's selector, row-bucket page and drafter rings
+    /// with the loader's formulas: they follow the engine's own buffers.
+    #[test]
+    fn the_planner_formulas_follow_the_engine_buffers() {
+        use cuteafd_loader::families::glm5::draft_representation::{GLM_DRAFT_RING, GLM_DRAFT_TAP_ROWS};
+        use cuteafd_loader::serving_capacity::{glmf_selector_bytes, GLMF_KEY_BYTES, GLMF_PAGE_ROWS, GLMF_RECORD_BYTES};
+        assert_eq!((GLMF_PAGE_ROWS, GLMF_RECORD_BYTES, GLMF_KEY_BYTES),
+            (engine::PAGE_ROWS as u64, engine::RECORD_BYTES as u64, engine::KEY_BYTES as u64));
+        assert_eq!((GLM_DRAFT_RING, GLM_DRAFT_TAP_ROWS),
+            (crate::families::glm5::dflash::RING as u64, crate::families::glm5::dflash::TAP_ROWS as u64));
+        for rows in [1usize, 64, 128, 256] {
+            let engine = rows * 12 + crate::shared::sampler::TargetSamplingWave::device_bytes(rows.clamp(1, 128), 154_880);
+            assert_eq!(glmf_selector_bytes(rows as u64, 154_880), engine as u64, "{rows} rows");
+        }
+        // The candidate's ledger at 128 decode rows: `sampler` 6,418,432 and the greedy outputs 1,536.
+        assert_eq!(glmf_selector_bytes(128, 154_880), 6_418_432 + 1_536);
+    }
+
     #[test]
     fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
         let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
@@ -1061,11 +1079,7 @@ impl Opened {
             // Row buckets: one scratch page per MLA layer past the pool (records, and token keys with
             // the keys index cache).
             let scratch_page = if args.decode_row_buckets {
-                let mla = self.cfg.attention[..layers].iter()
-                    .filter(|&&a| a == cuteafd_loader::families::glm5_flash::GlmNextAttention::Mla).count() as u64;
-                let row = engine::RECORD_BYTES as u64
-                    + if index_cache == engine::IndexCache::Keys { engine::KEY_BYTES as u64 } else { 0 };
-                mla * engine::PAGE_ROWS as u64 * row
+                cuteafd_loader::serving_capacity::glmf_bucket_scratch_bytes(&self.cfg, layers, index_cache.into())
             } else { 0 };
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes - shared_records + scratch_page;

@@ -224,7 +224,7 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,
     /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 0)]
     pub(crate) prefill_rows: u64,
     /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
     #[arg(long, default_value_t = 0)]
@@ -255,6 +255,38 @@ pub(crate) struct PlanArgs {
     /// unit beside the pool).
     #[arg(long, value_enum, default_value = "arena")]
     pub(crate) prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks,
+    /// GLM 5.3 Flash's DSA index cache for --layout (serve-glmf's --index-cache: `compact` holds
+    /// 6,172 B per token, `keys` 11,804).
+    #[arg(long, value_enum, default_value = "keys")]
+    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
+    /// GLM 5.3 Flash's KDA recurrent state for --layout (serve-glmf's --kda-state).
+    #[arg(long, value_enum, default_value = "f32")]
+    pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
+    /// GLM 5.3 Flash's KDA in/out projections for --layout (serve-glmf's --kda-fp8).
+    #[arg(long, value_enum, default_value = "off")]
+    pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
+    /// GLM 5.3 Flash's E4M3 LM head for --layout (serve-glmf's --fp8-head).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
+        action = clap::ArgAction::Set)]
+    pub(crate) fp8_head: bool,
+    /// GLM 5.3 Flash's decode row buckets for --layout (serve-glmf's --decode-row-buckets).
+    #[arg(long)]
+    pub(crate) decode_row_buckets: bool,
+    /// The drafter checkpoint for --layout (serve-glmf's --draft): GLM 5.3 Flash lays a DFlash2
+    /// drafter out from its config, with one context ring per sequence (--draft-context-slots
+    /// overrides); other drafters take the family's allowance.
+    #[arg(long)]
+    pub(crate) draft: Option<PathBuf>,
+    /// The drafter's weights in E4M3 (unset or true, the default) or the checkpoint's BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: Option<bool>,
+    /// How the FP8 drafter's GEMMs run (serve-glmf's --draft-linear): their scratch.
+    #[arg(long, value_enum, default_value = "w8a16")]
+    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
+    #[arg(long)]
+    pub(crate) draft_context_slots: Option<u64>,
+    #[arg(long, default_value_t = 16)]
+    pub(crate) draft_sequences: u64,
     /// Native drafter stages, 0 disables the native drafter.
     #[arg(long, default_value_t = 3)]
     pub(crate) native_mtp_layers: usize,
