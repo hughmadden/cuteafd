@@ -52,6 +52,17 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
+    /// Slots of the prefix mark arena the command allocates on every GPU (serve: its prefix
+    /// cache; golden: the --resume-at check), reserved before an automatic pool is sized, by the
+    /// planned admission and by the measured one alike.
+    #[arg(skip)]
+    pub planner_mark_slots: usize,
+    /// Where prefix-cache snapshots keep their KDA state marks: `arena`, a device arena of
+    /// 2C + 2 marks (147.6 MB each with FP32 state) beside the KV pool, or `pool`, units of
+    /// the KV pool itself (49 per mark), taken at capture and evicted (to the host tier when
+    /// it is on) like any snapshot's rows.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_PREFIX_MARKS", default_value = "arena")]
+    pub prefix_marks: prefix::PrefixMarks,
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
     #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
@@ -220,6 +231,14 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn prefix_marks_default_to_the_arena_and_take_the_pool() {
+        assert_eq!(parse(&[]).prefix_marks, prefix::PrefixMarks::Arena);
+        assert_eq!(parse(&["--prefix-marks", "pool"]).prefix_marks, prefix::PrefixMarks::Pool);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefix-marks", "host"]).is_err());
     }
 
     #[test]
@@ -527,18 +546,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 impl Opened {
-    /// Builds the engine and hands it to `body`.
+    /// Builds the engine and hands it to `body`. Either KV admission keeps the
+    /// `args.planner_mark_slots` prefix marks the caller allocates once the engine exists free.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
-        self.with_engine_admitting(args, &|_| 0, body)
-    }
-
-    /// [`Self::with_engine`], where the caller allocates `after_pool(cache geometry)` more device
-    /// bytes after the engine exists (the prefix cache's mark arena): a measured admission keeps
-    /// them free.
-    pub fn with_engine_admitting<T>(&self, args: &EngineArgs,
-        after_pool: &dyn Fn(&cuteafd_loader::serving_capacity::RankCacheGeometry) -> u64,
-        body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
@@ -671,8 +682,10 @@ impl Opened {
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes;
+            // The prefix mark arena the caller allocates once the engine exists (none with pool marks).
+            let marks = args.planner_mark_slots as u64 * rank.retained_mark_bytes;
             let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
-                graphs: graph_reserve(args), later: state + after_pool(rank) + future_expert_bytes };
+                graphs: graph_reserve(args), later: state + marks + future_expert_bytes };
             let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
                 (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
@@ -695,7 +708,7 @@ impl Opened {
                     if args.kda_fp32_partials { 4 } else { 2 })
             };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, args.slots,
+                args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra)?
         } else {
             args.pool_tokens
@@ -867,6 +880,9 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
+    // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
+    args.engine.planner_mark_slots =
+        if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena { 2 } else { 0 };
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -935,7 +951,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat);
+            args.resume_repeat, args.engine.prefix_marks);
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);

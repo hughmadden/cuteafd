@@ -295,7 +295,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
     let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     let embed = &sequence[prefill..prefill + rows];
-    let family = super::prefix::GlmfPrefix::new(engine, |_| 0)?;
+    let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
     let kda_layers = engine.weights.layers.iter()
         .filter(|l| l.attention == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda).count();
     let fp32_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * 4;

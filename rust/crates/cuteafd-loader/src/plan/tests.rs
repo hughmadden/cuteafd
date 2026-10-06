@@ -1266,3 +1266,54 @@ fn explicit_encoder_failure_and_small_pool_admission() {
         assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
     }
 }
+
+/// Every generic family's layout reserves the mark arena its server allocates at the default
+/// knobs (`cuteafd_core::prefix::mark_slots`, the rule of the runtime's `MarkArena`), and GLM
+/// 5.3 Flash's state carries its speculative replay records.
+#[test]
+fn layouts_reserve_the_mark_arena_their_servers_allocate() {
+    use crate::families::mimo_v2::MimoKvCache;
+    use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_core::prefix::{mark_slots, DEFAULT_ENTRIES, DEFAULT_MARK_BUDGET_MIB};
+    let arena = |concurrency: u64, mark: u64| mark_slots(concurrency as usize, DEFAULT_ENTRIES, mark as usize,
+        DEFAULT_MARK_BUDGET_MIB << 20) as u64;
+    let marks = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].by_category()
+        .get(&Category::Prefix).copied().unwrap_or(0);
+    let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(4) };
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    let mut config = glm5_flash_config(45);
+    config["text_config"]["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+    assert_eq!(rank.retained_mark_bytes, 147_619_840);
+    let dir = snapshot(config, &[]);
+    for (concurrency, slots) in [(8, 18), (16, 34)] {
+        let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
+        assert_eq!(arena(concurrency, rank.retained_mark_bytes), slots);
+        assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
+        let state = memory.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * (concurrency + 2)
+            + rank.speculative_replay_bytes);
+        assert_eq!(rank.speculative_replay_bytes, 321_421_312);
+    }
+    // An explicit arena (0: marks kept in the page pool) is taken as given.
+    let mut pooled = layout(96 << 30, 16);
+    pooled.layout.as_mut().unwrap().prefix_slots = Some(0);
+    assert_eq!(marks(&plan(dir.path(), &pooled).unwrap().memory_layout.unwrap()), 0);
+    // MiMo: both banks while 2C + 2 stays below 42; at C24 the lane floor (50) wins.
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+    let mark = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap()
+        .ranks[0].retained_mark_bytes;
+    for concurrency in [8, 24] {
+        let memory = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+            head_split: false, concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(6) })
+            .unwrap().memory_layout.unwrap();
+        assert_eq!(marks(&memory), arena(concurrency, mark) * mark, "MiMo at C{concurrency}");
+    }
+    assert!(arena(24, mark) > arena(8, mark));
+}

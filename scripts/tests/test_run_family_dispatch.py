@@ -366,6 +366,51 @@ def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
+                                           ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
+def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--prefix-marks" not in launch, launch
+    else:
+        assert f"--prefix-marks {expected}" in launch, launch
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("GLM5_FLASH_PREFIX_MARKS=pool\n", "auto"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", "64GiB"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=0\n", None),
+    ("GLM5_FLASH_PREFIX_MARKS=arena\n", None),
+    ("", None),
+])
+def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--host-cache-bytes" not in launch, launch
+    else:
+        assert launch.count("--host-cache-bytes") == 1 and f"--host-cache-bytes {expected}" in launch, launch
+
+
+def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
+    assert result.returncode == 2 and "GLM5_FLASH_PREFIX_MARKS must be" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,

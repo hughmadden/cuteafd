@@ -78,6 +78,15 @@ const REPLAY_ROWS: usize = DECODE_ROWS;
 fn replay_bytes(heads: usize, channels: usize) -> usize {
     REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
 }
+
+/// Bytes per KDA layer over `kda_heads` heads, as [`Caches::new`] allocates them: one
+/// sequence's FP32 recurrent state `[heads, 128, 128]` and BF16 conv window (the last three
+/// q/k/v inputs), the two regions `slot_regions_on` hands out per layer and a prefix mark
+/// copies, and the layer's speculative replay record.
+pub(crate) fn kda_layer_bytes(cfg: &GlmNextConfig, kda_heads: usize) -> (usize, usize, usize) {
+    let d = kda_heads * cfg.kda_head_dim;
+    (d * cfg.kda_head_dim * 4, 3 * 3 * d * 2, replay_bytes(kda_heads, 3 * d))
+}
 const MAX_RANKS: usize = 6;
 /// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
 /// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
@@ -350,6 +359,17 @@ impl Allocator {
                 Err(error).context("cache pages exhausted")
             }
         }
+    }
+
+    /// `n` units for a pool-page prefix mark, ascending as the prefix cache hands them out.
+    pub fn take_units(&mut self, n: usize) -> Result<Vec<u32>> {
+        let mut units = self.units.alloc(n).context("cache pages exhausted")?;
+        units.sort_unstable();
+        Ok(units)
+    }
+
+    pub fn release_units(&mut self, units: &[u32]) {
+        self.units.release(units);
     }
 
     /// A spare KDA state slot (a speculative verify's backup).
@@ -691,7 +711,7 @@ impl<'a> Caches<'a> {
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let d = kda_heads * cfg.kda_head_dim;
+        let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads);
         let (mut kv, mut index, mut kda_layers) = (Vec::new(), Vec::new(), 0);
         for layer in layers {
             match layer.attention {
@@ -706,9 +726,9 @@ impl<'a> Caches<'a> {
                 }
             }
         }
-        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * d * cfg.kda_head_dim * 4)?,
-            kda_conv: zeroed(kda_layers * slots * 3 * 3 * d * 2)?,
-            kda_replay: zeroed(kda_layers * replay_bytes(kda_heads, 3 * d))?,
+        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
+            kda_conv: zeroed(kda_layers * slots * conv)?,
+            kda_replay: zeroed(kda_layers * replay)?,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }
 }

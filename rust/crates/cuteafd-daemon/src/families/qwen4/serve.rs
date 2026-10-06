@@ -31,7 +31,7 @@ use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
-use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
@@ -175,14 +175,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    if args.pool_tokens == 0 {
-        let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
-            opened.cfg.layers, args.mtp > 0)?;
-        let mark = geometry.ranks[0].retained_mark_bytes as usize;
-        let slots = MarkArena::slots_for(max_sequences, prefix.prefix_cache_entries, mark,
-            prefix.prefix_cache_mark_mib << 20);
-        args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
-    }
+    // The arena `prefix_cache` allocates, for every admission (automatic pools and fixed pools
+    // under a GPU budget alike).
+    let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
+        opened.cfg.layers, args.mtp > 0)?;
+    let mark = geometry.ranks[0].retained_mark_bytes as usize;
+    let slots = prefix.mark_slots(max_sequences.min(DECODE_ROWS), mark);
+    args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
@@ -382,9 +381,8 @@ impl Trace {
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
     -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
-    let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
+    let family = Qwen4Prefix::new(engine, |mark| args.mark_slots(lanes, mark))?;
     let host = args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();

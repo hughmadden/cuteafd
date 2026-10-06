@@ -13,12 +13,12 @@ pub(crate) use budget::HostBudget;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct PrefixArgs {
     /// Retained snapshots per bank (prompts, completed turns); 0 turns the prefix cache off.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = cuteafd_core::prefix::DEFAULT_ENTRIES)]
     pub prefix_cache_entries: usize,
     /// Device memory for retained positional marks (SWA rows, MTP hidden rows, recurrent
     /// state), MiB; the arena holds two marks per entry pair while they fit, and never fewer
     /// than two per decoding sequence plus two.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = 2048)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = cuteafd_core::prefix::DEFAULT_MARK_BUDGET_MIB)]
     pub prefix_cache_mark_mib: usize,
     /// Shortest prompt or turn worth a snapshot.
     #[arg(long, default_value_t = 64)]
@@ -58,6 +58,14 @@ pub(crate) enum Toggle {
 }
 
 impl PrefixArgs {
+    /// Slots of the device mark arena for marks of `mark_bytes` (every rank's part) and `lanes`
+    /// decoding sequences: what the runtime allocates and what its planner reserves
+    /// ([`cuteafd_core::prefix::mark_slots`]).
+    pub fn mark_slots(&self, lanes: usize, mark_bytes: usize) -> usize {
+        cuteafd_core::prefix::mark_slots(lanes, self.prefix_cache_entries, mark_bytes,
+            self.prefix_cache_mark_mib.saturating_mul(1 << 20))
+    }
+
     pub fn points(&self) -> PointPolicy {
         PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
             per_request: self.prefix_points_per_request }
@@ -221,11 +229,11 @@ mod tests {
             .unwrap();
         assert_eq!(cli.prefix.host_cache_bytes, HostBudget::Auto);
         let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
         let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
     }

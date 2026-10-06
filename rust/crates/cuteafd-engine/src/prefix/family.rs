@@ -8,6 +8,28 @@ use serde::Serialize;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Where a family keeps the positional marks of its snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum MarkStore {
+    /// Fixed slots of a device arena the family preallocates ([`super::MarkArena`]).
+    #[default]
+    Arena,
+    /// `pages` pages of the shared page pool per mark: taken at capture (evicting like any
+    /// snapshot's rows), released with the snapshot, written and read by
+    /// [`PrefixFamily::capture_pages`] and [`PrefixFamily::restore_pages`].
+    Pool { pages: usize },
+}
+
+impl MarkStore {
+    /// Pool pages one mark takes (none in an arena).
+    pub fn pages(self) -> usize {
+        match self {
+            Self::Arena => 0,
+            Self::Pool { pages } => pages,
+        }
+    }
+}
+
 /// A family's snapshot geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FamilyLayout {
@@ -29,6 +51,8 @@ pub struct FamilyLayout {
     /// no mark: the family starts its positional state empty there and the prefill of the
     /// replayed rows rebuilds it approximately (V4.1-style).
     pub rule: ReuseRule,
+    /// Where marks live: an arena of `PrefixConfig::mark_slots` (the default), or pool pages.
+    pub mark_store: MarkStore,
 }
 
 impl FamilyLayout {
@@ -80,4 +104,24 @@ pub trait PrefixFamily {
     fn host_tail(&self) -> Vec<DeviceRange> {
         Vec::new()
     }
+    /// [`MarkStore::Pool`]: as [`PrefixFamily::capture`], into the mark's pool `pages` (whose
+    /// rows the cache took for it and nothing else reads), laid out in the order
+    /// [`PrefixFamily::mark_page_segments`] lists.
+    fn capture_pages(&self, pages: &[u32], placement: &Self::Placement, len: usize) -> Result<(), BoxError> {
+        let _ = (pages, placement, len);
+        Err(POOL_MARKS_UNSUPPORTED.into())
+    }
+    /// [`MarkStore::Pool`]: as [`PrefixFamily::restore`] with a mark, from the mark in `pages`.
+    fn restore_pages(&self, pages: &[u32], placement: &mut Self::Placement, len: usize) -> Result<(), BoxError> {
+        let _ = (pages, placement, len);
+        Err(POOL_MARKS_UNSUPPORTED.into())
+    }
+    /// [`MarkStore::Pool`]: device ranges of the mark held in `pages` (host tier), `mark_bytes`
+    /// in all, concatenated in this order on the host.
+    fn mark_page_segments(&self, pages: &[u32]) -> Result<Vec<DeviceRange>, BoxError> {
+        let _ = pages;
+        Err(POOL_MARKS_UNSUPPORTED.into())
+    }
 }
+
+const POOL_MARKS_UNSUPPORTED: &str = "this family keeps its marks in a device arena, not in pool pages";
