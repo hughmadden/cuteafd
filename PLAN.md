@@ -772,6 +772,12 @@ Work, in priority order:
    Hypothesis: a massive-activation outlier and LN amplification, not a
    demonstrated row-handling bug. Serving gates remain required before changing
    the Qwen launcher default.
+   **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
+   + 4 Sparks, correctness only; Qwen has no coordinator head split and the
+   second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image
+   QA, prefix a/e, one-image stall and proxy encoder loss on that layout.
+   Placing the encoder on the idle second RTX is a future planner option,
+   not part of this bring-up; do not claim two-RTX LM parity.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
