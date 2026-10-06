@@ -768,7 +768,14 @@ Work, in priority order:
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
    without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
-   returned as content (#1 FR-G.14). Readiness bug (2026-10-05, fidelity
+   returned as content (#1 FR-G.14). Bond balance, in part: with the
+   coordinator key `RDMA_BOND_BALANCE=probe` the expert QPs connect with
+   RoCE v2 flow labels (the UDP source port) the coordinator chooses; it reads
+   4 MiB from each candidate label's worker QP, sees which bond member's
+   `rx_bytes_phy` received it, and gives each rank's lanes alternating members
+   (`cuteafd-transport/src/bond.rs`). Default `off` keeps the kernel's
+   QP-number labels, which re-roll the split at every start; `labels` fixes
+   labels without measuring. Hardware A/B pending. Readiness bug (2026-10-05, fidelity
    agent): `/v1/models` reports ready before the Spark experts finish
    loading on the V4.1 launch path; readiness must wait for every expert
    rank. Admission bug (2026-10-05, host-embedding agent): MiMo V2.6 Pro

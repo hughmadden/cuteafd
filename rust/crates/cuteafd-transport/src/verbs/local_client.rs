@@ -31,6 +31,9 @@ pub(crate) struct LocalTp4Client {
     terminal_failed: bool,
     terminal_quiesced: bool,
     terminal_released: bool,
+    /// Each rank's RoCE flow label for this transport's sessions
+    /// (`CUTEAFD_RDMA_BOND_BALANCE`; all 0 when off).
+    flows: super::flows::FlowSlots,
 }
 impl LocalTp4Client {
     pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
@@ -45,7 +48,10 @@ impl LocalTp4Client {
     }
     fn with_peers(peers: Vec<SocketAddr>, config: TcpTransportConfig) -> Self {
         let world = peers.len();
+        // Placed now, before any request is in flight on the fabric.
+        let flows = super::flows::FlowSlots::prepare(&peers);
         Self {
+            flows,
             peers,
             config,
             sessions: (0..world).map(|_| None).collect(),
@@ -109,14 +115,17 @@ impl LocalTp4Client {
     /// reaped as send slots are reused.
     pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
         anyhow::ensure!(self.deadline.is_none(), "a received wave is pending on this transport");
+        self.flows.ensure_all(&self.peers)?;
         for rank in 0..self.peers.len() {
             anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
             if self.sessions[rank].as_ref().map(|s| s.fits(request)).transpose()? == Some(false) {
                 self.sessions[rank] = None;
             }
             if self.sessions[rank].is_none() {
+                let flow_label = self.flows.label(rank, self.peers[rank])?;
                 self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-                    self.peers[rank], &self.config, request, None, None, self.write[rank], self.terminal_owner.clone())?);
+                    self.peers[rank], &self.config, request, None, None, self.write[rank], self.terminal_owner.clone(),
+                    flow_label)?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
             anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
@@ -160,6 +169,8 @@ impl LocalTp4Client {
         result
     }
     fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        // Any rank still unplaced is measured before this wave's requests go out.
+        self.flows.ensure_all(&self.peers)?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.chunks = Some(rx);
         for rank in 0..self.peers.len() {
@@ -174,6 +185,7 @@ impl LocalTp4Client {
                 self.sessions[rank] = None;
             }
             if self.sessions[rank].is_none() {
+                let flow_label = self.flows.label(rank, self.peers[rank])?;
                 self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
                     self.peers[rank],
                     &self.config,
@@ -182,6 +194,7 @@ impl LocalTp4Client {
                     self.egress.as_ref(),
                     self.write[rank],
                     self.terminal_owner.clone(),
+                    flow_label,
                 )?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
