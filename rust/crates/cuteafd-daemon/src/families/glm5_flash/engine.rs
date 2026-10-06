@@ -207,6 +207,8 @@ impl<'a> PeerWorkspaces<'_, 'a> {
 struct StepTables {
     decode: bool,
     eager: bool,
+    /// Ordinary rows before startup graph padding; zero for all-masked warm-up.
+    real_rows: usize,
     positions: Vec<i64>,
     /// MLA latent record slot per row (also the row's token-key slot).
     kv_slots: Vec<i64>,
@@ -822,10 +824,10 @@ impl<'a> GlmfEngine<'a> {
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
         ensure!(self.ranks() == 1 && self.use_graphs && self.startup_graphs,
             "padding check needs one GPU, graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
-        ensure!(tokens.len() >= 42 && self.max_context >= 42, "padding check needs 42 tokens of context");
+        ensure!(tokens.len() >= 65 && self.max_context >= 65, "padding check needs 65 tokens of context");
         let mut placement = GlmfPlacement::new(vec![0], 0);
         self.prefill_device(&mut placement, &tokens[..32])?;
-        for rows in [3, 10] {
+        for rows in [3, 9, 17, 33] {
             let start = placement.len;
             let input = &tokens[32..32 + rows];
             let mut ignore = |_: usize, _: &[u8]| Ok(());
@@ -1588,7 +1590,7 @@ impl<'a> GlmfEngine<'a> {
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pool_pages);
-        let mut tables = StepTables { decode: true, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
+        let mut tables = StepTables { decode: true, real_rows: rows, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
             page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
             if placement.len == 0 {
@@ -2040,6 +2042,9 @@ impl<'a> GlmfEngine<'a> {
                 self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, "m64")?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
+                } else if self.startup_graphs {
+                    // Real width is runtime data, not part of a bucket graph key.
+                    Ok(())
                 } else {
                     self.moe_front(w, index, layer, t, rows, "m64")
                 }
@@ -2062,6 +2067,23 @@ impl<'a> GlmfEngine<'a> {
                 if self.warming_graphs.get() {
                     // Masked startup rows need no routed result; preserve peer event ordering.
                     self.exchange_window(index, true, true)?;
+                } else if self.startup_graphs {
+                    crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
+                        self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), "m64", true)
+                    }, |tail| {
+                        let offset = tail.start * self.cfg.hidden * 2;
+                        let bytes = tail.len() * self.cfg.hidden * 2;
+                        anyhow::ensure!(offset + bytes <= w.delta.buffer.bytes, "MoE tail exceeds delta");
+                        // SAFETY: this subrange belongs to the live delta allocation;
+                        // the same stream orders the clear after all quantizer scratch use.
+                        unsafe {
+                            let buffer = cuteafd_ffi::CuteafdDeviceBuffer {
+                                ptr: w.delta.buffer.ptr.cast::<u8>().add(offset).cast(),
+                                bytes, ..w.delta.buffer
+                            };
+                            self.library.cuda_zero_bytes_async(buffer, bytes, self.stream)
+                        }
+                    })?;
                 } else {
                     self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
                 }
@@ -2944,7 +2966,7 @@ mod prefill_lane_tests {
 
     #[test]
     fn decode_padding_masks_storage_and_preserves_real_tables() {
-        for (rows, bucket) in [(3, 4), (10, 16)] {
+        for (rows, bucket) in [(3, 4), (9, 16), (17, 32), (33, 64)] {
             let mut tables = super::StepTables { decode: true, page_stride: 8, pool_stride: 2,
                 positions: vec![17; rows], kv_slots: vec![19; rows], kda_slots: vec![2; rows],
                 seq_first: (0..rows as i32).collect(), pool_slots: vec![-1; rows], cache_lengths: vec![4; rows],

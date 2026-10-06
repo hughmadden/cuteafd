@@ -333,7 +333,7 @@ pub(crate) struct GoldenArgs {
     /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
-    /// Require byte-exact real-row logits for masked decode padding 3->4 and 10->16.
+    /// Require byte-exact real-row logits for speculative masked decode padding 3->4, 9->16, 17->32 and 33->64.
     #[arg(long)]
     pub padding_check: bool,
     /// Isolate one real routed-expert layer with --local-experts: compare a
