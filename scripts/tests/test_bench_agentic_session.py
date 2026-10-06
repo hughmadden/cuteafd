@@ -151,6 +151,38 @@ def test_echo_reasoning_off_keeps_reasoning_out_of_the_history(tmp_path, monkeyp
     assert json.loads((tmp_path / "r.json").read_text())["sessions"][0]["success"] is False
 
 
+@pytest.mark.parametrize("identical", [False, True])
+def test_bench_ab_concurrency_distinct_default_and_explicit_opt_out(tmp_path, monkeypatch, identical):
+    spec = importlib.util.spec_from_file_location("bench_ab", SCRIPT.with_name("bench-ab.py"))
+    ab = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ab)
+    monkeypatch.setattr(ab, "REPO", tmp_path)
+    monkeypatch.setattr(ab, "stop_all", lambda *a: None)
+    commands = []
+
+    def fake_run(cmd, cwd=None, log=None, timeout=0):
+        commands.append(cmd)
+        if "--output" in cmd:
+            output = Path(cmd[cmd.index("--output") + 1])
+            output.write_text(json.dumps({"summaries": [{"concurrency": 16, "median_aggregate_tps": 50}],
+                                          "median_weighted_observed_decode_tokens_per_second": 20}))
+
+    monkeypatch.setattr(ab, "run", fake_run)
+    monkeypatch.setattr(ab.sys, "argv", ["bench-ab.py", "--label", "test", "--arm", "a=" + str(tmp_path),
+                                       "--arm", "b=" + str(tmp_path), "--layouts", "1", "--sessions", "2",
+                                       "--concurrency", "16", "--nonce-seed", "7",
+                                       *(["--identical-prompts"] if identical else [])])
+    ab.main()
+    concurrent = [c for c in commands if any(x.endswith("bench-concurrent-api.py") for x in c)]
+    assert len(concurrent) == 2
+    for command in concurrent:
+        assert ("--distinct-prompts" in command) is not identical
+        assert "--identical-prompts" not in command
+        assert command[command.index("--nonce") + 1] == "ab-7"
+        assert command[command.index("--prompt-label") + 1] == "ab"
+    assert [c[c.index("--label") + 1] for c in concurrent] == ["a", "b"]
+
+
 def test_bench_ab_agentic_battery_rows_and_summary(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("bench_ab", SCRIPT.with_name("bench-ab.py"))
     ab = importlib.util.module_from_spec(spec)
