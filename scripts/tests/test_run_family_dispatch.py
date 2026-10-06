@@ -525,6 +525,50 @@ def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, m
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+GLMF_TWO_LAYER = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+                  "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+@pytest.mark.parametrize("keys,env", [
+    ("", []),
+    ("GLM5_FLASH_EXL3_WORKER_PATH=async\n", []),
+    ("GLM5_FLASH_EXL3_WORKER_PATH=blocking\n", ["-e CUTEAFD_EXL3_WORKER_PATH=blocking"]),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/routes-1\n",
+     ["-v /data/routes-1:/data/routes-1", "-e CUTEAFD_EXL3_ROUTE_DUMP=/data/routes-1/routes",
+      "-e CUTEAFD_EXL3_ROUTE_DUMP_CALLS=200000"]),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/r\nGLM5_FLASH_EXL3_ROUTE_DUMP_CALLS=5000\n",
+     ["-e CUTEAFD_EXL3_ROUTE_DUMP=/data/r/routes", "-e CUTEAFD_EXL3_ROUTE_DUMP_CALLS=5000"]),
+])
+def test_glmf_exl3_worker_env_reaches_only_the_spark_workers(tmp_path, keys, env):
+    """The Spark worker's host path and route capture are worker environment: forwarded to
+    every Spark rank's container, never to the coordinator; the defaults add nothing."""
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert workers and "CUTEAFD_EXL3_" not in coordinator
+    for worker in workers:
+        for flag in env:
+            assert f" {flag} " in worker, worker
+        if not env:
+            assert "CUTEAFD_EXL3_WORKER_PATH" not in worker and "CUTEAFD_EXL3_ROUTE_DUMP" not in worker
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_EXL3_WORKER_PATH=spin\n", "GLM5_FLASH_EXL3_WORKER_PATH must be async or blocking"),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=routes\n", "GLM5_FLASH_EXL3_ROUTE_DUMP must be an absolute directory"),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/r x\n", "GLM5_FLASH_EXL3_ROUTE_DUMP must be an absolute directory"),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/r\nGLM5_FLASH_EXL3_ROUTE_DUMP_CALLS=0\n",
+     "GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS must be a positive call count"),
+    ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/r\nSPARK_COUNT=0\n", "GLM5_FLASH_EXL3_ROUTE_DUMP records Spark expert calls"),
+])
+def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])

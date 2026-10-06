@@ -56,6 +56,38 @@ fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
 }
 
 #[test]
+fn exl3_worker_host_path_switch() -> Result<()> {
+    assert_eq!(HostPath::parse(None)?, HostPath::Async);
+    assert_eq!(HostPath::parse(Some(""))?, HostPath::Async);
+    assert_eq!(HostPath::parse(Some("async"))?, HostPath::Async);
+    assert_eq!(HostPath::parse(Some("blocking"))?, HostPath::Blocking);
+    assert!(HostPath::parse(Some("spin")).is_err());
+    Ok(())
+}
+
+#[test]
+fn exl3_route_dump_records_match_the_benchmark_format() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("routes.3.bin");
+    {
+        let mut dump = RouteDump::open(&path, 2)?;
+        dump.record(7, 1, 8, &[0, 1, 2, 3, 4, 5, 6, 287], &[0.5; 8])?;
+        dump.record(8, 2, 8, &[9; 16], &[0.25; 16])?;
+        // Past the call limit: dropped.
+        dump.record(9, 1, 8, &[1; 8], &[1.0; 8])?;
+    }
+    let bytes = std::fs::read(&path)?;
+    let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    assert_eq!(words.len(), (4 + 16) + (4 + 32));
+    assert_eq!(&words[..4], &[0x3145_5452, 7, 1, 8]);
+    assert_eq!(words[4 + 7], 287);
+    assert_eq!(f32::from_bits(words[4 + 8]), 0.5);
+    assert_eq!(&words[20..24], &[0x3145_5452, 8, 2, 8]);
+    assert_eq!(f32::from_bits(words[24 + 16]), 0.25);
+    Ok(())
+}
+
+#[test]
 fn exl3_worker_capacity_bounds() -> Result<()> {
     assert_eq!(Exl3Worker::capacities(1)?, vec![1]);
     assert_eq!(Exl3Worker::capacities(16)?, vec![1, 16]);

@@ -56,6 +56,19 @@ Attention (KDA), a minority run MLA + DSA.
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
+- Spark EXL3 worker host path: a call's routes are written straight into
+  pinned staging and uploaded with one batched asynchronous copy, the wire
+  decode reads the hidden rows in the mapped request frame (no device copy),
+  and the worker polls its stream instead of a blocking synchronize (which woke
+  about 8 us after the GPU finished). `GLM5_FLASH_EXL3_WORKER_PATH=blocking`
+  (`CUTEAFD_EXL3_WORKER_PATH=blocking`) restores the copies and the blocking
+  synchronize, for A/B; the kernels, their inputs and their bits are the same.
+- Route capture for kernel benchmarks: `GLM5_FLASH_EXL3_ROUTE_DUMP=DIR` (an
+  absolute directory on every Spark; `CUTEAFD_EXL3_ROUTE_DUMP=DIR/routes`)
+  appends each call's layer, rows, expert ids and gate weights to
+  `DIR/routes.<executor>.bin`, at most `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` calls
+  (default 200,000). SparkInfer's `benchmarks/benchmark_glmf_decode_schedule.py
+  --routes file:PATH` replays them.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 - Context: the DSA index top-k is the one program with an extent compiled in
