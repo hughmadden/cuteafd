@@ -99,6 +99,14 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
 
 
+def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
+    startup = serve[serve.index("let result = opened.with_engine"):serve.index("struct Active")]
+    assert startup.index("probe::graph_capture_stats(&mut stats);") < startup.index("ready.send(Ok(")
+    publish = serve[serve.index("fn publish("):serve.index("pub(crate) const MESSAGE_STARTS")]
+    assert publish.index("*stats = serde_json::json!") < publish.index("probe::graph_capture_stats(&mut stats);")
+
+
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     # At rectangular sizes a precomputed ratio changes taps by an FP32 ULP.
     positions = np.arange(256,dtype=np.float32)

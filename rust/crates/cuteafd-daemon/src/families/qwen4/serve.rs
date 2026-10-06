@@ -226,6 +226,12 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }
+        // Startup captures must be visible in the first API statistics snapshot.
+        {
+            let mut stats = stats.lock().map_err(|_| anyhow::anyhow!("Qwen serving stats lock poisoned"))?;
+            *stats = serde_json::json!({});
+            probe::graph_capture_stats(&mut stats);
+        }
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(preparer.clone().map(|p| (p, health.clone()))));
         }
@@ -452,6 +458,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
+        probe::graph_capture_stats(&mut stats);
     }
 }
 
