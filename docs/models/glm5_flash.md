@@ -50,6 +50,11 @@ Attention (KDA), a minority run MLA + DSA.
   multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
   two-GPU head split when both coordinator GPUs are available;
   `RTX_GPUS=1` or `COORDINATOR_SPLIT=off` serves from one GPU.
+- Spark EXL3 decode schedule: `GLM5_FLASH_EXL3_SCHEDULE=gb10`
+  (`expertd-native --exl3-schedule gb10`, opt-in) runs the TP4 decode exports
+  `m1-gb10` and `m80-gb10`: the default exports' products and sums, so the
+  same bits, with the weight words staged L2 evict-first and every tile's
+  first weight K tiles prefetched into L2 (the b12x `gb10` decode schedule).
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 - Admission and verify rows (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`

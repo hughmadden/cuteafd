@@ -42,6 +42,67 @@ impl Exl3RowPolicy {
     }
 }
 
+/// Spark decode schedule of the EXL3 exports (`--exl3-schedule`). `Gb10`
+/// runs the `m<capacity>-gb10` siblings of the GLM 5.3 Flash TP4 decode
+/// capacities (m1 for one row, m80 for 2-80): the same products and sums as
+/// the default exports, so the same bits, with the weight words staged L2
+/// evict-first and every tile's first weight K tiles prefetched into L2
+/// before it starts. Every other capacity runs its default export.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Exl3Schedule {
+    #[default]
+    Default,
+    Gb10,
+}
+
+impl Exl3Schedule {
+    const GB10_CAPACITIES: [u32; 2] = [1, 80];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Gb10 => "gb10",
+        }
+    }
+
+    fn scheduled(self, capacity: u32) -> bool {
+        self == Self::Gb10 && Self::GB10_CAPACITIES.contains(&capacity)
+    }
+
+    /// The export directory a capacity runs under this schedule.
+    pub(crate) fn directory(self, root: &Path, capacity: u32) -> PathBuf {
+        if self.scheduled(capacity) {
+            root.join(format!("m{capacity}-{}", self.name()))
+        } else {
+            root.join(format!("m{capacity}"))
+        }
+    }
+
+    /// Before any weight read: the GB10 exports exist for GLM 5.3 Flash only.
+    pub(crate) fn validate(self, row_policy: Exl3RowPolicy) -> Result<()> {
+        ensure!(self == Self::Default || row_policy == Exl3RowPolicy::GlmFlashK64,
+            "--exl3-schedule {} serves the GLM 5.3 Flash EXL3 experts only", self.name());
+        Ok(())
+    }
+
+    /// A scheduled capacity's export must record its decode schedule and a
+    /// default one none, so a mislabelled directory fails at start-up.
+    pub(crate) fn check_export(self, root: &Path, capacity: u32) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Record {
+            #[serde(default)]
+            decode_schedule: Option<String>,
+        }
+        let directory = self.directory(root, capacity);
+        let meta: Record = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))
+            .with_context(|| format!("EXL3 {} schedule export {}", self.name(), directory.display()))?)?;
+        ensure!(meta.decode_schedule.is_some() == self.scheduled(capacity),
+            "EXL3 export {} does not carry the {} decode schedule", directory.display(),
+            if self.scheduled(capacity) { self.name() } else { "default" });
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 struct Buffer {
     bytes: usize,

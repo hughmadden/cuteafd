@@ -125,14 +125,18 @@ class PackageProfileTests(unittest.TestCase):
                             descriptor_rows=4, native_info_version=3)
                 self.assertNotIn('tile', options,
                                  'the exporter refuses a tile override on paired builds')
-            # The build command may request a tile override and a residency cap.
+            # The build command may request a tile override, a residency cap and a
+            # decode schedule.
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'paired_boundary',
-                                                'hidden', 'swiglu_limit'},
+                                                'hidden', 'swiglu_limit', 'decode_schedule'},
                                  'unexpected option consumed by the fake export')
+            if 'decode_schedule' in options:
+                # The exporter records b12x's canonical options; any string will do here.
+                meta['decode_schedule'] = f"canonical:{options['decode_schedule']}"
             if geometry != 'v41':
                 meta['hidden'] = options['hidden']
                 self.assertEqual(options['hidden'], package.GEOMETRIES[geometry][0])
-                self.assertEqual(options['swiglu_limit'], package.swiglu_limit(geometry))
+                self.assertEqual(options.get('swiglu_limit', 10.0), package.swiglu_limit(geometry))
             # Same derivation as the exporter: direct vs packed routing decides the
             # route bridge, so m1 needs it too whenever routing is packed.
             direct = (False if DIRECT_ROUTES is None else bool(DIRECT_ROUTES(
@@ -242,6 +246,53 @@ class PackageProfileTests(unittest.TestCase):
             for call in whole:
                 self.assertEqual(call.kwargs['hidden'], 2560)
                 self.assertIsNone(call.kwargs['swiglu_limit'])
+
+    def test_glmf_spark_tp4_decode_capacities_carry_the_gb10_schedule(self):
+        """GLM 5.3 Flash's TP4 decode exports (m1, m80) get an m<capacity>-gb10 sibling with
+        the gb10 decode schedule, compiled once per capacity and shared by the four ranks;
+        every other export, and every m<capacity>, stays the default schedule."""
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, calls, capacities = self.build_fixture(
+                Path(temporary), 'spark', (3, 4), geometry='glmf')
+            scheduled = {v['directory']: v for v in manifest['variants'] if 'schedule' in v}
+            self.assertEqual(set(scheduled), {f'tp4-rank{rank}/m{capacity}-gb10'
+                                              for rank in range(4) for capacity in capacities})
+            for directory, variant in scheduled.items():
+                self.assertEqual((variant['schedule'], variant['decode_schedule']),
+                                 ('gb10', 'canonical:gb10'))
+                meta = json.loads((output / directory / 'v41_exl3.json').read_text())
+                self.assertEqual(meta['decode_schedule'], 'canonical:gb10')
+                default = json.loads((output / directory.removesuffix('-gb10') / 'v41_exl3.json').read_text())
+                self.assertNotIn('decode_schedule', default)
+            gb10 = [call for call in calls if call.kwargs.get('decode_schedule') == 'gb10']
+            self.assertEqual(sorted(call.args[3] for call in gb10), sorted(capacities))
+            self.assertTrue(all(call.args[1] == 512 for call in gb10))
+            profiles = package.profiles_for_role('spark', 'glmf')
+            self.assertEqual(len(calls) - len(gb10), len(profiles) * len(capacities))
+            for directory in (v['directory'] for v in manifest['variants'] if 'schedule' not in v):
+                self.assertRegex(directory, r'^tp[2346]-rank[0-5]/m(1|80)$')
+
+    def test_verify_rejects_a_relabelled_decode_schedule(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, _, _ = self.build_fixture(Path(temporary), 'spark', (3, 4), geometry='glmf')
+            for mutate in (lambda v: v.pop('schedule'), lambda v: v.update(decode_schedule='l2=2'),
+                           lambda v: v.update(schedule='gb11')):
+                broken = json.loads(json.dumps(manifest))
+                mutate(next(v for v in broken['variants'] if v.get('schedule') == 'gb10'))
+                (output / 'manifest.json').write_text(json.dumps(broken))
+                with self.assertRaisesRegex(ValueError, 'decode schedule mismatch'):
+                    package.verify(output)
+
+    def test_decode_schedules_leave_every_other_family_untouched(self):
+        for geometry in package.GEOMETRIES:
+            for role in ('spark', 'coordinator'):
+                for profile, *_ in package.profiles_for_role(role, geometry):
+                    for capacity in (1, 16, 80, 256, 1024, 4096):
+                        variants = package.decode_schedule_variants(geometry, role, profile, capacity)
+                        expected = ([('gb10', {'decode_schedule': 'gb10'})]
+                                    if (geometry, role) == ('glmf', 'spark')
+                                    and profile.startswith('tp4-') and capacity in (1, 80) else [])
+                        self.assertEqual(variants, expected, (geometry, role, profile, capacity))
 
     def test_requested_layouts_are_recorded_and_reverified(self):
         """A declared contract survives into verify(); its absence does not (v9)."""
