@@ -98,6 +98,211 @@ fn served_snapshot_template_matches_the_fixture_when_present() {
     assert_eq!(GlmEncoding::from_snapshot(snapshot).unwrap().tokens(), &GlmTokenIds::glm5());
 }
 
+mod vision_template {
+    use super::*;
+    use std::path::Path;
+
+    const VISION: &str = "{% for m in messages %}{% for p in m.content %}{% if p.type in ['image','image_url'] %}<boi><img><eoi>{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}<think>";
+    const TEXT_ONLY: &str = "text-only quant reminder<think>";
+
+    fn snapshot(path: &Path, template: &str, base: Option<&str>) {
+        std::fs::create_dir_all(path).unwrap();
+        let markers = ["<unk>", "<boi>", "<img>", "<eoi>", "</think>", "<tool_call>", "</tool_call>", "<think>"];
+        let vocab: serde_json::Map<String, Value> = markers.iter().enumerate()
+            .map(|(id, token)| (token.to_string(), json!(id))).collect();
+        let added: Vec<_> = markers.iter().enumerate().map(|(id, content)| json!({"id":id,
+            "content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true})).collect();
+        let tokenizer = json!({"version":"1.0","truncation":null,"padding":null,"added_tokens":added,
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":vocab,"unk_token":"<unk>"}});
+        std::fs::write(path.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let mut config = json!({"model_type":"glm5_next","vocab_size":8,"image_start_token_id":1,
+            "image_token_id":2,"image_end_token_id":3,"eos_token_id":[0]});
+        if let Some(base) = base { config["base_model"] = json!(base); }
+        std::fs::write(path.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(path.join("chat_template.jinja"), template).unwrap();
+    }
+
+    fn body() -> Value {
+        json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"unused"}},
+            {"type":"text","text":"Read it."}]}]})
+    }
+
+    fn options() -> GlmPromptOptions {
+        GlmPromptOptions { thinking:true, tool_names:vec![], tool_choice:GlmToolChoice::Auto, response_format:None }
+    }
+
+    #[test]
+    fn compatible_checkpoint_records_its_own_template() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), VISION, None);
+        let loaded = GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).unwrap();
+        assert_eq!(loaded.render(&body(), &options()).unwrap(), "<boi><img><eoi>Read it.<think>");
+        let p = loaded.template_provenance().unwrap();
+        assert_eq!(p.selection, "checkpoint");
+        assert_eq!(p.template_sha256, format!("{:x}", Sha256::digest(VISION.as_bytes())));
+        assert_eq!(p.requested_source, None);
+    }
+
+    #[test]
+    fn explicit_snapshot_overrides_only_template_and_keeps_served_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let vendor = temp.path().join("vendor");
+        snapshot(&served, TEXT_ONLY, None);
+        snapshot(&vendor, VISION, None);
+        let mut config = read_json(&vendor.join("config.json")).unwrap();
+        config["eos_token_id"] = json!([7]);
+        std::fs::write(vendor.join("config.json"), config.to_string()).unwrap();
+        let old = GlmEncoding::from_snapshot(&served).unwrap();
+        let loaded = GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).unwrap();
+        assert_eq!(loaded.tokens(), old.tokens());
+        assert_eq!(loaded.stop_token_ids(false), old.stop_token_ids(false));
+        assert_eq!(loaded.render(&body(), &options()).unwrap(), "<boi><img><eoi>Read it.<think>");
+        let p = loaded.template_provenance().unwrap();
+        assert_eq!(p.selection, "explicit");
+        assert_eq!(p.requested_source.as_deref(), vendor.to_str());
+        // Off uses the existing constructor even when an override was configured.
+        assert_eq!(old.render(&body(), &options()).unwrap(), TEXT_ONLY);
+    }
+
+    #[test]
+    fn config_named_hf_base_resolves_cached_ref_without_inference() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let hf = temp.path().join("hf");
+        let root = hf.join("hub/models--vendor--flash");
+        let vendor = root.join("snapshots/revision-a");
+        snapshot(&served, TEXT_ONLY, Some("vendor/flash"));
+        snapshot(&vendor, VISION, None);
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        std::fs::write(root.join("refs/main"), "revision-a\n").unwrap();
+        let loaded = GlmEncoding::from_snapshot_for_vision(&served, None, Some(&hf)).unwrap();
+        let p = loaded.template_provenance().unwrap();
+        assert_eq!(p.selection, "config_base_model");
+        assert_eq!(p.requested_source.as_deref(), Some("vendor/flash"));
+        assert_eq!(p.snapshot, std::fs::canonicalize(vendor).unwrap());
+        let explicit = GlmEncoding::from_snapshot_for_vision(&served, Some("vendor/flash"), Some(&hf)).unwrap();
+        assert_eq!(explicit.template_provenance().unwrap().selection, "explicit");
+    }
+
+    #[test]
+    fn missing_metadata_refuses_vision_but_text_only_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), TEXT_ONLY, None);
+        let error = GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).unwrap_err().to_string();
+        assert!(error.contains("VISION enabled") && error.contains("CHAT_TEMPLATE_FROM") && error.contains("no base_model"), "{error}");
+        assert_eq!(GlmEncoding::from_snapshot(temp.path()).unwrap().render(&body(), &options()).unwrap(), TEXT_ONLY);
+    }
+
+    #[test]
+    fn invalid_missing_or_text_only_override_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let vendor = temp.path().join("vendor");
+        snapshot(&served, TEXT_ONLY, None);
+        snapshot(&vendor, TEXT_ONLY, None);
+        for source in ["../vendor/flash", "vendor/../../flash", "missing/flash", vendor.to_str().unwrap()] {
+            assert!(GlmEncoding::from_snapshot_for_vision(&served, Some(source), Some(temp.path())).is_err(), "{source}");
+        }
+        std::fs::write(vendor.join("chat_template.jinja"), "{{ broken").unwrap();
+        assert!(GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).is_err());
+        std::fs::remove_file(vendor.join("chat_template.jinja")).unwrap();
+        assert!(GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).is_err());
+    }
+
+    #[test]
+    fn vocabulary_and_configured_image_marker_mismatch_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let vendor = temp.path().join("vendor");
+        snapshot(&served, TEXT_ONLY, None);
+        snapshot(&vendor, VISION, None);
+        let mut config = read_json(&vendor.join("config.json")).unwrap();
+        config["image_token_id"] = json!(1);
+        std::fs::write(vendor.join("config.json"), config.to_string()).unwrap();
+        assert!(GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).is_err());
+        snapshot(&vendor, VISION, None);
+        let mut tokenizer = read_json(&vendor.join("tokenizer.json")).unwrap();
+        tokenizer["model"]["vocab"]["<unk>"] = json!(7);
+        std::fs::write(vendor.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let error = GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).unwrap_err().to_string();
+        assert!(error.contains("tokenizer differs"), "{error}");
+    }
+
+    #[test]
+    fn render_refusal_can_use_a_declared_vendor_template() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let vendor = temp.path().join("vendor");
+        snapshot(&vendor, VISION, None);
+        snapshot(&served, "{{ raise_exception('text only') }}", vendor.to_str());
+        assert!(GlmEncoding::from_snapshot(&served).unwrap().render(&body(), &options()).is_err());
+        let loaded = GlmEncoding::from_snapshot_for_vision(&served, None, None).unwrap();
+        assert_eq!(loaded.template_provenance().unwrap().selection, "config_base_model");
+        assert_eq!(loaded.render(&body(), &options()).unwrap(), "<boi><img><eoi>Read it.<think>");
+    }
+
+    #[test]
+    fn unused_image_macro_does_not_qualify_a_template() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), "{% macro image() %}<boi><img><eoi>{% endmacro %}no images<think>", None);
+        assert!(GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).is_err());
+    }
+
+    #[test]
+    fn explicit_override_wins_over_incompatible_config_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let served = temp.path().join("served");
+        let vendor = temp.path().join("vendor");
+        snapshot(&served, VISION, Some("missing/base"));
+        snapshot(&vendor, VISION, None);
+        let encoding = GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).unwrap();
+        assert_eq!(encoding.template_provenance().unwrap().selection, "explicit");
+        let mut config = read_json(&vendor.join("config.json")).unwrap();
+        config["model_type"] = json!("other_family");
+        std::fs::write(vendor.join("config.json"), config.to_string()).unwrap();
+        assert!(GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_template_identity_is_public_model_provenance() {
+        use crate::openai::{router_for_model, ConsoleHub, ModelEncoding, ModelProfile, NativeLimits};
+        use axum::{body::{to_bytes, Body}, http::Request};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), VISION, None);
+        let encoding = GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).unwrap();
+        let expected = serde_json::to_value(encoding.template_provenance().unwrap()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(),
+            ModelProfile::new("test/glm", ModelEncoding::Glm(Arc::new(encoding))));
+        let response = app.oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(body["data"][0]["chat_template"], expected);
+        assert_eq!(body["data"][0]["capabilities"]["vision"], false);
+    }
+
+    #[test]
+    fn installed_official_and_tr3_templates_follow_vision_policy_when_present() {
+        let root = Path::new("/mnt/sparknest/hf-home/hub");
+        let official = root.join("models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a");
+        let tr3 = root.join("models--brandonmusic--GLM-5.3-Flash-tr3-4bpw/snapshots/a5fee929cf4888b1824323e33e8a19b60129e025");
+        if !official.is_dir() || !tr3.is_dir() { return; }
+        assert_eq!(GlmEncoding::from_snapshot_for_vision(&official, None, None).unwrap()
+            .template_provenance().unwrap().selection, "checkpoint");
+        let error = GlmEncoding::from_snapshot_for_vision(&tr3, None, None).unwrap_err().to_string();
+        assert!(error.contains("CHAT_TEMPLATE_FROM"), "{error}");
+        let old = GlmEncoding::from_snapshot(&tr3).unwrap();
+        let fallback = GlmEncoding::from_snapshot_for_vision(&tr3, Some(official.to_str().unwrap()), None).unwrap();
+        assert_eq!(old.tokens(), fallback.tokens());
+        assert!(fallback.render(&body(), &options()).unwrap().contains("<|begin_of_image|><|image|><|end_of_image|>"));
+        assert!(old.render(&body(), &options()).unwrap().contains("unable to process"));
+    }
+}
+
 // ---------------------------------------------------------------- parser
 
 fn tool(name: &str, parameters: Value) -> ToolDefinition {

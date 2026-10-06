@@ -469,6 +469,50 @@ def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, family, serve):
         assert f"--media-cache-bytes {quota}" in launch
 
 
+@pytest.mark.parametrize("source_kind", ["hf", "hub_snapshot", "external_snapshot"])
+def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path, source_kind):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    source = "test/model"
+    expected = source
+    if source_kind == "hub_snapshot":
+        source = str(tmp_path / "hf/hub/models--test--model/snapshots/abc")
+        expected = "/root/.cache/huggingface/hub/models--test--model/snapshots/abc"
+    elif source_kind == "external_snapshot":
+        source = str(tmp_path / "vendor")
+        Path(source).mkdir()
+        expected = source
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--chat-template-from {expected}" in launch
+    if source_kind == "external_snapshot":
+        assert f"-v {source}:{source}:ro" in launch
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert "--chat-template-from" not in worker and source not in worker
+
+
+def test_text_only_glm_ignores_template_override(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=off\nCHAT_TEMPLATE_FROM=missing/vendor\n")
+    assert result.returncode == 0, result.stderr
+    assert "--chat-template-from" not in result.stderr and "missing/vendor" not in result.stderr
+
+
+@pytest.mark.parametrize("source", ["../vendor", "vendor/../flash", "vendor/..", "missing/vendor"])
+def test_glm_template_override_invalid_source_refused_before_workers(tmp_path, source):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+    assert result.returncode == 2, result.stderr
+    assert "CHAT_TEMPLATE_FROM" in result.stderr or "missing snapshot" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr and "cuteafd serve-glmf" not in result.stderr
+
+
 @pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
 @pytest.mark.parametrize("value, expected", [("auto", None), ("on", "true"), ("off", "false")])
 def test_mimo_explicit_target_format_overrides_are_forwarded(tmp_path, key, option, value, expected):

@@ -252,8 +252,14 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
 }
 async fn models(State(state): State<NativeState>) -> Json<Value> {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
-    Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":owner,
-        "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
+    let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
+        "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()});
+    if let ModelEncoding::Glm(encoding) = &state.profile.encoding {
+        if let Some(provenance) = encoding.template_provenance() {
+            model["chat_template"] = json!(provenance);
+        }
+    }
+    Json(json!({"object":"list","data":[model]}))
 }
 async fn health(State(state): State<NativeState>) -> Response {
     let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));

@@ -78,6 +78,9 @@ pub(crate) struct ServeArgs {
     /// Resolved global vision policy, assigned before dispatch.
     #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
     pub vision: cuteafd_loader::plan::MediaMode,
+    /// Explicit vendor template source for vision: cached HF id or snapshot directory.
+    #[arg(long)]
+    pub chat_template_from: Option<String>,
     /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
     pub media_cache_bytes: Option<u64>,
@@ -113,7 +116,14 @@ pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
-    let encoding = GlmEncoding::from_snapshot(&snapshot)?;
+    let encoding = if args.vision == cuteafd_loader::plan::MediaMode::Off {
+        GlmEncoding::from_snapshot(&snapshot)?
+    } else {
+        GlmEncoding::from_snapshot_for_vision(&snapshot, args.chat_template_from.as_deref(), None)?
+    };
+    if let Some(provenance) = encoding.template_provenance() {
+        tracing::info!(chat_template = %serde_json::to_string(provenance)?, "GLM Flash chat template selected");
+    }
     let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),

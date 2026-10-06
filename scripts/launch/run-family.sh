@@ -219,6 +219,26 @@ draft_args=()
 embedding="$(get EMBEDDING gpu)"
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 family_args=(--embedding-placement "$embedding")
+chat_template_mounts=()
+# Vision-only override: no template inference and no changes to text-only prompts.
+chat_template_from="$(get CHAT_TEMPLATE_FROM)"
+if [[ -n "$chat_template_from" && "$vision" != off ]]; then
+  [[ "$family" == glm5_flash ]] || release_die "CHAT_TEMPLATE_FROM currently applies only to GLM Flash vision"
+  if [[ -d "$chat_template_from" ]]; then
+    chat_template_from="$(readlink -f "$chat_template_from")"
+    release_validate_path_setting CHAT_TEMPLATE_FROM "$chat_template_from"
+    if release_path_within "$chat_template_from" "$hub"; then
+      chat_template_from="/root/.cache/huggingface/hub${chat_template_from#"$hub"}"
+    else
+      chat_template_mounts=(-v "$chat_template_from:$chat_template_from:ro")
+    fi
+  else
+    [[ "$chat_template_from" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] &&
+      release_path_has_no_dot_segment "$chat_template_from" || release_die "CHAT_TEMPLATE_FROM must be an existing snapshot or ORG/MODEL HF id"
+    snapshot_of "$chat_template_from" "" >/dev/null || exit 2
+  fi
+  family_args+=(--chat-template-from "$chat_template_from")
+fi
 family_args+=(--vision "$vision" --audio "$audio")
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
@@ -735,7 +755,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${chat_template_mounts[@]}" "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
