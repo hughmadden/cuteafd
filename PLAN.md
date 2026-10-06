@@ -786,6 +786,16 @@ Work, in priority order:
    Hypothesis: a massive-activation outlier and LN amplification, not a
    demonstrated row-handling bug. Serving gates remain required before changing
    the Qwen launcher default.
+   **WP-7 concurrency workload:** the Python concurrent benchmark defaults to
+   one identical prompt for every request (`scripts/bench/deepseek_v41/bench-concurrent-api.py:45`).
+   Qwen's retained C16 Copy comparison generated mostly lockstep lazy outputs
+   but diverse bucket outputs, so its ratio does not isolate matched expert
+   work. WP-7 task runners must pass `--distinct-prompts` for both Copy and
+   plain C16 arms, with the same deterministic nonce and per-request index;
+   qualify three interleaved pairs and their median before promotion. Preserve
+   the identical-prompt evidence as a separate workload, not a diverse-load
+   performance gate. The shared Rust `cuteafd-bench` concurrency panel already
+   uses a unique nonce per request and alternating code/summary prompts.
    **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
    + 4 Sparks, correctness only; Qwen has no coordinator head split and the
    second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image
