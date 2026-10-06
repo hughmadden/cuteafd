@@ -3710,6 +3710,69 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_rdma_rc_endpoint_connect", status)
     }
 
+    /// [`Self::rdma_rc_endpoint_connect`] with an explicit RoCE v2 flow label
+    /// (20 bits), from which the NIC derives the QP's UDP source port; 0 keeps
+    /// the kernel's label derived from both QP numbers. Libraries without
+    /// `cuteafd_rdma_rc_endpoint_connect_flow_label` return an error.
+    pub fn rdma_rc_endpoint_connect_flow_label(
+        &self,
+        handle: *mut c_void,
+        remote_qp_num: u32,
+        remote_psn: u32,
+        remote_lid: u32,
+        remote_gid_hex: &str,
+        flow_label: u32,
+    ) -> Result<()> {
+        type ConnectFlowLabelFn =
+            unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_char, u32) -> CuteafdStatus;
+        // SAFETY: resolving the symbol does not call it.
+        let connect: Symbol<ConnectFlowLabelFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_connect_flow_label")? };
+        let remote_gid_hex =
+            CString::new(remote_gid_hex).context("RDMA remote GID contains nul byte")?;
+        // SAFETY: `handle` is a live endpoint owned by the caller and the GID
+        // string outlives the call.
+        let status = unsafe {
+            connect(handle, remote_qp_num, remote_psn, remote_lid, remote_gid_hex.as_ptr(), flow_label)
+        };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_connect_flow_label", status)
+    }
+
+    /// Registers the first `bytes` of the endpoint's send buffer for remote
+    /// reads and returns its (address, rkey).
+    pub fn rdma_rc_endpoint_expose_send_read(&self, handle: *mut c_void, bytes: usize) -> Result<(u64, u32)> {
+        type ExposeReadFn = unsafe extern "C" fn(*mut c_void, usize, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: resolving the symbol does not call it.
+        let expose: Symbol<ExposeReadFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_expose_send_read")? };
+        let (mut addr, mut rkey) = (0_u64, 0_u32);
+        // SAFETY: `handle` is a live endpoint; the registration covers its own
+        // send buffer and is released with it.
+        let status = unsafe { expose(handle, bytes, &mut addr, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_expose_send_read", status)?;
+        Ok((addr, rkey))
+    }
+
+    /// RDMA-reads `bytes` from the peer's `remote_addr`/`rkey` into the
+    /// endpoint's receive buffer at `offset` and waits up to `timeout_ms`.
+    pub fn rdma_rc_endpoint_read_wait(
+        &self,
+        handle: *mut c_void,
+        offset: usize,
+        bytes: usize,
+        remote_addr: u64,
+        rkey: u32,
+        timeout_ms: u32,
+    ) -> Result<()> {
+        type ReadWaitFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u32) -> CuteafdStatus;
+        // SAFETY: resolving the symbol does not call it.
+        let read: Symbol<ReadWaitFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_read_wait")? };
+        // SAFETY: `handle` is a live connected endpoint; the read lands in its
+        // own registered receive buffer, which the native side bounds-checks.
+        let status = unsafe { read(handle, offset, bytes, remote_addr, rkey, timeout_ms) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_read_wait", status)
+    }
+
     pub fn rdma_rc_endpoint_post_recv(
         &self,
         handle: *mut c_void,

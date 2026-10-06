@@ -484,6 +484,25 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_buffer_view(
 cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint32_t remote_qp_num,
                                                uint32_t remote_psn, uint32_t remote_lid,
                                                const char* remote_gid_hex);
+// As cuteafd_rdma_rc_endpoint_connect, with the RoCE v2 flow label of the
+// path (20 bits). The NIC derives this QP's UDP source port from it, so the
+// label fixes where a bonded link or an L4-hashing switch places the flow.
+// 0 keeps the kernel's default, a label derived from both QP numbers.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_connect_flow_label(void* handle, uint32_t remote_qp_num,
+                                                          uint32_t remote_psn,
+                                                          uint32_t remote_lid,
+                                                          const char* remote_gid_hex,
+                                                          uint32_t flow_label);
+// Registers the first `bytes` of the send buffer for remote reads (replacing
+// an earlier registration) and returns its address and rkey.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_send_read(void* handle, size_t bytes,
+                                                        uint64_t* remote_addr, uint32_t* rkey);
+// RDMA-reads `bytes` from the peer's `remote_addr`/`rkey` into the receive
+// buffer at `offset_bytes` and waits up to `timeout_ms` for its completion.
+// For a connected endpoint with nothing else in flight on its send queue.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_read_wait(void* handle, size_t offset_bytes, size_t bytes,
+                                                 uint64_t remote_addr, uint32_t rkey,
+                                                 uint32_t timeout_ms);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
