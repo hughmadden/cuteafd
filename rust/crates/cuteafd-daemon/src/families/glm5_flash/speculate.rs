@@ -483,19 +483,18 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         Ok(placement)
     }).collect::<Result<Vec<_>>>()?;
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
-    println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
-    for rows in 1..=max_rows {
-        if count * rows > engine.decode_rows {
-            break;
-        }
-        let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
+    // One step of `shares[i]` rows for sequence i: (median, min) seconds of 7 and per-step phases.
+    let mut time_step = |shares: &[usize]| -> Result<(f64, f64, [f64; 3])> {
+        let tokens: Vec<u32> = shares.iter().enumerate()
+            .flat_map(|(i, &rows)| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
         let mut times = Vec::new();
         *engine.profile.borrow_mut() = [0.0; 3];
         for round in 0..9 {
             for (placement, &start) in placements.iter_mut().zip(&starts) {
                 placement.len = start;
             }
-            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|p| (p, rows)).collect();
+            let mut step: Vec<(&mut GlmfPlacement, usize)> =
+                placements.iter_mut().zip(shares).map(|(p, &rows)| (p, rows)).collect();
             let timer = Instant::now();
             engine.verify_spec(&mut step, &tokens)?;
             if round >= 2 {
@@ -507,9 +506,27 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         times.sort_by(f64::total_cmp);
         let phases = std::mem::take(&mut *engine.profile.borrow_mut());
         let n = times.len() as f64;
+        Ok((times[times.len() / 2], times[0], phases.map(|p| p / n)))
+    };
+    println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
+    for rows in 1..=max_rows {
+        if count * rows > engine.decode_rows {
+            break;
+        }
+        let (median, min, phases) = time_step(&vec![rows; count])?;
         println!("  {rows} rows/sequence ({} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, Spark exchanges \
-            {:.2} ms, head {:.2} ms", count * rows, 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
-            1e3 * phases[1] / n, 1e3 * phases[2] / n);
+            {:.2} ms, head {:.2} ms", count * rows, 1e3 * median, 1e3 * min, 1e3 * phases[0], 1e3 * phases[1],
+            1e3 * phases[2]);
+    }
+    // The verify budget's own step where an even share leaves rows over, as the `cost` policy
+    // schedules it (127 rows at 16 sequences on 170 SMs: 15 sequences of 8 rows and one of 7).
+    let (share, over) = (engine.verify_rows / count, engine.verify_rows % count);
+    if over > 0 && share > 0 && share < max_rows {
+        let shares: Vec<usize> = (0..count).map(|i| share + usize::from(i < over)).collect();
+        let (median, min, phases) = time_step(&shares)?;
+        println!("  verify budget, {} rows ({over} of {} rows/sequence, {} of {share}): {:.2} ms (min {:.2}); GPU until \
+            exchanges {:.2} ms, Spark exchanges {:.2} ms, head {:.2} ms", engine.verify_rows, share + 1, count - over,
+            1e3 * median, 1e3 * min, 1e3 * phases[0], 1e3 * phases[1], 1e3 * phases[2]);
     }
     Ok(())
 }

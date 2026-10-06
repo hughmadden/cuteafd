@@ -944,6 +944,8 @@ impl Opened {
             args.kda_state, args.decode_rows)?;
         tracing::info!(index_cache = ?engine.index_cache, pool_tokens, decode_rows = engine.decode_rows,
             "GLM 5.3 Flash DSA index cache");
+        tracing::info!(decode_rows = engine.decode_rows, verify_rows = engine.verify_rows,
+            sms = self.library.sm_count()?, "GLM 5.3 Flash verify budget: the most rows a verify step schedules");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;

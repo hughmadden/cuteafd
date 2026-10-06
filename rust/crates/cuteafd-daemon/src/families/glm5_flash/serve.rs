@@ -72,10 +72,11 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
-    /// Which drafts a speculative step verifies under its decode rows (--decode-rows): `cost`
-    /// (every sequence the same room, rows / sequences - 1 drafts, the cost model's depth within
-    /// it) or `chain` (each sequence's drafts cut where the product of the drafter's probabilities
-    /// falls below --spec-tau, then the least likely drafts across sequences dropped first).
+    /// Which drafts a speculative step verifies under its verify budget (--decode-rows; with 128,
+    /// whole sparse MLA waves, 127 rows on an RTX 5090): `cost` (every sequence the same room, rows
+    /// / sequences - 1 drafts, the cost model's depth within it) or `chain` (each sequence's drafts
+    /// cut where the product of the drafter's probabilities falls below --spec-tau, then the least
+    /// likely drafts across sequences dropped first).
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
     pub verify_policy: VerifyPolicy,
     /// The chain cut of --verify-policy chain (0 < tau <= 1).
@@ -517,9 +518,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     marks: (PrefixMarks, usize), select: SelectPlacement, ready: &mut dyn FnMut()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences, marks)?;
-    // The most rows one decode or verify step takes (`--decode-rows`): every step's next tokens and
+    // The most rows one verify step schedules: `--decode-rows`, or with the wide programs this GPU's
+    // whole sparse MLA waves (`verify_budget`, 127 on an RTX 5090). Every step's next tokens and
     // drafts fit in it.
-    let verify_rows = engine.decode_rows;
+    let verify_rows = engine.verify_rows;
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
@@ -799,13 +801,25 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
         // Rows each sequence may add after its next token: the same room for every sequence (cost),
-        // or as many as the decode programs hold, the step's rows budgeted after drafting (chain).
+        // or the whole verify budget, the step's rows budgeted after drafting (chain).
         let room = match policy.verify {
             VerifyPolicy::Cost => (verify_rows / active.len()).max(1) - 1,
             VerifyPolicy::Chain => verify_rows - 1,
         };
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
+
+        // With the wide programs, the rows an even share leaves over go to the first sequences that
+        // can draft once more (127 rows at 16 sequences: 15 draft 7, one 6). The 64-row default
+        // keeps today's even share.
+        let mut limits = limits;
+        if engine.decode_rows > DECODE_ROWS {
+            super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
+                let a = &active[i];
+                !probe::no_speculation(&a.job.probe)
+                    && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
+            });
+        }
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {
