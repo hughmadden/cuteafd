@@ -132,6 +132,31 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Teacher-forced scoring on the prefill path (probe `score_path: prefill`): the rows predicting
+/// `tokens[from..]` (those the probe wants) come from prompt chunks of the engine's prefill
+/// capacity, computed as a prompt's own prefill computes them (prefill GEMMs, the chunked KDA
+/// recurrence above 64 rows, the lanes). Returns the rows scored.
+fn score_prefill_path(engine: &GlmfEngine<'_>, probe: &probe::ProbeRef, tokens: &[u32], from: usize,
+    placement: &mut GlmfPlacement) -> Result<usize> {
+    let p = probe.as_ref().context("scoring without a probe")?;
+    anyhow::ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
+    p.selected_score_path("prefill");
+    let from = from.clamp(1, tokens.len() - 1);
+    // Row r (after tokens[..=r]) predicts token r + 1: the last token's row predicts nothing here.
+    let capacity = engine.prefill_capacity();
+    let mut scored = 0;
+    for (index, chunk) in tokens[..tokens.len() - 1].chunks(capacity).enumerate() {
+        let start = index * capacity;
+        let wanted = |r: usize| start + r + 1 >= from && p.wants(start + r + 1);
+        engine.score_prefill(placement, chunk, &wanted, &mut |r, logits| {
+            p.row(start + r + 1, logits);
+            scored += 1;
+            Ok(())
+        })?;
+    }
+    Ok(scored)
+}
+
 /// What the live console shows for GLM 5.3 Flash.
 fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     use console::{Color::*, StepGroup};
@@ -513,13 +538,26 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
             if let Some(from) = probe::scoring(&job.probe) {
-                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained. The
+                // decode path (the default) runs verify steps of up to `verify_rows` (64) rows, the
+                // prefill path (`score_path: prefill`) the prompt chunks a prompt's prefill runs.
                 let mut placement = admitted.placement;
-                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, &mut placement,
-                    |placement, chunk, _| engine.prefill_device(placement, chunk),
-                    |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, false)?
-                        .context("scoring needs every layer"));
+                let scored = match job.probe.as_ref().and_then(|p| p.spec.score_path.as_deref()) {
+                    Some("prefill") => score_prefill_path(&engine, &job.probe, &tokens, from, &mut placement),
+                    None | Some("decode") => {
+                        let rows = job.probe.as_ref().and_then(|p| p.spec.verify_rows).unwrap_or(DECODE_ROWS)
+                            .clamp(1, DECODE_ROWS);
+                        if let Some(p) = &job.probe {
+                            p.selected_score_path("decode");
+                        }
+                        probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                            rows, &mut placement,
+                            |placement, chunk, _| engine.prefill_device(placement, chunk),
+                            |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, false)?
+                                .context("scoring needs every layer"))
+                    }
+                    Some(other) => Err(anyhow::anyhow!("score_path {other:?}: GLM 5.3 Flash scores decode or prefill")),
+                };
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }

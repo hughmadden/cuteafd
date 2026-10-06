@@ -397,6 +397,15 @@ coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
 # COORDINATOR_TRACE is its pre-rename key; images older than the rename read
 # the family variables, which are set too for one release.
+# PROBE_DUMP_ROOT=/abs/host/dir: benchmark probes (POST /v1/bench/probe) may stream
+# full-vocabulary rows (dump_rows) into new leaves under it (CUTEAFD_PROBE_DUMP_ROOT, mounted
+# at the same path); unset, remote probes cannot write rows.
+probe_args=()
+probe_root="$(get PROBE_DUMP_ROOT)"
+if [[ -n "$probe_root" ]]; then
+  [[ "$probe_root" == /* && -d "$probe_root" ]] || { echo "PROBE_DUMP_ROOT must be an existing absolute directory" >&2; exit 2; }
+  probe_args=(-v "$probe_root:$probe_root" -e "CUTEAFD_PROBE_DUMP_ROOT=$probe_root")
+fi
 trace_args=()
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
@@ -749,7 +758,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

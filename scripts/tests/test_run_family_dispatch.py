@@ -343,6 +343,22 @@ def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
+    root = tmp_path / "dumps"
+    root.mkdir()
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"-v {root}:{root} -e CUTEAFD_PROBE_DUMP_ROOT={root}" in launch
+    result = _family_launch_result(tmp_path / "unset", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n")
+    assert result.returncode == 0 and "CUTEAFD_PROBE_DUMP_ROOT" not in result.stderr
+    result = _family_launch_result(tmp_path / "missing", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nPROBE_DUMP_ROOT={tmp_path}/absent\n")
+    assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
+
+
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,

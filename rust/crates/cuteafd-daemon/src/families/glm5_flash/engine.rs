@@ -1356,6 +1356,62 @@ impl<'a> GlmfEngine<'a> {
         self.prefill_forced(placement, tokens, on_layer, None, false)
     }
 
+    /// Teacher-forced scoring on the prefill path: prefills `tokens` (one chunk of at most
+    /// [`Self::prefill_capacity`] rows, in the lanes any prompt chunk takes) and hands `sink` the
+    /// logits of every chunk row `r` with `wanted(r)`. After the pass the head runs over the wanted
+    /// rows in groups of up to `DECODE_ROWS` (a prefill workspace's logit capacity), so no
+    /// chunk-wide logits buffer is allocated; each row's logits are the ones its pass gives.
+    pub fn score_prefill(&self, placement: &mut GlmfPlacement, tokens: &[u32], wanted: &dyn Fn(usize) -> bool,
+        sink: &mut dyn FnMut(usize, &[f32]) -> Result<()>) -> Result<()> {
+        ensure!(self.weights.layers.len() == self.cfg.layers, "prefill-path scoring needs every layer");
+        let t = tokens.len();
+        self.prefill_step(placement, tokens, None, None, false, true)?;
+        if self.pipelined() {
+            let (_, per_lane) = prefill_lane_plan(t, self.prefill_rows)?;
+            let workspaces = self.lane_workspaces.borrow();
+            for (lane, w) in workspaces.iter().enumerate() {
+                let first = lane * per_lane;
+                if first >= t {
+                    break;
+                }
+                let rows = per_lane.min(t - first);
+                // The pass normalized only its last lane: every lane's final streams, normalized.
+                self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
+                    ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])?;
+                self.score_rows(w, first, rows, wanted, sink)?;
+            }
+        } else {
+            // The pass normalized every row of its one workspace.
+            let workspace = self.workspace.borrow();
+            self.score_rows(workspace.as_ref().context("prefill workspace")?, 0, t, wanted, sink)?;
+        }
+        Ok(())
+    }
+
+    /// The logits of the wanted rows among a workspace's `rows` normalized rows (chunk rows `first..`).
+    fn score_rows(&self, w: &Workspace<'_>, first: usize, rows: usize, wanted: &dyn Fn(usize) -> bool,
+        sink: &mut dyn FnMut(usize, &[f32]) -> Result<()>) -> Result<()> {
+        let vocab = self.cfg.vocab_size;
+        let mut at = 0;
+        while at < rows {
+            let n = DECODE_ROWS.min(rows - at);
+            if (at..at + n).any(|r| wanted(first + r)) {
+                // Rows at..at + n: the last n of the first at + n normalized rows.
+                self.logits(w, at + n, n, false)?;
+                let bytes = self.download(&w.logits, n * vocab * 4)?;
+                for (j, row) in bytes.chunks_exact(vocab * 4).enumerate() {
+                    if wanted(first + at + j) {
+                        let values: Vec<f32> = row.chunks_exact(4)
+                            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                        sink(first + at + j, &values)?;
+                    }
+                }
+            }
+            at += n;
+        }
+        Ok(())
+    }
+
     /// Appends each sequence's tokens (one for decode, several for a verify)
     /// at its length in one decode-shaped step; returns every row's logits.
     /// KDA state advances in place: a caller rejecting a suffix must replay
