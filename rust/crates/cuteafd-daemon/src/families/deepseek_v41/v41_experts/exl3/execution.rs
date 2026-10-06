@@ -628,6 +628,11 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) fn output_element_bytes(&self) -> usize {
         self.output_element_bytes
     }
+    /// Whether this execution reads its FP8 wire rows only through its own
+    /// decode pass (one read of each row), rather than in the core.
+    pub(crate) fn decodes_wire_rows(&self) -> bool {
+        self.wire.is_some()
+    }
 
     /// Privately allocated payload; shared arenas are counted once by their planner.
     pub(crate) fn workspace_bytes(&self) -> usize {
