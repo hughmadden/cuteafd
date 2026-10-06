@@ -457,13 +457,72 @@ fn release(family: &Qwen4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<
     slots.push(placement.slot);
 }
 
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct VerifyBucket {
+    steps: u64,
+    speculative_steps: u64,
+    verify_ms_sum: f64,
+    verify_ms_max: f64,
+}
+
+struct VerifyStats {
+    real: [VerifyBucket; DECODE_ROWS + 1],
+    bucket: [VerifyBucket; DECODE_ROWS + 1],
+}
+
+impl Default for VerifyStats {
+    fn default() -> Self {
+        Self { real: [VerifyBucket::default(); DECODE_ROWS + 1],
+            bucket: [VerifyBucket::default(); DECODE_ROWS + 1] }
+    }
+}
+
+impl VerifyStats {
+    fn record(&mut self, rows: usize, bucket: usize, spec: bool, ms: f64) {
+        for entry in [&mut self.real[rows], &mut self.bucket[bucket]] {
+            entry.steps += 1;
+            entry.speculative_steps += u64::from(spec);
+            entry.verify_ms_sum += ms;
+            entry.verify_ms_max = entry.verify_ms_max.max(ms);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let timing = |entries: &[VerifyBucket]| entries.iter().enumerate().filter(|(_, v)| v.steps > 0)
+            .map(|(rows, value)| (rows.to_string(), *value)).collect::<std::collections::BTreeMap<_, _>>();
+        let rows = self.real.iter().enumerate().filter(|(_, v)| v.steps > 0)
+            .map(|(rows, value)| (rows.to_string(), value.steps)).collect::<std::collections::BTreeMap<_, _>>();
+        serde_json::json!({"rows": rows, "by_real_rows": timing(&self.real), "by_bucket": timing(&self.bucket),
+            "timing_scope": "serving verify plus token selection host wall; existing synchronization boundary; excludes draft and commit; cumulative attempts including errors"})
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    #[test]
+    fn histogram_counts_real_and_physical_rows_at_existing_timing_boundary() {
+        let mut stats = super::VerifyStats::default();
+        assert_eq!(stats.snapshot()["rows"], serde_json::json!({}));
+        stats.record(17, 24, true, 12.5);
+        stats.record(24, 24, true, 10.0);
+        stats.record(16, 16, false, 3.0);
+        let json = stats.snapshot();
+        assert_eq!(json["rows"], serde_json::json!({"16": 1, "17": 1, "24": 1}));
+        assert_eq!(json["by_bucket"]["24"]["steps"], 2);
+        assert_eq!(json["by_bucket"]["24"]["speculative_steps"], 2);
+        assert_eq!(json["by_bucket"]["24"]["verify_ms_sum"], 22.5);
+        assert_eq!(json["by_bucket"]["24"]["verify_ms_max"], 12.5);
+        assert_eq!(json["by_real_rows"]["16"]["speculative_steps"], 0);
+    }
+}
+
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         probe::graph_capture_stats(&mut stats);
     }
@@ -490,6 +549,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     // Verify steps since the last completed request, host seconds in verifies and in MTP draft steps.
     let (mut steps, mut verify_s) = (0u64, 0f64);
     let mut timing = DraftTiming::default();
+    let mut verify_stats = VerifyStats::default();
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let mtp = matches!(drafts, Drafts::Mtp { .. });
     let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
@@ -513,7 +573,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -946,6 +1006,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 Ok((selector.select(&logits, &batch)?, logits))
             });
         let elapsed = timer.elapsed().as_secs_f64();
+        verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic), spec, 1e3 * elapsed);
         verify_s += elapsed;
         let shape = Shape::plain(tokens.len(), sequences.len());
         let predicted_ms = cost.verify_ms(shape);
@@ -1091,7 +1152,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             release(&family, &mut cache, &mut free_slots, &request.placement);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }

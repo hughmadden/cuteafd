@@ -988,6 +988,11 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_stream_synchronize(self.stream) }
     }
 
+    /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.
+    pub(crate) fn verify_bucket_rows(&self, rows: usize, spec: bool, diagnostic: bool) -> usize {
+        if self.startup_graphs && self.use_graphs && !diagnostic { decode_bucket(rows, spec) } else { rows }
+    }
+
     pub fn captured_graphs(&self) -> usize {
         self.graphs.borrow().len()
     }

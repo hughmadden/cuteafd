@@ -170,6 +170,18 @@ def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
     assert publish.index("*stats = serde_json::json!") < publish.index("probe::graph_capture_stats(&mut stats);")
 
 
+def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+    timer = serve[serve.index("        let elapsed = timer.elapsed().as_secs_f64();"):]
+    assert timer.index("verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("cost.observe_verify(")
+    assert '"verify": verify.snapshot()' in serve
+    assert serve.count("&cache, media, preparer, &verify_stats);") == 2
+    assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
+    assert "decode_bucket(rows, spec) } else { rows }" in engine
+    assert '"by_real_rows"' in serve and '"by_bucket"' in serve
+
+
 def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()

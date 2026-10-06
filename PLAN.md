@@ -66,6 +66,10 @@ Extend (new families; kernels largely exist in b12x already):
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
 ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
+Qwen's launcher defaults to MTP3 only for local EXL3 (`ranks == 0`);
+TP4's shipped default uses copy-window drafts. Enabling native MTP on TP4
+with coordinator-local draft experts is a separate policy question, not a
+requirement of vision or decode-bucket qualification.
 
 ## Architecture
 
