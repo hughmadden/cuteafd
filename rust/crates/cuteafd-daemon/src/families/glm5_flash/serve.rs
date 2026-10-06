@@ -178,17 +178,27 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine| {
+    let lanes = max_sequences.min(DECODE_ROWS);
+    // The prefix cache's mark arena is allocated once the engine exists: admission keeps it free.
+    let marks = |rank: &cuteafd_loader::serving_capacity::RankCacheGeometry| {
+        mark_slots(&prefix, lanes, rank.retained_mark_bytes as usize) as u64 * rank.retained_mark_bytes
+    };
+    let result = opened.with_engine_admitting(&args, &marks, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.experts().is_some(), "serve-glmf needs --peers (or --local-experts) for the routed experts");
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(()));
-        }
         let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
-            decode_share, &prefix, args.token_io.token_select)
+        // Ready once the prefix cache and the token selector exist: the ledger then lists every
+        // start-up allocation.
+        let mut on_ready = || {
+            crate::shared::memory_report::log("glm5_flash ready");
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Ok(()));
+            }
+        };
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, ranks,
+            decode_share, &prefix, args.token_io.token_select, &mut on_ready)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -355,14 +365,19 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Device mark slots of `mark_bytes` each for `lanes` decoding sequences.
+fn mark_slots(args: &PrefixArgs, lanes: usize, mark_bytes: usize) -> usize {
+    let entries = args.prefix_cache_entries;
+    if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark_bytes, args.prefix_cache_mark_mib << 20) }
+}
+
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: usize)
     -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
-    let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
+    let family = GlmfPrefix::new(engine, |mark| mark_slots(args, lanes, mark))?;
     let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
@@ -412,10 +427,15 @@ pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assis
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement)
-    -> Result<()> {
+    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement,
+    ready: &mut dyn FnMut()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
-    let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
+    // Made before the KV pool when start-up admitted it from measured memory.
+    let mut selector = match engine.take_selector() {
+        Some(selector) => selector,
+        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?,
+    };
+    ready();
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
     let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
@@ -933,9 +953,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let [steps_seen, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
+            let (graphs, graph_bytes) = engine.graph_stats();
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
+                graph_captures = graphs.captures, graph_recaptures = graphs.recaptures, graph_bytes,
                 "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {

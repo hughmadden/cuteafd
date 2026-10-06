@@ -888,6 +888,17 @@ impl<'a> GlmDrafter<'a> {
     }
 
     /// The last draft step's final-norm rows [sequences * block, hidden] BF16.
+    /// Allocates the draft workspace for the largest draft batch now (eager start-up); otherwise
+    /// the first draft does.
+    pub fn reserve_workspace(&self) -> Result<()> {
+        let mut slot = self.workspace.borrow_mut();
+        if slot.as_ref().is_none_or(|w| w.sequences < self.max_sequences) {
+            *slot = None;
+            *slot = Some(self.workspace(self.max_sequences)?);
+        }
+        Ok(())
+    }
+
     pub fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>> {
         let slot = self.workspace.borrow();
         let w = slot.as_ref().context("no draft step ran")?;

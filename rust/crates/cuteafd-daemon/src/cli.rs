@@ -223,9 +223,20 @@ pub(crate) struct PlanArgs {
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,
-    /// Prefill workspace capacity for --layout (0: family/image default).
+    /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
+    /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_lanes: u64,
+    /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
+    /// engines' --headroom-gib).
+    #[arg(long, default_value_t = 2.0)]
+    pub(crate) headroom_gib: f64,
+    /// Decode graph budget (MiB) for --layout (GLM 5.3 Flash's --graph-budget-mib; unset: the
+    /// family's graph allowance).
+    #[arg(long)]
+    pub(crate) graph_budget_mib: Option<u64>,
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
