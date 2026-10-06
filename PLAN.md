@@ -756,6 +756,12 @@ Work, in priority order:
    encodes is a stress case, not a gate for this default. MiMo launches
    now default to `VISION=auto`; other generic families stay `off` until
    their towers are qualified. Keep V4.1 vision unchanged.
+   **Merge note (Qwen WP-7 + GLM Flash WP-9):** the cold_steps echo allowlist in
+   `cuteafd-api/src/openai/probe.rs` is `mimo_v2|qwen4` on WP-7 and
+   `mimo_v2|glm5_flash` on WP-9. Each branch lists only families whose
+   replay executor it contains. When merging both, resolve it to the union
+   `mimo_v2|qwen4|glm5_flash`, with positive tests for all three. Never
+   list a family whose executor isn't present.
    **Remote integration qualified:** MiMo serving uses `RemoteEncoder`
    with checked `vision_peers`, revision and `encoder_plan_hash`; readiness
    waits for every replica. Remote failure marks `/health` vision failed
