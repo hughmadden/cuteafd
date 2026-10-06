@@ -1013,6 +1013,105 @@ def test_layer_checkpoint_resume_fails_closed(tmp_path, change, monkeypatch):
         LayerCheckpoints(tmp_path / "next", binding, shapes, resume=store.root)
 
 
+def test_streamed_checkpoints_load_one_window_and_retain_predecessor(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    from fidelity_windows import LayerCheckpoints, WindowCheckpoint
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=1024 * 2**30))
+    shapes = {"a": [1, 3, 1, 2], "b": [1, 7, 1, 2]}
+    store = LayerCheckpoints(tmp_path / "streamed", {"source": "new"}, shapes,
+                             streaming=True, retain_previous=True)
+    states = [np.arange(np.prod(s), dtype=np.uint16).reshape(s) for s in shapes.values()]
+    for layer in range(3):
+        folder = store.begin(layer)
+        descriptors = [store.write_window(folder, name, value) for name, value in zip(shapes, states)]
+        store.commit(layer, descriptors, [1.] * (layer + 1))
+    assert not (store.root / "layer00").exists()
+    assert (store.root / "layer01").exists() and (store.root / "layer02").exists()
+    resumed = LayerCheckpoints(tmp_path / "fresh", {"source": "qualified-new"}, shapes,
+                              streaming=True, resume_binding={"source": "new"}, resume=store.root)
+    layer, values, times = resumed.resumed
+    assert layer == 2 and len(times) == 3
+    for expected, descriptor in zip(states, values):
+        assert isinstance(descriptor, WindowCheckpoint)
+        np.testing.assert_array_equal(expected, descriptor.load())
+    (values[0].path).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="bytes changed"):
+        values[0].load()
+
+
+def test_streamed_partial_layer_cannot_replace_complete_pointer(tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    from fidelity_windows import LayerCheckpoints
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=1024 * 2**30))
+    shapes = {"a": [1, 2], "b": [1, 2]}
+    store = LayerCheckpoints(tmp_path / "store", {}, shapes, streaming=True)
+    states = [np.zeros(s, dtype=np.uint16) for s in shapes.values()]
+    store.commit(0, states, [1.])
+    folder = store.begin(1)
+    partial = store.write_window(folder, "a", states[0])
+    with pytest.raises(ValueError, match="incomplete"):
+        store.commit(1, [partial], [1., 2.])
+    assert store.read(store.root)[0] == 0
+
+
+@pytest.mark.parametrize("cuda_free,host_available", [(8, 32), (32, 8), (32, 32)])
+def test_unified_admission_checks_both_cuda_and_host(monkeypatch, cuda_free, host_available):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import fidelity_windows as fw
+    cuda = SimpleNamespace(synchronize=lambda: None, mem_get_info=lambda: (cuda_free * 2**30, 64 * 2**30))
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda p, *a, **kw:
+                        f"MemAvailable: {host_available * 2**20} kB\n" if str(p) == "/proc/meminfo"
+                        else original(p, *a, **kw))
+    if min(cuda_free, host_available) < 20:
+        with pytest.raises(RuntimeError, match="before allocation"):
+            fw.admit_reference_memory(cuda, 16 * 2**30)
+    else:
+        fw.admit_reference_memory(cuda, 16 * 2**30)
+
+
+def test_reference_cuda_telemetry_distinguishes_live_and_cached(capsys):
+    from fidelity_windows import log_reference_cuda_memory
+    events = []
+    cuda = SimpleNamespace(synchronize=lambda: events.append("drained"),
+                           mem_get_info=lambda: (70 * 2**30, 120 * 2**30),
+                           memory_allocated=lambda: 2**30, memory_reserved=lambda: 3 * 2**30)
+    stats = log_reference_cuda_memory(cuda, "retired")
+    assert events == ["drained"] and stats["allocated"] == 2**30 and stats["reserved"] == 3 * 2**30
+    assert "allocated=1.000GiB reserved=3.000GiB free=70.000GiB" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_reference_cache_release_requires_exact_host_ack(tmp_path, monkeypatch, complete):
+    import fidelity_windows as fw
+    request, response = tmp_path / "request", tmp_path / "response"
+    original = pathlib.Path.write_bytes
+
+    def acknowledge(path, data):
+        result = original(path, data)
+        if path.parent == request:
+            record = json.loads(data)
+            original(response / path.name, fw.canonical({"token": record["token"], "complete": complete}))
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", acknowledge)
+    if complete:
+        fw.release_reference_page_cache(request, response, "layer2")
+    else:
+        with pytest.raises(RuntimeError, match="release failed"):
+            fw.release_reference_page_cache(request, response, "layer2")
+    assert len(list(request.iterdir())) == 1
+
+
+def test_reference_cache_release_times_out_without_host(tmp_path):
+    from fidelity_windows import release_reference_page_cache
+    with pytest.raises(RuntimeError, match="timed out"):
+        release_reference_page_cache(tmp_path / "request", tmp_path / "response", "layer2", timeout=0)
+
+
 def test_layer_checkpoint_admission_retains_nvme_headroom(tmp_path, monkeypatch):
     import shutil
     from types import SimpleNamespace

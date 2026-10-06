@@ -95,17 +95,23 @@ def release_checkpoint(cuda, *readers):
 class LayerCheckpoints:
     """Keep a complete hash-sealed BF16 layer until its successor is committed."""
 
-    def __init__(self, root: Path, binding: dict, shapes: dict, *, resume: Path | None = None):
+    def __init__(self, root: Path, binding: dict, shapes: dict, *, resume: Path | None = None,
+                 streaming: bool = False, resume_binding: dict | None = None,
+                 retain_previous: bool = False):
         import shutil
         self.root, self.binding, self.shapes = root, binding, shapes
+        self.streaming = streaming
+        self.resume_binding = binding if resume_binding is None else resume_binding
+        self.retain_previous = retain_previous
+        self.retained = []
         self.bytes_per_layer = sum(int(np.prod(shape)) * 2 for shape in shapes.values())
         root.mkdir(parents=True, exist_ok=False)
-        if shutil.disk_usage(root).free < 2 * self.bytes_per_layer + 100 * 2**30:
-            raise RuntimeError("layer checkpoints require two layers plus100GiB NVMe headroom")
+        if shutil.disk_usage(root).free < (3 if retain_previous else 2) * self.bytes_per_layer + 100 * 2**30:
+            raise RuntimeError("layer checkpoints require retained layers plus100GiB NVMe headroom")
         self.previous = None
-        self.resumed = None if resume is None else self.read(resume)
+        self.resumed = None if resume is None else self.read(resume, binding=self.resume_binding)
 
-    def read(self, root: Path):
+    def read(self, root: Path, *, binding=None):
         pointer = json.loads((root / "latest.json").read_text())
         folder = root / pointer["layer"]
         if folder.parent != root or not re.fullmatch(r"layer[0-9]+", folder.name):
@@ -118,7 +124,7 @@ class LayerCheckpoints:
                 or folder.name != f"layer{seal['layer_id']:02d}"
                 or len(seal["seconds_per_layer"]) != seal["layer_id"] + 1):
             raise ValueError("invalid layer checkpoint extent")
-        if seal["binding"] != self.binding or seal["shapes"] != self.shapes:
+        if seal["binding"] != (self.binding if binding is None else binding) or seal["shapes"] != self.shapes:
             raise ValueError("layer checkpoint source/set/snapshot/shape identity differs")
         if set(seal["files"]) != set(self.shapes):
             raise ValueError("incomplete layer checkpoint window set")
@@ -129,10 +135,15 @@ class LayerCheckpoints:
             if path.resolve().parent != folder.resolve():
                 raise ValueError("layer checkpoint escapes its directory")
             size = int(np.prod(shape)) * 2
-            data = path.read_bytes()
-            if len(data) != size or entry["bytes"] != size or hashlib.sha256(data).hexdigest() != entry["sha256"]:
-                raise ValueError("layer checkpoint bytes changed")
-            states.append(np.frombuffer(data, dtype="<u2").reshape(shape).copy())
+            if self.streaming:
+                state = WindowCheckpoint(path, shape, entry)
+                state.verify()
+                states.append(state)
+            else:
+                data = path.read_bytes()
+                if len(data) != size or entry["bytes"] != size or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise ValueError("layer checkpoint bytes changed")
+                states.append(np.frombuffer(data, dtype="<u2").reshape(shape).copy())
         return seal["layer_id"], states, seal["seconds_per_layer"]
 
     def commit(self, layer_id: int, states, seconds_per_layer):
@@ -140,21 +151,21 @@ class LayerCheckpoints:
         if shutil.disk_usage(self.root).free < self.bytes_per_layer + 100 * 2**30:
             raise RuntimeError("layer checkpoint write would violate100GiB NVMe headroom")
         folder = self.root / f"layer{layer_id:02d}"
-        folder.mkdir(exist_ok=False)
+        if getattr(self, "pending", None) != folder:
+            folder.mkdir(exist_ok=False)
         files = {}
         if len(states) != len(self.shapes):
             raise ValueError("incomplete layer checkpoint state set")
         for (name, shape), state in zip(self.shapes.items(), states):
-            if list(state.shape) != shape or state.dtype != np.dtype("uint16"):
-                raise ValueError("layer checkpoint requires exact BF16 bits/shape")
-            path = folder / (name + ".bin")
-            data = state.astype("<u2", copy=False).tobytes()
-            with path.open("xb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-                os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-            files[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            if isinstance(state, WindowCheckpoint):
+                if state.path != folder / (name + ".bin") or state.shape != shape:
+                    raise ValueError("streamed checkpoint belongs to a different layer/window")
+                state.verify()
+                files[name] = state.entry
+            else:
+                if list(state.shape) != shape or state.dtype != np.dtype("uint16"):
+                    raise ValueError("layer checkpoint requires exact BF16 bits/shape")
+                files[name] = self.write_window(folder, name, state).entry
         seal = {"layer_id": layer_id, "binding": self.binding, "shapes": self.shapes,
                 "seconds_per_layer": seconds_per_layer, "files": files}
         seal_bytes = canonical(seal) + b"\n"
@@ -180,10 +191,105 @@ class LayerCheckpoints:
             os.fsync(fd)
         finally:
             os.close(fd)
-        if self.previous is not None:
-            shutil.rmtree(self.previous)
+        self.retained.append(folder)
+        while len(self.retained) > (2 if self.retain_previous else 1):
+            shutil.rmtree(self.retained.pop(0))
         self.previous = folder
+        self.pending = None
         print(f"layer checkpoint committed: layer={layer_id} bytes={self.bytes_per_layer}", flush=True)
+
+    def begin(self, layer_id):
+        import shutil
+        if shutil.disk_usage(self.root).free < self.bytes_per_layer + 100 * 2**30:
+            raise RuntimeError("layer checkpoint write would violate100GiB NVMe headroom")
+        self.pending = self.root / ("embedding" if layer_id == -1 else f"layer{layer_id:02d}")
+        self.pending.mkdir(exist_ok=False)
+        return self.pending
+
+    def write_window(self, folder, name, state):
+        shape = self.shapes[name]
+        if list(state.shape) != shape or state.dtype != np.dtype("uint16"):
+            raise ValueError("layer checkpoint requires exact BF16 bits/shape")
+        path = folder / (name + ".bin")
+        # memoryview avoids a second window-sized anonymous copy during persistence.
+        data = memoryview(np.ascontiguousarray(state, dtype="<u2")).cast("B")
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        return WindowCheckpoint(path, shape, {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+
+
+class WindowCheckpoint:
+    """An immutable window descriptor; only one payload enters anonymous RAM at a time."""
+
+    def __init__(self, path, shape, entry):
+        self.path, self.shape, self.entry = path, shape, entry
+
+    def verify(self):
+        digest = hashlib.sha256()
+        with self.path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 2**20), b""):
+                digest.update(chunk)
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        if (self.path.stat().st_size != int(np.prod(self.shape)) * 2
+                or self.path.stat().st_size != self.entry["bytes"]
+                or digest.hexdigest() != self.entry["sha256"]):
+            raise ValueError("layer checkpoint bytes changed")
+
+    def load(self):
+        self.verify()
+        with self.path.open("rb") as stream:
+            value = np.fromfile(stream, dtype="<u2").reshape(self.shape)
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        return value
+
+
+def release_reference_page_cache(request: Path, response: Path, label: str, *, timeout=180):
+    """Ask the lock-owning host runner to release clean FUSE backing pages."""
+    token = f"{os.getpid()}-{time.monotonic_ns()}"
+    request.mkdir(parents=True, exist_ok=True)
+    response.mkdir(parents=True, exist_ok=True)
+    (request / token).write_bytes(canonical({"token": token, "label": label}) + b"\n")
+    print(f"REFERENCE_CACHE_REQUEST {token}", flush=True)
+    deadline = time.monotonic() + timeout
+    reply_path = response / token
+    while not reply_path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("host page-cache release timed out")
+        time.sleep(0.1)
+    reply = json.loads(reply_path.read_bytes())
+    if reply.get("token") != token or reply.get("complete") is not True:
+        raise RuntimeError("host page-cache release failed")
+    print(f"reference page cache released: {label}", flush=True)
+
+
+def log_reference_cuda_memory(cuda, label):
+    """Separate live tensors, allocator cache and driver-visible unified memory."""
+    cuda.synchronize()
+    free, total = cuda.mem_get_info()
+    stats = {"allocated": cuda.memory_allocated(), "reserved": cuda.memory_reserved(),
+             "free": free, "total": total, "rss": rss_bytes()}
+    info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    stats.update({name: int(info[name].split()[0]) * 1024
+                  for name in ("MemFree", "MemAvailable", "Cached", "AnonPages")})
+    print(f"reference CUDA {label}: " + " ".join(
+        f"{name}={value / 2**30:.3f}GiB" for name, value in stats.items()), flush=True)
+    return stats
+
+
+def admit_reference_memory(cuda, required_peak_bytes, *, margin_bytes=4 * 2**30):
+    """GB10 shares physical memory: neither CUDA nor host availability alone suffices."""
+    cuda.synchronize()
+    free, _ = cuda.mem_get_info()
+    info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    host = int(info["MemAvailable"].split()[0]) * 1024
+    required = required_peak_bytes + margin_bytes
+    print(f"reference admission CUDA_free={free / 2**30:.3f}GiB host_available={host / 2**30:.3f}GiB "
+          f"required={required / 2**30:.3f}GiB RSS={rss_bytes() / 2**30:.3f}GiB", flush=True)
+    if min(free, host) < required:
+        raise RuntimeError("reference unified CUDA/host admission failed before allocation")
 
 
 def log_checkpoint_reads(label, readers, before, started):
