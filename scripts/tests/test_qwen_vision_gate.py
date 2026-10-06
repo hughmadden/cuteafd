@@ -93,7 +93,7 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert serve.index("probe.spec.validate_cold_steps(") < serve.index('probe::admitted(&job.probe, "qwen4"')
     assert "probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new()" in serve
     assert "probe.spec.cold_steps.get(p.chunks)" in serve
-    assert "let logits = if decode {\n                        engine.verify_device" in serve
+    assert "let logits = if decode {\n                        engine.verify_device_ungraphed" in serve
     assert "} else { engine.prefill_device(&mut p.placement, chunk, None, None, 1)? };" in serve
     assert 'matches!(engine, "mimo_v2" | "qwen4")' in api
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
@@ -105,6 +105,26 @@ def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
     assert startup.index("probe::graph_capture_stats(&mut stats);") < startup.index("ready.send(Ok(")
     publish = serve[serve.index("fn publish("):serve.index("pub(crate) const MESSAGE_STARTS")]
     assert publish.index("*stats = serde_json::json!") < publish.index("probe::graph_capture_stats(&mut stats);")
+
+
+def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+    startup = serve[serve.index("let result = opened.with_engine"):serve.index("struct Active")]
+    assert startup.index("engine.warm_decode_graphs(") < startup.index("probe::graph_capture_stats(")
+    assert startup.index("engine.check_decode_padding(") < startup.index("ready.send(Ok(")
+    scoring = serve[serve.index("|placement, chunk|"):serve.index("|placement, chunk|") + 160]
+    assert "verify_device_ungraphed" in scoring
+    assert "active.iter().any(|a| a.job.probe.is_some())" in serve
+    assert "if diagnostic {\n            engine.verify_device_ungraphed" in serve
+    assert "logits.rows = rows;" in engine
+    assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
+    assert "Qwen serving graph was not captured at startup" in engine
+    assert "index < layers.len() && !self.warming_graphs.get()" in engine
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert 'get QWEN_STARTUP_GRAPHS' in launcher
+    assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher
+    assert 'off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0)' in launcher
 
 
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():

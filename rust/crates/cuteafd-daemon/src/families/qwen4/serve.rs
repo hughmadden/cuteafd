@@ -226,6 +226,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }
+        engine.warm_decode_graphs(max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None))?;
+        if let Ok(path) = std::env::var("CUTEAFD_QWEN4_PADDING_TOKENS") {
+            let bytes = std::fs::read(&path).with_context(|| format!("Qwen padding tokens {path}"))?;
+            anyhow::ensure!(bytes.len() % 4 == 0, "Qwen padding token file is not U32-aligned");
+            let tokens: Vec<_> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            engine.check_decode_padding(&tokens)?;
+        }
         // Startup captures must be visible in the first API statistics snapshot.
         {
             let mut stats = stats.lock().map_err(|_| anyhow::anyhow!("Qwen serving stats lock poisoned"))?;
@@ -638,7 +645,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows, score_rows,
                     &mut placement,
                     |placement, chunk, logit| engine.prefill_device(placement, chunk, None, None, usize::from(logit)),
-                    |placement, chunk| engine.verify_device(&mut [(placement, chunk)], false)?
+                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false)?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
@@ -700,7 +707,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
                     let logits = if decode {
-                        engine.verify_device(&mut [(&mut p.placement, chunk)], false)?
+                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false)?
                     } else { engine.prefill_device(&mut p.placement, chunk, None, None, 1)? };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
@@ -919,11 +926,16 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let histories: Vec<_> = active.iter().map(|a| a.placement.history.clone()).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
+        let diagnostic = active.iter().any(|a| a.job.probe.is_some());
         let mut rows: Vec<(&mut Qwen4Placement, &[u32])> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
         steps += 1;
         let timer = Instant::now();
-        let step = engine.verify_device(&mut rows, spec).and_then(|logits| logits.context("decode needs every layer"))
+        let step = if diagnostic {
+            engine.verify_device_ungraphed(&mut rows, spec)
+        } else {
+            engine.verify_device(&mut rows, spec)
+        }.and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.
                 let mut batch = SelectBatch::default();

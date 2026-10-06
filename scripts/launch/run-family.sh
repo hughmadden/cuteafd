@@ -405,6 +405,15 @@ if [[ -n "$trace" ]]; then
   trace_args=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
 fi
+# Qwen startup graph buckets remain opt-in until padding and performance gates pass.
+if [[ $family == qwen4 ]]; then
+  case "$(get QWEN_STARTUP_GRAPHS)" in
+    "") ;;
+    on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1) ;;
+    off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0) ;;
+    *) echo "QWEN_STARTUP_GRAPHS must be on or off" >&2; exit 2 ;;
+  esac
+fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
