@@ -484,12 +484,12 @@ mod tests {
             GlmfMissingProgram("glmf_kda_s16_m64".into()));
     }
 
-    /// The wide programs' scratch at 128 rows: their scratch formulas at 128 rows (KDA, MLA, o,
-    /// FFN, indexer, mHC), the sparse MLA decode plan's 128-row bucket at one split, and the top-k
-    /// scaled with its rows (test inputs: the export's manifest gives the real ones).
+    /// The wide programs' scratch at 128 rows, from the first 128-row export on an RTX 5090, but
+    /// for the sparse MLA decode's: its 128-row bucket at one split (`full_launch_splits`), where
+    /// that export's split planner took 33 splits and 554,729,472 bytes.
     const WIDE_SCRATCH: [(&str, u64); 11] = [
         ("glmf_index_producer_m128", 1_122_304), ("glmf_index_producer_c_m128", 1_187_840),
-        ("glmf_index_topk_decode_m128", 17_307_648), ("glmf_mhc_post_pre_m128", 819_200),
+        ("glmf_index_topk_decode_m128", 17_304_576), ("glmf_mhc_post_pre_m128", 819_200),
         ("glmf_kda_m128", 21_053_440), ("glmf_kda_w8_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
         ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
         ("glmf_ffn_i12288_m128", 9_437_184),
@@ -510,7 +510,7 @@ mod tests {
         let wide = glmf_step_scratch(wide_lookup, &cfg, GlmfScratchOptions::default(), 128, true).unwrap();
         // mhc_pre (prefill capacity) stays the largest program; the top-k's own scratch grows.
         assert_eq!((narrow.programs, wide.programs), (26_214_400, 26_214_400));
-        assert_eq!((narrow.topk, wide.topk), (8_653_824, 17_307_648));
+        assert_eq!((narrow.topk, wide.topk), (8_653_824, 17_304_576));
         assert_eq!(glmf_step_scratch(lookup, &cfg, GlmfScratchOptions::default(), 128, true).unwrap_err(),
             GlmfMissingProgram("glmf_mhc_post_pre_m128".into()));
         // Up to 64 rows only the `_m64` programs count, whatever the wide ones hold.
@@ -537,7 +537,7 @@ mod tests {
         let workspace = |rows: u64, scratch: GlmfScratch| glmf_step_workspaces(&cfg, 2, 4096, rows, &shape, scratch,
             GlmfScratch::default()).decode;
         assert_eq!(workspace(64, narrow), 95_018_240);
-        assert_eq!(workspace(128, wide) - workspace(64, narrow), 64 * 874_308 + (17_307_648 - 8_653_824));
+        assert_eq!(workspace(128, wide) - workspace(64, narrow), 64 * 874_308 + (17_304_576 - 8_653_824));
     }
 
     #[test]
