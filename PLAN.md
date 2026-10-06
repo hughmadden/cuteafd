@@ -100,6 +100,12 @@ build.sh wip.sh run.sh stop.sh   kept; config gains MODEL + family auto-detect
 
 Traits the engine programs against (keep them few and concrete):
 
+Decode buckets must not straddle registered projection arithmetic thresholds.
+Families use a named Rust threshold registry and a fail-closed startup check;
+CPU contracts compare it with the pinned fork's routing rules at each pin bump.
+Exporter-embedded, object-attested route registries are possible hardening if
+pin bumps ever bypass those tests; the current AOT manifest does not carry them.
+
 - `Family`: reads `config.json` + `quantization_config` + safetensors index
   into a `ModelSpec` (layer kinds, attention kind per layer, MoE geometry,
   speculator, mapped tables, vision) and builds the per-layer `Block`s.

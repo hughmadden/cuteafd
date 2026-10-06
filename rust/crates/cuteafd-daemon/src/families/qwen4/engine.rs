@@ -36,7 +36,7 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use std::cell::{Cell, RefCell};
-use crate::shared::decode_graph::{masked_row, real_row_moe, row_bucket as decode_bucket, ROW_BUCKETS as DECODE_BUCKETS};
+use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -44,6 +44,34 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
+const PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];
+const SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
+// Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
+const GLM_BF16_SKINNY_ROWS: usize = 8;
+const QWEN_WIDE_SKINNY_ROWS: usize = 24;
+const QWEN_MEDIUM_SKINNY_ROWS: usize = 64;
+const QWEN_SMALL_SKINNY_ROWS: usize = 160;
+const FP8_PROJECTION_SKINNY_ROWS: usize = 16;
+const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
+    ProjectionThreshold { name: "gdn.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "gdn.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "hc.down_inject", skinny_rows: QWEN_SMALL_SKINNY_ROWS },
+    ProjectionThreshold { name: "head.mixer_down", skinny_rows: QWEN_SMALL_SKINNY_ROWS },
+    ProjectionThreshold { name: "ple.kv", skinny_rows: QWEN_WIDE_SKINNY_ROWS },
+    ProjectionThreshold { name: "router.scores", skinny_rows: QWEN_MEDIUM_SKINNY_ROWS },
+    ProjectionThreshold { name: "shared.gate_up", skinny_rows: QWEN_MEDIUM_SKINNY_ROWS },
+    ProjectionThreshold { name: "mtp.feedback", skinny_rows: QWEN_WIDE_SKINNY_ROWS },
+    ProjectionThreshold { name: "gdn.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
+];
+
+fn decode_bucket(rows: usize, spec: bool) -> usize {
+    let buckets = if spec { SPEC_BUCKETS } else { PLAIN_BUCKETS };
+    buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
+}
+
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 K/V record of one token: K [2, 256] then V [2, 256].
@@ -295,11 +323,28 @@ mod tests {
         use super::*;
         assert_eq!(graph_geometries(32768, 512, 2051).len(), 40);
         let shapes = serving_graph_shapes(32768, 512, 2051, 16, true);
-        assert_eq!(shapes.len() * 49, 11760);
+        assert_eq!(shapes.len() * 49, 21560);
         let modes: std::collections::HashSet<_> = shapes.iter().map(|&(rows, spec, _)| (rows, spec)).collect();
-        assert_eq!(modes, [(1, false), (4, false), (16, false), (4, true), (16, true), (64, true)].into());
-        assert_eq!(serving_graph_shapes(32768, 512, 2051, 16, false).len() * 49, 5880);
+        assert_eq!(modes, [(1, false), (4, false), (8, false), (16, false),
+            (2, true), (4, true), (8, true), (16, true), (24, true), (32, true), (64, true)].into());
+        assert_eq!(serving_graph_shapes(32768, 512, 2051, 16, false).len() * 49, 7840);
         assert_eq!(graph_geometries(8192, 128, 2051).len(), 23);
+    }
+
+    #[test]
+    fn decode_buckets_preserve_registered_arithmetic_routes() {
+        use super::*;
+        check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
+        check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
+        for (real, spec, bucket) in [(5, false, 8), (9, false, 16), (3, true, 4),
+            (5, true, 8), (9, true, 16), (17, true, 24), (25, true, 32), (33, true, 64)] {
+            assert_eq!(decode_bucket(real, spec), bucket);
+            for projection in DECODE_PROJECTION_THRESHOLDS {
+                assert_eq!(real <= projection.skinny_rows, bucket <= projection.skinny_rows, "{}", projection.name);
+            }
+        }
+        assert_eq!(decode_bucket(2, true), 2);
+        assert_eq!(decode_bucket(24, true), 24);
     }
 
     #[test]
@@ -333,7 +378,7 @@ mod tests {
                     cache_lengths: vec![4; real], page_table: vec![3; real * 4], pool_table: vec![5; real * 2],
                     ple_ids: vec![9; real * ple_rows], ..Default::default() };
                 let mut tokens = vec![248056; real];
-                let bucket = decode_bucket(real);
+                let bucket = decode_bucket(real, true);
                 pad_decode_tables(&mut tables, &mut tokens, bucket, ple_rows);
                 assert_eq!(tokens.len(), bucket);
                 assert_eq!(&tokens[..real], vec![248056; real]);
@@ -695,11 +740,10 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
 
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = decode_bucket(sequences.min(DECODE_ROWS));
+    let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
     graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        DECODE_BUCKETS.into_iter().flat_map(move |rows| [false, true].into_iter()
-            .filter(move |&spec| if spec { speculation && rows > 1 } else { rows <= plain })
-            .map(move |spec| (rows, spec, geometry)))
+        PLAIN_BUCKETS.iter().copied().filter(move |&rows| rows <= plain).map(move |rows| (rows, false, geometry))
+            .chain(SPEC_BUCKETS.iter().copied().filter(move |_| speculation).map(move |rows| (rows, true, geometry)))
     }).collect()
 }
 
@@ -827,10 +871,14 @@ impl<'a> Qwen4Engine<'a> {
     /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
         if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        ensure!(sequences <= *PLAIN_BUCKETS.last().unwrap(),
+            "Qwen startup graphs support at most 16 concurrent sequences");
+        check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
+        check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
         let segments = self.weights.layers.len() + 1;
         let expected = shapes.len() * segments;
-        tracing::info!(graphs = expected, shapes = shapes.len(), rows = ?DECODE_BUCKETS,
+        tracing::info!(graphs = expected, shapes = shapes.len(), plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS,
             "Qwen startup decode graph admission");
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true, DECODE_ROWS)?);
@@ -888,8 +936,8 @@ impl<'a> Qwen4Engine<'a> {
                 Ok(bytes)
             }).collect()
         };
-        for (sequences, width, spec) in [(3, 1, false), (10, 1, false),
-            (1, 3, true), (1, 10, true), (1, 17, true), (1, 33, true)] {
+        for (sequences, width, spec) in [(5, 1, false), (9, 1, false),
+            (1, 3, true), (1, 5, true), (1, 9, true), (1, 17, true), (1, 25, true), (1, 33, true)] {
             let mut allocator = Allocator::new(self.pages, self.slots, &self.cfg);
             let mut placements: Vec<_> = (0..sequences).map(|_| allocator.admit(65)).collect::<Result<_>>()?;
             for placement in &mut placements {
@@ -930,10 +978,10 @@ impl<'a> Qwen4Engine<'a> {
                 ensure!(u32::from_le_bytes(id.try_into()?) as usize == expected, "Qwen padded greedy id differs");
             }
             ensure!(plain.len() == padded.len() && plain.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "Qwen decode padding {rows}->{} changed real-row logits", decode_bucket(rows));
+                "Qwen decode padding {rows}->{} changed real-row logits", decode_bucket(rows, spec));
             ensure!(snapshot(&buffers)? == plain_state,
-                "Qwen decode padding {rows}->{} changed persistent cache/state bytes", decode_bucket(rows));
-            tracing::info!(rows, spec, bucket = decode_bucket(rows), bytes = plain.len() * 4,
+                "Qwen decode padding {rows}->{} changed persistent cache/state bytes", decode_bucket(rows, spec));
+            tracing::info!(rows, spec, bucket = decode_bucket(rows, spec), bytes = plain.len() * 4,
                 "Qwen padded decode logits and cache/state byte-exact");
         }
         // SAFETY: finish the diagnostic before releasing its persistent engine buffers.
@@ -1402,7 +1450,7 @@ impl<'a> Qwen4Engine<'a> {
         } else { Default::default() };
         let bucketed = self.startup_graphs && self.use_graphs && graphs && on_layer.is_none() && media.indices.is_empty();
         if bucketed {
-            pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+            pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
         let physical_rows = tokens.len();
         let mut logits = self.step(&tables, &tokens, physical_rows, on_layer, None, &media, graphs)?;

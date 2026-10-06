@@ -1,5 +1,7 @@
 """Qwen tower ABI, interpolation order and head72 export contracts, CPU-only."""
+import ast
 import ctypes
+import re
 import importlib.util
 from pathlib import Path
 
@@ -14,6 +16,67 @@ def module(path, name):
     result = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(result)
     return result
+
+
+def test_qwen_bucket_projection_registry_matches_pinned_fork():
+    fork = ROOT / "third_party/sparkinfer/b12x"
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+    def rust(name):
+        return int(re.search(rf"const {name}: usize = (\d+);", engine).group(1))
+    skinny = ast.parse((fork / "gemm/bf16_gemv/_skinny.py").read_text())
+    threshold = next(n for n in skinny.body if isinstance(n, ast.FunctionDef) and n.name == "skinny_max_rows")
+    # Execute only the pure scalar rule, never import CUDA, torch or the exporter.
+    scope = {}
+    exec(compile(ast.Module(body=[threshold], type_ignores=[]), "pinned skinny rule", "exec"), scope)
+    scalar_rule = scope["skinny_max_rows"]
+    assert scalar_rule(12800, 2560) == rust("QWEN_WIDE_SKINNY_ROWS")
+    for n in (512, 1296):
+        assert scalar_rule(n, 2560) == rust("QWEN_MEDIUM_SKINNY_ROWS")
+    for n in (320, 324):
+        assert scalar_rule(n, 10240) == rust("QWEN_SMALL_SKINNY_ROWS")
+    glm = (fork / "integration/cuteafd/_glm_kernels.py").read_text()
+    assert int(re.search(r"WIDE_SKINNY_MAX_ROWS = (\d+)", glm).group(1)) == rust("GLM_BF16_SKINNY_ROWS")
+    assert "max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None" in glm
+    fp8 = (fork / "integration/cuteafd/_fp8_weights.py").read_text()
+    assert int(re.search(r"FP8_GEMV_ROWS = (\d+)", fp8).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
+    assert "self.inner = glm_projection(n, k)" in fp8
+    fp8_ast = ast.parse(fp8)
+    projection_class = next(n for n in fp8_ast.body if isinstance(n, ast.ClassDef) and n.name == "Fp8Projection")
+    init = next(n for n in projection_class.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    defaults = {arg.arg: ast.literal_eval(default) for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
+                if arg.arg in ("gemv_rows", "wide_rows")}
+    assert defaults["gemv_rows"] == rust("FP8_PROJECTION_SKINNY_ROWS")
+    assert defaults["wide_rows"] == 0
+    for filename, contracts in {
+        "qwen4_gdn.py": ("self.in_proj = projection(p, g.hidden, self.fp8)", "self.o_proj = projection(g.hidden, v, self.fp8)"),
+        "qwen4_attention.py": ("self.proj = projection(g.attn_in_width, g.hidden, self.fp8)",
+                               "self.o_proj = projection(g.hidden, g.heads * g.head_dim, self.fp8)"),
+        "glmf.py": ("self.proj = RoutedBf16Projection(e, h, out_dtype=cutlass.Float32)",),
+    }.items():
+        source = (fork / "integration/cuteafd" / filename).read_text()
+        for contract in contracts:
+            assert contract in source
+    qwen = (fork / "integration/cuteafd/qwen4.py").read_text()
+    for contract in ("if (k // 8) % 32:", "return TmaBf16Projection(n, k, out_dtype=out_dtype)",
+                     "return RoutedBf16Projection(n, k, out_dtype=out_dtype)",
+                     "self.kv = _projection(c + h, g.ple_dim)", "self.di = _projection(self.d_width, c)",
+                     "self.up = _projection(c, r)", "self.gate_up = _projection(SHARED_ROWS, g.hidden)",
+                     "self.down = _projection(g.hidden, i)", "self.fc = _projection(g.hidden, g.hidden)"):
+        assert contract in qwen
+    expected_registry = {
+        "gdn.in_projection.bf16": "GLM_BF16_SKINNY_ROWS", "gdn.out_projection.bf16": "GLM_BF16_SKINNY_ROWS",
+        "attention.in_projection.bf16": "GLM_BF16_SKINNY_ROWS", "attention.out_projection.bf16": "GLM_BF16_SKINNY_ROWS",
+        "hc.down_inject": "QWEN_SMALL_SKINNY_ROWS", "head.mixer_down": "QWEN_SMALL_SKINNY_ROWS",
+        "ple.kv": "QWEN_WIDE_SKINNY_ROWS", "router.scores": "QWEN_MEDIUM_SKINNY_ROWS",
+        "shared.gate_up": "QWEN_MEDIUM_SKINNY_ROWS", "mtp.feedback": "QWEN_WIDE_SKINNY_ROWS",
+        "gdn.projections.fp8": "FP8_PROJECTION_SKINNY_ROWS", "attention.projections.fp8": "FP8_PROJECTION_SKINNY_ROWS",
+    }
+    actual_registry = dict(re.findall(r'ProjectionThreshold \{ name: "([^"]+)", skinny_rows: (\w+) \}', engine))
+    assert actual_registry == expected_registry
+    for buckets in ("PLAIN_BUCKETS", "SPEC_BUCKETS"):
+        assert f"check_bucket_thresholds({buckets}, DECODE_PROJECTION_THRESHOLDS)?" in engine
+    assert "const PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];" in engine
+    assert "const SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];" in engine
 
 
 def test_head72_uses_the_b12x_le128_tile():
