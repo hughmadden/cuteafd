@@ -546,6 +546,13 @@ if [[ $family == glm5_flash ]]; then
     [[ "$headroom" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "GLM5_FLASH_HEADROOM_GIB must be a non-negative size in GiB" >&2; exit 2; }
     family_args+=(--headroom-gib "$headroom")
   fi
+  # GLM5_FLASH_GRAPH_BUDGET_MIB: device memory the captured decode graphs may hold (the least
+  # recently launched leave past it); unset: unbounded, with the planner's allowance reserved.
+  graph_budget="$(get GLM5_FLASH_GRAPH_BUDGET_MIB)"
+  if [[ -n "$graph_budget" ]]; then
+    [[ "$graph_budget" =~ ^[1-9][0-9]*$ ]] || { echo "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number of MiB" >&2; exit 2; }
+    family_args+=(--graph-budget-mib "$graph_budget")
+  fi
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;

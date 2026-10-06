@@ -35,6 +35,8 @@ pub struct LayoutOptions {
     pub prefill_rows: u64,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+    /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance.
+    pub graph_budget_bytes: Option<u64>,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -72,6 +74,7 @@ impl Default for LayoutOptions {
             head_split: true,
             prefill_rows: 0,
             prefill_lanes: 0,
+            graph_budget_bytes: None,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
@@ -476,7 +479,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
-        device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], allowance_basis));
+        match options.graph_budget_bytes.filter(|_| family == "glm5_flash") {
+            Some(budget) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget, Basis::Formula)),
+            None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role],
+                allowance_basis)),
+        }
         let workspace = match glmf_steps {
             Some(steps) if index == 0 => steps,
             // The allowance covers the default lanes' rows in flight; more rows in flight take more.
