@@ -262,23 +262,23 @@ pub(crate) struct RecordGuard {
 }
 
 impl RecordGuard {
-    fn new(records: ReplayRecords) -> Self {
+    pub(crate) fn new(records: ReplayRecords) -> Self {
         Self { shared: records == ReplayRecords::Shared, ..Self::default() }
     }
 
     /// The prefill lanes (and their scratch) are in use.
-    fn prefilled(&self) {
+    pub(crate) fn prefilled(&self) {
         self.prefills.set(self.prefills.get() + 1);
     }
 
     /// A speculative verify recorded its rows.
-    fn recorded(&self) {
+    pub(crate) fn recorded(&self) {
         self.recorded_at.set(Some(self.prefills.get()));
     }
 
     /// Whether a commit may read the records: always with records of their own; with shared ones,
     /// only when no prefill has run since the last speculative verify.
-    fn check_commit(&self) -> Result<()> {
+    pub(crate) fn check_commit(&self) -> Result<()> {
         ensure!(!self.shared || self.recorded_at.get() == Some(self.prefills.get()),
             "a prefill ran between a speculative verify and its commit, over the replay records the commit \
             reads (--replay-records shared): commit every verify before the next prefill");

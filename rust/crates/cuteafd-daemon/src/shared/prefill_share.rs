@@ -27,6 +27,16 @@ use std::time::Instant;
 /// chunk per round.
 pub(crate) const ROUND_S: f64 = 1.0;
 
+/// Seconds on the clock a [`PrefillQueue`] times its rounds by: the wall clock when serving, a
+/// virtual one in a serve loop's simulation.
+pub(crate) type Clock = fn() -> f64;
+
+/// Seconds since this process first read it (monotonic).
+fn wall() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub(crate) struct DecodeShareArgs {
     /// Share of the time running requests keep while prompts prefill: after
@@ -65,11 +75,18 @@ pub(crate) struct PrefillQueue<P> {
     owed: f64,
     last_round: f64,
     round_s: f64,
+    now: Clock,
 }
 
 impl<P> PrefillQueue<P> {
     pub fn new(share: f64) -> Self {
-        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S }
+        Self::with_clock(share, wall)
+    }
+
+    /// [`Self::new`] timing its rounds by `now` (seconds): a serve loop's simulation advances a
+    /// virtual clock as its chunks and steps take their modeled time.
+    pub(crate) fn with_clock(share: f64, now: Clock) -> Self {
+        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S, now }
     }
 
     pub fn len(&self) -> usize {
@@ -97,12 +114,12 @@ impl<P> PrefillQueue<P> {
     /// Returns the prompts that finished (`Ok`) or failed (`Err`); call
     /// [`Self::settle`] once the finished ones joined the running requests.
     pub fn round(&mut self, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
-        let started = Instant::now();
+        let started = (self.now)();
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
         while let Some(mut prompt) = self.waiting.pop_front() {
-            if !whole && (!ran.is_empty() || !out.is_empty()) && started.elapsed().as_secs_f64() >= self.round_s {
+            if !whole && (!ran.is_empty() || !out.is_empty()) && (self.now)() - started >= self.round_s {
                 self.waiting.push_front(prompt);
                 break;
             }
@@ -117,7 +134,7 @@ impl<P> PrefillQueue<P> {
             }
         }
         self.waiting.extend(ran);
-        self.last_round = started.elapsed().as_secs_f64();
+        self.last_round = (self.now)() - started;
         out
     }
 
@@ -128,13 +145,13 @@ impl<P> PrefillQueue<P> {
     /// A pair consumes one elapsed-time budget, with one chunk per member.
     pub fn round_pairs(&mut self, eligible: impl Fn(&P, &P) -> bool,
         mut chunk: impl FnMut(&mut [P]) -> [Result<Chunk>; 2]) -> Vec<(P, Result<()>)> {
-        let started = Instant::now();
+        let started = (self.now)();
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
         let mut steps = 0;
         while !self.waiting.is_empty() {
-            if !whole && steps > 0 && started.elapsed().as_secs_f64() >= self.round_s { break; }
+            if !whole && steps > 0 && (self.now)() - started >= self.round_s { break; }
             let mut batch = vec![self.waiting.pop_front().expect("nonempty prefill queue")];
             if self.waiting.front().is_some_and(|next| eligible(&batch[0], next)) {
                 batch.push(self.waiting.pop_front().expect("eligible adjacent prompt"));
@@ -155,7 +172,7 @@ impl<P> PrefillQueue<P> {
             steps += 1;
         }
         self.waiting.extend(ran);
-        self.last_round = started.elapsed().as_secs_f64();
+        self.last_round = (self.now)() - started;
         out
     }
 
@@ -166,13 +183,13 @@ impl<P> PrefillQueue<P> {
     /// one chunk per member; with share 0 unfinished members go back to the front.
     pub fn round_groups(&mut self, most: usize, eligible: impl Fn(&[P], &P) -> bool,
         mut chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
-        let started = Instant::now();
+        let started = (self.now)();
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
         let mut steps = 0;
         while !self.waiting.is_empty() {
-            if !whole && steps > 0 && started.elapsed().as_secs_f64() >= self.round_s { break; }
+            if !whole && steps > 0 && (self.now)() - started >= self.round_s { break; }
             let mut group = vec![self.waiting.pop_front().expect("nonempty prefill queue")];
             while group.len() < most && self.waiting.front().is_some_and(|next| eligible(&group, next)) {
                 group.push(self.waiting.pop_front().expect("eligible adjacent prompt"));
@@ -191,7 +208,7 @@ impl<P> PrefillQueue<P> {
             steps += 1;
         }
         self.waiting.extend(ran);
-        self.last_round = started.elapsed().as_secs_f64();
+        self.last_round = (self.now)() - started;
         out
     }
 

@@ -1370,3 +1370,350 @@ mod ring_tests {
         assert_eq!(misses, 1);
     }
 }
+
+/// `schedule`'s interleave of prefill and decode, simulated on a virtual clock with the serving
+/// code's own policy objects: the `PrefillQueue` of `--decode-share` (its rounds of one chunk per
+/// prompt, `round_groups` with `--prefill-batch`, and the decode time a round leaves owed) and the
+/// `RecordGuard` of `--replay-records shared`. Each pass of the loop admits the prompts that have
+/// arrived, runs a prefill round when one is due and settles it, then, while anything decodes,
+/// runs one decode step in `schedule`'s order: the verify records its replay rows, the step's
+/// tokens stream, the commit reads the records, and the step's seconds go to `stepped`. Chunk cuts
+/// come from `plan_points`, packing from `packing::fits`; only the seconds a chunk or a step takes
+/// are modeled, from the measured runs each scenario names.
+#[cfg(test)]
+mod interleave_tests {
+    use super::super::engine::{RecordGuard, ReplayRecords};
+    use super::super::packing::{fits, Limits};
+    use crate::shared::prefill_share::{Chunk, PrefillQueue};
+    use cuteafd_engine::prefix::{plan_points, PointPolicy};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The simulation's clock (seconds); every test thread runs its own.
+        static NOW: Cell<f64> = const { Cell::new(0.0) };
+    }
+
+    fn now() -> f64 {
+        NOW.with(Cell::get)
+    }
+
+    fn advance(seconds: f64) {
+        NOW.with(|now| now.set(now.get() + seconds));
+    }
+
+    /// Rows one prefill call takes on the shipping profile: two lanes of 4,096
+    /// (`GlmfEngine::prefill_capacity`).
+    const CHUNK: usize = 8192;
+
+    /// A packed pass on that profile at a 1,048,576-token context with the drafter
+    /// (`GlmfEngine::packed_limits`): the first lane's 4,096 rows, chunks of at most 511 rows.
+    fn limits() -> Limits {
+        Limits { rows: 4096, chunk_rows: 511, table_pages: 16_384, table_pool_pages: 4096,
+            taps: Some(crate::families::glm5::dflash::TAP_ROWS), dense_context: 2051, max_context: 1 << 20 }
+    }
+
+    /// Seconds of `rows` prefill rows from position `start` in the M3 run (7 October, shipping
+    /// configuration at 1,048,576 tokens): 5,660 tok/s at the start (its 16,189-token calibration
+    /// prompt) falling linearly to 4,360 tok/s at 991,849 tokens, which gives that prompt's measured
+    /// 199.09 s of prefill alone (`prefill tokens=991849 busy_ms=199092`).
+    fn m3_seconds(start: usize, rows: usize) -> f64 {
+        let at = (start + rows / 2) as f64 / 991_849.0;
+        rows as f64 / (5660.0 - 1300.0 * at)
+    }
+
+    /// Seconds of prefill rows at the 79K bench prompt's rate (5,278 tok/s on the 2 x 4,096 profile).
+    fn bench_seconds(_start: usize, rows: usize) -> f64 {
+        rows as f64 / 5278.0
+    }
+
+    /// A decode step of one stream in the M3 run: its count request took 53 steps in 1.674 s.
+    const C1_STEP_S: f64 = 1.674 / 53.0;
+    /// A decode step of four streams (inferred: C4 code's 189.1 tok/s at C1's 3.4 tokens a step).
+    const C4_STEP_S: f64 = 4.0 * 3.4 / 189.1;
+
+    /// A prompt in the prefill queue: its chunk ends (as `schedule` plans them with the prefix cache
+    /// off), the chunks prefilled, and the seconds its own pass takes over rows from a position.
+    struct Prompt {
+        id: usize,
+        arrives: f64,
+        ends: Vec<usize>,
+        done: usize,
+        seconds: fn(usize, usize) -> f64,
+    }
+
+    impl Prompt {
+        fn new(id: usize, arrives: f64, tokens: usize, seconds: fn(usize, usize) -> f64) -> Self {
+            let ends = plan_points(0, tokens, CHUNK, &[], 0, 0, PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
+                .chunks;
+            Self { id, arrives, ends, done: 0, seconds }
+        }
+
+        /// Its next chunk: (first position, rows).
+        fn next(&self) -> (usize, usize) {
+            let start = if self.done == 0 { 0 } else { self.ends[self.done - 1] };
+            (start, self.ends[self.done] - start)
+        }
+    }
+
+    /// One prefill pass on the virtual clock.
+    struct Pass {
+        ids: Vec<usize>,
+        rows: Vec<usize>,
+        start: f64,
+        end: f64,
+    }
+
+    /// What a simulated run did.
+    #[derive(Default)]
+    struct Trace {
+        passes: Vec<Pass>,
+        /// Each decode step's start and end (its tokens stream at its end).
+        steps: Vec<(f64, f64)>,
+        /// Commits the guard let through, and commits it refused.
+        commits: usize,
+        refused: usize,
+        /// Each prompt's admission (the loop pass after it arrived) and its prefill's end (its first
+        /// token).
+        admitted: Vec<(usize, f64)>,
+        firsts: Vec<(usize, f64)>,
+    }
+
+    impl Trace {
+        fn admitted(&self, id: usize) -> f64 {
+            self.admitted.iter().find(|&&(p, _)| p == id).expect("the prompt was admitted").1
+        }
+
+        fn first(&self, id: usize) -> f64 {
+            self.firsts.iter().find(|&&(p, _)| p == id).expect("the prompt was prefilled").1
+        }
+
+        /// Between `from` and `to`: the streams' longest silence (they receive each step's tokens at
+        /// its end), their steps, and the seconds those steps took.
+        fn window(&self, from: f64, to: f64) -> (f64, usize, f64) {
+            let inside: Vec<&(f64, f64)> = self.steps.iter().filter(|&&(_, end)| end > from && end <= to).collect();
+            let mut points = vec![from];
+            points.extend(inside.iter().map(|&&(_, end)| end));
+            points.push(to);
+            let gap = points.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+            (gap, inside.len(), inside.iter().map(|&&(start, end)| end - start.max(from)).sum())
+        }
+
+        /// Decode steps between each two consecutive prefill passes.
+        fn steps_between_passes(&self) -> Vec<usize> {
+            self.passes.windows(2).map(|w| self.steps.iter()
+                .filter(|&&(start, end)| start >= w[0].end && end <= w[1].start).count()).collect()
+        }
+    }
+
+    struct Run {
+        share: f64,
+        /// `--prefill-batch`: `round_groups` over packable prompts, else `round`.
+        batch: bool,
+        /// Sequences decoding throughout, one step serving them all.
+        streams: usize,
+        step_s: f64,
+        prompts: Vec<Prompt>,
+        /// The order the loop must never take: a prefill round between a verify and its commit.
+        misordered: bool,
+    }
+
+    /// One prefill pass over the next chunk of each prompt of `group` (one prompt, or a packed
+    /// group): it takes the prefill lanes, which the guard counts. A packed pass takes 58% of its
+    /// prompts' own passes (four prompts of 176 rows: 232 ms packed, 398 ms one by one).
+    fn pass(guard: &RecordGuard, group: &mut [Prompt], trace: &mut Trace) -> Vec<anyhow::Result<Chunk>> {
+        guard.prefilled();
+        let own: f64 = group.iter().map(|p| {
+            let (start, rows) = p.next();
+            (p.seconds)(start, rows)
+        }).sum();
+        let start = now();
+        advance(if group.len() > 1 { 0.58 * own } else { own });
+        trace.passes.push(Pass { ids: group.iter().map(|p| p.id).collect(),
+            rows: group.iter().map(|p| p.next().1).collect(), start, end: now() });
+        group.iter_mut().map(|p| {
+            p.done += 1;
+            Ok(if p.done == p.ends.len() { Chunk::Done } else { Chunk::More })
+        }).collect()
+    }
+
+    /// A prefill round as `schedule` runs it: `round_groups` (at most the 64 verify rows' prompts
+    /// a group, each next prompt joining while every chunk fits one packed pass) or `round`.
+    fn round(queue: &mut PrefillQueue<Prompt>, batch: bool, guard: &RecordGuard, trace: &mut Trace) {
+        let finished = if batch {
+            queue.round_groups(64, |group, next| fits(&group.iter().chain([next]).map(Prompt::next).collect::<Vec<_>>(),
+                &limits()), |group| pass(guard, group, trace))
+        } else {
+            queue.round(|p| pass(guard, std::slice::from_mut(p), trace).remove(0))
+        };
+        for (p, result) in finished {
+            result.expect("a simulated chunk");
+            trace.firsts.push((p.id, now()));
+        }
+    }
+
+    /// `schedule`'s loop on the virtual clock, until every prompt is prefilled.
+    fn simulate(run: Run) -> Trace {
+        NOW.with(|now| now.set(0.0));
+        let guard = RecordGuard::new(ReplayRecords::Shared);
+        let mut queue = PrefillQueue::with_clock(run.share, now);
+        let mut arriving = run.prompts.into_iter().peekable();
+        let mut trace = Trace::default();
+        let decoding = run.streams > 0;
+        loop {
+            // Admission: the prompts that have arrived join the queue.
+            while let Some(p) = arriving.next_if(|p| p.arrives <= now()) {
+                trace.admitted.push((p.id, now()));
+                queue.push(p);
+            }
+            if queue.due(decoding) {
+                round(&mut queue, run.batch, &guard, &mut trace);
+                queue.settle(decoding);
+            }
+            if queue.is_empty() && arriving.peek().is_none() {
+                return trace;
+            }
+            if !decoding {
+                // Nothing decodes: the loop waits for the next prompt.
+                if queue.is_empty() {
+                    let next = arriving.peek().map_or(now(), |p| p.arrives);
+                    NOW.with(|now| now.set(next));
+                }
+                continue;
+            }
+            // The decode step: the verify records its replay rows, the step's tokens stream, the
+            // commit reads the records.
+            let start = now();
+            guard.recorded();
+            advance(run.step_s);
+            if run.misordered && !queue.is_empty() {
+                round(&mut queue, run.batch, &guard, &mut trace);
+            }
+            match guard.check_commit() {
+                Ok(()) => trace.commits += 1,
+                Err(_) => trace.refused += 1,
+            }
+            trace.steps.push((start, now()));
+            queue.stepped(now() - start);
+        }
+    }
+
+    /// Seconds a prompt's chunks take alone, and their rows.
+    fn alone(tokens: usize, seconds: fn(usize, usize) -> f64) -> (f64, Vec<usize>) {
+        let p = Prompt::new(0, 0.0, tokens, seconds);
+        let rows: Vec<usize> = std::iter::once(0).chain(p.ends.iter().copied()).collect::<Vec<_>>()
+            .windows(2).map(|w| w[1] - w[0]).collect();
+        let mut start = 0;
+        (rows.iter().map(|&n| {
+            let s = seconds(start, n);
+            start += n;
+            s
+        }).sum(), rows)
+    }
+
+    #[test]
+    fn a_stream_keeps_stepping_through_a_one_million_token_prefill() {
+        // M3's stream phase: one stream, then a 991,849-token cold prompt 20 s later.
+        let (busy, rows) = alone(991_849, m3_seconds);
+        assert!((busy - 199.092).abs() < 0.05, "{busy}");
+        assert_eq!((rows.len(), rows[0], *rows.last().unwrap()), (122, 8192, 617));
+        for batch in [true, false] {
+            let trace = simulate(Run { share: 0.2, batch, streams: 1, step_s: C1_STEP_S,
+                prompts: vec![Prompt::new(0, 20.0, 991_849, m3_seconds)], misordered: false });
+            let (from, first) = (trace.admitted(0), trace.first(0));
+            let (gap, steps, decode) = trace.window(from, first);
+            let slowest = trace.passes.iter().map(|p| p.end - p.start).fold(0.0, f64::max);
+            // One chunk a round, the plan's cuts (the math of a prompt's own passes), and a step
+            // between every two chunks.
+            assert!(trace.passes.iter().all(|p| p.ids == [0]));
+            assert_eq!(trace.passes.iter().map(|p| p.rows[0]).collect::<Vec<_>>(), rows);
+            assert!(trace.steps_between_passes().iter().all(|&n| n >= 1), "{:?}", trace.steps_between_passes());
+            // The stream's longest silence is one chunk (the slowest, 1.88 s) and a step.
+            assert!(gap <= slowest + C1_STEP_S + 1e-9 && slowest < 1.9, "{gap} {slowest}");
+            // It keeps the share of the time, at least, and the prompt takes 1 / (1 - share) as long.
+            let window = first - from;
+            let share = decode / window;
+            assert!((0.2..0.21).contains(&share), "{share}");
+            assert!((1.25..1.27).contains(&(window / busy)), "{}", window / busy);
+            // Every commit read records no prefill had touched.
+            assert_eq!((trace.refused, trace.commits), (0, trace.steps.len()));
+            println!("M3 stream (batch {batch}): {} chunks in {window:.1} s ({busy:.1} s alone), {steps} steps, \
+                stream tokens {:.1}/s against {:.1}/s alone, longest silence {gap:.3} s", rows.len(),
+                steps as f64 * (181.0 / 53.0) / window, (181.0 / 53.0) / C1_STEP_S);
+        }
+    }
+
+    #[test]
+    fn four_streams_keep_stepping_through_a_79k_prefill() {
+        let (busy, rows) = alone(79_000, bench_seconds);
+        assert_eq!(rows.len(), 10);
+        let trace = simulate(Run { share: 0.2, batch: true, streams: 4, step_s: C4_STEP_S,
+            prompts: vec![Prompt::new(0, 10.0, 79_000, bench_seconds)], misordered: false });
+        let (from, first) = (trace.admitted(0), trace.first(0));
+        let (gap, steps, decode) = trace.window(from, first);
+        assert!(trace.steps_between_passes().iter().all(|&n| n >= 1));
+        // Every stream's longest silence: one 8,192-row chunk (1.55 s) and a step.
+        assert!(gap <= 8192.0 / 5278.0 + C4_STEP_S + 1e-9, "{gap}");
+        let window = first - from;
+        assert!((0.2..0.23).contains(&(decode / window)), "{}", decode / window);
+        assert_eq!(trace.refused, 0);
+        println!("79K beside C4: {} chunks in {window:.1} s ({busy:.1} s alone), {steps} steps, each stream {:.1} \
+            tokens/s against {:.1}/s alone, longest silence {gap:.3} s", rows.len(), steps as f64 * 3.4 / window,
+            3.4 / C4_STEP_S);
+    }
+
+    #[test]
+    fn share_zero_prefills_the_whole_prompt_before_the_next_step() {
+        // --decode-share 0 (the old rule): the streams wait out the whole 79K prompt.
+        let (busy, _) = alone(79_000, bench_seconds);
+        let trace = simulate(Run { share: 0.0, batch: true, streams: 4, step_s: C4_STEP_S,
+            prompts: vec![Prompt::new(0, 10.0, 79_000, bench_seconds)], misordered: false });
+        let (from, first) = (trace.admitted(0), trace.first(0));
+        let (gap, steps, _) = trace.window(from, first);
+        assert_eq!(steps, 0);
+        assert!(trace.steps_between_passes().iter().all(|&n| n == 0));
+        assert!((gap - busy).abs() < 1e-6, "{gap} {busy}");
+        println!("79K beside C4 at share 0: no step for {gap:.2} s");
+    }
+
+    #[test]
+    fn packed_admission_keeps_the_interleave_and_the_long_prompt_alone() {
+        // Six short prompts arrive 30 s into a 262,144-token prefill beside one stream.
+        let mut prompts = vec![Prompt::new(0, 5.0, 262_144, m3_seconds)];
+        for (i, tokens) in [300, 120, 450, 64, 200, 511].into_iter().enumerate() {
+            prompts.push(Prompt::new(i + 1, 30.0, tokens, m3_seconds));
+        }
+        let trace = simulate(Run { share: 0.2, batch: true, streams: 1, step_s: C1_STEP_S, prompts,
+            misordered: false });
+        // The long prompt runs alone (its chunks are past a packed pass's 511 rows); the burst packs
+        // into passes of up to 4,096 rows.
+        assert!(trace.passes.iter().filter(|p| p.ids.contains(&0)).all(|p| p.ids == [0]));
+        let packed: Vec<&Pass> = trace.passes.iter().filter(|p| p.ids.len() > 1).collect();
+        assert!(!packed.is_empty() && packed.iter().all(|p| p.rows.iter().sum::<usize>() <= 4096));
+        assert_eq!(trace.passes.iter().map(|p| p.ids.iter().filter(|&&id| id > 0).count()).sum::<usize>(), 6);
+        // A first token goes out once its round returns (`schedule` emits after `round_groups`). The
+        // burst joins the queue behind the long prompt, so it waits for the decode owed, a round of
+        // the long prompt's chunk, the decode that round owes, then its own packed pass and the long
+        // prompt's next chunk in the same round: up to two long chunks and their owed decode.
+        let slowest = trace.passes.iter().filter(|p| p.ids == [0]).map(|p| p.end - p.start).fold(0.0, f64::max);
+        let packed_s: f64 = packed.iter().map(|p| p.end - p.start).sum();
+        for id in 1..=6 {
+            let wait = trace.first(id) - trace.admitted(id);
+            assert!(wait < 2.0 * (1.25 * slowest + C1_STEP_S) + packed_s, "prompt {id} waited {wait}");
+        }
+        assert!(trace.steps_between_passes().iter().zip(trace.passes.windows(2))
+            .all(|(&n, w)| n >= 1 || w[0].end == w[1].start), "rounds keep a step between them");
+        assert_eq!(trace.refused, 0);
+        let waits: Vec<f64> = (1..=6).map(|id| ((trace.first(id) - trace.admitted(id)) * 1e3).round() / 1e3).collect();
+        println!("packed burst during a 262,144-token prefill: {} packed passes of {packed_s:.3} s, long chunks up \
+            to {slowest:.3} s, first tokens {waits:?} s after admission", packed.len());
+    }
+
+    #[test]
+    fn a_prefill_between_a_verify_and_its_commit_is_refused() {
+        // The order the loop must not take, to show the guard watches this simulation: a round
+        // between a verify and its commit fails that commit.
+        let trace = simulate(Run { share: 0.2, batch: true, streams: 1, step_s: C1_STEP_S,
+            prompts: vec![Prompt::new(0, 1.0, 40_000, bench_seconds)], misordered: true });
+        assert!(trace.refused > 0 && trace.commits > 0, "{} refused, {} committed", trace.refused, trace.commits);
+    }
+}
