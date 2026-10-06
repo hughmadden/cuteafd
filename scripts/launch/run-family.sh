@@ -325,9 +325,10 @@ if [[ $family == qwen4 ]]; then
 fi
 # POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4): the largest pool the GPUs hold after the
 # planner's remaining costs (up to 2M tokens).
-# GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
-# 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
-glm_default=""; [[ $family != glm5 ]] || glm_default=auto
+# GLM 5.3 and Qwen default to auto; Qwen's former 32768-token pool admitted
+# only seven 4096-output requests, below the default eight serving lanes.
+# DeepSeek V4 keeps its engine default.
+glm_default=""; [[ ! $family =~ ^(glm5|qwen4)$ ]] || glm_default=auto
 if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
   pool="$(get POOL_TOKENS "$glm_default")"
   if [[ "$pool" == auto ]]; then
@@ -613,7 +614,7 @@ encoder_port=$((port + 1))
 if [[ "$family" =~ ^(mimo_v2|qwen4)$ && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
-  plan_pool="$(get POOL_TOKENS 32768)"; [[ "$plan_pool" != auto ]] || plan_pool=0
+  plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-95.5}"
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \

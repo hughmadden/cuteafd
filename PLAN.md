@@ -796,6 +796,16 @@ Work, in priority order:
    the identical-prompt evidence as a separate workload, not a diverse-load
    performance gate. The shared Rust `cuteafd-bench` concurrency panel already
    uses a unique nonce per request and alternating code/summary prompts.
+   **Qwen TP4 admission:** published WP-7 C16 figures used the former
+   32,768-token default KV pool and were admission-limited to seven active
+   requests, not by EXL3 slots. The retained 104/105-token prompts plus a
+   4096-token output budget and 64-row verify slack reserve seventeen
+   256-token units per request; only seven fit in 128 units. Qwen's launcher
+   now selects `POOL_TOKENS=auto` (explicit fixed pools still override), using
+   existing free-memory admission after resident weights with workspace,
+   state, prefix, graph and headroom reserves. A fresh identical-config A/B
+   uses 73,728 tokens in both arms so all sixteen requests fit; its runtime
+   and readiness results remain required before startup-graph promotion.
    **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
    + 4 Sparks, correctness only; Qwen has no coordinator head split and the
    second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image

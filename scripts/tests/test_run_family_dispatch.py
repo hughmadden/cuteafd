@@ -603,7 +603,18 @@ def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
     default = _family_launch_lines(tmp_path / "b", config, "Qwen/Qwen3.8-Flash-Next", "")
     launch = [l for l in default.splitlines() if "cuteafd serve-qwen4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
-    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens 0" in launch[0]
+
+
+@pytest.mark.parametrize("setting, expected", [("", "0"), ("auto", "0"), ("73728", "73728")])
+def test_qwen_pool_defaults_to_free_memory_admission(tmp_path: Path, setting: str, expected: str) -> None:
+    config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+                                                         "layer_types": ["linear_attention", "full_attention"]}}
+    result = _family_launch_result(tmp_path, config, "Qwen/Qwen3.8-Flash-Next",
+                                  "POOL_TOKENS=" + setting + "\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--pool-tokens " + expected in launch
 
 
 def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
