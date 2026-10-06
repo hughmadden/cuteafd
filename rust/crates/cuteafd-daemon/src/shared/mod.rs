@@ -2,6 +2,7 @@
 
 pub(crate) mod console;
 pub(crate) mod constraints;
+pub(crate) mod decode_graph;
 pub(crate) mod draft_policy;
 pub(crate) mod experts;
 pub(crate) mod fp8_linear;
