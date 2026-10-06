@@ -78,8 +78,8 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             validate_window(window)
     from shape_invariant import qualify
     diagnostic_stop = getattr(a, "diagnostic_stop_after", None)
-    proof = None if diagnostic_stop is not None else qualify(
-        a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
+    proof = None if diagnostic_stop is not None else qualify(a, manifest,
+        lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
     if PREFIX + "norm.weight" in dense:
