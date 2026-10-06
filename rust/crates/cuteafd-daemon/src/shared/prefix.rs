@@ -229,11 +229,11 @@ mod tests {
             .unwrap();
         assert_eq!(cli.prefix.host_cache_bytes, HostBudget::Auto);
         let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
         let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
     }
