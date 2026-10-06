@@ -38,6 +38,8 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-05 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · build v1.0.0 · [report](glm5_flash/2026-10-05-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark-rtx5090-checkpoint-precision-c8/report.svg)
+- 2026-10-05 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · build v1.0.0 · [report](glm5_flash/2026-10-05-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark-rtx5090-defaults-c16/report.svg)
 - 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc2 · [report](glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/report.svg)
 - 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max/report.svg)
 - 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build v1.0.0-rc1 · [report](glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg)
