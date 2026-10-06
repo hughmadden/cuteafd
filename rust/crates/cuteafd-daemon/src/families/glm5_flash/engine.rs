@@ -1081,6 +1081,43 @@ struct GraphKey {
     pool_stride: usize,
 }
 
+impl GraphKey {
+    /// Segment `segment` of a decode step of `rows` rows over `tables`. The pool top-k's width and
+    /// table stride reach a launch only when the step is long (`index_topk` runs only then), so a
+    /// short step's key leaves them out: steps whose segments launch the same programs with the same
+    /// scalars share their graphs.
+    fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
+        let (pool_width, pool_stride) = if tables.long { (tables.pool_width, tables.pool_stride) } else { (0, 0) };
+        Self { segment, rows, spec: tables.spec, long: tables.long, pool_width, page_stride: tables.page_stride,
+            pool_stride }
+    }
+}
+
+/// The narrowest decode page-table stride, in MLA pages (4,096 tokens), and pool-page table stride:
+/// sequences up to that size share one table shape (and so their decode graphs); a wider table
+/// row only costs its upload (64 rows x 64 x 4 B).
+const MIN_PAGE_STRIDE: usize = 64;
+const MIN_POOL_STRIDE: usize = MIN_PAGE_STRIDE / UNIT_PAGES;
+
+/// A decode step's (page-table, pool-table) strides for sequences of at most `pages` and
+/// `pool_pages` pages: powers of two from a floor (they bound the graphs a growing batch
+/// captures), at most the pool's pages and a table row's columns (a sequence holds at most
+/// `max_context` tokens' pages).
+fn decode_strides(pages: usize, pool_pages: usize, pool: (usize, usize), table: (usize, usize)) -> (usize, usize) {
+    (pages.max(1).next_power_of_two().max(MIN_PAGE_STRIDE).min(pool.0).min(table.0),
+        pool_pages.max(1).next_power_of_two().max(MIN_POOL_STRIDE).min(pool.1).min(table.1))
+}
+
+/// What the decode graph caches did and hold.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraphCounts {
+    pub stats: GraphStats,
+    /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
+    pub held: usize,
+    pub shapes: usize,
+    pub bytes: u64,
+}
+
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
 
 impl Drop for GraphExec<'_> {
@@ -1941,12 +1978,10 @@ impl<'a> GlmfEngine<'a> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
             "decode step of {rows} rows (--decode-rows {})", self.decode_rows);
-        // Power-of-two strides and widths bound the graphs a growing batch captures.
-        // A sequence holds at most `max_context` tokens' pages: the tables' columns bound the strides.
-        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pages).min(self.table_pages);
-        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pool_pages).min(self.table_pool_pages);
+        let (page_stride, pool_stride) = decode_strides(
+            sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
+            sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1),
+            (self.pages, self.pool_pages), (self.table_pages, self.table_pool_pages));
         let mut tables = StepTables { decode: true, page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
             if placement.len == 0 {
@@ -2181,8 +2216,7 @@ impl<'a> GlmfEngine<'a> {
     /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
     /// streams), its attention half and FFN half.
     fn peer_segment(&self, index: usize, w1: &Workspace<'_>, t: usize, tables: &StepTables) -> Result<()> {
-        let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-            pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+        let key = GraphKey::new(index, t, tables);
         let cap = decode_cap(t);
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
@@ -2348,8 +2382,7 @@ impl<'a> GlmfEngine<'a> {
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-                pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey::new(index, t, tables);
             self.replay(key, || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
@@ -2470,9 +2503,10 @@ impl<'a> GlmfEngine<'a> {
         self.replay_on(0, key, segment)
     }
 
-    /// [`Self::replay`] on rank `rank`'s stream (its own graphs). A capture measures its
-    /// executable's device bytes (free memory before the capture and after its instantiation);
-    /// executables evicted past the graph budget retire until the next decode step.
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs). Until the cache first evicts, a
+    /// capture measures the device bytes it took (free memory before the capture and after its
+    /// instantiation), which calibrates the size the cache charges every executable (see
+    /// `graphs.rs`); executables evicted past the graph budget retire until the next decode step.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
@@ -2481,8 +2515,9 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) });
         }
+        let calibrating = graphs.borrow().calibrating();
         let free = || self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free));
-        let before = free()?;
+        let before = if calibrating { Some(free()?) } else { None };
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
@@ -2491,17 +2526,24 @@ impl<'a> GlmfEngine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = GraphExec(exec?, self.library);
-        let bytes = before.saturating_sub(free()?) as u64;
+        let measured = match before {
+            Some(before) => Some(before.saturating_sub(free()?) as u64),
+            None => None,
+        };
         // SAFETY: the new graph reads and writes persistent engine buffers.
         self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;
         let (recaptured, evicted, held, stats) = {
             let mut graphs = graphs.borrow_mut();
             let recaptured = graphs.seen(&key);
-            let evicted = graphs.insert(key, exec, bytes);
+            let evicted = graphs.insert(key, exec, measured);
             (recaptured, evicted, graphs.bytes(), graphs.stats())
         };
         if recaptured {
-            tracing::debug!(rank, ?key, bytes, recaptures = stats.recaptures, "decode graph recaptured");
+            tracing::debug!(rank, ?key, recaptures = stats.recaptures, "decode graph recaptured");
+        }
+        if calibrating && !graphs.borrow().calibrating() {
+            tracing::info!(rank, executables = stats.captures, each_bytes = graphs.borrow().each(),
+                budget = ?graphs.borrow().budget(), "decode graph size calibrated at the first eviction");
         }
         if !evicted.is_empty() {
             tracing::info!(rank, evicted = evicted.len(), held = graphs.borrow().len(), held_bytes = held,
@@ -2544,14 +2586,19 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Decode graph captures, recaptures and evictions, and the measured bytes held (every rank).
-    pub(crate) fn graph_stats(&self) -> (GraphStats, u64) {
-        (0..self.ranks()).fold((GraphStats::default(), 0), |(total, bytes), rank| {
+    /// Decode graph captures, recaptures and evictions, and what the caches hold (every rank).
+    pub(crate) fn graph_stats(&self) -> GraphCounts {
+        (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
             let graphs = self.graphs_of(rank).borrow();
             let stats = graphs.stats();
-            (GraphStats { captures: total.captures + stats.captures, recaptures: total.recaptures + stats.recaptures,
-                evictions: total.evictions + stats.evictions, evicted_bytes: total.evicted_bytes + stats.evicted_bytes },
-                bytes + graphs.bytes())
+            GraphCounts {
+                stats: GraphStats { captures: total.stats.captures + stats.captures,
+                    recaptures: total.stats.recaptures + stats.recaptures,
+                    evictions: total.stats.evictions + stats.evictions },
+                held: total.held + graphs.len(),
+                shapes: total.shapes + graphs.count(|key| key.segment == 0),
+                bytes: total.bytes + graphs.bytes(),
+            }
         })
     }
 
@@ -3465,5 +3512,43 @@ mod prefill_lane_tests {
         assert_eq!(prefill_lane_capacity(DEFAULT_PREFILL_LANES, 4096), 8192);
         assert_eq!(prefill_lane_plan(511, 2, 4096).unwrap(), (1, 511));
         assert_eq!(prefill_lane_plan(512, 2, 4096).unwrap(), (2, 256));
+    }
+}
+
+#[cfg(test)]
+mod graph_key_tests {
+    use super::{decode_strides, GraphKey, StepTables, MIN_PAGE_STRIDE, MIN_POOL_STRIDE};
+
+    fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
+        StepTables { decode: true, long, pool_width, page_stride, pool_stride, spec: true, ..Default::default() }
+    }
+
+    #[test]
+    fn short_steps_share_graphs_whatever_their_pool_top_k_shape() {
+        // The pool top-k (the only reader of the width and the pool table stride) runs only when a
+        // row sees past the dense context.
+        let key = |t: &StepTables| GraphKey::new(3, 40, t);
+        assert_eq!(key(&tables(false, 1, 64, 16)), key(&tables(false, 4, 64, 32)));
+        assert_eq!(key(&tables(false, 8, 64, 16)).pool_width, 0);
+        assert_ne!(key(&tables(true, 1, 64, 16)), key(&tables(true, 4, 64, 16)));
+        assert_ne!(key(&tables(true, 4, 64, 16)), key(&tables(true, 4, 64, 32)));
+        // The page table stride reaches every step (the index expansion reads it).
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(false, 1, 128, 16)));
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(true, 1, 64, 16)));
+        assert_ne!(GraphKey::new(3, 40, &tables(false, 1, 64, 16)), GraphKey::new(4, 40, &tables(false, 1, 64, 16)));
+    }
+
+    #[test]
+    fn decode_strides_are_powers_of_two_from_a_floor_within_the_pool_and_the_table() {
+        let (pool, table) = ((1 << 20, 1 << 18), (2048, 512));
+        assert_eq!(decode_strides(5, 2, pool, table), (MIN_PAGE_STRIDE, MIN_POOL_STRIDE));
+        assert_eq!(decode_strides(64, 16, pool, table), (64, 16));
+        assert_eq!(decode_strides(65, 17, pool, table), (128, 32));
+        assert_eq!(decode_strides(132, 33, pool, table), (256, 64));
+        // A row holds one sequence of the context: 131,072 tokens are 2,048 pages, 512 pool pages.
+        assert_eq!(decode_strides(4000, 1000, pool, table), (2048, 512));
+        // A tiny pool caps the strides below the floor.
+        assert_eq!(decode_strides(5, 2, (32, 8), table), (32, 8));
+        assert_eq!(MIN_POOL_STRIDE * super::UNIT_PAGES, MIN_PAGE_STRIDE);
     }
 }

@@ -1017,11 +1017,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let [steps_seen, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
-            let (graphs, graph_bytes) = engine.graph_stats();
+            let graphs = engine.graph_stats();
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
-                graph_captures = graphs.captures, graph_recaptures = graphs.recaptures, graph_bytes,
+                graph_captures = graphs.stats.captures, graph_recaptures = graphs.stats.recaptures,
+                graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
                 "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {
