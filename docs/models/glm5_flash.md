@@ -48,11 +48,12 @@ Attention (KDA), a minority run MLA + DSA.
   two-GPU head split when both coordinator GPUs are available;
   `RTX_GPUS=1` or `COORDINATOR_SPLIT=off` serves from one GPU.
 - Spark EXL3 worker host path: a call's routes are written straight into
-  pinned staging and uploaded with one batched asynchronous copy, and the
-  worker polls its stream instead of a blocking synchronize (which woke about
-  8 us after the GPU finished). `GLM5_FLASH_EXL3_WORKER_PATH=blocking`
-  (`CUTEAFD_EXL3_WORKER_PATH=blocking`) restores the two synchronous copies and
-  the blocking synchronize, for A/B; the GPU work and its bits are the same.
+  pinned staging and uploaded with one batched asynchronous copy, the wire
+  decode reads the hidden rows in the mapped request frame (no device copy),
+  and the worker polls its stream instead of a blocking synchronize (which woke
+  about 8 us after the GPU finished). `GLM5_FLASH_EXL3_WORKER_PATH=blocking`
+  (`CUTEAFD_EXL3_WORKER_PATH=blocking`) restores the copies and the blocking
+  synchronize, for A/B; the kernels, their inputs and their bits are the same.
 - Route capture for kernel benchmarks: `GLM5_FLASH_EXL3_ROUTE_DUMP=DIR` (an
   absolute directory on every Spark; `CUTEAFD_EXL3_ROUTE_DUMP=DIR/routes`)
   appends each call's layer, rows, expert ids and gate weights to

@@ -20,10 +20,13 @@ use std::{io::Write, path::Path, rc::Rc};
 enum HostPath {
     /// `async` (default): the routes are written straight into pinned
     /// staging and uploaded with one batched asynchronous copy, so the host
-    /// goes on to launch while the copy runs; the worker thread then polls the
-    /// stream, which returns within a query of the top-k sum's completion.
+    /// goes on to launch while the copy runs; the wire decode reads the
+    /// hidden rows in the mapped request frame instead of a copy of them; the
+    /// worker thread then polls the stream, which returns within a query of
+    /// the top-k sum's completion.
     Async,
-    /// `blocking`: two synchronous copies, then a blocking stream synchronize.
+    /// `blocking`: the hidden rows copied on the stream, two synchronous route
+    /// copies, then a blocking stream synchronize.
     Blocking,
 }
 
@@ -375,15 +378,24 @@ impl<'a> Exl3Worker<'a> {
             "native exchange requires little-endian storage"
         );
         // Every previous response completed this stream before returning. The
-        // hidden rows come as a device copy from the mapped request frame when
-        // the transport exposes one (it outlives this request's stream sync
-        // below), else as a host upload.
+        // hidden rows come from the mapped request frame when the transport
+        // exposes one (it outlives this request's stream wait below), else as
+        // a host upload. On the asynchronous path, an execution whose own
+        // decode pass is the rows' only reader reads them in the frame (when
+        // aligned for it); otherwise they are first copied on the stream.
         let hidden_bytes = request.hidden().len();
         ensure!(hidden_bytes <= self.inputs[0].buffer.bytes, "EXL3 request hidden rows exceed the input buffer");
+        let required = self.row_policy.required_capacity(request.rows() as usize);
+        let decodes = self.executions.iter().find(|e| e.capacity() >= required)
+            .context("missing preloaded EXL3 worker capacity")?.decodes_wire_rows();
+        let device = self.inputs[0].buffer.device_id;
+        let mut hidden = self.inputs[0].buffer;
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+            Some(view) if self.host_path == HostPath::Async && decodes && view.ptr as usize % 16 == 0
+                && view.device_id == device => hidden = CuteafdDeviceBuffer { bytes: hidden_bytes, ..view },
             // SAFETY: the view is device-visible request storage of at least
             // `hidden_bytes`, retained by the transport until this request's
-            // response is emitted, which follows the stream synchronize below.
+            // response is emitted, which follows the stream wait below.
             Some(view) => unsafe {
                 self.library.copy_d2d_async(self.inputs[0].buffer,
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?
@@ -422,13 +434,13 @@ impl<'a> Exl3Worker<'a> {
         if let Some([start, _]) = &self.timing {
             unsafe { self.library.cuda_event_record(start.raw, self.stream.raw)?; }
         }
-        let inputs = std::array::from_fn(|i| self.inputs[i].buffer);
+        let inputs = [hidden, self.inputs[1].buffer, self.inputs[2].buffer];
         // Modules and storage are resolved before accepting requests. This
         // bounded selection performs no allocation, loading or compilation.
         let execution = self
             .executions
             .iter_mut()
-            .find(|e| e.capacity() >= self.row_policy.required_capacity(request.rows() as usize))
+            .find(|e| e.capacity() >= required)
             .context("missing preloaded EXL3 worker capacity")?;
         let output = unsafe {
             if self.ownership_words > 0 {
