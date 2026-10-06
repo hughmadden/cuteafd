@@ -61,6 +61,12 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = engine::DEFAULT_PREFILL_LANES,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_LANES as u64))]
     pub prefill_lanes: usize,
+    /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
+    /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
+    /// the pool (one GPU, Spark experts): the pool takes the rest, less the graph reserve and the
+    /// cache state. The planner's default; 1 suits a 32 GB card.
+    #[arg(long, default_value_t = 2.0)]
+    pub headroom_gib: f64,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -263,6 +269,16 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn measured_admission_keeps_the_planners_headroom_and_graph_allowance() {
+        let defaults = parse(&[]);
+        assert_eq!(defaults.headroom_bytes().unwrap(),
+            cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
+        assert_eq!(parse(&["--headroom-gib", "1"]).headroom_bytes().unwrap(), 1 << 30);
+        assert!(parse(&["--headroom-gib=-1"]).headroom_bytes().is_err());
+        assert_eq!(graph_reserve(&defaults), 1_610_612_736);
+    }
+
+    #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
         assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
@@ -426,6 +442,26 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     Ok(())
 }
 
+impl EngineArgs {
+    /// `--headroom-gib` in bytes.
+    pub(crate) fn headroom_bytes(&self) -> Result<u64> {
+        ensure!(self.headroom_gib.is_finite() && self.headroom_gib >= 0.0, "--headroom-gib must be a size in GiB");
+        Ok((self.headroom_gib * (1u64 << 30) as f64) as u64)
+    }
+}
+
+/// The step settings these arguments give the engine (its step plan's inputs besides layers and experts).
+fn step_settings(args: &EngineArgs) -> engine::StepSettings {
+    engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+        kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
+        max_context: args.max_context }
+}
+
+/// What a measured admission keeps free for decode graph executables: the planner's allowance.
+fn graph_reserve(_args: &EngineArgs) -> u64 {
+    cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0]
+}
+
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
@@ -492,6 +528,15 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
+        self.with_engine_admitting(args, &|_| 0, body)
+    }
+
+    /// [`Self::with_engine`], where the caller allocates `after_pool(cache geometry)` more device
+    /// bytes after the engine exists (the prefix cache's mark arena): a measured admission keeps
+    /// them free.
+    pub fn with_engine_admitting<T>(&self, args: &EngineArgs,
+        after_pool: &dyn Fn(&cuteafd_loader::serving_capacity::RankCacheGeometry) -> u64,
+        body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
@@ -579,7 +624,7 @@ impl Opened {
         // With a ceiling, establish local expert ownership before KV spends
         // the remaining budget. Lazy EXL3 owners reserve their loader peak.
         let mut future_expert_bytes = 0;
-        let admitted_experts = if budgeted {
+        let mut admitted_experts = if budgeted {
             ensure!(args.expert_window.is_none(),
                 "coordinator GPU budget admission requires resident experts, not diagnostic --expert-window paging");
             let experts = self.experts(args)?;
@@ -594,42 +639,60 @@ impl Opened {
             }
             Some(experts)
         } else { None };
-        // 0: automatic; budgeted fixed pools retain their requested size and
-        // refuse before allocation if the future storage would not fit.
+        let moe = (0..layers).any(|l| !self.cfg.dense[l]);
+        // Startup decode graphs (`CUTEAFD_GLMF_STARTUP_GRAPHS`, the default): every graph a serving
+        // loop launches is captured before readiness, so the pool leaves their reserve free (per rank).
         let startup_graphs = engine::startup_graphs_enabled();
-        let graph_extra = if startup_graphs {
+        let startup_reserve = if startup_graphs {
             let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, true));
             // An automatic pool can only shrink this geometry, never exceed the 2M cap.
             let pool = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
                 else { args.pool_tokens };
-            let reserve = engine::serving_graph_reserve(args.max_context, pool, self.cfg.dense_context(),
-                sequences, speculation, layers, peer_stream.is_some());
-            let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0];
-            let extra = reserve.into_iter().max().unwrap_or(0).saturating_sub(allowance);
-            tracing::info!(allowance_bytes = allowance, extra_reserve_bytes = extra,
-                "GLM Flash graph reserve above planner allowance");
-            extra
-        } else { 0 };
-        let pool_bound = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
-            else { args.pool_tokens };
-        let spark = args.peers.is_some();
-        let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
-        // The step workspaces the engine will allocate: page tables over the pool's bound, and
-        // routed-expert rows as `experts` will make them (FP8 experts local, or Spark staging).
-        let pages = pool_bound.div_ceil(engine::PAGE_ROWS).max(1).next_multiple_of(engine::UNIT_PAGES);
-        let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-            engine::WorkspaceOptions { fp32_partials: args.kda_fp32_partials, output_shard: args.kda_output_shard,
-                expanded: args.kda_prefill_expanded, full_logits: args.full_prefill_logits },
-            pages, pages / engine::UNIT_PAGES)
-            .with_experts(!args.skip_experts && self.fp8().is_some(), spark);
-        let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
-            args.draft.is_some())?;
-        let workspace_allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").workspace_bytes[0]
-            * args.prefill_rows.max(1) as u64 / 4096;
-        let workspace_extra = workspace_reserve.saturating_sub(workspace_allowance);
-        tracing::info!(lanes, workspace_reserve_bytes = workspace_reserve, planner_allowance_bytes = workspace_allowance,
-            extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
-        let pool_tokens = if args.pool_tokens == 0 || budgeted || startup_graphs || args.serving_graph_policy.is_some() {
+            Some(engine::serving_graph_reserve(args.max_context, pool, self.cfg.dense_context(),
+                sequences, speculation, layers, peer_stream.is_some()))
+        } else { None };
+        // Eager admission (an automatic or budgeted pool on one GPU, its experts on Sparks or
+        // admitted under the budget): the drafter, the Spark transports and intake, the dense
+        // package, the token selector and every step workspace exist before the pool is sized, so
+        // the pool takes the free memory they leave, less the headroom, the graph reserve and the
+        // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`).
+        let eager = (args.pool_tokens == 0 || budgeted) && peer_stream.is_none() && (!args.local_experts || budgeted);
+        let mut early = None;
+        let pool_tokens = if eager {
+            let experts = if moe {
+                match admitted_experts.take() { Some(experts) => experts, None => self.experts(args)? }
+            } else { None };
+            let drafter = self.load_drafter(args, stream, &embedding)?;
+            if let Some(drafter) = &drafter {
+                drafter.prepare_workspace()?;
+            }
+            let dense = self.load_dense(args, &model.layers)?;
+            let mut selector = crate::shared::token_io::TokenSelector::new(&self.library, args.token_io.token_select,
+                self.cfg.vocab_size, engine::DECODE_ROWS)?;
+            selector.reserve_sampler()?;
+            let lanes = if engine::prefill_pipelines(layers, self.cfg.layers, experts.as_ref(), args.prefill_lanes) {
+                args.prefill_lanes
+            } else { 1 };
+            let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
+                &model.layers, experts.as_ref(), step_settings(args)), args.prefill_rows, lanes)?;
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(&self.cfg, layers)?;
+            let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
+            let unit = geometry.logical_unit_rows.max(1);
+            let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
+                + rank.speculative_replay_bytes;
+            // Graphs: the startup set's reserve, else the planner's allowance.
+            let graphs = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied())
+                .unwrap_or_else(|| graph_reserve(args));
+            let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
+                graphs, later: state + after_pool(rank) + future_expert_bytes };
+            let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
+                (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
+            early = Some((experts, drafter, dense, selector, workspaces));
+            tokens
+        } else if args.pool_tokens == 0 || budgeted || startup_graphs || args.serving_graph_policy.is_some() {
+            // 0: automatic; budgeted fixed pools retain their requested size and
+            // refuse before allocation if the future storage would not fit.
             let precise_split = args.kda_fp32_partials || args.kda_output_shard;
             let devices: Vec<i32> = if precise_split {
                 vec![args.device, args.split_device.context("precise head split")?]
@@ -643,6 +706,26 @@ impl Opened {
                 engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 })
             };
+            // The step workspaces this engine makes before readiness (`workspace_reserve`: the decode
+            // workspace, the prefill lanes over their shared temporaries, and the measured runtime
+            // allowance per workspace), past the planner's workspace allowance.
+            let spark = args.peers.is_some();
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
+                step_settings(args)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
+            let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
+            let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
+                args.draft.is_some())?;
+            let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
+            let workspace_allowance = costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096;
+            let workspace_extra = workspace_reserve.saturating_sub(workspace_allowance);
+            tracing::info!(lanes, workspace_reserve_bytes = workspace_reserve, planner_allowance_bytes = workspace_allowance,
+                extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
+            let graph_extra = startup_reserve.as_ref().map_or(0, |reserve| reserve.iter().copied().max().unwrap_or(0)
+                .saturating_sub(costs.graph_bytes[0]));
+            if startup_graphs {
+                tracing::info!(allowance_bytes = costs.graph_bytes[0], extra_reserve_bytes = graph_extra,
+                    "GLM Flash graph reserve above planner allowance");
+            }
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra + workspace_extra)?
@@ -666,26 +749,28 @@ impl Opened {
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
-        if let Some(snapshot) = &args.draft {
-            let started = Instant::now();
-            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
-                ::from_fp8_option(args.draft_fp8);
-            let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
-                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                &engine.embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation,
-                args.fp8_scales)?;
-            let name = drafter.name();
-            engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "{name} drafter resident");
-        }
-        if engine.weights.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
-            let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
-            engine.set_dense_nvfp4(engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?);
-            tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
-        }
-        if (0..layers).any(|l| !self.cfg.dense[l]) {
-            if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args)? } {
-                engine.set_experts(experts);
+        match early {
+            Some((experts, drafter, dense, selector, workspaces)) => {
+                engine.drafter = drafter;
+                if let Some(dense) = dense {
+                    engine.set_dense_nvfp4(dense);
+                }
+                if let Some(experts) = experts {
+                    engine.set_experts(experts);
+                }
+                engine.install_workspaces(workspaces)?;
+                engine.set_selector(selector);
+            }
+            None => {
+                engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
+                if let Some(dense) = self.load_dense(args, &engine.weights.layers)? {
+                    engine.set_dense_nvfp4(dense);
+                }
+                if moe {
+                    if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args)? } {
+                        engine.set_experts(experts);
+                    }
+                }
             }
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
@@ -705,6 +790,32 @@ impl Opened {
                 || unsafe { self.library.cuda_stream_destroy(peer_stream) })?;
         }
         result
+    }
+
+    /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
+    fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>) -> Result<Option<dspark::Drafter<'s>>> {
+        let Some(snapshot) = &args.draft else { return Ok(None) };
+        let started = Instant::now();
+        let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+            ::from_fp8_option(args.draft_fp8);
+        let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
+            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "{} drafter resident", drafter.name());
+        Ok(Some(drafter))
+    }
+
+    /// The one-expert NVFP4 package of ModelOpt NVFP4 dense MLPs, when `layers` have them.
+    fn load_dense<'s>(&'s self, args: &EngineArgs, layers: &[weights::GlmfLayer<'_>])
+        -> Result<Option<engine::DenseNvfp4<'s>>> {
+        if !layers.iter().any(|layer| layer.has("nvfp4_w1")) {
+            return Ok(None);
+        }
+        let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
+        let dense = engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?;
+        tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
+        Ok(Some(dense))
     }
 
     fn experts<'s>(&'s self, args: &EngineArgs) -> Result<Option<engine::Experts<'s>>> {

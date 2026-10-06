@@ -40,14 +40,14 @@ use crate::families::glm5::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding, TokenSelector};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_temporary_bytes,
-    GlmfScratchOptions, GlmfStepShape};
+use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+    glmf_temporary_bytes, GlmfScratchOptions, GlmfStepShape};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
@@ -113,6 +113,21 @@ fn prefill_lane_plan(tokens: usize, lanes: usize, rows: usize) -> Result<(usize,
     Ok((tokens.div_ceil(per_lane), per_lane))
 }
 const HC: usize = 4;
+
+/// CUTEAFD_GLMF_PREFILL_LANES: (lanes on: unset or not `1`, lanes with a `--layers` subset: `subset`).
+fn lane_setting() -> (bool, bool) {
+    let setting = std::env::var("CUTEAFD_GLMF_PREFILL_LANES");
+    (setting.as_ref().map_or(true, |v| v != "1"), setting.as_ref().is_ok_and(|v| v == "subset"))
+}
+
+/// Whether an engine over `layers` of `total` with `experts` prefills in `lanes` Spark lanes (as
+/// [`GlmfEngine::prefill_capacity`] finds once it exists): lanes on, every layer resident (or a
+/// subset with `subset`) and a Spark transport per lane.
+pub(crate) fn prefill_pipelines(layers: usize, total: usize, experts: Option<&Experts<'_>>, lanes: usize) -> bool {
+    let (on, subset) = lane_setting();
+    on && (layers == total || subset)
+        && matches!(experts, Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= lanes)
+}
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident
 /// unless an explicit diagnostic paging window was requested.
@@ -470,31 +485,40 @@ pub(crate) struct StepPlan<'p, 'a> {
     shape: GlmfStepShape,
 }
 
+/// The engine settings a step plan depends on besides its layers and experts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StepSettings {
+    pub kda_fp32_partials: bool,
+    pub kda_output_shard: bool,
+    pub kda_prefill_expanded: bool,
+    pub full_prefill_logits: bool,
+    /// Sizes the page tables (`glmf_table_pages`).
+    pub max_context: usize,
+}
+
 impl<'p, 'a> StepPlan<'p, 'a> {
-    /// The plan of an engine over `layers` with `experts`, `options` and page tables of `pages` MLA
-    /// pages and `pool_pages` pool pages (rank 0's shape).
-    #[allow(clippy::too_many_arguments)]
+    /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], experts: Option<&Experts<'_>>, options: WorkspaceOptions, pages: usize,
-        pool_pages: usize) -> Self {
+        layers: &[GlmfLayer<'_>], experts: Option<&Experts<'_>>, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
+        let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         Self {
             library,
             programs,
             cfg,
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
-                kda_fp32_partials: options.fp32_partials, kda_output_shard: options.output_shard,
-                kda_prefill_expanded: options.expanded },
+                kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
+                kda_prefill_expanded: settings.kda_prefill_expanded },
             shape: GlmfStepShape {
                 lead: true,
                 split,
                 local_experts: matches!(experts, Some(Experts::Local(_))),
                 spark: matches!(experts, Some(Experts::Spark { .. })),
-                partial_bytes: if options.fp32_partials { 4 } else { 2 },
-                output_shard: options.output_shard,
-                full_prefill_logits: options.full_logits,
-                table_pages: pages as u64,
-                table_pool_pages: pool_pages as u64,
+                partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
+                output_shard: settings.kda_output_shard,
+                full_prefill_logits: settings.full_prefill_logits,
+                table_pages,
+                table_pool_pages,
             },
         }
     }
@@ -519,6 +543,31 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             prefill_scratch).device_bytes())
     }
 
+    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape) {
+        (self.scratch, self.shape)
+    }
+}
+
+/// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
+/// every prefill lane, so the KV pool is sized from the memory they leave.
+pub(crate) struct StepWorkspaces<'a> {
+    key: (GlmfScratchOptions, GlmfStepShape),
+    rows: usize,
+    decode: Workspace<'a>,
+    lanes: Vec<Workspace<'a>>,
+}
+
+impl<'a> StepWorkspaces<'a> {
+    /// The decode workspace and `lanes` prefill lanes of `rows` rows of `plan`, on the current device.
+    pub(crate) fn allocate(plan: &StepPlan<'_, 'a>, rows: usize, lanes: usize) -> Result<Self> {
+        let decode = plan.lane(0, DECODE_ROWS, true, Rc::new(plan.temporaries(0, DECODE_ROWS, true)?))?;
+        let temps = Rc::new(plan.temporaries(0, rows, false)?);
+        let lanes = (0..lanes).map(|_| plan.lane(0, rows, false, temps.clone())).collect::<Result<_>>()?;
+        Ok(Self { key: plan.key(), rows, decode, lanes })
+    }
+}
+
+impl<'a> StepPlan<'_, 'a> {
     fn shape(&self, rank: usize) -> GlmfStepShape {
         if rank == 0 { self.shape } else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..self.shape } }
     }
@@ -753,6 +802,10 @@ pub(crate) struct GlmfEngine<'a> {
     pool_logical_host: RefCell<Vec<i32>>,
     /// Pool-cache pages: one per allocation unit (`pages / UNIT_PAGES`).
     pub pool_pages: usize,
+    /// Columns of a step row's MLA page table and pool-page table (`glmf_table_pages`): one
+    /// sequence of `max_context` tokens, so the tables are sized before the pool.
+    table_pages: usize,
+    table_pool_pages: usize,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Prefill lanes of `prefill_rows` rows over one set of temporaries (pipelined Spark prefill;
     /// a serial prefill runs in the first).
@@ -790,6 +843,8 @@ pub(crate) struct GlmfEngine<'a> {
     pub kda_prefill_expanded: bool,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
+    /// The serving loop's token selector when start-up made it before the KV pool.
+    selector: RefCell<Option<TokenSelector<'a>>>,
 }
 
 /// Which prefill projections run W8A8 block-FP8 GEMMs (E4M3 activations per
@@ -845,14 +900,6 @@ const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
 // adds 71,942,144 B beyond tracked buffers; drafter adds 68,269,888 B. This
 // measured/calibrated allowance is not exact cuBLAS allocator ownership.
 const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct WorkspaceOptions {
-    pub fp32_partials: bool,
-    pub output_shard: bool,
-    pub expanded: bool,
-    pub full_logits: bool,
-}
 
 /// The device bytes a GPU's step workspaces take before the KV pool, for an admission that sizes
 /// the pool before they exist: the decode workspace and `lanes` prefill lanes of `prefill_rows` rows
@@ -1032,27 +1079,25 @@ impl<'a> GlmfEngine<'a> {
         let kda_heads = cfg.kda_heads / if weights.layers.first().is_some_and(|l| l.split) { 2 } else { 1 };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads)?;
         let device = library.cuda_get_device()?;
+        let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
+        let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots,
-            kda_ordinal, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, decode_workspace: RefCell::new(None),
+            kda_ordinal, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
+            table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
-            lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
-            subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
+            lanes: lane_setting().0,
+            subset_lanes: lane_setting().1,
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
-            kda_prefill_expanded: false, l2: None, embedding })
-    }
-
-    fn workspace_options(&self) -> WorkspaceOptions {
-        WorkspaceOptions { fp32_partials: self.kda_fp32_partials, output_shard: self.kda_output_shard,
-            expanded: self.kda_prefill_expanded, full_logits: self.full_prefill_logits }
+            kda_prefill_expanded: false, l2: None, embedding, selector: RefCell::new(None) })
     }
 
     /// Own every ordinary text/media workspace before readiness: both ranks' decode workspaces and
@@ -1531,7 +1576,30 @@ impl<'a> GlmfEngine<'a> {
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
-            self.workspace_options(), self.pages, self.pool_pages)
+            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+                kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
+                max_context: self.max_context })
+    }
+
+    /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
+    /// what its step plan holds.
+    pub(crate) fn install_workspaces(&self, workspaces: StepWorkspaces<'a>) -> Result<()> {
+        ensure!(self.peer.is_none() && workspaces.key == self.step_plan().key() && workspaces.rows == self.prefill_rows,
+            "step workspaces allocated for another plan");
+        ensure!(self.decode_workspace.borrow().is_none() && self.lane_workspaces.borrow().is_empty(),
+            "step workspaces already allocated");
+        *self.decode_workspace.borrow_mut() = Some(workspaces.decode);
+        *self.lane_workspaces.borrow_mut() = workspaces.lanes;
+        Ok(())
+    }
+
+    /// The token selector made at start-up (eager admission), for the serving loop to take.
+    pub(crate) fn set_selector(&self, selector: TokenSelector<'a>) {
+        *self.selector.borrow_mut() = Some(selector);
+    }
+
+    pub(crate) fn take_selector(&self) -> Option<TokenSelector<'a>> {
+        self.selector.borrow_mut().take()
     }
 
     /// Rank `rank`'s decode workspace (its own temporaries), allocated on that rank's GPU on first use.
@@ -1737,8 +1805,8 @@ impl<'a> GlmfEngine<'a> {
         if start == 0 {
             self.start(placement)?;
         }
-        let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
-            ..Default::default() };
+        let mut tables = StepTables { page_table: self.columns(&placement.pages, self.table_pages),
+            pool_table: self.columns(&placement.pool_pages, self.table_pool_pages), ..Default::default() };
         self.rows(placement, start..start + t, 0, &mut tables)?;
         let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced, None, media)?;
         placement.len += t;
@@ -1789,8 +1857,8 @@ impl<'a> GlmfEngine<'a> {
         let mut steps = Vec::new();
         let mut first = 0;
         for n in cuts {
-            let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
-                ..Default::default() };
+            let mut tables = StepTables { page_table: self.columns(&placement.pages, self.table_pages),
+                pool_table: self.columns(&placement.pool_pages, self.table_pool_pages), ..Default::default() };
             self.rows(placement, start + first..start + first + n, 0, &mut tables)?;
             steps.push((tables, &tokens[first..first + n]));
             first += n;
@@ -1882,10 +1950,11 @@ impl<'a> GlmfEngine<'a> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
+        // A sequence holds at most `max_context` tokens' pages: the tables' columns bound the strides.
         let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pages);
+            .min(self.pages).min(self.table_pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pool_pages);
+            .min(self.pool_pages).min(self.table_pool_pages);
         let mut tables = StepTables { decode: true, real_rows: rows, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
             page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
@@ -1926,6 +1995,12 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         Ok(logits)
+    }
+
+    /// A sequence's pages as one table row of `columns` columns: positions past `max_context`
+    /// are never stepped, so pages past the table's columns are never read.
+    fn columns(&self, pages: &[i32], columns: usize) -> Vec<i32> {
+        pages[..pages.len().min(columns)].to_vec()
     }
 
     /// Writes a step's tables into `w` (on the current device).

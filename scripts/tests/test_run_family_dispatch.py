@@ -383,12 +383,13 @@ def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys,
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", [], ["--prefill-lanes", "--prefill-lane-rows"]),
+    ("", [], ["--prefill-lanes", "--prefill-lane-rows", "--headroom-gib"]),
     ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
      ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
     ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-lanes"]),
 ])
-def test_glmf_prefill_lanes_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -407,8 +408,10 @@ def test_glmf_prefill_lanes_are_forwarded_only_when_set(tmp_path, keys, expected
     ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
     ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
     ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
+    ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
 ])
-def test_glmf_invalid_prefill_lanes_fail_before_workers_launch(tmp_path, key, value, message):
+def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}

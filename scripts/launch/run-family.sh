@@ -603,6 +603,13 @@ if [[ $family == glm5_flash ]]; then
     fi
     family_args+=(--prefill-lane-rows "$lane_rows")
   fi
+  # GLM5_FLASH_HEADROOM_GIB: GPU memory an automatic pool leaves free for runtime growth when
+  # every other allocation precedes it (unset: the engine's 2 GiB; a 32 GB card takes 1).
+  headroom="$(get GLM5_FLASH_HEADROOM_GIB)"
+  if [[ -n "$headroom" ]]; then
+    [[ "$headroom" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "GLM5_FLASH_HEADROOM_GIB must be a non-negative size in GiB" >&2; exit 2; }
+    family_args+=(--headroom-gib "$headroom")
+  fi
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
