@@ -20,6 +20,8 @@ pub const GLMF_DECODE_ROWS: u64 = 64;
 pub const GLMF_SPARSE_TOPK: u64 = 2112;
 /// The vocabulary head's cuBLAS workspace (`cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE`).
 pub const GLMF_HEAD_WORKSPACE: u64 = 4 << 20;
+/// Prefill lanes by default (the engine's `--prefill-lanes`).
+pub const GLMF_DEFAULT_PREFILL_LANES: u64 = 2;
 /// mHC streams per row.
 const HC: u64 = 4;
 /// Tokens per DSA index pool.
@@ -254,6 +256,14 @@ pub fn glmf_temporary_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape:
     }
 }
 
+/// Columns of a step row's MLA page table and pool-page table: the pages of one sequence of
+/// `max_context` tokens (whole 256-token units), rounded up to a power of two as decode strides
+/// are. Known before the pool is sized; positions past `max_context` are never stepped.
+pub fn glmf_table_pages(max_context: u64) -> (u64, u64) {
+    let units = max_context.div_ceil(256).max(1);
+    ((units * 4).next_power_of_two(), units.next_power_of_two())
+}
+
 /// One GPU's step workspaces: a decode workspace, and `lanes` prefill lanes over
 /// one shared set of temporaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -382,6 +392,20 @@ mod tests {
         assert_eq!((four.lane, four.prefill_temporaries), (195_961_900, 1_688_969_216));
         assert_eq!(four.device_bytes(), 2_567_772_336);
         assert_eq!(workspaces(1, 4096).device_bytes(), two.device_bytes() - two.lane);
+    }
+
+    #[test]
+    fn page_tables_hold_one_sequence_of_the_context() {
+        // 131,072 tokens: 512 units, 2,048 MLA pages; 1M tokens: 16,384 pages.
+        assert_eq!(glmf_table_pages(131_072), (2048, 512));
+        assert_eq!(glmf_table_pages(1_048_576), (16_384, 4096));
+        // Decode strides are the next power of two of a sequence's pages.
+        assert_eq!(glmf_table_pages(65_537), (2048, 512));
+        assert_eq!(glmf_table_pages(1), (4, 1));
+        // A decode workspace's tables at 1M tokens: 64 rows of 16,384 + 4,096 columns.
+        let shape = GlmfStepShape { table_pages: 16_384, table_pool_pages: 4096, ..spark_shape() };
+        let lane = glmf_lane_bytes(&glm53_flash(), 64, true, &shape);
+        assert_eq!(lane.page_table + lane.pool_table, 64 * (16_384 + 4096) * 4);
     }
 
     #[test]
