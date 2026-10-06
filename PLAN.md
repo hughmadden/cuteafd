@@ -704,6 +704,9 @@ Policy decisions:
   passes full decode and prefill (top-1 upper bounds 0.000937 / 0.001854;
   KL upper bounds 0.000846 / 0.000305 nat). Quick is inconclusive, not fail;
   independent agentic replay remains required and defaults are unchanged.
+- **Gate provenance:** every gate seal JSON records the exact source commit
+  and a dirty flag, including untracked files, alongside the binary hash.
+  Rebuilt gates use task-private targets; never repin a changed shared binary.
 - **Exact speculation:** attempt byte-exact greedy speculation (drafts
   on/off, C1→C4) per family when it doesn't cost C1. Where it does, keep the
   faster path and accept proven rounding.
