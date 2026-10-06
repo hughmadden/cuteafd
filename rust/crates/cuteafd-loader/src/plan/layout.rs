@@ -187,6 +187,11 @@ pub struct FamilyCosts {
 }
 
 
+/// What GLM 5.3 Flash's wide decode programs (`--decode-rows 128`: the 17 `_m128` programs its
+/// start-up then loads) add to one GPU's untracked bytes at admission: 954,490,432 measured with them
+/// against 946,248,768 without (RTX 5090, the same build, 16 sequences).
+pub const GLMF_WIDE_DECODE_RUNTIME: u64 = 954_490_432 - 946_248_768;
+
 const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
 }
@@ -237,11 +242,11 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split). Without a program manifest,
         // one GPU's step workspaces: decode and two lanes of 4,096 rows over shared temporaries
         // (`serving_capacity::glmf_step_workspaces` of the 5090 export, 2.68 GiB). One GPU's runtime:
-        // untracked bytes when the measured admission sized the pool, every start-up allocation
-        // made (RTX 5090 + 4 Sparks, 16 sequences, the compact profile's programs: 954,371,648 at
-        // 131,072 tokens and 954,490,432 at 1,048,576).
+        // the untracked bytes when the measured admission sized the pool, every start-up allocation
+        // made (RTX 5090 + 4 Sparks, 16 sequences, its programs loaded GLM-only): 946,248,768 with
+        // the 64-row decode programs; the wide decode programs add `GLMF_WIDE_DECODE_RUNTIME`.
         "glm5_flash" => FamilyCosts {
-            runtime_bytes: [gib(89), gib(78), gib(78)],
+            runtime_bytes: [946_248_768, gib(78), gib(78)],
             graph_bytes: [gib(150), gib(150), gib(150)],
             workspace_bytes: [gib(268), gib(472), gib(472)],
             drafter_bytes: gib(324),
@@ -568,7 +573,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let gpus_now = active_gpus;
     for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
-        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
+        let wide_modules = if family == "glm5_flash" && role == 0 && glmf_decode_rows > crate::serving_capacity::GLMF_DECODE_ROWS {
+            GLMF_WIDE_DECODE_RUNTIME
+        } else { 0 };
+        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role] + wide_modules,
             allowance_basis));
         match options.graph_budget_bytes.filter(|_| family == "glm5_flash") {
             Some(budget) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget, Basis::Formula)),

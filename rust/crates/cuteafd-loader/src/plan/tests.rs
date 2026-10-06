@@ -1097,12 +1097,13 @@ fn glmf_compact_profile(layout: &mut layout::LayoutOptions) {
 /// sequences: 1,683,456 tokens at a 131,072-token context and 1,676,288 at 1,048,576),
 /// each fixed cost from the formulas the start-up ledger reproduces: the weights, drafter, step
 /// workspaces with the intake and token selector, and the cache state to the byte, the drafter's FP8
-/// scratch at the larger card's split plan (2 MiB over the 5090's), the runtime within 1.3 MB.
+/// scratch at the larger card's split plan (2 MiB over the 5090's), the runtime as measured at
+/// 1,048,576 (118,784 bytes over the 131,072-token launch's).
 #[test]
 fn glm5_flash_plan_sizes_the_5090_profile_within_one_percent_of_the_measured_pools() {
     use cuteafd_core::memory_layout::Category;
-    for (context, measured, workspace) in [(131_072u64, 1_683_456u64, 2_937_306_624u64),
-        (1_048_576, 1_676_288, 2_981_228_032)] {
+    for (context, measured, planned, workspace) in [(131_072u64, 1_683_456u64, 1_682_944u64, 2_937_306_624u64),
+        (1_048_576, 1_676_288, 1_675_776, 2_981_228_032)] {
         let memory = glmf_5090_layout(context, glmf_compact_profile);
         let gpu = &memory.devices[0];
         let item = |group: &str| gpu.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
@@ -1119,10 +1120,11 @@ fn glm5_flash_plan_sizes_the_5090_profile_within_one_percent_of_the_measured_poo
         assert_eq!(item("state"), 1_222_434_048);
         assert_eq!(item("reserved units"), 1_579_780);
         assert_eq!(item("graph budget"), 512 << 20);
+        assert_eq!(item("context+modules"), 954_490_432, "with the wide decode programs");
         assert_eq!(gpu.capacity_bytes, 33_711_521_792 - (1 << 30));
         let error = memory.pool_tokens.abs_diff(measured) as f64 / measured as f64;
         assert!(error < 0.01, "{context}: planned {} against measured {measured}", memory.pool_tokens);
-        assert_eq!(measured - memory.pool_tokens, 512, "{context}: two units under the measured pool");
+        assert_eq!(memory.pool_tokens, planned, "{context}: two units under the measured pool");
     }
 }
 
@@ -1130,11 +1132,26 @@ fn glm5_flash_plan_sizes_the_5090_profile_within_one_percent_of_the_measured_poo
 /// standard settings (the keys index, FP32 state, an arena of marks, the embedding on the GPU, the
 /// 2 GiB headroom and graph allowance, 64 decode rows) admit a fraction of one 131,072-token request
 /// plus 65,536 tokens for every other sequence on an RTX 5090, and the whole of it on a 96 GB card;
-/// the compact profile admits it on the 5090.
+/// the compact profile admits it on the 5090. The standard plan is the pool the standard launch
+/// admitted on the 5090 (49,408 tokens: every fixed cost its start-up ledger shows, and its untracked
+/// bytes at admission with the 64-row decode programs).
 #[test]
 fn glm5_flash_standard_settings_fall_short_on_a_5090_and_not_on_a_96_gb_card() {
+    use cuteafd_core::memory_layout::Category;
     let need = 131_072 + 15 * 65_536;
     let standard = glmf_5090_layout(131_072, |_| {});
+    assert_eq!(standard.pool_tokens, 49_408);
+    let gpu = &standard.devices[0];
+    let item = |group: &str| gpu.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let categories = gpu.by_category();
+    // The standard launch's ledger: weights, the GPU embedding, the drafter (16 rings, w8a16), the step
+    // workspaces with the intake and the 64-row selector, FP32 state for 16 slots, 34 arena marks.
+    assert_eq!((categories[&Category::Weights], categories[&Category::Embedding]), (14_034_716_416, 1_268_776_960));
+    assert_eq!((item("drafter"), item("drafter workspace")), (2_081_647_104, 174_999_744));
+    assert_eq!(item("drafter fp8 scratch"), 14_156_288 + (1 << 20), "w8a16 scratch at 188 SMs (170: 14,156,288)");
+    assert_eq!(item("steps"), 2_872_700_160 + 268_435_456 + 3_209_216 + 768);
+    assert_eq!((item("state"), item("marks")), (2_683_339_520, 34 * 147_619_840));
+    assert_eq!((item("context+modules"), item("graph allowance")), (946_248_768, 1_610_612_736));
     assert!(standard.pool_tokens < need / 4, "{}", standard.pool_tokens);
     let large = glmf_5090_layout(131_072, |layout| layout.rtx_bytes = vec![95 * (1 << 30) + (512 << 20)]);
     assert!(large.pool_tokens >= need, "{}", large.pool_tokens);
