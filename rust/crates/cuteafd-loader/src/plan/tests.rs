@@ -1429,3 +1429,32 @@ fn layouts_reserve_the_mark_arena_their_servers_allocate() {
     }
     assert!(arena(24, mark) > arena(8, mark));
 }
+
+/// `--prefix-marks pool` for GLM 5.3 Flash: no mark arena, and the units pool marks reserve
+/// (`GLMF_POOL_MARK_RESERVED_UNITS`, never handed out) charged beside the pool, so the pool the
+/// layout admits is the pool requests can use.
+#[test]
+fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
+    use crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS;
+    let mut config = glm5_flash_config(45);
+    config["text_config"]["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+    let unit = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+    let dir = snapshot(config, &[]);
+    let layout = |pool_marks: bool, prefix_slots: Option<u64>| plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![48 << 30], concurrency: 16, pool_tokens: Some(0),
+            glmf_pool_marks: pool_marks, prefix_slots, ..Default::default() }), ..sparks(4) })
+        .unwrap().memory_layout.unwrap();
+    let item = |memory: &cuteafd_core::memory_layout::MemoryLayout, group: &str| memory.devices[0].items.iter()
+        .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let (pool, none) = (layout(true, None), layout(false, Some(0)));
+    assert_eq!((item(&pool, "marks"), item(&pool, "reserved units")), (0, GLMF_POOL_MARK_RESERVED_UNITS * unit));
+    assert_eq!((item(&none, "marks"), item(&none, "reserved units")), (0, 0));
+    // Pool marks ignore an arena request; the reserved unit's bytes come out of the pool.
+    assert_eq!(item(&layout(true, Some(34)), "marks"), 0);
+    assert!(none.pool_tokens - pool.pool_tokens <= 256 && pool.pool_tokens > 0, "{} {}", none.pool_tokens, pool.pool_tokens);
+    assert_eq!(none.devices[0].free_bytes() - pool.devices[0].free_bytes(),
+        (GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - (none.pool_tokens - pool.pool_tokens) as i64 * unit as i64 / 256);
+}

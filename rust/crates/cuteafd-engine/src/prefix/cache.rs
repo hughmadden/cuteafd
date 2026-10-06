@@ -166,9 +166,10 @@ impl<E: CopyEngine> PrefixCache<E> {
     pub fn new(layout: FamilyLayout, config: PrefixConfig, host: Option<(cuteafd_hostcache::config::Config, E)>)
         -> Result<Self, PrefixError> {
         // Before the host tier pins its memory.
-        if let MarkStore::Pool { pages } = layout.mark_store {
-            if layout.mark_bytes == 0 || pages == 0 || pages > layout.pages {
-                return Err(PrefixError::Layout("pool-page marks take at least one page and at most the pool"));
+        if let MarkStore::Pool { pages, reserved } = layout.mark_store {
+            if layout.mark_bytes == 0 || pages == 0 || pages > layout.pages.saturating_sub(reserved) {
+                return Err(PrefixError::Layout("pool-page marks take at least one page and at most the pool's \
+                    unreserved pages"));
             }
         }
         let host = match host {
@@ -183,7 +184,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         Ok(Self {
             retained: Retention::with_rule(config.entries, layout.rule),
             entries: BTreeMap::new(),
-            pool: RefPagePool::new(layout.pages, layout.page_rows),
+            pool: RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
             arena: MarkArena::new(slots, layout.mark_bytes),
             host,
             clock: 0,
@@ -617,7 +618,7 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// segments over consecutive pages coalesce; `None` for arena or mark-less families.
     fn take_mark_pages(&mut self) -> Result<Option<Mark>, PrefixError> {
         match self.layout.mark_store {
-            MarkStore::Pool { pages } if self.layout.mark_bytes > 0 => {
+            MarkStore::Pool { pages, .. } if self.layout.mark_bytes > 0 => {
                 let mut pages = self.pool.alloc(pages)?;
                 pages.sort_unstable();
                 Ok(Some(Mark::Pages(pages)))

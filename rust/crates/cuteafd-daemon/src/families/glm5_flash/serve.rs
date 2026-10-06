@@ -493,10 +493,12 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
+    // The pages requests and snapshots share: the pool, without the units pool marks reserve.
+    let pages = cache.pool().capacity();
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), mark_store = ?layout.mark_store,
-        page_bytes = layout.page_bytes, pages = layout.pages, page_rows = layout.page_rows, host_bytes,
-        points = ?args.points(), "GLM 5.3 Flash prefix cache");
-    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+        page_bytes = layout.page_bytes, pages, reserved_pages = layout.mark_store.reserved(), page_rows = layout.page_rows,
+        host_bytes, points = ?args.points(), "GLM 5.3 Flash prefix cache");
+    cuteafd_bench::context::set_kv((pages * layout.page_rows) as u64, pages as u64,
         &"FP8 MLA latent + KDA state".to_string(), host_bytes);
     Ok((family, cache))
 }

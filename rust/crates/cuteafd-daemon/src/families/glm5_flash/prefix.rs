@@ -24,7 +24,11 @@
 //!   capture or restore is one batch of copies between those runs and the slot regions
 //!   ([`gather_scatter`], `cudaMemcpyBatchAsync` where the runtime has it). Whatever the slot
 //!   regions hold (BF16 state, index tails) and whatever a unit's buffers are (with or without
-//!   token keys), the mark follows them.
+//!   token keys), the mark follows them. Unit 0 is never handed out (to a mark or to rows): the
+//!   decode sparse MLA reads its first record, slot 0, for every masked candidate and weights it
+//!   by zero, so a mark's bytes there (an E4M3 NaN, an arbitrary FP32 scale) would turn every
+//!   decode row with a masked candidate into NaN (0 x NaN = NaN). Reserved, it stays zeroed
+//!   (`GLMF_POOL_MARK_RESERVED_UNITS`, allocated beside the admitted pool).
 //! The capture point must be where the KDA state is: `kda_len` (a speculative verify leaves
 //! the state behind the placement until its kept rows are committed), so `capture_reach` is 0.
 //!
@@ -49,6 +53,9 @@ use std::ffi::c_void;
 
 /// Pool-key page: 64 pools x 128 E4M3, then 64 FP32 scales.
 const POOL_KEY_BYTES: usize = 128;
+/// Leading units pool marks keep out of every allocation (unit 0: the decode sparse MLA's
+/// stand-in record for masked candidates).
+const RESERVED_UNITS: usize = cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS as usize;
 const POOL_SCALES: usize = PAGE_ROWS * POOL_KEY_BYTES;
 const POOL_PAGE_BYTES: usize = PAGE_ROWS * (POOL_KEY_BYTES + 4);
 
@@ -100,8 +107,9 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
                 Ok(part.div_ceil(unit))
             }).try_fold(0, |units, rank| rank.map(|rank| units.max(rank)))?),
         };
-        ensure!(mark_units < engine.pool_pages.max(1), "a pool mark of {mark_units} units does not fit a pool of {}",
-            engine.pool_pages);
+        let reserved = if mark_units > 0 { RESERVED_UNITS } else { 0 };
+        ensure!(mark_units + reserved < engine.pool_pages.max(1), "a pool mark of {mark_units} units and {reserved} \
+            reserved do not fit a pool of {} units", engine.pool_pages);
         let arenas = parts.into_iter().enumerate().map(|(rank, part)| -> Result<_> {
             let arena = if slots > 0 { Some(engine.on(rank, || DeviceAllocation::new(engine.library, slots * part))?) }
                 else { None };
@@ -271,7 +279,8 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
             mark_bytes: self.mark_bytes,
             draft_bytes: 0,
             rule: ReuseRule::EXACT,
-            mark_store: if self.mark_units > 0 { MarkStore::Pool { pages: self.mark_units } } else { MarkStore::Arena },
+            mark_store: if self.mark_units > 0 { MarkStore::Pool { pages: self.mark_units, reserved: RESERVED_UNITS } }
+                else { MarkStore::Arena },
         }
     }
 
@@ -538,7 +547,8 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
 /// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
 /// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
 /// `marks` picks where the two marks live: arena slots, or pool units taken beside the
-/// sequences' own units (so their rows must come through the mark's units untouched too).
+/// sequences' own units (so their rows must come through the mark's units untouched too), with
+/// unit 0 reserved as in serving.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n: usize, chunk: usize, decode: usize,
     cold: bool, repeat: usize, marks: PrefixMarks) -> Result<()> {
@@ -549,7 +559,8 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let embed = &tokens[..n];
     let family = GlmfPrefix::new(engine, marks, |_| 2)?;
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let reserved = family.layout().mark_store.reserved();
+    let mut allocator = Allocator::with_reserved(engine.pages, engine.slots, reserved);
     let err = |e: BoxError| anyhow::anyhow!("{e}");
     // Marks 0 and 1: arena slots, or two marks of pool units.
     let pool_marks = match marks {
@@ -618,7 +629,8 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     let len = a.len;
     let paged_equal = paged_rows(&family, &a, len)? == paged_rows(&family, &b, len)?;
     let state_equal = engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
-    let store = if pool_marks.is_some() { format!("in {} pool units", family.mark_units()) } else { "in an arena slot".into() };
+    let store = if pool_marks.is_some() { format!("in {} pool units, unit 0 reserved", family.mark_units()) }
+        else { "in an arena slot".into() };
     println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): state at {at} {} | layers {} | logits \
         {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | KDA state {} | mark round trip \
         {} ({} B {store}), capture+restore {restore_ms:.1} ms", if state_at { "identical" } else { "DIFFERS" },
@@ -803,6 +815,35 @@ mod tests {
         assert!(consecutive < scattered, "{consecutive} vs {scattered}");
         // One unit holds less than a mark (the family refuses that, never truncates the state).
         assert_eq!(mark_runs(&[unit(1)], part).iter().map(|&(_, n)| n).sum::<usize>(), 140);
+    }
+
+    /// Pool marks keep unit 0 out of every allocation: the decode sparse MLA reads its first record
+    /// (slot 0) for every masked candidate and weights it by zero, so a mark's bytes there would
+    /// make every decode row with a masked candidate NaN. The golden harness's allocator takes its
+    /// marks first, as in the failing `--resume-at` runs, and still never hands out unit 0; the
+    /// marks' runs never start at record slot 0 of any MLA layer.
+    #[test]
+    fn pool_marks_never_take_the_stand_in_unit() {
+        use super::{mark_runs, Span, RESERVED_UNITS};
+        assert_eq!(RESERVED_UNITS, 1);
+        let (pages, slots, mark_units) = (512 * 4, 4, 49);
+        let mut allocator = Allocator::with_reserved(pages, slots, RESERVED_UNITS);
+        let marks = [allocator.take_units(mark_units).unwrap(), allocator.take_units(mark_units).unwrap()];
+        let a = allocator.admit(5008).unwrap();
+        let (b, _) = allocator.fork(&a, 2600, 5008).unwrap();
+        let c = allocator.admit(5000).unwrap();
+        for units in marks.iter().chain([&a.units, &b.units, &c.units]) {
+            assert!(!units.contains(&0), "{units:?}");
+        }
+        assert_eq!(marks[0][0], 1);
+        // Unit u's segments in a fake address space: records of every unit first (264 B each),
+        // then pool keys (8 B each), as two MLA layers' buffers would lie.
+        let unit = |u: u32| -> Vec<Span> { vec![(u as usize * 264, 264), (1 << 20 | u as usize * 8, 8)] };
+        let runs = mark_runs(&marks[0].iter().map(|&u| unit(u)).collect::<Vec<_>>(), 1000);
+        assert!(runs.iter().all(|&(at, _)| at != 0 && at != 1 << 20), "{runs:?}");
+        // Unreserved, the same allocation puts the first mark on unit 0 (the failing runs).
+        let mut unreserved = Allocator::new(pages, slots);
+        assert_eq!(unreserved.take_units(mark_units).unwrap()[0], 0);
     }
 
     #[test]
