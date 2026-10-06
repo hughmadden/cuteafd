@@ -59,11 +59,12 @@ __global__ void qwen_grid(int32_t* hw,int32_t* indices,float* weights,int gh,int
 }
 __global__ void qwen_patch_position(float* x,const float* bias,const uint16_t* table,
   const int32_t* indices,const float* weights,size_t count) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=count)return;
-  int p=i/1152,c=i%1152;
-  float pos=0.f;
-  for(int j=0;j<4;++j)pos+=from_bf16(table[size_t(indices[p*4+j])*1152+c])*weights[p*4+j];
-  x[i]=round_bf16(round_bf16(x[i]+bias[c])+round_bf16(pos));
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x) {
+    int p=i/1152,c=i%1152;
+    float pos=0.f;
+    for(int j=0;j<4;++j)pos+=from_bf16(table[size_t(indices[p*4+j])*1152+c])*weights[p*4+j];
+    x[i]=round_bf16(round_bf16(x[i]+bias[c])+round_bf16(pos));
+  }
 }
 __global__ void qwen_rope(const float* qkv,const float* bias,const int32_t* hw,
   const float* inv,int row0,uint16_t* q,uint16_t* k,uint16_t* v,int rows) {
@@ -84,19 +85,24 @@ __global__ void qwen_rope(const float* qkv,const float* bias,const int32_t* hw,
   }
 }
 __global__ void qwen_residual(float* x,const float* y,const float* bias,size_t count) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<count)x[i]=round_bf16(x[i]+round_bf16(y[i]+bias[i%1152]));
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
+    x[i]=round_bf16(x[i]+round_bf16(y[i]+bias[i%1152]));
 }
 __global__ void qwen_biased_gelu(const float* x,const float* bias,uint16_t* out,size_t count,int width,bool tanh_mode) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=count)return;
-  float a=round_bf16(x[i]+bias[i%width]);
-  float y=tanh_mode ? 0.5f*a*(1.f+tanhf(0.7978845608028654f*(a+0.044715f*a*a*a))) :
-    0.5f*a*(1.f+erff(a*0.7071067811865475f));
-  out[i]=bf16_bits(y);
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x) {
+    float a=round_bf16(x[i]+bias[i%width]);
+    float y=tanh_mode ? 0.5f*a*(1.f+tanhf(0.7978845608028654f*(a+0.044715f*a*a*a))) :
+      0.5f*a*(1.f+erff(a*0.7071067811865475f));
+    out[i]=bf16_bits(y);
+  }
 }
 __global__ void qwen_biased_cast(const float* x,const float* bias,uint16_t* y,size_t count,int width) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<count)y[i]=bf16_bits(x[i]+bias[i%width]);
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=bf16_bits(x[i]+bias[i%width]);
+}
+__global__ void qwen_cast_float(const uint16_t* x,float* y,size_t count) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=from_bf16(x[i]);
 }
 int encode_qwen(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,int gh,int gw,
   uint16_t* output,uint64_t output_bytes,cuteafd_vision_observer cb,void* ctx) {
@@ -142,7 +148,7 @@ int encode_qwen(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
   }
   Q_LAUNCH((layernorm_bf16_kernel<<<n,256,0,stream>>>(o->x,w(s.merger_norm),w(s.merger_norm_bias),o->norm,1152,1e-6f)));
   if(cb) {
-    Q_LAUNCH((cast_float<<<grid_for(long(n)*1152),256,0,stream>>>(o->norm,o->xt,size_t(n)*1152)));
+    Q_LAUNCH((qwen_cast_float<<<grid_for(long(n)*1152),256,0,stream>>>(o->norm,o->xt,size_t(n)*1152)));
     Q_RUN(observe(o,cb,ctx,29,o->xt,n,1152,false));
   }
   for(int u=0;u<units;u+=CHUNK) {

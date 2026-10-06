@@ -45,6 +45,22 @@ def test_qwen_patch_lut_uses_host_f64_rescale_then_f32_normalize():
     np.testing.assert_array_equal(patches[:,:,0],patches[:,:,1])
 
 
+def test_qwen_pointwise_launches_cover_every_element():
+    source = (ROOT / "native/shared/cuda/vision_qwen.cuh").read_text()
+    # Every pointwise kernel using the unchanged capped launcher must grid-stride.
+    assert source.count("i+=size_t(gridDim.x)*blockDim.x") == 5
+    assert "(cast_float<<<grid_for(" not in source
+    for count in (4096*256+1,256*4*1152,4096*4304,4096*2560):
+        stride = min((count+255)//256,4096)*256
+        first_thread = (count-1)%stride
+        visited = range(first_thread,count,stride)
+        assert visited[-1] == count-1
+    test = (ROOT / "native/tests/vision_pointwise_test.cu").read_text()
+    assert "4096*256+1" in test
+    for kernel in ("qwen_patch_position","qwen_residual","qwen_biased_gelu","qwen_biased_cast","qwen_cast_float"):
+        assert kernel in test
+
+
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     # At rectangular sizes a precomputed ratio changes taps by an FP32 ULP.
     positions = np.arange(256,dtype=np.float32)

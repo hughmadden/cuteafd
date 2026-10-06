@@ -566,6 +566,13 @@ if(CUTEAFD_ENABLE_CUDA)
   add_executable(cuteafd_cuda_selftest tests/cuda_selftest.cc)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)
+  add_executable(cuteafd_vision_pointwise_selftest tests/vision_pointwise_test.cu)
+  set_target_properties(cuteafd_vision_pointwise_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_include_directories(cuteafd_vision_pointwise_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
+  add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
+  set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with
