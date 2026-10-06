@@ -424,7 +424,7 @@ def test_glmf_default_launch_passes_no_memory_profile_option(tmp_path):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in ("--index-cache", "--kda-state", "--prefix-marks", "--host-cache-bytes", "--prefill-lanes",
                    "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib", "--decode-rows",
-                   "--replay-records"):
+                   "--replay-records", "--decode-row-buckets"):
         assert option not in launch, (option, launch)
 
 
@@ -505,6 +505,27 @@ def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shar
     ("RTX_GPUS=1\nGLM5_FLASH_REPLAY_RECORDS=host\n", "GLM5_FLASH_REPLAY_RECORDS must be own or shared"),
 ])
 def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,on", [("", False), ("GLM5_FLASH_DECODE_ROW_BUCKETS=off\n", False),
+                                    ("GLM5_FLASH_DECODE_ROW_BUCKETS=on\n", True)])
+def test_glmf_decode_row_buckets_are_forwarded_only_when_on(tmp_path, keys, on):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--decode-row-buckets" in launch) == on, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROW_BUCKETS=yes\n", "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off"),
+])
+def test_glmf_decode_row_buckets_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr

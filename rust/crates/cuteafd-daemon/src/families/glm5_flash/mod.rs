@@ -106,6 +106,13 @@ pub(crate) struct EngineArgs {
     /// Spark experts, where the step workspaces precede the KV pool.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
     pub replay_records: engine::ReplayRecords,
+    /// Run each speculative decode or verify step past 16 rows padded to a row bucket: whole steps
+    /// of 4 rows to 64 and of 8 to 128. The padded rows write a scratch page past the KV pool (one
+    /// 64-row page per MLA layer) and stay out of the expert exchange, and a real row computes the
+    /// same bits padded or not (`glmf-golden --bucket-check`). At 16 sequences the decode graphs
+    /// then hold 13 row shapes up to 64 rows instead of 49. One GPU.
+    #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROW_BUCKETS", default_value_t = false)]
+    pub decode_row_buckets: bool,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -312,6 +319,16 @@ mod draft_cli_tests {
             "glmf_kda_m128", "glmf_kda_commit_m128"]);
         assert_eq!(kept(true, 64), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_head_fp8",
             "glmf2_kda_m64", "glmf2_join_rows"]);
+    }
+
+    /// `--decode-row-buckets` pads one GPU's speculative steps, off by default.
+    #[test]
+    fn decode_row_buckets_are_opt_in_on_one_gpu() {
+        assert!(!parse(&[]).decode_row_buckets);
+        assert!(parse(&["--decode-row-buckets"]).decode_row_buckets);
+        check_options(&parse(&["--decode-row-buckets", "--decode-rows", "128"])).unwrap();
+        let error = check_options(&parse(&["--decode-row-buckets", "--split-device", "1"])).unwrap_err().to_string();
+        assert!(error.contains("--decode-row-buckets"), "{error}");
     }
 
     /// `--replay-records shared` keeps the records in one GPU's prefill scratch.
@@ -546,6 +563,11 @@ pub(crate) struct GoldenArgs {
     /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
+    /// Row-bucket check (with --decode-row-buckets): after --prefill tokens, every speculative
+    /// verify step of 17..=N rows that a bucket pads runs padded and unpadded from the same state;
+    /// the real rows' logits, the committed KDA state and the paged rows must be identical.
+    #[arg(long)]
+    pub bucket_check: Option<usize>,
     /// Isolate one real routed-expert layer with --local-experts: compare a
     /// fixed first row across m1/m16/m80 packages and require that changing
     /// later inputs in the same row geometry cannot change it. No backbone
@@ -613,6 +635,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
         "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(!args.decode_row_buckets || args.split_device.is_none(),
+        "--decode-row-buckets pads one GPU's decode steps: it takes no --split-device");
     ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
         "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
@@ -909,8 +933,17 @@ impl Opened {
                 cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes(&self.cfg, layers, 1,
                     args.decode_rows as u64)?
             } else { 0 };
+            // Row buckets: one scratch page per MLA layer past the pool (records, and token keys with
+            // the keys index cache).
+            let scratch_page = if args.decode_row_buckets {
+                let mla = self.cfg.attention[..layers].iter()
+                    .filter(|&&a| a == cuteafd_loader::families::glm5_flash::GlmNextAttention::Mla).count() as u64;
+                let row = engine::RECORD_BYTES as u64
+                    + if index_cache == engine::IndexCache::Keys { engine::KEY_BYTES as u64 } else { 0 };
+                mla * engine::PAGE_ROWS as u64 * row
+            } else { 0 };
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
-                + rank.speculative_replay_bytes - shared_records;
+                + rank.speculative_replay_bytes - shared_records + scratch_page;
             // The prefix mark arena the caller allocates once the engine exists (none with pool marks).
             let marks = args.planner_mark_slots as u64 * rank.retained_mark_bytes;
             let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
@@ -956,7 +989,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records)?;
+            args.kda_state, args.decode_rows, records, args.decode_row_buckets)?;
         tracing::info!(index_cache = ?engine.index_cache, pool_tokens, decode_rows = engine.decode_rows,
             "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
@@ -1178,6 +1211,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if let Some(start) = args.draft_replay {
         return speculate::draft_replay(args, opened, engine, start);
+    }
+    if let Some(rows) = args.bucket_check {
+        return speculate::bucket_check(args, engine, rows);
     }
     if let Some(rows) = args.replay_check {
         return speculate::replay_check(args, engine, rows);

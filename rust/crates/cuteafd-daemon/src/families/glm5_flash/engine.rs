@@ -441,6 +441,55 @@ struct StepTables {
     long: bool,
     /// A speculative verify: KDA state stays, replay rows are recorded.
     spec: bool,
+    /// Leading rows that are real; the rest pad a decode step to its row bucket
+    /// (`decode_row_bucket`) and write only the scratch page. The routed experts and the shared
+    /// expert run these rows alone. 0: every row is real.
+    real_rows: usize,
+}
+
+impl StepTables {
+    /// Rows the routed and shared experts run: the real rows of a padded step, else every row.
+    fn exchange_rows(&self) -> usize {
+        if self.real_rows > 0 { self.real_rows } else { self.positions.len() }
+    }
+}
+
+/// The rows a speculative decode or verify step of `rows` rows runs as with row buckets
+/// (`--decode-row-buckets`): exact up to 16 rows (no step a sequence's own verify fills is padded,
+/// and the FP8 GEMVs' 16-row route never changes), then whole steps of 4 rows to 64 and of 8 to
+/// 128. A bucket never crosses 64 rows, so a padded step runs its rows' program capacity (`_m64`
+/// or `_m128`), and within one the programs' routes do not depend on the rows (the sparse MLA
+/// split plan has buckets 1, 8 and the capacity; the GEMMs, from 17 rows, one route): a real row
+/// computes the same bits padded or not.
+pub(crate) fn decode_row_bucket(rows: usize) -> usize {
+    match rows {
+        0..=16 => rows,
+        17..=DECODE_ROWS => rows.next_multiple_of(4),
+        _ => rows.next_multiple_of(8),
+    }
+}
+
+/// Pads a speculative decode step's tables (decode tables: one page-table row per step row) to
+/// `bucket` rows over the scratch page `scratch` (one page past the pool): see
+/// [`GlmfEngine::pad_rows`].
+fn pad_tables(tables: &mut StepTables, bucket: usize, scratch: usize) -> Result<()> {
+    let real = tables.positions.len();
+    ensure!(tables.decode && tables.spec && bucket >= real && bucket - real <= PAGE_ROWS && tables.page_stride > 0,
+        "padding a decode step of {real} rows to {bucket} needs a speculative decode step");
+    tables.real_rows = real;
+    for pad in 0..bucket - real {
+        let row = tables.positions.len();
+        tables.positions.push(0);
+        tables.kv_slots.push((scratch * PAGE_ROWS + pad) as i64);
+        tables.kda_slots.push(0);
+        tables.seq_first.push(row as i32);
+        tables.pool_slots.push(-1);
+        tables.cache_lengths.push(0);
+        tables.page_table.push(scratch as i32);
+        tables.page_table.extend(std::iter::repeat_n(0, tables.page_stride - 1));
+        tables.pool_table.extend(std::iter::repeat_n(0, tables.pool_stride));
+    }
+    Ok(())
 }
 
 /// Tokens per DSA index pool, and pools per pool-cache page.
@@ -981,7 +1030,7 @@ impl<'a> Caches<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
         slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
-        records: Option<PrefillScratch<'a>>) -> Result<Self> {
+        records: Option<PrefillScratch<'a>>, scratch_page: bool) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -990,13 +1039,15 @@ impl<'a> Caches<'a> {
         let (state, conv, _) = kda_layer_bytes(cfg, kda_heads, kda_state);
         let replay = replay_bytes(kda_heads, 3 * kda_heads * cfg.kda_head_dim, decode_rows);
         let keys = index_cache == IndexCache::Keys;
+        // One page past the pool, which only padded decode rows write (row buckets).
+        let record_rows = (pages + usize::from(scratch_page)) * PAGE_ROWS;
         let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0, 0);
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    kv.push(Some(zeroed(record_rows * RECORD_BYTES)?));
                     index.push(Some(IndexLayer {
-                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES)?) } else { None },
+                        keys: if keys { Some(zeroed(record_rows * KEY_BYTES)?) } else { None },
                         pools: zeroed(pool_pages * PAGE_ROWS * 132)?,
                     }));
                     mla_layers += 1;
@@ -1091,6 +1142,10 @@ pub(crate) struct GlmfEngine<'a> {
     /// between a verify and its commit.
     pub replay_records: ReplayRecords,
     records: RecordGuard,
+    /// Speculative decode steps run padded to their row bucket (`--decode-row-buckets`; the
+    /// caches then have a scratch page past the pool, which `row_buckets_available` reports).
+    row_buckets: std::cell::Cell<bool>,
+    scratch_page: bool,
     /// Per layer: its index among the KDA layers (None for MLA).
     kda_ordinal: Vec<Option<usize>>,
     /// Per layer: its index among the MLA layers (None for KDA).
@@ -1257,7 +1312,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState,
-        decode_rows: usize, records: Option<PrefillScratch<'a>>) -> Result<Self> {
+        decode_rows: usize, records: Option<PrefillScratch<'a>>, row_buckets: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -1285,15 +1340,17 @@ impl<'a> GlmfEngine<'a> {
         ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
         ensure!(records.is_none() || !split, "a head split keeps the replay records of its own (--replay-records own)");
+        ensure!(!row_buckets || !split, "a head split runs decode steps at their own rows (no --decode-row-buckets)");
         let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache,
-            kda_state, decode_rows, records)?;
+            kda_state, decode_rows, records, row_buckets)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots, decode_rows, replay_rows: std::cell::Cell::new(DECODE_ROWS),
             replay_records, records: RecordGuard::new(replay_records),
+            row_buckets: std::cell::Cell::new(row_buckets), scratch_page: row_buckets,
             kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -1343,7 +1400,7 @@ impl<'a> GlmfEngine<'a> {
             // Its own and the shares' programs (a head split takes decode steps of 64 rows).
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, DECODE_ROWS))?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
+                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None, false)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1505,9 +1562,13 @@ impl<'a> GlmfEngine<'a> {
     /// [`Self::paged_buffers`] of rank `rank` (1: the head split's identical copy).
     pub(crate) fn paged_buffers_on(&self, rank: usize) -> Vec<PagedLayer> {
         let caches = self.caches_of(rank);
+        // The pool's pages only: a scratch page past them (row buckets) belongs to no unit.
+        let rows = self.pages * PAGE_ROWS;
+        let pages = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, row: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+            bytes: buffer.bytes.min(rows * row), ..buffer };
         caches.kv.iter().zip(&caches.index).filter_map(|(kv, index)| match (kv, index) {
-            (Some(kv), Some(index)) => Some(PagedLayer { records: kv.buffer, keys: index.keys.as_ref().map(|k| k.buffer),
-                pools: index.pools.buffer }),
+            (Some(kv), Some(index)) => Some(PagedLayer { records: pages(kv.buffer, RECORD_BYTES),
+                keys: index.keys.as_ref().map(|k| pages(k.buffer, KEY_BYTES)), pools: index.pools.buffer }),
             _ => None,
         }).collect()
     }
@@ -2112,12 +2173,25 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
+        // Row buckets: a speculative step past 16 rows runs padded to its bucket, its padded rows
+        // in the scratch page (a layer callback or trace reads the real rows alone: unpadded).
+        let bucket = if spec && self.row_buckets.get() && on_layer.is_none() && trace.is_none() {
+            decode_row_bucket(rows).min(self.decode_rows)
+        } else { rows };
+        let padded_tokens;
+        let tokens = if bucket > rows {
+            self.pad_rows(&mut tables, bucket)?;
+            padded_tokens = tokens.iter().copied().chain(std::iter::repeat_n(0, bucket - rows)).collect::<Vec<_>>();
+            &padded_tokens[..]
+        } else { tokens };
         if spec {
             // The commit that follows reads records at this step's program capacity.
-            self.replay_rows.set(replay_rows_of(decode_cap(rows)));
+            self.replay_rows.set(replay_rows_of(decode_cap(bucket)));
             self.records.recorded();
         }
-        let logits = self.step(&tables, tokens, rows, on_layer, None, trace)?;
+        // Padded rows' logits follow the real rows'; only those are returned.
+        let logits = self.step(&tables, tokens, bucket, on_layer, None, trace)?
+            .map(|logits| DeviceLogits { rows, ..logits });
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
             if !spec {
@@ -2125,6 +2199,27 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         Ok(logits)
+    }
+
+    /// Pads a decode step's tables to `bucket` rows: each padded row its own one-row sequence at
+    /// position 0, its latent record (and token key) in its own row of the scratch page past the
+    /// pool, its page table naming that page, no pool key, and KDA slot 0, which a speculative
+    /// step only reads. Nothing a sequence reads changes.
+    fn pad_rows(&self, tables: &mut StepTables, bucket: usize) -> Result<()> {
+        ensure!(self.scratch_page, "padding a decode step needs the scratch page (--decode-row-buckets)");
+        pad_tables(tables, bucket, self.pages)
+    }
+
+    /// Whether this engine's caches have the scratch page padded decode rows write.
+    pub(crate) fn row_buckets_available(&self) -> bool {
+        self.scratch_page
+    }
+
+    /// Turns row buckets on or off (golden comparisons of padded and unpadded steps).
+    pub(crate) fn set_row_buckets(&self, on: bool) -> Result<()> {
+        ensure!(!on || self.scratch_page, "row buckets need the scratch page (--decode-row-buckets)");
+        self.row_buckets.set(on);
+        Ok(())
     }
 
     /// A sequence's pages as one table row of `columns` columns: positions past `max_context`
@@ -2433,7 +2528,7 @@ impl<'a> GlmfEngine<'a> {
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
-                self.moe(w, index, layer, t, rows, cap, tables.decode)?;
+                self.moe(w, index, layer, t, rows, cap, tables.decode, tables.exchange_rows())?;
             }
             let out = self.meet_ffn(w, index, 0, layers.len(), t)?;
             match layers.get(index + 1) {
@@ -2558,7 +2653,9 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             if layers.get(index).is_some_and(|layer| !layer.dense) {
-                self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
+                // A padded step's real rows alone go to the experts; padded rows reduce stale planes.
+                let real = tables.exchange_rows();
+                self.moe_experts(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true)?;
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
@@ -3009,12 +3106,13 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
+    /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta` for
+    /// the first `exchange` rows (a padded decode step's real rows; otherwise all `t`).
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
-        decode: bool) -> Result<()> {
+        decode: bool, exchange: usize) -> Result<()> {
         self.moe_front(w, index, layer, t, rows, cap)?;
-        self.moe_experts(w, index, layer, t, rows, cap, decode)
+        self.moe_experts(w, index, layer, exchange, Scalar::I32(exchange as i32), cap, decode)
     }
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
@@ -3699,5 +3797,63 @@ mod replay_record_tests {
         guard.prefilled();
         guard.check_commit().unwrap();
         assert!(RecordGuard::new(ReplayRecords::Own).check_commit().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod row_bucket_tests {
+    use super::{decode_row_bucket, decode_cap, pad_tables, GraphKey, StepTables, PAGE_ROWS};
+
+    #[test]
+    fn buckets_are_exact_to_16_then_4_rows_to_64_then_8_to_128() {
+        for rows in 1..=16 {
+            assert_eq!(decode_row_bucket(rows), rows);
+        }
+        assert_eq!([17, 20, 21, 61, 64, 65, 72, 73, 121, 128].map(decode_row_bucket),
+            [20, 20, 24, 64, 64, 72, 72, 80, 128, 128]);
+        for rows in 1..=128 {
+            let bucket = decode_row_bucket(rows);
+            // A bucket keeps its rows' program capacity and adds at most 3 rows (7 past 64).
+            assert_eq!(decode_cap(bucket), decode_cap(rows), "{rows}");
+            assert!(bucket >= rows && bucket - rows <= if rows <= 64 { 3 } else { 7 }, "{rows}");
+        }
+        let shapes = |range: std::ops::RangeInclusive<usize>| {
+            range.map(decode_row_bucket).collect::<std::collections::BTreeSet<_>>().len()
+        };
+        // 16 sequences: 16 to 64 rows in 13 shapes (49 exact), 16 to 128 in 21 (113).
+        assert_eq!((shapes(16..=64), shapes(16..=128), shapes(1..=128)), (13, 21, 36));
+    }
+
+    #[test]
+    fn padded_rows_write_only_the_scratch_page_and_sit_out_the_exchange() {
+        let mut tables = StepTables { decode: true, spec: true, page_stride: 64, pool_stride: 16, ..Default::default() };
+        for row in 0..18 {
+            tables.positions.push(1000 + row);
+            tables.kv_slots.push(5000 + row);
+            tables.kda_slots.push(3);
+            tables.seq_first.push(0);
+            tables.pool_slots.push(-1);
+            tables.cache_lengths.push(250);
+            tables.page_table.extend(std::iter::repeat_n(7, 64));
+            tables.pool_table.extend(std::iter::repeat_n(2, 16));
+        }
+        let unpadded = GraphKey::new(1, 20, &tables);
+        pad_tables(&mut tables, 20, 1852).unwrap();
+        assert_eq!((tables.positions.len(), tables.exchange_rows(), tables.real_rows), (20, 18, 18));
+        assert_eq!(&tables.positions[18..], [0, 0]);
+        assert_eq!(&tables.kv_slots[18..], [1852 * PAGE_ROWS as i64, 1852 * PAGE_ROWS as i64 + 1]);
+        assert_eq!((&tables.kda_slots[18..], &tables.seq_first[18..]), (&[0, 0][..], &[18, 19][..]));
+        assert_eq!((&tables.pool_slots[18..], &tables.cache_lengths[18..]), (&[-1, -1][..], &[0, 0][..]));
+        assert_eq!(tables.page_table.len(), 20 * 64);
+        assert_eq!(&tables.page_table[18 * 64..18 * 64 + 2], [1852, 0]);
+        assert!(tables.pool_table[18 * 16..].iter().all(|&p| p == 0) && tables.pool_table.len() == 20 * 16);
+        // The real rows' tables are untouched, and the key is the bucket's.
+        assert_eq!(tables.positions[17], 1017);
+        assert_eq!(GraphKey::new(1, 20, &tables), unpadded);
+        // Plain steps update KDA state in place: never padded.
+        let mut plain = StepTables { decode: true, spec: false, page_stride: 64, pool_stride: 16, ..Default::default() };
+        plain.positions.push(0);
+        assert!(pad_tables(&mut plain, 4, 1852).is_err());
+        assert_eq!(StepTables::default().exchange_rows(), 0);
     }
 }
