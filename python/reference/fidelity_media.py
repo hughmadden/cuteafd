@@ -62,13 +62,14 @@ def read_fixture(root: Path, span: dict) -> bytes:
     return data
 
 
-def require_media_flag(manifest, enabled, family):
+def require_media_flag(manifest, enabled, family, *, implemented_families=()):
+    """Family runners opt in only after implementing their official tower hook."""
     present = any(w.get("media") for w in manifest["windows"])
     if present and not enabled:
         raise ValueError("media windows require explicit --media; refusing text-only scoring")
     if enabled and not present:
         raise ValueError("--media requires pinned media windows")
-    if present and family != "mimo_v2":
+    if present and family not in {"mimo_v2", *implemented_families}:
         raise ValueError(f"{family} official media golden is not implemented")
     return present
 

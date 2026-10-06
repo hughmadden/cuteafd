@@ -11,9 +11,9 @@ the unweighted stream mean, then ``model.norm`` and ``lm_head`` in FP32.
 Weights: the coordinator tensors come from ``--snapshot`` (BF16 as stored;
 FP8 tensors times their FP32 128x128 block scales); the routed experts come
 from ``--experts-snapshot`` (default the same snapshot), which must hold
-FP8 or BF16 experts (the EXL3 checkpoints' dense tensors equal the official
-BF16 release bit for bit, so ``--snapshot EXL3 --experts-snapshot FP8`` is
-the official model with its FP8 experts). Routed experts are summed in FP32
+FP8 or BF16 experts. An EXL3 coordinator snapshot uses its stored dense and
+tower tensors with the separately identified expert source; no tensor-byte
+equivalence to another release is inferred from headers. Routed experts are summed in FP32
 with the SwiGLU clamp and rounded once (transformers' eager experts sum in
 BF16, which moves routes on rounding-level changes: compare engines by NLL as
 well as agreement). Run with ``PYTHONPATH=third_party/transformers/src`` (the
@@ -57,19 +57,40 @@ FP32_KEYS = ("conv1d", "dt_bias", "A_log", "e_score_correction_bias", "hc.base",
 def run_windows(a, config, ref, dense, experts_src):
     manifest = load_set(a.windows, "glm5_flash")
     from fidelity_media import require_media_flag
-    require_media_flag(manifest, getattr(a, "media", False), "glm5_flash")
+    media = require_media_flag(manifest, getattr(a, "media", False), "glm5_flash",
+                               implemented_families=("glm5_flash",))
     identity = verify_snapshot(manifest, a.snapshot)
+    if media:
+        from glm_flash_media import (snapshot_identity, expert_snapshot_identity,
+                                     validate_spans, window_features, inject_embeddings)
+        validate_spans(manifest, json.loads((a.snapshot / "config.json").read_text()))
+        coordinator = snapshot_identity(a.snapshot)
+        identity.update(coordinator)
+        identity.update(coordinator_tower=coordinator,
+                        experts=expert_snapshot_identity(a.experts_snapshot or a.snapshot),
+                        tower_dtype=a.tower_dtype)
     proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, dense, experts_src))
+    if media and not getattr(a, "_prefix_probe", False):
+        from fidelity_windows import validate_qualification
+        validate_qualification(proof, manifest, identity)
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
+    features = {}
+    if media:
+        features, encoded_identity = window_features(a, manifest)
+        if encoded_identity != coordinator:
+            raise ValueError("GLM tower source identity changed during reference execution")
     started, rows, times, states = time.time(), [], [], []
     with torch.inference_mode():
         embed = dense.get(PREFIX + "embed_tokens.weight")
         for w in manifest["windows"]:
             ids = torch.tensor([w["tokens"]], device="cuda")
             h = torch.nn.functional.embedding(ids, embed)
+            if media:
+                inject_embeddings(h, w.get("media", []), features)
             states.append((h.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous().cpu(), None))
         del embed, ids, h
+        del features
         memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(config.num_hidden_layers):
             start = time.time()
@@ -114,7 +135,10 @@ def run_windows(a, config, ref, dense, experts_src):
             del h, logits
     finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
         experts_snapshot=str(a.experts_snapshot or a.snapshot),
-        reference="transformers glm5_next (eager, FP32 routed sum, fixed-M128 linears)",
+        reference=("transformers glm5_next (eager, FP32 routed sum, fixed-M128 LM linears); "
+                   "official SDPA-math tower from coordinator snapshot; stored dense tensors + "
+                   "separately identified BF16/FP8 experts, not a full official-model byte-equivalence claim"
+                   if media else "transformers glm5_next (eager, FP32 routed sum, fixed-M128 linears)"),
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
         prefix_qualification=proof)
 
@@ -228,14 +252,19 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
-    p.add_argument("--media", action="store_true", help="reserved official tower hook; currently fails closed")
+    p.add_argument("--media", action="store_true", help="inject the checkpoint's official GLM vision tower features")
+    p.add_argument("--media-root", type=Path, help="fixture root (default --windows parent)")
+    p.add_argument("--media-features-out", type=Path, help="immutable BF16 feature rows for paired native probes")
+    p.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
     if a.media and not a.windows:
-        p.error("--media requires --windows (official media hook not implemented)")
+        p.error("--media requires --windows")
+    if (a.media_root or a.media_features_out or a.tower_dtype != "bf16") and not a.media:
+        p.error("media fixture/feature/precision options require --media")
     if a.windows and (a.text or a.text_file or a.max_tokens or a.stop_after is not None):
         p.error("--windows cannot be combined with legacy text/truncation/stop options")
 

@@ -189,3 +189,316 @@ def test_fixture_hash_and_family_fail_closed(tmp_path):
     for family, flag in [("mimo_v2", False), ("qwen4", True), ("glm5_flash", True)]:
         with pytest.raises(ValueError):
             require_media_flag(manifest, flag, family)
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "qwen4"])
+def test_explicit_implemented_family_opt_in(family):
+    manifest = {"windows": [{"media": [span()]}]}
+    assert require_media_flag(manifest, True, family, implemented_families=(family,))
+    with pytest.raises(ValueError, match="not implemented"):
+        require_media_flag(manifest, True, "deepseek_v4", implemented_families=(family,))
+    with pytest.raises(ValueError, match="explicit --media"):
+        require_media_flag(manifest, False, family, implemented_families=(family,))
+    with pytest.raises(ValueError, match="pinned media"):
+        require_media_flag({"windows": [{}]}, True, family, implemented_families=(family,))
+
+
+def glm_config():
+    return {"model_type": "glm5_next", "image_start_token_id": 1,
+            "image_end_token_id": 2, "image_token_id": 9,
+            "text_config": {"vocab_size": 32, "hidden_size": 8,
+                            "moe_intermediate_size": 4, "n_routed_experts": 1,
+                            "first_k_dense_replace": 0, "num_hidden_layers": 1}}
+
+
+@pytest.mark.parametrize("bad", [None, "placeholder", "begin", "end", "ids", "capacity"])
+def test_glm_spans_use_actual_checkpoint_markers(bad):
+    from glm_flash_media import validate_spans
+    config = glm_config()
+    image = span()
+    tokens = [1] + [9] * 4 + [2, 3]
+    if bad == "placeholder": tokens[2] = 8
+    if bad == "begin": tokens[0] = 8
+    if bad == "end": tokens[5] = 8
+    if bad == "ids": config["image_token_id"] = True
+    if bad == "capacity":
+        image["len"] = 4097
+        tokens = [1] + [9] * 4097 + [2, 3]
+    manifest = {"windows": [{"tokens": tokens, "media": [image]}]}
+    if bad:
+        with pytest.raises(ValueError): validate_spans(manifest, config)
+    else:
+        validate_spans(manifest, config)
+
+
+def test_glm_source_identity_hashes_loaded_code_and_nested_processor(tmp_path):
+    import json
+    from glm_flash_media import snapshot_identity
+    for name in ("config.json", "tokenizer.json", "processor_config.json", "model.safetensors.index.json",
+                 "modeling.py", "processing.py"):
+        (tmp_path / name).write_text(json.dumps({"source": name}))
+    identity = snapshot_identity(tmp_path, tmp_path / "modeling.py", tmp_path / "processing.py")
+    for key, name in (("modeling", "modeling.py"), ("image_processing", "processing.py"),
+                      ("preprocessor", "processor_config.json"), ("index", "model.safetensors.index.json")):
+        assert identity[key + "_sha256"] == hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+    assert "tensor_bytes_sha256" not in identity
+
+
+def test_glm_processor_uses_nested_config_and_cap(tmp_path, monkeypatch):
+    import json
+    from types import ModuleType
+    from glm_flash_media import processor
+    name = "transformers.models.glm5_next.image_processing_pil_glm5_next"
+    module = ModuleType(name)
+    module.Glm5NextImageProcessorPil = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, name, module)
+    config = {"image_processor": {"max_image_tokens": 8000, "patch_size": 14,
+                                  "image_processor_type": "Glm5NextImageProcessor"},
+              "video_processor": {"max_image_tokens": 240000}}
+    (tmp_path / "processor_config.json").write_text(json.dumps(config))
+    assert processor(tmp_path) == {"max_image_tokens": 4096, "patch_size": 14}
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_glm_tower_restores_global_lm_arithmetic_on_exception(monkeypatch, fail):
+    from types import ModuleType, SimpleNamespace
+    from glm_flash_media import official_tower_arithmetic
+    torch = ModuleType("torch")
+    F = ModuleType("torch.nn.functional")
+    nn = ModuleType("torch.nn")
+    nn.functional = F
+    torch.nn = nn
+    padded_linear, padded_einsum, official_linear, official_einsum = [object() for _ in range(4)]
+    F.linear, torch.einsum = padded_linear, padded_einsum
+    for name, module in (("torch", torch), ("torch.nn", nn), ("torch.nn.functional", F)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, "shape_invariant",
+                        SimpleNamespace(_linear=official_linear, _einsum=official_einsum))
+    def encode():
+        with official_tower_arithmetic():
+            assert F.linear is official_linear and torch.einsum is official_einsum
+            if fail: raise RuntimeError("tower failed")
+    if fail:
+        with pytest.raises(RuntimeError, match="tower failed"): encode()
+    else:
+        encode()
+    assert F.linear is padded_linear and torch.einsum is padded_einsum
+
+
+def make_glm_experts(tmp_path, dtype="BF16", quant=None):
+    import json
+    import struct
+    config = glm_config()
+    if quant: config["quantization_config"] = {"quant_method": quant}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    headers = {}
+    for projection in ("gate", "up", "down"):
+        name = f"model.language_model.layers.0.mlp.experts.0.{projection}_proj.weight"
+        shape = [8, 4] if projection == "down" else [4, 8]
+        headers[name] = {"dtype": dtype, "shape": shape, "data_offsets": [0, 64]}
+        if dtype == "F8_E4M3":
+            headers[name.removesuffix("weight") + "weight_scale_inv"] = {
+                "dtype": "F32", "shape": [1, 1], "data_offsets": [64, 68]}
+    encoded = json.dumps(headers).encode()
+    (tmp_path / "weights.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded)
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        name: "weights.safetensors" for name in headers}}))
+    return headers
+
+
+@pytest.mark.parametrize("dtype,quant", [("BF16", None), ("F8_E4M3", "fp8"), ("U8", None), ("BF16", "exl3")])
+def test_glm_media_experts_fail_closed_without_torch(tmp_path, dtype, quant):
+    from glm_flash_media import expert_snapshot_identity
+    make_glm_experts(tmp_path, dtype, quant)
+    if dtype == "U8" or quant == "exl3":
+        with pytest.raises(ValueError, match="unsupported|EXL3"):
+            expert_snapshot_identity(tmp_path)
+    else:
+        identity = expert_snapshot_identity(tmp_path)
+        assert identity["storage_dtypes"] == [dtype]
+        assert "tensor bytes not hashed" in identity["scope"]
+        assert identity["snapshot_revision"] == tmp_path.name
+
+
+def test_glm_expert_fp8_scale_and_missing_tensor_rejected(tmp_path):
+    import json
+    import struct
+    from glm_flash_media import expert_snapshot_identity
+    headers = make_glm_experts(tmp_path, "F8_E4M3", "fp8")
+    scale = next(name for name in headers if name.endswith("weight_scale_inv"))
+    headers[scale]["dtype"] = "BF16"
+    encoded = json.dumps(headers).encode()
+    (tmp_path / "weights.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded)
+    with pytest.raises(ValueError, match="block scale"): expert_snapshot_identity(tmp_path)
+    headers = make_glm_experts(tmp_path)
+    name = next(iter(headers))
+    del headers[name]
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        key: "weights.safetensors" for key in headers}}))
+    with pytest.raises(ValueError, match="missing official expert tensor"): expert_snapshot_identity(tmp_path)
+
+
+def test_glm_injects_single_stream_before_four_hc_copies():
+    from glm_flash_media import inject_embeddings
+    class Tensor(np.ndarray):
+        def copy_(self, value): np.copyto(self, value)
+    embeddings = np.zeros((1, 7, 8)).view(Tensor)
+    features = {"a" * 64: np.arange(32).reshape(4, 8)}
+    inject_embeddings(embeddings, [span()], features)
+    hc = np.repeat(embeddings[:, :, None], 4, axis=2)
+    for lane in range(4): np.testing.assert_array_equal(hc[0, 1:5, lane], features["a" * 64])
+    assert not embeddings[:, [0, 5, 6]].any()
+    with pytest.raises(ValueError, match="widths"):
+        inject_embeddings(embeddings, [span()], {"a" * 64: np.zeros((4, 4))})
+
+
+def fake_torch(monkeypatch):
+    from contextlib import nullcontext
+    from types import ModuleType, SimpleNamespace
+    torch = ModuleType("torch")
+    nn, F = ModuleType("torch.nn"), ModuleType("torch.nn.functional")
+    nn.functional = F
+    F.linear, torch.einsum = object(), object()
+    nn.attention = SimpleNamespace(sdpa_kernel=lambda _backend: nullcontext(),
+                                  SDPBackend=SimpleNamespace(MATH="math"))
+    torch.nn = nn
+    torch.inference_mode = torch.no_grad = nullcontext
+    torch.bfloat16, torch.float32, torch.uint16 = "bf16", "fp32", "uint16"
+    torch.cuda = SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None)
+    for name, module in (("torch", torch), ("torch.nn", nn), ("torch.nn.functional", F)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(sys.modules, "shape_invariant", raising=False)
+    return torch
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+def test_glm_encode_uses_pooler_not_last_hidden_state(tmp_path, monkeypatch, dtype):
+    import io
+    from types import SimpleNamespace
+    from PIL import Image
+    from glm_flash_media import encode_span
+    torch = fake_torch(monkeypatch)
+    data = io.BytesIO()
+    Image.new("RGBA", (4, 4), (10, 20, 30, 128)).save(data, format="PNG")
+    (tmp_path / "code.png").write_bytes(data.getvalue())
+    image_span = span()
+    image_span["fixture"]["sha256"] = hashlib.sha256(data.getvalue()).hexdigest()
+    class Tensor:
+        def __init__(self, data): self.data = np.asarray(data)
+        @property
+        def shape(self): return self.data.shape
+        def cuda(self): return self
+        def to(self, actual): assert actual == dtype; return self
+        def tolist(self): return self.data.tolist()
+        def cpu(self): return self
+    value = Tensor(np.arange(32).reshape(4, 8))
+    torch.isfinite = lambda features: np.isfinite(features.data)
+    def process(*, images, return_tensors):
+        assert images.mode == "RGB" and images.getpixel((0, 0)) == (10, 20, 30)
+        assert return_tensors == "pt"
+        return {"image_grid_thw": Tensor([[1, 4, 4]]), "pixel_values": Tensor([[0.]])}
+    class Tower:
+        config = SimpleNamespace(out_hidden_size=8)
+        def __call__(self, _pixels, _grid):
+            return SimpleNamespace(pooler_output=value, last_hidden_state=Tensor(np.zeros((4, 4096))))
+    assert encode_span(Tower(), process, tmp_path, image_span, dtype=dtype) is value
+    image_span["grid"] = [1, 2, 8]
+    with pytest.raises(ValueError, match="grid differs"):
+        encode_span(Tower(), process, tmp_path, image_span, dtype=dtype)
+
+
+@pytest.mark.parametrize("change", [None, "missing", "dtype", "shape"])
+def test_glm_tower_loader_consumes_only_bf16_visual_parameters(tmp_path, monkeypatch, change):
+    import json
+    from contextlib import nullcontext
+    from types import ModuleType, SimpleNamespace
+    from glm_flash_media import load_tower
+    torch = fake_torch(monkeypatch)
+    events, defaults = [], ["bf16"]
+    torch.get_default_dtype = lambda: defaults[-1]
+    torch.set_default_dtype = lambda dtype: defaults.append(dtype)
+    torch.backends = SimpleNamespace(cuda=SimpleNamespace(matmul=SimpleNamespace()),
+                                     cudnn=SimpleNamespace())
+    class Tensor:
+        dtype = "bf16" if change != "dtype" else "fp32"
+        shape = (2, 2) if change != "shape" else (3, 2)
+        def copy_(self, value): events.append(("copy", value))
+    class Tower:
+        def __init__(self, config):
+            assert torch.get_default_dtype() == "fp32" and config._attn_implementation == "sdpa"
+            self.parameter = SimpleNamespace(shape=(2, 2), copy_=lambda value: events.append(("copy", value)))
+            self.buffer = object()
+        def named_parameters(self): return [("weight", self.parameter)]
+        def to(self, dtype): events.append(("to", dtype)); return self
+        def cuda(self): events.append("cuda"); return self
+        def eval(self): events.append("eval"); return self
+    config_module = ModuleType("transformers.models.glm5_next.configuration_glm5_next")
+    config_module.Glm5NextVisionConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    model_module = ModuleType("transformers.models.glm5_next.modeling_glm5_next")
+    model_module.Glm5NextVisionModel = Tower
+    safetensors = ModuleType("safetensors")
+    def opened(path, **kwargs):
+        assert path == str(tmp_path / "visual.safetensors")
+        return nullcontext(SimpleNamespace(get_tensor=lambda name: Tensor()))
+    safetensors.safe_open = opened
+    for module in (config_module, model_module, safetensors):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    config = glm_config()
+    config["vision_config"] = {"out_hidden_size": 8}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    index = {"lm_head.weight": "never-opened.safetensors"}
+    if change != "missing": index["model.visual.weight"] = "visual.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+    if change:
+        with pytest.raises(ValueError, match="missing|dtype/shape"):
+            load_tower(tmp_path)
+    else:
+        model, _config = load_tower(tmp_path)
+        assert model.buffer is not None and events[-2:] == ["cuda", "eval"]
+        assert [entry for entry in events if isinstance(entry, tuple) and entry[0] == "to"] == [("to", "bf16")]
+    assert defaults[-1] == "bf16"
+
+
+def test_glm_feature_export_and_prefix_probe_immutability(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import glm_flash_media as media
+    from fidelity_windows import canonical
+    torch = fake_torch(monkeypatch)
+    events = []
+    torch.cuda.synchronize = lambda: events.append("drain")
+    torch.cuda.empty_cache = lambda: events.append("empty")
+    class Tensor:
+        def bfloat16(self): return self
+        def contiguous(self): return self
+        def view(self, dtype): assert dtype == "uint16"; return self
+        def numpy(self): return np.full((4, 8), 0x3f80, dtype=np.uint16)
+    (tmp_path / "config.json").write_text(json.dumps(glm_config()))
+    identity = {"snapshot_revision": "test", "tokenizer_sha256": "a" * 64}
+    monkeypatch.setattr(media, "snapshot_identity", lambda *_args: identity)
+    monkeypatch.setattr(media, "load_tower", lambda *_args: (object(), {}))
+    monkeypatch.setattr(media, "processor", lambda *_args: object())
+    calls = []
+    monkeypatch.setattr(media, "encode_span", lambda *_args, **_kwargs: calls.append("encode") or Tensor())
+    image = span()
+    window = {"tokens": [1] + [9] * 4 + [2], "media": [image]}
+    manifest = {"windows": [window, window], "family": "glm5_flash", "checkpoint": "test", "set_sha256": "b" * 64}
+    args = SimpleNamespace(snapshot=tmp_path, media_root=tmp_path, windows=tmp_path / "input.json",
+                           media_features_out=tmp_path / "features", tower_dtype="fp32")
+    values, actual_identity = media.window_features(args, manifest)
+    assert len(values) == 1 and calls == ["encode"] and actual_identity == identity
+    assert events == ["drain", "empty"]
+    metadata = json.loads((args.media_features_out / (image["key"] + ".json")).read_text())
+    assert metadata["tower_dtype"] == "fp32" and metadata["dtype"] == "bf16-le"
+    files = {p.name: p.read_bytes() for p in args.media_features_out.iterdir()}
+    args._prefix_probe = True
+    media.window_features(args, manifest)
+    assert {p.name: p.read_bytes() for p in args.media_features_out.iterdir()} == files
+    args._prefix_probe = False
+    index = args.media_features_out / "features.json"
+    index.write_bytes(canonical({"tampered": True}))
+    with pytest.raises(ValueError, match="index is immutable"): media.window_features(args, manifest)
+    conflict = copy.deepcopy(window)
+    conflict["media"][0]["fixture"]["sha256"] = "c" * 64
+    manifest["windows"] = [window, conflict]
+    with pytest.raises(ValueError, match="different fixtures/grids"): media.window_features(args, manifest)
