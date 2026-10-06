@@ -453,14 +453,15 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
 
 
 @pytest.mark.parametrize("quota", [None, "4MiB", "0"])
+@pytest.mark.parametrize("vision", ["off", "auto"])
 @pytest.mark.parametrize("checkpoint,serve", [("mimo_flash", "serve-mimo"), ("qwen4", "serve-qwen4")])
-def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, checkpoint, serve):
+def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, vision, checkpoint, serve):
     config = SPLIT_CONFIGS[checkpoint]
-    keys = "" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n"
+    keys = f"VISION={vision}\n" + ("" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n")
     result = _family_launch_result(tmp_path, config, f"test/{checkpoint}", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
-    if quota is None:
+    if quota is None or vision == "off":
         assert "--media-cache-bytes" not in launch
     else:
         assert f"--media-cache-bytes {quota}" in launch

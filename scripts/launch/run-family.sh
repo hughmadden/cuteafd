@@ -276,8 +276,8 @@ case $family in
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
-if [[ $family == mimo_v2 || $family == qwen4 ]]; then
-  # Optional host embedding quota; unset retains the engine's admitted default.
+if [[ ( $family == mimo_v2 || $family == qwen4 ) && $vision != off ]]; then
+  # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
 if [[ $family == mimo_v2 ]]; then

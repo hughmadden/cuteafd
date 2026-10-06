@@ -3,6 +3,7 @@ import ast
 import ctypes
 import re
 import importlib.util
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -232,6 +233,24 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert 'get QWEN_STARTUP_GRAPHS' in launcher
     assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher
     assert 'off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0)' in launcher
+
+
+@pytest.mark.parametrize("family", ["qwen4", "mimo_v2", "glm5"])
+@pytest.mark.parametrize("vision", ["off", "auto", "rtx", "spark:1"])
+@pytest.mark.parametrize("quota", ["", "2621440"])
+def test_media_cache_flag_only_reaches_enabled_vision(family, vision, quota):
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    start = launcher.index('if [[ ( $family == mimo_v2')
+    block = launcher[start:launcher.index('if [[ $family == mimo_v2 ]]; then', start)]
+    program = '''
+family=$1; vision=$2; quota=$3
+get() { printf '%s' "$quota"; }
+family_args=()
+''' + block + '\nif ((${#family_args[@]})); then printf "%s\\n" "${family_args[@]}"; fi\n'
+    result = subprocess.run(["bash", "-c", program, "test", family, vision, quota],
+                            check=True, capture_output=True, text=True)
+    expected = ["--media-cache-bytes", quota] if family in ("qwen4", "mimo_v2") and vision != "off" and quota else []
+    assert result.stdout.splitlines() == expected
 
 
 def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
