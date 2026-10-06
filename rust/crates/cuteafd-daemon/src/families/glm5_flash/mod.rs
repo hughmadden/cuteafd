@@ -330,6 +330,9 @@ pub(crate) struct GoldenArgs {
     /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
+    /// Require byte-exact real-row logits for masked decode padding 3->4 and 10->16.
+    #[arg(long)]
+    pub padding_check: bool,
     /// Isolate one real routed-expert layer with --local-experts: compare a
     /// fixed first row across m1/m16/m80 packages and require that changing
     /// later inputs in the same row geometry cannot change it. No backbone
@@ -764,6 +767,12 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
+    if args.padding_check {
+        let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+        anyhow::ensure!(bytes.len() % 4 == 0, "padding check token bytes must be u32-aligned");
+        let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        return engine.check_decode_padding(&tokens);
+    }
     if let Some(dir) = &args.draft_oracle {
         return speculate::draft_oracle(args, opened, engine, dir);
     }

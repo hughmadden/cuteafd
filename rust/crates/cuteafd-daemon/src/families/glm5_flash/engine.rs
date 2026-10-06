@@ -206,6 +206,7 @@ impl<'a> PeerWorkspaces<'_, 'a> {
 #[derive(Default)]
 struct StepTables {
     decode: bool,
+    eager: bool,
     positions: Vec<i64>,
     /// MLA latent record slot per row (also the row's token-key slot).
     kv_slots: Vec<i64>,
@@ -559,6 +560,9 @@ pub(crate) struct GlmfEngine<'a> {
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly).
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    startup_graphs: bool,
+    warming_graphs: std::cell::Cell<bool>,
+    logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,
     /// Spark prefill runs in lanes (CUTEAFD_GLMF_PREFILL_LANES, default on).
     lanes: bool,
     /// CUTEAFD_GLMF_PREFILL_LANES=subset: lanes even with a `--layers`
@@ -588,6 +592,65 @@ pub(crate) struct Fp8Prefill {
     pub ffn: bool,
     /// KDA projections that run FP8 (bit 0 the in-projection, bit 1 o_proj).
     pub kda_bits: i32,
+}
+
+// Serving uses exact canonical row buckets; teacher-forced probe spans run eagerly
+// and do not enlarge the startup graph set. Counters still count every capture.
+use crate::shared::decode_graph::{masked_row, row_bucket as decode_bucket, ROW_BUCKETS as DECODE_BUCKETS};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphGeometry {
+    pool_width: usize,
+    page_stride: usize,
+    pool_stride: usize,
+    long: bool,
+}
+
+fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
+    let pools = pages / UNIT_PAGES;
+    let mut geometries = Vec::new();
+    for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
+        let pool_stride = units.next_power_of_two().min(pools);
+        let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+        let capacity = (units * UNIT_ROWS).min(context);
+        let mut width = 1;
+        while width / 2 * UNIT_ROWS < capacity {
+            let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
+            let high = (width * UNIT_ROWS).min(capacity);
+            for long in [false, true] {
+                if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                    let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                    if !geometries.contains(&geometry) { geometries.push(geometry); }
+                }
+            }
+            width *= 2;
+        }
+    }
+    geometries
+}
+
+fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
+    -> Vec<(usize, bool, GraphGeometry)> {
+    let plain = decode_bucket(sequences.min(DECODE_ROWS));
+    graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
+        DECODE_BUCKETS.into_iter().flat_map(move |rows| [false, true].into_iter()
+            .filter(move |&spec| if spec { speculation && rows > 1 } else { rows <= plain })
+            .map(move |spec| (rows, spec, geometry)))
+    }).collect()
+}
+
+fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
+    while tables.kv_slots.len() < bucket {
+        let row = masked_row(tables.kv_slots.len());
+        tables.positions.push(row.position);
+        tables.kv_slots.push(row.kv_slot);
+        tables.pool_slots.push(row.pool_slot);
+        tables.kda_slots.push(row.state_slot);
+        tables.seq_first.push(row.seq_first);
+        tables.cache_lengths.push(row.cache_length);
+        tables.page_table.extend(std::iter::repeat_n(0, tables.page_stride));
+        tables.pool_table.extend(std::iter::repeat_n(0, tables.pool_stride));
+    }
 }
 
 /// What a captured decode segment baked in.
@@ -656,6 +719,8 @@ impl<'a> GlmfEngine<'a> {
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
+            startup_graphs: std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").is_ok_and(|v| v == "1"),
+            warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
@@ -664,6 +729,81 @@ impl<'a> GlmfEngine<'a> {
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
             kda_prefill_expanded: false, l2: None, embedding })
+    }
+
+    /// Capture the complete serving key set on masked rows, without expert traffic.
+    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
+        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
+        let segments = self.weights.layers.len() + 1;
+        let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
+        tracing::info!(shapes = shapes.len(), graphs = expected, rows = ?DECODE_BUCKETS,
+            "GLM Flash startup decode graph admission");
+        // Allocate fixed workspaces before measuring the graph executables' physical memory.
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
+        }
+        let _ = self.peer_workspaces(true, None)?;
+        self.synchronize()?;
+        let free = || (0..self.ranks()).map(|rank| self.on(rank,
+            || self.library.cuda_physical_memory_info().map(|(free, _)| free as i64))).collect::<Result<Vec<_>>>();
+        let before = free()?;
+        let started = std::time::Instant::now();
+        self.warming_graphs.set(true);
+        let captured = (|| -> Result<()> {
+            for &(rows, spec, geometry) in &shapes {
+                let mut tables = StepTables { decode: true, spec, long: geometry.long,
+                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                    pool_stride: geometry.pool_stride, ..Default::default() };
+                pad_decode_tables(&mut tables, rows);
+                self.step(&tables, &vec![0; rows], rows, None, None, None, None)?;
+            }
+            self.synchronize()
+        })();
+        self.warming_graphs.set(false);
+        captured?;
+        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
+        for &(rows, spec, geometry) in &shapes {
+            for rank in 0..self.ranks() {
+                let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
+                let end = if rank == 0 { segments } else { segments - 1 };
+                for segment in 0..end {
+                    ensure!(graphs.borrow().contains_key(&GraphKey { segment, rows, spec, long: geometry.long,
+                        pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                        pool_stride: geometry.pool_stride }), "startup graph coverage missing");
+                }
+            }
+        }
+        let bytes: Vec<i64> = before.into_iter().zip(free()?).map(|(before, after)| before - after).collect();
+        tracing::info!(graphs, shapes = shapes.len(), ?bytes, elapsed_ms = started.elapsed().as_millis() as u64,
+            "GLM Flash decode graphs captured at startup");
+        Ok(graphs)
+    }
+
+    /// One-GPU real-row byte gate; speculative steps leave the prefilled KDA state intact.
+    pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(self.ranks() == 1 && self.use_graphs && self.startup_graphs,
+            "padding check needs one GPU, graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
+        ensure!(tokens.len() >= 42 && self.max_context >= 42, "padding check needs 42 tokens of context");
+        let mut placement = GlmfPlacement::new(vec![0], 0);
+        self.prefill_device(&mut placement, &tokens[..32])?;
+        for rows in [3, 10] {
+            let start = placement.len;
+            let input = &tokens[32..32 + rows];
+            let mut ignore = |_: usize, _: &[u8]| Ok(());
+            let plain = self.decode_step(&mut [(&mut placement, rows)], input, Some(&mut ignore), true, None, None, true)?
+                .context("padding check needs all layers")?.to_host(self.library)?;
+            placement.len = start;
+            let padded = self.verify_device(&mut [(&mut placement, rows)], input, true)?
+                .context("padding check needs all layers")?.to_host(self.library)?;
+            placement.len = start;
+            ensure!(plain.len() == padded.len() && plain.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "decode padding {rows}->{} changed real-row logits", decode_bucket(rows));
+            tracing::info!(rows, bucket = decode_bucket(rows), bytes = plain.len() * 4,
+                "GLM Flash padded decode real-row logits byte-exact");
+        }
+        self.synchronize()
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1337,12 +1477,12 @@ impl<'a> GlmfEngine<'a> {
     /// (or verify with [`Self::verify_spec`] and commit what it keeps).
     pub fn verify(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, tokens, on_layer, false, None, None)?.map(|l| l.to_host(self.library)).transpose()
+        self.decode_step(sequences, tokens, on_layer, false, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
     pub fn verify_trace(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: &mut dyn FnMut(usize, &[u8]) -> Result<()>, dir: &std::path::Path) -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, tokens, Some(on_layer), false, Some(dir), None)?
+        self.decode_step(sequences, tokens, Some(on_layer), false, Some(dir), None, true)?
             .map(|l| l.to_host(self.library)).transpose()
     }
 
@@ -1379,26 +1519,26 @@ impl<'a> GlmfEngine<'a> {
     /// steps). Placements advance by all rows; callers set the kept length.
     pub fn verify_spec(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32])
         -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, tokens, None, true, None, None)?.map(|l| l.to_host(self.library)).transpose()
+        self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
     /// logits on the device, with the decode graph's greedy selection of them.
     pub fn verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32], spec: bool)
         -> Result<Option<DeviceLogits>> {
-        self.decode_step(sequences, tokens, None, spec, None, None)
+        self.decode_step(sequences, tokens, None, spec, None, None, false)
     }
 
     /// Teacher-forced scoring may append image rows with decode geometry.
     pub fn verify_media_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
         ensure!(sequences.len() == 1, "media scoring needs one sequence");
-        self.decode_step(sequences, tokens, None, false, None, Some(media))
+        self.decode_step(sequences, tokens, None, false, None, Some(media), true)
     }
 
     fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
-        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>, eager: bool) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
@@ -1406,7 +1546,8 @@ impl<'a> GlmfEngine<'a> {
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pool_pages);
-        let mut tables = StepTables { decode: true, page_stride, pool_stride, spec, ..Default::default() };
+        let mut tables = StepTables { decode: true, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
+            page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
             if placement.len == 0 {
                 self.start(placement)?;
@@ -1423,7 +1564,21 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, tokens, rows, on_layer, None, trace, media)?;
+        let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
+            && media.is_none_or(|m| m.spans().is_empty());
+        let logits = if graphed {
+            let bucket = if self.startup_graphs { decode_bucket(rows) } else { rows };
+            pad_decode_tables(&mut tables, bucket);
+            let mut padded = tokens.to_vec();
+            padded.resize(bucket, 0);
+            self.step(&tables, &padded, bucket, None, None, None, None)?.map(|mut logits| {
+                // Keep the bucket-sized greedy status offset while exposing only real rows.
+                logits.rows = rows;
+                logits
+            })
+        } else {
+            self.step(&tables, tokens, rows, on_layer, None, trace, media)?
+        };
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
             if !spec {
@@ -1670,7 +1825,7 @@ impl<'a> GlmfEngine<'a> {
         }
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none()
+        let graphed = self.use_graphs && tables.decode && !tables.eager && on_layer.is_none() && forced.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
         self.load_streams(w, tokens, graphed)?;
         self.inject_media(w, tables, media)?;
@@ -1862,7 +2017,12 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             if layers.get(index).is_some_and(|layer| !layer.dense) {
-                self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
+                if self.warming_graphs.get() {
+                    // Masked startup rows need no routed result; preserve peer event ordering.
+                    self.exchange_window(index, true, true)?;
+                } else {
+                    self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
+                }
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
@@ -1931,6 +2091,12 @@ impl<'a> GlmfEngine<'a> {
         if let Some(graph) = graphs.borrow().get(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+        }
+        let geometry = GraphGeometry { pool_width: key.pool_width, page_stride: key.page_stride,
+            pool_stride: key.pool_stride, long: key.long };
+        if !self.warming_graphs.get() && self.logged_graph_shapes.borrow_mut().insert((rank, key.rows, key.spec, geometry)) {
+            tracing::warn!(rank, rows = key.rows, spec = key.spec, long = key.long, pool_width = key.pool_width,
+                page_stride = key.page_stride, pool_stride = key.pool_stride, "GLM Flash unseen serving graph geometry");
         }
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
@@ -2680,6 +2846,58 @@ mod prefill_lane_tests {
         assert_eq!(super::audit_token_hash(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(super::audit_token_hash(&[1, 2]), 0xc9c2_8939_c996_68c6);
         assert_ne!(super::audit_token_hash(&[1, 2]), super::audit_token_hash(&[2, 1]));
+    }
+
+    #[test]
+    fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
+        use super::{decode_bucket, serving_graph_shapes, GraphGeometry, UNIT_PAGES, UNIT_ROWS};
+        for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
+            let shapes = serving_graph_shapes(context, pages, dense, 16, true);
+            let set: std::collections::HashSet<_> = shapes.iter().copied().collect();
+            assert_eq!(shapes.len(), set.len());
+            for capacity in 1..=context.min(pages / UNIT_PAGES * UNIT_ROWS) {
+                let units = capacity.div_ceil(UNIT_ROWS);
+                let mut lengths = vec![1, capacity, dense.min(capacity), (dense + 1).min(capacity)];
+                for bit in 0..usize::BITS {
+                    let Some(boundary) = UNIT_ROWS.checked_shl(bit) else { break };
+                    if boundary >= capacity { break; }
+                    lengths.extend([boundary, boundary + 1]);
+                }
+                for len in lengths {
+                    let geometry = GraphGeometry {
+                        page_stride: (units * UNIT_PAGES).next_power_of_two().min(pages),
+                        pool_stride: units.next_power_of_two().min(pages / UNIT_PAGES),
+                        pool_width: len.div_ceil(UNIT_ROWS).next_power_of_two().min(units.next_power_of_two().min(pages / UNIT_PAGES)),
+                        long: len > dense,
+                    };
+                    for (rows, spec) in [(1, false), (3, false), (10, false), (16, false), (2, true), (10, true), (64, true)] {
+                        assert!(set.contains(&(decode_bucket(rows), spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 240);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 120);
+    }
+
+    #[test]
+    fn decode_padding_masks_storage_and_preserves_real_tables() {
+        for (rows, bucket) in [(3, 4), (10, 16)] {
+            let mut tables = super::StepTables { decode: true, page_stride: 8, pool_stride: 2,
+                positions: vec![17; rows], kv_slots: vec![19; rows], kda_slots: vec![2; rows],
+                seq_first: (0..rows as i32).collect(), pool_slots: vec![-1; rows], cache_lengths: vec![4; rows],
+                page_table: vec![3; rows * 8], pool_table: vec![1; rows * 2], ..Default::default() };
+            super::pad_decode_tables(&mut tables, bucket);
+            assert_eq!(&tables.positions[..rows], vec![17; rows]);
+            assert_eq!(&tables.kv_slots[..rows], vec![19; rows]);
+            assert_eq!(&tables.positions[rows..], vec![-1; bucket - rows]);
+            assert_eq!(&tables.kv_slots[rows..], vec![-1; bucket - rows]);
+            assert_eq!(&tables.kda_slots[rows..], vec![-1; bucket - rows]);
+            assert_eq!(&tables.cache_lengths[rows..], vec![0; bucket - rows]);
+            assert_eq!(tables.page_table.len(), bucket * 8);
+            assert_eq!(tables.pool_table.len(), bucket * 2);
+            assert_eq!(super::decode_bucket(rows), bucket);
+        }
     }
 
     #[test]
