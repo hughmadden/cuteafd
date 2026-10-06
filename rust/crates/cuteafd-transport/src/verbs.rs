@@ -3,8 +3,10 @@ mod landing;
 pub use landing::{gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
+mod flows;
 mod local;
 mod local_client;
+pub use flows::FlowProbesOnly;
 pub(crate) use local_client::LocalTp4Client;
 pub use local::{LocalVerbsExpertConnection, RingBudget, RingReservation};
 use anyhow::{bail, Context, Result};
@@ -2033,15 +2035,17 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0)
     }
 
+    /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
+    #[allow(clippy::too_many_arguments)]
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
-                     terminal_owner: Option<Arc<AtomicBool>>) -> Result<Self> {
+                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner)?;
+            terminal_owner, flow_label)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2055,11 +2059,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
         Ok(session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
                     request: &ExpertProtocolV2Request, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
-                    write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>)
+                    write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
+                    flow_label: u32)
                     -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
@@ -2112,6 +2118,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             client_endpoint: endpoint.verbs_descriptor("client", &client_host),
             client_native_endpoint: endpoint.native_descriptor(),
             write_target: write.map(|target| landing::expose(&endpoint, target)).transpose()?,
+            flow_label,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = read_control(&mut reader)?;
@@ -2120,6 +2127,12 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 "verbs-host ProtocolV2 persistent client received invalid ready message {}",
                 ready.message
             );
+        }
+        if ready.flow_label != flow_label {
+            // An older worker connected its QP with the kernel's label, so its
+            // responses' bond member is not the placed one.
+            tracing::warn!(peer = %addr, flow_label, server_flow_label = ready.flow_label,
+                "expert worker did not apply the RDMA flow label");
         }
         validate_persistent_endpoint_capacity(
             &start.client_endpoint,
@@ -2159,7 +2172,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 ready.server_native_endpoint.status
             );
         }
-        endpoint.connect(&ready.server_native_endpoint)?;
+        endpoint.connect_with_flow_label(&ready.server_native_endpoint, flow_label)?;
         // Before any receive is posted, so every response slot scatters alike.
         let gpu_landing = match landing {
             Some(landing) if start.write_target.is_none() => landing::attach(&endpoint, landing, addr),
@@ -3000,12 +3013,22 @@ fn handle_verbs_host_protocol_v2_connection(
 ) -> Result<()> {
     configure_control_stream(&stream, default_control_timeout())?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut pending = None;
     loop {
-        let value = match read_control_value(&mut reader) {
+        let value = match pending.take().map_or_else(|| read_control_value(&mut reader), Ok) {
             Ok(value) => value,
             Err(error) if error.to_string().contains("control plane closed") => return Ok(()),
             Err(error) => return Err(error),
         };
+        if flows::is_flow_probe_start(&value) {
+            match flows::serve_flow_probes(&mut stream, &mut reader, &library, value)? {
+                Some(next) => {
+                    pending = Some(next);
+                    continue;
+                }
+                None => return Ok(()),
+            }
+        }
         let message = control_message(&value)?;
         if message == "mapped_rdma_ring_start" {
             let start: VerbsHostMappedRdmaRingStart = serde_json::from_value(value)
@@ -3326,6 +3349,14 @@ struct VerbsHostProtocolV2PersistentStart {
     /// are SENDs into its receive ring).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     write_target: Option<VerbsHostWriteTarget>,
+    /// RoCE v2 flow label both QPs connect with (`CUTEAFD_RDMA_BOND_BALANCE`);
+    /// absent or 0: the kernel derives one from the QP numbers.
+    #[serde(default, skip_serializing_if = "is_zero_label")]
+    flow_label: u32,
+}
+
+fn is_zero_label(label: &u32) -> bool {
+    *label == 0
 }
 
 /// Where a write-mode server RDMA-writes each response: the partial rows into
@@ -3348,6 +3379,9 @@ struct VerbsHostProtocolV2PersistentReady {
     message: String,
     server_endpoint: VerbsHostRcEndpointDescriptor,
     server_native_endpoint: VerbsHostNativeEndpointDescriptor,
+    /// The start's flow label, echoed by a server that connected with it.
+    #[serde(default, skip_serializing_if = "is_zero_label")]
+    flow_label: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3639,6 +3673,22 @@ impl NativeRdmaEndpoint {
             peer.psn,
             peer.lid,
             &peer.gid_hex,
+        )
+    }
+
+    /// [`Self::connect`] with an explicit RoCE v2 flow label (fixing this QP's
+    /// UDP source port); label 0 is exactly [`Self::connect`].
+    fn connect_with_flow_label(&self, peer: &VerbsHostNativeEndpointDescriptor, flow_label: u32) -> Result<()> {
+        if flow_label == 0 {
+            return self.connect(peer);
+        }
+        self.library.rdma_rc_endpoint_connect_flow_label(
+            self.info.handle,
+            peer.qp_num,
+            peer.psn,
+            peer.lid,
+            &peer.gid_hex,
+            flow_label,
         )
     }
 

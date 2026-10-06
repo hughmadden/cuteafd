@@ -3,6 +3,7 @@ use cuteafd_core::{ExpertRequest, ExpertResponse};
 use std::io::ErrorKind;
 use std::time::Duration;
 
+pub mod bond;
 mod capabilities;
 pub mod fabric;
 mod debug_json;
@@ -61,7 +62,7 @@ pub use synthetic::{
     SYNTHETIC_EXPERT_KERNEL,
 };
 pub use verbs::{
-    gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe, VerbsHostWriteTarget,
+    gpu_landing_probe, DeviceLanding, DeviceWriteTarget, FlowProbesOnly, GpuLandingProbe, VerbsHostWriteTarget,
     VERBS_HOST_WRITE_FLAG_ERROR,
     LocalVerbsExpertConnection, RingBudget, RingReservation,
     serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,

@@ -41,6 +41,15 @@ coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
 coordinator_budget_args=()
 [[ -z "$coordinator_budget" ]] || coordinator_budget_args=(--coordinator-gpu-budget-gib "$coordinator_budget")
+# RDMA_BOND_BALANCE: the coordinator's expert QPs connect with RoCE v2 flow labels it chooses,
+# so a coordinator port that is an LACP bond carries as many of them on each member: off
+# (default: the kernel's per-QP labels, re-rolled at every start), labels (fixed labels, the
+# same placement at every start) or probe (labels measured onto alternating members; see
+# rust/crates/cuteafd-transport/src/bond.rs). Workers need no setting.
+bond_balance="$(get RDMA_BOND_BALANCE off)"
+case "$bond_balance" in off|labels|probe) ;; *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;; esac
+bond_args=()
+[[ "$bond_balance" == off ]] || bond_args=(-e "CUTEAFD_RDMA_BOND_BALANCE=$bond_balance")
 # Validate the name before it is used to identify allocations during admission.
 instance="$(get INSTANCE)"
 [[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
@@ -1028,7 +1037,7 @@ case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2;
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${device_map_args[@]}" "${wip_mount_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
