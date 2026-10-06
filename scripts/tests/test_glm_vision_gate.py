@@ -163,14 +163,21 @@ def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
 def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     root = ROOT / "rust/crates/cuteafd-daemon/src/families"
     source = (root / "glm5_flash/engine.rs").read_text()
-    construction = source.split("fn workspace_here(", 1)[1].split("/// Streams start", 1)[0]
-    assert "workspace_layout(" in construction
-    assert "self.alloc(layout.streams)" in construction
-    assert "self.alloc(layout.scratch)" in construction
+    # Every workspace buffer comes from the loader's arithmetic, which the reserve charges: a lane's
+    # own buffers over its GPU's shared temporaries.
+    temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
+    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
+    lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
+    assert "glmf_lane_bytes(" in lane and "self.alloc(bytes.streams)" in lane
+    reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("fn prefill_workspace_count(", 1)[0]
+    assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
-    for required in ("self.decode_workspace", "self.pipelined()", "PREFILL_LANES",
-                     "self.peer_workspaces", "drafter.prepare_workspace()", "self.synchronize()"):
+    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "PREFILL_LANES",
+                     "self.prefill_lanes_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
+    # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
+    scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
+    assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
     assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in source
     assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
     assert "kda.in[24896|12576,4096]" in source
@@ -184,6 +191,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "partial_exchange_reserve(" in opening
     assert 'full_prefill_logits_bytes(' not in opening
     assert opening.index("engine.prepare_serving_workspaces()") < opening.index("let result = body(&engine)")
+    assert opening.index("engine.prepare_scoring_prefill()") < opening.index("let result = body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
     # Shared DFlash only gains an explicit API; all existing users keep lazy timing.
     drafter = (root / "glm5/dflash.rs").read_text()

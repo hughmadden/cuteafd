@@ -591,10 +591,16 @@ impl Opened {
             else { args.pool_tokens };
         let spark = args.peers.is_some();
         let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers);
-        let workspace_reserve = engine::workspace_reserve(&programs, &self.cfg, &model, args.prefill_rows, pool_bound,
+        // The step workspaces the engine will allocate: page tables over the pool's bound, and
+        // routed-expert rows as `experts` will make them (FP8 experts local, or Spark staging).
+        let pages = pool_bound.div_ceil(engine::PAGE_ROWS).max(1).next_multiple_of(engine::UNIT_PAGES);
+        let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
             engine::WorkspaceOptions { fp32_partials: args.kda_fp32_partials, output_shard: args.kda_output_shard,
                 expanded: args.kda_prefill_expanded, full_logits: args.full_prefill_logits },
-            lanes, peer_stream.is_some(), args.draft.is_some())?;
+            pages, pages / engine::UNIT_PAGES)
+            .with_experts(!args.skip_experts && self.fp8().is_some(), spark);
+        let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
+            args.draft.is_some())?;
         let workspace_allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").workspace_bytes[0]
             * args.prefill_rows.max(1) as u64 / 4096;
         let workspace_extra = workspace_reserve.iter().copied().max().unwrap_or(0).saturating_sub(workspace_allowance);
