@@ -229,6 +229,11 @@ pub(crate) struct PlanArgs {
     /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_lanes: u64,
+    /// The most rows of one decode or verify step for --layout (GLM 5.3 Flash's --decode-rows: its
+    /// decode workspace and replay records; 0: the decode programs' 64).
+    #[arg(long, default_value_t = 0, value_parser = clap::builder::TypedValueParser::map(
+        clap::builder::PossibleValuesParser::new(["0", "64", "128"]), |rows| rows.parse::<u64>().expect("a listed row count")))]
+    pub(crate) decode_rows: u64,
     /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
     /// engines' --headroom-gib).
     #[arg(long, default_value_t = 2.0)]

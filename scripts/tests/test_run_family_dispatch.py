@@ -423,7 +423,7 @@ def test_glmf_default_launch_passes_no_memory_profile_option(tmp_path):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in ("--index-cache", "--kda-state", "--prefix-marks", "--host-cache-bytes", "--prefill-lanes",
-                   "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"):
+                   "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib", "--decode-rows"):
         assert option not in launch, (option, launch)
 
 
@@ -507,6 +507,28 @@ def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, f
     ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
 ])
 def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,wide", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                       ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_decode_rows_are_forwarded_only_when_wide(tmp_path, keys, wide):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--decode-rows 128" in launch) == wide, launch
+    assert "--decode-rows 64" not in launch and launch.count("--decode-rows") == int(wide)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROWS=128\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=96\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+])
+def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr

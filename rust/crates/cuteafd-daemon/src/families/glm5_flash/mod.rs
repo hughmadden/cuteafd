@@ -75,6 +75,15 @@ pub(crate) struct EngineArgs {
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
     #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// The most rows one decode or verify step takes (all sequences' next tokens and drafts):
+    /// 64 (the decode programs' rows), or 128, where steps past 64 rows run the wide `_m128`
+    /// programs (fewer rows keep the 64-row ones, so their bits and speed do not change). At 16
+    /// sequences that is 7 drafts each instead of 3. 128 doubles the speculative replay records
+    /// (321 MB more with FP32 or BF16 state) and grows the decode workspace; one GPU only.
+    #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROWS", default_value_t = engine::DECODE_ROWS,
+        value_parser = clap::builder::TypedValueParser::map(clap::builder::PossibleValuesParser::new(["64", "128"]),
+            |rows| rows.parse::<usize>().expect("a listed row count")))]
+    pub decode_rows: usize,
     /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
     /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
     /// --prefill-rows rows. The lanes share one set of attention temporaries.
@@ -273,7 +282,48 @@ mod draft_cli_tests {
             cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
         assert_eq!((defaults.kda_state.program("m64"), defaults.kda_state.program("m4096"),
             defaults.kda_state.commit_program()), ("kda_m64".to_string(), "kda_m4096".to_string(), "kda_commit"));
+        // Decode steps of up to 64 rows: the `_m64` programs alone, no wide program required.
+        assert_eq!(defaults.decode_rows, engine::DECODE_ROWS);
+        assert!(wide_decode_programs(&defaults, false).is_empty() && wide_decode_programs(&defaults, true).is_empty());
         check_options(&defaults).unwrap();
+    }
+
+    /// `--decode-rows` takes 64 or 128; 128 runs on one GPU and needs the wide programs its
+    /// configuration's steps launch, and the commit of their 128-row records.
+    #[test]
+    fn decode_rows_take_64_or_128_on_one_gpu() {
+        assert_eq!(parse(&["--decode-rows", "128"]).decode_rows, engine::WIDE_DECODE_ROWS);
+        assert_eq!(parse(&["--decode-rows", "64"]).decode_rows, engine::DECODE_ROWS);
+        for rows in ["96", "256", "0"] {
+            assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--decode-rows", rows]).is_err(), "{rows}");
+        }
+        check_options(&parse(&["--decode-rows", "128"])).unwrap();
+        check_options(&parse(&["--decode-rows", "64", "--split-device", "1"])).unwrap();
+        let error = check_options(&parse(&["--decode-rows", "128", "--split-device", "1"])).unwrap_err().to_string();
+        assert!(error.contains("--decode-rows 128") && error.contains("one GPU"), "{error}");
+        let wide = |extra: &[&str], compact: bool| {
+            let mut args = vec!["--decode-rows", "128"];
+            args.extend_from_slice(extra);
+            wide_decode_programs(&parse(&args), compact)
+        };
+        let common = ["glmf_mhc_post_pre_m128", "glmf_mla_producer_m128", "glmf_index_topk_decode_m128",
+            "glmf_sparse_mla_decode_m128", "glmf_o_m128", "glmf_ffn_i2048_m128", "glmf_ffn_i12288_m128"];
+        let expect = |kda: &str, index: &str, commit: &str| {
+            let mut names: Vec<String> = common.iter().map(|n| n.to_string()).collect();
+            names.extend([kda.to_string(), index.to_string(), commit.to_string()]);
+            names.sort();
+            names
+        };
+        let sorted = |mut names: Vec<String>| {
+            names.sort();
+            names
+        };
+        assert_eq!(sorted(wide(&[], false)), expect("glmf_kda_m128", "glmf_index_producer_m128", "glmf_kda_commit_m128"));
+        assert_eq!(sorted(wide(&["--kda-state", "bf16"], true)),
+            expect("glmf_kda_s16_m128", "glmf_index_producer_c_m128", "glmf_kda_commit_c_s16_m128"));
+        assert_eq!(sorted(wide(&["--kda-fp8", "row128"], false)),
+            expect("glmf_kda_w8_m128", "glmf_index_producer_m128", "glmf_kda_commit_m128"));
     }
 
     #[test]
@@ -530,6 +580,9 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
         "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
+        "--decode-rows {} runs the wide decode programs on one GPU: the head split's programs take {} rows \
+        (drop --split-device or keep --decode-rows {})", args.decode_rows, engine::DECODE_ROWS, engine::DECODE_ROWS);
     Ok(())
 }
 
@@ -546,7 +599,23 @@ impl EngineArgs {
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache, kda_state: args.kda_state }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state, decode_rows: args.decode_rows }
+}
+
+/// The wide decode programs (`_m128`) the decode steps of `args` launch past 64 rows, and the
+/// commit of their 128-row replay records: none with `--decode-rows 64`.
+fn wide_decode_programs(args: &EngineArgs, compact: bool) -> Vec<String> {
+    if args.decode_rows <= engine::DECODE_ROWS {
+        return Vec::new();
+    }
+    let cap = engine::decode_cap(args.decode_rows);
+    let kda = if args.kda_fp8 != fp8::KdaFp8::Off { format!("kda_w8_{cap}") } else { args.kda_state.program(cap) };
+    let index = if compact { "index_producer_c" } else { "index_producer" };
+    let commit = if compact { args.kda_state.compact_commit_program() } else { args.kda_state.commit_program() };
+    [format!("mhc_post_pre_{cap}"), kda, format!("mla_producer_{cap}"), format!("{index}_{cap}"),
+        format!("index_topk_decode_{cap}"), format!("sparse_mla_decode_{cap}"), format!("o_{cap}"),
+        format!("ffn_i2048_{cap}"), format!("ffn_i12288_{cap}"), format!("{commit}_{cap}")]
+        .into_iter().map(|name| format!("glmf_{name}")).collect()
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -670,6 +739,10 @@ impl Opened {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
+        for name in wide_decode_programs(args, compact) {
+            programs.spec(&name).with_context(|| format!("--decode-rows {} needs program {name}; this native \
+                library predates it (or was exported with --glmf-wide-decode-rows 0)", args.decode_rows))?;
+        }
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
@@ -766,16 +839,17 @@ impl Opened {
             }
             let dense = self.load_dense(args, &model.layers)?;
             let mut selector = crate::shared::token_io::TokenSelector::new(&self.library, args.token_io.token_select,
-                self.cfg.vocab_size, engine::DECODE_ROWS)?;
+                self.cfg.vocab_size, args.decode_rows)?;
             selector.reserve_sampler()?;
             let lanes = if engine::prefill_pipelines(layers, self.cfg.layers, experts.as_ref(), args.prefill_lanes) {
                 args.prefill_lanes
             } else { 1 };
             let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
                 &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
-            // The caches this engine builds: records per token, state and marks follow the index cache.
-            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
-                index_cache.into(), args.kda_state.bytes() as u64)?;
+            // The caches this engine builds: records per token, state and marks follow the index cache,
+            // the replay records the decode rows.
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry_rows(&self.cfg, layers, 1,
+                index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
@@ -805,18 +879,26 @@ impl Opened {
                 engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 })
             };
+            // The planner's workspace allowance was measured at the 64-row decode workspace and
+            // sampler: a wider decode workspace (its formula, over this build's programs) and
+            // sampler add to it.
+            let wide = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
+                step_settings(args, index_cache)).with_experts(args.local_experts, args.peers.is_some())
+                .wide_decode_bytes()? + crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS,
+                    self.cfg.vocab_size);
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra,
-                index_cache.into(), args.kda_state.bytes() as u64)?
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + wide,
+                index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?
         } else {
             args.pool_tokens
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state)?;
-        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, "GLM 5.3 Flash DSA index cache");
+            args.kda_state, args.decode_rows)?;
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, decode_rows = engine.decode_rows,
+            "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;

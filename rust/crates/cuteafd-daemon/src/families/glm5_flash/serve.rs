@@ -72,10 +72,10 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
-    /// Which drafts a speculative step verifies under the decode programs' 64 rows: `cost` (every
-    /// sequence the same room, 64 / sequences - 1 drafts, the cost model's depth within it) or
-    /// `chain` (each sequence's drafts cut where the product of the drafter's probabilities falls
-    /// below --spec-tau, then the least likely drafts across sequences dropped first).
+    /// Which drafts a speculative step verifies under its decode rows (--decode-rows): `cost`
+    /// (every sequence the same room, rows / sequences - 1 drafts, the cost model's depth within
+    /// it) or `chain` (each sequence's drafts cut where the product of the drafter's probabilities
+    /// falls below --spec-tau, then the least likely drafts across sequences dropped first).
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
     pub verify_policy: VerifyPolicy,
     /// The chain cut of --verify-policy chain (0 < tau <= 1).
@@ -188,7 +188,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences.min(args.engine.decode_rows);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = match (args.draft_fixed, args.verify_policy) {
         (Some(n), _) => format!("fixed {n}"),
@@ -226,7 +226,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let opened = match open(&args).and_then(|opened| {
         let layers = args.layers.unwrap_or(opened.cfg.layers).min(opened.cfg.layers);
         args.planner_mark_slots = match args.prefix_marks {
-            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(DECODE_ROWS),
+            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(args.decode_rows),
                 args.index_cache, args.kda_state)?,
             PrefixMarks::Pool => 0,
         };
@@ -239,7 +239,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         }
     };
     let mut ready = Some(ready);
-    let lanes = max_sequences.min(DECODE_ROWS);
+    let lanes = max_sequences.min(args.decode_rows);
     // Either admission (planned or measured) keeps `planner_mark_slots` arena marks free.
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
@@ -517,10 +517,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     marks: (PrefixMarks, usize), select: SelectPlacement, ready: &mut dyn FnMut()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences, marks)?;
+    // The most rows one decode or verify step takes (`--decode-rows`): every step's next tokens and
+    // drafts fit in it.
+    let verify_rows = engine.decode_rows;
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
-        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?,
+        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, verify_rows)?,
     };
     ready();
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
@@ -537,7 +540,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
         _ => GLMF_TP2_STEP_MS.to_vec(),
     };
-    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
+    let mut cost = dflash_policy::step_cost(&table, verify_rows);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -621,14 +624,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }));
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained. The
-                // decode path (the default) runs verify steps of up to `verify_rows` (64) rows, the
-                // prefill path (`score_path: prefill`) the prompt chunks a prompt's prefill runs.
+                // decode path (the default) runs verify steps of up to `verify_rows` (64, at most the
+                // engine's --decode-rows) rows, the prefill path (`score_path: prefill`) the prompt
+                // chunks a prompt's prefill runs.
                 let mut placement = admitted.placement;
                 let scored = match job.probe.as_ref().and_then(|p| p.spec.score_path.as_deref()) {
                     Some("prefill") => score_prefill_path(&engine, &job.probe, &tokens, from, &mut placement),
                     None | Some("decode") => {
                         let rows = job.probe.as_ref().and_then(|p| p.spec.verify_rows).unwrap_or(DECODE_ROWS)
-                            .clamp(1, DECODE_ROWS);
+                            .clamp(1, verify_rows);
                         if let Some(p) = &job.probe {
                             p.selected_score_path("decode");
                         }
@@ -676,7 +680,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let library = &opened.library;
             let finished = if policy.batch && engine.packs_prefill() {
                 let limits = engine.packed_limits();
-                prefills.round_groups(DECODE_ROWS, |group, next| packable(group, next, &limits),
+                prefills.round_groups(verify_rows, |group, next| packable(group, next, &limits),
                     |group| if group.len() == 1 {
                         vec![prefill_chunk(engine, library, &mut selector, &mut cache, &family, caching, &mut group[0])]
                     } else {
@@ -797,8 +801,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // Rows each sequence may add after its next token: the same room for every sequence (cost),
         // or as many as the decode programs hold, the step's rows budgeted after drafting (chain).
         let room = match policy.verify {
-            VerifyPolicy::Cost => (DECODE_ROWS / active.len()).max(1) - 1,
-            VerifyPolicy::Chain => DECODE_ROWS - 1,
+            VerifyPolicy::Cost => (verify_rows / active.len()).max(1) - 1,
+            VerifyPolicy::Chain => verify_rows - 1,
         };
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
@@ -889,7 +893,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             }).collect();
             let drafts: Vec<usize> = sequences.iter().map(|rows| rows.len() - 1).collect();
-            for (i, kept) in verify::budget(&probs, &drafts, DECODE_ROWS).into_iter().enumerate() {
+            for (i, kept) in verify::budget(&probs, &drafts, verify_rows).into_iter().enumerate() {
                 sequences[i].truncate(kept + 1);
                 if !used_copy[i] {
                     planned[i] = planned[i].min(kept);

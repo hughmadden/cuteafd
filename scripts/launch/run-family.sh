@@ -659,10 +659,11 @@ if [[ $family == glm5_flash ]]; then
     on) family_args+=(--prefill-batch) ;;
     *) echo "GLM5_FLASH_PREFILL_BATCH must be on or off" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under the 64 decode rows,
-  # cost (default: the same room for every sequence, the cost model's depth within it) or chain
-  # (each sequence's drafts cut at GLM5_FLASH_SPEC_TAU, default 0.7, of cumulative draft
-  # probability, then the least likely drafts across sequences dropped first).
+  # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under its decode rows
+  # (GLM5_FLASH_DECODE_ROWS, 64 by default): cost (default: the same room for every sequence, the
+  # cost model's depth within it) or chain (each sequence's drafts cut at GLM5_FLASH_SPEC_TAU,
+  # default 0.7, of cumulative draft probability, then the least likely drafts across sequences
+  # dropped first).
   verify_policy="$(get GLM5_FLASH_VERIFY_POLICY cost)"
   case "$verify_policy" in
     ""|cost) ;;
@@ -674,6 +675,21 @@ if [[ $family == glm5_flash ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
     family_args+=(--spec-tau "$spec_tau")
   fi
+  # GLM5_FLASH_DECODE_ROWS: the most rows one decode or verify step takes, 64 (default: the decode
+  # programs' rows) or 128: steps past 64 rows run the wide _m128 programs (16 sequences verify 7
+  # drafts each instead of 3; fewer rows keep the 64-row programs). Their replay records take
+  # 321 MB more. One GPU only.
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  case "$decode_rows" in
+    ""|64) ;;
+    128)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--decode-rows 128) ;;
+    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

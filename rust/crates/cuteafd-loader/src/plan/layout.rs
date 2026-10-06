@@ -35,6 +35,9 @@ pub struct LayoutOptions {
     pub prefill_rows: u64,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+    /// Rows of GLM 5.3 Flash's widest decode and verify step (`--decode-rows`: its decode workspace
+    /// and replay records); 0 selects the decode programs' 64.
+    pub glmf_decode_rows: u64,
     /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance.
     pub graph_budget_bytes: Option<u64>,
     /// Spark wave capacity in rows (`expertd --capacity`).
@@ -74,6 +77,7 @@ impl Default for LayoutOptions {
             head_split: true,
             prefill_rows: 0,
             prefill_lanes: 0,
+            glmf_decode_rows: 0,
             graph_budget_bytes: None,
             spark_capacity_rows: 4096,
             pool_tokens: None,
@@ -477,9 +481,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // GLM 5.3 Flash on one GPU: the step workspaces its engine allocates, from the program manifest.
     let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
         else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
+    let glmf_decode_rows = if options.glmf_decode_rows > 0 { options.glmf_decode_rows }
+        else { crate::serving_capacity::GLMF_DECODE_ROWS };
     let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
         .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
-            context_tokens))).flatten();
+            context_tokens, glmf_decode_rows))).flatten();
 
     // Fixed runtime costs.
     let gpus_now = active_gpus;
@@ -633,7 +639,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
-        prefill_rows: prefill_rows, ..Default::default() });
+        prefill_rows: prefill_rows, glmf_decode_rows, ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
         Ok(Some(mut geometry)) => {
@@ -737,10 +743,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 }
 
 /// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine
-/// allocates for the decode workspace and `lanes` prefill lanes of `rows` rows
-/// (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
+/// allocates for the decode workspace of `decode_rows` rows and `lanes` prefill lanes of `rows`
+/// rows (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
-    lanes: u64, rows: u64, context: u64) -> Option<u64> {
+    lanes: u64, rows: u64, context: u64, decode_rows: u64) -> Option<u64> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
@@ -753,11 +759,12 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
     let shape = GlmfStepShape { lead: true, split: false, local_experts: !spark, spark, partial_bytes: 2,
         output_shard: false, full_prefill_logits: false, table_pages, table_pool_pages };
-    let decode = glmf_step_scratch(&lookup, &cfg, options, 64, true).ok()?;
+    let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
     let prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // A lane needs a Spark transport of its own: local experts prefill in one.
     let lanes = if spark { lanes } else { 1 };
-    Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, &shape, decode, prefill).device_bytes())
+    Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, decode_rows, &shape, decode, prefill)
+        .device_bytes())
 }
 
 fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {

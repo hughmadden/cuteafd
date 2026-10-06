@@ -1,14 +1,14 @@
 //! Likelihood-ranked verify rows (`serve-glmf --verify-policy chain`), after glm53f-afd's
 //! verify-length policy (hughmadden/glm53f-afd v1.1.0, MIT: `crates/glm53f-coordinator/src/spec.rs`).
 //!
-//! The default policy (`cost`) gives every sequence the same room under the decode programs' 64
-//! rows (`64 / sequences - 1` drafts: 3 at 16 sequences) and lets the cost model choose a depth
-//! within it. `chain` spends the 64 rows by draft likelihood instead: each sequence's drafts are
-//! cut where the product of the drafter's probabilities through the draft (the chain's own
-//! estimate that the draft is kept) falls below tau, 0.7; when the step's rows still exceed the
-//! budget, the least likely drafts across all sequences are dropped first. A confident sequence
-//! verifies up to its seven drafts while a doubtful one verifies few, so the rows go to the
-//! drafts most likely to be kept.
+//! The default policy (`cost`) gives every sequence the same room under the step's decode rows
+//! (`--decode-rows`, 64 by default: `64 / sequences - 1` drafts, 3 at 16 sequences) and lets the
+//! cost model choose a depth within it. `chain` spends those rows by draft likelihood instead:
+//! each sequence's drafts are cut where the product of the drafter's probabilities through the
+//! draft (the chain's own estimate that the draft is kept) falls below tau, 0.7; when the step's
+//! rows still exceed the budget, the least likely drafts across all sequences are dropped first. A
+//! confident sequence verifies up to its seven drafts while a doubtful one verifies few, so the
+//! rows go to the drafts most likely to be kept.
 //!
 //! It changes only which drafts a step verifies: verification decides what is kept.
 //!
@@ -28,7 +28,8 @@ pub(crate) const COPY_TOKEN_P: f32 = 0.94;
 /// Which drafts a speculative step verifies (`--verify-policy`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum VerifyPolicy {
-    /// Every sequence the same room (`64 / sequences - 1` drafts), the cost model's depth within it.
+    /// Every sequence the same room (`decode rows / sequences - 1` drafts), the cost model's depth
+    /// within it.
     #[default]
     Cost,
     /// Each sequence's drafts cut at `--spec-tau` cumulative probability, then the least likely
