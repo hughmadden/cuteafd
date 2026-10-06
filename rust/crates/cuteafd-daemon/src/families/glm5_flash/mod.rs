@@ -635,6 +635,12 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Diagnostic for --resume-at with --prefix-marks pool: fill the reserved unit 0's first MLA
+    /// record with 0xFF in every MLA layer before the continuations and report the non-finite
+    /// logits instead of failing on them (non-zero: a kernel reads that record for masked
+    /// candidates).
+    #[arg(long, hide = true, requires = "resume_at")]
+    pub resume_poison_unit0: bool,
     /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
     /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
     /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
@@ -1303,7 +1309,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat, args.engine.prefix_marks);
+            args.resume_repeat, args.engine.prefix_marks, args.resume_poison_unit0);
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);
