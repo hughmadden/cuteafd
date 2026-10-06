@@ -916,7 +916,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         // What the engine allocates from the same arithmetic and manifest.
         let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
             output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
-        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, &shape,
+        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, 64, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
         let steps = gpu.items.iter().find(|i| i.category == Category::Workspace && i.group == "steps").unwrap();
@@ -940,6 +940,72 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
         .collect();
     assert_eq!(graphs, [("graph budget", 512 << 20)]);
+}
+
+/// `--decode-rows 128`: the planner charges the decode workspace the engine allocates at 128 rows
+/// (over the `_m64` and `_m128` programs' scratch) and the 128-row replay records.
+#[test]
+fn glm5_flash_layout_charges_the_wide_decode_workspace_and_replay_records() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glm_flash_rank_cache_geometry_rows, glmf_manifest_scratch, glmf_step_scratch,
+        glmf_step_workspaces, GlmfIndexCache, GlmfStepShape};
+    use cuteafd_core::memory_layout::Category;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // The base export's scratch, and the wide programs' at 128 rows (their scratch formulas at 128
+    // rows; the sparse MLA and top-k plans scaled with the rows: test inputs, not an export).
+    let programs: Vec<(&str, u64)> = vec![("glmf_mhc_pre", 26_214_400), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
+        ("glmf_ffn_i12288_m4096", 353_894_400)];
+    let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_307_648),
+        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
+        ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
+        ("glmf_ffn_i12288_m128", 9_437_184)];
+    let manifest = |with_wide: bool| {
+        let extra: &[(&str, u64)] = if with_wide { &wide } else { &[] };
+        let all: Vec<Value> = programs.iter().chain(extra)
+            .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+        json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072}, "programs": all})
+    };
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest(true).to_string()).unwrap();
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let options = |decode_rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+        context_tokens: 131_072, workspace_manifest: Some(path.clone()), glmf_decode_rows: decode_rows,
+        ..Default::default() }), ..sparks(4) };
+    let item = |decode_rows: u64, category: Category, group: &str| plan(dir.path(), &options(decode_rows)).unwrap()
+        .memory_layout.unwrap().devices[0].items.iter().find(|i| i.category == category && i.group == group).unwrap()
+        .bytes;
+    let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+        output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+    let full = manifest(true);
+    let lookup = glmf_manifest_scratch(&full);
+    let engine = |decode_rows: u64| glmf_step_workspaces(&cfg, 2, 4096, decode_rows, &shape,
+        glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
+        glmf_step_scratch(&lookup, &cfg, Default::default(), 4096, false).unwrap()).device_bytes();
+    let intake = 2 * 4 * 4096 * 4096 * 2;
+    for decode_rows in [0, 64, 128] {
+        let rows = if decode_rows == 0 { 64 } else { decode_rows };
+        assert_eq!(item(decode_rows, Category::Workspace, "steps"), engine(rows) + intake, "{decode_rows} rows");
+    }
+    // The wide programs' scratch stays under mhc_pre's (prefill capacity); the top-k's grows.
+    let narrow = glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap();
+    let both = glmf_step_scratch(&lookup, &cfg, Default::default(), 128, true).unwrap();
+    assert_eq!((narrow.programs, both.programs, narrow.topk, both.topk), (26_214_400, 26_214_400, 8_653_824, 17_307_648));
+    // The state item carries the replay records at the decode rows.
+    let replay = |rows: u64| glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap()
+        .ranks[0].clone();
+    let (r64, r128) = (replay(64), replay(128));
+    assert_eq!(item(128, Category::Kv, "state") - item(64, Category::Kv, "state"),
+        (r128.speculative_replay_bytes + r128.fixed_state_bytes) - (r64.speculative_replay_bytes + r64.fixed_state_bytes));
+    // A build without the wide programs: no formula at 128 rows (the planner falls back to its allowance).
+    let base = manifest(false);
+    assert!(glmf_step_scratch(glmf_manifest_scratch(&base), &cfg, Default::default(), 128, true).is_err());
 }
 
 #[test]

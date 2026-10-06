@@ -236,9 +236,11 @@ fn state_delta(a: &[u8], b: &[u8], recurrent_bytes: usize, element: usize) -> (u
     (differ, worst)
 }
 
-fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>) -> Result<usize> {
-    ensure!(rows > 0 && rows <= super::engine::DECODE_ROWS && rows < tokens,
-        "--replay-check needs 1..={} rows and at least one prefill token", super::engine::DECODE_ROWS);
+/// The prefill length of a check of `rows`-row steps over `tokens` tokens, on an engine taking
+/// steps of up to `cap` rows (`--decode-rows`).
+fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>, cap: usize) -> Result<usize> {
+    ensure!(rows > 0 && rows <= cap && rows < tokens,
+        "--replay-check needs 1..={cap} rows (--decode-rows {cap}) and at least one prefill token");
     let prefill = prefill.unwrap_or(64).min(tokens - rows);
     ensure!(prefill > 0, "--replay-check needs at least one prefill token");
     Ok(prefill)
@@ -272,7 +274,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     let sequence = tokens(args)?;
     let rows = args.step_rows;
     ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut serial = allocator.admit(prefill + rows)?;
     let mut wide = allocator.admit(prefill + rows)?;
@@ -302,7 +304,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     let embed = &sequence[prefill..prefill + rows];
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
@@ -439,13 +441,17 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
 mod tests {
     #[test]
     fn replay_check_rejects_invalid_bounds_before_subtracting() {
-        assert!(super::replay_bounds(10, 11, None).is_err());
-        assert!(super::replay_bounds(0, 0, None).is_err());
-        assert!(super::replay_bounds(10, 0, None).is_err());
-        assert!(super::replay_bounds(10, 10, None).is_err());
-        assert!(super::replay_bounds(100, super::super::engine::DECODE_ROWS + 1, None).is_err());
-        assert!(super::replay_bounds(10, 4, Some(0)).is_err());
-        assert_eq!(super::replay_bounds(10, 4, Some(20)).unwrap(), 6);
+        use super::super::engine::{DECODE_ROWS, WIDE_DECODE_ROWS};
+        assert!(super::replay_bounds(10, 11, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(0, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 10, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(100, DECODE_ROWS + 1, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 4, Some(0), DECODE_ROWS).is_err());
+        assert_eq!(super::replay_bounds(10, 4, Some(20), DECODE_ROWS).unwrap(), 6);
+        // --decode-rows 128: a 128-row window (the wide programs) after the default 64-token prefill.
+        assert_eq!(super::replay_bounds(3000, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
+        assert!(super::replay_bounds(3000, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
     }
 
     #[test]
@@ -479,7 +485,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
     println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
     for rows in 1..=max_rows {
-        if count * rows > super::engine::DECODE_ROWS {
+        if count * rows > engine.decode_rows {
             break;
         }
         let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();

@@ -165,7 +165,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences.min(args.engine.decode_rows);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
     let drafter = args.engine.draft.as_deref()
@@ -199,7 +199,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let opened = match open(&args).and_then(|opened| {
         let layers = args.layers.unwrap_or(opened.cfg.layers).min(opened.cfg.layers);
         args.planner_mark_slots = match args.prefix_marks {
-            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(DECODE_ROWS),
+            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(args.decode_rows),
                 args.index_cache, args.kda_state)?,
             PrefixMarks::Pool => 0,
         };
@@ -212,7 +212,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         }
     };
     let mut ready = Some(ready);
-    let lanes = max_sequences.min(DECODE_ROWS);
+    let lanes = max_sequences.min(args.decode_rows);
     // Either admission (planned or measured) keeps `planner_mark_slots` arena marks free.
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
@@ -477,10 +477,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     marks: (PrefixMarks, usize), select: SelectPlacement, ready: &mut dyn FnMut()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences, marks)?;
+    // The most rows one decode or verify step takes (`--decode-rows`): every step's next tokens and
+    // drafts fit in it.
+    let verify_rows = engine.decode_rows;
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
-        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?,
+        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, verify_rows)?,
     };
     ready();
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
@@ -497,7 +500,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
         _ => GLMF_TP2_STEP_MS.to_vec(),
     };
-    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
+    let mut cost = dflash_policy::step_cost(&table, verify_rows);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -581,14 +584,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }));
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained. The
-                // decode path (the default) runs verify steps of up to `verify_rows` (64) rows, the
-                // prefill path (`score_path: prefill`) the prompt chunks a prompt's prefill runs.
+                // decode path (the default) runs verify steps of up to `verify_rows` (64, at most the
+                // engine's --decode-rows) rows, the prefill path (`score_path: prefill`) the prompt
+                // chunks a prompt's prefill runs.
                 let mut placement = admitted.placement;
                 let scored = match job.probe.as_ref().and_then(|p| p.spec.score_path.as_deref()) {
                     Some("prefill") => score_prefill_path(&engine, &job.probe, &tokens, from, &mut placement),
                     None | Some("decode") => {
                         let rows = job.probe.as_ref().and_then(|p| p.spec.verify_rows).unwrap_or(DECODE_ROWS)
-                            .clamp(1, DECODE_ROWS);
+                            .clamp(1, verify_rows);
                         if let Some(p) = &job.probe {
                             p.selected_score_path("decode");
                         }
@@ -793,7 +797,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
         // Rows each sequence may add after its next token.
-        let room = (DECODE_ROWS / active.len()).max(1) - 1;
+        let room = (verify_rows / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // DFlash2 drafts after every next token, then the policy's counts.

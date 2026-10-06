@@ -650,6 +650,21 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--kda-state "$kda_state") ;;
     *) echo "GLM5_FLASH_KDA_STATE must be f32, bf16 or bf16-tile" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_DECODE_ROWS: the most rows one decode or verify step takes, 64 (default: the decode
+  # programs' rows) or 128: steps past 64 rows run the wide _m128 programs (16 sequences verify 7
+  # drafts each instead of 3; fewer rows keep the 64-row programs). Their replay records take
+  # 321 MB more. One GPU only.
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  case "$decode_rows" in
+    ""|64) ;;
+    128)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--decode-rows 128) ;;
+    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

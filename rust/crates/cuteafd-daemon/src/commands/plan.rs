@@ -31,6 +31,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
                 prefill_lanes: args.prefill_lanes,
+                glmf_decode_rows: args.decode_rows,
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 concurrency: args.concurrency,
@@ -116,6 +117,7 @@ mod tests {
             context_tokens: 262144,
             prefill_rows: 4096,
             prefill_lanes: 0,
+            decode_rows: 0,
             headroom_gib: 2.0,
             graph_budget_mib: None,
             concurrency: 8,
@@ -132,6 +134,18 @@ mod tests {
         assert_eq!(cli.vision, Some(cuteafd_loader::plan::MediaMode::Off));
         assert_eq!(cli.audio, Some(cuteafd_loader::plan::MediaMode::Auto));
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "bad"]).is_err());
+    }
+
+    #[test]
+    fn glm_flash_decode_rows_reach_the_layout() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, rows) in [(&[][..], 0), (&["--decode-rows", "64"][..], 64), (&["--decode-rows", "128"][..], 128)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_decode_rows, rows);
+        }
+        assert!(parse(&["--decode-rows", "96"]).is_err());
     }
 
     #[test]
