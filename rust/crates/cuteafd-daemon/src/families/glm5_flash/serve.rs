@@ -174,7 +174,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let opened = match open(&args).and_then(|opened| {
         let layers = args.layers.unwrap_or(opened.cfg.layers).min(opened.cfg.layers);
         args.planner_mark_slots = match args.prefix_marks {
-            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(DECODE_ROWS))?,
+            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, max_sequences.min(DECODE_ROWS),
+                args.index_cache)?,
             PrefixMarks::Pool => 0,
         };
         Ok(opened)
@@ -373,9 +374,12 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 
 /// The mark arena slots [`prefix_cache`] allocates for `lanes` decoding sequences over the
 /// first `layers` layers, from the checkpoint alone: the planner reserves them before the pool.
+/// A mark is the slot regions the engine hands out, so it follows `index_cache` (the compact
+/// cache's tails ride in it). Under a head split compact falls back to keys at start-up; the
+/// count is checked against the arena `prefix_cache` builds either way.
 pub(crate) fn arena_mark_slots(args: &PrefixArgs, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig,
-    layers: usize, lanes: usize) -> Result<usize> {
-    let geometry = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(cfg, layers)?;
+    layers: usize, lanes: usize, index_cache: super::engine::IndexCache) -> Result<usize> {
+    let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(cfg, layers, 1, index_cache.into())?;
     Ok(args.mark_slots(lanes, usize::try_from(geometry.ranks[0].retained_mark_bytes)?))
 }
 
@@ -389,7 +393,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     let family = GlmfPrefix::new(engine, marks, |mark| args.mark_slots(lanes, mark))?;
     anyhow::ensure!(family.slots() == planned, "the prefix mark arena holds {} marks of {} B, the KV admission \
         reserved {planned}", family.slots(), family.mark_bytes());
-    let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
+    let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {

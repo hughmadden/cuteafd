@@ -14,10 +14,16 @@
 //! and records each row's replay inputs; `commit` then applies the accepted
 //! rows with the recurrent step's own arithmetic. MLA layers
 //! keep FP8 528-byte latent records in 64-row pages, and their DSA indexer
-//! keeps per-token BF16 keys and gates beside the records and one FP8 key
-//! per completed 4-token pool in pool pages (64 pools per page). The
-//! indexer selects every earlier token up to 2051 tokens; past that the top
-//! 512 pools (glmf_index_topk) expand to tokens plus the open tail pool.
+//! keeps one FP8 key per completed 4-token pool in pool pages (64 pools per
+//! page). The pooled keys are computed from the pool's BF16 keys and gates:
+//! with `--index-cache keys` every token's key | gate row is kept beside its
+//! record (512 B per token and MLA layer); with `--index-cache compact` only
+//! the rows of each sequence's open pool are (at most three, in a per-slot
+//! tail that the KDA slot regions carry, so marks and slot copies include it),
+//! and a speculative step records its rows for `commit` to rebuild the tails.
+//! Both give the same pooled keys bit for bit. The indexer selects every
+//! earlier token up to 2051 tokens; past that the top 512 pools
+//! (glmf_index_topk) expand to tokens plus the open tail pool.
 //!
 //! FFN: dense SwiGLU (clamped at 10), or the MoE: FP32 router logits, the
 //! native sigmoid top-8 select, the shared expert, and routed experts from
@@ -86,6 +92,34 @@ fn replay_bytes(heads: usize, channels: usize) -> usize {
 pub(crate) fn kda_layer_bytes(cfg: &GlmNextConfig, kda_heads: usize) -> (usize, usize, usize) {
     let d = kda_heads * cfg.kda_head_dim;
     (d * cfg.kda_head_dim * 4, 3 * 3 * d * 2, replay_bytes(kda_heads, 3 * d))
+}
+
+/// One token's BF16 DSA index key | gate row (128 keys after k_norm, 128 gates).
+pub(crate) const KEY_BYTES: usize = 512;
+/// One sequence's index tail in one MLA layer (`TAIL_BYTES` of the fork's `_glmf_kernels.py`):
+/// an i32 row count (0..=3), 12 zero bytes, then the key | gate rows of its open pool, zero
+/// past the count.
+pub(crate) const TAIL_BYTES: usize = 16 + 3 * KEY_BYTES;
+
+/// The DSA index cache (`--index-cache`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum IndexCache {
+    /// Every token's BF16 key | gate row beside its latent record: 11,804 B per token.
+    #[default]
+    Keys,
+    /// The pooled keys alone, plus a tail of at most three BF16 key | gate rows per sequence and
+    /// MLA layer (`glmf_index_producer_c_*`, `glmf_kda_commit_c`): 6,172 B per token, the same
+    /// pooled keys bit for bit. A two-GPU head split keeps `keys`.
+    Compact,
+}
+
+impl From<IndexCache> for cuteafd_loader::serving_capacity::GlmfIndexCache {
+    fn from(cache: IndexCache) -> Self {
+        match cache {
+            IndexCache::Keys => Self::Keys,
+            IndexCache::Compact => Self::Compact,
+        }
+    }
 }
 const MAX_RANKS: usize = 6;
 /// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
@@ -512,6 +546,8 @@ pub(crate) struct StepSettings {
     pub full_prefill_logits: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
+    /// The DSA index cache: the compact one runs the `index_producer_c` programs.
+    pub index_cache: IndexCache,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -520,13 +556,16 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         layers: &[GlmfLayer<'_>], experts: Option<&Experts<'_>>, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
+        // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
+        let index_compact = settings.index_cache == IndexCache::Compact
+            && layers.iter().any(|layer| layer.attention == GlmNextAttention::Mla);
         Self {
             library,
             programs,
             cfg,
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
-                kda_prefill_expanded: settings.kda_prefill_expanded },
+                kda_prefill_expanded: settings.kda_prefill_expanded, index_compact },
             shape: GlmfStepShape {
                 lead: true,
                 split,
@@ -684,18 +723,39 @@ impl<'a> DenseNvfp4<'a> {
     }
 }
 
-/// One GPU's caches. Per MLA layer (None for KDA): the latent record pool, and the per-token
-/// indexer keys | gates (BF16 [record slots, 256]) with the FP8 pool-key cache. Every KDA
-/// layer's pools back to back: FP32 recurrent state `[layers, slots, heads, 128, 128]`, BF16
-/// conv state `[layers, slots, 3, 3D]` and the speculative replay records (`replay_bytes`
-/// per layer), over this GPU's KDA heads. The `glmf_kda_commit` tables (slot, first row, kept
-/// rows per sequence) and the logical page of each pool-cache page within its sequence.
+/// One MLA layer's DSA index cache: the per-token keys | gates (BF16 [record slots, 256];
+/// `--index-cache keys` only) and the FP8 pool-key pages.
+struct IndexLayer<'a> {
+    keys: Option<Dev<'a>>,
+    pools: Dev<'a>,
+}
+
+/// One MLA layer's paged buffers: latent records (528 B per row) and, with `--index-cache
+/// keys`, the indexer's token keys (512 B per row), both in 64-row MLA pages, then the
+/// pool-key cache (8448 B per pool page).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PagedLayer {
+    pub records: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub keys: Option<cuteafd_ffi::CuteafdDeviceBuffer>,
+    pub pools: cuteafd_ffi::CuteafdDeviceBuffer,
+}
+
+/// One GPU's caches. Per MLA layer (None for KDA): the latent record pool and its DSA index
+/// cache. Every KDA layer's pools back to back: FP32 recurrent state `[layers, slots, heads,
+/// 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]` and the speculative replay records
+/// (`replay_bytes` per layer), over this GPU's KDA heads. With the compact index cache, every
+/// MLA layer's sequence tails `[MLA layers, slots, TAIL_BYTES]` and speculative key | gate
+/// records `[MLA layers, REPLAY_ROWS, 256]` (BF16). The `glmf_kda_commit` tables (slot, first
+/// row, kept rows per sequence) and the logical page of each pool-cache page within its
+/// sequence.
 struct Caches<'a> {
     kv: Vec<Option<Dev<'a>>>,
-    index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
+    index: Vec<Option<IndexLayer<'a>>>,
     kda_state: Dev<'a>,
     kda_conv: Dev<'a>,
     kda_replay: Dev<'a>,
+    /// Compact index cache: (tails, speculative key | gate records).
+    index_tails: Option<(Dev<'a>, Dev<'a>)>,
     commit_tables: Dev<'a>,
     pool_logical: Dev<'a>,
     /// KDA heads of this GPU.
@@ -704,20 +764,26 @@ struct Caches<'a> {
 
 impl<'a> Caches<'a> {
     /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads.
+    #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
-        slots: usize, kda_heads: usize) -> Result<Self> {
+        slots: usize, kda_heads: usize, index_cache: IndexCache) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
         let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads);
-        let (mut kv, mut index, mut kda_layers) = (Vec::new(), Vec::new(), 0);
+        let keys = index_cache == IndexCache::Keys;
+        let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0, 0);
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
                     kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
-                    index.push(Some((zeroed(pages * PAGE_ROWS * 512)?, zeroed(pool_pages * PAGE_ROWS * 132)?)));
+                    index.push(Some(IndexLayer {
+                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES)?) } else { None },
+                        pools: zeroed(pool_pages * PAGE_ROWS * 132)?,
+                    }));
+                    mla_layers += 1;
                 }
                 GlmNextAttention::Kda => {
                     kv.push(None);
@@ -726,9 +792,12 @@ impl<'a> Caches<'a> {
                 }
             }
         }
+        let index_tails = if keys || mla_layers == 0 { None } else {
+            Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * REPLAY_ROWS * KEY_BYTES)?))
+        };
         Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
-            kda_replay: zeroed(kda_layers * replay)?,
+            kda_replay: zeroed(kda_layers * replay)?, index_tails,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }
 }
@@ -784,6 +853,10 @@ pub(crate) struct GlmfEngine<'a> {
     pub slots: usize,
     /// Per layer: its index among the KDA layers (None for MLA).
     kda_ordinal: Vec<Option<usize>>,
+    /// Per layer: its index among the MLA layers (None for KDA).
+    mla_ordinal: Vec<Option<usize>>,
+    /// The DSA index cache the caches were built for.
+    pub index_cache: IndexCache,
     /// This GPU's caches (rank 0 of a head split).
     caches: Caches<'a>,
     /// This engine's GPU (rank 0 of a head split).
@@ -898,10 +971,12 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 }
 
 impl<'a> GlmfEngine<'a> {
+    /// `index_cache`: the DSA index cache (`compact` needs at least one MLA layer to matter;
+    /// without one there is no index cache, and the engine records `keys`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
-        slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -912,20 +987,27 @@ impl<'a> GlmfEngine<'a> {
         // Whole allocation units: four MLA pages and one pool page each.
         let pages = pages.max(1).next_multiple_of(UNIT_PAGES);
         let pool_pages = pages / UNIT_PAGES;
-        let mut kda_layers = 0;
-        let kda_ordinal = weights.layers.iter().map(|layer| (layer.attention == GlmNextAttention::Kda).then(|| {
-            kda_layers += 1;
-            kda_layers - 1
-        })).collect();
+        let ordinals = |kind: GlmNextAttention| -> Vec<Option<usize>> {
+            let mut count = 0;
+            weights.layers.iter().map(|layer| (layer.attention == kind).then(|| {
+                count += 1;
+                count - 1
+            })).collect()
+        };
+        let (kda_ordinal, mla_ordinal) = (ordinals(GlmNextAttention::Kda), ordinals(GlmNextAttention::Mla));
+        // No MLA layer, no index cache: the compact one has nothing to hold.
+        let index_cache = if mla_ordinal.iter().flatten().next().is_some() { index_cache } else { IndexCache::Keys };
         // A head split's shares hold half the KDA heads (and their state).
-        let kda_heads = cfg.kda_heads / if weights.layers.first().is_some_and(|l| l.split) { 2 } else { 1 };
-        let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads)?;
+        let split = weights.layers.first().is_some_and(|l| l.split);
+        ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
+        let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
+        let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots,
-            kda_ordinal, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
+            kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphCache::new(None)),
@@ -965,10 +1047,12 @@ impl<'a> GlmfEngine<'a> {
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
+        // Both GPUs run the indexer; per-rank index tails are not built yet.
+        ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads)?;
+                self.caches.kda_heads, self.index_cache)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1077,9 +1161,9 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// Copies a sequence's KDA recurrent and conv state from slot `from` to
-    /// slot `to` on the engine stream (the backup a speculative verify
-    /// restores before replaying its accepted rows).
+    /// Copies a sequence's KDA recurrent and conv state (and, with the compact index cache, its
+    /// index tails) from slot `from` to slot `to` on the engine stream (the backup a
+    /// speculative verify restores before replaying its accepted rows).
     pub fn copy_slot(&self, from: i32, to: i32) -> Result<()> {
         let (from, to) = (usize::try_from(from)?, usize::try_from(to)?);
         ensure!(from < self.slots && to < self.slots && from != to, "KDA slots {from} -> {to} out of range");
@@ -1094,7 +1178,8 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// Every KDA layer's recurrent and conv state regions of `slot` (rank 0's under a head split).
+    /// Every KDA layer's recurrent and conv state regions of `slot`, then (compact index cache)
+    /// every MLA layer's index tail (rank 0's under a head split).
     pub(crate) fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         self.slot_regions_on(0, slot)
     }
@@ -1104,7 +1189,8 @@ impl<'a> GlmfEngine<'a> {
         let layers = self.kda_ordinal.iter().flatten().count().max(1);
         let caches = self.caches_of(rank);
         let mut out = Vec::new();
-        for pool in [&caches.kda_state, &caches.kda_conv] {
+        let tails = caches.index_tails.as_ref().map(|(tails, _)| (tails, self.mla_ordinal.iter().flatten().count()));
+        for (pool, layers) in [(&caches.kda_state, layers), (&caches.kda_conv, layers)].into_iter().chain(tails) {
             let per = pool.buffer.bytes / layers / self.slots;
             for layer in 0..layers {
                 out.push(cuteafd_ffi::CuteafdDeviceBuffer {
@@ -1119,21 +1205,24 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Every MLA layer's paged buffers: latent records (528 B per row), indexer token keys
-    /// (512 B per row), both in 64-row MLA pages, and the pool-key cache (8448 B per pool page).
-    pub(crate) fn paged_buffers(&self) -> Vec<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> {
+    /// (512 B per row; `--index-cache keys` only), both in 64-row MLA pages, and the pool-key
+    /// cache (8448 B per pool page).
+    pub(crate) fn paged_buffers(&self) -> Vec<PagedLayer> {
         self.paged_buffers_on(0)
     }
 
     /// [`Self::paged_buffers`] of rank `rank` (1: the head split's identical copy).
-    pub(crate) fn paged_buffers_on(&self, rank: usize) -> Vec<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> {
+    pub(crate) fn paged_buffers_on(&self, rank: usize) -> Vec<PagedLayer> {
         let caches = self.caches_of(rank);
         caches.kv.iter().zip(&caches.index).filter_map(|(kv, index)| match (kv, index) {
-            (Some(kv), Some((keys, pools))) => Some([kv.buffer, keys.buffer, pools.buffer]),
+            (Some(kv), Some(index)) => Some(PagedLayer { records: kv.buffer, keys: index.keys.as_ref().map(|k| k.buffer),
+                pools: index.pools.buffer }),
             _ => None,
         }).collect()
     }
 
-    /// Zeroes a sequence's KDA recurrent and conv state (before its first step).
+    /// Zeroes a sequence's KDA recurrent and conv state, and its index tails (before its first
+    /// step).
     pub fn reset_slot(&self, slot: i32) -> Result<()> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
@@ -1146,17 +1235,21 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks): the FP32
-    /// recurrent state first (rank by rank under a head split), then the BF16 conv state.
+    /// recurrent state first (rank by rank under a head split), then the BF16 conv state, then
+    /// (compact index cache) every MLA layer's index tail.
     pub fn slot_state(&self, slot: i32) -> Result<Vec<u8>> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
         self.synchronize()?;
-        let (mut state, mut conv) = (Vec::new(), Vec::new());
+        let kda = self.kda_ordinal.iter().flatten().count().max(1);
+        let (mut state, mut conv, mut tails) = (Vec::new(), Vec::new(), Vec::new());
         for rank in 0..self.ranks() {
             let regions = self.slot_regions_on(rank, slot);
-            // `slot_regions_on`: every layer's recurrent region, then every layer's conv region.
-            let (recurrent, window) = regions.split_at(regions.len() / 2);
-            for (out, regions) in [(&mut state, recurrent), (&mut conv, window)] {
+            // `slot_regions_on`: every KDA layer's recurrent region, every KDA layer's conv region,
+            // then every MLA layer's index tail.
+            let (recurrent, rest) = regions.split_at(kda);
+            let (window, tail) = rest.split_at(kda);
+            for (out, regions) in [(&mut state, recurrent), (&mut conv, window), (&mut tails, tail)] {
                 for &region in regions {
                     let mut bytes = vec![0u8; region.bytes];
                     self.on(rank, || self.library.copy_d2h(&mut bytes, region))?;
@@ -1165,12 +1258,15 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         state.extend(conv);
+        state.extend(tails);
         Ok(state)
     }
 
     /// After a speculative verify step (`verify_spec`): applies each
     /// sequence's first `keep` rows (from step row `first`) to the KDA state
-    /// of `slot` in every layer, as serial steps over those rows would have.
+    /// of `slot` in every layer, as serial steps over those rows would have,
+    /// and (compact index cache, the same launch) rebuilds its index tail in
+    /// every MLA layer from the old tail and the kept rows' keys and gates.
     /// Callers set the committed placements' `kda_len` to their kept length.
     pub fn commit(&self, sequences: &[(i32, usize, usize)]) -> Result<()> {
         if sequences.is_empty() {
@@ -1194,10 +1290,19 @@ impl<'a> GlmfEngine<'a> {
                 self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             }
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
-            self.run_on(rank, split, "kda_commit", &[("state", caches.kda_state.buffer.ptr),
+            let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
                 ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.buffer.ptr),
-                ("tables", caches.commit_tables.buffer.ptr)],
-                &[Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)])?;
+                ("tables", caches.commit_tables.buffer.ptr)];
+            let mut scalars = vec![Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)];
+            let program = match &caches.index_tails {
+                Some((tails, records)) => {
+                    pointers.extend([("tails", tails.buffer.ptr), ("index_replay", records.buffer.ptr)]);
+                    scalars.push(Scalar::I32(self.mla_ordinal.iter().flatten().count() as i32));
+                    "kda_commit_c"
+                }
+                None => "kda_commit",
+            };
+            self.run_on(rank, split, program, &pointers, &scalars)?;
         }
         Ok(())
     }
@@ -1292,7 +1397,7 @@ impl<'a> GlmfEngine<'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
-                max_context: self.max_context })
+                max_context: self.max_context, index_cache: self.index_cache })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -2408,7 +2513,8 @@ impl<'a> GlmfEngine<'a> {
         let trace = trace.filter(|_| tables.decode && index == 3);
         let mode = if tables.decode { "decode" } else { "prefill" };
         let cache = caches.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
-        let (keys, pool_cache) = caches.index[index].as_ref().context("MLA layer without an index cache")?;
+        let index_cache = caches.index[index].as_ref().context("MLA layer without an index cache")?;
+        let pool_cache = &index_cache.pools;
         let decode = tables.decode;
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let fp8 = decode || self.fp8_prefill.mla;
@@ -2432,12 +2538,33 @@ impl<'a> GlmfEngine<'a> {
             std::fs::write(dir.join("mla_meta.json"), serde_json::to_vec(&serde_json::json!({
                 "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024 }))?)?;
         }
-        self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
-            ("slots", w.kv_slots.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr), ("w_iq", layer.ptr("w_iq")?),
-            ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
-            ("ape", layer.ptr("ape")?), ("token_keys", keys.buffer.ptr), ("index_cache", pool_cache.buffer.ptr),
-            ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        match (&index_cache.keys, &caches.index_tails) {
+            (Some(keys), _) => self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", w.x.buffer.ptr),
+                ("q_resid", w.q_resid.buffer.ptr), ("slots", w.kv_slots.buffer.ptr),
+                ("pool_slots", w.pool_slots.buffer.ptr), ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?),
+                ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?),
+                ("token_keys", keys.buffer.ptr), ("index_cache", pool_cache.buffer.ptr),
+                ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
+                ("scratch", w.scratch.buffer.ptr)], &[rows])?,
+            (None, Some((tails, records))) => {
+                // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
+                let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+                ensure!(!tables.spec || t <= REPLAY_ROWS, "a speculative step of {t} rows exceeds the replay record");
+                // SAFETY: ordinal < MLA layers: both regions lie inside their pools.
+                let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
+                    records.buffer.ptr.cast::<u8>().add(ordinal * REPLAY_ROWS * KEY_BYTES)) };
+                self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", w.x.buffer.ptr),
+                    ("q_resid", w.q_resid.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr),
+                    ("positions", w.positions.buffer.ptr), ("kda_slots", w.kda_slots.buffer.ptr),
+                    ("seq_first", w.seq_first.buffer.ptr), ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?),
+                    ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
+                    ("ape", layer.ptr("ape")?), ("tails", tails.cast()), ("replay", record.cast()),
+                    ("index_cache", pool_cache.buffer.ptr), ("q_fp8", w.q_fp8.buffer.ptr),
+                    ("head_weights", w.head_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+                    &[rows, Scalar::I32(i32::from(tables.spec))])?
+            }
+            (None, None) => anyhow::bail!("MLA layer {index} has neither token keys nor index tails"),
+        }
         if tables.long {
             self.run_on(rank, false, &format!("index_topk_{mode}_{cap}"), &[("q_fp8", w.q_fp8.buffer.ptr),
                 ("weights", w.head_weights.buffer.ptr), ("index_k_cache", pool_cache.buffer.ptr),

@@ -574,6 +574,16 @@ if [[ $family == glm5_flash ]]; then
     [[ "$graph_budget" =~ ^[1-9][0-9]*$ ]] || { echo "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number of MiB" >&2; exit 2; }
     family_args+=(--graph-budget-mib "$graph_budget")
   fi
+  # GLM5_FLASH_INDEX_CACHE: the DSA index cache, keys (default: every token's BF16 key | gate
+  # row beside its latent record, 11,804 B per token) or compact (the pooled keys plus each
+  # sequence's open pool, 6,172 B per token, the same pooled keys bit for bit; one GPU only,
+  # a head split keeps keys).
+  index_cache="$(get GLM5_FLASH_INDEX_CACHE keys)"
+  case "$index_cache" in
+    ""|keys) ;;
+    compact) family_args+=(--index-cache compact) ;;
+    *) echo "GLM5_FLASH_INDEX_CACHE must be keys or compact" >&2; exit 2 ;;
+  esac
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;

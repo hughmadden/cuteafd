@@ -11,8 +11,9 @@ use anyhow::{ensure, Context, Result};
 fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
     engine.synchronize()?;
     let mut out = Vec::new();
-    for buffers in engine.paged_buffers() {
-        for buffer in buffers {
+    for layer in engine.paged_buffers() {
+        // Records, token keys (`--index-cache keys` only) and pool keys.
+        for buffer in std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]) {
             ensure!(buffer.bytes % engine.pool_pages == 0, "a paged buffer that is not whole units");
             let per_unit = buffer.bytes / engine.pool_pages;
             for &unit in &placement.units {
