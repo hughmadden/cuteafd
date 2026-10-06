@@ -643,6 +643,24 @@ def test_glmf_decode_row_buckets_reject_unsupported_layouts_before_launch(tmp_pa
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,tensor", [("", False), ("GLM5_FLASH_DRAFT_HEAD=exact\n", False),
+                                        ("GLM5_FLASH_DRAFT_HEAD=tensor\n", True)])
+def test_glmf_draft_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--draft-head tensor" in launch) == tensor, launch
+    assert ("--draft-head" in launch) == tensor, launch
+
+
+def test_glmf_draft_head_rejects_unknown_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_HEAD=fp8\n")
+    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()

@@ -125,7 +125,7 @@ extern "C" int32_t cuteafd_v41_markov_destroy(void* opaque) {
   return blas_status(status);
 }
 static int32_t launch_head(void* opaque, const uint16_t* embedding,
-    const uint16_t* weight, float* logits, int32_t rows, void* stream, int width) {
+    const uint16_t* weight, float* logits, int32_t rows, void* stream, int width, bool tensor_op = false) {
   if (!opaque || rows < 1) return cudaErrorInvalidValue;
   auto* handle = static_cast<MarkovHandle*>(opaque);
   if (handle->width != width || rows > handle->max_rows) return cudaErrorInvalidValue;
@@ -157,9 +157,11 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
   // Vocabulary logits follow the reference's FP32-promoted projection. The
   // default BF16 tensor-op path exceeds its error bound on real head weights;
   // require pedantic FP32 accumulation while retaining BF16 resident storage.
-  const bool vocabulary = width >= 4096;
-  const auto compute = vocabulary ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F;
-  const auto algorithm = vocabulary ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  // A drafter's head (`tensor_op`) only proposes tokens the target verifies,
+  // so it takes the tensor-op path: BF16 products, FP32 accumulation.
+  const bool pedantic = width >= 4096 && !tensor_op;
+  const auto compute = pedantic ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F;
+  const auto algorithm = pedantic ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   return blas_status(cublasGemmEx(handle->blas, CUBLAS_OP_T, CUBLAS_OP_N,
       handle->vocab_rows, rows, width, &alpha, weight, CUDA_R_16BF, width,
       embedding, CUDA_R_16BF, width, &beta, logits, CUDA_R_32F, handle->vocab_rows,
@@ -189,6 +191,17 @@ extern "C" int32_t cuteafd_vocabulary_head_launch_width(void* handle, const uint
   if (!handle) return cudaErrorInvalidValue;
   return launch_head(handle, input, weight, output, rows, stream,
                      static_cast<MarkovHandle*>(handle)->width);
+}
+// The same head for drafts (GLM 5.3 Flash's DFlash2 and dSpark drafters): a
+// BF16 tensor-core GEMM with FP32 accumulation and FP32 logits, which reads
+// the head once for every row count. The pedantic FP32 path above runs on CUDA
+// cores (4.5 ms for 128 rows of GLM's head on an RTX 5090); drafts only steer
+// speculation, so their logits need not follow the target's FP32 promotion.
+extern "C" int32_t cuteafd_vocabulary_head_launch_tensor_op(void* handle, const uint16_t* input,
+    const uint16_t* weight, float* output, int32_t rows, void* stream) {
+  if (!handle) return cudaErrorInvalidValue;
+  return launch_head(handle, input, weight, output, rows, stream,
+                     static_cast<MarkovHandle*>(handle)->width, true);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {
