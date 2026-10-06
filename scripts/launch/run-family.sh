@@ -144,6 +144,8 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
 fi
 layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
+# Docker options only the Spark expert workers take (their environment and mounts).
+spark_worker_env=""
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
@@ -553,6 +555,29 @@ if [[ $family == glm5_flash ]]; then
     off) family_args+=(--fp8-prefill none) ;;
     *) family_args+=(--fp8-prefill "$fp8_prefill") ;;
   esac
+  # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's routes and waits for its
+  # GPU work. async (the default): pinned staging, one batched asynchronous copy and a polled
+  # stream; blocking: the earlier two synchronous copies and a blocking synchronize. Same bits.
+  exl3_worker_path="$(get GLM5_FLASH_EXL3_WORKER_PATH async)"
+  case "$exl3_worker_path" in
+    async) ;;
+    blocking) spark_worker_env+=" -e CUTEAFD_EXL3_WORKER_PATH=blocking" ;;
+    *) echo "GLM5_FLASH_EXL3_WORKER_PATH must be async or blocking" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_EXL3_ROUTE_DUMP: an absolute directory on every Spark. Each worker appends its
+  # calls' routes to DIR/routes.<executor>.bin, which SparkInfer's GLM Flash decode benchmark
+  # replays (--routes file:PATH); GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS caps the calls (default 200000).
+  exl3_route_dump="$(get GLM5_FLASH_EXL3_ROUTE_DUMP "")"
+  exl3_route_dump_calls="$(get GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS 200000)"
+  if [[ -n "$exl3_route_dump" ]]; then
+    [[ "$exl3_route_dump" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+      { echo "GLM5_FLASH_EXL3_ROUTE_DUMP must be an absolute directory" >&2; exit 2; }
+    [[ "$exl3_route_dump_calls" =~ ^[1-9][0-9]{0,8}$ ]] ||
+      { echo "GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS must be a positive call count" >&2; exit 2; }
+    [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_EXL3_ROUTE_DUMP records Spark expert calls; SPARK_COUNT=0 runs none" >&2; exit 2; }
+    spark_worker_env+=" -v $exl3_route_dump:$exl3_route_dump -e CUTEAFD_EXL3_ROUTE_DUMP=$exl3_route_dump/routes"
+    spark_worker_env+=" -e CUTEAFD_EXL3_ROUTE_DUMP_CALLS=$exl3_route_dump_calls"
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -687,7 +712,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     fi
   done
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
