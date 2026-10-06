@@ -84,7 +84,7 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
     let budget = Exl3Weights::plan(&catalog, layer)?;
     let (free, _) = lib.cuda_memory_info()?;
     ensure!(
-        free > budget.resident_bytes + Exl3Worker::plan(&aot, 4096)? + (256 << 20),
+        free > budget.resident_bytes + Exl3Worker::plan(&aot, 4096, Exl3Schedule::Default)? + (256 << 20),
         "insufficient GPU headroom"
     );
     let weights = Rc::new(vec![Exl3Weights::load(
@@ -93,8 +93,8 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
         layer,
         budget.resident_bytes,
     )?]);
-    let workspace = Exl3Worker::plan(&aot, 4096)?;
-    let mut worker = Exl3Worker::new(&lib, weights, &aot, 4096, workspace)?;
+    let workspace = Exl3Worker::plan(&aot, 4096, Exl3Schedule::Default)?;
+    let mut worker = Exl3Worker::new(&lib, weights, &aot, 4096, workspace, Exl3Schedule::Default)?;
     let mut exchange = HostExpertExchange::new(4096)?;
     let mut row_indices = vec![0; 4096];
     assert!(worker.bind_layer(1).is_err());
@@ -248,7 +248,7 @@ fn paired_worker_loading_rejects_wrong_rank_and_mixed_capacities() -> Result<()>
     };
     for c in [1, 16, 80] { write(c, &original)?; }
     for rank in 0..4 {
-        assert_eq!(Exl3Worker::partition(root.path(), 80, rank)?, V41Exl3Partition::Disjoint);
+        assert_eq!(Exl3Worker::partition(root.path(), 80, rank, Exl3Schedule::Default)?, V41Exl3Partition::Disjoint);
     }
     for (boundary, ranks) in [("last", [0, 2]), ("first", [1, 3])] {
         let mut paired = original.clone();
@@ -257,14 +257,59 @@ fn paired_worker_loading_rejects_wrong_rank_and_mixed_capacities() -> Result<()>
         paired["native_info_version"] = 3.into();
         for c in [1, 16, 80] { write(c, &paired)?; }
         for rank in ranks {
-            assert_eq!(Exl3Worker::partition(root.path(), 80, rank)?, V41Exl3Partition::PairedTp4);
-            assert!(Exl3Worker::partition(root.path(), 80, rank ^ 1).is_err());
+            assert_eq!(Exl3Worker::partition(root.path(), 80, rank, Exl3Schedule::Default)?, V41Exl3Partition::PairedTp4);
+            assert!(Exl3Worker::partition(root.path(), 80, rank ^ 1, Exl3Schedule::Default).is_err());
         }
         write(80, &original)?;
-        assert!(Exl3Worker::partition(root.path(), 80, ranks[0]).is_err());
-        assert_eq!(Exl3Worker::partition(root.path(), 16, ranks[0])?, V41Exl3Partition::PairedTp4);
+        assert!(Exl3Worker::partition(root.path(), 80, ranks[0], Exl3Schedule::Default).is_err());
+        assert_eq!(Exl3Worker::partition(root.path(), 16, ranks[0], Exl3Schedule::Default)?, V41Exl3Partition::PairedTp4);
     }
-    assert!(Exl3Worker::partition(root.path(), 80, 4).is_err());
+    assert!(Exl3Worker::partition(root.path(), 80, 4, Exl3Schedule::Default).is_err());
+    Ok(())
+}
+
+#[test]
+fn gb10_schedule_runs_the_glm_flash_decode_exports_and_refuses_mislabels() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (gb10, default) = (Exl3Schedule::Gb10, Exl3Schedule::Default);
+    for capacity in [1, 80] {
+        assert_eq!(gb10.directory(root.path(), capacity), root.path().join(format!("m{capacity}-gb10")));
+    }
+    for capacity in [1, 16, 80, 256, 1024, 4096] {
+        assert_eq!(default.directory(root.path(), capacity), root.path().join(format!("m{capacity}")));
+        if ![1, 80].contains(&capacity) {
+            // Prefill capacities (and the unused m16) run their default export.
+            assert_eq!(gb10.directory(root.path(), capacity), root.path().join(format!("m{capacity}")));
+        }
+    }
+    // GB10 exports exist for GLM 5.3 Flash only.
+    gb10.validate(Exl3RowPolicy::GlmFlashK64)?;
+    assert!(gb10.validate(Exl3RowPolicy::Nearest).is_err());
+    default.validate(Exl3RowPolicy::Nearest)?;
+    let write = |name: &str, schedule: Option<&str>| -> Result<()> {
+        let directory = root.path().join(name);
+        std::fs::create_dir_all(&directory)?;
+        let mut meta = serde_json::json!({"schema": "cuteafd.v41-exl3-aot.v1", "capacity": 80});
+        if let Some(schedule) = schedule { meta["decode_schedule"] = schedule.into(); }
+        std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+        Ok(())
+    };
+    let canonical = "l2=2,pf1=4,pf2=8,pdl=2";
+    for capacity in [1, 80] {
+        write(&format!("m{capacity}"), None)?;
+        write(&format!("m{capacity}-gb10"), Some(canonical))?;
+    }
+    for capacity in [1, 80] {
+        default.check_export(root.path(), capacity)?;
+        gb10.check_export(root.path(), capacity)?;
+    }
+    // A scheduled directory without its schedule, a default one with one, a missing one.
+    write("m80-gb10", None)?;
+    assert!(gb10.check_export(root.path(), 80).is_err());
+    write("m1", Some(canonical))?;
+    assert!(default.check_export(root.path(), 1).is_err());
+    std::fs::remove_dir_all(root.path().join("m1-gb10"))?;
+    assert!(gb10.check_export(root.path(), 1).is_err());
     Ok(())
 }
 
@@ -295,12 +340,13 @@ fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
         let input = read("input")?; let ids = read("ids")?; let routing = read("weights")?;
         let owners = read("owners")?; let expected = read("expected")?;
         let aot = package.join(format!("tp4-rank{rank}"));
-        assert_eq!(Exl3Worker::partition(&aot, 80, rank)?, V41Exl3Partition::PairedTp4);
+        assert_eq!(Exl3Worker::partition(&aot, 80, rank, Exl3Schedule::Default)?, V41Exl3Partition::PairedTp4);
         let layer = ExpertLayer::Backbone { layer:30, rank };
         let budget = Exl3Weights::plan_with_layout(&catalog, layer, V41Exl3Partition::PairedTp4)?;
         let weights = Rc::new(vec![Exl3Weights::load_with_layout(&lib, &catalog, layer,
             budget.resident_bytes, V41Exl3Partition::PairedTp4)?]);
-        let mut worker = Exl3Worker::new(&lib, weights, &aot, 80, Exl3Worker::plan(&aot, 80)?)?;
+        let mut worker = Exl3Worker::new(&lib, weights, &aot, 80, Exl3Worker::plan(&aot, 80, Exl3Schedule::Default)?,
+            Exl3Schedule::Default)?;
         let mut exchange = HostExpertExchange::new(80)?;
         let mut request = ExpertProtocolV2Request::new(91,17,30,5120,ExpertV2Dtype::Fp8E4m3Ue8m0K32,
             (0..80).map(|r| ExpertProtocolV2RowDescriptor { row_id:r as u64, source_kind:ExpertV2SourceKind::Prefill,
