@@ -1340,7 +1340,8 @@ impl<'a> GlmfEngine<'a> {
         ensure!(self.decode_rows == DECODE_ROWS, "a head split takes decode steps of up to {DECODE_ROWS} rows \
             (--decode-rows {DECODE_ROWS})");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
-            self.programs.load_all()?;
+            // Its own and the shares' programs (a head split takes decode steps of 64 rows).
+            self.programs.load_matching(|name| super::glmf_startup_program(name, true, DECODE_ROWS))?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
                 self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,

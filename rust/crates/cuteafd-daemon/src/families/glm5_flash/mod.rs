@@ -297,6 +297,23 @@ mod draft_cli_tests {
         check_options(&defaults).unwrap();
     }
 
+    /// Start-up loads GLM Flash's own programs: the head split's shares with a second GPU, the
+    /// wide decode programs with 128 decode rows, nothing of another family.
+    #[test]
+    fn startup_loads_only_the_programs_a_glm_flash_engine_launches() {
+        let names = ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_head_fp8",
+            "glmf_kda_m128", "glmf_kda_commit_m128", "glmf2_kda_m64", "glmf2_join_rows", "dsv4f_attention_m64",
+            "dsv4p_compressor_m4096", "glm_mla_m64", "mimo_attention_m64", "qwen4_gdn_m64"];
+        let kept = |split: bool, rows: usize| -> Vec<&str> {
+            names.iter().copied().filter(|n| glmf_startup_program(n, split, rows)).collect()
+        };
+        assert_eq!(kept(false, 64), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_head_fp8"]);
+        assert_eq!(kept(false, 128), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_head_fp8",
+            "glmf_kda_m128", "glmf_kda_commit_m128"]);
+        assert_eq!(kept(true, 64), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_head_fp8",
+            "glmf2_kda_m64", "glmf2_join_rows"]);
+    }
+
     /// `--replay-records shared` keeps the records in one GPU's prefill scratch.
     #[test]
     fn replay_records_take_shared_on_one_gpu() {
@@ -637,6 +654,15 @@ fn wide_decode_programs(args: &EngineArgs, compact: bool) -> Vec<String> {
         .into_iter().map(|name| format!("glmf_{name}")).collect()
 }
 
+/// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`, and
+/// the head split's `glmf2_` shares with a second GPU), without the wide `_m128` decode programs
+/// unless decode steps take 128 rows. Everything a step can launch inside a decode graph capture
+/// is loaded; the engine launches no other family's program.
+pub(crate) fn glmf_startup_program(name: &str, split: bool, decode_rows: usize) -> bool {
+    let own = name.starts_with("glmf_") || (split && name.starts_with("glmf2_"));
+    own && (decode_rows > engine::DECODE_ROWS || !name.ends_with(&format!("_m{}", engine::WIDE_DECODE_ROWS)))
+}
+
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
 /// planner's allowance.
 fn graph_reserve(args: &EngineArgs) -> u64 {
@@ -762,7 +788,11 @@ impl Opened {
             programs.spec(&name).with_context(|| format!("--decode-rows {} needs program {name}; this native \
                 library predates it (or was exported with --glmf-wide-decode-rows 0)", args.decode_rows))?;
         }
-        programs.load_all()?;
+        // GLM Flash's programs only (a release library carries every family's): `glmf2_` share
+        // programs only for a head split, the wide `_m128` decode programs only with 128 rows.
+        let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name,
+            args.split_device.is_some(), args.decode_rows))?;
+        tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
         // (`glmf2`) in this build.
