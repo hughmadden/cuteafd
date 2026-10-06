@@ -1298,6 +1298,13 @@ CublasLtM1ParityBatchedPlan* create_cublaslt_m1_parity_plan(
     delete plan;
     return nullptr;
   }
+  char thread_name[16] = "unknown";
+  (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+  std::fprintf(stderr,
+               "cuteafd BLAS plan workspace allocated library=cublasLt thread=%s "
+               "rows=%zu input_dim=%zu output_dim=%zu workspace_bytes=%zu "
+               "scope=device-shape-cache allocator=cudaMalloc\n",
+               thread_name, rows, input_dim, output_dim, plan->workspace_bytes);
   plan->algorithm = result.algo;
   return plan;
 }
