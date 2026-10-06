@@ -72,11 +72,10 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-if [[ "$family" == mimo_v2 ]]; then
-  case "$vision" in
-    auto|spark|spark:*) release_die "Spark encoder placement not yet wired into MiMo serving; use VISION=rtx or off" ;;
-  esac
-fi
+# MiMo's qualified remote encoder uses Spark-first auto unless explicitly off.
+# Other generic families keep off until their towers are qualified.
+if [[ "$family" == mimo_v2 && -z "$(get VISION)" ]]; then vision=auto; fi
+# Auto/spark placement is resolved by the encoder plan below.
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
 # the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
@@ -740,7 +739,13 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"
-until curl -sf "$url/health" >/dev/null; do
+ready_deadline=$((SECONDS + 900))
+until curl --max-time 5 -sf "$url/health" >/dev/null; do
+  if (( SECONDS >= ready_deadline )); then
+    echo "coordinator readiness timed out: $(curl --max-time 5 -s "$url/health" || true)" >&2
+    docker logs --tail 30 "$coordinator_name" >&2
+    exit 1
+  fi
   docker ps -q -f "name=^$coordinator_name\$" | grep -q . ||
     { echo "coordinator exited:" >&2; docker logs --tail 30 "$coordinator_name" >&2; exit 1; }
   sleep 2

@@ -1,4 +1,4 @@
-//! MiMo's image request state and resident local encoder readiness.
+//! MiMo's image request state and local/remote encoder readiness.
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
@@ -11,31 +11,76 @@ fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<s
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
+pub(super) struct RemoteVision {
+    addresses: Vec<std::net::SocketAddr>,
+    plan_hash: [u8; 32],
+    revision: String,
+}
+impl RemoteVision {
+    pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
+        let Some(peers) = &args.vision_peers else {
+            anyhow::ensure!(args.encoder_plan_hash.is_none() && args.encoder_revision.is_none(),
+                "encoder plan hash/revision require --vision-peers");
+            return Ok(None);
+        };
+        anyhow::ensure!(matches!(args.vision, MediaMode::Auto | MediaMode::Spark(_)),
+            "--vision-peers requires Spark/auto vision placement");
+        let addresses = peers.split(',').map(|peer| peer.trim().parse()
+            .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
+        let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
+            .context("--vision-peers requires --encoder-plan-hash")?)?;
+        let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
+        anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
+        Ok(Some(Self { addresses, plan_hash, revision }))
+    }
+}
+
 pub(super) struct ReadyVision {
-    pub encoder: crate::shared::vision::local::LocalEncoder,
+    pub encoder: Encoder,
     pub preparer: Arc<MediaPreparer>,
     pub cache_bytes: usize,
 }
 impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode, prefix: &super::serve::PrefixArgs,
-        cache_bytes: Option<u64>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
+        cache_bytes: Option<u64>, remote: Option<RemoteVision>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
         let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
+        let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Mimo)?;
+        // Header-only on the coordinator: remote tower payload stays on its Spark.
+        let spec = crate::shared::vision::TowerSpec::mimo(&args.snapshot, 4096)?;
+        let width = config["hidden_size"].as_u64().context("MiMo hidden_size")? as usize;
+        let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
+        if let Some(remote) = remote {
+            anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
+                "--vision-peers requires Spark/auto vision placement");
+            let id = spec.encoder_id(&remote.revision, 121);
+            let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
+            anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "MiMo tower capacity is 4096 tokens per image");
+            let expected = crate::shared::vision::remote::EncoderHandshake {
+                encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
+                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+            };
+            anyhow::ensure!(expected.output_width as usize == width, "MiMo tower/LM output width mismatch");
+            let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
+                std::time::Duration::from_secs(60))?;
+            tracing::info!(cache_bytes, "MiMo remote vision encoder ready");
+            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
+        }
         let gpu = match mode {
             MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
-            MediaMode::Auto | MediaMode::Spark(_) => {
-                tracing::warn!(?mode, "MiMo encoder placement pending: use --vision rtx[:gpu] to enable images");
-                return Ok((None, prefix.clone()));
-            }
+            MediaMode::Auto => {
+                anyhow::ensure!(args.peers.is_none() || args.local_experts,
+                    "auto vision with Spark experts requires planner-resolved --vision-peers");
+                args.device
+            },
+            MediaMode::Spark(_) => anyhow::bail!("Spark vision placement requires --vision-peers, --encoder-plan-hash and --encoder-revision"),
             MediaMode::Off => unreachable!(),
         };
-        let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Mimo)?;
-        let spec = crate::shared::vision::TowerSpec::mimo(&args.snapshot, 4096)?;
         let info = library.cuda_device_info(gpu)?;
         let sm = u32::try_from(info.compute_capability_major * 10 + info.compute_capability_minor)?;
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
         anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "MiMo tower capacity is 4096 tokens per image");
-        let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         library.cuda_set_device(gpu)?;
         let admitted = ledger.total_bytes();
@@ -51,27 +96,42 @@ impl ReadyVision {
         let restored = library.cuda_set_device(args.device);
         let service = loaded?;
         restored?;
-        let width = config["hidden_size"].as_u64().context("MiMo hidden_size")? as usize;
         tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "MiMo resident vision encoder ready");
-        Ok((Some(Self { encoder: crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096),
+        Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
             preparer, cache_bytes }), prefix))
     }
 }
 
 pub(super) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
+    Remote(crate::shared::vision::remote::RemoteEncoder),
     Off,
+}
+impl Encoder {
+    pub fn health_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        match self { Self::Remote(client) => Some(client.health_handle()), _ => None }
+    }
+    pub fn available(&self) -> bool {
+        match self { Self::Remote(client) => client.healthy(), Self::Local(_) => true, Self::Off => false }
+    }
 }
 impl cuteafd_engine::media::EncoderClient for Encoder {
     fn submit(&mut self, job: EncodeJob) -> std::result::Result<cuteafd_engine::media::EncoderTicket, cuteafd_engine::media::MediaError> {
         use cuteafd_engine::media::MediaError;
-        match self { Self::Local(client) => client.submit(job), Self::Off => Err(MediaError::Encoder("encoder not loaded".into())) }
+        match self { Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
+            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())) }
     }
     fn poll(&mut self, ticket: cuteafd_engine::media::EncoderTicket) -> Option<std::result::Result<cuteafd_engine::media::EncodeOutput, cuteafd_engine::media::MediaError>> {
-        match self { Self::Local(client) => client.poll(ticket), Self::Off => None }
+        match self { Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket), Self::Off => None }
     }
     fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
-        if let Self::Local(client) = self { client.cancel(ticket); }
+        match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
+    }
+}
+pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
+    match error {
+        cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
+        error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
     }
 }
 
@@ -260,6 +320,37 @@ mod tests {
     use cuteafd_core::TargetSamplingParams;
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
 
+    #[test]
+    fn remote_options_require_complete_identity_and_valid_placement() {
+        use clap::Parser;
+        let make = |options: Vec<String>| {
+            let mut argv = vec!["cuteafd".into(), "serve-mimo".into(), "--snapshot".into(), "/not-read".into(),
+                "--native-lib".into(), "/not-read.so".into()];
+            argv.extend(options);
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::ServeMimo(mut args) = cli.command else { panic!("MiMo command") };
+            args.vision = MediaMode::Spark(Some(0));
+            args
+        };
+        assert!(RemoteVision::from_args(&make(vec![])).unwrap().is_none());
+        let complete = vec!["--vision-peers".into(), "127.0.0.1:1234,127.0.0.2:1234".into(),
+            "--encoder-plan-hash".into(), "ab".repeat(32), "--encoder-revision".into(), "revision".into()];
+        let args = make(complete.clone());
+        let remote = RemoteVision::from_args(&args).unwrap().unwrap();
+        assert_eq!(remote.addresses.len(), 2); assert_eq!(remote.plan_hash, [0xab;32]);
+        for bad in ["", "hostname:1234", "127.0.0.1", "127.0.0.1:1234,"] {
+            let mut args = make(complete.clone()); args.vision_peers = Some(bad.into());
+            assert!(RemoteVision::from_args(&args).is_err());
+        }
+        let mut args = make(complete.clone()); args.encoder_plan_hash = None;
+        assert!(RemoteVision::from_args(&args).is_err());
+        let mut args = make(complete.clone()); args.encoder_revision = None;
+        assert!(RemoteVision::from_args(&args).is_err());
+        let mut args = make(complete); args.vision = MediaMode::Rtx(None);
+        assert!(RemoteVision::from_args(&args).is_err());
+        assert!(matches!(failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
+            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+    }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
         NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images,
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
