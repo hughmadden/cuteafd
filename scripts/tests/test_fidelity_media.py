@@ -592,6 +592,10 @@ def test_glm_feature_export_and_prefix_probe_immutability(tmp_path, monkeypatch)
     assert events == ["drain", "empty"]
     metadata = json.loads((args.media_features_out / (image["key"] + ".json")).read_text())
     assert metadata["tower_dtype"] == "fp32" and metadata["dtype"] == "bf16-le"
+    index = args.media_features_out / "features.json"
+    published = index.stat()
+    media.window_features(args, manifest)
+    assert (index.stat().st_ino, index.stat().st_mtime_ns) == (published.st_ino, published.st_mtime_ns)
     files = {p.name: p.read_bytes() for p in args.media_features_out.iterdir()}
     args._prefix_probe = True
     media.window_features(args, manifest)
