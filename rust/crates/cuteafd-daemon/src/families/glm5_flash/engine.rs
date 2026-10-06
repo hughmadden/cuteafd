@@ -596,7 +596,43 @@ pub(crate) struct Fp8Prefill {
 
 // Serving uses exact canonical row buckets; teacher-forced probe spans run eagerly
 // and do not enlarge the startup graph set. Counters still count every capture.
-use crate::shared::decode_graph::{masked_row, row_bucket as decode_bucket, ROW_BUCKETS as DECODE_BUCKETS};
+use crate::shared::decode_graph::{masked_row, row_bucket as plain_decode_bucket, ROW_BUCKETS as PLAIN_DECODE_BUCKETS};
+
+const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
+// WP9 official-startup-dflash2-20261006-v1, SM120 RTX PRO 6000, 2026-10-06:
+// 11,040 TP1 graphs, 1,616,904,192 physical bytes after fixed workspaces
+// (146,458.713 B/graph).
+// Remeasure for another GPU target or graph implementation; round up here.
+const MEASURED_GRAPH_BYTES: u64 = 146_459;
+const GRAPH_MARGIN_PERCENT: u64 = 20;
+const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
+
+pub(crate) fn startup_graphs_enabled() -> bool {
+    std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0")
+        && std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").is_ok_and(|v| v == "1")
+}
+
+fn decode_bucket(rows: usize, spec: bool) -> usize {
+    if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
+    else { plain_decode_bucket(rows) }
+}
+
+pub(crate) fn graph_reserve_bytes(graphs: usize) -> u64 {
+    let measured = graphs as u64 * MEASURED_GRAPH_BYTES;
+    measured + (measured * GRAPH_MARGIN_PERCENT).div_ceil(100) + GRAPH_RANK_MARGIN_BYTES
+}
+
+pub(crate) fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
+    sequences: usize, speculation: bool, layers: usize, peer: bool) -> Vec<u64> {
+    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation).len();
+    let graphs = std::iter::once(shapes * (layers + 1))
+        .chain(peer.then_some(shapes * layers)).collect::<Vec<_>>();
+    let bytes: Vec<_> = graphs.iter().map(|&count| graph_reserve_bytes(count)).collect();
+    tracing::info!(?graphs, ?bytes, shapes, pool_tokens, measured_bytes_per_graph = MEASURED_GRAPH_BYTES,
+        margin_percent = GRAPH_MARGIN_PERCENT, rank_margin_bytes = GRAPH_RANK_MARGIN_BYTES,
+        "GLM Flash graph reserve before KV admission");
+    bytes
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GraphGeometry {
@@ -631,11 +667,12 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
 
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = decode_bucket(sequences.min(DECODE_ROWS));
+    let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
     graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        DECODE_BUCKETS.into_iter().flat_map(move |rows| [false, true].into_iter()
-            .filter(move |&spec| if spec { speculation && rows > 1 } else { rows <= plain })
-            .map(move |spec| (rows, spec, geometry)))
+        PLAIN_DECODE_BUCKETS.into_iter().filter(move |&rows| rows <= plain)
+            .map(move |rows| (rows, false, geometry))
+            .chain(SPEC_DECODE_BUCKETS.into_iter().filter(move |_| speculation)
+                .map(move |rows| (rows, true, geometry)))
     }).collect()
 }
 
@@ -719,7 +756,7 @@ impl<'a> GlmfEngine<'a> {
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").is_ok_and(|v| v == "1"),
+            startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
@@ -737,7 +774,7 @@ impl<'a> GlmfEngine<'a> {
         let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
         let segments = self.weights.layers.len() + 1;
         let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
-        tracing::info!(shapes = shapes.len(), graphs = expected, rows = ?DECODE_BUCKETS,
+        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?PLAIN_DECODE_BUCKETS, spec_rows = ?SPEC_DECODE_BUCKETS,
             "GLM Flash startup decode graph admission");
         // Allocate fixed workspaces before measuring the graph executables' physical memory.
         if self.decode_workspace.borrow().is_none() {
@@ -799,8 +836,8 @@ impl<'a> GlmfEngine<'a> {
                 .context("padding check needs all layers")?.to_host(self.library)?;
             placement.len = start;
             ensure!(plain.len() == padded.len() && plain.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "decode padding {rows}->{} changed real-row logits", decode_bucket(rows));
-            tracing::info!(rows, bucket = decode_bucket(rows), bytes = plain.len() * 4,
+                "decode padding {rows}->{} changed real-row logits", decode_bucket(rows, true));
+            tracing::info!(rows, bucket = decode_bucket(rows, true), bytes = plain.len() * 4,
                 "GLM Flash padded decode real-row logits byte-exact");
         }
         self.synchronize()
@@ -1522,6 +1559,11 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
+    /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
+    pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
+        if self.use_graphs && self.startup_graphs { decode_bucket(rows, spec) } else { rows }
+    }
+
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
     /// logits on the device, with the decode graph's greedy selection of them.
     pub fn verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32], spec: bool)
@@ -1567,7 +1609,7 @@ impl<'a> GlmfEngine<'a> {
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
         let logits = if graphed {
-            let bucket = if self.startup_graphs { decode_bucket(rows) } else { rows };
+            let bucket = self.serving_decode_rows(rows, spec);
             pad_decode_tables(&mut tables, bucket);
             let mut padded = tokens.to_vec();
             padded.resize(bucket, 0);
@@ -2871,13 +2913,33 @@ mod prefill_lane_tests {
                         long: len > dense,
                     };
                     for (rows, spec) in [(1, false), (3, false), (10, false), (16, false), (2, true), (10, true), (64, true)] {
-                        assert!(set.contains(&(decode_bucket(rows), spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
+                        assert!(set.contains(&(decode_bucket(rows, spec), spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
                     }
                 }
             }
         }
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 240);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 360);
         assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 120);
+    }
+
+    #[test]
+    fn speculation_buckets_and_pre_kv_reserve_match_serving_policy() {
+        for rows in 1..=64 {
+            let bucket = super::decode_bucket(rows, true);
+            assert!(bucket >= rows && bucket <= 2 * rows);
+        }
+        assert_eq!(super::decode_bucket(8, true), 8);
+        assert_eq!(super::decode_bucket(32, true), 32);
+        assert_eq!(super::decode_bucket(8, false), 16);
+        assert_eq!(super::decode_bucket(17, false), 64);
+        for sequences in [8, 16] {
+            let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true);
+            assert_eq!(shapes.len() * 46, 16560);
+            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true);
+            assert_eq!(reserve, [2_977_542_112, super::graph_reserve_bytes(16200)]);
+            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 5520);
+        }
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 18400);
     }
 
     #[test]
@@ -2896,7 +2958,7 @@ mod prefill_lane_tests {
             assert_eq!(&tables.cache_lengths[rows..], vec![0; bucket - rows]);
             assert_eq!(tables.page_table.len(), bucket * 8);
             assert_eq!(tables.pool_table.len(), bucket * 2);
-            assert_eq!(super::decode_bucket(rows), bucket);
+            assert_eq!(super::decode_bucket(rows, true), bucket);
         }
     }
 

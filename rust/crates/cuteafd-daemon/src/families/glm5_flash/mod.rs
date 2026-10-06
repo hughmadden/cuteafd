@@ -164,6 +164,9 @@ pub(crate) struct EngineArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+    /// Serving-only policy used to reserve the complete graph set before KV allocation.
+    #[arg(skip)]
+    pub serving_graph_policy: Option<(usize, bool)>,
 }
 
 #[cfg(test)]
@@ -565,20 +568,34 @@ impl Opened {
         } else { None };
         // 0: automatic; budgeted fixed pools retain their requested size and
         // refuse before allocation if the future storage would not fit.
-        let pool_tokens = if args.pool_tokens == 0 || budgeted {
+        let startup_graphs = engine::startup_graphs_enabled();
+        let graph_extra = if startup_graphs {
+            let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, true));
+            // An automatic pool can only shrink this geometry, never exceed the 2M cap.
+            let pool = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
+                else { args.pool_tokens };
+            let reserve = engine::serving_graph_reserve(args.max_context, pool, self.cfg.dense_context(),
+                sequences, speculation, layers, peer_stream.is_some());
+            let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0];
+            let extra = reserve.into_iter().max().unwrap_or(0).saturating_sub(allowance);
+            tracing::info!(allowance_bytes = allowance, extra_reserve_bytes = extra,
+                "GLM Flash graph reserve above planner allowance");
+            extra
+        } else { 0 };
+        let pool_tokens = if args.pool_tokens == 0 || budgeted || startup_graphs {
             let precise_split = args.kda_fp32_partials || args.kda_output_shard;
             let devices: Vec<i32> = if precise_split {
                 vec![args.device, args.split_device.context("precise head split")?]
             } else {
                 std::iter::once(args.device)
-                    .chain(if budgeted { peer_stream.map(|(d, _)| d) } else { None }).collect()
+                    .chain(if budgeted || startup_graphs { peer_stream.map(|(d, _)| d) } else { None }).collect()
             };
             let extra = if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
                 else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 }) };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra)?
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra)?
         } else {
             args.pool_tokens
         };

@@ -201,10 +201,11 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
 type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 #[allow(clippy::too_many_arguments)]
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
+    args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some() || policy.copy > 0));
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -412,6 +413,22 @@ fn cold_replay_decode(probe: &probe::ProbeRef, chunk: usize) -> bool {
 #[cfg(test)]
 mod media_tests {
     #[test]
+    fn verify_histogram_counts_actual_steps_and_existing_timing_boundary() {
+        let mut stats = super::VerifyStats::default();
+        assert_eq!(stats.snapshot()["rows"], serde_json::json!({}));
+        stats.record(7, 8, true, 12.5);
+        stats.record(8, 8, true, 10.0);
+        stats.record(1, 1, false, 3.0);
+        let json = stats.snapshot();
+        assert_eq!(json["rows"], serde_json::json!({"1": 1, "7": 1, "8": 1}));
+        assert_eq!(json["by_bucket"]["8"]["steps"], 2);
+        assert_eq!(json["by_bucket"]["8"]["speculative_steps"], 2);
+        assert_eq!(json["by_bucket"]["8"]["verify_ms_sum"], 22.5);
+        assert_eq!(json["by_bucket"]["8"]["verify_ms_max"], 12.5);
+        assert_eq!(json["by_real_rows"]["1"]["speculative_steps"], 0);
+    }
+
+    #[test]
     fn cold_replay_keeps_source_geometry_and_disables_snapshot_points() {
         use cuteafd_api::openai::probe::{Probe, ProbeColdStep, ProbeSpec};
         use cuteafd_engine::prefix::PointPlan;
@@ -508,15 +525,68 @@ fn release(family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
     slots.extend(slot);
 }
 
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct VerifyBucket {
+    steps: u64,
+    speculative_steps: u64,
+    verify_ms_sum: f64,
+    verify_ms_max: f64,
+}
+
+struct VerifyStats {
+    real: [VerifyBucket; DECODE_ROWS + 1],
+    bucket: [VerifyBucket; DECODE_ROWS + 1],
+}
+
+impl Default for VerifyStats {
+    fn default() -> Self {
+        Self { real: [VerifyBucket::default(); DECODE_ROWS + 1],
+            bucket: [VerifyBucket::default(); DECODE_ROWS + 1] }
+    }
+}
+
+impl VerifyStats {
+    fn record(&mut self, rows: usize, bucket: usize, spec: bool, ms: f64) {
+        for entry in [&mut self.real[rows], &mut self.bucket[bucket]] {
+            entry.steps += 1;
+            entry.speculative_steps += u64::from(spec);
+            entry.verify_ms_sum += ms;
+            entry.verify_ms_max = entry.verify_ms_max.max(ms);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let timing = |entries: &[VerifyBucket]| entries.iter().enumerate().filter(|(_, v)| v.steps > 0)
+            .map(|(rows, value)| (rows.to_string(), *value)).collect::<std::collections::BTreeMap<_, _>>();
+        let rows = self.real.iter().enumerate().filter(|(_, v)| v.steps > 0)
+            .map(|(rows, value)| (rows.to_string(), value.steps)).collect::<std::collections::BTreeMap<_, _>>();
+        serde_json::json!({"rows": rows, "by_real_rows": timing(&self.real), "by_bucket": timing(&self.bucket),
+            "timing_scope": "serving verify plus token selection host wall; existing synchronization boundary; excludes draft and commit; cumulative attempts including errors"})
+    }
+}
+
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         crate::shared::probe::graph_capture_stats(&mut stats);
+        // Idle checkpoints only: never sample the process ledger on the decode hot path.
+        if active == 0 && prefilling == 0 {
+            use cuteafd_ffi::memory_ledger::{snapshot, Space};
+            let ledger = snapshot();
+            let devices: Vec<_> = ledger.devices().into_iter().map(|device| serde_json::json!({
+                "device": device, "device_bytes": ledger.total(Space::Device, device),
+                "managed_bytes": ledger.total(Space::Managed, device),
+                "device_by_scope": ledger.by_scope(Space::Device, device),
+                "managed_by_scope": ledger.by_scope(Space::Managed, device)})).collect();
+            stats["memory_ledger"] = serde_json::json!({"devices": devices,
+                "pinned_bytes": ledger.rows.iter().filter(|r| r.key.space == Space::Pinned).map(|r| r.bytes).sum::<usize>(),
+                "scope": "idle live allocations tracked through NativeLibrary; runtime contexts, modules, cuBLAS and graph executables excluded"});
+        }
     }
 }
 
@@ -551,12 +621,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
+    let mut verify_stats = VerifyStats::default();
     // Per request window: verify steps, and host seconds drafting, verifying
     // (engine step + commit) and selecting/streaming tokens.
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
-    publish(stats, requests, generated_total, 0, 0, &cache, media, preparer);
+    publish(stats, requests, generated_total, 0, 0, &cache, media, preparer, &verify_stats);
     ready();
     loop {
         while active.len() + prefills.len() < max_sequences {
@@ -573,7 +644,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -996,6 +1067,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 Ok((selector.select(&logits, &batch)?, logits))
             });
         let step_ms = timer.elapsed().as_secs_f64() * 1e3;
+        verify_stats.record(tokens.len(), engine.serving_decode_rows(tokens.len(), spec), spec, step_ms);
         verify_s += step_ms / 1e3;
         let (selected, logits) = match step {
             Ok(step) => step,
@@ -1137,7 +1209,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
