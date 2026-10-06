@@ -104,7 +104,7 @@ impl Client {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();
-                return Err(UpstreamHttpError { code, body: text.chars().take(400).collect() }.into());
+                return Err(UpstreamHttpError { code, body: text }.into());
             }
             Err(error) => return Err(error).context("chat request"),
         };

@@ -168,7 +168,11 @@ fn probe_error(error: anyhow::Error) -> Response {
     let status = if error.downcast_ref::<StartError>().is_some_and(|e| matches!(e, StartError::Busy(_))) {
         StatusCode::CONFLICT
     } else if let Some(upstream) = error.downcast_ref::<crate::client::UpstreamHttpError>() {
-        StatusCode::from_u16(upstream.code).unwrap_or(StatusCode::BAD_GATEWAY)
+        let status = StatusCode::from_u16(upstream.code).unwrap_or(StatusCode::BAD_GATEWAY);
+        if serde_json::from_str::<serde_json::Value>(&upstream.body).is_ok() {
+            return (status, [(header::CONTENT_TYPE, "application/json")], upstream.body.clone()).into_response();
+        }
+        status
     } else {
         StatusCode::BAD_REQUEST
     };
@@ -336,6 +340,18 @@ mod tests {
         assert_eq!(probe_error(anyhow::anyhow!("invalid probe")).status(), StatusCode::BAD_REQUEST);
         // A string resembling an HTTP error is not an upstream status contract.
         assert_eq!(probe_error(anyhow::anyhow!("HTTP 503: invalid input")).status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn probe_passes_upstream_json_body_through_verbatim() {
+        let body = format!("{{ \"error\": {{\"message\":\"vision encoder unavailable\",\"type\":\"native_v41_error\"}}, \"detail\":\"{}\" }}", "x".repeat(512));
+        let error = anyhow::Error::new(crate::client::UpstreamHttpError { code: 503, body: body.clone() })
+            .context("probe chat");
+        let response = probe_error(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(bytes.as_ref(), body.as_bytes());
     }
 
     #[tokio::test]
