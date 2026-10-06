@@ -52,12 +52,15 @@ Attention (KDA), a minority run MLA + DSA.
   `RTX_GPUS=1` or `COORDINATOR_SPLIT=off` serves from one GPU.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
-- Packed admission prefill (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
+- Admission and verify rows (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
   (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
   prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head
   run over its own rows as its own pass would, the rest over all rows, with one Spark wave per
   MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
-  pass).
+  pass). `GLM5_FLASH_VERIFY_POLICY=chain` (`--verify-policy chain`, `GLM5_FLASH_SPEC_TAU`,
+  default 0.7) cuts each sequence's drafts at that cumulative draft probability and drops the
+  least likely drafts across sequences when a step exceeds the 64 verify rows, in place of the
+  same room for every sequence.
 
 ## Default precision (single residency)
 

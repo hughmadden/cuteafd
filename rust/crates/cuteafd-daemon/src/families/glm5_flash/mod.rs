@@ -14,6 +14,7 @@ pub(crate) mod packing;
 mod header;
 pub(crate) mod head;
 mod precision;
+pub(crate) mod verify;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
