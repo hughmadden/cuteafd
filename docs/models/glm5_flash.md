@@ -68,6 +68,16 @@ Attention (KDA), a minority run MLA + DSA.
   programs; shorter steps keep the 131,072-token ones and their bits. With
   `--max-context` past 131,072 their scratch adds 33.5 MB to the prefill
   temporaries and 0.5 MB to the decode workspace (1 MB at `--decode-rows 128`).
+- Masked sparse-MLA slots: a selected slot of -1, or one past its row's length,
+  stages record slot 0 (page 0's first record) and is weighted by zero, so the
+  default programs need finite bytes there (0 x NaN is NaN). Builds with
+  `CUTEAFD_GLM_ZERO_MASKED_V=ON` (`CUTEAFD_WIP_GLM_ZERO_MASKED_V`,
+  `CUTEAFD_RELEASE_GLM_ZERO_MASKED_V`; opt-in) export the GLM 5.x and GLM 5.3
+  Flash sparse MLA programs with b12x's `zero_masked_v`: a masked slot's staged
+  V and FP32 scales are zeroed first, so slot 0 may hold any bytes. Same stems
+  (their manifest params record `zero_masked_v`); rows with a valid slot keep
+  their values (decode rows their bits), and a row whose every slot is masked
+  returns zeros.
 - Admission and verify rows (defaults). Prompts that wait together prefill in one pass, up to
   the first prefill lane's rows (`--prefill-batch`, `GLM5_FLASH_PREFILL_BATCH`; `off` for one
   pass per prompt): each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head run

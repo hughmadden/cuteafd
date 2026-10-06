@@ -60,6 +60,7 @@ set(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING
 set(CUTEAFD_DSV4_MAX_CONTEXT "131072" CACHE STRING "DeepSeek V4 cache extent compiled into programs")
 set(CUTEAFD_GLMF_MAX_CONTEXT "" CACHE STRING
   "GLM 5.3 Flash context extent (tokens, e.g. 1048576): its index top-k is also exported at this extent, beside CUTEAFD_DSV4_MAX_CONTEXT's programs; empty: CUTEAFD_DSV4_MAX_CONTEXT")
+option(CUTEAFD_GLM_ZERO_MASKED_V "GLM 5.x and GLM 5.3 Flash sparse MLA programs zero a masked slot's staged V and FP32 scales (b12x zero_masked_v), so record slot 0 may hold any bytes" OFF)
 if((CUTEAFD_ENABLE_V41_HC_LAGGED_AOT OR CUTEAFD_ENABLE_V41_NARROW_AOT) AND NOT CUTEAFD_ENABLE_V41_FP8_AOT)
   message(FATAL_ERROR "Candidate mHC/narrow AOT requires V4.1 FP8 AOT")
 endif()

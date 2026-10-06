@@ -212,6 +212,7 @@ cmake \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_GLMF_MAX_CONTEXT="${CUTEAFD_RELEASE_GLMF_MAX_CONTEXT:-}" \
+  -DCUTEAFD_GLM_ZERO_MASKED_V="${CUTEAFD_RELEASE_GLM_ZERO_MASKED_V:-OFF}" \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \

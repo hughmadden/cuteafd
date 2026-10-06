@@ -12,7 +12,10 @@ compile-time: decode programs cover ``--decode-rows``, prefill programs
 ``--prefill-rows``, and cache extents follow ``--max-context``. GLM 5.3 Flash also
 exports its decode programs at ``--glmf-wide-decode-rows`` (wider verify steps), and its
 index top-k at ``--glmf-max-context`` when that is longer (contexts up to 1,048,576
-tokens), after every other program.
+tokens), after every other program. ``--glm-zero-masked-v`` builds the GLM 5.x and GLM 5.3
+Flash sparse MLA programs with b12x's ``zero_masked_v``: masked slots, which stage record
+slot 0, get their V and FP32 scales zeroed before their zero weight meets them, so slot 0
+may hold any bytes (same stems; their params record it).
 """
 
 from __future__ import annotations
@@ -35,6 +38,13 @@ import _pinned_sparkinfer
 
 SCALAR_KINDS = {"int32": "i", "int64": "l", "float32": "f"}
 PAGE_ROWS = 64
+
+
+def _masked_v(zero_masked_v: bool) -> dict:
+    """The GLM sparse MLA option ``--glm-zero-masked-v`` adds to a program's params and compile
+    call: nothing unless it is set, so the default export, its manifest and its objects stay as
+    they were (and an older SparkInfer pin still exports them)."""
+    return {"zero_masked_v": True} if zero_masked_v else {}
 
 
 def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
@@ -110,8 +120,9 @@ def head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int
     return [item for item in programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
-def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
-    """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``."""
+def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int, zero_masked_v: bool = False):
+    """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``;
+    ``zero_masked_v`` builds the sparse MLA programs with that b12x option."""
     from b12x.integration.cuteafd import glm_attention as attn
     from b12x.integration.cuteafd import glm_ffn as ffn
     from b12x.integration.cuteafd import glm_indexer as idx
@@ -164,19 +175,22 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"mode": mode, "max_rows": rows, "max_pages": index_pages},
                     lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(
                         g, max_rows=rows, max_pages=index_pages, mode=mode)))
-        out.append((f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
-                    lambda mode=mode, rows=rows: mla.compile_glm_sparse_mla_aot(g, route=mode, max_rows=rows)))
+        out.append((f"sparse_mla_{mode}_m{rows}", "sparse_mla",
+                    {"route": mode, "max_rows": rows, **_masked_v(zero_masked_v)},
+                    lambda mode=mode, rows=rows: mla.compile_glm_sparse_mla_aot(g, route=mode, max_rows=rows,
+                                                                                 **_masked_v(zero_masked_v))))
     return out
 
 
-def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int, zero_masked_v: bool = False):
     """One GPU's share of a two-GPU GLM 5.x head split (``g`` the half geometry: half the
     heads, half the dense and shared-expert intermediates): the MLA producer (the replicated
     latent record, its heads' queries), sparse MLA, W_UV + o_proj (a partial over its heads)
     and the dense / shared-expert MLPs (partials over their intermediate slices); the indexer,
     norms, router and expert input stay the whole model's programs."""
     keep = ("producer_m", "producer_bf16_m", "o_m", "o_bf16_m", "ffn_i", "sparse_mla_")
-    return [item for item in glm_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    return [item for item in glm_programs(g, decode_rows, prefill_rows, max_context, zero_masked_v)
+            if item[0].startswith(keep)]
 
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
@@ -234,9 +248,10 @@ def mimo_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return [item for item in mimo_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
-def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int, zero_masked_v: bool = False):
     """GLM 5.3 Flash programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    mHC is the DeepSeek V4 program set at this model's width and epsilons."""
+    mHC is the DeepSeek V4 program set at this model's width and epsilons; ``zero_masked_v``
+    builds the sparse MLA programs with that b12x option."""
     from b12x.integration.cuteafd import dsv4_mhc as mhc
     from b12x.integration.cuteafd import glm_sparse_mla as mla
     from b12x.integration.cuteafd import glmf
@@ -286,9 +301,10 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows, m=mode: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only=m)),
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only=m)),
-            (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
+            (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows, **_masked_v(zero_masked_v)},
              lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r,
-                                      name="glmf_sparse_mla", fp32_partials=m == "decode")),
+                                      name="glmf_sparse_mla", fp32_partials=m == "decode",
+                                      **_masked_v(zero_masked_v))),
         ]
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
@@ -312,7 +328,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
-def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: int):
+def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: int, zero_masked_v: bool = False):
     """GLM 5.3 Flash decode and verify steps of ``decode_rows`` < rows <= ``wide_rows`` (serve
     ``--decode-rows``): every decode program a step launches again at ``wide_rows`` rows, as new
     stems ``*_m{wide_rows}``, and the replay commits over records of that many rows
@@ -353,9 +369,11 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
         # planner finds no split count within its waves once the unsplit launch exceeds them
         # (128 rows x 4 head blocks, 512 CTAs on 170 SMs) and would split it 33 ways, FP32
         # partials of 33 chunks per row and head in a 554,729,472-byte scratch.
-        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "full_launch_splits": 1},
+        (f"sparse_mla_decode_m{r}", "sparse_mla",
+         {"route": "decode", "max_rows": r, "full_launch_splits": 1, **_masked_v(zero_masked_v)},
          lambda: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
-                                                fp32_partials=True, full_launch_splits=1)),
+                                                fp32_partials=True, full_launch_splits=1,
+                                                **_masked_v(zero_masked_v))),
     ]
     for inter in (g.moe_inter, g.dense_inter):
         out.append((f"ffn_i{inter}_m{r}", "ffn", {"max_rows": r, "inter": inter, "fp8_only": "decode"},
@@ -395,7 +413,7 @@ def glmf_extent_programs(g, decode_rows: int, prefill_rows: int, wide_rows: int,
             for mode, rows in caps]
 
 
-def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int, zero_masked_v: bool = False):
     """One GPU's share of a two-GPU GLM 5.3 Flash head split (``g`` the half geometry: half the
     MLA and KDA heads, half the dense and shared-expert intermediates): KDA (its heads'
     in-projection rows, conv, recurrence and state, a partial o_proj) and its verify-by-replay
@@ -408,7 +426,7 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
 
     # The head split keeps the per-token index keys and an FP32 KDA state (no compact index cache
     # or BF16-state ``_s16`` programs on two GPUs yet).
-    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context)
+    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context, zero_masked_v)
                 if item[0].startswith(keep) and not item[0].startswith("kda_commit_c") and "_s16" not in item[0]]
     programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
     programs.append(("join_heads", "join", {"half_width": g.kda_width},
@@ -523,6 +541,10 @@ def main() -> None:
                         help="with glmf: GLM 5.3 Flash's context extent (e.g. 1048576), recorded as "
                              "families.glmf.max_context; when longer than --max-context its index top-k is also "
                              "exported at it (new stems after every other program); 0: --max-context")
+    parser.add_argument("--glm-zero-masked-v", action="store_true",
+                        help="with glm, glm2, glmf, glmf2: sparse MLA programs zero a masked slot's staged V and "
+                             "FP32 scales (b12x zero_masked_v), so record slot 0, which masked slots stage, may "
+                             "hold any bytes; same stems, params record it")
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     args = parser.parse_args()
     glmf_max_context = args.glmf_max_context or args.max_context
@@ -599,11 +621,13 @@ def main() -> None:
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
-        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
+        masked = {"zero_masked_v": True} if args.glm_zero_masked_v and name in ("glm", "glm2", "glmf", "glmf2") else {}
+        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context, **masked)]
     if "glmf" in geometries:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
-                                                                       args.glmf_wide_decode_rows, args.max_context)]
+                                                                       args.glmf_wide_decode_rows, args.max_context,
+                                                                       args.glm_zero_masked_v)]
         work += [("glmf", *item) for item in glmf_extent_programs(
             GLM53_FLASH, args.decode_rows, args.prefill_rows, args.glmf_wide_decode_rows, args.max_context,
             glmf_max_context)]

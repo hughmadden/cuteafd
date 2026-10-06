@@ -56,6 +56,10 @@ set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --glmf-max-context "${glmf_max_context}")
+# GLM sparse MLA with b12x zero_masked_v (same stems; the manifest's params record it).
+if(CUTEAFD_GLM_ZERO_MASKED_V)
+  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --glm-zero-masked-v)
+endif()
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
