@@ -150,8 +150,33 @@ class Weights:
         self.read_bytes = 0
         self.read_seconds = 0.0
         self.staged = {}
+        self.layer_read_bytes = 0
+        self.layer_read_seconds = 0.0
+        self.slow_layers = 0
 
-    def stage_layer(self, prefix: str, *, minimum_mbps=200):
+    def check_layer_read_rate(self, prefix, payload_bytes, elapsed, *, minimum_mbps=200,
+                              slow_mbps=100, consecutive_slow_layers=2):
+        # Prefix probes reuse this reader; each layer-0 pass gets its own history.
+        if prefix == "model.layers.0.":
+            self.layer_read_bytes = 0
+            self.layer_read_seconds = 0.0
+            self.slow_layers = 0
+        self.layer_read_bytes += payload_bytes
+        self.layer_read_seconds += elapsed
+        rate = payload_bytes / 1e6 / max(elapsed, 1e-9)
+        average = self.layer_read_bytes / 1e6 / max(self.layer_read_seconds, 1e-9)
+        self.slow_layers = self.slow_layers + 1 if rate < slow_mbps else 0
+        print(f"checkpoint sequential reads {prefix}: bytes={payload_bytes} "
+              f"elapsed={elapsed:.3f}s MB/s={rate:.3f} cumulative_MB/s={average:.3f} "
+              f"consecutive_below_{slow_mbps}={self.slow_layers}", flush=True)
+        if average < minimum_mbps or self.slow_layers >= consecutive_slow_layers:
+            self.staged.clear()
+            release_checkpoint(torch.cuda, self)
+            raise RuntimeError(f"GLM archive read guard: cumulative {average:.3f}MB/s "
+                               f"(minimum {minimum_mbps}), consecutive below {slow_mbps}MB/s "
+                               f"={self.slow_layers} (limit {consecutive_slow_layers}); stop, do not crawl")
+
+    def stage_layer(self, prefix: str):
         """Clone complete tensors in physical shard-offset order, never table rows."""
         if self.staged:
             raise ValueError("previous GLM layer staging has not been retired")
@@ -174,13 +199,7 @@ class Weights:
                     self.read_bytes += value.numel() * value.element_size()
                     self.read_seconds += time.monotonic() - tensor_start
         elapsed = time.monotonic() - started
-        rate = (self.read_bytes - before) / 1e6 / max(elapsed, 1e-9)
-        print(f"checkpoint sequential reads {prefix}: bytes={self.read_bytes-before} "
-              f"elapsed={elapsed:.3f}s MB/s={rate:.3f}", flush=True)
-        if rate < minimum_mbps:
-            self.staged.clear()
-            release_checkpoint(torch.cuda, self)
-            raise RuntimeError(f"GLM archive read rate below{minimum_mbps}MB/s: {rate:.3f}; stop, do not crawl")
+        self.check_layer_read_rate(prefix, self.read_bytes - before, elapsed)
 
     def raw(self, name: str) -> torch.Tensor:
         if name in self.staged:

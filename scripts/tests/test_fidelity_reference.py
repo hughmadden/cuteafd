@@ -1065,8 +1065,11 @@ def test_glm5_layer_reads_are_physical_order_and_stop_on_slow_archive():
     weights = next(n for n in tree.body if getattr(n, "name", None) == "Weights")
     stage = ast.unparse(next(n for n in weights.body if getattr(n, "name", None) == "stage_layer"))
     assert "data_offsets" in stage and "handle.get_tensor(name).clone()" in stage
-    assert "minimum_mbps=200" in stage and "rate < minimum_mbps" in stage
-    assert "self.staged.clear()" in stage and "stop, do not crawl" in stage
+    guard = ast.unparse(next(n for n in weights.body if getattr(n, "name", None) == "check_layer_read_rate"))
+    assert "check_layer_read_rate" in stage
+    assert "minimum_mbps=200" in guard and "average < minimum_mbps" in guard
+    assert "slow_mbps=100" in guard and "consecutive_slow_layers=2" in guard
+    assert "self.staged.clear()" in guard and "stop, do not crawl" in guard
     run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
     assert run.index("weights.stage_layer") < run.index("GlmMoeDsaDecoderLayer")
 
@@ -1106,3 +1109,36 @@ def test_glm5_sequential_layer_staging_consumes_whole_tensors(tmp_path, slow):
         before = weights.read_bytes
         assert isinstance(weights.raw(names[0]), Tensor)
         assert weights.read_bytes == before and names[0] not in weights.staged
+
+
+@pytest.mark.parametrize("rates,failed", [
+    ([600, 123, 400], None),
+    ([1000, 90, 90], 2),
+    ([600, 70, 400, 70], None),
+    ([300, 123, 123], 2),
+    ([199], 0),
+    ([200], None),
+    ([1000, 100, 100], None),
+])
+def test_glm5_archive_guard_uses_cumulative_and_consecutive_rates(tmp_path, rates, failed):
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    cls = next(n for n in tree.body if getattr(n, "name", None) == "Weights")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+    released = []
+    scope = dict(Path=pathlib.Path, json=json, torch=SimpleNamespace(Tensor=object, cuda=None),
+                 release_checkpoint=lambda *_args: released.append(True))
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "glm5-rate-guard", "exec"), scope)
+    weights = scope["Weights"](tmp_path)
+    for layer, rate in enumerate(rates):
+        weights.staged = {"tensor": object()}
+        if layer == failed:
+            with pytest.raises(RuntimeError, match="stop, do not crawl"):
+                weights.check_layer_read_rate(f"model.layers.{layer}.", rate * 1_000_000, 1)
+            assert weights.staged == {} and released == [True]
+            break
+        weights.check_layer_read_rate(f"model.layers.{layer}.", rate * 1_000_000, 1)
+        assert weights.staged and not released
+    # A new prefix probe cannot inherit a prior pass's throughput or slow streak.
+    weights.check_layer_read_rate("model.layers.0.", 600_000_000, 1)
+    assert weights.layer_read_bytes == 600_000_000
+    assert weights.layer_read_seconds == 1 and weights.slow_layers == 0
