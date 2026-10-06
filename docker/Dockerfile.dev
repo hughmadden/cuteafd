@@ -17,7 +17,9 @@ RUN apt-get update && \
       openssh-client netcat-openbsd iproute2 pciutils && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && \
+# Pinned toolchain: a release at least two weeks old, so builds do not move under us.
+ARG RUST_TOOLCHAIN=1.98.1
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} && \
     rustup component add rustfmt
 
 ENV UV_SYSTEM_PYTHON=1
