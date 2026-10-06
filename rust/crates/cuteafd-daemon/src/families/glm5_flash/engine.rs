@@ -78,25 +78,39 @@ fn replay_bytes(heads: usize, channels: usize) -> usize {
     REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
 }
 const MAX_RANKS: usize = 6;
-/// Lanes a long Spark prefill chunk splits into (one lane's GPU layers run
-/// while the other lane's Spark wave is in flight), and the fewest rows per
-/// lane worth a second exchange per layer.
-pub(crate) const PREFILL_LANES: usize = 2;
+/// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
+/// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
+/// lane), and the fewest rows per lane worth another exchange per layer.
+pub(crate) const DEFAULT_PREFILL_LANES: usize = 2;
+pub(crate) const MAX_PREFILL_LANES: usize = 4;
 const MIN_LANE_ROWS: usize = 256;
 
-/// Multi-lane splits must land on MLA page boundaries. A narrow workspace
-/// still accepts a single unpadded tail, but cannot advertise unusable padding.
-fn prefill_lane_capacity(rows: usize) -> usize {
-    rows.max(PREFILL_LANES * (rows / PAGE_ROWS) * PAGE_ROWS)
+/// The longest chunk `lanes` lanes of `rows` rows take. Multi-lane splits must land on MLA page
+/// boundaries. A narrow workspace still accepts a single unpadded tail, but cannot advertise
+/// unusable padding.
+fn prefill_lane_capacity(lanes: usize, rows: usize) -> usize {
+    rows.max(lanes * (rows / PAGE_ROWS) * PAGE_ROWS)
 }
 
-fn prefill_lane_plan(tokens: usize, rows: usize) -> Result<(usize, usize)> {
-    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(rows),
-        "prefill of {tokens} tokens exceeds the {rows}-row lane workspaces");
-    let lanes = if tokens <= rows && tokens < PREFILL_LANES * MIN_LANE_ROWS { 1 } else { PREFILL_LANES };
-    let per_lane = if lanes == 1 { tokens } else { tokens.div_ceil(lanes).next_multiple_of(PAGE_ROWS) };
+/// How a chunk of `tokens` rows runs on up to `lanes` lanes of `rows` rows: (lanes, rows per
+/// lane). One lane per `MIN_LANE_ROWS` rows, at most `lanes`, and at least as many as the rows
+/// need once each lane's share is rounded up to whole MLA pages: every lane but the last holds
+/// the same number of pages, so each lane's pools and pages start where the previous lane's end.
+/// Two lanes keep the rule they always had: two from twice `MIN_LANE_ROWS` rows (or when one
+/// lane cannot hold the chunk), cut at the middle rounded up to a page.
+fn prefill_lane_plan(tokens: usize, lanes: usize, rows: usize) -> Result<(usize, usize)> {
+    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(lanes, rows),
+        "prefill of {tokens} tokens exceeds {lanes} lanes of {rows} rows");
+    let mut wanted = (tokens / MIN_LANE_ROWS).clamp(1, lanes.max(1)).max(tokens.div_ceil(rows.max(1)));
+    let per_lane = loop {
+        let per_lane = if wanted == 1 { tokens } else { tokens.div_ceil(wanted).next_multiple_of(PAGE_ROWS) };
+        if per_lane <= rows || wanted >= lanes {
+            break per_lane;
+        }
+        wanted += 1;
+    };
     ensure!(per_lane <= rows, "prefill lane of {per_lane} tokens exceeds {rows} rows");
-    Ok((lanes, per_lane))
+    Ok((tokens.div_ceil(per_lane), per_lane))
 }
 const HC: usize = 4;
 
@@ -337,19 +351,20 @@ impl Allocator {
     }
 }
 
-/// Extra per-GPU storage: all peer receive slots and every retained workspace's delta.
-pub(crate) fn fp32_partial_reserve(prefill_rows: usize, hidden: usize) -> u64 {
-    partial_reserve(prefill_rows, hidden, 4)
+/// Extra per-GPU storage of `lanes` prefill lanes: all peer receive slots and every retained
+/// workspace's delta.
+pub(crate) fn fp32_partial_reserve(lanes: usize, prefill_rows: usize, hidden: usize) -> u64 {
+    partial_reserve(lanes, prefill_rows, hidden, 4)
 }
 
-pub(crate) fn partial_reserve(prefill_rows: usize, hidden: usize, bytes: usize) -> u64 {
-    (((4 * PREFILL_LANES + PREFILL_LANES + 1) * prefill_rows.max(DECODE_ROWS) + DECODE_ROWS)
+pub(crate) fn partial_reserve(lanes: usize, prefill_rows: usize, hidden: usize, bytes: usize) -> u64 {
+    (((4 * lanes + lanes + 1) * prefill_rows.max(DECODE_ROWS) + DECODE_ROWS)
         * hidden * bytes.saturating_sub(2)) as u64
 }
 
-/// Four additional parity/lane slots hold normalized heads until the peer consumes them.
-pub(crate) fn output_shard_reserve(prefill_rows: usize, hidden: usize) -> u64 {
-    (2 * PREFILL_LANES * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
+/// Two additional parity slots per lane hold normalized heads until the peer consumes them.
+pub(crate) fn output_shard_reserve(lanes: usize, prefill_rows: usize, hidden: usize) -> u64 {
+    (2 * lanes * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
 }
 
 /// A step workspace: one lane's own buffers over the temporaries of one attention call. Prefill
@@ -643,8 +658,10 @@ fn slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
 
-fn norm_slot(output_slot: usize) -> usize {
-    4 * PREFILL_LANES + (output_slot / 4) * 2 + (output_slot % 4) / 2
+/// The normalized-heads slot of attention exchange slot `output_slot` with `lanes` prefill lanes
+/// (after every lane's four exchange slots).
+fn norm_slot(lanes: usize, output_slot: usize) -> usize {
+    4 * lanes + (output_slot / 4) * 2 + (output_slot % 4) / 2
 }
 
 /// Output token rows: rank 0 owns the leading ceil half, rank 1 the remaining rows.
@@ -661,7 +678,10 @@ pub(crate) struct GlmfEngine<'a> {
     pub weights: GlmfWeights<'a>,
     pub stream: *mut c_void,
     pub max_context: usize,
+    /// Rows of one prefill lane (and of a serial prefill chunk).
     pub prefill_rows: usize,
+    /// Prefill lanes (1..=[`MAX_PREFILL_LANES`]): a Spark prefill chunk runs in up to this many.
+    pub prefill_lane_count: usize,
     pub pages: usize,
     pub slots: usize,
     /// Per layer: its index among the KDA layers (None for MLA).
@@ -772,11 +792,13 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
-        stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
-        embedding: TokenEmbedding<'a>) -> Result<Self> {
+        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
+        slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
+        ensure!((1..=MAX_PREFILL_LANES).contains(&prefill_lane_count) && prefill_rows > 0,
+            "{prefill_lane_count} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_LANES} lanes)");
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
         // Whole allocation units: four MLA pages and one pool page each.
@@ -791,7 +813,8 @@ impl<'a> GlmfEngine<'a> {
         let kda_heads = cfg.kda_heads / if weights.layers.first().is_some_and(|l| l.split) { 2 } else { 1 };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
+            pages, slots,
             kda_ordinal, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
@@ -822,13 +845,13 @@ impl<'a> GlmfEngine<'a> {
 
     /// Attaches the head split's second GPU: `device` with `stream`, holding `layers` (every
     /// layer's rank-1 share, see `GlmfLoader::model`). Loads the programs there, allocates its
-    /// caches and the exchange (four slots per prefill lane).
+    /// caches and the exchange (four slots per prefill lane, six with the KDA output shard).
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmfLayer<'a>>) -> Result<()> {
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * PREFILL_LANES,
+            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
@@ -1345,6 +1368,14 @@ impl<'a> GlmfEngine<'a> {
         if on_layer.is_none() && forced.is_none() && self.pipelined() {
             return self.prefill_lanes(placement, tokens, all_logits, device);
         }
+        Ok(self.prefill_one(placement, tokens, on_layer, forced, all_logits)?.map(StepLogits::Device))
+    }
+
+    /// One serial prefill pass of `tokens` (at most `prefill_rows`) in the first lane's workspace.
+    fn prefill_one(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool) -> Result<Option<DeviceLogits>> {
+        let (t, start) = (tokens.len(), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         if start == 0 {
             self.start(placement)?;
@@ -1355,39 +1386,51 @@ impl<'a> GlmfEngine<'a> {
         let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced, None)?;
         placement.len += t;
         placement.kda_len = placement.len;
-        Ok(logits.map(StepLogits::Device))
+        Ok(logits)
+    }
+
+    /// A serial prefill pass whatever the lanes (the reference `--lane-check` holds lanes to):
+    /// every row's logits with `all_logits`, else the last row's.
+    pub(crate) fn prefill_serial(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool)
+        -> Result<Option<Vec<f32>>> {
+        self.prefill_one(placement, tokens, None, None, all_logits)?.map(|logits| logits.to_host(self.library)).transpose()
+    }
+
+    /// The rows of each lane a pipelined prefill of `tokens` rows runs in, in order.
+    pub(crate) fn prefill_cuts(&self, tokens: usize) -> Result<Vec<usize>> {
+        let (_, per_lane) = prefill_lane_plan(tokens, self.prefill_lane_count, self.prefill_rows)?;
+        Ok((0..tokens).step_by(per_lane).map(|first| per_lane.min(tokens - first)).collect())
     }
 
     /// Whether prefill runs as Spark lanes (a transport per lane, every layer resident).
     /// CUTEAFD_GLMF_PREFILL_LANES=1 keeps the serial one-workspace prefill (A/B runs).
     fn pipelined(&self) -> bool {
         self.lanes && (self.weights.layers.len() == self.cfg.layers || self.subset_lanes) && matches!(&self.experts,
-            Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= PREFILL_LANES)
+            Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= self.prefill_lane_count)
     }
 
     /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
     /// each when Spark prefill is pipelined.
     pub fn prefill_capacity(&self) -> usize {
-        if self.pipelined() { prefill_lane_capacity(self.prefill_rows) } else { self.prefill_rows }
+        if self.pipelined() { prefill_lane_capacity(self.prefill_lane_count, self.prefill_rows) } else { self.prefill_rows }
     }
 
-    /// A Spark prefill chunk as up to [`PREFILL_LANES`] lanes of consecutive
+    /// A Spark prefill chunk as up to `prefill_lane_count` lanes of consecutive
     /// rows (see [`Self::step_lanes`]).
     fn prefill_lanes(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool)
         -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        let (_, per_lane) = prefill_lane_plan(t, self.prefill_rows)?;
         // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
         // pools and pages start where the previous lane's end.
-        ensure!(t > 0 && per_lane <= self.prefill_rows && start + t <= self.max_context,
+        let cuts = self.prefill_cuts(t)?;
+        ensure!(t > 0 && cuts.iter().all(|&n| n <= self.prefill_rows) && start + t <= self.max_context,
             "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
         if start == 0 {
             self.start(placement)?;
         }
         let mut steps = Vec::new();
         let mut first = 0;
-        while first < t {
-            let n = per_lane.min(t - first);
+        for n in cuts {
             let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
                 ..Default::default() };
             self.rows(placement, start + first..start + first + n, 0, &mut tables)?;
@@ -1560,7 +1603,7 @@ impl<'a> GlmfEngine<'a> {
         let h = self.cfg.hidden;
         let (first, owned) = output_rows(t, rank);
         let sent_first = if rank == 0 { owned } else { 0 };
-        let heads_slot = norm_slot(output_slot);
+        let heads_slot = norm_slot(self.prefill_lane_count, output_slot);
         exchange.push(rank, heads_slot, w.delta.buffer.ptr.wrapping_byte_add(sent_first * h * 2),
             (t - owned) * h * 2)?;
         exchange.wait(rank, heads_slot)?;
@@ -2721,7 +2764,8 @@ impl Drop for GlmfEngine<'_> {
 
 #[cfg(test)]
 mod prefill_lane_tests {
-    use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+    use super::{prefill_lane_capacity, prefill_lane_plan, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES, MIN_LANE_ROWS,
+        PAGE_ROWS};
 
     #[test]
     fn split_audit_counts_routes_and_hashes_token_bytes_in_order() {
@@ -2752,37 +2796,70 @@ mod prefill_lane_tests {
     }
 
     #[test]
-    fn output_shard_norm_slots_isolate_both_lanes_and_layer_parities() {
-        let mut heads = std::collections::BTreeSet::new();
-        let mut existing = std::collections::BTreeSet::new();
-        for lane in 0..PREFILL_LANES {
-            for layer in 0..2 {
-                existing.insert(super::slot(layer, false, lane));
-                existing.insert(super::slot(layer, true, lane));
-                let slot = super::norm_slot(super::slot(layer, false, lane));
-                assert_eq!(slot, super::norm_slot(super::slot(layer + 2, false, lane)));
-                assert!(heads.insert(slot));
+    fn output_shard_norm_slots_isolate_every_lane_and_layer_parity() {
+        for lanes in 1..=MAX_PREFILL_LANES {
+            let mut heads = std::collections::BTreeSet::new();
+            let mut existing = std::collections::BTreeSet::new();
+            for lane in 0..lanes {
+                for layer in 0..2 {
+                    existing.insert(super::slot(layer, false, lane));
+                    existing.insert(super::slot(layer, true, lane));
+                    let slot = super::norm_slot(lanes, super::slot(layer, false, lane));
+                    assert_eq!(slot, super::norm_slot(lanes, super::slot(layer + 2, false, lane)));
+                    assert!(heads.insert(slot));
+                }
             }
+            assert!(heads.is_disjoint(&existing));
+            // The exchange holds six slots per lane with the output shard.
+            assert_eq!(heads, (4 * lanes..6 * lanes).collect(), "{lanes} lanes");
         }
-        assert!(heads.is_disjoint(&existing));
-        assert_eq!(heads, (8..12).collect());
     }
 
     #[test]
     fn every_advertised_prefill_tail_fits_its_lane_workspaces() {
-        for rows in [1, 63, 64, 65, 96, 127, 128, 255, 256, 511, 512, 1024, 1536, 2047, 2048, 4096] {
-            let capacity = prefill_lane_capacity(rows);
-            for tokens in 1..=capacity {
-                let (lanes, per_lane) = prefill_lane_plan(tokens, rows).unwrap();
-                assert!(lanes <= PREFILL_LANES && per_lane <= rows, "rows={rows}, tokens={tokens}");
-                let starts: Vec<_> = (0..tokens).step_by(per_lane).collect();
-                assert!(starts.len() <= lanes);
-                assert_eq!(starts.iter().map(|&s| per_lane.min(tokens - s)).sum::<usize>(), tokens);
-                assert!(starts.iter().all(|&s| per_lane.min(tokens - s) <= rows));
-                assert!(starts.iter().skip(1).all(|s| s % PAGE_ROWS == 0));
+        for lanes in 1..=MAX_PREFILL_LANES {
+            for rows in [1, 63, 64, 65, 96, 127, 128, 255, 256, 511, 512, 1024, 1536, 2047, 2048, 4096] {
+                let capacity = prefill_lane_capacity(lanes, rows);
+                for tokens in 1..=capacity {
+                    let (used, per_lane) = prefill_lane_plan(tokens, lanes, rows).unwrap();
+                    assert!(used <= lanes && per_lane <= rows, "lanes={lanes}, rows={rows}, tokens={tokens}");
+                    let starts: Vec<_> = (0..tokens).step_by(per_lane).collect();
+                    assert_eq!(starts.len(), used);
+                    assert_eq!(starts.iter().map(|&s| per_lane.min(tokens - s)).sum::<usize>(), tokens);
+                    assert!(starts.iter().all(|&s| per_lane.min(tokens - s) <= rows));
+                    assert!(starts.iter().skip(1).all(|s| s % PAGE_ROWS == 0));
+                }
+                assert!(prefill_lane_plan(capacity + 1, lanes, rows).is_err());
             }
-            assert!(prefill_lane_plan(capacity + 1, rows).is_err());
         }
+    }
+
+    #[test]
+    fn two_lanes_keep_their_cuts_for_every_chunk() {
+        // The rule before the lane count was a setting: identical cuts give identical bits.
+        let before = |tokens: usize, rows: usize| {
+            let lanes = if tokens <= rows && tokens < 2 * MIN_LANE_ROWS { 1 } else { 2 };
+            if lanes == 1 { tokens } else { tokens.div_ceil(lanes).next_multiple_of(PAGE_ROWS) }
+        };
+        for rows in [64, 128, 256, 2048, 4096] {
+            for tokens in 1..=prefill_lane_capacity(2, rows) {
+                assert_eq!(prefill_lane_plan(tokens, 2, rows).unwrap().1, before(tokens, rows), "{tokens} of {rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn four_lanes_of_2048_hold_a_chunk_of_8192() {
+        assert_eq!(prefill_lane_capacity(4, 2048), 8192);
+        assert_eq!(prefill_lane_plan(8192, 4, 2048).unwrap(), (4, 2048));
+        assert_eq!(prefill_lane_plan(4096, 4, 2048).unwrap(), (4, 1024));
+        // One lane per 256 rows, cut on 64-row pages.
+        assert_eq!(prefill_lane_plan(1000, 4, 2048).unwrap(), (3, 384));
+        assert_eq!(prefill_lane_plan(511, 4, 2048).unwrap(), (1, 511));
+        // One lane: the chunk is the lane.
+        assert_eq!(prefill_lane_capacity(1, 4096), 4096);
+        assert_eq!(prefill_lane_plan(4096, 1, 4096).unwrap(), (1, 4096));
+        assert!(prefill_lane_plan(4097, 1, 4096).is_err());
     }
 
     #[test]
@@ -2795,13 +2872,13 @@ mod prefill_lane_tests {
 
     #[test]
     fn narrow_workspace_splits_the_short_tool_prompt() {
-        assert_eq!(prefill_lane_plan(214, 128).unwrap(), (2, 128));
-        assert_eq!(prefill_lane_plan(1, 1).unwrap(), (1, 1));
-        assert!(prefill_lane_plan(0, 128).is_err());
-        assert!(prefill_lane_plan(1, 0).is_err());
+        assert_eq!(prefill_lane_plan(214, 2, 128).unwrap(), (2, 128));
+        assert_eq!(prefill_lane_plan(1, 2, 1).unwrap(), (1, 1));
+        assert!(prefill_lane_plan(0, 2, 128).is_err());
+        assert!(prefill_lane_plan(1, 2, 0).is_err());
         // Keep the qualified default's lane threshold and advertised width.
-        assert_eq!(prefill_lane_capacity(4096), 8192);
-        assert_eq!(prefill_lane_plan(511, 4096).unwrap(), (1, 511));
-        assert_eq!(prefill_lane_plan(512, 4096).unwrap(), (2, 256));
+        assert_eq!(prefill_lane_capacity(DEFAULT_PREFILL_LANES, 4096), 8192);
+        assert_eq!(prefill_lane_plan(511, 2, 4096).unwrap(), (1, 511));
+        assert_eq!(prefill_lane_plan(512, 2, 4096).unwrap(), (2, 256));
     }
 }

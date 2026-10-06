@@ -317,6 +317,41 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("", [], ["--prefill-lanes", "--prefill-lane-rows"]),
+    ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
+     ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
+    ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
+])
+def test_glmf_prefill_lanes_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, launch
+    for option in absent:
+        assert option not in launch, launch
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("GLM5_FLASH_PREFILL_LANES", "0", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
+    ("GLM5_FLASH_PREFILL_LANES", "5", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+])
+def test_glmf_invalid_prefill_lanes_fail_before_workers_launch(tmp_path, key, value, message):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{key}={value}\n")
+    assert result.returncode == 2 and message in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
