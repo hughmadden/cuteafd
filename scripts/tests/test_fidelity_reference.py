@@ -1046,3 +1046,15 @@ def test_glm5_fixed_dsa_hooks_are_fail_closed_and_panel_bound():
     run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
     assert run.index("install_dsa") < run.index("qualify")
     assert "_dsa_extent" in run
+
+
+def test_glm5_timing_pilot_cannot_publish_golden_evidence():
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    function = next(n for n in tree.body if getattr(n, "name", None) == "run_windows")
+    source = ast.unparse(function)
+    assert "None if diagnostic_stop is not None else qualify" in source
+    stop = next(n for n in ast.walk(function) if isinstance(n, ast.If)
+                and ast.unparse(n.test) == "diagnostic_stop == layer_id")
+    assert isinstance(stop.body[-1], ast.Return)
+    assert "'qualification': False" in ast.unparse(stop)
+    assert "finish_golden" not in ast.unparse(stop)

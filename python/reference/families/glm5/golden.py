@@ -213,7 +213,8 @@ def run_windows(a, config, ref, weights):
     if not getattr(a, "_prefix_probe", False):
         a._dsa_extent = max(len(w["tokens"]) for w in manifest["windows"])
     install_dsa(ref, a._dsa_extent)
-    proof = qualify(a, manifest, lambda probe: run_windows(probe, config, ref, weights))
+    diagnostic_stop = getattr(a, "diagnostic_layer", None)
+    proof = None if diagnostic_stop is not None else qualify(a, manifest, lambda probe: run_windows(probe, config, ref, weights))
     if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
         return
     started, rows, times, states = time.time(), [], [], []
@@ -284,6 +285,13 @@ def run_windows(a, config, ref, weights):
                 memory.release()
                 memory.check(f"layer {layer_id} checkpoint")
             print(f"layer {layer_id} {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+            if diagnostic_stop == layer_id:
+                (a.out / "diagnostic.json").write_text(json.dumps({
+                    "qualification": False, "kind": "layer-timing-only",
+                    "set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                    "seconds_per_layer": times, "windows": [w["id"] for w in manifest["windows"]],
+                }, sort_keys=True) + "\n")
+                return
         norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
         norm.weight.copy_(weights.get("model.norm.weight"))
         head = weights.get("lm_head.weight").float()
@@ -311,11 +319,14 @@ def main() -> None:
                    help="re-quantize FP8 blocks to power-of-two scales (the b12x linear format)")
     p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored logits")
     p.add_argument("--prefix-only", action="store_true")
+    p.add_argument("--diagnostic-layer", type=int, help="stop after layer timing; never qualifies")
     p.add_argument("--prefix-trace", action="store_true", help="save all layers for actual prefix diagnostic")
     p.add_argument("--checkpoint-layers", action="store_true", help="rolling sealed hidden+DSA states")
     p.add_argument("--resume-layers", type=Path, help="resume into fresh output from complete layer states")
     p.add_argument("--source-seal-sha256", help="verified immutable checkpoint source seal")
     a = p.parse_args()
+    if a.diagnostic_layer is not None and (not a.windows or a.prefix_only or a.diagnostic_layer < 0):
+        p.error("--diagnostic-layer requires full --windows and a nonnegative layer")
     if a.checkpoint_layers and (not a.windows or a.prefix_only or not a.source_seal_sha256
             or len(a.source_seal_sha256) != 64 or any(c not in "0123456789abcdef" for c in a.source_seal_sha256)):
         p.error("--checkpoint-layers requires full --windows and a verified source seal SHA256")
@@ -335,6 +346,8 @@ def main() -> None:
     install()
     config = AutoConfig.from_pretrained(a.snapshot)
     config._attn_implementation = "eager"
+    if a.diagnostic_layer is not None and a.diagnostic_layer >= config.num_hidden_layers:
+        p.error("diagnostic layer exceeds model extent")
     if a.windows:
         a.out.mkdir(parents=True, exist_ok=True)
         run_windows(a, config, ref, Weights(a.snapshot))
