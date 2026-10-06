@@ -482,6 +482,15 @@ impl<'a> TokenSelector<'a> {
             landing: HostAllocation::new(library, capacity * 12)?, wave: None, counts: [0; 3] })
     }
 
+    /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
+    /// selection does.
+    pub fn reserve_sampler(&mut self) -> Result<()> {
+        if self.wave.is_none() && self.placement != SelectPlacement::Host {
+            self.wave = Some(TargetSamplingWave::new(self.library, self.capacity.min(128), self.vocab)?);
+        }
+        Ok(())
+    }
+
     /// Selects `batch.rows[i]` from logits row `i`.
     pub fn select(&mut self, logits: &DeviceLogits, batch: &SelectBatch) -> Result<Vec<RowResult>> {
         let rows = &batch.rows;

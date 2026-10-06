@@ -173,6 +173,33 @@ pub(crate) fn admitted_pool_tokens(library: &cuteafd_ffi::NativeLibrary, devices
     Ok(tokens)
 }
 
+/// What a measured admission keeps free beside the KV pool's records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeasuredReserve {
+    /// Runtime growth the start-up cannot see (`--headroom-gib`).
+    pub headroom: u64,
+    /// Graph executables captured after start-up: the graph budget, else the planner's allowance.
+    pub graphs: u64,
+    /// Allocated with the pool or after it: recurrent state, replay records, prefix marks.
+    pub later: u64,
+}
+
+/// The KV pool of an engine that allocated everything else first (drafter, transports and
+/// intake, step workspaces, selector): the GPU's free memory now, less `reserve`, over its
+/// records per token, in whole `unit_rows` units. No calibrated workspace, drafter or runtime
+/// allowance: those are allocated, so free memory already shows them. `requested` is a fixed
+/// pool, checked instead of sized.
+pub(crate) fn measured_pool_tokens(library: &cuteafd_ffi::NativeLibrary, device: i32, bytes_per_token: u64,
+    unit_rows: u64, reserve: MeasuredReserve, requested: Option<u64>) -> anyhow::Result<usize> {
+    let reserve_bytes = reserve.headroom.checked_add(reserve.graphs).and_then(|bytes| bytes.checked_add(reserve.later))
+        .ok_or_else(|| anyhow::anyhow!("KV admission reserve overflows"))?;
+    tracing::info!(device, headroom_bytes = reserve.headroom, graph_bytes = reserve.graphs,
+        later_bytes = reserve.later, "KV admission from measured free memory after start-up allocations");
+    let tokens = admitted_pool_tokens(library, &[KvDevice { device, bytes_per_token, reserve_bytes }], unit_rows,
+        cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS, requested)?;
+    Ok(usize::try_from(tokens)?)
+}
+
 /// Bytes of a checkpoint directory's safetensors shards (a drafter's resident
 /// size when it keeps its checkpoint representation).
 pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
