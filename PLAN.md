@@ -704,6 +704,30 @@ Policy decisions:
   passes full decode and prefill (top-1 upper bounds 0.000937 / 0.001854;
   KL upper bounds 0.000846 / 0.000305 nat). Quick is inconclusive, not fail;
   independent agentic replay remains required and defaults are unchanged.
+- **Qwen reference ULP-sensitivity floor:** on SM121, changing official
+  eager QSA from variable K to zero-padded K2560 gives mean full-vocabulary
+  KL 0.0176858 (legacy) / 0.1790475 (a00), with seven confident top-1 flips
+  on a00. The unchanged-source variable-K arm reproduces both original
+  raw-F32 goldens byte-exactly; frozen attention padding agrees exactly on
+  CPU with FP64 inputs, including a true-FP64 softmax diagnostic. This is
+  consistent with GPU reduction-order perturbations amplifying through
+  48 layers, not observed runner/checkpoint drift. Both official-math
+  references remain valid; no regeneration, threshold relaxation or
+  default promotion. This two-window sensitivity measurement is not a
+  full-text-set noise bound; measuring that floor is a later item.
+- **GLM 5.3 EXL3 K4 open finding:** copy-heavy context rows d03/d04/a25
+  remain flagged. The aligned d04 versus c03 diagnostic shows an isolated
+  attention spike at layer 22 and content-specific late divergence after
+  about layer 46. The official d04 replay reproduces its confident answer;
+  the engine keeps copy-source token 1103 at every full-index layer after
+  physical-cache-slot IDs are mapped to logical positions. Late selected
+  sets overlap the reference by about 94.5-97.2% (c03: 97.4-98.5%);
+  selection drift is within about 5.5%, not a copy-source drop. A forced
+  layer-50 attention check cannot be reconstructed from current dumps:
+  per-layer K/V history and the MLA query/cache were not saved. Quantization
+  amplification is a hypothesis, not an engine-correctness verdict; no
+  further hardware run is scheduled. This open finding does not block
+  dataset upload, which still needs the d03 reference check and TJ approval.
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.
