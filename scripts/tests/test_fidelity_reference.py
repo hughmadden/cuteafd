@@ -786,6 +786,9 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
             return Tensor(np.broadcast_to(self.data, shape))
         def contiguous(self): return Tensor(self.data.copy())
         def mean(self, dim): return Tensor(self.data.mean(axis=dim))
+        @property
+        def dtype(self): return "bf16"
+        def triu(self, diagonal): return Tensor(np.triu(self.data, diagonal))
         def to(self, _dtype): return self
         def copy_(self, other): self.data = other.data.copy()
 
@@ -810,11 +813,12 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
         def to(self, _dtype): return self
         def __call__(self, h): return h
 
-    weights = SimpleNamespace(files={}, get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
+    weights = SimpleNamespace(files={}, read_bytes=0, get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
     torch = SimpleNamespace(inference_mode=nullcontext, device=lambda _name: nullcontext(),
         bfloat16="bf16", float32="f32", bool="bool", set_default_dtype=lambda _dtype: None,
         tensor=lambda data, **_kwargs: Tensor(data), arange=lambda n, **_kwargs: Tensor(np.arange(n)),
         ones=lambda *shape, **_kwargs: Tensor(np.ones(shape)),
+        full=lambda shape, value, **_kwargs: Tensor(np.full(shape, value)),
         cuda=SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None),
         nn=SimpleNamespace(functional=SimpleNamespace(
             embedding=lambda ids, _weights: Tensor(ids.data[..., None]),
@@ -823,7 +827,8 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
     scope = dict(torch=torch, time=time, load_set=load_set, verify_snapshot=lambda *_args: {},
         qualify=lambda *_args: None, write_scored_logits=write_scored_logits, finish_golden=finish_golden,
         PREFIX="model.language_model.", FP32_KEYS=(), load_layer=lambda *_args: None,
-        CheckpointStorage=CheckpointStorage)
+        CheckpointStorage=CheckpointStorage, install_dsa=lambda *_args: None,
+        log_checkpoint_reads=lambda *_args: None)
     exec(compile(ast.Module(body=[function], type_ignores=[]), "glm_window_runner", "exec"), scope)
     config = SimpleNamespace(hc_mult=4, num_hidden_layers=3, hidden_size=1, rms_norm_eps=1e-6,
                              layer_types=["dsa", "dsa", "kda"])
@@ -1015,3 +1020,29 @@ def test_layer_checkpoint_admission_retains_nvme_headroom(tmp_path, monkeypatch)
     monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=100 * 2**30))
     with pytest.raises(RuntimeError, match="headroom"):
         LayerCheckpoints(tmp_path / "first", {}, {"w": [1, 2, 1, 2]})
+
+
+def test_glm5_checkpoints_preserve_hidden_and_shared_dsa_indices():
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
+    assert "-hidden" in run and "-index" in run
+    assert "config.index_topk, 2" in run
+    assert "checkpoint_states(states)" in run and "restore_states(arrays)" in run
+    assert run.index("del layer") < run.index("checkpoints.commit")
+    assert "not getattr(a, '_prefix_probe', False)" in run
+    assert "attention_mask=mask" in run
+    assert "log_checkpoint_reads" in run
+
+
+def test_glm5_fixed_dsa_hooks_are_fail_closed_and_panel_bound():
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    hook = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "install_dsa"))
+    assert "unsupported official DSA score site" in hook
+    assert "unsupported official DSA selection site" in hook
+    assert "fixed_index_topk(scores, slots)" in hook
+    assert "values.to(torch.int32)" in hook
+    assert "value=-float('inf')" in hook
+    assert "range(0, length, ROWS)" in hook
+    run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
+    assert run.index("install_dsa") < run.index("qualify")
+    assert "_dsa_extent" in run
