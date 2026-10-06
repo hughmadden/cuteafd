@@ -80,8 +80,9 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
     assert kwargs["kda_s16_m128"] == {"max_rows": 128, "fp8": True, "state_dtype": "bfloat16",
                                       "state_rounding": "window"}
     assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
+    # The 128-row bucket keeps one split where the planner would split it maximally.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
-                                                "fp32_partials": True}
+                                                "fp32_partials": True, "full_launch_splits": 1}
     assert kwargs["index_topk_decode_m128"] == {"max_rows": 128, "max_pages": 512, "mode": "decode"}
     assert kwargs["index_producer_c_m128"] == {"max_rows": 128, "verify_rows": 128}
     for stem in ("mla_producer_m128", "o_m128"):

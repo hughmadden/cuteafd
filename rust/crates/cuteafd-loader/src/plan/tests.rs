@@ -952,8 +952,8 @@ fn glm5_flash_layout_charges_the_wide_decode_workspace_and_replay_records() {
     use cuteafd_core::memory_layout::Category;
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
-    // The base export's scratch, and the wide programs' at 128 rows (their scratch formulas at 128
-    // rows; the sparse MLA and top-k plans scaled with the rows: test inputs, not an export).
+    // The base export's scratch, and the wide programs' from the first 128-row export, but for the
+    // sparse MLA decode's: its 128-row bucket at one split (that export's planner took 33).
     let programs: Vec<(&str, u64)> = vec![("glmf_mhc_pre", 26_214_400), ("glmf_index_producer_m64", 561_152),
         ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
         ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
@@ -962,7 +962,7 @@ fn glm5_flash_layout_charges_the_wide_decode_workspace_and_replay_records() {
         ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
         ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
         ("glmf_ffn_i12288_m4096", 353_894_400)];
-    let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_307_648),
+    let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_304_576),
         ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
         ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
         ("glmf_ffn_i12288_m128", 9_437_184)];
@@ -996,7 +996,7 @@ fn glm5_flash_layout_charges_the_wide_decode_workspace_and_replay_records() {
     // The wide programs' scratch stays under mhc_pre's (prefill capacity); the top-k's grows.
     let narrow = glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap();
     let both = glmf_step_scratch(&lookup, &cfg, Default::default(), 128, true).unwrap();
-    assert_eq!((narrow.programs, both.programs, narrow.topk, both.topk), (26_214_400, 26_214_400, 8_653_824, 17_307_648));
+    assert_eq!((narrow.programs, both.programs, narrow.topk, both.topk), (26_214_400, 26_214_400, 8_653_824, 17_304_576));
     // The state item carries the replay records at the decode rows.
     let replay = |rows: u64| glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap()
         .ranks[0].clone();

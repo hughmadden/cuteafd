@@ -348,9 +348,13 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only="decode")),
-        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r},
+        # One split for the 128-row bucket, as the 64-row program's 64-row bucket: the split
+        # planner finds no split count within its waves once the unsplit launch exceeds them
+        # (128 rows x 4 head blocks, 512 CTAs on 170 SMs) and would split it 33 ways, FP32
+        # partials of 33 chunks per row and head in a 554,729,472-byte scratch.
+        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "full_launch_splits": 1},
          lambda: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
-                                                fp32_partials=True)),
+                                                fp32_partials=True, full_launch_splits=1)),
     ]
     for inter in (g.moe_inter, g.dense_inter):
         out.append((f"ffn_i{inter}_m{r}", "ffn", {"max_rows": r, "inter": inter, "fp8_only": "decode"},
