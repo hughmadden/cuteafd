@@ -896,6 +896,41 @@ fn a_capture_with_nothing_to_evict_is_skipped_and_counted() {
     assert_eq!(cache.pool().free(), 6);
 }
 
+/// Pool-page marks with the host tier on: under pressure a capture evicts the least recently
+/// used snapshot only once its rows and mark reached pinned RAM (the eviction waits for the
+/// write-behind copy still in flight), and a later request brings both back into fresh pages
+/// and continues exactly.
+#[test]
+fn pool_mark_evictions_reach_the_host_tier_and_come_back_exactly() {
+    let fake = Fake::pooled(10, 3);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let first = seq(100, 12);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &first, &[], 12);
+    cache.release(&fake, &a.pages).unwrap();
+    // The second prompt's snapshot needs the first one's pages; nothing has advanced the copy
+    // clock, so the first snapshot's store is still in flight when it is evicted.
+    let (_, _, b) = serve(&mut cache, &fake, 1, &seq(200, 16), &[], 16);
+    cache.release(&fake, &b.pages).unwrap();
+    let stats = cache.stats();
+    let host = stats.host.clone().unwrap();
+    assert_eq!((stats.evictions, stats.host_evict_waits, stats.host_evict_uncached), (1, 1, 0), "{stats:?}");
+    assert_eq!((host.stores_completed, stats.entries_prompt), (1, 1), "{stats:?}");
+    // The first conversation continues: rows and mark come back from RAM (evicting the second
+    // snapshot, again only after its copy landed), and every context row checks out.
+    let mut next = first.clone();
+    next.push(5);
+    let (resume, _, mut c) = serve(&mut cache, &fake, 2, &next, &[], 16);
+    assert_eq!(resume, first.len());
+    let stats = cache.stats();
+    assert_eq!((stats.promotions, stats.host.unwrap().restores, stats.evictions, stats.host_evict_waits), (1, 1, 2, 2));
+    let mut longer = next.clone();
+    longer.push(6);
+    fake.forward(&mut c, &longer).unwrap();
+    cache.release(&fake, &c.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.stats().mark_pages), (10, 0));
+}
+
 /// A pool-page layout must hold a mark of at least one page; an arena family keeps its arena.
 #[test]
 fn pool_page_layouts_are_checked() {
