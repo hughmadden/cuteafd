@@ -69,6 +69,75 @@ pub struct GlmfScratchOptions {
     pub index_compact: bool,
     /// The KDA recurrent state (`--kda-state`): which KDA programs the steps launch.
     pub kda_state: GlmfKdaState,
+    /// GLM 5.3 Flash's longer index top-k extent (tokens, `GlmfTopkExtents::long`) when the steps
+    /// may run its `glmf_index_topk_*_ctx{N}` programs (a context past the plain programs'): their
+    /// scratch counts too. None: the plain programs alone.
+    pub topk_long: Option<u64>,
+}
+
+/// GLM 5.3 Flash's DSA index top-k extents (tokens): the plain `glmf_index_topk_*` programs'
+/// (the manifest's `capacities.max_context`) and, for a context past it, the longer
+/// `glmf_index_topk_*_ctx{N}` programs' (`families.glmf.max_context`, exported with CMake
+/// `CUTEAFD_GLMF_MAX_CONTEXT`). Only the top-k bakes in an extent: every other program serves any
+/// context. A step runs the longer program only when its pool tables are wider than the plain
+/// one's pages, so shorter contexts keep the plain programs, their bits and their speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlmfTopkExtents {
+    pub base: u64,
+    /// None when the context fits the plain programs (or the build has no longer extent).
+    pub long: Option<u64>,
+}
+
+/// A step whose pool tables are wider than every index top-k the engine runs covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlmfTopkWidth {
+    pub width: u64,
+    pub pages: u64,
+}
+
+impl std::fmt::Display for GlmfTopkWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a GLM 5.3 Flash step over {} pool pages exceeds the index top-k's {} (its context extent)",
+            self.width, self.pages)
+    }
+}
+
+impl std::error::Error for GlmfTopkWidth {}
+
+/// Pool-cache pages of the DSA index over `context` tokens: 64 pools of [`KPOOL`] tokens a page
+/// (512 at 131,072 tokens; 4,096, 262,144 pools, at 1,048,576).
+pub fn glmf_pool_pages(context: u64) -> u64 {
+    context.div_ceil(KPOOL * 64)
+}
+
+/// The longer-extent index top-k program (without the `glmf_` prefix) of route `mode` (`decode`,
+/// `prefill`) and capacity `cap` (`m64`, `m128`, `m4096`) over `context` tokens.
+pub fn glmf_topk_long_program(mode: &str, cap: &str, context: u64) -> String {
+    format!("index_topk_{mode}_{cap}_ctx{context}")
+}
+
+impl GlmfTopkExtents {
+    /// The extents an engine of `max_context` tokens runs, from the manifest's shared extent
+    /// `base` and GLM 5.3 Flash's own `glmf` (`ProgramCapacities`): the longer one only when the
+    /// context is past `base`. The caller has checked `max_context` against both.
+    pub fn for_context(base: u64, glmf: Option<u64>, max_context: u64) -> Self {
+        Self { base, long: glmf.filter(|&glmf| glmf > base && max_context > base) }
+    }
+
+    /// The index top-k program (without `glmf_`) a step of route `mode` at capacity `cap` runs
+    /// over pool tables of `width` columns, and the width it passes: the plain program up to its
+    /// pages, else the longer one, whose pages bound the width (decode widths round up to a power
+    /// of two; no row needs more pages than the context holds).
+    pub fn program(&self, mode: &str, cap: &str, width: u64) -> Result<(String, u64), GlmfTopkWidth> {
+        let base = glmf_pool_pages(self.base);
+        if width <= base {
+            return Ok((format!("index_topk_{mode}_{cap}"), width));
+        }
+        match self.long {
+            Some(long) => Ok((glmf_topk_long_program(mode, cap, long), width.min(glmf_pool_pages(long)))),
+            None => Err(GlmfTopkWidth { width, pages: base }),
+        }
+    }
 }
 
 /// The KDA recurrent state the step programs keep (the engine's `--kda-state`).
@@ -168,7 +237,12 @@ fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, 
             scratch = scratch.max(required(format!("glmf2_kda_output_rows{expanded}_{cap}"))? + output);
         }
     }
-    Ok(GlmfScratch { programs: scratch, topk: required(format!("glmf_index_topk_{mode}_{cap}"))? })
+    // One zeroed top-k scratch serves both extents' programs (each launch writes what it reads).
+    let mut topk = required(format!("glmf_index_topk_{mode}_{cap}"))?;
+    if let Some(long) = options.topk_long {
+        topk = topk.max(required(format!("glmf_{}", glmf_topk_long_program(mode, cap, long)))?);
+    }
+    Ok(GlmfScratch { programs: scratch, topk })
 }
 
 /// `glmf_step_scratch`'s lookup over an exported `PROGRAMS.json`.
@@ -538,6 +612,72 @@ mod tests {
             GlmfScratch::default()).decode;
         assert_eq!(workspace(64, narrow), 95_018_240);
         assert_eq!(workspace(128, wide) - workspace(64, narrow), 64 * 874_308 + (17_304_576 - 8_653_824));
+    }
+
+    /// The 1M extent's top-k scratch: the plain programs' layout (one 32,768-pool supertile, the
+    /// same route and tiles) plus the fold's carry ping-pong for its 8 chunks, 2 x 2 x rows x 512 x 4
+    /// bytes (b12x dsa_indexer scratch; the export's manifest gives the real ones).
+    const EXTENT_SCRATCH: [(&str, u64); 3] = [
+        ("glmf_index_topk_decode_m64_ctx1048576", 8_653_824 + 524_288),
+        ("glmf_index_topk_decode_m128_ctx1048576", 17_304_576 + 1_048_576),
+        ("glmf_index_topk_prefill_m4096_ctx1048576", 558_007_296 + 33_554_432),
+    ];
+
+    fn extent_lookup(name: &str) -> Option<u64> {
+        EXTENT_SCRATCH.iter().find(|(n, _)| *n == name).map(|&(_, bytes)| bytes).or_else(|| wide_lookup(name))
+    }
+
+    /// A context past the plain programs' extent charges the longer top-k's scratch (decode,
+    /// wide decode and prefill), and needs the programs; up to the extent nothing changes.
+    #[test]
+    fn a_longer_context_charges_the_longer_top_k() {
+        let cfg = glm53_flash();
+        let long = GlmfScratchOptions { topk_long: Some(1_048_576), ..Default::default() };
+        let plain = |rows, decode| glmf_step_scratch(wide_lookup, &cfg, GlmfScratchOptions::default(), rows, decode).unwrap();
+        let extended = |rows, decode| glmf_step_scratch(extent_lookup, &cfg, long, rows, decode).unwrap();
+        assert_eq!(extended(64, true), GlmfScratch { topk: 9_178_112, ..plain(64, true) });
+        assert_eq!(extended(128, true), GlmfScratch { topk: 18_353_152, ..plain(128, true) });
+        assert_eq!(extended(4096, false), GlmfScratch { topk: 591_561_728, ..plain(4096, false) });
+        assert_eq!(glmf_step_scratch(wide_lookup, &cfg, long, 64, true).unwrap_err(),
+            GlmfMissingProgram("glmf_index_topk_decode_m64_ctx1048576".into()));
+        // The 1M extent's whole cost at 16 sequences on one RTX with Sparks (two lanes of 4,096 rows,
+        // decode rows 64), against 131,072 tokens of context: the top-k scratch and the wider tables.
+        let shape = |context| { let (pages, pools) = glmf_table_pages(context);
+            GlmfStepShape { table_pages: pages, table_pool_pages: pools, ..spark_shape() } };
+        let bytes = |context, options| glmf_step_workspaces(&cfg, 2, 4096, 64, &shape(context),
+            glmf_step_scratch(extent_lookup, &cfg, options, 64, true).unwrap(),
+            glmf_step_scratch(extent_lookup, &cfg, options, 4096, false).unwrap()).device_bytes();
+        let cost = bytes(1_048_576, long) - bytes(131_072, GlmfScratchOptions::default());
+        assert_eq!(cost, 33_554_432 + 524_288 + 64 * (14_336 + 3584) * 4 + 2 * (14_336 + 3584) * 4);
+        assert_eq!(cost, 38_809_600);
+    }
+
+    #[test]
+    fn steps_past_the_plain_extent_run_the_longer_top_k() {
+        assert_eq!((glmf_pool_pages(131_072), glmf_pool_pages(1_048_576), glmf_pool_pages(1_000_000)), (512, 4096, 3907));
+        let extents = GlmfTopkExtents::for_context(131_072, Some(1_048_576), 1_048_576);
+        assert_eq!(extents.long, Some(1_048_576));
+        // Up to 512 pool pages (32,768 pools: 131,072 tokens) the plain programs, their width as given.
+        for (mode, cap) in [("decode", "m64"), ("decode", "m128"), ("prefill", "m4096")] {
+            for width in [1, 9, 511, 512] {
+                assert_eq!(extents.program(mode, cap, width).unwrap(), (format!("index_topk_{mode}_{cap}"), width));
+            }
+            for width in [513, 1024, 2048, 4096] {
+                assert_eq!(extents.program(mode, cap, width).unwrap(),
+                    (format!("index_topk_{mode}_{cap}_ctx1048576"), width));
+            }
+        }
+        // An extent of partial units: its pages bound a decode width rounded up to a power of two.
+        let partial = GlmfTopkExtents::for_context(131_072, Some(1_000_000), 1_000_000);
+        assert_eq!(partial.program("decode", "m64", 4096).unwrap(), ("index_topk_decode_m64_ctx1000000".into(), 3907));
+        // A context within the plain extent never runs (or needs) the longer programs.
+        for context in [8192, 131_072] {
+            assert_eq!(GlmfTopkExtents::for_context(131_072, Some(1_048_576), context).long, None);
+        }
+        assert_eq!(GlmfTopkExtents::for_context(131_072, Some(131_072), 131_072).long, None);
+        assert_eq!(GlmfTopkExtents::for_context(131_072, None, 131_072).long, None);
+        let plain = GlmfTopkExtents::for_context(131_072, None, 131_072);
+        assert_eq!(plain.program("decode", "m64", 1024).unwrap_err(), GlmfTopkWidth { width: 1024, pages: 512 });
     }
 
     #[test]

@@ -57,6 +57,16 @@ Attention (KDA), a minority run MLA + DSA.
   first weight K tiles prefetched into L2 (the b12x `gb10` decode schedule).
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
+- Context: the DSA index top-k is the one program with an extent compiled in
+  (131,072 tokens, `CUTEAFD_DSV4_MAX_CONTEXT`). Builds with
+  `CUTEAFD_GLMF_MAX_CONTEXT=1048576` (`CUTEAFD_WIP_GLMF_MAX_CONTEXT`,
+  `CUTEAFD_RELEASE_GLMF_MAX_CONTEXT`) also export it over 262,144 pools
+  (`glmf_index_topk_*_ctx1048576`, recorded as `families.glmf.max_context`), and
+  `MAX_CONTEXT_TOKENS` (`--max-context`) goes up to 1,048,576. Only steps whose
+  pool table is wider than 512 pages (a row past 131,072 tokens) run the 1M
+  programs; shorter steps keep the 131,072-token ones and their bits. With
+  `--max-context` past 131,072 their scratch adds 33.5 MB to the prefill
+  temporaries and 0.5 MB to the decode workspace (1 MB at `--decode-rows 128`).
 - Admission and verify rows (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
   (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
   prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head

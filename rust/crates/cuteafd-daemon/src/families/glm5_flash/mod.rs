@@ -46,7 +46,10 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the exported index top-k covers up to 131072).
+    /// Longest sequence (prompt plus output). The exported index top-k covers the build's
+    /// `capacities.max_context` (131,072), and with CUTEAFD_GLMF_MAX_CONTEXT GLM 5.3 Flash's own
+    /// extent (`families.glmf.max_context`, up to 1,048,576): steps past 131,072 tokens run that
+    /// extent's top-k programs, shorter ones the plain programs.
     #[arg(long, default_value_t = 65_536)]
     pub max_context: usize,
     /// Tokens the MLA record pools hold across sequences.
@@ -324,6 +327,28 @@ mod draft_cli_tests {
             expect("glmf_kda_s16_m128", "glmf_index_producer_c_m128", "glmf_kda_commit_c_s16_m128"));
         assert_eq!(sorted(wide(&["--kda-fp8", "row128"], false)),
             expect("glmf_kda_w8_m128", "glmf_index_producer_m128", "glmf_kda_commit_m128"));
+    }
+
+    /// `--max-context` past the plain index top-k's extent needs the longer-extent top-k at every
+    /// capacity the steps run (the wide decode rows' too); within it, none.
+    #[test]
+    fn a_context_past_the_plain_top_k_needs_the_longer_one() {
+        use cuteafd_ffi::programs::ProgramCapacities;
+        let both = ProgramCapacities { max_context: Some(131_072), glmf_max_context: Some(1_048_576), ..Default::default() };
+        let plain = ProgramCapacities { max_context: Some(131_072), ..Default::default() };
+        assert_eq!(parse(&["--max-context", "1048576"]).max_context, 1_048_576);
+        assert_eq!(longer_topk_programs(&parse(&["--max-context", "1048576"]), both),
+            ["glmf_index_topk_decode_m64_ctx1048576", "glmf_index_topk_prefill_m4096_ctx1048576"]);
+        assert_eq!(longer_topk_programs(&parse(&["--max-context", "131073", "--decode-rows", "128"]), both),
+            ["glmf_index_topk_decode_m64_ctx1048576", "glmf_index_topk_prefill_m4096_ctx1048576",
+                "glmf_index_topk_decode_m128_ctx1048576"]);
+        for context in ["65536", "131072"] {
+            assert!(longer_topk_programs(&parse(&["--max-context", context]), both).is_empty(), "{context}");
+        }
+        // Without a longer extent the start-up check (`require_context`) refuses past 131,072 instead.
+        assert!(longer_topk_programs(&parse(&["--max-context", "1048576"]), plain).is_empty());
+        assert!(plain.require_context("glm5_flash", 1_048_576).is_err());
+        both.require_context("glm5_flash", 1_048_576).unwrap();
     }
 
     #[test]
@@ -618,6 +643,19 @@ fn wide_decode_programs(args: &EngineArgs, compact: bool) -> Vec<String> {
         .into_iter().map(|name| format!("glmf_{name}")).collect()
 }
 
+/// The longer-extent index top-k programs a context of `args` launches past the plain programs'
+/// extent (`--max-context` past `capacities.max_context`): one per top-k capacity its steps run.
+/// None within the plain extent.
+fn longer_topk_programs(args: &EngineArgs, capacities: cuteafd_ffi::programs::ProgramCapacities) -> Vec<String> {
+    let Some(long) = engine::topk_extents(capacities, args.max_context).long else { return Vec::new() };
+    let mut caps = vec![("decode", "m64"), ("prefill", "m4096")];
+    if args.decode_rows > engine::DECODE_ROWS {
+        caps.push(("decode", "m128"));
+    }
+    caps.into_iter().map(|(mode, cap)| format!("glmf_{}",
+        cuteafd_loader::serving_capacity::glmf_topk_long_program(mode, cap, long))).collect()
+}
+
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
 /// planner's allowance.
 fn graph_reserve(args: &EngineArgs) -> u64 {
@@ -693,6 +731,12 @@ impl Opened {
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
+        // A context past the plain index top-k's extent: its longer-extent programs, at every capacity.
+        for name in longer_topk_programs(args, programs.capacities()) {
+            programs.spec(&name).with_context(|| format!("--max-context {} needs program {name} (the index \
+                top-k past {} tokens); this native library predates it", args.max_context,
+                programs.capacities().max_context.unwrap_or_default()))?;
+        }
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
         let mut needed = Vec::new();
         if args.kda_fp8 != fp8::KdaFp8::Off {
@@ -882,10 +926,11 @@ impl Opened {
             // The planner's workspace allowance was measured at the 64-row decode workspace and
             // sampler: a wider decode workspace (its formula, over this build's programs) and
             // sampler add to it.
-            let wide = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-                step_settings(args, index_cache)).with_experts(args.local_experts, args.peers.is_some())
-                .wide_decode_bytes()? + crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS,
-                    self.cfg.vocab_size);
+            // So does the longer-extent index top-k's scratch, past the plain programs' context.
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
+                step_settings(args, index_cache)).with_experts(args.local_experts, args.peers.is_some());
+            let wide = plan.wide_decode_bytes()? + plan.longer_topk_bytes(args.prefill_rows)?
+                + crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS, self.cfg.vocab_size);
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + wide,

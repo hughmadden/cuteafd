@@ -703,6 +703,20 @@ if [[ $family == glm5_flash ]]; then
       spark_worker_args+=" --exl3-schedule gb10" ;;
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
+  # MAX_CONTEXT_TOKENS (the longest request, prompt plus output; default 8192) goes up to
+  # 1,048,576. Past 131,072 the image needs GLM 5.3 Flash's own extent (built with
+  # CUTEAFD_GLMF_MAX_CONTEXT, e.g. 1048576: its index top-k exported there too); start-up names a
+  # shorter one before loading weights. A 1M request holds about 6.5 GB of pool (compact index).
+  glmf_context="$(get MAX_CONTEXT_TOKENS 8192)"
+  if ! [[ "$glmf_context" =~ ^[1-9][0-9]{0,6}$ ]] || ((glmf_context > 1048576)); then
+    echo "MAX_CONTEXT_TOKENS must be 1 to 1048576 for GLM 5.3 Flash" >&2
+    exit 2
+  fi
+  host_bytes="$(get HOST_CACHE_BYTES)"
+  if ((glmf_context > 131072)) && [[ "$host_bytes" == auto || ($prefix_marks == pool && -z "$host_bytes") ]]; then
+    echo "note: HOST_CACHE_BYTES=auto sizes the RAM tier for $(get PREFIX_CACHE_ENTRIES 20) snapshots a bank of" \
+      "MAX_CONTEXT_TOKENS=$glmf_context tokens, up to all but 10% of free RAM; set HOST_CACHE_BYTES (e.g. 64GiB) to bound it" >&2
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

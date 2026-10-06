@@ -58,6 +58,8 @@ set(CUTEAFD_DSV4_PREFILL_ROWS "4096" CACHE STRING "DeepSeek V4 prefill program c
 set(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING
   "GLM 5.3 Flash wide decode and verify program capacity (serve --decode-rows 128); 0 exports none")
 set(CUTEAFD_DSV4_MAX_CONTEXT "131072" CACHE STRING "DeepSeek V4 cache extent compiled into programs")
+set(CUTEAFD_GLMF_MAX_CONTEXT "" CACHE STRING
+  "GLM 5.3 Flash context extent (tokens, e.g. 1048576): its index top-k is also exported at this extent, beside CUTEAFD_DSV4_MAX_CONTEXT's programs; empty: CUTEAFD_DSV4_MAX_CONTEXT")
 if((CUTEAFD_ENABLE_V41_HC_LAGGED_AOT OR CUTEAFD_ENABLE_V41_NARROW_AOT) AND NOT CUTEAFD_ENABLE_V41_FP8_AOT)
   message(FATAL_ERROR "Candidate mHC/narrow AOT requires V4.1 FP8 AOT")
 endif()
