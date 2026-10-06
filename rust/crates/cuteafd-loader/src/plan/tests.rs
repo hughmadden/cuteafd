@@ -1187,6 +1187,79 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
 }
 
 #[test]
+fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(2);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let tensors: Vec<_> = super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect();
+    let dir = snapshot_tp(cfg.clone(), &tensors, Some(4));
+    for (gpus, gib, ranks) in [(1, 96, 4), (2, 96, 4), (1, 32, 4), (1, 96, 0)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![gib << 30; gpus], pool_tokens: Some(32768), ..Default::default()
+        }), ..sparks(ranks) };
+        let report = plan(dir.path(), &options).unwrap();
+        let encoder = report.encoder.as_ref().unwrap();
+        assert_eq!(encoder.weights, 1_128_026_176);
+        assert_eq!(encoder.admitted_bytes(), 1_919_933_760);
+        assert_eq!(encoder.kind, if ranks > 0 { EncoderKind::Spark { rank: 0 } } else { EncoderKind::Rtx { gpu: 0 } });
+        let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
+        assert_eq!(vision.status, Status::Ready);
+        assert_eq!(vision.rejected, 0);
+        assert_eq!(vision.bytes, 1_127_254_016);
+        assert_eq!(vision.formats.keys().collect::<Vec<_>>(), vec!["bf16"]);
+        let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
+        assert_eq!(off.encoder.unwrap().admitted_bytes(), 0);
+        assert_eq!(off.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes, 0);
+    }
+    let mut bad = cfg.clone(); bad["vision_config"]["num_heads"] = json!(8);
+    let invalid = snapshot_tp(bad, &tensors, Some(4));
+    let report = plan(invalid.path(), &sparks(4)).unwrap();
+    assert_ne!(report.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Ready);
+    assert_eq!(report.encoder.as_ref().unwrap().admitted_bytes(), 0);
+    assert!(!report.placement_supported);
+    let mut missing = tensors.clone(); missing.pop();
+    let incomplete = snapshot_tp(cfg.clone(), &missing, Some(4));
+    let report = plan(incomplete.path(), &sparks(4)).unwrap();
+    assert_ne!(report.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Ready);
+    let mut wrong_dtype = tensors.clone(); wrong_dtype[0].1 = "F16";
+    let mut extra_tensor = tensors.clone();
+    extra_tensor.push(t("model.visual.unrecognized.weight", "BF16", &[1024]));
+    for unsupported in [wrong_dtype, extra_tensor] {
+        let invalid = snapshot_tp(cfg.clone(), &unsupported, Some(4));
+        let report = plan(invalid.path(), &sparks(4)).unwrap();
+        assert_ne!(component(&report, Component::Vision).status, Status::Ready);
+        assert_eq!(report.encoder.as_ref().unwrap().admitted_bytes(), 0);
+    }
+    let mut mimo_config = mimo_flash_mopd_config();
+    mimo_config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut mimo_tensors = mimo_flash_mopd_tensors();
+    mimo_tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let mimo = snapshot(mimo_config, &mimo_tensors);
+    let report = plan(mimo.path(), &sparks(4)).unwrap();
+    let glm = plan(dir.path(), &sparks(4)).unwrap();
+    let component = |report: &super::PlanReport| serde_json::to_value(report.components.iter()
+        .find(|c| c.component == Component::Vision).unwrap()).unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    // Both families expose the same component/encoder schema, not a GLM-only side channel.
+    assert_eq!(component(&glm), component(&report));
+    let mimo_vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
+    assert_eq!(mimo_vision.status, Status::Ready);
+    assert_eq!(mimo_vision.formats.keys().collect::<Vec<_>>(), vec!["bf16"]);
+    let encoder_keys = |report: &super::PlanReport| serde_json::to_value(report.encoder.as_ref().unwrap())
+        .unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(encoder_keys(&glm), encoder_keys(&report));
+    assert_eq!(glm.encoder.as_ref().unwrap().kind, report.encoder.as_ref().unwrap().kind);
+    let rendered = super::render(&glm);
+    assert!(rendered.contains("Spark { rank: 0 }") && rendered.contains("1128026176"));
+    assert!(!rendered.contains("MiMo key-0"));
+}
+
+#[test]
 fn explicit_encoder_failure_and_small_pool_admission() {
     use super::encoder::EncoderKind;
     let mut cfg = mimo_flash_config();

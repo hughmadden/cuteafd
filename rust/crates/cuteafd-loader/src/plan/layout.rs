@@ -16,6 +16,9 @@ mod v41;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
+// 2026-10-07 SM120/SM121 resident ledger at the fixed 4096-image-token capacity:
+// native scratch_glm's aligned arenas, including its dedicated 4 MiB BLAS workspace.
+const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 
 /// The hardware and serving shape to lay out.
 #[derive(Debug, Clone)]
@@ -644,7 +647,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 let target = options.pool_tokens.filter(|&tokens| tokens != 0)
                     .unwrap_or_else(|| if options.rtx_bytes[0] <= 32 * GIB { 1_000_000 } else { options.target_pool_tokens });
                 let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
-                resolve_encoder(report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
+                resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
@@ -693,7 +696,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     }
 
     if family != "deepseek_v41" && report.encoder.is_none() {
-        resolve_encoder(report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options.vision_replicas, &mut notes);
+        resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options.vision_replicas, &mut notes);
     }
     devices.extend(spark_devices);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -863,7 +866,7 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
     }).collect())
 }
 
-fn resolve_encoder(report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], replicas: usize, notes: &mut Vec<String>) {
+fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], replicas: usize, notes: &mut Vec<String>) {
     use super::encoder::*;
     let source = report.components.iter().find(|c| c.component == Component::Vision);
     let source_bytes = source.map_or(0, |c| c.bytes);
@@ -872,6 +875,23 @@ fn resolve_encoder(report: &mut PlanReport, model: &dyn super::FamilyModel, rtx:
     let (weights, scratch) = if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
         let width = model.spec().hidden as u64;
         (1_458_170_944 + width.saturating_sub(4096) * 5120 * 2, mimo_scratch_bytes(width))
+    } else if report.family.as_deref() == Some("glm5_flash") && source_bytes > 0 {
+        match super::families::glm::glm_flash_vision_resident_weights(checkpoint) {
+            Ok(weights) => (weights, GLM_FLASH_ENCODER_SCRATCH_BYTES),
+            Err(reason) if report.vision != super::MediaMode::Off => {
+                report.placement_supported = false;
+                report.hints.push(super::Hint {
+                    what: format!("GLM Flash vision tower unavailable: {reason}"),
+                    how: "Use the qualified official BF16 tower geometry or explicitly use --vision=off.".into(),
+                });
+                notes.push(format!("vision Off: {reason}; 0 bytes admitted"));
+                report.encoder = Some(EncoderPlacement {
+                    kind: EncoderKind::Off, weights: 0, scratch: 0, replicas: Vec::new(), reason, shortfall: 0,
+                });
+                return;
+            }
+            Err(_) => (0, 0),
+        }
     } else { (source_bytes, 512 * MIB) };
     let hardware = EncoderHardware { v41: false,
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
