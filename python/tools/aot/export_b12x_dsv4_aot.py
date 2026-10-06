@@ -10,8 +10,9 @@ ABI and scratch sizes at its capacity, and ``dsv4_programs.h``: the table the
 generic native shim (native/shared/src/dsv4_programs.cc) launches from. Capacities are
 compile-time: decode programs cover ``--decode-rows``, prefill programs
 ``--prefill-rows``, and cache extents follow ``--max-context``. GLM 5.3 Flash also
-exports its decode programs at ``--glmf-wide-decode-rows`` (wider verify steps), after
-every other program.
+exports its decode programs at ``--glmf-wide-decode-rows`` (wider verify steps), and its
+index top-k at ``--glmf-max-context`` when that is longer (contexts up to 1,048,576
+tokens), after every other program.
 """
 
 from __future__ import annotations
@@ -370,6 +371,30 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
     return out
 
 
+def glmf_extent_programs(g, decode_rows: int, prefill_rows: int, wide_rows: int, max_context: int,
+                         glmf_max_context: int):
+    """GLM 5.3 Flash contexts past ``max_context`` (serve ``--max-context`` up to
+    ``glmf_max_context``, e.g. 1,048,576 tokens): the index top-k over ``glmf_max_context``
+    tokens' pools (at 1M, 262,144 pools in 4,096 pool pages) at every capacity a step launches it
+    (decode, prefill, and the wide decode rows when exported), as new stems
+    ``index_topk_*_ctx{glmf_max_context}``. A step runs one only when its pool table is wider than
+    ``max_context``'s, so shorter contexts keep the ``max_context`` programs, their objects and
+    their scratch; no other program bakes in an extent. None when ``glmf_max_context`` does not
+    exceed ``max_context``."""
+    if glmf_max_context <= max_context:
+        return []
+    from b12x.integration.cuteafd import glmf
+
+    pool_pages = -(-glmf_max_context // (g.index_kpool * PAGE_ROWS))
+    caps = [("decode", decode_rows), ("prefill", prefill_rows)]
+    if wide_rows > decode_rows:
+        caps.append(("decode", wide_rows))
+    return [(f"index_topk_{mode}_m{rows}_ctx{glmf_max_context}", "index_topk",
+             {"mode": mode, "max_rows": rows, "max_pages": pool_pages, "max_context": glmf_max_context},
+             lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m))
+            for mode, rows in caps]
+
+
 def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """One GPU's share of a two-GPU GLM 5.3 Flash head split (``g`` the half geometry: half the
     MLA and KDA heads, half the dense and shared-expert intermediates): KDA (its heads'
@@ -494,8 +519,16 @@ def main() -> None:
                              "--decode-rows 128), new stems after every other program; 0 exports none")
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
+    parser.add_argument("--glmf-max-context", type=int, default=0,
+                        help="with glmf: GLM 5.3 Flash's context extent (e.g. 1048576), recorded as "
+                             "families.glmf.max_context; when longer than --max-context its index top-k is also "
+                             "exported at it (new stems after every other program); 0: --max-context")
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     args = parser.parse_args()
+    glmf_max_context = args.glmf_max_context or args.max_context
+    if glmf_max_context < args.max_context:
+        raise SystemExit(f"--glmf-max-context {glmf_max_context} is shorter than --max-context {args.max_context}: "
+                         "every GLM 5.3 Flash program covers --max-context")
 
     import torch
     from b12x.integration.cuteafd import (
@@ -571,6 +604,11 @@ def main() -> None:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
                                                                        args.glmf_wide_decode_rows, args.max_context)]
+        work += [("glmf", *item) for item in glmf_extent_programs(
+            GLM53_FLASH, args.decode_rows, args.prefill_rows, args.glmf_wide_decode_rows, args.max_context,
+            glmf_max_context)]
+        # The longest context GLM 5.3 Flash serves (the serving engine's limit).
+        manifest["families"]["glmf"]["max_context"] = glmf_max_context
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

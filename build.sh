@@ -78,6 +78,9 @@ Families beyond V4.1 are opt-in. CUTEAFD_RELEASE_{DSV4,GLM,MIMO,GLMF,QWEN4}_AOT=
 put each family's coordinator programs in the coordinator image, and
 CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
 packages to both images, each keeping its architecture's entries.
+CUTEAFD_RELEASE_GLMF_MAX_CONTEXT (e.g. 1048576) also exports GLM 5.3 Flash's index
+top-k at that context extent, so it serves --max-context up to it (unset: the
+programs' 131072).
 CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES (e.g. mimo, or mimo;glm) adds optional
 BF16-input Spark siblings for the requested FAMILY:fp8 packages. It does not
 change serving precision defaults. Empty builds the existing artifact set.
@@ -689,6 +692,7 @@ timeout "$export_timeout" docker run --rm --name "$coordinator_export_container"
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_GLMF_MAX_CONTEXT=${CUTEAFD_RELEASE_GLMF_MAX_CONTEXT:-}" \
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$release_source_dir:/source:ro" \
