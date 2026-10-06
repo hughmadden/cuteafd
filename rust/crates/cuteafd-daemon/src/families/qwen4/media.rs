@@ -36,6 +36,20 @@ impl RemoteVision {
     }
 }
 
+fn cache_capacity_warning(cache_bytes: usize, max_tokens: usize, width: usize) -> Result<Option<String>> {
+    let required = max_tokens.checked_mul(width).and_then(|n| n.checked_mul(2))
+        .context("Qwen maximum image feature byte extent overflow")?;
+    Ok((cache_bytes < required).then(|| format!(
+        "MEDIA_CACHE_BYTES {cache_bytes} is smaller than largest admissible image {required} bytes")))
+}
+
+fn warn_cache_capacity(cache_bytes: usize, max_tokens: usize, width: usize) -> Result<()> {
+    if let Some(message) = cache_capacity_warning(cache_bytes, max_tokens, width)? {
+        tracing::warn!(%message, "Qwen media cache cannot admit every allowed image");
+    }
+    Ok(())
+}
+
 pub(super) struct ReadyVision {
     pub encoder: Encoder,
     pub preparer: Arc<MediaPreparer>,
@@ -57,6 +71,7 @@ impl ReadyVision {
             let id = spec.encoder_id(&remote.revision, 121);
             let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
             anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
+            warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), output_width: spec.native.output_width,
                 patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
@@ -82,6 +97,7 @@ impl ReadyVision {
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
         anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
+        warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         library.cuda_set_device(gpu)?;
         let admitted = ledger.total_bytes();
@@ -132,6 +148,8 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
 pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
         cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
+        error @ (cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull) =>
+            cuteafd_api::openai::NativeFailure::Unavailable(error.to_string()),
         error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
     }
 }
@@ -339,6 +357,26 @@ mod tests {
     use cuteafd_core::TargetSamplingParams;
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
 
+    #[test]
+    fn cache_capacity_warns_without_rejecting_tiny_g7_quota() {
+        let required = 1024 * 2560 * 2;
+        let warning = cache_capacity_warning(required - 1, 1024, 2560).unwrap().unwrap();
+        assert!(warning.contains("5242879") && warning.contains("5242880"));
+        assert!(cache_capacity_warning(required, 1024, 2560).unwrap().is_none());
+        assert!(warn_cache_capacity(2621440, 1024, 2560).is_ok());
+        assert!(cache_capacity_warning(usize::MAX, usize::MAX, 2560).is_err());
+    }
+    #[test]
+    fn permanent_image_admission_and_transient_pressure_have_distinct_errors() {
+        use cuteafd_engine::media::MediaError;
+        let error = MediaError::ImageTooLarge { needed: 5242880, capacity: 2621440 };
+        assert!(matches!(failure(error), cuteafd_api::openai::NativeFailure::BadRequest(message)
+            if message == "image needs 5242880 bytes > media cache capacity 2621440"));
+        let error = MediaError::CacheFull { needed: 2621440, free: 0, capacity: 5242880 };
+        assert!(matches!(failure(error), cuteafd_api::openai::NativeFailure::Unavailable(message)
+            if message.contains("2621440") && message.contains("5242880")));
+        assert!(matches!(failure(MediaError::QueueFull), cuteafd_api::openai::NativeFailure::Unavailable(_)));
+    }
     #[test]
     fn remote_options_require_complete_identity_and_valid_placement() {
         use clap::Parser;

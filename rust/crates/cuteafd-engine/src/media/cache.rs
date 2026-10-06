@@ -83,6 +83,9 @@ impl EmbeddingCache {
         if bytes == 0 {
             return Err(MediaError::Features);
         }
+        if bytes > self.capacity {
+            return Err(MediaError::ImageTooLarge { needed: bytes, capacity: self.capacity });
+        }
         if let Some(entry) = self.entries.get_mut(&key) {
             if entry.bytes != bytes {
                 return Err(MediaError::Features);
@@ -216,6 +219,20 @@ mod tests {
         drop(put(&mut cache, 4));
         assert!(cache.contains(key(1)) && !cache.contains(key(3)));
         assert!(cache.bytes() <= cache.capacity());
+    }
+    #[test]
+    fn oversized_image_is_admission_not_pressure_and_preserves_cache() {
+        let mut cache = EmbeddingCache::new(4);
+        drop(put(&mut cache, 1));
+        let error = cache.reserve(key(2), 5).unwrap_err();
+        assert_eq!(error, MediaError::ImageTooLarge { needed: 5, capacity: 4 });
+        assert_eq!(error.to_string(), "image needs 5 bytes > media cache capacity 4");
+        assert!(cache.contains(key(1)));
+        assert_eq!(cache.bytes(), 4);
+        assert_eq!(cache.len(), 1);
+        let pin = cache.get(key(1)).unwrap();
+        assert!(matches!(cache.reserve(key(2), 4), Err(MediaError::CacheFull { .. })));
+        drop(pin);
     }
     #[test]
     fn reservation_cleanup_and_no_unbudgeted_completion() {

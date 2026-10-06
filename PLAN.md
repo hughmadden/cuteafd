@@ -778,6 +778,16 @@ Work, in priority order:
    QA, prefix a/e, one-image stall and proxy encoder loss on that layout.
    Placing the encoder on the idle second RTX is a future planner option,
    not part of this bring-up; do not claim two-RTX LM parity.
+   **Media-cache merge policy:** shared cache admission distinguishes a single
+   image larger than total capacity (permanent 400, `image needs N bytes > media
+   cache capacity M`) from capacity sufficient but pinned entries preventing
+   admission (transient 503 with `Retry-After: 1`). Qwen implements both; apply
+   the same pressure mapping to MiMo at integration (currently 400); GLM Flash
+   already maps pressure to 503. Qwen warns at startup when configured cache
+   bytes are below max admissible tokens times BF16 feature-row bytes, naming
+   both byte counts; add the warning to MiMo and GLM Flash at integration.
+   Do not reject/clamp deliberately tiny G7 eviction-test quotas. The shared
+   `ImageTooLarge` variant must stay in each family's permanent-400 fallback.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
