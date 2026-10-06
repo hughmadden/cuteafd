@@ -811,6 +811,23 @@ Work, in priority order:
    accumulation in V4 expert combine or exchange, and launch-time kernel or
    split choices. This widens paired precision noise for V4 Flash and
    blocks byte-exact speculation there.
+   **Separate task: GLM Flash speculative decode is not launch-deterministic
+   (2026-10-07, WP-9):** greedy, temperature 0 / seed 0, identical prompt and
+   tokenizer diverge at token 6 between launches on the unchanged lazy path
+   (retokenized SSE text, not a raw generated-ID trace). Lazy/startup also
+   diverge; the lazy/lazy control rules out attributing this to bucket padding
+   alone. Find the input: adaptive draft length or copy policy reading timing,
+   or nondeterministic Spark reduce order. The draft cost model demonstrably
+   observes live draft and verify wall time and replans within a request;
+   timing -> proposal width -> arithmetic is a candidate, not a causal trace.
+   Principled fix: make verify logits width-invariant for real rows, extending
+   aligned-bucket invariance across widths and buckets so greedy output is
+   independent of scheduling. Alternative: seed from a fixed cost table and
+   update it only between requests, not mid-stream. Goal: same prompt, same
+   config, same token stream. Until fixed, every performance A/B on a
+   speculative-decoding family needs at least three launches per arm; retain
+   every pair and judge the median paired emitted-throughput ratio. This is a
+   separate determinism task, not part of WP-9 vision/default promotion.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
