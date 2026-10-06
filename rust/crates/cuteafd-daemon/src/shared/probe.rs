@@ -11,6 +11,57 @@ use std::sync::Arc;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
+/// Adds cumulative capture counts and site deltas since the last stats publication.
+/// Gate clients subtract the cumulative fields across their own warmed interval.
+pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
+    static PREVIOUS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+    let mut previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner());
+    let sites = cuteafd_ffi::graph_capture_sites();
+    record_graph_captures(stats, cuteafd_ffi::graph_captures(), sites, &mut previous);
+}
+
+fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(String, u64)>,
+    previous: &mut Vec<(String, u64)>) {
+    let deltas: Vec<_> = sites.iter().filter_map(|(site, count)| {
+        let before = previous.iter().find(|(name, _)| name == site).map_or(0, |(_, n)| *n);
+        let delta = count.saturating_sub(before);
+        (delta > 0).then(|| (site.clone(), delta))
+    }).collect();
+    stats["graph_captures"] = total.into();
+    stats["graph_capture_sites"] = serde_json::json!(sites);
+    stats["graph_capture_site_deltas"] = serde_json::json!(deltas);
+    *previous = sites;
+}
+
+#[cfg(test)]
+mod graph_capture_tests {
+    use super::*;
+
+    #[test]
+    fn stats_include_capture_total_and_per_site_deltas() {
+        let mut stats = serde_json::json!({"active": 0});
+        let mut previous = vec![("engine.rs:1937".into(), 2)];
+        record_graph_captures(&mut stats, 5,
+            vec![("engine.rs:1937".into(), 4), ("draft.rs:20".into(), 1)], &mut previous);
+        assert_eq!(stats["graph_captures"], 5);
+        assert_eq!(stats["graph_capture_site_deltas"],
+            serde_json::json!([["engine.rs:1937", 2], ["draft.rs:20", 1]]));
+        record_graph_captures(&mut stats, 5, previous.clone(), &mut previous);
+        assert_eq!(stats["graph_capture_site_deltas"], serde_json::json!([]));
+        assert_eq!(stats["graph_capture_sites"],
+            serde_json::json!([["engine.rs:1937", 4], ["draft.rs:20", 1]]));
+    }
+
+    #[test]
+    fn live_counter_fields_are_present_without_cuda() {
+        let mut stats = serde_json::json!({});
+        graph_capture_stats(&mut stats);
+        assert!(stats["graph_captures"].is_u64());
+        assert!(stats["graph_capture_sites"].is_array());
+        assert!(stats["graph_capture_site_deltas"].is_array());
+    }
+}
+
 /// The prompt ids a request runs: the probe's own, else `tokenize()`.
 pub(crate) fn prompt_ids(probe: &ProbeRef, tokenize: impl FnOnce() -> Result<Vec<u32>>) -> Result<Vec<u32>> {
     match probe.as_ref().and_then(|p| p.spec.prompt_ids.clone()) {
