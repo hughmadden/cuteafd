@@ -362,11 +362,14 @@ cuteafd_status_t modify_rc_qp_to_init(ibv_qp* qp, uint32_t port_num) {
   return ok();
 }
 
+// `flow_label` 0 lets the kernel derive the RoCE v2 flow label (and with it
+// the UDP source port) from both QP numbers, so it changes with every new
+// pair of QPs; a nonzero label fixes it.
 cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
                                    const ibv_port_attr& port_attr, uint32_t port_num,
                                    uint32_t remote_qp_num, uint32_t remote_psn,
                                    uint32_t remote_lid, const ibv_gid* remote_gid,
-                                   uint32_t local_gid_index) {
+                                   uint32_t local_gid_index, uint32_t flow_label = 0) {
   ibv_qp_attr attr = {};
   attr.qp_state = IBV_QPS_RTR;
   attr.path_mtu = port_attr.active_mtu;
@@ -394,6 +397,7 @@ cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
     attr.ah_attr.grh.dgid = gid;
     attr.ah_attr.grh.sgid_index = local_gid_index;
     attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.flow_label = flow_label;
   }
   const int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                     IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
@@ -451,6 +455,8 @@ struct CuteafdRdmaRcEndpointHandle {
   std::vector<ibv_mr*> regions;
   // Device range a peer RDMA-writes into (`cuteafd_rdma_rc_endpoint_expose_device`).
   ibv_mr* exposed_mr = nullptr;
+  // Send-buffer prefix a peer RDMA-reads (`cuteafd_rdma_rc_endpoint_expose_send_read`).
+  ibv_mr* read_mr = nullptr;
   // Registered host words the completion flags of written responses are sent
   // from (a ring, so a value is never rewritten while its write may be queued).
   ibv_mr* flag_source_mr = nullptr;
@@ -503,6 +509,9 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   }
   if (endpoint->exposed_mr != nullptr) {
     ibv_dereg_mr(endpoint->exposed_mr);
+  }
+  if (endpoint->read_mr != nullptr) {
+    ibv_dereg_mr(endpoint->read_mr);
   }
   if (endpoint->flag_source_mr != nullptr) {
     ibv_dereg_mr(endpoint->flag_source_mr);
@@ -3188,10 +3197,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_buffer_view(
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint32_t remote_qp_num,
-                                                          uint32_t remote_psn,
-                                                          uint32_t remote_lid,
-                                                          const char* remote_gid_hex) {
+static cuteafd_status_t connect_rdma_rc_endpoint(void* handle, uint32_t remote_qp_num,
+                                                 uint32_t remote_psn, uint32_t remote_lid,
+                                                 const char* remote_gid_hex,
+                                                 uint32_t flow_label) {
   if (handle == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
   }
@@ -3200,6 +3209,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint3
   }
   if (remote_psn > 0x00ff'ffff) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint remote PSN exceeds 24 bits");
+  }
+  if (flow_label > 0x000f'ffff) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint flow label exceeds 20 bits");
   }
 #if CUTEAFD_NATIVE_ENABLE_RDMA
   auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
@@ -3210,7 +3222,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint3
   }
   status = modify_rc_qp_to_rtr(endpoint->context, endpoint->qp, endpoint->port_attr,
                                endpoint->port_num, remote_qp_num, remote_psn, remote_lid,
-                               &remote_gid, endpoint->gid_index);
+                               &remote_gid, endpoint->gid_index, flow_label);
   if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
@@ -3222,6 +3234,125 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint3
   (void)remote_gid_hex;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "RDMA RC endpoint connect requires CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint32_t remote_qp_num,
+                                                          uint32_t remote_psn,
+                                                          uint32_t remote_lid,
+                                                          const char* remote_gid_hex) {
+  return connect_rdma_rc_endpoint(handle, remote_qp_num, remote_psn, remote_lid, remote_gid_hex,
+                                  0);
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_connect_flow_label(
+    void* handle, uint32_t remote_qp_num, uint32_t remote_psn, uint32_t remote_lid,
+    const char* remote_gid_hex, uint32_t flow_label) {
+  return connect_rdma_rc_endpoint(handle, remote_qp_num, remote_psn, remote_lid, remote_gid_hex,
+                                  flow_label);
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_send_read(void* handle, size_t bytes,
+                                                                   uint64_t* remote_addr,
+                                                                   uint32_t* rkey) {
+  if (handle == nullptr || remote_addr == nullptr || rkey == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint handle or read exposure output is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (bytes == 0 || bytes > endpoint->send_registered_span_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint read exposure exceeds the send buffer");
+  }
+  if (endpoint->read_mr != nullptr) {
+    ibv_dereg_mr(endpoint->read_mr);
+    endpoint->read_mr = nullptr;
+  }
+  endpoint->read_mr = ibv_reg_mr(endpoint->pd, endpoint->send_buffer, bytes,
+                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+  if (endpoint->read_mr == nullptr) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                "ibv_reg_mr failed for the RC endpoint read exposure");
+  }
+  *remote_addr = reinterpret_cast<uintptr_t>(endpoint->send_buffer);
+  *rkey = endpoint->read_mr->rkey;
+  return ok();
+#else
+  (void)bytes;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint read exposure requires CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_read_wait(void* handle, size_t offset_bytes,
+                                                            size_t bytes, uint64_t remote_addr,
+                                                            uint32_t rkey, uint32_t timeout_ms) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+  if (bytes == 0 || bytes > std::numeric_limits<uint32_t>::max() || remote_addr == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint read is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (offset_bytes > endpoint->recv_registered_span_bytes ||
+      bytes > endpoint->recv_registered_span_bytes - offset_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint read exceeds the receive buffer");
+  }
+  constexpr uint64_t kReadWrId = 0x7256'5244;  // "RD"
+  ibv_sge sge = {};
+  sge.addr = reinterpret_cast<uintptr_t>(endpoint->recv_buffer + offset_bytes);
+  sge.length = static_cast<uint32_t>(bytes);
+  sge.lkey = endpoint->recv_mr->lkey;
+  ibv_send_wr wr = {};
+  wr.wr_id = kReadWrId;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_READ;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = rkey;
+  ibv_send_wr* bad = nullptr;
+  if (ibv_post_send(endpoint->qp, &wr, &bad) != 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_send of an RC read failed");
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<uint32_t>(timeout_ms, 1));
+  for (;;) {
+    ibv_wc wc = {};
+    const int polled = ibv_poll_cq(endpoint->send_cq, 1, &wc);
+    if (polled < 0) {
+      return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "ibv_poll_cq send failed for an RC read");
+    }
+    if (polled == 1) {
+      if (wc.status != IBV_WC_SUCCESS) {
+        char message[256];
+        std::snprintf(message, sizeof(message),
+                      "RDMA RC read completion returned non-success status status=%u (%s) "
+                      "vendor_err=%u",
+                      static_cast<unsigned>(wc.status), ibv_wc_status_str(wc.status),
+                      static_cast<unsigned>(wc.vendor_err));
+        return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, message);
+      }
+      if (wc.opcode == IBV_WC_RDMA_READ && wc.wr_id == kReadWrId) {
+        return ok();
+      }
+      // Not ours: leave it for the endpoint's ordinary send polling.
+      endpoint->pending_send_completions += 1;
+      continue;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA RC endpoint timed out waiting for a read");
+    }
+  }
+#else
+  (void)offset_bytes;
+  (void)rkey;
+  (void)timeout_ms;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint read requires CUTEAFD_ENABLE_RDMA=ON");
 #endif
 }
 

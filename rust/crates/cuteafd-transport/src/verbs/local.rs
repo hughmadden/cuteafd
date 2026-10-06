@@ -200,7 +200,15 @@ impl LocalVerbsExpertConnection {
     ) -> Result<VerbsHostProtocolV2PersistentStart> {
         configure_control_stream(stream, default_control_timeout())?;
         let mut reader = BufReader::new(stream.try_clone()?);
-        let start: VerbsHostProtocolV2PersistentStart = read_control(&mut reader)?;
+        let mut value = read_control_value(&mut reader)?;
+        if flows::is_flow_probe_start(&value) {
+            // A coordinator measuring which bond member a flow label reaches:
+            // serve its probes, and admit a session only if one follows.
+            let library = load_verbs_host_native_library()?;
+            let mut stream = stream.try_clone()?;
+            value = flows::serve_flow_probes(&mut stream, &mut reader, &library, value)?.ok_or(FlowProbesOnly)?;
+        }
+        let start: VerbsHostProtocolV2PersistentStart = serde_json::from_value(value)?;
         anyhow::ensure!(
             start.message == "protocol_v2_persistent_start",
             "native owner requires persistent RoCE bootstrap"
@@ -318,7 +326,7 @@ impl LocalVerbsExpertConnection {
             start.request_registered_span_bytes,
             response_ring.depth,
         )?;
-        endpoint.connect(&start.client_native_endpoint)?;
+        endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
         for slot in 0..request_ring.depth {
             endpoint.post_recv_at(
                 request_ring.slot_offset(slot),
@@ -351,6 +359,7 @@ impl LocalVerbsExpertConnection {
                 message: "protocol_v2_persistent_ready".to_owned(),
                 server_endpoint,
                 server_native_endpoint: endpoint.native_descriptor(),
+                flow_label: start.flow_label,
             },
         )?;
 
