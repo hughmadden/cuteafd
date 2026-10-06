@@ -40,6 +40,7 @@
 //! identical. Router, routed experts, LM head and drafter stay on rank 0; rank 1 is queued a
 //! layer ahead of rank 0's expert exchange.
 use super::graphs::{GraphCache, GraphStats};
+use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use super::head::GlmfHead;
@@ -219,6 +220,12 @@ fn prefill_lane_plan(tokens: usize, lanes: usize, rows: usize) -> Result<(usize,
 }
 const HC: usize = 4;
 
+/// The longest chunk a lone prefill runs as one step: pipelined Spark lanes ([`prefill_lane_plan`])
+/// cut a chunk into two lanes from twice `MIN_LANE_ROWS` rows; a serial prefill takes `rows`.
+fn single_pass_rows(pipelined: bool, lanes: usize, rows: usize) -> usize {
+    if pipelined && lanes > 1 { (2 * MIN_LANE_ROWS - 1).min(rows) } else { rows }
+}
+
 /// CUTEAFD_GLMF_PREFILL_LANES: (lanes on: unset or not `1`, lanes with a `--layers` subset: `subset`).
 fn lane_setting() -> (bool, bool) {
     let setting = std::env::var("CUTEAFD_GLMF_PREFILL_LANES");
@@ -365,7 +372,58 @@ struct StepTables {
     long: bool,
     /// A speculative verify: KDA state stays, replay rows are recorded.
     spec: bool,
+    /// A packed prefill's sequences ([`GlmfEngine::prefill_packed`]): every per-sequence program
+    /// runs once per segment over its rows, with its own tables. Empty: one sequence (or a decode
+    /// step, whose programs take every row's sequence from the tables).
+    segments: Vec<packing::Segment>,
 }
+
+/// Rows a per-sequence program runs over: one packed sequence's, or the whole step's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    first: usize,
+    rows: usize,
+}
+
+impl Span {
+    fn rows(&self) -> Scalar {
+        Scalar::I32(self.rows as i32)
+    }
+}
+
+impl StepTables {
+    /// The rows each per-sequence program runs over: every packed sequence's, or the whole step.
+    fn spans(&self) -> Vec<Span> {
+        if self.segments.is_empty() {
+            vec![Span { first: 0, rows: self.kv_slots.len() }]
+        } else {
+            self.segments.iter().map(|s| Span { first: s.first, rows: s.rows }).collect()
+        }
+    }
+}
+
+/// One sequence's rows for the DSA indexer, its pool top-k and the selection
+/// ([`GlmfEngine::index_parts`]).
+struct IndexPart {
+    first: usize,
+    rows: usize,
+    /// A row sees more than the dense context: the pool top-k runs.
+    long: bool,
+    /// Pool-table columns the top-k reads.
+    pool_width: usize,
+    /// The sequence's record-page and pool-page tables (one shared row in a prefill step).
+    page_table: *mut c_void,
+    pool_table: *mut c_void,
+}
+
+/// Row `first` of `buffer`'s rows of `row_bytes` bytes (the buffer itself for row 0).
+fn row_at(buffer: &Dev<'_>, first: usize, row_bytes: usize) -> *mut c_void {
+    buffer.buffer.ptr.wrapping_byte_add(first * row_bytes)
+}
+
+/// DSA indexer heads: the index query and head-weight rows (`glmf_temporary_bytes`'s q_fp8 and
+/// head_weights).
+const INDEX_HEADS: usize = 32;
 
 /// Tokens per DSA index pool, and pools per pool-cache page.
 pub(crate) const KPOOL: usize = 4;
@@ -1733,6 +1791,65 @@ impl<'a> GlmfEngine<'a> {
         Ok(logits)
     }
 
+    /// What one packed prefill pass ([`Self::prefill_packed`]) may hold: the first prefill lane's
+    /// rows, one sequence's table columns, and the drafter's tap rows.
+    pub(crate) fn packed_limits(&self) -> packing::Limits {
+        packing::Limits { rows: self.prefill_rows,
+            chunk_rows: single_pass_rows(self.pipelined(), self.prefill_lane_count, self.prefill_rows),
+            table_pages: self.table_pages, table_pool_pages: self.table_pool_pages,
+            taps: self.drafter.as_ref().map(|_| crate::families::glm5::dflash::TAP_ROWS),
+            dense_context: self.cfg.dense_context(), max_context: self.max_context }
+    }
+
+    /// Whether a packed prefill can run at all: one GPU and every layer resident.
+    pub(crate) fn packs_prefill(&self) -> bool {
+        self.peer.is_none() && self.weights.layers.len() == self.cfg.layers
+    }
+
+    /// One prefill pass over the next chunk of each of `sequences` (`packing`): their rows back to
+    /// back in the first prefill lane's workspace, each sequence's mHC sites, router scores, KDA
+    /// layers, DSA indexer, top-k and selection run over its rows alone, everything else over all
+    /// rows, and one Spark wave per MoE layer. `on_logits(i, logits)` then receives sequence `i`'s
+    /// last row's logits, in order (valid until it returns). Advances every placement; returns the
+    /// layout (each sequence's drafter tap rows).
+    pub fn prefill_packed(&self, sequences: &mut [(&mut GlmfPlacement, &[u32])],
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>) -> Result<Vec<packing::Segment>> {
+        ensure!(self.packs_prefill(), "a packed prefill runs on one GPU with every layer");
+        let chunks: Vec<(usize, usize)> = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect();
+        let segments = packing::plan(&chunks, &self.packed_limits())?;
+        let mut tables = StepTables::default();
+        for ((placement, tokens), segment) in sequences.iter().zip(&segments) {
+            if placement.len == 0 {
+                self.start(placement)?;
+            }
+            // `seq_first` stays 0: every program that reads it runs per sequence.
+            self.rows(placement, placement.len..placement.len + tokens.len(), 0, &mut tables)?;
+            tables.page_table.extend_from_slice(placement.pages.get(..segment.page_columns)
+                .context("a packed sequence's positions past its pages")?);
+            tables.pool_table.extend_from_slice(placement.pool_pages.get(..segment.pool_columns)
+                .context("a packed sequence's positions past its pool pages")?);
+        }
+        tables.segments = segments.clone();
+        let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
+        self.step(&tables, &tokens, 1, None, None, None)?;
+        {
+            let lanes = self.prefill_lanes_of(0, 1)?;
+            let w = lanes.first().context("prefill workspace")?;
+            for (i, segment) in segments.iter().enumerate() {
+                // The sequence's last normalized row through the head alone, as its own pass's.
+                let timer = std::time::Instant::now();
+                self.logits(w, segment.end_row(), 1, false)?;
+                self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+                on_logits(i, self.device_logits(w, 1, false))?;
+            }
+        }
+        for (placement, tokens) in sequences.iter_mut() {
+            placement.len += tokens.len();
+            placement.kda_len = placement.len;
+        }
+        Ok(segments)
+    }
+
     pub fn prefill(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         self.prefill_forced(placement, tokens, on_layer, None, false)
@@ -2136,6 +2253,10 @@ impl<'a> GlmfEngine<'a> {
         }
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
+        // The mHC sites and the router scores run per sequence in a packed prefill (one span: the
+        // whole step).
+        let spans = tables.spans();
+        ensure!(w1.is_none() || tables.segments.is_empty(), "a packed prefill runs on one GPU");
         if let Some(w1) = w1 {
             // The streams to the second GPU, which runs a unit ahead of the host's rank-0
             // work (all its inputs are pushes from rank 0).
@@ -2143,7 +2264,9 @@ impl<'a> GlmfEngine<'a> {
             self.peer_attention(0, 0, w1, t, cap, tables)?;
         }
         let mut cur = 0usize;
-        self.pre(w, &w.streams[cur], &layers[0], rows)?;
+        for span in &spans {
+            self.pre_at(0, w, &w.streams[cur], &layers[0], span.first, span.rows())?;
+        }
         for (index, layer) in layers.iter().enumerate() {
             if let Some(dir) = trace {
                 let dir = dir.join(format!("layer{index:02}"));
@@ -2180,7 +2303,9 @@ impl<'a> GlmfEngine<'a> {
             // Attention back into the streams (a head split: the two partials' sum), then the
             // FFN site's collapse + norm.
             let attended = self.meet_attention(w, slot(index, false, 0), t, layer, cap)?;
-            self.post_pre_on(0, w, attended, cur, layer, "ffn", "post_norm", rows, cap)?;
+            for span in &spans {
+                self.post_pre_at(0, w, attended, cur, layer, "ffn", "post_norm", span.first, span.rows(), cap)?;
+            }
             cur ^= 1;
             if let Some(w1) = w1 {
                 // Rank 1: this layer's FFN exchange, then the next layer's attention.
@@ -2195,24 +2320,34 @@ impl<'a> GlmfEngine<'a> {
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
-                self.moe(w, index, layer, t, rows, cap, tables.decode)?;
+                self.moe(w, index, layer, t, rows, cap, tables.decode, &spans)?;
             }
             let out = self.meet_ffn(w, index, 0, layers.len(), t)?;
             match layers.get(index + 1) {
                 Some(next) => {
-                    self.post_pre_on(0, w, out, cur, next, "attn", "input_norm", rows, cap)?;
+                    for span in &spans {
+                        self.post_pre_at(0, w, out, cur, next, "attn", "input_norm", span.first, span.rows(), cap)?;
+                    }
                     cur ^= 1;
                 }
                 None => {
-                    self.run("mhc_post", &[("x", out), ("residual", w.streams[cur].buffer.ptr),
-                        ("prev_post", w.post.buffer.ptr), ("prev_comb", w.comb.buffer.ptr),
-                        ("out", w.streams[cur ^ 1].buffer.ptr)], &[rows])?;
+                    for span in &spans {
+                        self.mhc_post_at(w, out, cur, span)?;
+                    }
                     cur ^= 1;
                 }
             }
             if let Some(drafter) = &self.drafter {
-                let n = t.min(crate::families::glm5::dflash::TAP_ROWS);
-                drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
+                if tables.segments.is_empty() {
+                    let n = t.min(crate::families::glm5::dflash::TAP_ROWS);
+                    drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
+                } else {
+                    // Each packed sequence's last rows, as its own pass taps them, at its tap rows.
+                    for s in tables.segments.iter().filter(|s| s.tap_rows > 0) {
+                        drafter.tap_streams_at(index, w.streams[cur].buffer.ptr, HC, s.end_row() - s.tap_rows,
+                            s.tap_rows, s.tap_offset)?;
+                    }
+                }
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
@@ -2234,9 +2369,26 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
+        if !tables.segments.is_empty() {
+            // A packed prefill: the caller takes each sequence's last row's logits in turn
+            // ([`Self::prefill_packed`]) from the normalized rows.
+            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+            return Ok(None);
+        }
         self.logits(w, t, logit_rows, tables.decode)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(self.device_logits(w, logit_rows, false)))
+    }
+
+    /// The last layer's mHC post of `span`'s rows: the FFN output `x` back into streams `cur`, into
+    /// the other stream buffer.
+    fn mhc_post_at(&self, w: &Workspace<'_>, x: *mut c_void, cur: usize, span: &Span) -> Result<()> {
+        let (h, first) = (self.cfg.hidden, span.first);
+        ensure!(first == 0 || self.peer.is_none(), "per-sequence rows run on one GPU");
+        self.run("mhc_post", &[("x", x.wrapping_byte_add(first * h * 2)),
+            ("residual", row_at(&w.streams[cur], first, HC * h * 2)), ("prev_post", row_at(&w.post, first, HC * 4)),
+            ("prev_comb", row_at(&w.comb, first, HC * HC * 4)),
+            ("out", row_at(&w.streams[cur ^ 1], first, HC * h * 2))], &[span.rows()])
     }
 
     /// A decode step as captured segments: segment `i` posts layer `i - 1`'s
@@ -2300,7 +2452,7 @@ impl<'a> GlmfEngine<'a> {
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
                 } else {
-                    self.moe_front(w, index, layer, t, rows, "m64")
+                    self.moe_front(w, index, layer, t, rows, "m64", &[Span { first: 0, rows: t }])
                 }
             })?;
             if let Some(w1) = w1 {
@@ -2470,9 +2622,18 @@ impl<'a> GlmfEngine<'a> {
     /// [`Self::pre`] on rank `rank`.
     fn pre_on(&self, rank: usize, w: &Workspace<'_>, streams: &Dev<'_>, layer: &GlmfLayer<'_>, rows: Scalar)
         -> Result<()> {
-        self.run_on(rank, false, "mhc_pre", &[("residual", streams.buffer.ptr), ("fn", layer.ptr("attn.fn")?),
-            ("scale", layer.ptr("attn.scale")?), ("base", layer.ptr("attn.base")?), ("norm", layer.ptr("input_norm")?),
-            ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.x.buffer.ptr),
+        self.pre_at(rank, w, streams, layer, 0, rows)
+    }
+
+    /// [`Self::pre_on`] over the `rows` rows from row `first` (one packed sequence's), the
+    /// program's scratch from its start as for any other call.
+    fn pre_at(&self, rank: usize, w: &Workspace<'_>, streams: &Dev<'_>, layer: &GlmfLayer<'_>, first: usize,
+        rows: Scalar) -> Result<()> {
+        let h = self.cfg.hidden;
+        self.run_on(rank, false, "mhc_pre", &[("residual", row_at(streams, first, HC * h * 2)),
+            ("fn", layer.ptr("attn.fn")?), ("scale", layer.ptr("attn.scale")?), ("base", layer.ptr("attn.base")?),
+            ("norm", layer.ptr("input_norm")?), ("post", row_at(&w.post, first, HC * 4)),
+            ("comb", row_at(&w.comb, first, HC * HC * 4)), ("y", row_at(&w.x, first, h * 2)),
             ("scratch", w.scratch.buffer.ptr)], &[rows])
     }
 
@@ -2482,13 +2643,23 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn post_pre_on(&self, rank: usize, w: &Workspace<'_>, x: *mut c_void, cur: usize, layer: &GlmfLayer<'_>,
         site: &str, norm: &str, rows: Scalar, cap: &str) -> Result<()> {
-        self.run_on(rank, false, &format!("mhc_post_pre_{cap}"), &[("x", x),
-            ("residual", w.streams[cur].buffer.ptr), ("prev_post", w.post.buffer.ptr),
-            ("prev_comb", w.comb.buffer.ptr), ("fn", layer.ptr(&format!("{site}.fn"))?),
+        self.post_pre_at(rank, w, x, cur, layer, site, norm, 0, rows, cap)
+    }
+
+    /// [`Self::post_pre_on`] over the `rows` rows from row `first` (one packed sequence's, on one
+    /// GPU: `x` holds BF16 rows), the program's scratch from its start as for any other call.
+    #[allow(clippy::too_many_arguments)]
+    fn post_pre_at(&self, rank: usize, w: &Workspace<'_>, x: *mut c_void, cur: usize, layer: &GlmfLayer<'_>,
+        site: &str, norm: &str, first: usize, rows: Scalar, cap: &str) -> Result<()> {
+        let h = self.cfg.hidden;
+        ensure!(first == 0 || self.peer.is_none(), "per-sequence rows run on one GPU");
+        self.run_on(rank, false, &format!("mhc_post_pre_{cap}"), &[("x", x.wrapping_byte_add(first * h * 2)),
+            ("residual", row_at(&w.streams[cur], first, HC * h * 2)), ("prev_post", row_at(&w.post, first, HC * 4)),
+            ("prev_comb", row_at(&w.comb, first, HC * HC * 4)), ("fn", layer.ptr(&format!("{site}.fn"))?),
             ("scale", layer.ptr(&format!("{site}.scale"))?), ("base", layer.ptr(&format!("{site}.base"))?),
-            ("norm", layer.ptr(norm)?), ("residual_out", w.streams[cur ^ 1].buffer.ptr),
-            ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.x.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])
+            ("norm", layer.ptr(norm)?), ("residual_out", row_at(&w.streams[cur ^ 1], first, HC * h * 2)),
+            ("post", row_at(&w.post, first, HC * 4)), ("comb", row_at(&w.comb, first, HC * HC * 4)),
+            ("y", row_at(&w.x, first, h * 2)), ("scratch", w.scratch.buffer.ptr)], &[rows])
     }
 
     /// Layer `index`'s attention on rank `rank` into `delta` (a head split: that rank's heads,
@@ -2497,15 +2668,22 @@ impl<'a> GlmfEngine<'a> {
     fn attention(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables, trace: Option<&std::path::Path>) -> Result<()> {
         match layer.attention {
-            GlmNextAttention::Kda => self.kda_on(rank, w, index, layer, rows, cap, tables.spec),
+            // The chunked recurrence above 64 rows holds one sequence: a packed prefill runs the
+            // layer once per sequence, over its rows (one span: the whole step).
+            GlmNextAttention::Kda => tables.spans().iter().try_for_each(|span| {
+                ensure!(span.first == 0 || (rank == 0 && self.peer.is_none()), "per-sequence rows run on one GPU");
+                self.kda_on(rank, w, index, layer, if tables.segments.is_empty() { rows } else { span.rows() },
+                    span.first, cap, tables.spec)
+            }),
             GlmNextAttention::Mla => self.mla_on(rank, w, index, layer, rows, cap, tables, trace),
         }
     }
 
-    /// Layer `index`'s KDA on rank `rank` (a head split: its heads and their state).
+    /// Layer `index`'s KDA on rank `rank` (a head split: its heads and their state), over the
+    /// `rows` rows from row `first` (one packed sequence's: its `seq_first` entries are 0).
     #[allow(clippy::too_many_arguments)]
-    fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
-        spec: bool) -> Result<()> {
+    fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, first: usize,
+        cap: &str, spec: bool) -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
         let at = |pool: &Dev<'_>, per: usize| -> *mut c_void {
             // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
@@ -2517,18 +2695,23 @@ impl<'a> GlmfEngine<'a> {
         let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         let replay = at(&caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
         let decode = cap == "m64";
+        // Row `first`'s input, state slot, sequence start and output (BF16 rows on one GPU).
+        let h = self.cfg.hidden;
+        let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
+            w.delta.buffer.ptr.wrapping_byte_add(first * h * self.partial_bytes())];
         if layer.has("w_in_fp8") {
-            return self.kda_w8(rank, w, layer, rows, cap, spec, [conv_state, state, replay]);
+            return self.kda_w8(rank, w, layer, rows, rows_at, cap, spec, [conv_state, state, replay]);
         }
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
+        let [x, slots, seq_first, out] = rows_at;
+        let mut pointers = vec![("x", x), ("w_in", layer.ptr("w_in")?)];
         // Decode programs read per-row scales [N, K/128]; prefill ones K-block major.
         let (in_scale, o_scale) = if decode { ("w_in_scale", "w_o_scale") } else { ("w_in_kscale", "w_o_kscale") };
         pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?), (in_scale, layer.ptr_or(in_scale, "w_in")?)]);
         pointers.extend([("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?), ("w_o", layer.ptr("w_o")?)]);
         pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), (o_scale, layer.ptr_or(o_scale, "w_o")?)]);
-        pointers.extend([("conv_state", conv_state), ("state", state), ("slots", w.kda_slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
+        pointers.extend([("conv_state", conv_state), ("state", state), ("slots", slots), ("seq_first", seq_first),
+            ("out", out)]);
         let mut scalars = self.fp8_scalars(rows, decode, layer.has(if decode { "w_in_fp8" } else { "w_in_kscale" }));
         if !decode && layer.has("w_in_kscale") {
             // Prefill fp8_rows bits: 1 the in-projection, 2 o_proj.
@@ -2546,17 +2729,18 @@ impl<'a> GlmfEngine<'a> {
 
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
     /// projections: `kda_w8_{cap}`. Decode rows up to 32 on half heads (16 on full heads) run the FP8 GEMV, wider
-    /// verify steps W8A16; prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16.
+    /// verify steps W8A16; prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16. `rows_at`: the
+    /// rows' input, state slots, sequence starts and output.
     #[allow(clippy::too_many_arguments)]
-    fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, spec: bool,
+    fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar,
+        [x, slots, seq_first, out]: [*mut c_void; 4], cap: &str, spec: bool,
         [conv_state, state, replay]: [*mut c_void; 3]) -> Result<()> {
         let decode = cap == "m64";
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in_fp8", layer.ptr("w_in_fp8")?),
+        let mut pointers = vec![("x", x), ("w_in_fp8", layer.ptr("w_in_fp8")?),
             ("w_in_kscale", layer.ptr("w_in_kscale")?), ("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?),
             ("a_log", layer.ptr("a_log")?), ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_kscale", layer.ptr("w_o_kscale")?), ("conv_state", conv_state),
-            ("state", state), ("slots", w.kda_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
-            ("out", w.delta.buffer.ptr)];
+            ("state", state), ("slots", slots), ("seq_first", seq_first), ("out", out)];
         let mut scalars = vec![rows, Scalar::I32(if decode {
             if layer.split { 32 } else { FP8_ROWS }
         } else { self.fp8_prefill.kda_bits })];
@@ -2620,6 +2804,18 @@ impl<'a> GlmfEngine<'a> {
             &self.fp8_scalars(rows, decode, decode || self.fp8_prefill.ffn))
     }
 
+    /// The rows and tables the DSA indexer, top-k and selection run over: each packed sequence's
+    /// (its rows, and its page tables at their offsets in `w`'s table row), or the whole step's.
+    fn index_parts(&self, w: &Workspace<'_>, tables: &StepTables) -> Vec<IndexPart> {
+        if tables.segments.is_empty() {
+            return vec![IndexPart { first: 0, rows: tables.positions.len(), long: tables.long,
+                pool_width: tables.pool_width, page_table: w.page_table.buffer.ptr, pool_table: w.pool_table.buffer.ptr }];
+        }
+        tables.segments.iter().map(|s| IndexPart { first: s.first, rows: s.rows, long: s.long, pool_width: s.pool_columns,
+            page_table: row_at(&w.page_table, s.page_offset, 4), pool_table: row_at(&w.pool_table, s.pool_offset, 4) })
+            .collect()
+    }
+
     /// Layer `index`'s MLA on rank `rank` (a head split: the replicated latent record and DSA
     /// indexer, its heads' queries, sparse MLA, W_UV and a partial o_proj).
     #[allow(clippy::too_many_arguments)]
@@ -2661,44 +2857,54 @@ impl<'a> GlmfEngine<'a> {
             std::fs::write(dir.join("mla_meta.json"), serde_json::to_vec(&serde_json::json!({
                 "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024 }))?)?;
         }
-        match (&index_cache.keys, &caches.index_tails) {
-            (Some(keys), _) => self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", w.x.buffer.ptr),
-                ("q_resid", w.q_resid.buffer.ptr), ("slots", w.kv_slots.buffer.ptr),
-                ("pool_slots", w.pool_slots.buffer.ptr), ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?),
-                ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?),
-                ("token_keys", keys.buffer.ptr), ("index_cache", pool_cache.buffer.ptr),
-                ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
-                ("scratch", w.scratch.buffer.ptr)], &[rows])?,
-            (None, Some((tails, records))) => {
-                // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
-                let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
-                ensure!(!tables.spec || t <= REPLAY_ROWS, "a speculative step of {t} rows exceeds the replay record");
-                // SAFETY: ordinal < MLA layers: both regions lie inside their pools.
-                let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
-                    records.buffer.ptr.cast::<u8>().add(ordinal * REPLAY_ROWS * KEY_BYTES)) };
-                self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", w.x.buffer.ptr),
-                    ("q_resid", w.q_resid.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr),
-                    ("positions", w.positions.buffer.ptr), ("kda_slots", w.kda_slots.buffer.ptr),
-                    ("seq_first", w.seq_first.buffer.ptr), ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?),
-                    ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
-                    ("ape", layer.ptr("ape")?), ("tails", tails.cast()), ("replay", record.cast()),
-                    ("index_cache", pool_cache.buffer.ptr), ("q_fp8", w.q_fp8.buffer.ptr),
-                    ("head_weights", w.head_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-                    &[rows, Scalar::I32(i32::from(tables.spec))])?
+        // The DSA indexer, its pool top-k and the selection read one sequence's tables: a packed
+        // prefill runs them once per sequence, over its rows and its tables (one part: the step).
+        let (h, q, pools) = (self.cfg.hidden, self.cfg.q_lora_rank, self.cfg.index_topk / KPOOL);
+        ensure!(rank == 0 || tables.segments.is_empty(), "a packed prefill runs on one GPU");
+        for part in self.index_parts(w, tables) {
+            let (first, rows) = (part.first, if tables.segments.is_empty() { rows } else { Scalar::I32(part.rows as i32) });
+            let (x, q_resid) = (row_at(&w.x, first, h * 2), row_at(&w.q_resid, first, q * 2));
+            let (q_fp8, head_weights) = (row_at(&w.q_fp8, first, INDEX_HEADS * 128), row_at(&w.head_weights, first,
+                INDEX_HEADS * 4));
+            let (pool_slots, positions) = (row_at(&w.pool_slots, first, 8), row_at(&w.positions, first, 8));
+            match (&index_cache.keys, &caches.index_tails) {
+                (Some(keys), _) => self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", x),
+                    ("q_resid", q_resid), ("slots", row_at(&w.kv_slots, first, 8)), ("pool_slots", pool_slots),
+                    ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
+                    ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("token_keys", keys.buffer.ptr),
+                    ("index_cache", pool_cache.buffer.ptr), ("q_fp8", q_fp8), ("head_weights", head_weights),
+                    ("scratch", w.scratch.buffer.ptr)], &[rows])?,
+                (None, Some((tails, records))) => {
+                    // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
+                    let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+                    ensure!(!tables.spec || t <= REPLAY_ROWS, "a speculative step of {t} rows exceeds the replay record");
+                    // SAFETY: ordinal < MLA layers: both regions lie inside their pools.
+                    let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
+                        records.buffer.ptr.cast::<u8>().add(ordinal * REPLAY_ROWS * KEY_BYTES)) };
+                    self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", x), ("q_resid", q_resid),
+                        ("pool_slots", pool_slots), ("positions", positions),
+                        ("kda_slots", row_at(&w.kda_slots, first, 4)), ("seq_first", row_at(&w.seq_first, first, 4)),
+                        ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
+                        ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("tails", tails.cast()),
+                        ("replay", record.cast()), ("index_cache", pool_cache.buffer.ptr), ("q_fp8", q_fp8),
+                        ("head_weights", head_weights), ("scratch", w.scratch.buffer.ptr)],
+                        &[rows, Scalar::I32(i32::from(tables.spec))])?
+                }
+                (None, None) => anyhow::bail!("MLA layer {index} has neither token keys nor index tails"),
             }
-            (None, None) => anyhow::bail!("MLA layer {index} has neither token keys nor index tails"),
+            let pools_at = row_at(&w.pools, first, pools * 4);
+            if part.long {
+                self.run_on(rank, false, &format!("index_topk_{mode}_{cap}"), &[("q_fp8", q_fp8),
+                    ("weights", head_weights), ("index_k_cache", pool_cache.buffer.ptr), ("page_table", part.pool_table),
+                    ("cache_lengths", row_at(&w.cache_lengths, first, 4)), ("output_indices", pools_at),
+                    ("scratch", w.topk_scratch.buffer.ptr)],
+                    &[rows, Scalar::I32(part.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
+            }
+            self.run_on(rank, false, "index_expand", &[("positions", positions), ("pools", pools_at),
+                ("pool_logical", caches.pool_logical.buffer.ptr), ("page_table", part.page_table),
+                ("indices", row_at(&w.indices, first, SPARSE_TOPK * 4)), ("lengths", row_at(&w.lengths, first, 4))],
+                &[rows, Scalar::I32(tables.page_stride as i32)])?;
         }
-        if tables.long {
-            self.run_on(rank, false, &format!("index_topk_{mode}_{cap}"), &[("q_fp8", w.q_fp8.buffer.ptr),
-                ("weights", w.head_weights.buffer.ptr), ("index_k_cache", pool_cache.buffer.ptr),
-                ("page_table", w.pool_table.buffer.ptr), ("cache_lengths", w.cache_lengths.buffer.ptr),
-                ("output_indices", w.pools.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr)],
-                &[rows, Scalar::I32(tables.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
-        }
-        self.run_on(rank, false, "index_expand", &[("positions", w.positions.buffer.ptr), ("pools", w.pools.buffer.ptr),
-            ("pool_logical", caches.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
-            ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)],
-            &[rows, Scalar::I32(tables.page_stride as i32)])?;
         if let Some(dir) = trace {
             for (name, buffer, bytes) in [("mla_indices.bin", &w.indices, t * SPARSE_TOPK * 4),
                 ("mla_lengths.bin", &w.lengths, t * 4)] {
@@ -2752,23 +2958,30 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
+    /// `spans`: the router scores' rows (each packed sequence's, or the whole step).
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
-        decode: bool) -> Result<()> {
-        self.moe_front(w, index, layer, t, rows, cap)?;
+        decode: bool, spans: &[Span]) -> Result<()> {
+        self.moe_front(w, index, layer, t, rows, cap, spans)?;
         self.moe_experts(w, index, layer, t, rows, cap, decode)
     }
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
-    /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync.
-    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str)
-        -> Result<()> {
+    /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync. The router scores, a skinny
+    /// GEMV up to 160 rows, run over each of `spans` (each packed sequence's rows, or the whole
+    /// step); the rest over every row.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
+        spans: &[Span]) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} is an MoE layer: pass --local-experts (FP8 package) or Spark --peers \
              (run --layers 3 for the dense layers alone)"))?;
-        self.run("router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
-            ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        for span in spans {
+            let rows = if spans.len() == 1 && span.rows == t { rows } else { span.rows() };
+            self.run("router_scores", &[("x", row_at(&w.x, span.first, h * 2)), ("w", layer.ptr("gate")?),
+                ("logits", row_at(&w.router_logits, span.first, self.cfg.experts * 4))], &[rows])?;
+        }
         self.timed("router_select", || {
             // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
             unsafe {
@@ -3059,7 +3272,7 @@ impl<'a> GlmfEngine<'a> {
             if weights.dense {
                 self.ffn(w, weights, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
             } else {
-                self.moe_front(w, layer, weights, t, rows, cap)
+                self.moe_front(w, layer, weights, t, rows, cap, &[Span { first: 0, rows: t }])
             }
         };
         let post = |(layer, lane): (usize, usize)| -> Result<()> {
@@ -3327,6 +3540,18 @@ mod prefill_lane_tests {
         assert_eq!(GLMF_DECODE_ROWS, super::DECODE_ROWS as u64);
         assert_eq!(GLMF_SPARSE_TOPK, super::SPARSE_TOPK as u64);
         assert_eq!(GLMF_HEAD_WORKSPACE, cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64);
+    }
+
+    #[test]
+    fn single_pass_rows_are_the_chunks_the_lane_plan_leaves_in_one_lane() {
+        for (lanes, rows) in [(2, 4096), (4, 2048), (3, 1024), (2, 256), (1, 4096)] {
+            let single = super::single_pass_rows(true, lanes, rows);
+            for tokens in 1..=prefill_lane_capacity(lanes, rows) {
+                let (cut, _) = prefill_lane_plan(tokens, lanes, rows).unwrap();
+                assert_eq!(cut == 1, tokens <= single, "{lanes} lanes of {rows}: {tokens} tokens in {cut} lanes");
+            }
+        }
+        assert_eq!(super::single_pass_rows(false, 2, 4096), 4096);
     }
 
     #[test]
