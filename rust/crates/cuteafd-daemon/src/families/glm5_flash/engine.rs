@@ -328,6 +328,17 @@ impl Allocator {
         }
     }
 
+    /// `n` units for a pool-page prefix mark, ascending as the prefix cache hands them out.
+    pub fn take_units(&mut self, n: usize) -> Result<Vec<u32>> {
+        let mut units = self.units.alloc(n).context("cache pages exhausted")?;
+        units.sort_unstable();
+        Ok(units)
+    }
+
+    pub fn release_units(&mut self, units: &[u32]) {
+        self.units.release(units);
+    }
+
     /// A spare KDA state slot (a speculative verify's backup).
     pub fn spare_slot(&mut self) -> Result<i32> {
         self.slots.pop().context("KDA state slots exhausted")

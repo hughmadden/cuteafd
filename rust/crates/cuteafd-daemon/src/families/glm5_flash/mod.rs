@@ -54,6 +54,12 @@ pub(crate) struct EngineArgs {
     /// cache; golden: the --resume-at check), reserved before an automatic pool is sized.
     #[arg(skip)]
     pub planner_mark_slots: usize,
+    /// Where prefix-cache snapshots keep their KDA state marks: `arena`, a device arena of
+    /// 2C + 2 marks (147.6 MB each with FP32 state) beside the KV pool, or `pool`, units of
+    /// the KV pool itself (49 per mark), taken at capture and evicted (to the host tier when
+    /// it is on) like any snapshot's rows.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_PREFIX_MARKS", default_value = "arena")]
+    pub prefix_marks: prefix::PrefixMarks,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
@@ -204,6 +210,14 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn prefix_marks_default_to_the_arena_and_take_the_pool() {
+        assert_eq!(parse(&[]).prefix_marks, prefix::PrefixMarks::Arena);
+        assert_eq!(parse(&["--prefix-marks", "pool"]).prefix_marks, prefix::PrefixMarks::Pool);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefix-marks", "host"]).is_err());
     }
 
     #[test]
@@ -720,8 +734,9 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
-    // --resume-at captures into two arena marks (`prefix::resume_check`).
-    args.engine.planner_mark_slots = if args.resume_at.is_some() { 2 } else { 0 };
+    // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
+    args.engine.planner_mark_slots =
+        if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena { 2 } else { 0 };
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -790,7 +805,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat);
+            args.resume_repeat, args.engine.prefix_marks);
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);
