@@ -118,7 +118,8 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(routing, 'auto')
             raw.mkdir(parents=True)
             meta = dict(capacity=capacity, intermediate=width, experts=experts,
-                        top_k=topk, output_dtype=dtype, bits=list(tiers), blocks_per_sm=1,
+                        top_k=topk, output_dtype=dtype, bits=list(tiers),
+                        blocks_per_sm=options.get('blocks_per_sm', 1),
                         sparkinfer_revision=pinned.REVISION)
             if paired:
                 meta.update(paired_boundary=options['paired_boundary'],
@@ -264,9 +265,19 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertEqual(meta['decode_schedule'], 'canonical:gb10')
                 default = json.loads((output / directory.removesuffix('-gb10') / 'v41_exl3.json').read_text())
                 self.assertNotIn('decode_schedule', default)
+                # m80-gb10 runs 64x128 tiles at two CTAs per SM; m1-gb10 keeps the default tile.
+                wide = directory.endswith('/m80-gb10')
+                self.assertEqual(variant['blocks_per_sm'], 2 if wide else 1)
+                if wide:
+                    self.assertEqual(variant['tile'], [64, 128, 64, 128])
+                    self.assertNotIn('tile_requested', variant)
             gb10 = [call for call in calls if call.kwargs.get('decode_schedule') == 'gb10']
             self.assertEqual(sorted(call.args[3] for call in gb10), sorted(capacities))
             self.assertTrue(all(call.args[1] == 512 for call in gb10))
+            for call in gb10:
+                expected = ({'tile': (64, 128, 64, 128), 'blocks_per_sm': 2} if call.args[3] == 80 else {})
+                self.assertEqual({key: call.kwargs[key] for key in ('tile', 'blocks_per_sm')
+                                  if key in call.kwargs}, expected)
             profiles = package.profiles_for_role('spark', 'glmf')
             self.assertEqual(len(calls) - len(gb10), len(profiles) * len(capacities))
             for directory in (v['directory'] for v in manifest['variants'] if 'schedule' not in v):
@@ -289,7 +300,10 @@ class PackageProfileTests(unittest.TestCase):
                 for profile, *_ in package.profiles_for_role(role, geometry):
                     for capacity in (1, 16, 80, 256, 1024, 4096):
                         variants = package.decode_schedule_variants(geometry, role, profile, capacity)
-                        expected = ([('gb10', {'decode_schedule': 'gb10'})]
+                        options = {1: {'decode_schedule': 'gb10'},
+                                   80: {'decode_schedule': 'gb10', 'tile': (64, 128, 64, 128),
+                                        'blocks_per_sm': 2}}
+                        expected = ([('gb10', options[capacity])]
                                     if (geometry, role) == ('glmf', 'spark')
                                     and profile.startswith('tp4-') and capacity in (1, 80) else [])
                         self.assertEqual(variants, expected, (geometry, role, profile, capacity))

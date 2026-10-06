@@ -404,16 +404,22 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, .
 
 
 # Decode-schedule variants: a capacity directory m<capacity>-<name> beside the
-# default m<capacity>, exported with the b12x decode schedule of that name
-# (bit-identical; the worker's --exl3-schedule NAME selects it). gb10 is the
-# DGX Spark schedule of the GLM 5.3 Flash TP4 decode capacities (FR-G.7(b):
-# weight words staged evict-first in L2, every tile's first weight K tiles
-# prefetched into L2 before it starts, each GEMM's first tile before the grid
-# barrier that precedes it). The worker runs m1 for one row and m80 for 2-80
-# rows (K64 both), so those two capacities carry it.
+# default m<capacity>, exported with per-capacity options (bit-identical; the
+# worker's --exl3-schedule NAME selects it). gb10 is the DGX Spark schedule of
+# the GLM 5.3 Flash TP4 decode capacities (FR-G.7(b)), which the worker runs as
+# m1 for one row and m80 for 2-80 rows: the b12x gb10 decode schedule (weight
+# words staged L2 evict-first), and at m80 64x128 tiles at two CTAs per SM (the
+# same K partition, so the same bits; it hides one CTA's tile start behind the
+# other's stream). Measured on GB10, one TP4 rank slice, uniform top-8 routes,
+# fastest call against the default export (b12x
+# benchmarks/benchmark_glmf_decode_schedule.py, 5 rounds): 1 row (m1) 1.071x;
+# 2 / 4 / 8 / 16 / 32 / 64 / 80 rows (m80) 1.112x / 1.057x / 1.032x / 1.031x /
+# 1.026x / 1.020x / 1.014x. At m1 the narrow tile measured 1.053x, below 1.071x.
 DECODE_SCHEDULES = {
-    'gb10': {'geometry': 'glmf', 'profiles': ('tp4-',), 'capacities': (1, 80),
-             'options': {'decode_schedule': 'gb10'}},
+    'gb10': {'geometry': 'glmf', 'profiles': ('tp4-',),
+             'capacities': {1: {'decode_schedule': 'gb10'},
+                            80: {'decode_schedule': 'gb10', 'tile': (64, 128, 64, 128),
+                                 'blocks_per_sm': 2}}},
 }
 
 
@@ -422,7 +428,8 @@ def decode_schedule_variants(geometry: str, role: str, profile: str,
     """(name, export options) of every decode-schedule variant of one export."""
     if role != 'spark':
         return []
-    return [(name, dict(spec['options'])) for name, spec in sorted(DECODE_SCHEDULES.items())
+    return [(name, dict(spec['capacities'][capacity]))
+            for name, spec in sorted(DECODE_SCHEDULES.items())
             if spec['geometry'] == geometry and profile.startswith(spec['profiles'])
             and capacity in spec['capacities']]
 
@@ -675,7 +682,9 @@ def build(args: argparse.Namespace) -> None:
                             # policy varies per capacity (m16 is the known special case),
                             # so a build without an override still has a real tile.
                             variant['tile'] = meta['tile']
-                        if tile is not None:
+                        if tile is not None and schedule is None:
+                            # An A/B tile override applies to the default export; a
+                            # schedule variant brings its own options.
                             variant['tile_requested'] = list(tile)
                         if 'route_block' in meta:
                             variant['route_block'] = meta['route_block']

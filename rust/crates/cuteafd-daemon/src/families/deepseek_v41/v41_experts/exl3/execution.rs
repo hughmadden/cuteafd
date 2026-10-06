@@ -46,8 +46,8 @@ impl Exl3RowPolicy {
 /// runs the `m<capacity>-gb10` siblings of the GLM 5.3 Flash TP4 decode
 /// capacities (m1 for one row, m80 for 2-80): the same products and sums as
 /// the default exports, so the same bits, with the weight words staged L2
-/// evict-first and every tile's first weight K tiles prefetched into L2
-/// before it starts. Every other capacity runs its default export.
+/// evict-first and, at m80, 64x128 tiles at two CTAs per SM. Every other
+/// capacity runs its default export.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Exl3Schedule {
     #[default]

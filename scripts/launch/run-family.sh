@@ -654,7 +654,7 @@ if [[ $family == glm5_flash ]]; then
   esac
   # GLM5_FLASH_EXL3_SCHEDULE: the Spark EXL3 decode schedule, default or gb10. gb10 runs the
   # m1-gb10/m80-gb10 TP4 exports: the same products and sums (the same bits), with the weight
-  # words staged evict-first in L2 and every tile's first weight K tiles prefetched into L2.
+  # words staged evict-first in L2, and at m80 64x128 tiles at two CTAs per SM.
   exl3_schedule="$(get GLM5_FLASH_EXL3_SCHEDULE default)"
   case "$exl3_schedule" in
     default) ;;
