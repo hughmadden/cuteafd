@@ -257,6 +257,22 @@ mod draft_cli_tests {
             .chain(extra.iter().copied())).unwrap().engine
     }
 
+    /// The memory profile's settings are opt-in: without them the engine keeps today's DSA index
+    /// keys, FP32 KDA state and its programs, arena marks, two prefill lanes of 4,096 rows, the
+    /// planner's 2 GiB headroom and unbounded decode graphs.
+    #[test]
+    fn default_flags_keep_todays_caches_programs_lanes_and_headroom() {
+        let defaults = parse(&[]);
+        assert_eq!((defaults.index_cache, defaults.kda_state, defaults.prefix_marks),
+            (engine::IndexCache::Keys, engine::KdaState::F32, prefix::PrefixMarks::Arena));
+        assert_eq!((defaults.prefill_lanes, defaults.prefill_rows, defaults.graph_budget_mib), (2, 4096, None));
+        assert_eq!(defaults.headroom_bytes().unwrap(),
+            cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
+        assert_eq!((defaults.kda_state.program("m64"), defaults.kda_state.program("m4096"),
+            defaults.kda_state.commit_program()), ("kda_m64".to_string(), "kda_m4096".to_string(), "kda_commit"));
+        check_options(&defaults).unwrap();
+    }
+
     #[test]
     fn prefix_marks_default_to_the_arena_and_take_the_pool() {
         assert_eq!(parse(&[]).prefix_marks, prefix::PrefixMarks::Arena);

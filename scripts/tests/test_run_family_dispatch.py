@@ -412,6 +412,21 @@ def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+def test_glmf_default_launch_passes_no_memory_profile_option(tmp_path):
+    """The memory profile's launcher keys are opt-in: without them the coordinator gets none of
+    their options and starts with today's index keys, FP32 KDA state, arena marks without the
+    host tier, two prefill lanes of 4,096 rows, 2 GiB headroom and unbounded decode graphs."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in ("--index-cache", "--kda-state", "--prefix-marks", "--host-cache-bytes", "--prefill-lanes",
+                   "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"):
+        assert option not in launch, (option, launch)
+
+
 @pytest.mark.parametrize("keys,compact", [("", False), ("GLM5_FLASH_INDEX_CACHE=keys\n", False),
                                          ("GLM5_FLASH_INDEX_CACHE=compact\n", True)])
 def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact):
