@@ -520,6 +520,14 @@ impl<'a> DsparkDrafter<'a> {
         self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
     }
 
+    /// Explicit serving startup admission; other callers retain lazy allocation.
+    pub(crate) fn prepare_workspace(&self) -> Result<()> {
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
+        }
+        Ok(())
+    }
+
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
         let c = &self.cfg;
         let rows = sequences * c.block;
@@ -758,6 +766,13 @@ impl<'a> Drafter<'a> {
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
         Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales)?))
+    }
+
+    pub fn prepare_workspace(&self) -> Result<()> {
+        match self {
+            Self::Dflash2(d) => d.prepare_workspace(),
+            Self::Dspark(d) => d.prepare_workspace(),
+        }
     }
 
     pub fn name(&self) -> &'static str {
