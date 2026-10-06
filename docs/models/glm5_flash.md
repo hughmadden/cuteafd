@@ -205,7 +205,9 @@ names `compact`.
   one 1,048,576-token request. It needs one GPU, Spark experts and an automatic
   pool.
 - `auto` lays the standard settings out with `cuteafd plan --layout` on the
-  coordinator GPU's free memory (nvidia-smi) for `CONCURRENCY` sequences and
+  coordinator GPU's free memory (nvidia-smi; under `--restart` with this
+  launch's coordinator crediting the device's used memory when it is the GPU's
+  only compute process) for `CONCURRENCY` sequences and
   `MAX_CONTEXT_TOKENS`, with every memory flag the standard launch would pass,
   and keeps them when that pool holds one `MAX_CONTEXT_TOKENS` request and
   65,536 tokens for each other sequence; otherwise it runs the launch as

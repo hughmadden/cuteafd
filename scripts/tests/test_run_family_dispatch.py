@@ -104,13 +104,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
                           with_nest: bool = True, extra_env: dict[str, str] | None = None,
                           extra_args: tuple[str, ...] = (), extra_snapshots: tuple[str, ...] = (),
-                          layout_plan: str | None = None,
-                          gpu_memory: tuple[int, int] | None = None) -> subprocess.CompletedProcess[str]:
+                          layout_plan: str | None = None, gpu_memory: tuple[int, int] | None = None,
+                          gpu_used_mib: int = 2) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. `extra_snapshots` are more models
     in the cache (drafters, FP8 releases); `layout_plan` is what `cuteafd plan --layout` prints
-    for a GLM 5.3 Flash memory plan; `gpu_memory` (free, total MiB) answers nvidia-smi's memory
-    queries while it still lists `physical_gpus`."""
+    for a GLM 5.3 Flash memory plan; `gpu_memory` (free, total MiB) and `gpu_used_mib` answer
+    nvidia-smi's memory queries while it still lists `physical_gpus`."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
@@ -147,6 +147,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if gpu_memory is not None:
         (bin_dir / "nvidia-smi").write_text(
             f'#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo {gpu_memory[0]} ;; *memory.total*) echo {gpu_memory[1]}'
+            f" ;; *memory.used*) echo {gpu_used_mib}"
             f" ;; *query-compute-apps*) printf '%s\\n' {allocations} ;; *) printf '%s\\n' "
             + " ".join(map(str, physical_gpus)) + " ;; esac\n")
     else:
@@ -1732,3 +1733,21 @@ def test_glmf_auto_plans_a_wip_slot_with_its_own_planner_and_programs(tmp_path):
     assert ":/opt/cuteafd-plan:ro --entrypoint /opt/cuteafd-plan/cuteafd dev-image plan " in plan
     assert "--workspace-manifest /opt/cuteafd-plan/PROGRAMS.json" in plan
     assert "note: GLM5_FLASH_MEMORY=auto keeps standard" in result.stderr
+
+
+@pytest.mark.parametrize("allocations,used,free_mib", [
+    # The coordinator alone on the GPU: the device's used memory, 142 MiB more than nvidia-smi's per-process
+    # figure (the GPU read 32,149 MiB free idle, total less reserved).
+    (((123, 30626),), 30768, 1383 + 30768),
+    # Another process on the GPU: only what nvidia-smi attributes to this launch's coordinator.
+    (((123, 30626), (456, 100)), 30868, 1383 + 30626),
+])
+def test_glmf_auto_restart_credits_its_coordinator_with_the_device_used_memory_when_alone(
+        tmp_path, allocations, used, free_mib):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nINSTANCE=own\n", physical_gpus=(0,),
+                          gpu_memory=(1383, 32607), gpu_used_mib=used, restart=True, container_pids=(123,),
+                          gpu_allocations=allocations, layout_plan=_glmf_plan_json(2_097_152))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    assert f"--rtx-gib {free_mib / 1024} " in plan
+    assert f"on GPU 0 ({free_mib / 1024} GiB free)" in _glmf_lines(result)[2][0]

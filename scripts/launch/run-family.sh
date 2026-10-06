@@ -167,16 +167,25 @@ bond_args=()
 # The free memory of coordinator GPU $1 in GiB as an admission would see it: nvidia-smi's free MiB,
 # with --restart crediting this launch's own coordinator on it (removed after validation; never
 # another launch's memory), within COORDINATOR_GPU_BUDGET_GIB when set (0 without a total to charge
-# against). Empty when nvidia-smi gives no sample.
+# against). Empty when nvidia-smi gives no sample. While the coordinator is the GPU's only compute
+# process the credit is the device's used memory: nvidia-smi attributes part of a process's device
+# memory to no process (142 MiB of a GLM 5.3 Flash coordinator on an RTX 5090), and idle the device's
+# free memory is its total less the reserved memory alone.
 selected_gpu_free_gib() {
-  local selected="$1" free_mib own_pids own_mib free_gib total_mib
+  local selected="$1" free_mib used_mib own_pids own_mib free_gib total_mib
   free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
   [[ "$free_mib" =~ ^[0-9]+$ ]] || return 0
   if [[ "$restart" == 1 ]]; then
     own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
     if [[ -n "$own_pids" ]]; then
+      used_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
       own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
-        | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
+        | python3 -c 'import csv,sys
+p, used = set(sys.argv[1].split()), sys.argv[2]
+rows = [(r[0].strip(), r[1].strip()) for r in csv.reader(sys.stdin) if len(r) == 2 and r[0].strip()]
+own = sum(int(m) for pid, m in rows if pid in p and m.isdigit())
+alone = all(pid in p for pid, _ in rows)
+print(int(used) if own and alone and used.isdigit() else own)' "$own_pids" "$used_mib" || true)"
       [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
     fi
   fi
