@@ -21,6 +21,14 @@ typedef struct {
   uint32_t abi_version, max_tokens, output_width, reserved;
   uint64_t weight_bytes, patch, merger_norm, merger_fc1, merger_fc2, inv_freq;
   cuteafd_vision_block blocks[CUTEAFD_VISION_DEPTH];
+  /* ABI 2 only: reserved selects Qwen=2 or GLM Flash=3. ABI 1's prefix
+   * and numerics are unchanged; native code must not read this suffix. */
+  uint32_t hidden, depth, heads, kv_heads, head_dim, intermediate, patch_size, merger_width;
+  float norm_eps;
+  uint32_t geometry_reserved;
+  uint64_t patch_bias, pos_embed, merger_norm_bias, merger_fc1_bias, merger_fc2_bias;
+  uint64_t merger_extra[8];
+  uint64_t norm1_bias[28], norm2_bias[28], q_norm[28], k_norm[28];
 } cuteafd_vision_spec;
 
 typedef struct {
