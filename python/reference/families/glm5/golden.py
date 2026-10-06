@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import time
 from pathlib import Path
 
@@ -148,8 +149,42 @@ class Weights:
         self.files: dict[str, object] = {}
         self.read_bytes = 0
         self.read_seconds = 0.0
+        self.staged = {}
+
+    def stage_layer(self, prefix: str, *, minimum_mbps=200):
+        """Clone complete tensors in physical shard-offset order, never table rows."""
+        if self.staged:
+            raise ValueError("previous GLM layer staging has not been retired")
+        names = [name for name in self.index if name.startswith(prefix)]
+        if not names:
+            raise ValueError(f"no tensors for {prefix}")
+        started, before = time.monotonic(), self.read_bytes
+        for shard in sorted({self.index[name] for name in names}):
+            # Headers are small; tensor payloads are touched once in offset order.
+            with (self.snapshot / shard).open("rb") as stream:
+                length = struct.unpack("<Q", stream.read(8))[0]
+                header = json.loads(stream.read(length))
+            ordered = sorted((name for name in names if self.index[name] == shard),
+                             key=lambda name: header[name]["data_offsets"][0])
+            with safe_open(str(self.snapshot / shard), framework="pt", device="cpu") as handle:
+                for name in ordered:
+                    tensor_start = time.monotonic()
+                    value = handle.get_tensor(name).clone()
+                    self.staged[name] = value
+                    self.read_bytes += value.numel() * value.element_size()
+                    self.read_seconds += time.monotonic() - tensor_start
+        elapsed = time.monotonic() - started
+        rate = (self.read_bytes - before) / 1e6 / max(elapsed, 1e-9)
+        print(f"checkpoint sequential reads {prefix}: bytes={self.read_bytes-before} "
+              f"elapsed={elapsed:.3f}s MB/s={rate:.3f}", flush=True)
+        if rate < minimum_mbps:
+            self.staged.clear()
+            release_checkpoint(torch.cuda, self)
+            raise RuntimeError(f"GLM archive read rate below{minimum_mbps}MB/s: {rate:.3f}; stop, do not crawl")
 
     def raw(self, name: str) -> torch.Tensor:
+        if name in self.staged:
+            return self.staged.pop(name)
         started = time.monotonic()
         shard = self.index[name]
         if shard not in self.files:
@@ -249,13 +284,16 @@ def run_windows(a, config, ref, weights):
         rotary = ref.GlmMoeDsaRotaryEmbedding(config=config).cuda()
         for layer_id in range(first_layer, config.num_hidden_layers):
             start = time.time()
+            read_started, read_before = time.monotonic(), weights.read_bytes
+            weights.stage_layer(f"model.layers.{layer_id}.")
             torch.set_default_dtype(torch.bfloat16)
             with torch.device("meta"):
                 layer = ref.GlmMoeDsaDecoderLayer(config, layer_id)
             torch.set_default_dtype(torch.float32)
             layer = layer.to_empty(device="cuda")
-            read_started, read_before = time.monotonic(), weights.read_bytes
             load_layer(layer, weights, f"model.layers.{layer_id}.")
+            if weights.staged:
+                raise ValueError(f"unconsumed layer staging: {sorted(weights.staged)[:8]}")
             log_checkpoint_reads(f"layer {layer_id} load", (weights,), read_before, read_started)
             layer.eval()
             for i, w in enumerate(manifest["windows"]):

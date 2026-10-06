@@ -813,7 +813,7 @@ def test_glm_window_dsa_handoff_is_per_window(tmp_path, family):
         def to(self, _dtype): return self
         def __call__(self, h): return h
 
-    weights = SimpleNamespace(files={}, read_bytes=0, get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
+    weights = SimpleNamespace(files={}, read_bytes=0, stage_layer=lambda *_args: None, staged={}, get=lambda name: Tensor(np.ones((16, 1)) if "lm_head" in name else [1.0]))
     torch = SimpleNamespace(inference_mode=nullcontext, device=lambda _name: nullcontext(),
         bfloat16="bf16", float32="f32", bool="bool", set_default_dtype=lambda _dtype: None,
         tensor=lambda data, **_kwargs: Tensor(data), arange=lambda n, **_kwargs: Tensor(np.arange(n)),
@@ -1058,3 +1058,51 @@ def test_glm5_timing_pilot_cannot_publish_golden_evidence():
     assert isinstance(stop.body[-1], ast.Return)
     assert "'qualification': False" in ast.unparse(stop)
     assert "finish_golden" not in ast.unparse(stop)
+
+
+def test_glm5_layer_reads_are_physical_order_and_stop_on_slow_archive():
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    weights = next(n for n in tree.body if getattr(n, "name", None) == "Weights")
+    stage = ast.unparse(next(n for n in weights.body if getattr(n, "name", None) == "stage_layer"))
+    assert "data_offsets" in stage and "handle.get_tensor(name).clone()" in stage
+    assert "minimum_mbps=200" in stage and "rate < minimum_mbps" in stage
+    assert "self.staged.clear()" in stage and "stop, do not crawl" in stage
+    run = ast.unparse(next(n for n in tree.body if getattr(n, "name", None) == "run_windows"))
+    assert run.index("weights.stage_layer") < run.index("GlmMoeDsaDecoderLayer")
+
+
+@pytest.mark.parametrize("slow", [False, True])
+def test_glm5_sequential_layer_staging_consumes_whole_tensors(tmp_path, slow):
+    import struct
+    tree = ast.parse((ROOT / "python/reference/families/glm5/golden.py").read_text())
+    cls = next(n for n in tree.body if getattr(n, "name", None) == "Weights")
+    names = ["model.layers.0.z", "model.layers.0.a"]
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(names, "shard")}))
+    header = json.dumps({names[0]: {"data_offsets": [0, 10]}, names[1]: {"data_offsets": [10, 20]}}).encode()
+    (tmp_path / "shard").write_bytes(struct.pack("<Q", len(header)) + header)
+    order = []
+    class Tensor:
+        def clone(self): return self
+        def numel(self): return 300_000_000
+        def element_size(self): return 2
+    class Handle:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def get_tensor(self, name): order.append(name); return Tensor()
+    now = iter(range(100)) if not slow else iter(range(0, 100000, 1000))
+    scope = dict(Path=pathlib.Path, json=json, struct=struct,
+        time=SimpleNamespace(monotonic=lambda: next(now)),
+        torch=SimpleNamespace(Tensor=Tensor, cuda=None), safe_open=lambda *_args, **_kw: Handle(),
+        release_checkpoint=lambda *_args: None)
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "glm5-staging", "exec"), scope)
+    weights = scope["Weights"](tmp_path)
+    if slow:
+        with pytest.raises(RuntimeError, match="stop, do not crawl"):
+            weights.stage_layer("model.layers.0.")
+        assert weights.staged == {}
+    else:
+        weights.stage_layer("model.layers.0.")
+        assert order == names and weights.read_bytes == 1_200_000_000
+        before = weights.read_bytes
+        assert isinstance(weights.raw(names[0]), Tensor)
+        assert weights.read_bytes == before and names[0] not in weights.staged
