@@ -1,10 +1,14 @@
 """Host-only media identity, fixture and probe-feature contracts."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
+import tempfile
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -73,6 +77,54 @@ def require_media_flag(manifest, enabled, family):
     return present
 
 
+@contextmanager
+def _feature_lock(root):
+    root.mkdir(parents=True, exist_ok=True)
+    # A persistent lock inode serializes all feature pairs and indices in a set.
+    with (root / ".features.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _publish_locked(contents):
+    """Validate every existing member before publishing any new member."""
+    missing = []
+    for path, data in contents:
+        if path.exists():
+            if path.read_bytes() != data:
+                raise ValueError("feature identity reused with different bytes or metadata; feature index is immutable")
+        else:
+            missing.append((path, data))
+    for path, data in missing:
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".feature-", delete=False) as output:
+                temporary = Path(output.name)
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            # Readers see complete bytes; the held lock prevents writer replacement.
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    if missing:
+        directory = os.open(missing[0][0].parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def publish_immutable(path: Path, content: bytes):
+    """Publish complete immutable bytes under the shared feature-set writer lock."""
+    with _feature_lock(path.parent):
+        _publish_locked([(path, content)])
+
+
 def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity: dict):
     """Write immutable row-major BF16 probe rows; values are CPU uint16 bits."""
     import numpy as np
@@ -91,13 +143,7 @@ def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity
             "sha256": hashlib.sha256(data).hexdigest(), "tower_dtype": tower_dtype,
             "fixture_sha256": span["fixture"]["sha256"], "snapshot_identity": identity}
     encoded = json.dumps(meta, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
-    root.mkdir(parents=True, exist_ok=True)
-    for suffix, content in ((".bf16", data), (".json", encoded)):
-        path = root / (span["key"] + suffix)
-        if path.exists():
-            if path.read_bytes() != content:
-                raise ValueError("feature identity reused with different bytes or metadata")
-        else:
-            with path.open("xb") as output:
-                output.write(content)
+    with _feature_lock(root):
+        _publish_locked([(root / (span["key"] + ".bf16"), data),
+                         (root / (span["key"] + ".json"), encoded)])
     return meta

@@ -1,6 +1,7 @@
 """Media fidelity contracts: CPU-only, no checkpoint or GPU needed."""
 import copy
 import hashlib
+import multiprocessing
 import pathlib
 import sys
 
@@ -9,7 +10,7 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_media import read_fixture, require_media_flag, validate_media, write_features
+from fidelity_media import publish_immutable, read_fixture, require_media_flag, validate_media, write_features
 
 
 def load_script(name):
@@ -170,6 +171,74 @@ def test_feature_writer_binds_immutable_bytes(tmp_path):
         write_features(tmp_path, s, values + 1, tower_dtype="bf16", identity={"snapshot_revision": "pinned"})
     with pytest.raises(ValueError, match="non-finite"):
         write_features(tmp_path, s, np.full((4, 8), 0x7f80, dtype=np.uint16), tower_dtype="bf16", identity={})
+
+
+def test_immutable_publish_preserves_existing_inode_and_complete_bytes(tmp_path):
+    path = tmp_path / "features.json"
+    content = b'{"features":["first"]}\n'
+    publish_immutable(path, content)
+    before = path.stat()
+    publish_immutable(path, content)
+    assert path.stat().st_ino == before.st_ino and path.stat().st_mtime_ns == before.st_mtime_ns
+    with pytest.raises(ValueError, match="immutable"):
+        publish_immutable(path, b"different")
+    assert path.read_bytes() == content and not list(tmp_path.glob(".feature-*"))
+
+
+def _feature_racing_writer(root, barrier, results, kind, variant):
+    try:
+        barrier.wait(timeout=10)
+        if kind == "index":
+            publish_immutable(root / "features.json", b'{"set":' + str(variant).encode() + b'}\n')
+        else:
+            write_features(root, span(), np.full((4, 8), 0x3f80 + variant, dtype=np.uint16),
+                           tower_dtype="bf16", identity={"snapshot_revision": "pinned"})
+        results.put((variant, True))
+    except ValueError:
+        results.put((variant, False))
+
+
+@pytest.mark.parametrize("kind,equal", [("index", False), ("index", True), ("rows", False), ("rows", True)])
+def test_feature_writers_race_without_replacing_identity(tmp_path, kind, equal):
+    import json
+    context = multiprocessing.get_context("spawn")
+    barrier, results = context.Barrier(2), context.Queue()
+    variants = [0, 0 if equal else 1]
+    children = [context.Process(target=_feature_racing_writer, args=(tmp_path, barrier, results, kind, v))
+                for v in variants]
+    try:
+        for child in children:
+            child.start()
+        outcomes = [results.get(timeout=15) for _ in children]
+        for child in children:
+            child.join(timeout=15)
+            assert child.exitcode == 0
+    finally:
+        for child in children:
+            if child.is_alive():
+                child.terminate()
+                child.join()
+        results.close()
+        results.join_thread()
+    assert sum(success for _, success in outcomes) == (2 if equal else 1)
+    winner = next(v for v, success in outcomes if success)
+    if kind == "index":
+        assert json.loads((tmp_path / "features.json").read_text()) == {"set": winner}
+    else:
+        data = (tmp_path / (span()["key"] + ".bf16")).read_bytes()
+        meta = json.loads((tmp_path / (span()["key"] + ".json")).read_text())
+        assert np.frombuffer(data, dtype="<u2").tolist() == [0x3f80 + winner] * 32
+        assert meta["sha256"] == hashlib.sha256(data).hexdigest()
+    assert not list(tmp_path.glob(".feature-*"))
+
+
+def test_feature_pair_conflict_does_not_publish_other_member(tmp_path):
+    key = span()["key"]
+    (tmp_path / (key + ".json")).write_bytes(b"conflicting metadata")
+    with pytest.raises(ValueError, match="identity reused"):
+        write_features(tmp_path, span(), np.full((4, 8), 0x3f80, dtype=np.uint16),
+                       tower_dtype="bf16", identity={})
+    assert not (tmp_path / (key + ".bf16")).exists()
 
 
 def test_fixture_hash_and_family_fail_closed(tmp_path):

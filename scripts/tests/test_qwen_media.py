@@ -68,6 +68,7 @@ def test_snapshot_identity_hashes_actual_modeling(tmp_path, monkeypatch):
 
 
 def test_processor_uses_official_pil_size_and_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "official_reference", lambda: None)
     module = "transformers.models.qwen2_vl.image_processing_pil_qwen2_vl"
     monkeypatch.setitem(sys.modules, module, types.SimpleNamespace(Qwen2VLImageProcessorPil=lambda **kw: kw))
     (tmp_path / "preprocessor_config.json").write_text(json.dumps({
@@ -239,6 +240,87 @@ def test_feature_export_abi_index_and_probe_suppression(tmp_path, monkeypatch):
     panel["windows"].append(bad)
     with pytest.raises(ValueError, match="different fixtures/grids"):
         media.window_features(args, panel)
+
+
+def test_imported_processor_provenance_fails_closed(tmp_path, monkeypatch):
+    root = tmp_path / "src/transformers"
+    model_path = root / "models/qwen4_exp/modeling_qwen4_exp.py"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"modeling")
+    source = ROOT / "third_party/transformers/src/transformers"
+    if not source.exists():
+        pytest.skip("initialize pinned Transformers for provenance contract")
+    modules = {}
+    for name in media.PROCESSOR_SOURCES:
+        path = root / (name.replace(".", "/") + ".py")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((source / path.relative_to(root)).read_bytes())
+        modules["transformers." + name] = types.SimpleNamespace(__file__=str(path))
+    copied = root / "models/qwen2_vl/image_processing_qwen2_vl.py"
+    copied.write_bytes((source / copied.relative_to(root)).read_bytes())
+    monkeypatch.setattr(media.importlib, "import_module", lambda name: modules[name])
+    revision, changes = media.TRANSFORMERS_REVISION, ""
+    monkeypatch.setattr(media.subprocess, "check_output", lambda args, **kw:
+                        revision if args[-1] == "HEAD" else changes)
+    ref = types.SimpleNamespace(__file__=str(model_path))
+    media.verify_sources(ref)
+    revision = "wrong"
+    with pytest.raises(ValueError, match="clean pinned"):
+        media.verify_sources(ref)
+    revision, changes = media.TRANSFORMERS_REVISION, " M src/transformers/image_utils.py"
+    with pytest.raises(ValueError, match="clean pinned"):
+        media.verify_sources(ref)
+    changes = ""
+    path = root / "image_utils.py"
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n# changed")
+    with pytest.raises(ValueError, match="pinned imported image_utils"):
+        media.verify_sources(ref)
+    path.write_bytes(original)
+    shadow = tmp_path / "shadow.py"
+    shadow.write_bytes(original)
+    modules["transformers.image_utils"].__file__ = str(shadow)
+    with pytest.raises(ValueError, match="pinned imported image_utils"):
+        media.verify_sources(ref)
+
+
+@pytest.mark.parametrize("orientation,side", [(2, (64, 32)), (3, (64, 32)), (4, (64, 32)),
+                                               (6, (32, 32)), (8, (32, 32))])
+def test_exif_pixels_transpose_even_when_grid_is_unchanged(tmp_path, monkeypatch, orientation, side):
+    import io
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from PIL import Image
+    media.official_reference()
+    width, height = side
+    pixels = np.arange(width * height * 3, dtype=np.uint32).reshape(height, width, 3).astype(np.uint8)
+    image = Image.fromarray(pixels)
+    exif = Image.Exif()
+    exif[274] = orientation
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG", exif=exif)
+    path = tmp_path / "exif.png"
+    path.write_bytes(encoded.getvalue())
+    transforms = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
+                  4: Image.Transpose.FLIP_TOP_BOTTOM, 6: Image.Transpose.ROTATE_270,
+                  8: Image.Transpose.ROTATE_90}
+    expected = np.asarray(image.transpose(transforms[orientation]))
+    assert expected.shape == pixels.shape and not np.array_equal(expected, pixels)
+    captured = []
+    grid = [1, height // 16, width // 16]
+    span = {"grid": grid, "len": grid[1] * grid[2] // 4,
+            "fixture": {"path": "exif.png", "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+
+    def processor(**kwargs):
+        captured.append(np.asarray(kwargs["images"]).copy())
+        assert kwargs["images"].mode == "RGB" and kwargs["images"].getexif().get(274) is None
+        return {"pixel_values": torch.zeros(1, 8), "image_grid_thw": torch.tensor([grid])}
+
+    model = lambda *args, **kwargs: types.SimpleNamespace(pooler_output=torch.zeros(
+        span["len"], media.WIDTH, dtype=torch.bfloat16))
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    media.encode_span(model, processor, tmp_path, span)
+    assert np.array_equal(captured[0], expected)
 
 
 def test_real_cpu_torch_official_positions_and_hc(tmp_path):

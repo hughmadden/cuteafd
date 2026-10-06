@@ -3,17 +3,54 @@ from __future__ import annotations
 
 import hashlib
 import io
+import importlib
 import json
 from pathlib import Path
+import subprocess
 import types
 
-from fidelity_media import read_fixture, validate_media, write_features
+from fidelity_media import publish_immutable, read_fixture, validate_media, write_features
 from fidelity_windows import canonical
 
 TRANSFORMERS_REVISION = "62d7ebd7de4938e072b7aaeb881593b79dc56835"
 MODELING_SHA256 = "2a44aeadb215acbb5c75939fcc97e9f14bccff5a51c232826427594993f6a760"
 IMAGE_ID, START_ID, END_ID = 248056, 248053, 248054
 WIDTH = 2560
+PROCESSOR_SOURCES = {
+    "models.qwen2_vl.image_processing_pil_qwen2_vl": "f7403c897abd3c0b3ed678a3a208233cb4ab21fc030d45b8e16e6153de6a4e87",
+    "image_utils": "24e1b8f65481a87f2d294473b238fe7ac3a5dbdf8fe64c4efac72a3616c66437",
+    "image_transforms": "260fd1b2d3b23811f6be81da20777105d522c0213030580e6cf717a34492ef3b",
+    "image_processing_backends": "5f3176903638125ee01af36e8c74741a7bab19581f3c13349a775b093cb1bbb0",
+    "image_processing_utils": "3328a0e2b38e272e824cad64a50d3e84206dab13d31b96104afa6459e149f7c1",
+    "image_processing_base": "c37174598b741995c505ff315c1562e8a7e9e0a216cad53a56615e103af0327a",
+    "processing_utils": "53ffe4236eca38eea4142315c0b98bfebc18859812df620b136bac928723d6b5",
+    "models.qwen4_exp.configuration_qwen4_exp": "b78132d8cd935437208ee281fa4569b771a63fcb58ebffe84f3e62f5b86235ca",
+}
+
+
+def verify_sources(ref):
+    """Check actual imports and their clean checkout before claiming a full revision."""
+    source = Path(ref.__file__).resolve()
+    root = source.parents[2]
+    checkout = root.parent.parent
+    try:
+        revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True, timeout=10).strip()
+        changes = subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain",
+                                           "--untracked-files=no"], text=True, timeout=10)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise ValueError("Qwen media requires the pinned Transformers source checkout") from error
+    if revision != TRANSFORMERS_REVISION or changes:
+        raise ValueError("Qwen media requires the clean pinned Transformers source checkout")
+    for name, expected in PROCESSOR_SOURCES.items():
+        module = importlib.import_module("transformers." + name)
+        actual = Path(module.__file__).resolve()
+        if actual != root / (name.replace(".", "/") + ".py") or hashlib.sha256(actual.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Qwen media requires the pinned imported {name} source")
+    # The PIL smart-resize implementation is copied from the Torchvision variant;
+    # check its source too without importing the optional Torchvision dependency.
+    copied = root / "models/qwen2_vl/image_processing_qwen2_vl.py"
+    if hashlib.sha256(copied.read_bytes()).hexdigest() != "4e1da45f9e7e157ca08aa88243fcc1495ea6a333e40e0c5035ef17ef2747a97d":
+        raise ValueError("Qwen media requires the pinned Qwen image processor source")
 
 
 def official_reference():
@@ -21,6 +58,7 @@ def official_reference():
     digest = hashlib.sha256(Path(ref.__file__).read_bytes()).hexdigest()
     if digest != MODELING_SHA256:
         raise ValueError("Qwen media requires the pinned modeling_qwen4_exp.py")
+    verify_sources(ref)
     return ref
 
 
@@ -129,6 +167,7 @@ def load_tower(snapshot):
 
 
 def processor(snapshot):
+    official_reference()
     from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
     config = json.loads((snapshot / "preprocessor_config.json").read_text())
     config.pop("image_processor_type", None)
@@ -144,10 +183,10 @@ def encode_span(model, image_processor, root, span):
     import torch
     import torch.nn.functional as F
     from PIL import Image
-    with Image.open(io.BytesIO(read_fixture(root, span))) as image:
-        if image.mode == "RGBA":
-            image = image.convert("RGB")  # WP1 drops alpha instead of compositing.
-        prepared = image_processor(images=image, return_tensors="pt")
+    from transformers.image_utils import load_image
+    with Image.open(io.BytesIO(read_fixture(root, span))) as source:
+        # Official load_image applies EXIF orientation, then drops alpha to RGB.
+        prepared = image_processor(images=load_image(source), return_tensors="pt")
     if prepared["image_grid_thw"].tolist() != [span["grid"]]:
         raise ValueError("official Qwen PIL processor grid differs from engine span")
     invariant = sys.modules.get("shape_invariant")
@@ -197,7 +236,5 @@ def window_features(args, manifest):
                  "set_sha256": manifest["set_sha256"], "features": [entry["key"] for entry in entries]}
         path = args.media_features_out / "features.json"
         encoded = canonical(index) + b"\n"
-        if path.exists() and path.read_bytes() != encoded:
-            raise ValueError("feature index is immutable")
-        path.write_bytes(encoded)
+        publish_immutable(path, encoded)
     return features, identity
