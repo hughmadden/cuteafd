@@ -38,19 +38,27 @@ impl RemoteVision {
 
 pub(super) struct ReadyVision {
     pub encoder: Encoder,
-    pub preparer: Arc<MediaPreparer>,
+    pub preparer: Option<Arc<MediaPreparer>>,
+    pub audio_preparer: Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>,
     pub cache_bytes: usize,
 }
 impl ReadyVision {
-    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode, prefix: &super::serve::PrefixArgs,
-        cache_bytes: Option<u64>, remote: Option<RemoteVision>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
-        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
+    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
+        audio_mode: MediaMode, prefix: &super::serve::PrefixArgs, cache_bytes: Option<u64>,
+        remote: Option<RemoteVision>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
+        let config = vision_config(mode, &args.snapshot)?;
+        let audio_on = audio_mode != MediaMode::Off;
+        anyhow::ensure!(!audio_on || (remote.is_none() && !matches!(mode, MediaMode::Spark(_))
+            && !matches!(audio_mode, MediaMode::Spark(_))),
+            "remote audio placement requires the audio encoder peer transport; use --audio rtx with local vision or --vision off");
+        if config.is_none() && !audio_on { return Ok((None, prefix.clone())); }
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Mimo)?;
-        // Header-only on the coordinator: remote tower payload stays on its Spark.
-        let spec = crate::shared::vision::TowerSpec::mimo(&args.snapshot, 4096)?;
-        let width = config["hidden_size"].as_u64().context("MiMo hidden_size")? as usize;
+        let model_config: serde_json::Value = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
+        let width = model_config["hidden_size"].as_u64().context("MiMo hidden_size")? as usize;
+        let spec = config.as_ref().map(|_| crate::shared::vision::TowerSpec::mimo(&args.snapshot, 4096)).transpose()?;
         let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
         if let Some(remote) = remote {
+            let spec = spec.context("remote vision requires checkpoint vision tower")?;
             anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
                 "--vision-peers requires Spark/auto vision placement");
             let id = spec.encoder_id(&remote.revision, 121);
@@ -64,41 +72,64 @@ impl ReadyVision {
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
                 std::time::Duration::from_secs(60))?;
             tracing::info!(cache_bytes, "MiMo remote vision encoder ready");
-            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
+            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer: Some(preparer), audio_preparer: None, cache_bytes }), prefix));
         }
-        let gpu = match mode {
-            MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
+        let local_mode = if spec.is_none() { audio_mode } else { mode };
+        let gpu = match local_mode {
+            MediaMode::Rtx(gpu) => gpu.map(i32::try_from).transpose()?.unwrap_or(args.device),
             MediaMode::Auto => {
                 anyhow::ensure!(args.peers.is_none() || args.local_experts,
                     "auto vision with Spark experts requires planner-resolved --vision-peers");
                 args.device
             },
             MediaMode::Spark(_) => anyhow::bail!("Spark vision placement requires --vision-peers, --encoder-plan-hash and --encoder-revision"),
-            MediaMode::Off => unreachable!(),
+            MediaMode::Off => args.device,
         };
+        if let MediaMode::Rtx(Some(audio_gpu)) = audio_mode {
+            anyhow::ensure!(audio_gpu == gpu as usize,
+                "local image/audio owner requires the same device; separate placement requires audio peers");
+        }
         let info = library.cuda_device_info(gpu)?;
         let sm = u32::try_from(info.compute_capability_major * 10 + info.compute_capability_minor)?;
+        anyhow::ensure!(!audio_on || sm == 120, "MiMo audio is RTX SM120-only; Spark audio is deferred");
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;
-        let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
-        anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "MiMo tower capacity is 4096 tokens per image");
-        let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
+        let preparer = spec.as_ref().map(|spec| MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)
+            .map(Arc::new)).transpose()?;
+        let vision_bytes = spec.as_ref().map(|spec| cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)
+            .map(|ledger| ledger.total_bytes())).transpose()?.unwrap_or(0);
+        let audio = if audio_on {
+            let spec = crate::shared::vision::audio::AudioTowerSpec::from_snapshot(&args.snapshot,
+                cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+            anyhow::ensure!(spec.plan().output_width() == width, "MiMo audio tower/LM output width mismatch");
+            let backend = cuteafd_ffi::audio::NativeAudio::backend(&args.native_lib)?;
+            let slots = preparer.as_ref().map(|p| p.slots.clone()).unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(4)));
+            let audio_preparer = Arc::new(cuteafd_api::openai::media::audio::AudioPreparer::new(
+                spec.plan().encoder_id(revision, sm, &backend), slots));
+            let bytes = cuteafd_ffi::audio::NativeAudio::required(&args.native_lib, spec.native())?.total_bytes()?;
+            Some((crate::shared::vision::audio::AudioOwnerConfig { spec, admitted_bytes: bytes }, audio_preparer))
+        } else { None };
+        let audio_bytes = audio.as_ref().map_or(0, |(config, _)| config.admitted_bytes);
         library.cuda_set_device(gpu)?;
-        let admitted = ledger.total_bytes();
         let loaded = (|| -> Result<_> {
-        let (free, total) = library.cuda_memory_info()?;
-        cuteafd_core::serving_capacity::admit_device_reservations(95,
-            cuteafd_core::serving_capacity::DeviceMemory { device: gpu as u32,
-                total_bytes: total as u64, baseline_free_bytes: free as u64 },
-            &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }])?;
-        // Start before LM preflight: its live baseline already includes the admitted tower.
-        Ok(crate::shared::vision::EncoderService::start(spec, args.native_lib.clone(), gpu, admitted)?)
+            let (free, total) = library.cuda_memory_info()?;
+            cuteafd_core::serving_capacity::admit_device_reservations(95,
+                cuteafd_core::serving_capacity::DeviceMemory { device: gpu as u32,
+                    total_bytes: total as u64, baseline_free_bytes: free as u64 },
+                &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: vision_bytes },
+                  cuteafd_core::serving_capacity::MemoryReservation { name: "audio.resident_weights_scratch".into(), bytes: audio_bytes }])?;
+            let (audio_config, audio_preparer) = audio.map_or((None, None), |(config, preparer)| (Some(config), Some(preparer)));
+            let service = match spec {
+                Some(spec) => crate::shared::vision::EncoderService::start_with_audio(spec, args.native_lib.clone(), gpu, vision_bytes, audio_config)?,
+                None => crate::shared::vision::EncoderService::start_audio(args.native_lib.clone(), gpu, audio_config.context("audio owner config")?)?,
+            };
+            Ok((service, audio_preparer))
         })();
         let restored = library.cuda_set_device(args.device);
-        let service = loaded?;
+        let (service, audio_preparer) = loaded?;
         restored?;
-        tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "MiMo resident vision encoder ready");
+        tracing::info!(gpu, vision_bytes, audio_bytes, cache_bytes, sm, "MiMo resident media encoder ready");
         Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
-            preparer, cache_bytes }), prefix))
+            preparer, audio_preparer, cache_bytes }), prefix))
     }
 }
 
@@ -109,10 +140,10 @@ pub(super) enum Encoder {
 }
 impl Encoder {
     pub fn health_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        match self { Self::Remote(client) => Some(client.health_handle()), _ => None }
+        match self { Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()), Self::Off => None }
     }
     pub fn available(&self) -> bool {
-        match self { Self::Remote(client) => client.healthy(), Self::Local(_) => true, Self::Off => false }
+        match self { Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(), Self::Off => false }
     }
 }
 impl cuteafd_engine::media::EncoderClient for Encoder {
@@ -130,6 +161,8 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
 }
 pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
+        cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull =>
+            cuteafd_api::openai::NativeFailure::Unavailable(error.to_string()),
         cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
         error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
     }
@@ -142,8 +175,11 @@ pub(super) struct Prompt {
 }
 pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json::Value,
     vocabulary: usize, hidden: usize, max_context: usize) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)> {
-    let (tokens, spans) = if config.get("vision_config").is_some() {
-        let expander = SpanExpander::from_config(config, vocabulary as u32)?;
+    anyhow::ensure!(job.audio.is_empty() || !job.probe.as_ref().is_some_and(|p| !p.spec.media.is_empty()),
+        "audio cannot be combined with expanded image probes");
+    let (tokens, spans) = if config.get("vision_config").is_some() || config.get("audio_token_id").is_some() {
+        let expander = if config.get("vision_config").is_some() { SpanExpander::from_config(config, vocabulary as u32)? }
+            else { SpanExpander::from_audio_config(config, vocabulary as u32)? };
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
         if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
@@ -165,16 +201,18 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
                 == spans.iter().map(|span| span.len).sum::<usize>(), "unbound probe image placeholders");
             (tokens, spans)
         } else {
-            let expanded = expander.expand(&tokens, &images, max_context)?;
+            let audio = job.audio.iter().map(|clip| clip.as_ref().clone()).collect::<Vec<_>>();
+            let expanded = SpanExpander::expand_media(config, vocabulary as u32, &tokens, &images, &audio, max_context)?;
             (expanded.tokens, expanded.media)
         }
     } else {
-        anyhow::ensure!(job.media.is_empty(), "checkpoint has no vision tower");
+        anyhow::ensure!(job.media.is_empty() && job.audio.is_empty(), "checkpoint has no media tower");
         (tokens, Vec::new())
     };
     if let Some(probe) = &job.probe {
-        anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
-        let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
+        let image_spans = spans.iter().filter(|span| !span.key.is_audio()).collect::<Vec<_>>();
+        anyhow::ensure!(image_spans.len() == job.media.len(), "probe image count differs");
+        let echo = image_spans.into_iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
             cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
                 key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
@@ -183,7 +221,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     }
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
-    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();
+    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden))
+        .chain(job.audio.iter().map(|clip| EncodeJob::audio(clip.key, clip.pcm.clone(), clip.geometry.tokens, hidden))).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
@@ -340,7 +379,7 @@ mod tests {
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images,
+        NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, probe: None }
     }
@@ -351,6 +390,22 @@ mod tests {
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+    }
+    #[test]
+    fn mixed_image_audio_jobs_and_span_identities_remain_in_prompt_order() {
+        let mut cfg = config();
+        cfg["audio_start_token_id"] = 7.into(); cfg["audio_token_id"] = 8.into(); cfg["audio_end_token_id"] = 9.into();
+        let clip = Arc::new(cuteafd_loader::media::audio::prepare_pcm(vec![0.;24000],
+            cuteafd_loader::media::EncoderId([2;32])).unwrap());
+        let mut job = request(vec![image()]); job.audio = vec![clip.clone()];
+        let (prompt, media, jobs) = prepare(job, vec![1,7,8,9,4,5,6,2], &cfg, 32, 4096, 100).unwrap();
+        assert_eq!(prompt.tokens, [1,7,8,8,8,8,8,8,8,9,4,5,5,5,5,6,2]);
+        assert_eq!(media.spans().iter().map(|span| (span.start, span.len)).collect::<Vec<_>>(), [(2,7),(11,4)]);
+        assert_eq!(media.spans()[0].key, clip.key.into());
+        assert_eq!(media.spans()[1].key, image().key.into());
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| job.key == clip.key.into() && job.tokens == 7));
+        assert!(jobs.iter().any(|job| job.key == image().key.into() && job.tokens == 4));
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};

@@ -80,6 +80,8 @@ pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
+    pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
+    pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
     pub capabilities: MediaCapabilities,
     pub id: String,
@@ -94,7 +96,8 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None }
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None,
+            audio_preparer: None, audio_health: None }
     }
 
     /// Install only after the matching encoder is loaded and ready. A processor
@@ -102,6 +105,13 @@ impl ModelProfile {
     pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
+        self
+    }
+
+    pub fn with_loaded_audio(mut self, preparer: Arc<media::audio::AudioPreparer>, health: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.audio_preparer = Some(preparer);
+        self.audio_health = Some(health);
+        self.capabilities.audio = true;
         self
     }
 
@@ -172,6 +182,7 @@ pub struct NativeRequest {
     pub images: Vec<cuteafd_loader::V41Image>,
     /// Generic-family media, in template order. V4.1 only uses `images`.
     pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
+    pub audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
     pub max_tokens: usize,
     /// Resolved target-sampling parameters. `TargetSamplingParams::greedy()`
     /// keeps the legacy device-argmax route; anything else selects from the
@@ -238,7 +249,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/models", get(models))
         .route("/v1/stats", get(stats_route))
         .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
+        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
         .with_state(NativeState { queue, limits, images, stats, admission, profile: Arc::new(profile) })
         .merge(console_routes)
 }
@@ -263,13 +274,15 @@ async fn models(State(state): State<NativeState>) -> Json<Value> {
 }
 async fn health(State(state): State<NativeState>) -> Response {
     let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));
-    let status = if state.queue.is_closed() || vision == Some(false) {
+    let audio = state.profile.audio_health.as_ref().map(|h| h.load(Ordering::Acquire));
+    let status = if state.queue.is_closed() || vision == Some(false) || audio == Some(false) {
         StatusCode::SERVICE_UNAVAILABLE
     } else { StatusCode::OK };
-    match vision {
-        Some(healthy) => (status, Json(json!({"vision": if healthy { "ready" } else { "failed" }}))).into_response(),
-        None => status.into_response(),
-    }
+    if vision.is_none() && audio.is_none() { return status.into_response(); }
+    let mut readiness = serde_json::Map::new();
+    if let Some(healthy) = vision { readiness.insert("vision".into(), json!(if healthy { "ready" } else { "failed" })); }
+    if let Some(healthy) = audio { readiness.insert("audio".into(), json!(if healthy { "ready" } else { "failed" })); }
+    (status, Json(Value::Object(readiness))).into_response()
 }
 fn error_body(message: impl ToString) -> Value {
     // Bound upstream parse/validation details before they reach the response
@@ -405,6 +418,16 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
         }
     }
+    let audio_sources = if state.profile.capabilities.audio {
+        if state.profile.audio_preparer.is_none() { return error(StatusCode::SERVICE_UNAVAILABLE, "audio processor unavailable"); }
+        match media::audio::take_audio_sources(&mut body) {
+            Ok(sources) => sources,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        }
+    } else { Vec::new() };
+    if !audio_sources.is_empty() && state.profile.audio_health.as_ref().is_none_or(|h| !h.load(Ordering::Acquire)) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "audio encoder unavailable");
+    }
     let media_sources = match &state.profile.media_preparer {
         Some(preparer) => match media::extract_image_sources(&body, preparer.limits.images) {
             Ok(sources) => sources,
@@ -511,6 +534,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         },
         _ => None,
     };
+    if !audio_sources.is_empty() {
+        if glm_request.is_none() { return error(StatusCode::BAD_REQUEST, "audio requires a checkpoint chat template"); }
+        media::audio::strip_adapter_audio(&mut body);
+    }
     let mut parsed: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -682,7 +709,24 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
         }
     };
+    let audio = if audio_sources.is_empty() { Vec::new() } else {
+        let preparer = state.profile.audio_preparer.as_ref().expect("sources require audio preparer").clone();
+        let slot = match preparer.slots.clone().acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "media preparation is closed"),
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let sources = audio_sources.iter().map(|(data, format)| media::audio::AudioSource { data, format: *format }).collect::<Vec<_>>();
+            preparer.prepare(&sources)
+        }).await {
+            Ok(Ok(prepared)) => prepared.clips,
+            Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    };
     let image_tokens: usize = media.iter().map(|image| image.tokens).sum();
+    let audio_tokens: usize = audio.iter().map(|clip| clip.geometry.tokens).sum();
     // Unbounded on purpose: inference threads send without ever blocking, so a
     // client that stops reading cannot stall the shared scheduler. A request's
     // backlog is bounded by its own max_tokens.
@@ -692,6 +736,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let prompt = if prepared.is_empty() { prompt }
         else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
     let job = NativeRequest {
+        audio,
         media,
         prompt,
         constraint,
@@ -774,7 +819,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 match chunk {
                     Ok(chunk) => {
                         let mut value = serde_json::to_value(&chunk).unwrap();
-                        add_image_usage(&mut value, image_tokens);
+                        add_media_usage(&mut value, image_tokens, audio_tokens);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -827,17 +872,21 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Some(message) = failure.lock().unwrap().clone() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
-    if image_tokens == 0 { return Json(response).into_response(); }
+    if image_tokens == 0 && audio_tokens == 0 { return Json(response).into_response(); }
     let mut value = serde_json::to_value(response).expect("chat response serializes");
-    add_image_usage(&mut value, image_tokens);
+    add_media_usage(&mut value, image_tokens, audio_tokens);
     Json(value).into_response()
 }
 
-fn add_image_usage(response: &mut Value, image_tokens: usize) {
-    if image_tokens == 0 { return; }
+fn add_media_usage(response: &mut Value, image_tokens: usize, audio_tokens: usize) {
+    if image_tokens == 0 && audio_tokens == 0 { return; }
     if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
         let details = usage.entry("prompt_tokens_details").or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() { details.insert("image_tokens".into(), json!(image_tokens)); }
+        if let Some(details) = details.as_object_mut() {
+            // Keep image-only responses unchanged; add only present modalities.
+            if image_tokens > 0 { details.insert("image_tokens".into(), json!(image_tokens)); }
+            if audio_tokens > 0 { details.insert("audio_tokens".into(), json!(audio_tokens)); }
+        }
     }
 }
 
@@ -900,6 +949,65 @@ mod tests {
     use tower::ServiceExt;
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
+    }
+    #[tokio::test]
+    async fn audio_request_prepares_pcm_without_payload_in_prompt_and_fails_closed() {
+        use base64::Engine;
+        let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/2479e2d0029eca9a34cc7e7f55a121925f81908e");
+        if !snapshot.exists() { return; }
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF"); wav.extend(48036u32.to_le_bytes()); wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes()); wav.extend(1u16.to_le_bytes()); wav.extend(1u16.to_le_bytes());
+        wav.extend(24000u32.to_le_bytes()); wav.extend(48000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes()); wav.extend(16u16.to_le_bytes()); wav.extend(b"data");
+        wav.extend(48000u32.to_le_bytes()); wav.resize(48044, 0);
+        let data = base64::engine::general_purpose::STANDARD.encode(wav);
+        for streaming in [false, true] {
+            let health = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let profile = ModelProfile::new("mimo-audio-test", ModelEncoding::Qwen(Arc::new(
+                qwen4::QwenEncoding::from_snapshot(snapshot).unwrap())))
+                .with_loaded_audio(Arc::new(media::audio::AudioPreparer::new(
+                    cuteafd_loader::media::EncoderId([1;32]), Arc::new(tokio::sync::Semaphore::new(1)))), health.clone());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert_eq!(job.audio.len(), 1); assert_eq!(job.audio[0].pcm.len(), 24000);
+                assert_eq!(job.audio[0].geometry.tokens, 7);
+                assert!(job.media.is_empty());
+                assert_eq!(job.prompt, "<|im_start|>user\nbefore<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>after<|im_end|><|im_start|>assistant\n<think></think>");
+                for event in [InferenceChunk::Ready {system_fingerprint:None,
+                    prompt_usage:PromptUsage {prompt_tokens:20,prompt_cache_hit_tokens:0}},
+                    InferenceChunk::Finish {finish_reason:InferenceFinishReason::Stop}] {
+                    job.events.send(Ok(event)).unwrap();
+                }
+                rx
+            });
+            let mut body = json!({"model":"mimo-audio-test","enable_thinking":false,"max_tokens":8,
+                "stream":streaming,"messages":[{"role":"user","content":[
+                    {"type":"text","text":"before"},{"type":"input_audio","input_audio":{"data":data,"format":"wav"}},
+                    {"type":"text","text":"after"}]}]});
+            if streaming { body["stream_options"] = json!({"include_usage":true}); }
+            let request = || axum::http::Request::post("/v1/chat/completions").header("content-type","application/json")
+                .body(Body::from(body.to_string())).unwrap();
+            let response = app.clone().oneshot(request()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            let usage: Value = if streaming {
+                std::str::from_utf8(&bytes).unwrap().split("data: ")
+                    .filter_map(|s| s.trim_end().parse::<Value>().ok()).find(|v| v["choices"] == json!([])).unwrap()
+            } else { serde_json::from_slice(&bytes).unwrap() };
+            assert_eq!(usage["usage"]["prompt_tokens_details"]["audio_tokens"], 7);
+            assert!(usage["usage"]["prompt_tokens_details"]["image_tokens"].is_null());
+            let mut rx = worker.await.unwrap();
+            health.store(false, Ordering::Release);
+            assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(app.oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap()).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {

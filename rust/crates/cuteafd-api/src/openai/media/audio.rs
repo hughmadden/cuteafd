@@ -61,10 +61,49 @@ pub fn extract_audio_sources(body: &Value) -> Result<Vec<AudioSource<'_>>> {
     Ok(sources)
 }
 
+/// Move source payloads out before cloning template context or parsing the text adapter.
+pub fn take_audio_sources(body: &mut Value) -> Result<Vec<(String, AudioFormat)>> {
+    extract_audio_sources(body)?;
+    let mut sources = Vec::new();
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("input_audio") {
+                        let format = part["input_audio"]["format"].as_str().unwrap().parse()?;
+                        let Value::String(data) = part["input_audio"]["data"].take() else { unreachable!("validated audio source") };
+                        sources.push((data, format));
+                        *part = serde_json::json!({"type":"input_audio"});
+                    }
+                }
+            }
+        }
+    }
+    Ok(sources)
+}
+
+/// The recipe validates tools/sampling but does not support audio. The original
+/// checkpoint template context retains the audio markers; the adapter sees no payload.
+pub fn strip_adapter_audio(body: &mut Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("input_audio") {
+                        *part = serde_json::json!({"type":"text","text":""});
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct MemoEntry {
     source: [u8; 32],
     audio: Arc<PreparedAudio>,
 }
+#[derive(Debug)]
 pub struct AudioPreparer {
     encoder: EncoderId,
     pub limits: AudioDecodeLimits,
@@ -210,6 +249,51 @@ mod tests {
         bytes.extend((samples * 2).to_le_bytes());
         bytes.resize(bytes.len() + samples as usize * 2, 0);
         STANDARD.encode(bytes)
+    }
+    #[test]
+    fn official_mimo_template_matches_transformers_processor_audio_span() {
+        use crate::openai::chat::qwen4::{QwenEncoding, QwenPromptOptions};
+        use crate::openai::chat::qwen4::prompt::QwenToolChoice;
+        let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/2479e2d0029eca9a34cc7e7f55a121925f81908e");
+        if !snapshot.exists() { return; }
+        let mut body = json!({"enable_thinking":false,"messages":[{"role":"user","content":[
+            {"type":"text","text":"before"}, {"type":"input_audio","input_audio":{"data":wav_source(24000),"format":"wav"}},
+            {"type":"text","text":"after"}]}]});
+        let owned = take_audio_sources(&mut body).unwrap();
+        let options = QwenPromptOptions { thinking: false, tool_names: vec![],
+            tool_choice: QwenToolChoice::Auto, response_format: None };
+        let rendered = QwenEncoding::from_snapshot(snapshot).unwrap().render(&body, &options).unwrap();
+        // Transformers at 62d7ebd7 + SHA-checked MiMoOmniProcessor (audio_reference.py
+        // SOURCES["vllm"]): one second of zero PCM -> mel [101,128], seven LM rows.
+        assert_eq!(rendered, "<|im_start|>user\nbefore<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>after<|im_end|><|im_start|>assistant\n<think></think>");
+        let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot).unwrap();
+        let tokens = tokenizer.encode_text(&rendered, false).unwrap();
+        assert_eq!(tokens.token_ids, &[151644,872,198,14801,151673,151669,151674,10694,151645,151644,77091,198,151667,151668]);
+        let preparer = AudioPreparer::new(EncoderId([1;32]), Arc::new(tokio::sync::Semaphore::new(1)));
+        let prepared = preparer.prepare(&[AudioSource {data:&owned[0].0,format:owned[0].1}]).unwrap();
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json")).unwrap()).unwrap();
+        let clips = prepared.clips.iter().map(|clip| clip.as_ref().clone()).collect::<Vec<_>>();
+        let expanded = cuteafd_loader::media::SpanExpander::expand_media(&config, 152064,
+            &tokens.token_ids, &[], &clips, 100).unwrap();
+        assert_eq!(expanded.tokens, [151644,872,198,14801,151673,151669,151669,151669,151669,151669,151669,151669,151674,10694,151645,151644,77091,198,151667,151668]);
+        assert_eq!(expanded.media.len(), 1);
+        assert_eq!((expanded.media[0].start, expanded.media[0].len), (5, 7));
+    }
+    #[test]
+    fn owned_sources_remove_payload_only_and_keep_template_order() {
+        let mut body = json!({"messages":[{"content":[{"type":"text","text":"before"},
+            {"type":"input_audio","input_audio":{"data":"YWJj","format":"wav"}},
+            {"type":"image_url","image_url":{"url":"unchanged"}}, {"type":"text","text":"after"}]}]});
+        let sources = take_audio_sources(&mut body).unwrap();
+        assert_eq!(sources, [("YWJj".into(), AudioFormat::Wav)]);
+        assert_eq!(body["messages"][0]["content"][1], json!({"type":"input_audio"}));
+        assert_eq!(body["messages"][0]["content"][2]["image_url"]["url"], "unchanged");
+        let template = body.clone(); strip_adapter_audio(&mut body);
+        assert_eq!(template["messages"][0]["content"][1]["type"], "input_audio");
+        assert_eq!(body["messages"][0]["content"][1], json!({"type":"text","text":""}));
+        let mut text = json!({"messages":[{"content":"byte identical"}]});
+        let original = text.clone(); assert!(take_audio_sources(&mut text).unwrap().is_empty());
+        strip_adapter_audio(&mut text); assert_eq!(text, original);
     }
     #[test]
     fn extraction_validates_schema_format_and_history_count() {
