@@ -1323,12 +1323,14 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
     assert_eq!(auto.encoder.as_ref().unwrap().weights, 898_680_904);
     assert_eq!(auto.encoder.as_ref().unwrap().scratch, 447_778_048);
+    assert_eq!(auto.encoder.as_ref().unwrap().admitted_bytes(), 1_346_458_952);
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, 32768);
     let vision = auto.components.iter().find(|c| c.component == Component::Vision).unwrap();
     assert_eq!(vision.status, Status::Ready);
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     assert_eq!(off.max_image_tokens, Some(1024));
     assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(), 0);
     assert_ne!(auto.encoder_plan_hash, off.encoder_plan_hash);
     cfg["vision_config"]["intermediate_size"] = json!(4305);
     let invalid = snapshot(cfg, &tensors);

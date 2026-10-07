@@ -1074,8 +1074,6 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
 @pytest.mark.parametrize("family_config,serve", [
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
-    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
-      "layer_types": ["linear_attention", "full_attention"]}}, "serve-qwen4"),
 ])
 def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_config, serve):
     model = "zai-org/GLM-5.3-Flash" if serve == "serve-glmf" else "test/model"
@@ -1092,6 +1090,8 @@ def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_conf
     ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
       "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
      "zai-org/GLM-5.3-Flash", "serve-glmf"),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+      "layer_types": ["linear_attention", "full_attention"]}}, "test/qwen", "serve-qwen4"),
 ])
 def test_text_only_qualified_family_auto_default_does_not_start_a_tower(tmp_path, config, model, serve):
     result = _family_launch_result(tmp_path, config, model, "SPECULATOR=off\n")
@@ -1184,8 +1184,8 @@ def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
     assert result.returncode == 2 and "RDMA_BOND_BALANCE must be off, labels or probe" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 @pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"),
-                                        ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
-def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
+                                        ("rtx:0", "rtx"), ("off", "off"), (None, "spark")])
+def test_qwen_encoder_explicit_placement_and_default_auto(tmp_path, mode, kind):
     config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
               "layer_types": ["linear_attention", "full_attention"]}, "vision_config": {"depth": 27}}
     placement = {"kind": kind}
