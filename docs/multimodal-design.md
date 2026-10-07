@@ -235,10 +235,10 @@ Kernels: what exists, what to write (WP‑3 unless noted).
   4. sum of 20 `speech_embeddings` (1280×1024 each);
   5. groups of 4 frames → a 6-layer Qwen2 transformer bidirectional **within each 4-frame group** (θ 640,000);
   6. projection 4096 → 16384 → 4096/6144 (GELU, no bias);
-  7. **6.25 LM tokens per second** (5 min = 1875 tokens).
+  7. **Approximately 6.25 LM tokens per second.** Centered STFT adds the final mel frame: exactly 300 s produces 30,001 mel frames in six segments, 7501 RVQ frames and **1876 LM tokens**. The final incomplete 4-frame group repeats the last code; it is not zero-padded.
   
   Placeholder `<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>` (151673 / 151669 / 151674), 1-D positions, injected like images.
-- **Unknown to resolve first (WP‑10a):** the exact mel extractor (window function, power, log clamp, padding) is not in the snapshot. Locate the official MiMo-Audio-Tokenizer / SGLang processor and pin it before any kernel work.
+- **Resolved WP-10a source pin:** XiaomiMiMo/MiMo-Audio-Tokenizer `b62b59922979bf9f389b373169298a251587653f`, `mimo_audio_tokenizer/utils.py::mel_spectrogram` (Apache-2.0). Corroborated by XiaomiMiMo/MiMo-Audio `691ce54144a6844cc641fd96046a6ba20776c8b0`, SGLang `1c42ad3679fcad7fa4609189763b01ee9f5bd28b` and vLLM `e6fc81bc7892f2f58c0e347a701fc060ceef44bb`; full source digests are in `python/reference/families/mimo_v2/mimo_v26/audio_reference.py`. CPU reference pins torch/torchaudio 2.9.1+cpu and the locked transformers checkout. Periodic Hann, unnormalized one-sided STFT, `center=True` reflection padding of 480 samples per side, no explicit padding, magnitude (`power=1`, not squared power), HTK triangular 128-bin mel filterbank over 0-12 kHz with no area normalization, natural log after clamp at 1e-7. Clips of at most 480 samples after 24 kHz resampling are rejected with 400 (`audio clip too short: N samples, need > 480`), not padded artificially. The patch encoder uses SDPA with `is_causal=False`; its six layers must have no causal mask (the eager Qwen2 path otherwise silently remains causal).
 - **Kernels:** conv1d via im2col GEMM; b12x varlen causal with left window 128; RVQ as a per-codebook distance GEMM (F32) plus argmin with first-index tie-break; the rest reuses the ViT toolkit. Cost ≈ 20 TF for 300 s (≈ 0.13 s PRO 6000, ≈ 0.5 s GB10).
 - **Placement:** the same service and rank as vision. `AUDIO=off` by default until its gates pass; then `auto` follows `VISION` (D4).
 - **Gates:**
