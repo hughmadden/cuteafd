@@ -6,6 +6,7 @@ mod qwen;
 pub mod local;
 pub mod remote;
 pub mod worker;
+pub mod audio;
 
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
@@ -33,6 +34,10 @@ pub enum VisionError {
     Json(#[from] serde_json::Error),
     #[error("vision native: {0}")]
     Native(#[from] cuteafd_ffi::vision::VisionError),
+    #[error("audio tower: {0}")]
+    AudioPlan(#[from] cuteafd_loader::media::audio_tower::AudioTowerError),
+    #[error("audio native: {0}")]
+    AudioNative(#[from] cuteafd_ffi::audio::AudioError),
     #[error("vision encoder queue is full")]
     QueueFull,
     #[error("vision encoder unavailable")]
@@ -419,8 +424,12 @@ impl Drop for EncoderTicket {
         self.cancel();
     }
 }
+enum EncoderJob {
+    Vision(EncodeJob),
+    Audio(audio::AudioEncodeJob),
+}
 struct Work {
-    job: EncodeJob,
+    job: EncoderJob,
     reply: mpsc::SyncSender<Result<Vec<u16>>>,
     cancelled: Arc<AtomicBool>,
 }
@@ -431,7 +440,8 @@ impl Drop for OwnerHealth {
 
 fn terminal_encode_failure(result: &Result<Vec<u16>>) -> bool {
     matches!(result, Err(VisionError::Unavailable | VisionError::Native(
-        cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_))))
+        cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_))
+        | VisionError::AudioNative(cuteafd_ffi::audio::AudioError::Native(_))))
 }
 
 fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>, result: Result<Vec<u16>>) -> bool {
@@ -441,12 +451,13 @@ fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>
     terminal
 }
 
-/// Bounded queue, one image at a time. Every CUDA call stays on this thread.
+/// Bounded shared media queue, one clip/image at a time. CUDA stays on this thread.
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
     queue: Option<mpsc::SyncSender<Work>>,
     owner: Option<JoinHandle<()>>,
     pub ledger: VisionLedger,
+    pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
     healthy: Arc<AtomicBool>,
 }
 impl EncoderService {
@@ -456,63 +467,115 @@ impl EncoderService {
         device: i32,
         admitted_bytes: u64,
     ) -> Result<Self> {
+        Self::start_with_audio(spec, library, device, admitted_bytes, None)
+    }
+    /// Audio is optional: `None` allocates no audio weights, scratch or owner.
+    /// Both towers share this service's one CUDA thread and bounded queue.
+    pub fn start_with_audio(
+        spec: TowerSpec,
+        library: PathBuf,
+        device: i32,
+        admitted_bytes: u64,
+        audio: Option<audio::AudioOwnerConfig>,
+    ) -> Result<Self> {
+        Self::start_media(Some((spec, admitted_bytes)), library, device, audio)
+    }
+    /// Audio-only deployment keeps the same owner/queue, without vision weights.
+    pub fn start_audio(
+        library: PathBuf,
+        device: i32,
+        audio: audio::AudioOwnerConfig,
+    ) -> Result<Self> {
+        Self::start_media(None, library, device, Some(audio))
+    }
+    fn start_media(
+        vision: Option<(TowerSpec, u64)>,
+        library: PathBuf,
+        device: i32,
+        audio: Option<audio::AudioOwnerConfig>,
+    ) -> Result<Self> {
+        // Query and admit every enabled component before either allocates.
+        if let Some((spec, admitted)) = &vision {
+            let required = NativeVision::required(&library, &spec.native)?.total_bytes();
+            if required > *admitted {
+                return Err(VisionError::Unsupported(format!("vision admission needs {required}, got {admitted}")));
+            }
+        }
+        if let Some(config) = &audio {
+            let required = cuteafd_ffi::audio::NativeAudio::required(&library, config.spec.native())?.total_bytes()?;
+            if required > config.admitted_bytes {
+                return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes)));
+            }
+        }
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
         let owner_health = healthy.clone();
         let owner = thread::Builder::new()
-            .name("vision-owner".into())
+            .name("media-owner".into())
             .spawn(move || {
                 let _health = OwnerHealth(owner_health.clone());
-                let mut runtime = match VitRuntime::load(spec, &library, device, admitted_bytes) {
+                let mut runtime = match vision.map(|(spec, admitted)| VitRuntime::load(spec, &library, device, admitted)).transpose() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready.send(Err(error));
                         return;
                     }
                 };
-                let ledger = match runtime.ledger() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = ready.send(Err(e));
+                let ledger = match runtime.as_ref().map(VitRuntime::ledger).transpose() {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
                         return;
                     }
                 };
+                let mut audio_runtime = match audio.map(|config| audio::AudioRuntime::load(config, &library, device)).transpose() {
+                    Ok(runtime) => runtime,
+                    Err(error) => { let _ = ready.send(Err(error)); return; }
+                };
+                let audio_ledger = match audio_runtime.as_ref().map(audio::AudioRuntime::ledger).transpose() {
+                    Ok(ledger) => ledger,
+                    Err(error) => { let _ = ready.send(Err(error)); return; }
+                };
                 owner_health.store(true, Ordering::Release);
-                if ready.send(Ok(ledger)).is_err() {
+                if ready.send(Ok((ledger, audio_ledger))).is_err() {
                     return;
                 }
-                while let Ok(mut work) = jobs.recv() {
+                while let Ok(work) = jobs.recv() {
                     let result = if work.cancelled.load(Ordering::Acquire) {
                         Err(VisionError::Cancelled)
                     } else {
-                        runtime
-                            .encode_into(
-                                &work.job.rgb,
-                                work.job.grid,
-                                &work.job.lut,
-                                &mut work.job.output,
-                            )
-                            .and_then(|()| {
-                                if work.cancelled.load(Ordering::Acquire) {
-                                    Err(VisionError::Cancelled)
-                                } else {
-                                    Ok(work.job.output)
-                                }
-                            })
+                        let encoded = match work.job {
+                            EncoderJob::Vision(mut job) => match runtime.as_mut() {
+                                Some(runtime) => runtime.encode_into(
+                                    &job.rgb, job.grid, &job.lut, &mut job.output,
+                                ).map(|()| job.output),
+                                None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
+                            },
+                            EncoderJob::Audio(job) => match audio_runtime.as_mut() {
+                                Some(runtime) => runtime.encode(job),
+                                None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
+                            },
+                        };
+                        encoded.and_then(|output| {
+                            if work.cancelled.load(Ordering::Acquire) {
+                                Err(VisionError::Cancelled)
+                            } else { Ok(output) }
+                        })
                     };
                     if let Err(ref error) = result {
-                        tracing::debug!(%error, "vision job failed");
+                        tracing::debug!(%error, "media job failed");
                     }
                     // CUDA errors poison this owner: queued tickets fail closed.
                     if reply_encode(&owner_health, &work.reply, result) { break; }
                 }
             })?;
         match readiness.recv() {
-            Ok(Ok(ledger)) => Ok(Self {
+            Ok(Ok((ledger, audio_ledger))) => Ok(Self {
                 queue: Some(queue),
                 owner: Some(owner),
                 ledger,
+                audio_ledger,
                 healthy,
             }),
             Ok(Err(error)) => {
@@ -532,6 +595,18 @@ impl EncoderService {
     }
     pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
+        self.submit_job(EncoderJob::Vision(job))
+    }
+    pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
+        if self.audio_ledger.is_none() {
+            return Err(VisionError::Unsupported("audio encoder is not loaded".into()));
+        }
+        // Official padded multi-clip batches changed 16-20 RVQ codes in probes.
+        // One complete clip per encode matches tokenize_audio_batch([mel]) and
+        // keeps audio identities independent of request/batch composition.
+        self.submit_job(EncoderJob::Audio(job))
+    }
+    fn submit_job(&self, job: EncoderJob) -> Result<EncoderTicket> {
         if !self.healthy() { return Err(VisionError::Unavailable); }
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -579,12 +654,14 @@ mod tests {
     #[test]
     fn only_terminal_native_errors_poison_owner_before_reply() {
         for error in [VisionError::QueueFull, VisionError::Cancelled,
-            VisionError::Native(cuteafd_ffi::vision::VisionError::InvalidInput("bad grid"))] {
+            VisionError::Native(cuteafd_ffi::vision::VisionError::InvalidInput("bad grid")),
+            VisionError::AudioNative(cuteafd_ffi::audio::AudioError::InvalidInput("bad PCM"))] {
             assert!(!terminal_encode_failure(&Err(error)));
         }
         for error in [VisionError::Unavailable,
             VisionError::Native(cuteafd_ffi::vision::VisionError::Native(1)),
-            VisionError::Native(cuteafd_ffi::vision::VisionError::Runtime("CUDA failure".into()))] {
+            VisionError::Native(cuteafd_ffi::vision::VisionError::Runtime("CUDA failure".into())),
+            VisionError::AudioNative(cuteafd_ffi::audio::AudioError::Native(1))] {
             assert!(terminal_encode_failure(&Err(error)));
         }
     }
@@ -613,6 +690,43 @@ mod tests {
             assert!(result.recv().unwrap().is_err());
             assert!(healthy.load(Ordering::Acquire));
         }
+    }
+    #[test]
+    fn shared_queue_orders_modalities_and_rejects_disabled_audio() {
+        let (queue, jobs) = mpsc::sync_channel(2);
+        let mut service = EncoderService { queue: Some(queue), owner: None,
+            ledger: Default::default(), audio_ledger: None,
+            healthy: Arc::new(AtomicBool::new(true)) };
+        let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
+            output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
+        assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));
+        service.audio_ledger = Some(Default::default());
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = observed.clone();
+        let (gate, wait) = mpsc::sync_channel(0);
+        service.owner = Some(thread::spawn(move || {
+            wait.recv().unwrap();
+            while let Ok(work) = jobs.recv() {
+                let (kind, output) = match work.job {
+                    EncoderJob::Vision(job) => ("vision", job.output),
+                    EncoderJob::Audio(job) => ("audio", job.output),
+                };
+                seen.lock().unwrap().push(kind);
+                let _ = work.reply.send(if work.cancelled.load(Ordering::Acquire) {
+                    Err(VisionError::Cancelled)
+                } else { Ok(output) });
+            }
+        }));
+        let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [2,2],
+            lut: Arc::new([0.0; 768]), output: vec![0; 4096] }).unwrap();
+        let audio = service.submit_audio(audio_job()).unwrap();
+        assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::QueueFull)));
+        audio.cancel();
+        gate.send(()).unwrap();
+        assert!(image.result.recv().unwrap().is_ok());
+        assert!(matches!(audio.result.recv().unwrap(), Err(VisionError::Cancelled)));
+        drop(service);
+        assert_eq!(*observed.lock().unwrap(), ["vision", "audio"]);
     }
     #[test]
     fn reject_unimplemented_geometry_before_weights() {

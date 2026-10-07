@@ -427,6 +427,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "claxon"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -731,10 +737,13 @@ name = "cuteafd-loader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "claxon",
  "cuteafd-core",
  "daachorse",
+ "hound",
  "image",
  "libc",
+ "nanomp3",
  "rayon",
  "serde",
  "serde_json",
@@ -1324,6 +1333,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,6 +1920,21 @@ dependencies = [
  "num-traits",
  "pxfm",
 ]
+
+[[package]]
+name = "nanomp3"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acd9a8d0592a17ee5211aae2f976e6dc2f6846135d1f49665b3f19a7afd23435"
+dependencies = [
+ "nanomp3-core",
+]
+
+[[package]]
+name = "nanomp3-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
 
 [[package]]
 name = "nom"
