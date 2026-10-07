@@ -35,12 +35,13 @@ pub type Key = u64;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum EvictionOrder {
     /// Legacy order: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
-    #[default]
     Banks,
     /// Least recently used: the smallest use count (`HostSnapshot::last_use`), whichever bank.
     /// A prompt snapshot shares its pages with its turn snapshot, so bank order deleted fresh
     /// prompts before stale turns and made retries prefill from cold. A conversation stores its
-    /// prompt snapshot before its turn snapshot, so a stale pair still goes prompt first.
+    /// prompt snapshot before its turn snapshot, so a stale pair still goes prompt first. The
+    /// default, and the order V4.1 and the generic engine serve with.
+    #[default]
     LeastRecent,
 }
 
@@ -134,8 +135,8 @@ struct PageEntry {
 /// The store of host snapshots. Invariants: a page slab is held exactly while its reference
 /// count is positive; the device map holds an entry only for a page that is both alive on the
 /// device and present in a host slab, and is filled at commit so an in-flight copy is never
-/// shared; `bytes_used()` equals the pool's; eviction order equals `Retention::evict_one` order
-/// over unpinned snapshots.
+/// shared; `bytes_used()` equals the pool's; eviction takes unpinned snapshots in the store's
+/// `EvictionOrder`.
 pub struct Snapshots {
     pool: SlabPool,
     retention: Retention<Key>,
@@ -152,10 +153,11 @@ pub struct Snapshots {
 }
 
 impl Snapshots {
-    /// A store over `pool` with no snapshots. Invariant: every slab this store hands out comes
-    /// from `pool`, so `bytes_used()` never exceeds the pool's quota.
+    /// A store over `pool` with no snapshots, under V4.1's reuse rule and least-recent eviction.
+    /// Invariant: every slab this store hands out comes from `pool`, so `bytes_used()` never
+    /// exceeds the pool's quota.
     pub fn new(pool: SlabPool) -> Self {
-        Self::with_rule(pool, ReuseRule::V41, EvictionOrder::Banks)
+        Self::with_rule(pool, ReuseRule::V41, EvictionOrder::LeastRecent)
     }
 
     /// A store whose lookups follow `rule` and whose eviction follows `order`.
@@ -396,7 +398,7 @@ impl Snapshots {
         }
     }
 
-    /// Evict in the engine's order until `bytes_used() <= quota`, skipping pinned snapshots;
+    /// Evict in this store's order until `bytes_used() <= quota`, skipping pinned snapshots;
     /// returns the evicted keys and the bytes freed. Invariant: a pinned snapshot is never
     /// evicted; stops early if only pinned snapshots remain.
     pub fn evict_to(&mut self, quota: u64) -> (Vec<Key>, u64) {
@@ -657,6 +659,11 @@ pub mod testing {
         Snapshots::new(pool(quota).0)
     }
 
+    /// [`snapshots`] evicting in `order`.
+    pub fn snapshots_ordered(quota: u64, order: EvictionOrder) -> Snapshots {
+        Snapshots::with_rule(pool(quota).0, ReuseRule::V41, order)
+    }
+
     /// A `Snapshots` over a fresh pool of `quota` bytes with `layout`, using a chunk large
     /// enough for the layout's largest class.
     pub fn snapshots_with_layout(quota: u64, layout: Layout) -> Snapshots {
@@ -902,8 +909,33 @@ mod tests {
     }
 
     #[test]
-    fn eviction_skips_pinned_and_follows_bank_order() {
+    fn least_recent_eviction_skips_pinned_snapshots() {
         let mut store = snapshots(1 << 30);
+        let commit = |store: &mut Snapshots, kind, tokens: &[u32], page: u32| {
+            let plan = store.plan_store(meta(kind, tokens, false), &pages(&[id(page)])).expect("plan");
+            store.commit_store(plan, 0)
+        };
+        let oldest = commit(&mut store, SnapshotKind::Prompt, &[1], 1);
+        let middle = commit(&mut store, SnapshotKind::Turn, &[2], 2);
+        let newest = commit(&mut store, SnapshotKind::Prompt, &[3], 3);
+        // A restore pins the least recently used snapshot: eviction passes over it, in order.
+        store.pin(oldest);
+        assert_eq!(store.evict_one().map(|(key, _)| key), Some(middle));
+        // A pinned snapshot stays pinned through a lookup hit, which also makes it the newest.
+        assert_eq!(store.lookup(&[1], 0).map(|hit| hit.key), Some(oldest));
+        store.pin(newest);
+        assert_eq!(store.evict_one(), None, "only pinned snapshots remain");
+        assert_eq!(store.evict_to(0).0, Vec::<Key>::new());
+        store.unpin(oldest);
+        store.unpin(newest);
+        // Unpinned again, they go by use: `newest` was stored before `oldest`'s hit.
+        assert_eq!(store.evict_to(0).0, vec![newest, oldest]);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn eviction_skips_pinned_and_follows_bank_order() {
+        let mut store = super::testing::snapshots_ordered(1 << 30, EvictionOrder::Banks);
         let prompt = store
             .plan_store(
                 SnapshotMeta {

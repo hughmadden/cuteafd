@@ -1,16 +1,20 @@
 //! Shared model for the HC-2 suites: mirrors `Snapshots` with a separately maintained
 //! `Retention<Key>` and exact page-reference and byte accounting, so a random or interleaved
 //! sequence can be checked after every step. Plans are modelled separately from commits so the
-//! concurrency suite can interleave plan, commit and abort steps.
+//! concurrency suite can interleave plan, commit and abort steps. It evicts in either
+//! `EvictionOrder`; the suites run both.
 #![allow(dead_code)]
 use cuteafd_core::prefix::{Retention, SnapshotKind};
 use cuteafd_hostcache::cache::HostCache;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_hostcache::pool::testing::layout;
 use cuteafd_hostcache::pool::Layout;
-use cuteafd_hostcache::snapshot::{DevicePageId, Key, SnapshotMeta, Snapshots, StorePlan};
+use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, Key, SnapshotMeta, Snapshots, StorePlan};
 use cuteafd_hostcache::COMPRESSORS;
 use std::collections::HashMap;
+
+/// Both host eviction orders: the production `LeastRecent` first, then the legacy `Banks`.
+pub const ORDERS: [EvictionOrder; 2] = [EvictionOrder::LeastRecent, EvictionOrder::Banks];
 
 /// xorshift64*: deterministic, so a failing schedule reproduces from its seed.
 pub struct Rng(u64);
@@ -49,6 +53,9 @@ pub struct Model {
     pub next_key: Key,
     pub next_page: u32,
     pub layout: Layout,
+    pub order: EvictionOrder,
+    /// Commits plus lookup hits so far; `ModelSnapshot::last_use` is stamped from it.
+    pub uses: u64,
 }
 
 pub struct ModelSnapshot {
@@ -57,6 +64,8 @@ pub struct ModelSnapshot {
     pub pages: Vec<u32>,
     pub has_draft: bool,
     pub pins: u32,
+    /// `uses` at the commit or the last lookup hit; `LeastRecent` evicts the smallest.
+    pub last_use: u64,
 }
 
 /// A planned store: the pages it holds, the copies it still owes and the non-page bytes it
@@ -71,7 +80,13 @@ pub struct ModelPlan {
 }
 
 impl Model {
+    /// The model of a store built by `Snapshots::new`: least-recent eviction.
     pub fn new() -> Self {
+        Self::with_order(EvictionOrder::LeastRecent)
+    }
+
+    /// The model of a store evicting in `order`.
+    pub fn with_order(order: EvictionOrder) -> Self {
         Self {
             retention: Retention::new(usize::MAX),
             snapshots: HashMap::new(),
@@ -83,6 +98,8 @@ impl Model {
             next_key: 0,
             next_page: 0,
             layout: layout(),
+            order,
+            uses: 0,
         }
     }
 
@@ -164,6 +181,7 @@ impl Model {
             self.release(old);
         }
         self.retention.bank_mut(meta.kind).insert(&meta.tokens, key);
+        self.uses += 1;
         self.snapshots.insert(
             key,
             ModelSnapshot {
@@ -172,6 +190,7 @@ impl Model {
                 pages: pages.into_iter().flatten().collect(),
                 has_draft: meta.has_draft,
                 pins: 0,
+                last_use: self.uses,
             },
         );
         key
@@ -229,10 +248,15 @@ impl Model {
         }
     }
 
+    /// The reuse rule; a hit refreshes the snapshot's use.
     pub fn lookup(&mut self, tokens: &[u32]) -> Option<(usize, usize, Key)> {
-        self.retention
+        let hit = self
+            .retention
             .lookup_reusable(tokens)
-            .map(|(common, frontier, &key)| (common, frontier, key))
+            .map(|(common, frontier, &key)| (common, frontier, key))?;
+        self.uses += 1;
+        self.snapshots.get_mut(&hit.2).expect("model hit is resident").last_use = self.uses;
+        Some(hit)
     }
 
     pub fn evict_to(&mut self, quota: u64) -> (Vec<Key>, u64) {
@@ -248,18 +272,33 @@ impl Model {
         (evicted, freed)
     }
 
-    /// Evict the least recently used unpinned snapshot; `None` when only pinned snapshots
-    /// remain. Mirrors `Snapshots::evict_one`.
+    /// Evict the next unpinned snapshot in the model's order; `None` when only pinned
+    /// snapshots remain. Mirrors `Snapshots::evict_one`.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
-        let next = {
-            let snapshots = &self.snapshots;
-            self.retention.evict_one_where(&|key: &Key| {
-                snapshots.get(key).is_some_and(|snapshot| snapshot.pins > 0)
-            })
-        };
-        let (_kind, key) = next?;
         let before = self.bytes;
-        self.release(key);
+        let key = match self.order {
+            EvictionOrder::LeastRecent => {
+                let key = self
+                    .snapshots
+                    .iter()
+                    .filter(|(_, snapshot)| snapshot.pins == 0)
+                    .min_by_key(|(_, snapshot)| snapshot.last_use)
+                    .map(|(&key, _)| key)?;
+                self.remove(key);
+                key
+            }
+            EvictionOrder::Banks => {
+                let next = {
+                    let snapshots = &self.snapshots;
+                    self.retention.evict_one_where(&|key: &Key| {
+                        snapshots.get(key).is_some_and(|snapshot| snapshot.pins > 0)
+                    })
+                };
+                let (_kind, key) = next?;
+                self.release(key);
+                key
+            }
+        };
         Some((key, before - self.bytes))
     }
 
@@ -320,6 +359,7 @@ impl Model {
             assert_eq!(actual.meta.kind, expected.kind);
             assert_eq!(actual.meta.tokens, expected.tokens);
             assert_eq!(actual.pins, expected.pins);
+            assert_eq!(actual.last_use, expected.last_use, "last use of {key}");
         }
     }
 }

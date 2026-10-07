@@ -4,9 +4,9 @@
 //! A failure prints the schedule log and reproduces from its seed.
 mod common;
 
-use common::{apply, Model, Op};
-use cuteafd_hostcache::snapshot::testing::snapshots;
-use cuteafd_hostcache::snapshot::{DevicePageId, StorePlan};
+use common::{apply, Model, Op, ORDERS};
+use cuteafd_hostcache::snapshot::testing::snapshots_ordered;
+use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, StorePlan};
 use cuteafd_hostcache::SnapshotKind;
 
 /// A small deterministic generator so a schedule reproduces from its seed.
@@ -89,15 +89,15 @@ fn lane_script(lane: usize, rng: &mut Rng, ids: &[DevicePageId], tokens: &[Vec<u
         .collect()
 }
 
-fn run_seed(seed: u64) -> Vec<String> {
+fn run_seed(seed: u64, order: EvictionOrder) -> Vec<String> {
     let mut rng = Rng::new(seed);
     let ids = device_ids();
     let tokens = token_sets();
     let mut lanes: Vec<Vec<Op>> = (0..4)
         .map(|lane| lane_script(lane, &mut rng, &ids, &tokens))
         .collect();
-    let mut store = snapshots(1 << 24);
-    let mut model = Model::new();
+    let mut store = snapshots_ordered(1 << 24, order);
+    let mut model = Model::with_order(order);
     let mut pending: Vec<Option<StorePlan>> = (0..lanes.len()).map(|_| None).collect();
     let mut log = Vec::new();
     let mut now = 0u64;
@@ -112,7 +112,7 @@ fn run_seed(seed: u64) -> Vec<String> {
             apply(&mut store, &mut model, &op, now, &mut pending[lane]);
         }));
         if let Err(payload) = outcome {
-            eprintln!("seed {seed}: model mismatch after step {now}");
+            eprintln!("seed {seed}, {order:?}: model mismatch after step {now}");
             for line in &log {
                 eprintln!("  {line}");
             }
@@ -126,16 +126,18 @@ fn run_seed(seed: u64) -> Vec<String> {
 
 #[test]
 fn seeded_lanes_interleave_with_shared_pages() {
-    let log = run_seed(0x5EED_1234_ABCD_0001);
-    assert!(log.len() > 50, "schedule too short: {}", log.len());
-    assert!(log[0].starts_with("0: lane "));
+    for order in ORDERS {
+        let log = run_seed(0x5EED_1234_ABCD_0001, order);
+        assert!(log.len() > 50, "schedule too short: {}", log.len());
+        assert!(log[0].starts_with("0: lane "));
+    }
 }
 
 #[test]
 fn every_seed_reproduces_and_keeps_the_invariants() {
-    for seed in 1..=8 {
-        let first = run_seed(seed);
-        let second = run_seed(seed);
-        assert_eq!(first, second, "seed {seed} did not reproduce");
+    for (seed, order) in (1..=8).flat_map(|seed| ORDERS.map(|order| (seed, order))) {
+        let first = run_seed(seed, order);
+        let second = run_seed(seed, order);
+        assert_eq!(first, second, "seed {seed} ({order:?}) did not reproduce");
     }
 }

@@ -7,8 +7,9 @@ mod common_hc_5;
 
 use common::{reconcile, Model};
 use common_hc_5::{
-    cache, config, default_cache, device_pages, restored_bytes, settle, snapshot, store_resident,
-    stored_bytes, target, tokens, write_snapshot, Device, FailAfter, Payload, DEVICE_BYTES,
+    cache, config, default_cache, device_pages, ordered_cache, restored_bytes, settle, snapshot,
+    store_resident, stored_bytes, target, tokens, write_snapshot, Device, FailAfter, Payload,
+    DEVICE_BYTES,
 };
 use cuteafd_core::prefix::ReuseRule;
 use cuteafd_hostcache::cache::{
@@ -757,12 +758,14 @@ fn take_pending(pending: &mut Vec<(StoreTicket, Key)>, ticket: StoreTicket) -> K
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
-    fn random_sequences_keep_the_invariants(ops in prop::collection::vec(operation(), 1..40)) {
+    fn random_sequences_keep_the_invariants(ops in prop::collection::vec(operation(), 1..40), banks: bool) {
         let quota = 8 * CHUNK as u64;
         // The facade evicts to the pool's quota exactly after every commit.
         let evict_quota = quota;
-        let mut cache = default_cache(quota, StoreMode::OnRetain);
-        let mut model = Model::new();
+        // Each case runs in one host eviction order, the model in the same.
+        let order = if banks { EvictionOrder::Banks } else { EvictionOrder::LeastRecent };
+        let mut cache = ordered_cache(quota, StoreMode::OnRetain, order);
+        let mut model = Model::with_order(order);
         let mut device = Device::new(DEVICE_BYTES);
         let mut stored: HashMap<Key, DeviceSnapshot> = HashMap::new();
         let mut planned: HashMap<Key, DeviceSnapshot> = HashMap::new();
