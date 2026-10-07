@@ -23,6 +23,54 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
+def validator_panel_counts(panel, manifest, files, record_counts):
+    tree = ast.parse((ROOT / "scripts/bench/validate-fidelity-dataset.py").read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    start = next(i for i, node in enumerate(main.body)
+                 if isinstance(node, ast.Assign) and node.targets[0].id == "windows")
+    shape_loop = main.body[start + 5]
+    row_assert = next(node for node in shape_loop.body if isinstance(node, ast.Assert))
+    checks = ast.Module(body=main.body[start:start + 5] + [row_assert], type_ignores=[])
+    scope = dict(panel=panel, manifest=manifest, dataset=dict(files=files),
+                 maps=[dict.fromkeys(range(n)) for n in record_counts])
+    exec(compile(checks, "validator-panel-counts", "exec"), scope)
+    return scope["scored_positions"]
+
+
+def panel_count_fixture(count):
+    panel = dict(windows=[dict(id=f"w{i}", tokens=[0] * 576, score_from=64)
+                          for i in range(count)])
+    manifest = dict(windows=[dict(id=f"w{i}", positions=list(range(64, 576)))
+                             for i in range(count)])
+    files = [dict(window=f"w{i}") for i in range(count)]
+    return panel, manifest, files
+
+
+@pytest.mark.parametrize("count, rows", [(64, 32768), (8, 4096)])
+def test_dataset_validator_admits_declared_text_and_media_geometry(count, rows):
+    assert validator_panel_counts(*panel_count_fixture(count), [rows, rows]) == rows
+
+
+@pytest.mark.parametrize("count", [64, 8])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("changed", ["manifest_windows", "files", "panel_windows", "manifest_rows", "report_rows"])
+def test_dataset_validator_rejects_count_mismatch(count, direction, changed):
+    panel, manifest, files = panel_count_fixture(count)
+    records = [count * 512] * 2
+    if changed == "manifest_windows":
+        manifest["windows"] = manifest["windows"][:-1] if direction < 0 else manifest["windows"] + [dict(id="extra", positions=list(range(512)))]
+    elif changed == "files":
+        files = files[:-1] if direction < 0 else files + [dict(window="extra")]
+    elif changed == "panel_windows":
+        panel["windows"] = panel["windows"][:-1] if direction < 0 else panel["windows"] + [dict(id="extra", tokens=[0] * 576, score_from=64)]
+    elif changed == "manifest_rows":
+        manifest["windows"][0]["positions"] = list(range(512 + direction))
+    else:
+        records[1] += direction
+    with pytest.raises(AssertionError):
+        validator_panel_counts(panel, manifest, files, records)
+
+
 def tiny_set():
     windows = []
     for name in ("legacy", "a00"):
