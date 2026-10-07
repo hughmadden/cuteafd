@@ -18,7 +18,7 @@ pub mod prefix;
 pub mod serving_capacity;
 pub mod memory_layout;
 pub mod media;
-pub use media::{AudioKey, ImageKey, MediaSpan};
+pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};
 pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPrefillCursor, ENGRAM_LAYERS, ENGRAM_ROWS, ENGRAM_COMPRESSED_VOCAB};
 mod attention_geometry;
 mod constants;

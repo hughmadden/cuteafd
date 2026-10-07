@@ -428,7 +428,7 @@ mod tests {
         let pin = cache.reserve(key, 16).unwrap();
         let payload: Vec<u8> = (0..16).collect();
         let lease = cache.complete(key, std::sync::Arc::from(payload.clone())).unwrap();
-        let mut media = RequestMedia::new(vec![MediaSpan { start: 2, len: 4, key }], 2, 8).unwrap();
+        let mut media = RequestMedia::new(vec![MediaSpan { start: 2, len: 4, key: key.into() }], 2, 8).unwrap();
         media.attach(lease).unwrap(); drop(pin);
         let mut image = super::Qwen4Placement::new(vec![0], 0, super::NgramHistory(vec![0]));
         image.media = Some(media);

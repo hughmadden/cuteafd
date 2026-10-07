@@ -4,7 +4,7 @@ fn media_span(key: ImageKey) -> MediaSpan {
     MediaSpan {
         start: 2,
         len: 4,
-        key,
+        key: key.into(),
     }
 }
 fn media_keys(key: ImageKey, n: usize) -> MediaKeys {
@@ -87,7 +87,7 @@ fn media_repeat_next_turn_and_changed_image_restore_exactly() {
         MediaSpan {
             start: 9,
             len: 2,
-            key: ImageKey([2; 32]),
+            key: ImageKey([2; 32]).into(),
         },
     ];
     native[..8].copy_from_slice(&seq(10, 8));
@@ -206,7 +206,7 @@ fn media_point_schedule_rounds_boundaries_and_periodic_points_before_capture() {
     let spans = [MediaSpan {
         start: 3,
         len: 10,
-        key: ImageKey([1; 32]),
+        key: ImageKey([1; 32]).into(),
     }];
     let policy = PointPolicy {
         gap: 4,
@@ -309,13 +309,7 @@ fn embedding_eviction_reencode_and_prefix_restore_remain_byte_exact() {
         MediaWaiter::new(
             1,
             RequestMedia::new(keys.spans().to_vec(), 1, 8).unwrap(),
-            vec![EncodeJob {
-                key,
-                grid: [1, 2, 2],
-                rgb8: Arc::from([3; 12]),
-                tokens: 4,
-                hidden_width: 1,
-            }],
+            vec![EncodeJob::image(key, [1, 2, 2], Arc::from([3; 12]), 4, 1)],
             resume,
         )
         .unwrap()

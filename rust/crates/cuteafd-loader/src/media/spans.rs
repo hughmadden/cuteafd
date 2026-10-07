@@ -99,7 +99,7 @@ impl SpanExpander {
             media.push(MediaSpan {
                 start: expanded.len(),
                 len: image.tokens,
-                key: image.key,
+                key: image.key.into(),
             });
             expanded.extend(std::iter::repeat_n(self.placeholder, image.tokens));
         }

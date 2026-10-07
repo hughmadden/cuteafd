@@ -1,6 +1,6 @@
 use super::{
     round_frontier, stats::Latencies, EmbeddingCache, EmbeddingLease, EncodeJob, EncoderClient,
-    EncoderTicket, ImageKey, MediaError, MediaStats, RequestMedia,
+    EncoderTicket, MediaKey, MediaError, MediaStats, RequestMedia,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 pub struct MediaWaiter<T> {
     pub job: T,
     pub media: RequestMedia,
-    prepared: HashMap<ImageKey, EncodeJob>,
+    prepared: HashMap<MediaKey, EncodeJob>,
     resume: usize,
     retries: u8,
     cold: bool,
@@ -28,6 +28,7 @@ impl<T> MediaWaiter<T> {
         }
         let mut inputs = HashMap::new();
         for image in prepared {
+            image.validate()?;
             if inputs.get(&image.key).is_some_and(|old| old != &image) {
                 return Err(MediaError::Spans);
             }
@@ -114,13 +115,13 @@ struct Flight {
     _pin: EmbeddingLease,
 }
 
-/// A bounded media_pending queue and one in-flight encode per ImageKey, shared across requests.
+/// A bounded media_pending queue and one in-flight encode per modality-tagged MediaKey, shared across requests.
 /// poll is nonblocking and ready requests may pass a slower encoder job (decode stays runnable).
 pub struct MediaAdmission<T, C: EncoderClient> {
     pub cache: EmbeddingCache,
     encoder: C,
     pending: VecDeque<MediaWaiter<T>>,
-    flights: HashMap<ImageKey, Flight>,
+    flights: HashMap<MediaKey, Flight>,
     capacity: usize,
     max_images: usize,
     max_tokens: usize,
@@ -342,7 +343,7 @@ impl<T, C: EncoderClient> Drop for MediaAdmission<T, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::{FakeEncoder, MediaSpan};
+    use crate::media::{FakeEncoder, ImageKey, MediaSpan};
     use std::sync::Arc;
     fn waiter(id: usize, keys: &[u8], resume: usize) -> MediaWaiter<usize> {
         let spans = keys
@@ -351,19 +352,13 @@ mod tests {
             .map(|(i, &k)| MediaSpan {
                 start: i * 2,
                 len: 2,
-                key: ImageKey([k; 32]),
+                key: ImageKey([k; 32]).into(),
             })
             .collect();
         let media = RequestMedia::new(spans, 2, keys.len() * 2).unwrap();
         let jobs = keys
             .iter()
-            .map(|&k| EncodeJob {
-                key: ImageKey([k; 32]),
-                grid: [1, 2, 2],
-                rgb8: Arc::from([k; 12]),
-                tokens: 2,
-                hidden_width: 2,
-            })
+            .map(|&k| EncodeJob::image(ImageKey([k; 32]), [1, 2, 2], Arc::from([k; 12]), 2, 2))
             .collect();
         MediaWaiter::new(id, media, jobs, resume).unwrap()
     }
@@ -373,6 +368,40 @@ mod tests {
             _ => panic!("not ready"),
         }
     }
+    #[test]
+    fn audio_cache_dedupes_content_without_aliasing_images_and_reencodes_exactly() {
+        use crate::media::{AudioKey, MediaKeys, verify_media};
+        let audio_key = AudioKey([1; 32]);
+        let span = MediaSpan { start: 0, len: 2, key: audio_key.into() };
+        let pcm: Arc<[f32]> = vec![0.0; 4800].into();
+        let make = |id, resume| MediaWaiter::new(id, RequestMedia::new(vec![span], 2, 2).unwrap(),
+            vec![EncodeJob::audio(audio_key, pcm.clone(), 2, 2)], resume).unwrap();
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(8), FakeEncoder::default(), 3);
+        queue.enqueue(make(1, 0)).unwrap();
+        queue.enqueue(make(2, 0)).unwrap();
+        let first = ready(queue.poll(|_| false));
+        let second = ready(queue.poll(|_| false));
+        assert_eq!(queue.encoder().submitted, 1);
+        assert!(queue.cache.contains(audio_key));
+        assert!(!queue.cache.contains(ImageKey(audio_key.0)));
+        let mut a = crate::media::MediaChunk::default(); first.media().write_chunk(0, 2, &mut a).unwrap();
+        let native = [3, 3];
+        let image = MediaSpan { key: ImageKey(audio_key.0).into(), ..span };
+        assert_ne!(MediaKeys::new(&native, 10, &[span]).unwrap().tokens(), MediaKeys::new(&native, 10, &[image]).unwrap().tokens());
+        assert!(!verify_media(2, &[span], &[image]));
+        drop(first); drop(second);
+        let pin = queue.cache.reserve(ImageKey([2; 32]), 8).unwrap();
+        assert!(!queue.cache.contains(audio_key)); drop(pin); queue.cache.prune_reservations();
+        queue.enqueue(make(3, 2)).unwrap();
+        let restored = ready(queue.poll(|_| false));
+        assert_eq!(queue.encoder().submitted, 1, "prefix restore needs no embeddings");
+        let retry = restored.reconcile(0).unwrap_err(); queue.enqueue(retry).unwrap();
+        let reencoded = ready(queue.poll(|_| false));
+        let mut b = crate::media::MediaChunk::default(); reencoded.media().write_chunk(0, 2, &mut b).unwrap();
+        assert_eq!(a.features, b.features);
+        assert_eq!(queue.encoder().submitted, 2);
+    }
+
     #[test]
     fn dedupe_cancel_and_no_head_of_line_blocking() {
         let mut encoder = FakeEncoder::default();

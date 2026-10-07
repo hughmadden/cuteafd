@@ -1,4 +1,4 @@
-use super::{ImageKey, MediaError, MediaSpan};
+use super::{ImageKey, MediaError, MediaKey, MediaSpan};
 
 /// Native tokens remain owned by the caller; only this copy goes to prefix tiers.
 #[derive(Clone, Debug)]
@@ -22,7 +22,7 @@ impl MediaKeys {
         let mut tokens = native.to_vec();
         for span in spans {
             for row in 0..span.len {
-                tokens[span.start + row] = image_token_id(span.key, row);
+                tokens[span.start + row] = media_token_id(span.key, row);
             }
         }
         Ok(Self {
@@ -42,14 +42,18 @@ impl MediaKeys {
 /// `image_token_id`, with a fold of the full SHA-256 key instead of a source hash.
 /// This is a radix hint, not an identity: restores must verify all 256 key bits.
 pub fn image_token_id(key: ImageKey, row: usize) -> u32 {
+    media_token_id(key.into(), row)
+}
+pub fn media_token_id(key: MediaKey, row: usize) -> u32 {
     let hash = key
-        .0
+        .bytes()
         .chunks_exact(8)
         .enumerate()
         .fold(0u64, |h, (i, word)| {
             h ^ u64::from_le_bytes(word.try_into().unwrap()).rotate_left((i * 13) as u32)
         });
-    let mut x = hash ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let domain = if key.is_audio() { 0x6175_6469_6f76_3031 } else { 0 };
+    let mut x = hash ^ domain ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
     x ^= x >> 33;
@@ -107,7 +111,7 @@ mod tests {
         let span = MediaSpan {
             start: 2,
             len: 2,
-            key: ImageKey([7; 32]),
+            key: ImageKey([7; 32]).into(),
         };
         let keys = MediaKeys::new(&native, 10, &[span]).unwrap();
         assert_eq!(
@@ -124,7 +128,7 @@ mod tests {
         let span = MediaSpan {
             start: 2,
             len: 3,
-            key: ImageKey([7; 32]),
+            key: ImageKey([7; 32]).into(),
         };
         assert!(MediaKeys::new(&[1; 4], 10, &[span]).is_err());
         assert!(MediaKeys::new(&[0x8000_0000], u32::MAX, &[]).is_err());

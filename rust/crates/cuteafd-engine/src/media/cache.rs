@@ -1,15 +1,15 @@
-use super::{ImageKey, MediaError};
+use super::{MediaKey, MediaError};
 use std::{collections::HashMap, sync::Arc};
 
 /// A request/encode pin. Cloning keeps the entry pinned; dropping needs no cache callback.
 #[derive(Clone, Debug)]
 pub struct EmbeddingLease {
-    key: ImageKey,
+    key: MediaKey,
     rows: Option<Arc<[u8]>>,
     _pin: Arc<()>,
 }
 impl EmbeddingLease {
-    pub fn key(&self) -> ImageKey {
+    pub fn key(&self) -> MediaKey {
         self.key
     }
     pub fn features(&self) -> Option<&Arc<[u8]>> {
@@ -26,7 +26,7 @@ struct Entry {
 /// Host-RAM LRU. Reservations count against the byte budget before the encoder allocates.
 /// Pinned entries (including encodes in flight) never become eviction candidates.
 pub struct EmbeddingCache {
-    entries: HashMap<ImageKey, Entry>,
+    entries: HashMap<MediaKey, Entry>,
     capacity: usize,
     bytes: usize,
     clock: u64,
@@ -60,12 +60,13 @@ impl EmbeddingCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn contains(&self, key: ImageKey) -> bool {
-        self.entries.get(&key).is_some_and(|e| e.rows.is_some())
+    pub fn contains(&self, key: impl Into<MediaKey>) -> bool {
+        self.entries.get(&key.into()).is_some_and(|e| e.rows.is_some())
     }
 
     /// Includes references hidden by a prefix hit: callers touch all history images.
-    pub fn get(&mut self, key: ImageKey) -> Option<EmbeddingLease> {
+    pub fn get(&mut self, key: impl Into<MediaKey>) -> Option<EmbeddingLease> {
+        let key = key.into();
         let entry = self.entries.get_mut(&key)?;
         if entry.rows.is_none() {
             return None;
@@ -79,7 +80,8 @@ impl EmbeddingCache {
             _pin: entry.pin.clone(),
         })
     }
-    pub fn reserve(&mut self, key: ImageKey, bytes: usize) -> Result<EmbeddingLease, MediaError> {
+    pub fn reserve(&mut self, key: impl Into<MediaKey>, bytes: usize) -> Result<EmbeddingLease, MediaError> {
+        let key = key.into();
         if bytes == 0 {
             return Err(MediaError::Features);
         }
@@ -119,9 +121,10 @@ impl EmbeddingCache {
     }
     pub fn complete(
         &mut self,
-        key: ImageKey,
+        key: impl Into<MediaKey>,
         rows: Arc<[u8]>,
     ) -> Result<EmbeddingLease, MediaError> {
+        let key = key.into();
         let entry = self
             .entries
             .get_mut(&key)
@@ -155,7 +158,7 @@ impl EmbeddingCache {
             self.remove(key);
         }
     }
-    fn remove(&mut self, key: ImageKey) {
+    fn remove(&mut self, key: MediaKey) {
         if let Some(entry) = self.entries.remove(&key) {
             self.bytes -= entry.bytes;
         }
@@ -194,8 +197,9 @@ impl EmbeddingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn key(i: u8) -> ImageKey {
-        ImageKey([i; 32])
+    use super::super::ImageKey;
+    fn key(i: u8) -> MediaKey {
+        ImageKey([i; 32]).into()
     }
     fn put(cache: &mut EmbeddingCache, i: u8) -> EmbeddingLease {
         let pending = cache.reserve(key(i), 4).unwrap();

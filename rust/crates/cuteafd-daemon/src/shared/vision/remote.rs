@@ -64,12 +64,12 @@ impl EncoderHandshake {
         Ok(value)
     }
     fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
-        let [t, h, w] = job.grid;
+        let ([t, h, w], rgb8) = job.image_input()?;
         let patches = u64::from(h) * u64::from(w);
         let rgb_bytes = patches * u64::from(self.patch_size).pow(2) * 3;
         if t != 1 || h == 0 || w == 0 || h % self.merge_size != 0 || w % self.merge_size != 0
             || patches > u64::from(self.max_patches) || job.tokens as u64 != patches / u64::from(self.merge_size).pow(2)
-            || job.hidden_width != self.output_width as usize || job.rgb8.len() as u64 != rgb_bytes {
+            || job.hidden_width != self.output_width as usize || rgb8.len() as u64 != rgb_bytes {
             return Err(error("invalid image grid/RGB8/output geometry"));
         }
         job.feature_bytes()
@@ -236,15 +236,16 @@ fn ping(s: &mut Wire) -> Result<()> {
     Ok(())
 }
 fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
+    let (grid, rgb8) = job.image_input()?;
     s.frame();
     put_u32(s, 1)?;
-    s.write_all(&job.key.0).map_err(error)?;
-    for n in job.grid { put_u32(s, n)?; }
+    s.write_all(job.key.bytes()).map_err(error)?;
+    for n in grid { put_u32(s, n)?; }
     put_u64(s, job.tokens as u64)?;
-    put_u64(s, job.rgb8.len() as u64)?;
-    s.write_all(&job.rgb8).map_err(error)?;
+    put_u64(s, rgb8.len() as u64)?;
+    s.write_all(rgb8).map_err(error)?;
     let status = get_u32(s)?;
-    let key = ImageKey(read_array(s)?);
+    let key: cuteafd_core::MediaKey = ImageKey(read_array(s)?).into();
     let elapsed_ms = get_u64(s)? as f64 / 1_000_000.0;
     let len = get_u64(s)?;
     if key != job.key { return Err(error("vision reply key mismatch")); }
@@ -273,7 +274,8 @@ impl EncoderServer {
         let health = service.clone();
         Self::start_backend(address, handshake, timeout, move || health.healthy(), move |job| {
             let started = Instant::now();
-            let ticket = service.submit(NativeJob { rgb: job.rgb8.clone(), grid: [job.grid[1] as usize, job.grid[2] as usize], lut: lut.clone(), output: vec![0; job.tokens * job.hidden_width] }).map_err(error)?;
+            let (grid, rgb8) = job.image_input()?;
+            let ticket = service.submit(NativeJob { rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize], lut: lut.clone(), output: vec![0; job.tokens * job.hidden_width] }).map_err(error)?;
             // The owner retains all buffers until its stream has drained, even
             // when a peer disappears. A deadline closes TCP, not CUDA lifetimes.
             let output = loop {
@@ -332,7 +334,7 @@ where F: FnMut(&EncodeJob) -> Result<EncodeOutput>, H: Fn() -> bool {
         let opcode = get_u32(s)?;
         if !healthy() { return Err(error("vision encoder unavailable")); }
         match opcode { 0 => { put_u32(s, 0)?; continue; }, 1 => {}, _ => return Err(error("invalid vision opcode")) }
-        let key = ImageKey(read_array(s)?);
+        let key: cuteafd_core::MediaKey = ImageKey(read_array(s)?).into();
         let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
         let tokens = get_u64(s)?;
         let len = get_u64(s)?;
@@ -345,7 +347,7 @@ where F: FnMut(&EncodeJob) -> Result<EncodeOutput>, H: Fn() -> bool {
         }
         let mut rgb = vec![0; len as usize];
         s.read_exact(&mut rgb).map_err(error)?;
-        let job = EncodeJob { key, grid, rgb8: rgb.into(), tokens: tokens as usize, hidden_width: handshake.output_width as usize };
+        let job = EncodeJob::image(match key { cuteafd_core::MediaKey::Image(key) => key, _ => unreachable!() }, grid, rgb.into(), tokens as usize, handshake.output_width as usize);
         handshake.validate_job(&job)?;
         let result = encode(&job).and_then(|output| {
             if output.key != key || output.features.len() != job.feature_bytes()? || !output.elapsed_ms.is_finite() || output.elapsed_ms < 0.0 {
@@ -359,7 +361,7 @@ where F: FnMut(&EncodeJob) -> Result<EncodeOutput>, H: Fn() -> bool {
             Err(e) => (1, 0, Arc::from(e.to_string().as_bytes().iter().take(MAX_ERROR).copied().collect::<Vec<_>>())),
         };
         put_u32(s, status)?;
-        s.write_all(&key.0).map_err(error)?;
+        s.write_all(key.bytes()).map_err(error)?;
         put_u64(s, elapsed)?;
         put_u64(s, bytes.len() as u64)?;
         s.write_all(&bytes).map_err(error)?;
@@ -375,7 +377,7 @@ mod tests {
         EncoderHandshake { encoder_id: EncoderId([7; 32]), max_patches: 16_384, output_width: 4096, patch_size: 16, merge_size: 2, plan_hash: [9; 32] }
     }
     fn job(value: u8) -> EncodeJob {
-        EncodeJob { key: ImageKey([value; 32]), grid: [1, 4, 4], rgb8: vec![value; 4*4*768].into(), tokens: 4, hidden_width: 4096 }
+        EncodeJob::image(ImageKey([value; 32]), [1, 4, 4], vec![value; 4*4*768].into(), 4, 4096)
     }
     fn server() -> EncoderServer {
         EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake(), Duration::from_secs(2), || true, |job| Ok(EncodeOutput { key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0 })).unwrap()
@@ -478,7 +480,9 @@ mod tests {
     fn invalid_geometry_rejected_before_queue_and_rank_failure_visible() {
         let server = server();
         let mut client = RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_secs(1)).unwrap();
-        let mut invalid = job(0); invalid.grid[1] = u32::MAX;
+        let mut invalid = job(0);
+        if let cuteafd_engine::media::EncodeInput::Image { grid, .. } = &mut invalid.input { grid[1] = u32::MAX; }
+        assert!(client.submit(EncodeJob::audio(cuteafd_core::AudioKey([0;32]), vec![0.0;481].into(), 1, 4096)).is_err());
         assert!(client.submit(invalid).is_err());
         drop(server);
         let ticket = client.submit(job(1)).unwrap();
