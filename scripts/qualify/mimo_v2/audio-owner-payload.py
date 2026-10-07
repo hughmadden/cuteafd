@@ -101,6 +101,7 @@ def compare(args):
     from mimo_media import snapshot_identity
     report = json.loads((args.capture / 'capture.json').read_text())
     identity = snapshot_identity(args.snapshot)
+    hidden = json.loads((args.snapshot / 'config.json').read_text())['hidden_size']
     results = []
     for clip in report['clips']:
         prefix = args.capture / clip['payload_prefix']
@@ -109,7 +110,7 @@ def compare(args):
         for suffix, field in (('.bf16', 'bf16_sha256'), ('.codes.i64', 'codes_sha256')):
             if sha256(Path(str(prefix) + suffix)) != clip[field]:
                 raise ValueError('capture payload hash differs')
-        expected, meta = oracle.read_probe_features(args.features, clip['span'], 4096, identity)
+        expected, meta = oracle.read_probe_features(args.features, clip['span'], hidden, identity)
         actual = np.fromfile(str(prefix) + '.bf16', dtype='<u2').reshape(expected.shape)
         codes = np.fromfile(str(prefix) + '.codes.i64', dtype='<i8').reshape(-1, 20)
         ref_codes = np.fromfile(args.features / (clip['span']['key'] + '.codes.i64'), dtype='<i8').reshape(codes.shape)

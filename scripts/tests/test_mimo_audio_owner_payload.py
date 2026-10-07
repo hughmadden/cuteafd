@@ -1,6 +1,8 @@
 """CPU contracts for retained serving-library audio payload diagnostics."""
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -37,3 +39,37 @@ def test_identical_payload_and_invalid_inputs():
         MODULE.differences(bits, bits.astype(np.uint32))
     with pytest.raises(ValueError, match='nonfinite'):
         MODULE.differences(np.array([[0x7f80, 0]], dtype=np.uint16), bits)
+
+
+@pytest.mark.parametrize('hidden', [4096, 6144])
+def test_compare_uses_checkpoint_width_and_checks_hashes(tmp_path, hidden):
+    from mimo_media import snapshot_identity
+    snapshot = tmp_path / 'snapshot'
+    snapshot.mkdir()
+    (snapshot / 'config.json').write_text(json.dumps({'hidden_size': hidden}))
+    for name in ('tokenizer.json', 'modeling_mimo_v2.py', 'preprocessor_config.json'):
+        (snapshot / name).write_text('{}')
+    features = tmp_path / 'features'
+    capture = tmp_path / 'capture'
+    capture.mkdir()
+    span = {'start': 4, 'len': 1, 'samples': 481, 'key': 'a' * 64, 'pcm_sha256': 'b' * 64}
+    geometry = MODULE.oracle.token_geometry(span['samples'])
+    bits = np.full((1, hidden), 0x3f80, dtype='<u2')
+    codes = np.zeros((geometry['codes'], 20), dtype='<i8')
+    MODULE.oracle.write_probe_features(features, span, bits, codes, snapshot_identity(snapshot))
+    bits.tofile(capture / '0.bf16')
+    codes.tofile(capture / '0.codes.i64')
+    clip = {'id': 'test', 'span': span, 'payload_prefix': '0',
+            'bf16_sha256': MODULE.sha256(capture / '0.bf16'),
+            'codes_sha256': MODULE.sha256(capture / '0.codes.i64')}
+    clip['e2e_bf16_sha256'] = clip['bf16_sha256']
+    (capture / 'capture.json').write_text(json.dumps({'library_sha256': 'c' * 64,
+        'backend': 'test', 'clips': [clip]}))
+    args = SimpleNamespace(capture=capture, features=features, snapshot=snapshot, output=tmp_path / 'result.json')
+    MODULE.compare(args)
+    result = json.loads(args.output.read_text())['results'][0]
+    assert result['rvq_identical'] and result['matches_e2e_owner_hash']
+    assert result['bf16']['elements'] == hidden
+    (capture / '0.bf16').write_bytes(b'bad')
+    with pytest.raises(ValueError, match='hash differs'):
+        MODULE.compare(args)
