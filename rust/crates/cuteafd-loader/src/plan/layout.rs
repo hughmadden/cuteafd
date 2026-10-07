@@ -91,16 +91,28 @@ impl Default for LayoutOptions {
     }
 }
 
+/// Shared with the GLM runtime so admission and allocation use the same lanes.
+pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
+    value.and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 4)
+}
+
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// MiMo has one full-row head (earlier lanes are headless), GLM/GLM Flash
-/// have one per row lane (plus GLM Flash's serial workspace), and Qwen one.
-/// V4 downloads through its existing bounded head buffer; V4.1 already
-/// supports prefill scoring.
+/// GLM uses its configured lanes; GLM Flash includes the serial workspace.
+/// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
+    let lanes = glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref());
+    full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
+}
+
+fn effective_glm_prefill_lanes(sparks: bool, value: Option<&str>) -> usize {
+    if sparks { glm_prefill_lanes(value) } else { 1 }
+}
+
+pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64, glm_lanes: usize) -> u64 {
     let (lanes, ordinary_rows) = match family {
         "mimo_v2" => (1, 1),
         "qwen4" => (1, 1),
-        "glm5" => (4, rows.min(64)),
+        "glm5" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
         "glm5_flash" => (3, rows.min(64)),
         _ => return 0,
     };
@@ -119,7 +131,18 @@ mod scoring_workspace_tests {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
         assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
-        assert_eq!(full_prefill_logits_bytes("glm5", 128, 1000), 4 * 64 * 1000 * 4);
+        assert_eq!(glm_prefill_lanes(None), 3);
+        assert_eq!(effective_glm_prefill_lanes(false, None), 1);
+        assert_eq!(effective_glm_prefill_lanes(false, Some("4")), 1);
+        assert_eq!(effective_glm_prefill_lanes(true, None), 3);
+        for lanes in 1..=4 {
+            assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
+            assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
+                lanes as u64 * 64 * 1000 * 4);
+        }
+        assert_eq!(glm_prefill_lanes(Some("0")), 1);
+        assert_eq!(glm_prefill_lanes(Some("9")), 4);
+        assert_eq!(glm_prefill_lanes(Some("invalid")), 3);
         assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 3 * 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
@@ -534,7 +557,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
         if options.full_prefill_logits && index == 0 {
             device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
-                full_prefill_logits_bytes(family, prefill_rows, model.spec().vocab as u64), Basis::Formula));
+                full_prefill_logits_bytes_with_lanes(family, prefill_rows, model.spec().vocab as u64,
+                    effective_glm_prefill_lanes(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+                        std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())), Basis::Formula));
         }
         if split {
             let exact_peer = if family == "deepseek_v4" {

@@ -292,11 +292,13 @@ impl Opened {
         let pool_tokens = if args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
             // The planner's GLM costs stay free on each GPU; records fill the rest.
             let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
-            crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
+            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, 0,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0,
-                if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
-                    "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64) } else { 0 })?
+                &crate::shared::memory_report::lead_reserves(devices.len(),
+                    if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(
+                        "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64,
+                        if args.peers.is_some() { engine::configured_lanes() } else { 1 }) } else { 0 }))?
         } else {
             args.pool_tokens
         };
