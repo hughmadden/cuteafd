@@ -457,7 +457,7 @@ impl<'a> MimoLoader<'a> {
     }
 
     /// V2.6 Pro's fused `qkv_proj` (FP8, TP-interleaved row shards with their
-    /// own 128x128 grids) in the coordinator's `[q; k; v]` layout with keys
+    /// own whole-shard 128x128 grids) in the coordinator's `[q; k; v]` layout with keys
     /// `cfg.qkv_key_stride()` rows apart (256: each 192-row key zero-padded):
     /// the E4M3 rows and FP32 per-row x 128-K scales, row major and K-block
     /// major (exactly the checkpoint's values; padding rows keep zero values and scales).
@@ -499,7 +499,7 @@ impl<'a> MimoLoader<'a> {
                     covered[segment.dest_row..segment.dest_row + segment.rows].fill(true);
                     for r in 0..segment.rows {
                         row_scales[(segment.dest_row + r) * k_blocks..][..k_blocks]
-                            .copy_from_slice(&grid[(scale0 + segment.scale_row + r / 128) * k_blocks..][..k_blocks]);
+                            .copy_from_slice(&grid[(scale0 + segment.scale_row_of(r)) * k_blocks..][..k_blocks]);
                     }
                 }
                 for (row, _) in covered.iter().enumerate().filter(|(_, &c)| !c) {
