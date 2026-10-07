@@ -44,11 +44,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     );
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
-    let _encoder = if let Some(encoder) = &config.encoder {
-        let (server, admitted) = crate::shared::vision::worker::start(encoder, &config.snapshot, config.library.clone(), config.device_budget as u64)?;
-        config.device_budget = config.device_budget.checked_sub(admitted as usize).context("vision reservation exceeds Spark budget")?;
-        Some(server)
-    } else { None };
+    let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
+        config.encoder.as_ref(), config.audio_encoder.as_ref(), &config.snapshot,
+        config.library.clone(), config.device_budget as u64)?;
+    config.device_budget = config.device_budget.checked_sub(usize::try_from(reserved)?)
+        .context("media reservation exceeds Spark budget")?;
     let library = unsafe { NativeLibrary::load(&config.library) }?;
     let (weights, remaining) = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
