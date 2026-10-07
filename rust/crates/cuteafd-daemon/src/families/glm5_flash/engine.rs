@@ -961,25 +961,27 @@ pub(crate) struct StartupGraphReserve {
 }
 
 /// Admits the KV pool beside the startup decode graphs (`startup`), falling back to lazily captured
-/// graphs only on a real shortfall: the admission with the startup set's bytes above the allowance
-/// is refused for want of memory (`memory_report::kv_shortfall`), and the same admission with lazily
-/// captured graphs, which keep only the allowance, admits a pool. `admit(extra)` is the planned
-/// admission with `extra` graph bytes per GPU above the allowance. Returns the pool and whether
-/// decode graphs are captured at startup. Every other refusal stands: the first admission's own
-/// error when it is not a shortfall; the startup refusal when the retry is short of memory too; and
-/// the retry's own error, with the startup refusal as context, when the retry fails for another
+/// graphs only on a real shortfall: the admission keeping the startup set's bytes, more than the
+/// allowance, is refused for want of memory (`memory_report::kv_shortfall`), and the same admission
+/// with lazily captured graphs, which keep only the allowance, admits a pool. `admit(Some(bytes))` is
+/// the admission keeping the startup set's `bytes` free, `admit(None)` the one keeping what lazily
+/// captured graphs keep; each admission charges them its own way (a planned one the bytes above the
+/// planner's allowance on every GPU, a measured one the bytes themselves). Returns the pool and
+/// whether decode graphs are captured at startup. Every other refusal stands: the first admission's
+/// own error when it is not a shortfall; the startup refusal when the retry is short of memory too;
+/// and the retry's own error, with the startup refusal as context, when the retry fails for another
 /// reason (its memory sample, an overflow, a CUDA query, a checkpoint read).
 pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
-    mut admit: impl FnMut(u64) -> Result<usize>) -> Result<(usize, bool)> {
+    mut admit: impl FnMut(Option<u64>) -> Result<usize>) -> Result<(usize, bool)> {
     use crate::shared::memory_report::kv_shortfall;
-    let Some(graphs) = startup else { return Ok((admit(0)?, false)) };
+    let Some(graphs) = startup else { return Ok((admit(None)?, false)) };
     let extra = graphs.reserve.saturating_sub(graphs.allowance);
-    let refused = match admit(extra) {
+    let refused = match admit(Some(graphs.reserve)) {
         Ok(tokens) => return Ok((tokens, true)),
         Err(error) if extra > 0 && kv_shortfall(&error) => error,
         Err(error) => return Err(error),
     };
-    let tokens = match admit(0) {
+    let tokens = match admit(None) {
         Ok(tokens) => tokens,
         // No room either way: the startup set is not what leaves the pool out, so its refusal stands.
         Err(retry) if kv_shortfall(&retry) => return Err(refused),
@@ -3505,29 +3507,32 @@ mod prefill_lane_tests {
             Ok(tokens as usize)
         };
         let calls = std::cell::RefCell::new(Vec::new());
+        // A planned admission: the startup set's bytes above the allowance, nothing for lazy capture.
         let counted = |room: u64| { let admit = modelled(room); let calls = &calls;
-            move |extra: u64| { calls.borrow_mut().push(extra); admit(extra) } };
-        // Fits: startup capture, one admission with the startup set's extra.
+            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs);
+                admit(graphs.map_or(0, |bytes| bytes.saturating_sub(allowance))) } };
+        let set = Some(allowance + 3_388_063_576);
+        // Fits: startup capture, one admission keeping the startup set.
         let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(8_000_000_000)).unwrap();
         assert!(at_startup && tokens == 390_656);
-        assert_eq!(calls.take(), [3_388_063_576]);
+        assert_eq!(calls.take(), [set]);
         // A real shortfall: no room beside the startup set, 49,408 tokens with lazily captured graphs.
         let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(49_408 * 11_804)).unwrap();
         assert!(!at_startup && tokens == 49_408);
-        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        assert_eq!(calls.take(), [set, None]);
         // No room either way: the startup admission's refusal stands.
         let error = admit_beside_decode_graphs(startup, counted(1_000)).unwrap_err();
         assert!(error.to_string().contains(&format!("{}", 1_000 - 3_388_063_576_i64)), "{error}");
-        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        assert_eq!(calls.take(), [set, None]);
         // Any other refusal is not a shortfall: no retry.
-        let failing = |_: u64| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
+        let failing = |_: Option<u64>| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
         assert!(admit_beside_decode_graphs(startup, failing).unwrap_err().to_string().contains("CUDA error"));
         // A startup set within the allowance adds nothing to retry without; startup capture off runs lazily.
         let within = Some(StartupGraphReserve { reserve: allowance, allowance });
         assert!(admit_beside_decode_graphs(within, counted(1_000)).is_err());
-        assert_eq!(calls.take(), [0]);
+        assert_eq!(calls.take(), [Some(allowance)]);
         assert_eq!(admit_beside_decode_graphs(None, counted(49_408 * 11_804)).unwrap(), (49_408, false));
-        assert_eq!(calls.take(), [0]);
+        assert_eq!(calls.take(), [None]);
     }
 
     /// The lazy retry after each refusal for want of memory: a pool falls back to lazy capture; a retry
@@ -3558,25 +3563,26 @@ mod prefill_lane_tests {
         let allowance = 1_610_612_736;
         let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
         let calls = std::cell::RefCell::new(Vec::new());
-        // The admission with the startup set's extra is refused with `first`; the retry answers `retry`.
+        // The admission keeping the startup set is refused with `first`; the retry answers `retry`.
         let scripted = |first: anyhow::Error, retry: anyhow::Result<usize>| {
             let mut answers = vec![retry, Err(first)];
             let calls = &calls;
-            move |extra: u64| { calls.borrow_mut().push(extra); answers.pop().expect("at most two admissions") }
+            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two admissions") }
         };
+        let both = [Some(allowance + 3_388_063_576), None];
         let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
         let refusals: [(fn() -> anyhow::Error, usize); 2] = [(no_room, 49_408), (over_budget, 91_904)];
         for (refusal, pool) in refusals {
             // A pool with lazily captured graphs: lazy capture.
             let admitted = admit_beside_decode_graphs(startup, scripted(refusal(), Ok(pool))).unwrap();
             assert_eq!(admitted, (pool, false));
-            assert_eq!(calls.take(), [3_388_063_576, 0]);
+            assert_eq!(calls.take(), both);
             // Short either way: the startup refusal, unchanged.
             for (short, _) in refusals {
                 let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(short()))).unwrap_err();
                 assert!(kv_shortfall(&error));
                 assert_eq!(chain(&error), chain(&refusal()));
-                assert_eq!(calls.take(), [3_388_063_576, 0]);
+                assert_eq!(calls.take(), both);
             }
             // Another failure: the retry's own error, whole, beneath the startup refusal as context.
             for other in others {
@@ -3584,7 +3590,7 @@ mod prefill_lane_tests {
                 assert!(!kv_shortfall(&error), "{error:#}");
                 assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
                 assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
-                assert_eq!(calls.take(), [3_388_063_576, 0]);
+                assert_eq!(calls.take(), both);
             }
         }
     }

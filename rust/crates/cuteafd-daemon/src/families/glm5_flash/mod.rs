@@ -386,6 +386,128 @@ mod draft_cli_tests {
         assert_eq!(planned_graph_extra(&lazy, None, allowance), 0);
     }
 
+    /// `measured_pool_tokens` modelled on a 5090 (33,711,521,792 B) at default flags with Spark experts,
+    /// an automatic pool and 16 sequences, from what its launches measured once start-up had allocated
+    /// everything but the pool: `free` bytes free (11,876,761,600 at 8,192 and at 131,072 tokens), and
+    /// 2 GiB of headroom and 7,702,414,080 B of state and marks kept beside the graphs, at 11,804 B a
+    /// token in 256-token units. The GPU's one-unit check, then the pool in what the reserve leaves
+    /// (`admitted_pool_tokens`). Records each measurement's graph bytes in `calls`.
+    fn measured_on_a_5090(free: u64, calls: &std::cell::RefCell<Vec<u64>>)
+        -> impl FnMut(u64) -> anyhow::Result<usize> + '_ {
+        use cuteafd_core::serving_capacity::{DeviceMemory, GpuMemoryBudget, DEFAULT_GPU_KV_TOKENS};
+        const TOTAL: u64 = 33_711_521_792;
+        move |graphs| {
+            calls.borrow_mut().push(graphs);
+            let reserve = (2u64 << 30) + graphs + 7_702_414_080;
+            GpuMemoryBudget(TOTAL).admit(DeviceMemory { device: 0, total_bytes: TOTAL, baseline_free_bytes: free },
+                reserve + 256 * 11_804)?;
+            let room = free as i64 - reserve as i64;
+            let tokens = cuteafd_core::memory_layout::size_pool(&[room], &[11_804], 256, DEFAULT_GPU_KV_TOKENS);
+            anyhow::ensure!(tokens >= 256, crate::shared::memory_report::NoKvRoom { free_after_reserve: vec![room] });
+            Ok(tokens as usize)
+        }
+    }
+
+    /// The 5090's measured refusal (its one-unit check): `required` bytes against 33,711,521,792. At default
+    /// flags, 131,072 tokens and 16 sequences the launch beside the startup set (28,060 graphs,
+    /// 4,998,676,312 B) was refused needing 36,686,356,056 B, short 2,974,834,264 B.
+    fn the_5090_refusal(required: u64, shortfall: u64) -> cuteafd_core::serving_capacity::CapacityError {
+        cuteafd_core::serving_capacity::CapacityError::GpuBudgetExceeded { device: 0, required,
+            budget: 33_711_521_792, shortfall }
+    }
+
+    /// The launch the measured admission refused falls back to lazily captured graphs, which keep the
+    /// 1.5 GiB allowance: 3,388,063,576 B more room, 35,072 tokens. With less free memory, short either
+    /// way, the startup refusal stands.
+    #[test]
+    fn a_measured_admission_falls_back_to_lazy_capture_on_a_real_shortfall() {
+        use cuteafd_core::serving_capacity::CapacityError;
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        assert_eq!(kv_admission(&args, false, false), KvAdmission::Measured);
+        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
+        assert_eq!(allowance, 1_610_612_736);
+        let calls = std::cell::RefCell::new(Vec::new());
+        // The model refuses the startup set as the launch did.
+        let refused = measured_on_a_5090(11_876_761_600, &calls)(set).unwrap_err();
+        assert_eq!(refused.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(36_686_356_056, 2_974_834_264)));
+        assert_eq!(calls.take(), [set]);
+        // Measured again keeping the allowance: lazy capture, 35,072 tokens.
+        let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
+        assert_eq!(admitted, (35_072, false));
+        assert_eq!(calls.take(), [set, allowance]);
+        // 876,761,600 B less free: short by 463,532,288 B with the allowance too, so the startup refusal stands.
+        let error = measured_admission(&args, Some(set), measured_on_a_5090(11_000_000_000, &calls)).unwrap_err();
+        assert_eq!(error.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(37_563_117_656, 3_851_595_864)));
+        assert_eq!(calls.take(), [set, allowance]);
+    }
+
+    /// A startup set that fits is kept as before: measured once, captured at startup. At 8,192 tokens the
+    /// launch's set (10,580 graphs, 1,926,552,328 B) left the 8,448 tokens it admitted. A set within the
+    /// allowance (1,474,297,856 B, what that launch captured) is kept exactly, not as the allowance, and
+    /// refused, has no room to gain from lazy capture: its refusal stands, measured once.
+    #[test]
+    fn a_measured_admission_keeps_a_startup_set_that_fits_unchanged() {
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        let calls = std::cell::RefCell::new(Vec::new());
+        for (set, tokens) in [(1_926_552_328, 8_448), (1_474_297_856, 46_592)] {
+            let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
+            assert_eq!(admitted, (tokens, true));
+            assert_eq!(calls.take(), [set]);
+        }
+        let error = measured_admission(&args, Some(1_474_297_856), measured_on_a_5090(11_000_000_000, &calls))
+            .unwrap_err();
+        assert!(crate::shared::memory_report::kv_shortfall(&error), "{error:#}");
+        assert_eq!(calls.take(), [1_474_297_856]);
+    }
+
+    /// A lazy retry that fails for another reason (its memory sample, an overflow, a CUDA query) returns
+    /// its own error, whole, beneath the startup refusal; a first measurement that fails so is not retried.
+    #[test]
+    fn a_measured_retry_that_fails_for_another_reason_keeps_its_own_error() {
+        use crate::shared::memory_report::kv_shortfall;
+        use cuteafd_core::serving_capacity::CapacityError;
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
+        let refusal = || anyhow::Error::from(the_5090_refusal(36_686_356_056, 2_974_834_264));
+        let others: [fn() -> anyhow::Error; 3] = [
+            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
+            || anyhow::anyhow!("KV admission reserve overflows"),
+            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
+        ];
+        let calls = std::cell::RefCell::new(Vec::new());
+        // Measurements answering `answers` in turn.
+        let scripted = |mut answers: Vec<anyhow::Result<usize>>| { answers.reverse(); let calls = &calls;
+            move |graphs: u64| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two measurements") } };
+        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
+        for other in others {
+            let error = measured_admission(&args, Some(set), scripted(vec![Err(refusal()), Err(other())])).unwrap_err();
+            assert!(!kv_shortfall(&error), "{error:#}");
+            assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
+            assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
+            assert_eq!(calls.take(), [set, allowance]);
+            let error = measured_admission(&args, Some(set), scripted(vec![Err(other())])).unwrap_err();
+            assert_eq!(chain(&error), chain(&other()));
+            assert_eq!(calls.take(), [set]);
+        }
+    }
+
+    /// Without a startup set (a graph budget turns startup capture off, as `CUTEAFD_GLMF_STARTUP_GRAPHS=0`
+    /// does) the measured admission measures once, keeping the budget, else the allowance, and captures
+    /// lazily, with nothing to fall back to: at 512 MiB the 126,208 tokens the budgeted launch admitted;
+    /// at 4096 MiB its refusal stands.
+    #[test]
+    fn a_measured_admission_without_a_startup_set_measures_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        for (budget, kept, admitted) in [(None, 1_610_612_736, Some(35_072)), (Some("512"), 536_870_912, Some(126_208)),
+            (Some("4096"), 4_294_967_296, None)] {
+            let args = with_budget(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat(), budget);
+            assert!(budget.is_none() || !args.startup_graphs());
+            let result = measured_admission(&args, None, measured_on_a_5090(11_876_761_600, &calls));
+            assert_eq!(result.ok(), admitted.map(|tokens| (tokens, false)), "{budget:?}");
+            assert_eq!(calls.take(), [kept], "{budget:?}");
+        }
+    }
+
     #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
@@ -582,7 +704,7 @@ fn graph_reserve(args: &EngineArgs) -> u64 {
 enum KvAdmission {
     /// From the free memory measured once everything else is allocated: one GPU with Spark experts
     /// and an automatic pool, or any one-GPU launch under a coordinator GPU budget. It keeps the
-    /// startup set's reserve free for decode graphs, else `graph_reserve`.
+    /// startup set's reserve free for decode graphs, else `graph_reserve` (`measured_admission`).
     Measured,
     /// From the planner's per-GPU costs before the engine allocates: a head split, local experts
     /// without a GPU budget, a fixed pool. Every GPU keeps the planner's graph allowance and
@@ -615,6 +737,21 @@ fn kv_admission(args: &EngineArgs, gpu_budget: bool, split: bool) -> KvAdmission
 fn planned_graph_extra(args: &EngineArgs, startup_reserve: Option<&[u64]>, allowance: u64) -> u64 {
     let startup = startup_reserve.and_then(|reserve| reserve.iter().copied().max()).unwrap_or(0);
     startup.max(args.graph_budget_mib.map_or(0, |mib| mib << 20)).saturating_sub(allowance)
+}
+
+/// The measured admission beside the startup decode graphs (`startup`, the set's reserve on its one
+/// GPU; None when graphs are captured lazily). `measure(graphs)` sizes the pool from the free memory
+/// measured now, keeping `graphs` bytes free for decode graphs. It keeps the startup set's reserve
+/// exactly, below the allowance or above it. When that leaves no room for a pool, it measures again
+/// keeping `graph_reserve` (with a startup set, the planner's allowance), and decode graphs are
+/// captured lazily: the planned admission's rule (`engine::admit_beside_decode_graphs`). Everything
+/// else precedes the pool, so only the graph reserve differs between the two measurements. Returns the
+/// pool and whether decode graphs are captured at startup.
+fn measured_admission(args: &EngineArgs, startup: Option<u64>, mut measure: impl FnMut(u64) -> Result<usize>)
+    -> Result<(usize, bool)> {
+    let lazy = graph_reserve(args);
+    engine::admit_beside_decode_graphs(startup.map(|reserve| engine::StartupGraphReserve { reserve, allowance: lazy }),
+        |graphs| measure(graphs.unwrap_or(lazy)))
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -850,16 +987,18 @@ impl Opened {
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes;
-            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance).
-            let graphs = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied())
-                .unwrap_or_else(|| graph_reserve(args));
-            let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
-                graphs, later: state + after_pool(rank) + future_expert_bytes };
-            let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
-                (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
+            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
+            // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
+            let (headroom, later) = (args.headroom_bytes()?, state + after_pool(rank) + future_expert_bytes);
+            let startup = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied());
+            let admitted = measured_admission(args, startup, |graphs| {
+                let reserve = crate::shared::memory_report::MeasuredReserve { headroom, graphs, later };
+                crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
+                    (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
+                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64))
+            })?;
             early = Some((experts, drafter, dense, selector, workspaces));
-            (tokens, startup_graphs)
+            admitted
         } else if admission == KvAdmission::Planned {
             // 0: automatic; fixed pools (budgeted, served, or beside decode graphs) retain their
             // requested size and refuse before allocation if the future storage would not fit.
@@ -906,8 +1045,9 @@ impl Opened {
             let lazy_extra = planned_graph_extra(args, None, allowance);
             let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
                 reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
-            engine::admit_beside_decode_graphs(startup, |graph_extra| {
-                let graph_extra = graph_extra.max(lazy_extra);
+            engine::admit_beside_decode_graphs(startup, |graphs| {
+                // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
+                let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
                 let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
                     crate::shared::memory_report::RankReserve {
                         extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
