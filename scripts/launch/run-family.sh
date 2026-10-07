@@ -680,6 +680,21 @@ if [[ $family == glm5_flash ]]; then
     spark_worker_env+=" -v $exl3_route_dump:$exl3_route_dump -e CUTEAFD_EXL3_ROUTE_DUMP=$exl3_route_dump/routes"
     spark_worker_env+=" -e CUTEAFD_EXL3_ROUTE_DUMP_CALLS=$exl3_route_dump_calls"
   fi
+  # GLM5_FLASH_KDA_STATE: the KDA recurrent state, f32 (default) or bf16: half the state and
+  # prefix-mark bytes, computed in FP32 and rounded after every decode/verify/commit row and at
+  # each chunked-prefill window end (bf16-tile: after every 16-row prefill tile). It runs the
+  # BF16-projection KDA programs on one GPU (GLM5_FLASH_KDA_FP8=off, no head split).
+  kda_state="$(get GLM5_FLASH_KDA_STATE f32)"
+  case "$kda_state" in
+    ""|f32) ;;
+    bf16|bf16-tile)
+      if [[ $kda_fp8 != off || $head_split != 0 ]]; then
+        echo "GLM5_FLASH_KDA_STATE=$kda_state runs the BF16-projection KDA programs on one GPU; set GLM5_FLASH_KDA_FP8=off without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--kda-state "$kda_state") ;;
+    *) echo "GLM5_FLASH_KDA_STATE must be f32, bf16 or bf16-tile" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

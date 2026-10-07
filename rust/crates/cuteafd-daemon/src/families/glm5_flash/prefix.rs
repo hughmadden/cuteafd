@@ -8,8 +8,9 @@
 //! length), and a partial tail unit is copied (its rows and its complete pools).
 //!
 //! Mark: the KDA layers' recurrent state is per sequence and overwritten by every step, so a
-//! snapshot copies it whole: every KDA layer's FP32 state `[64, 128, 128]` and conv window
-//! (the last three q/k/v inputs), 34 layers = 140.8 MiB. The arena is sized by decoding lanes,
+//! snapshot copies it whole: every KDA layer's state `[64, 128, 128]` and conv window (the last
+//! three q/k/v inputs), 34 layers = 140.8 MiB with an FP32 state, 72.8 MiB with `--kda-state bf16`
+//! (the slot regions' bytes, whatever the state type). The arena is sized by decoding lanes,
 //! with the host tier holding the rest. A restore copies the mark back into the new
 //! sequence's own KDA slot and maps its pool pages; nothing else of the state is positional.
 //! The capture point must be where the KDA state is: `kda_len` (a speculative verify leaves

@@ -522,7 +522,8 @@ impl FamilyModel for GlmModel {
         }
         match &self.cache_cfg {
             GlmCacheConfig::Dsa(cfg) => glm_cache_geometry(cfg, cfg.layers, options.coordinator_ranks).map(Some),
-            GlmCacheConfig::Flash(cfg) => glm_flash_rank_cache_geometry(cfg, cfg.layers, options.coordinator_ranks).map(Some),
+            GlmCacheConfig::Flash(cfg) => glm_flash_rank_cache_geometry(cfg, cfg.layers, options.coordinator_ranks,
+                options.kda_state_bytes).map(Some),
         }
     }
 

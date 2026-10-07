@@ -6,8 +6,8 @@
 //! back into the streams and onto the FFN site, the FFN, and the next fused
 //! post/pre (`mhc_post` after the last layer, then the stream-mean head).
 //!
-//! Attention: KDA layers keep per-sequence recurrent state (FP32
-//! `[64, 128, 128]`) and short-conv state (the last three q/k/v inputs) in
+//! Attention: KDA layers keep per-sequence recurrent state (FP32, or BF16 with
+//! `--kda-state bf16`, `[64, 128, 128]`) and short-conv state (the last three q/k/v inputs) in
 //! slot pools, one slot per sequence shared by every KDA layer (every KDA
 //! layer's pool back to back, so `glmf_kda_commit` reaches all of them in one
 //! launch). A speculative verify step (`verify_spec`) leaves that state alone
@@ -48,7 +48,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
-    glmf_temporary_bytes, GlmfScratchOptions, GlmfStepShape};
+    glmf_temporary_bytes, GlmfKdaState, GlmfScratchOptions, GlmfStepShape};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
@@ -78,6 +78,60 @@ const REPLAY_ROWS: usize = DECODE_ROWS;
 fn replay_bytes(heads: usize, channels: usize) -> usize {
     REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
 }
+/// Storage of the KDA recurrent state (`--kda-state`). Every program computes in FP32; a BF16
+/// state is rounded to nearest even after every decode, verify and commit row (after the row's
+/// read-out, so a verify committed at k rows stores the bits of k serial steps) and in the chunked
+/// prefill where each window of tiles stores it (`bf16-tile`: after every 16-row tile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum KdaState {
+    #[default]
+    F32,
+    Bf16,
+    /// BF16 with the chunked prefill rounded after every 16-row tile.
+    #[value(name = "bf16-tile")]
+    Bf16Tile,
+}
+
+impl KdaState {
+    /// The `--kda-state` value.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Bf16 => "bf16",
+            Self::Bf16Tile => "bf16-tile",
+        }
+    }
+
+    /// Bytes of one state element.
+    pub(crate) fn bytes(self) -> usize {
+        if self == Self::F32 { 4 } else { 2 }
+    }
+
+    /// The `glmf_kda_*` program of capacity `cap` (`m64`, `m4096`) for this state.
+    pub(crate) fn program(self, cap: &str) -> String {
+        match (self, cap) {
+            (Self::F32, _) => format!("kda_{cap}"),
+            (Self::Bf16Tile, "m4096") => format!("kda_s16t_{cap}"),
+            _ => format!("kda_s16_{cap}"),
+        }
+    }
+
+    /// The verify-by-replay commit program for this state.
+    pub(crate) fn commit_program(self) -> &'static str {
+        if self == Self::F32 { "kda_commit" } else { "kda_commit_s16" }
+    }
+}
+
+impl From<KdaState> for GlmfKdaState {
+    fn from(state: KdaState) -> Self {
+        match state {
+            KdaState::F32 => Self::F32,
+            KdaState::Bf16 => Self::Bf16,
+            KdaState::Bf16Tile => Self::Bf16Tile,
+        }
+    }
+}
+
 const MAX_RANKS: usize = 6;
 /// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
 /// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
@@ -501,6 +555,8 @@ pub(crate) struct StepSettings {
     pub full_prefill_logits: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
+    /// The KDA recurrent state's storage: which KDA programs the steps launch (`--kda-state`).
+    pub kda_state: KdaState,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -515,7 +571,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             cfg,
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
-                kda_prefill_expanded: settings.kda_prefill_expanded },
+                kda_prefill_expanded: settings.kda_prefill_expanded, kda_state: settings.kda_state.into() },
             shape: GlmfStepShape {
                 lead: true,
                 split,
@@ -695,7 +751,7 @@ impl<'a> DenseNvfp4<'a> {
 
 /// One GPU's caches. Per MLA layer (None for KDA): the latent record pool, and the per-token
 /// indexer keys | gates (BF16 [record slots, 256]) with the FP8 pool-key cache. Every KDA
-/// layer's pools back to back: FP32 recurrent state `[layers, slots, heads, 128, 128]`, BF16
+/// layer's pools back to back: FP32 or BF16 recurrent state `[layers, slots, heads, 128, 128]`, BF16
 /// conv state `[layers, slots, 3, 3D]` and the speculative replay records (`replay_bytes`
 /// per layer), over this GPU's KDA heads. The `glmf_kda_commit` tables (slot, first row, kept
 /// rows per sequence) and the logical page of each pool-cache page within its sequence.
@@ -714,7 +770,7 @@ struct Caches<'a> {
 impl<'a> Caches<'a> {
     /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads.
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
-        slots: usize, kda_heads: usize) -> Result<Self> {
+        slots: usize, kda_heads: usize, kda_state: KdaState) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -735,7 +791,7 @@ impl<'a> Caches<'a> {
                 }
             }
         }
-        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * d * cfg.kda_head_dim * 4)?,
+        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * d * cfg.kda_head_dim * kda_state.bytes())?,
             kda_conv: zeroed(kda_layers * slots * 3 * 3 * d * 2)?,
             kda_replay: zeroed(kda_layers * replay_bytes(kda_heads, 3 * d))?,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
@@ -854,6 +910,8 @@ pub(crate) struct GlmfEngine<'a> {
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
+    /// The KDA recurrent state's storage (its programs, slot and mark bytes).
+    pub kda_state: KdaState,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
     /// The serving loop's token selector when start-up made it before the KV pool.
@@ -1125,7 +1183,7 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
-        slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        slots: usize, embedding: TokenEmbedding<'a>, kda_state: KdaState) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -1143,7 +1201,7 @@ impl<'a> GlmfEngine<'a> {
         })).collect();
         // A head split's shares hold half the KDA heads (and their state).
         let kda_heads = cfg.kda_heads / if weights.layers.first().is_some_and(|l| l.split) { 2 } else { 1 };
-        let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads)?;
+        let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, kda_state)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
@@ -1164,7 +1222,7 @@ impl<'a> GlmfEngine<'a> {
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
-            kda_prefill_expanded: false, l2: None, embedding, selector: RefCell::new(None) })
+            kda_prefill_expanded: false, kda_state, l2: None, embedding, selector: RefCell::new(None) })
     }
 
     /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
@@ -1327,7 +1385,7 @@ impl<'a> GlmfEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads)?;
+                self.caches.kda_heads, self.kda_state)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1504,8 +1562,8 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks): the FP32
-    /// recurrent state first (rank by rank under a head split), then the BF16 conv state.
+    /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks): the recurrent
+    /// state first (FP32 or BF16, rank by rank under a head split), then the BF16 conv state.
     pub fn slot_state(&self, slot: i32) -> Result<Vec<u8>> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
@@ -1553,7 +1611,7 @@ impl<'a> GlmfEngine<'a> {
                 self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             }
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
-            self.run_on(rank, split, "kda_commit", &[("state", caches.kda_state.buffer.ptr),
+            self.run_on(rank, split, self.kda_state.commit_program(), &[("state", caches.kda_state.buffer.ptr),
                 ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.buffer.ptr),
                 ("tables", caches.commit_tables.buffer.ptr)],
                 &[Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)])?;
@@ -1663,7 +1721,7 @@ impl<'a> GlmfEngine<'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
-                max_context: self.max_context })
+                max_context: self.max_context, kda_state: self.kda_state })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -2765,7 +2823,7 @@ impl<'a> GlmfEngine<'a> {
         let caches = self.caches_of(rank);
         let d = caches.kda_heads * self.cfg.kda_head_dim;
         let conv_state = at(&caches.kda_conv, self.slots * 3 * 3 * d * 2);
-        let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * 4);
+        let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         let replay = at(&caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
         let decode = cap == "m64";
         if layer.has("w_in_fp8") {
@@ -2792,7 +2850,7 @@ impl<'a> GlmfEngine<'a> {
             ensure!(!spec, "speculative steps are decode-shaped");
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        self.run_on(rank, layer.split, &format!("kda_{cap}"), &pointers, &scalars)
+        self.run_on(rank, layer.split, &self.kda_state.program(cap), &pointers, &scalars)
     }
 
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
@@ -3430,8 +3488,30 @@ impl Drop for GlmfEngine<'_> {
 
 #[cfg(test)]
 mod prefill_lane_tests {
-    use super::{prefill_lane_capacity, prefill_lane_plan, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES, MIN_LANE_ROWS,
-        PAGE_ROWS};
+    use super::{prefill_lane_capacity, prefill_lane_plan, KdaState, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES,
+        MIN_LANE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn kda_state_selects_its_programs_and_element_size() {
+        assert_eq!((KdaState::F32.program("m64"), KdaState::F32.program("m4096"), KdaState::F32.commit_program()),
+            ("kda_m64".to_string(), "kda_m4096".to_string(), "kda_commit"));
+        assert_eq!((KdaState::Bf16.program("m64"), KdaState::Bf16.program("m4096"), KdaState::Bf16.commit_program()),
+            ("kda_s16_m64".to_string(), "kda_s16_m4096".to_string(), "kda_commit_s16"));
+        // Per-tile rounding changes only the chunked prefill; decode and commit are per row either way.
+        assert_eq!((KdaState::Bf16Tile.program("m64"), KdaState::Bf16Tile.program("m4096"),
+            KdaState::Bf16Tile.commit_program()),
+            ("kda_s16_m64".to_string(), "kda_s16t_m4096".to_string(), "kda_commit_s16"));
+        assert_eq!([KdaState::F32.bytes(), KdaState::Bf16.bytes(), KdaState::Bf16Tile.bytes()], [4, 2, 2]);
+        // 34 KDA layers x 16 slots x 64 heads x 128 x 128: 2.28 GB in FP32, 1.14 GB in BF16.
+        assert_eq!(34 * 16 * 64 * 128 * 128 * KdaState::F32.bytes(), 2_281_701_376);
+        assert_eq!(34 * 16 * 64 * 128 * 128 * KdaState::Bf16.bytes(), 1_140_850_688);
+        // The loader's step scratch (`GlmfScratchOptions::kda_state`) charges the programs the steps launch.
+        for state in [KdaState::F32, KdaState::Bf16, KdaState::Bf16Tile] {
+            let loader = super::GlmfKdaState::from(state);
+            assert_eq!((loader.program("m64"), loader.program("m4096"), loader.bytes()),
+                (state.program("m64"), state.program("m4096"), state.bytes() as u64));
+        }
+    }
 
     #[test]
     fn split_audit_counts_routes_and_hashes_token_bytes_in_order() {

@@ -14,8 +14,8 @@ mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
-    glmf_table_pages, glmf_temporary_bytes, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions, GlmfStepShape,
-    GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS, GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE,
+    glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions,
+    GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS, GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE,
     GLMF_SPARSE_TOPK};
 mod v4_workspace;
 pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
@@ -52,6 +52,8 @@ pub struct CacheOptions {
     pub mimo_kv: MimoKvCache,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
+    /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
+    pub kda_state_bytes: u64,
 }
 
 impl Default for CacheOptions {
@@ -61,6 +63,7 @@ impl Default for CacheOptions {
             native_mtp_layers: 0,
             mimo_kv: MimoKvCache::Int8,
             prefill_rows: 4096,
+            kda_state_bytes: 4,
         }
     }
 }
@@ -235,18 +238,21 @@ pub fn glm_flash_cache_geometry(
     cfg: &GlmNextConfig,
     layers: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
-    glm_flash_rank_cache_geometry(cfg, layers, 1)
+    glm_flash_rank_cache_geometry(cfg, layers, 1, 4)
 }
 
 /// MLA records remain replicated; recurrent KDA state and replay follow each
-/// coordinator's head partition, as in the GLM Flash engine's Caches.
+/// coordinator's head partition, as in the GLM Flash engine's Caches. The
+/// recurrent state takes `state_bytes` per element: 4 (FP32) or 2 (BF16).
 pub fn glm_flash_rank_cache_geometry(
     cfg: &GlmNextConfig,
     layers: usize,
     ranks: usize,
+    state_bytes: u64,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("glm5_flash", cfg.layers, layers)?;
     if ![1, 2].contains(&ranks)
+        || ![2, 4].contains(&state_bytes)
         || cfg.kv_lora_rank != 512
         || cfg.kda_head_dim != 128
         || cfg.kda_heads == 0
@@ -274,7 +280,7 @@ pub fn glm_flash_rank_cache_geometry(
         &[
             product(
                 "KDA recurrent state",
-                &[channels, cfg.kda_head_dim as u64, 4],
+                &[channels, cfg.kda_head_dim as u64, state_bytes],
             )?,
             product("KDA short-conv state", &[3, 3, channels, 2])?,
         ],
@@ -579,7 +585,7 @@ mod tests {
             geometry.ranks[0].active_state_per_sequence_bytes,
             geometry.ranks[0].retained_mark_bytes
         );
-        let split = glm_flash_rank_cache_geometry(&cfg, 45, 2).unwrap();
+        let split = glm_flash_rank_cache_geometry(&cfg, 45, 2, 4).unwrap();
         assert_eq!(split.placement, KvPlacement::Replicated);
         assert_eq!(split.ranks[0], split.ranks[1]);
         assert_eq!(split.ranks[0].persistent_unit_bytes, geometry.ranks[0].persistent_unit_bytes);
@@ -588,8 +594,17 @@ mod tests {
         assert_eq!(split.ranks[0].retained_mark_bytes * 2, geometry.ranks[0].retained_mark_bytes);
         assert_eq!(split.ranks[0].speculative_replay_bytes * 2, geometry.ranks[0].speculative_replay_bytes);
         for ranks in [0, 3] {
-            assert!(glm_flash_rank_cache_geometry(&cfg, 45, ranks).is_err());
+            assert!(glm_flash_rank_cache_geometry(&cfg, 45, ranks, 4).is_err());
         }
+        // A BF16 recurrent state: 34 KDA layers x (64 x 128 x 128 x 2 + the BF16 conv windows)
+        // per sequence and per mark; the MLA pools and the FP32 replay records are unchanged.
+        let bf16 = glm_flash_rank_cache_geometry(&cfg, 45, 1, 2).unwrap();
+        assert_eq!(bf16.ranks[0].retained_mark_bytes, 76_316_672);
+        assert_eq!(bf16.ranks[0].active_state_per_sequence_bytes, 76_316_672);
+        assert_eq!(geometry.ranks[0].retained_mark_bytes - bf16.ranks[0].retained_mark_bytes, 34 * 64 * 128 * 128 * 2);
+        assert_eq!(bf16.ranks[0].persistent_unit_bytes, geometry.ranks[0].persistent_unit_bytes);
+        assert_eq!(bf16.ranks[0].speculative_replay_bytes, geometry.ranks[0].speculative_replay_bytes);
+        assert!(glm_flash_rank_cache_geometry(&cfg, 45, 1, 8).is_err());
     }
 
     #[test]
