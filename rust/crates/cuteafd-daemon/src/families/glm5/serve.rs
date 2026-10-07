@@ -55,10 +55,10 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
-    /// How a request that turns thinking off renders: low (the template's
-    /// Low effort, think block open) or empty (an empty think block after
-    /// the default Max effort).
-    #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "low")]
+    /// How a request that turns thinking off renders: empty (strictly off,
+    /// an empty think block after the default Max effort) or low (the
+    /// template's Low effort, think block open, a short plan as reasoning).
+    #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
     /// Decode one token per step (no copy-window drafts).
     #[arg(long)]
