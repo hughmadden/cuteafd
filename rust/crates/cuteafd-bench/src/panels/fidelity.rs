@@ -148,9 +148,11 @@ mod tests {
         info.configuration.settings.push(crate::report::Setting {name:"full-prefill-logits".into(),
             value:Some("true".into()),default:Some("false".into()),source:"cli".into()});
         assert!(FULL.unavailable(&info).is_none());
-        info.model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into();
-        assert!(STANDARD.unavailable(&info).is_none());
-        assert!(FULL.unavailable(&info).is_none());
+        for model in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"] {
+            info.model = model.into();
+            assert!(STANDARD.unavailable(&info).is_none());
+            assert!(FULL.unavailable(&info).is_none());
+        }
         info.configuration.settings.clear();
         assert!(FULL.unavailable(&info).unwrap().contains("FULL_PREFILL_LOGITS=on"));
     }
