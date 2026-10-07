@@ -615,6 +615,10 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                                 Err(_) => break,
                             }
                         };
+                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                            let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
+                            continue;
+                        }
                         if !job.media.is_empty() && !media.encoder().available() {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
@@ -676,12 +680,6 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 Ok(rope) => rope,
                 Err(error) => { reject(&ready, format!("rotary positions: {error:#}")); continue; }
             };
-            let score_rows = if probe::scoring(&ready.job().job.probe).is_some() {
-                match super::media::scoring_rows(&ready.job().job.probe, DECODE_ROWS) {
-                    Ok(rows) => rows,
-                    Err(error) => { reject(&ready, format!("scoring: {error:#}")); continue; }
-                }
-            } else { DECODE_ROWS };
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
             let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(engine.max_context);
             let Some(slot) = free_slots.pop() else {
@@ -735,9 +733,10 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             }));
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
-                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows, score_rows,
-                    &mut placement,
-                    |placement, chunk, logit| engine.prefill_device(placement, chunk, None, None, usize::from(logit)),
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
+                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, None, None, rows)?
+                        .map(probe::ScoreLogits::Device)),
                     |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false)?
                         .context("scoring needs every layer"));
                 match scored {

@@ -10,8 +10,8 @@
 //! the header does nothing for an ordinary client.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod rows;
 
@@ -207,6 +207,7 @@ pub struct ProbeRecord {
     pub cold: bool,
     pub no_speculation: bool,
     pub scored: usize,
+    /// The scoring path actually selected by the engine, not just requested.
     #[serde(default)]
     pub score_path: Option<String>,
     pub error: Option<String>,

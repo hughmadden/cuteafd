@@ -547,7 +547,7 @@ impl Opened {
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights resident (one copy each)");
-        let budgeted = cuteafd_ffi::coordinator_gpu_budget().is_some();
+        let budgeted = args.full_prefill_logits || cuteafd_ffi::coordinator_gpu_budget().is_some();
         // With a ceiling, establish local expert ownership before KV spends
         // the remaining budget. Lazy EXL3 owners reserve their loader peak.
         let mut future_expert_bytes = 0;
@@ -606,6 +606,8 @@ impl Opened {
             let extra = if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
                 else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 }) };
+            let extra = extra + if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
+                "glm5_flash", args.prefill_rows as u64, self.cfg.vocab_size as u64) } else { 0 };
             crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra + workspace_extra)?
@@ -658,6 +660,7 @@ impl Opened {
             }
         }
         if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
+        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the streams is gone.

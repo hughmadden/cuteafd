@@ -13,6 +13,10 @@ Spark ranks. DeepSeek V4.1 (the default) runs natively with the options below;
 DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints are
 recognized from their config.json and started by scripts/launch/run-family.sh,
 which takes --config and --restart and reads its own config keys.
+FULL_PREFILL_LOGITS=on (off by default) admits probe-only all-row prefill logits
+at launch for these five families (--full-prefill-logits in the daemon). Fidelity
+score_path=prefill requires this option; ordinary serving still uses last-row logits.
+The CPU planner counts this workspace with plan --layout --full-prefill-logits.
 SPARK_COUNT=2 or SPARK_COUNT=3 (compact EXL3, no SPARK_TP/SPARK_EP keys)
 requires EXL3 on one RTX, with a hard 32GiB GPU ceiling.
 An optional expert-group topology is selected in the configuration with

@@ -1459,6 +1459,20 @@ impl<'a> GlmfEngine<'a> {
         Ok(self.programs.spec(&format!("glmf_{name}"))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
+    pub fn prepare_scoring_prefill(&self) -> Result<()> {
+        // Prefix and short chunks use the serial workspace even with pipelining.
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false)?);
+        }
+        self.peer_workspaces(false, None)?;
+        if self.pipelined() {
+            let mut slots = self.lane_workspaces.borrow_mut();
+            while slots.len() < PREFILL_LANES { slots.push(self.workspace(self.prefill_rows, false)?); }
+            self.peer_workspaces(false, Some(PREFILL_LANES))?;
+        }
+        Ok(())
+    }
+
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.workspace_on(0, t, decode)
     }
@@ -1668,6 +1682,15 @@ impl<'a> GlmfEngine<'a> {
     pub fn prefill_media_device(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
         self.prefill_step(placement, tokens, None, None, false, true, Some(media))?.map(StepLogits::device).transpose()
+    }
+
+    /// Keep ordered all-row logits and media injection on the admitted scoring path.
+    pub(crate) fn prefill_scoring_media(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        self.prefill_step(placement, tokens, None, None, true, false, Some(media))?
+            .map(|logits| Ok(crate::shared::probe::ScoreLogits::Host {
+                values: logits.into_host(self.library)?, vocab: self.cfg.vocab_size,
+            })).transpose()
     }
 
     fn prefill_step(&self, placement: &mut GlmfPlacement, tokens: &[u32],

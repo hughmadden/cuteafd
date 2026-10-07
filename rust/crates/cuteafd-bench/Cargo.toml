@@ -10,6 +10,7 @@ description = "In-server benchmark runner: panels driven over the server's own O
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+base64 = "=0.22.1"
 clap.workspace = true
 cuteafd-api = { path = "../cuteafd-api" }
 cuteafd-loader = { path = "../cuteafd-loader" }
@@ -25,6 +26,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ureq = "=2.12.1"
+tempfile.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -532,6 +532,10 @@ fn schedule(
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
+            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                reject(&job, format!("scoring: {error:#}"));
+                continue;
+            }
             if !job.images.is_empty() {
                 reject(&job, "this checkpoint takes no images".into());
                 continue;
@@ -577,10 +581,18 @@ fn schedule(
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows,
+                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), engine.full_prefill_logits,
                     &mut (&mut placement, &mut *transports),
-                    |(placement, transports), chunk, logit| engine.prefill_device(placement, chunk, transports, runtime,
-                        usize::from(logit)),
+                    |(placement, transports), chunk, rows| {
+                        if rows > 1 {
+                            Ok(Some(probe::ScoreLogits::Host {
+                                values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,
+                                vocab: engine.cfg.vocab_size }))
+                        } else {
+                            Ok(engine.prefill_device(placement, chunk, transports, runtime, rows)?
+                                .map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |(placement, transports), chunk| engine.verify_device(&mut [(&mut **placement, chunk)], transports,
                         runtime));
                 match scored {

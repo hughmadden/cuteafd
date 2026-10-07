@@ -472,6 +472,14 @@ impl<'a> GlmEngine<'a> {
         Ok(self.programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
+    pub fn prepare_scoring_prefill(&self) -> Result<()> {
+        let count = if self.pipelined() { self.prefill_lanes } else { 1 };
+        let mut slots = self.lane_workspaces.borrow_mut();
+        while slots.len() < count { slots.push(self.workspace(self.prefill_rows, false)?); }
+        self.peer_workspaces(false, count)?;
+        Ok(())
+    }
+
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.workspace_on(0, t, decode)
     }

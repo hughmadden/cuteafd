@@ -7,8 +7,9 @@ out of every layer as a full-sequence prefill without a cache. Gated DeltaNet
 layers take the chunked path; full-attention layers run the real QSA indexer
 (every token is selected up to 2051 visible tokens, so shorter prompts are
 dense causal GQA) and eager attention. Positions, rotary embeddings and the
-causal mask are built as Qwen4ExpTextModel.forward builds them for a
-text-only prompt. The final collapse is ``hyper_connection_mixer``
+causal mask follow Qwen4ExpTextModel.forward; media windows use the pinned
+Qwen4ExpModel.get_rope_index T/H/W axes and native ids for PLE. The official
+BF16 tower replaces embeddings before their four HC copies. The final collapse is ``hyper_connection_mixer``
 (Qwen4ExpTextGatedResidual without the injection); there is no final norm,
 ``lm_head`` runs in FP32.
 
@@ -45,9 +46,14 @@ Writes the raw files ``qwen4-golden`` reads:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
+
+# Purge freed CPU staging pages immediately on the ARM Torch allocator.
+import os
+os.environ.setdefault("MIMALLOC_PURGE_DELAY", "0")
 
 import torch
 from safetensors import safe_open
@@ -55,12 +61,206 @@ from safetensors import safe_open
 PREFIX = "model.language_model."
 SHARD_ROWS = 2_500_012
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from fidelity_windows import CheckpointStorage, LayerCheckpoints, release_checkpoint, load_set, write_scored_logits, finish_golden, verify_snapshot, log_checkpoint_reads
+
+
+def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
+    manifest = load_set(a.windows, "qwen4")
+    from fidelity_media import require_media_flag
+    media = require_media_flag(manifest, getattr(a, "media", False), "qwen4")
+    identity = verify_snapshot(manifest, a.snapshot)
+    if media:
+        from qwen_media import snapshot_identity, validate_window
+        identity.update(snapshot_identity(a.snapshot))
+        for window in manifest["windows"]:
+            validate_window(window)
+    from shape_invariant import qualify
+    diagnostic_stop = getattr(a, "diagnostic_stop_after", None)
+    proof = None if diagnostic_stop is not None else qualify(a, manifest,
+        lambda probe: run_windows(probe, config, ref, dense, experts_src, create_causal_mask))
+    if getattr(a, "prefix_only", False) and not getattr(a, "_prefix_probe", False):
+        return
+    if PREFIX + "norm.weight" in dense:
+        raise ValueError("unexpected final norm: model feeds stream mixer into lm_head")
+    started, times, rows, states = time.time(), [], [], []
+    features, window_positions = {}, []
+    if media:
+        from qwen_media import window_features, rope_positions, inject_embeddings
+        features, _ = window_features(a, manifest)
+    for w in manifest["windows"]:
+        if media:
+            window_positions.append(rope_positions(w, a.snapshot, device="cpu"))
+        else:
+            window_positions.append(torch.arange(len(w["tokens"])).view(1, 1, -1).expand(4, 1, -1))
+    checkpoints = None
+    if getattr(a, "checkpoint_layers", False) and not getattr(a, "_prefix_probe", False):
+        shapes = {w["id"]: [1, len(w["tokens"]), config.hc_count * config.hidden_size] for w in manifest["windows"]}
+        binding = {"set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                   "experts_snapshot_identity": verify_snapshot({}, a.experts_snapshot or a.snapshot),
+                   "source_seal_sha256": a.source_seal_sha256,
+                   "ple_storage_seal_sha256": dense.ple_storage_seal_sha256}
+        checkpoints = LayerCheckpoints(a.out / "layer-checkpoints", binding, shapes,
+                                       resume=getattr(a, "resume_layers", None))
+    first_layer = 0
+    with torch.inference_mode():
+        if checkpoints is not None and checkpoints.resumed is not None:
+            last, arrays, times = checkpoints.resumed
+            if not 0 <= last < config.num_hidden_layers or len(times) != last + 1:
+                raise ValueError("invalid resumed layer extent")
+            states = [torch.from_numpy(bits).view(torch.bfloat16) for bits in arrays]
+            checkpoints.resumed = None
+            del arrays
+            first_layer = last + 1
+        else:
+            embed_weight = dense.get(PREFIX + "embed_tokens.weight")
+            for w in manifest["windows"]:
+                ids = torch.tensor([w["tokens"]], device="cuda")
+                embed = torch.nn.functional.embedding(ids, embed_weight)
+                if media:
+                    states.append(inject_embeddings(embed, w, features, config.hc_count).cpu())
+                else:
+                    states.append(embed.repeat(1, 1, config.hc_count).cpu())
+            del embed_weight, ids, embed
+        del features
+        rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
+        for layer_id in range(first_layer, config.num_hidden_layers):
+            start = time.time()
+            read_start = time.monotonic()
+            read_before = dense.read_bytes + experts_src.read_bytes if dense is not experts_src else dense.read_bytes
+            read_sources = (dense, experts_src) if dense is not experts_src else (dense,)
+            kind = config.layer_types[layer_id]
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.Qwen4ExpTextDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            skip = {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                table_rows, dim = emb.ngram_embedding.num_embeddings, emb.ngram_embedding.embedding_dim
+                if table_rows != 128 * SHARD_ROWS:
+                    raise ValueError("unexpected n-gram table shape")
+                emb.ngram_embedding = torch.nn.Identity()
+                del emb
+            layer = layer.to_empty(device="cuda")
+            if layer.ple is not None:
+                prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
+                layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, prefix, table_rows, dim)
+            load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
+            load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            log_checkpoint_reads(f"layer {layer_id} load", read_sources, read_before, read_start)
+            layer.eval()
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size, emb.ple_layer_index, emb.seed)
+                if not (torch.equal(emb.layer_multipliers.cpu(), expected)
+                        and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
+                        and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
+                    raise ValueError("checkpoint n-gram hash buffers differ from module")
+                del emb, expected
+            for i, w in enumerate(manifest["windows"]):
+                h = states[i].cuda()
+                ids = torch.tensor([w["tokens"]], device="cuda")
+                positions = window_positions[i].cuda()
+                # Masks/rotary depend on shape, not on the embedding values; one
+                # hidden-width view matches the original embedding's geometry.
+                embed_shape = h[..., :config.hidden_size]
+                causal = create_causal_mask(config=config, inputs_embeds=embed_shape, attention_mask=None,
+                    past_key_values=None, position_ids=positions[0], allow_is_causal_skip=False)
+                position_embeddings = rotary(embed_shape, positions[1:])
+                h = layer(h, position_embeddings=position_embeddings, attention_mask=causal, conv_mask=None,
+                          past_key_values=None, ple_input_ids=ids)
+                if a.layers is not None and layer_id in a.layers:
+                    folder = a.out / "windows" / w["id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+                states[i] = h.cpu()
+                del h, ids, positions, embed_shape, causal, position_embeddings
+            log_checkpoint_reads(f"layer {layer_id} total (includes lazy PLE)", read_sources, read_before, read_start)
+            del layer
+            memory.release()
+            memory.check(f"layer {layer_id}")
+            times.append(time.time() - start)
+            if checkpoints is not None:
+                checkpoints.commit(layer_id, [h.view(torch.uint16).numpy() for h in states], times)
+                memory.release()
+                memory.check(f"layer {layer_id} checkpoint")
+            print(f"layer {layer_id} ({kind}) {times[-1]:.1f}s ({len(states)} windows)", flush=True)
+            if diagnostic_stop == layer_id:
+                (a.out / "diagnostic.json").write_text(json.dumps({
+                    "qualification": False, "kind": "layer-timing-only",
+                    "set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                    "ple_storage_seal_sha256": dense.ple_storage_seal_sha256,
+                    "seconds_per_layer": times, "windows": [w["id"] for w in manifest["windows"]],
+                }, indent=2) + "\n")
+                return
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            mixer = ref.Qwen4ExpTextGatedResidual(config, use_combine=False)
+        torch.set_default_dtype(torch.float32)
+        mixer = mixer.to_empty(device="cuda")
+        load_module(mixer, dense, PREFIX + "hyper_connection_mixer.", set())
+        head = dense.get("lm_head.weight").float()
+        for i, w in enumerate(manifest["windows"]):
+            h = states[i][:, w["score_from"] - 1:len(w["tokens"]) - 1].cuda()
+            logits = torch.nn.functional.linear(mixer(h)[0].float(), head)
+            rows.append(write_scored_logits(a.out, w, logits.cpu().numpy()))
+            states[i] = None
+            del h, logits
+    finish_golden(a.out, manifest, rows, snapshot=str(a.snapshot),
+        experts_snapshot=str(a.experts_snapshot or a.snapshot),
+        reference="transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
+        seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        prefix_qualification=proof, ple_storage_seal_sha256=dense.ple_storage_seal_sha256)
+
+
+def verify_ple_storage(snapshot: Path, local: Path, index: dict) -> str:
+    """Admit a sealed local copy of only the indexed random-access table files."""
+    seal_bytes = (local / "seal.json").read_bytes()
+    seal = json.loads(seal_bytes)
+    expected = {v for k, v in index.items() if ".ple.ple_embedding.ngram_embedding.shard_" in k}
+    entries = seal.get("files", [])
+    if (seal.get("complete") is not True or seal.get("snapshot_revision") != snapshot.name
+            or seal.get("index_sha256") != hashlib.sha256((snapshot / "model.safetensors.index.json").read_bytes()).hexdigest()
+            or {entry["path"] for entry in entries} != expected or len(entries) != len(expected)):
+        raise ValueError("local PLE seal does not match the pinned checkpoint index")
+    total = 0
+    for entry in entries:
+        name = entry["path"]
+        path = local / name
+        if Path(name).name != name or path.resolve().parent != local.resolve():
+            raise ValueError("local PLE file escapes its staging directory")
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            while data := stream.read(8 << 20):
+                digest.update(data)
+                size += len(data)
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        if size != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
+            raise ValueError(f"local PLE bytes differ from the copy seal: {name}")
+        total += size
+    if total != seal.get("total_bytes"):
+        raise ValueError("local PLE total bytes differ from the copy seal")
+    return hashlib.sha256(seal_bytes).hexdigest()
+
 
 class Weights:
-    def __init__(self, snapshot: Path):
+    def __init__(self, snapshot: Path, ple_local: Path | None = None):
         self.snapshot = snapshot
         self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
         self.files: dict[str, object] = {}
+        self.read_bytes = 0
+        self.read_seconds = 0.0
+        self.ple_local = ple_local
+        self.ple_storage_seal_sha256 = verify_ple_storage(snapshot, ple_local, self.index) if ple_local else None
+
+    def ple_path(self, name: str) -> Path:
+        if ".ple.ple_embedding.ngram_embedding.shard_" not in name:
+            raise ValueError("local PLE mapping requested for a non-table tensor")
+        return (self.ple_local or self.snapshot) / self.index[name]
 
     def __contains__(self, name: str) -> bool:
         return name in self.index
@@ -72,7 +272,11 @@ class Weights:
         return self.files[shard]
 
     def raw(self, name: str) -> torch.Tensor:
-        return self.handle(name).get_tensor(name)
+        start = time.monotonic()
+        value = self.handle(name).get_tensor(name).clone()
+        self.read_bytes += value.numel() * value.element_size()
+        self.read_seconds += time.monotonic() - start
+        return value
 
     def get(self, name: str, device: str = "cuda") -> torch.Tensor:
         """BF16/FP32/int tensors as stored; FP8 weights times their 128x128 block scales."""
@@ -105,17 +309,23 @@ class LazyNgramTable(torch.nn.Module):
         for shard in torch.unique(shard_of).tolist():
             pick = (shard_of == shard).nonzero().flatten()
             name = f"{self.prefix}shard_{shard}.weight"
-            view = self.w.handle(name).get_slice(name)
-            for i in pick.tolist():
-                r = int(unique[i]) - shard * SHARD_ROWS
-                row = view[r:r + 1]
-                if row.dtype == torch.float8_e4m3fn:
-                    if self.scale is None:
-                        raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
-                    row = row.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
-                elif row.dtype != torch.bfloat16:
-                    raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
-                out[i] = row[0]
+            # PLE may touch all 128 shards in one layer; do not cache these handles.
+            with safe_open(str(self.w.ple_path(name)), framework="pt", device="cpu") as handle:
+                view = handle.get_slice(name)
+                for i in pick.tolist():
+                    r = int(unique[i]) - shard * SHARD_ROWS
+                    read_start = time.monotonic()
+                    row = view[r:r + 1]
+                    self.w.read_bytes += row.numel() * row.element_size()
+                    if row.dtype == torch.float8_e4m3fn:
+                        if self.scale is None:
+                            raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
+                        row = row.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
+                    elif row.dtype != torch.bfloat16:
+                        raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
+                    out[i] = row[0]
+                    self.w.read_seconds += time.monotonic() - read_start
+                del row, view
         return out[inverse].reshape(*ids.shape, self.dim).to(ids.device)
 
 
@@ -125,6 +335,7 @@ def load_experts(experts, src: Weights, prefix: str) -> None:
         if fused in src:
             experts.gate_up_proj.copy_(src.get(fused).to(torch.bfloat16))
             experts.down_proj.copy_(src.get(prefix + "mlp.experts.down_proj").to(torch.bfloat16))
+            release_checkpoint(torch.cuda, src)
             return
         first = prefix + "mlp.experts.0."
         if first + "gate_proj.trellis" in src:
@@ -134,6 +345,7 @@ def load_experts(experts, src: Weights, prefix: str) -> None:
             experts.gate_up_proj[e].copy_(torch.cat([src.get(base + "gate_proj.weight"),
                                                      src.get(base + "up_proj.weight")], 0))
             experts.down_proj[e].copy_(src.get(base + "down_proj.weight"))
+    release_checkpoint(torch.cuda, src)
 
 
 def load_module(module: torch.nn.Module, dense: Weights, prefix: str, skip: set[str]) -> None:
@@ -145,6 +357,7 @@ def load_module(module: torch.nn.Module, dense: Weights, prefix: str, skip: set[
             raise KeyError(f"{name}: no checkpoint tensor for {key}")
         with torch.no_grad():
             param.copy_(dense.get(name).reshape(param.shape).to(param.dtype))
+    release_checkpoint(torch.cuda, dense)
 
 
 def experts_fp32(self, hidden_states, top_k_index, top_k_weights):
@@ -165,14 +378,37 @@ def main() -> None:
     p.add_argument("--snapshot", type=Path, required=True, help="coordinator weights, config and tokenizer")
     p.add_argument("--experts-snapshot", type=Path,
                    help="routed experts (FP8 per-expert or BF16 fused; not EXL3); default --snapshot")
+    p.add_argument("--ple-local", type=Path, help="hash-sealed local PLE physical shards; all other weights still stream")
+    p.add_argument("--diagnostic-stop-after", type=int, help="window layer-timing diagnostic only; no qualification or logits")
+    p.add_argument("--checkpoint-layers", action="store_true", help="rolling hash-sealed local layer states")
+    p.add_argument("--resume-layers", type=Path, help="resume into a fresh output from a complete layer checkpoint tree")
+    p.add_argument("--source-seal-sha256", help="verified immutable source seal for checkpoint/resume identity")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
+    p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
+    p.add_argument("--media", action="store_true", help="inject the pinned official BF16 Qwen tower for media windows")
+    p.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
+    p.add_argument("--media-features-out", type=Path, help="write immutable BF16 paired-probe feature files")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
+    if a.prefix_only and not a.windows:
+        p.error("--prefix-only requires --windows")
+    if (a.media or a.media_root or a.media_features_out) and not (a.media and a.windows):
+        p.error("media options require --media --windows")
+
+    if a.checkpoint_layers and (not a.windows or a.prefix_only or a.diagnostic_stop_after is not None
+            or not a.source_seal_sha256 or len(a.source_seal_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in a.source_seal_sha256)):
+        p.error("--checkpoint-layers requires full --windows and a verified source seal SHA256")
+    if a.resume_layers and not a.checkpoint_layers:
+        p.error("--resume-layers requires --checkpoint-layers")
+    if a.diagnostic_stop_after is not None and (not a.windows or a.prefix_only or a.diagnostic_stop_after < 0):
+        p.error("--diagnostic-stop-after requires --windows, a nonnegative layer and no --prefix-only")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -183,13 +419,27 @@ def main() -> None:
     torch.cuda.set_device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    from shape_invariant import install
+    install()
+    from shape_invariant import install_eager
+    install_eager(ref)
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
+    if a.diagnostic_stop_after is not None and a.diagnostic_stop_after >= config.num_hidden_layers:
+        p.error("diagnostic layer is outside the model")
+    if a.windows:
+        if a.text or a.text_file or a.max_tokens or a.stop_after is not None:
+            p.error("--windows cannot be combined with legacy text/truncation/stop options")
+        a.out.mkdir(parents=True, exist_ok=True)
+        dense = Weights(a.snapshot, a.ple_local)
+        experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
+        run_windows(a, config, ref, dense, experts_src, create_causal_mask)
+        return
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     if a.max_tokens:
         tokens = tokens[:a.max_tokens]
-    dense = Weights(a.snapshot)
+    dense = Weights(a.snapshot, a.ple_local)
     experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
     if PREFIX + "norm.weight" in dense:
         raise ValueError("unexpected final norm: this model feeds the stream mixer straight into lm_head")
@@ -213,6 +463,7 @@ def main() -> None:
         rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
         position_embeddings = rotary(embed, mrope_positions)
         h = embed.repeat(1, 1, config.hc_count)
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
         for layer_id in range(layers):
             start = time.time()
             kind = config.layer_types[layer_id]
@@ -227,12 +478,14 @@ def main() -> None:
                 if rows != 128 * SHARD_ROWS:
                     raise ValueError(f"n-gram table has {rows} rows, expected 128 shards of {SHARD_ROWS}")
                 emb.ngram_embedding = torch.nn.Identity()  # dropped before allocation
+                del emb
             layer = layer.to_empty(device="cuda")
             if layer.ple is not None:
                 table_prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
                 layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, table_prefix, rows, dim)
             load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
             load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            layer.eval()
             if layer.ple is not None:
                 emb = layer.ple.ple_embedding
                 expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size,
@@ -241,13 +494,15 @@ def main() -> None:
                         and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
                         and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
                     raise ValueError("checkpoint n-gram hash buffers differ from the module's construction")
+                del emb, expected
             h = layer(h, position_embeddings=position_embeddings, attention_mask=causal, conv_mask=conv_mask,
                       past_key_values=None, ple_input_ids=ids)
             if layer_id in save:
                 (a.out / f"layer{layer_id:02d}.bin").write_bytes(
                     h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
             del layer
-            torch.cuda.empty_cache()
+            memory.release()
+            memory.check(f"layer {layer_id}")
             timings.append(time.time() - start)
             print(f"layer {layer_id} ({kind}) {timings[-1]:.1f}s", flush=True)
         if layers < n_layers:
@@ -260,7 +515,7 @@ def main() -> None:
         load_module(mixer, dense, PREFIX + "hyper_connection_mixer.", set())
         final = mixer(h)
         head = dense.get("lm_head.weight").float()
-        logits = final[0].float() @ head.T
+        logits = torch.nn.functional.linear(final[0].float(), head)
         del head
         (a.out / "logits.bin").write_bytes(logits.contiguous().cpu().numpy().tobytes())
         argmax = logits.argmax(-1)

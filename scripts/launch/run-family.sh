@@ -253,6 +253,11 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   family_args+=(--chat-template-from "$chat_template_from")
 fi
 family_args+=(--vision "$vision" --audio "$audio")
+case "$(get FULL_PREFILL_LOGITS off)" in
+  on) family_args+=(--full-prefill-logits) ;;
+  off) ;;
+  *) echo "FULL_PREFILL_LOGITS must be on or off" >&2; exit 2 ;;
+esac
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
   case "$(get MIMO_WEIGHT_POLICY auto)" in

@@ -706,6 +706,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
+                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                            let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
+                            continue;
+                        }
                         if !job.media.is_empty() && !media.encoder().available() && !super::media::reference_probe(&job.probe) {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
@@ -814,14 +818,17 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = (|| {
-                    let rows = super::media::scoring_rows(&job.probe, DECODE_ROWS)?;
-                    probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    rows, &mut placement,
-                    |placement, chunk, _| engine.prefill_media_device(placement, chunk, &request_media),
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
+                    |placement, chunk, rows| {
+                        if rows > 1 {
+                            engine.prefill_scoring_media(placement, chunk, &request_media)
+                        } else {
+                            Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
-                        .context("scoring needs every layer"))
-                })();
+                        .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }

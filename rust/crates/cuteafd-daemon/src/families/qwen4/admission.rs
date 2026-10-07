@@ -46,7 +46,9 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, cfg: &Qwen
     let costs = cuteafd_loader::plan::layout::family_costs("qwen4");
     let unit = geometry.logical_unit_rows;
     let marks = args.planner_prefix_bytes.unwrap_or(rank.retained_mark_bytes * costs.mark_slots);
-    let fixed = future_expert_bytes + costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096
+    let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
+        "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
+    let fixed = logits + future_expert_bytes + costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096
         // Persistent row and block-start T/H/W tables for both workspaces.
         + 24 * (args.prefill_rows.max(1) as u64 + super::engine::DECODE_ROWS as u64)
         + rank.active_state_per_sequence_bytes * args.slots as u64

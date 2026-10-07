@@ -30,6 +30,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
+                full_prefill_logits: args.full_prefill_logits,
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
                 native_mtp_layers: args.native_mtp_layers,
@@ -112,6 +113,7 @@ mod tests {
             local_expert_layers: None,
             context_tokens: 262144,
             prefill_rows: 4096,
+            full_prefill_logits: false,
             concurrency: 8,
             prefix_slots: None,
             native_mtp_layers: 3,
@@ -177,6 +179,18 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
+        }
+    }
+
+    #[test]
+    fn diagnostic_prefill_flag_is_forwarded_to_layout() {
+        use clap::Parser;
+        for enabled in [false, true] {
+            let mut argv = vec!["cuteafd", "plan", "/not-read", "--layout"];
+            if enabled { argv.push("--full-prefill-logits"); }
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().full_prefill_logits, enabled);
         }
     }
 

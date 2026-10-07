@@ -707,11 +707,57 @@ Policy decisions:
   (±1.4-point top-1 standard error, no code or tool calls). A redesigned
   agentic-coding set (draft `docs/fidelity-design.md`) replaces it before
   any precision default changes on the new bar.
-- **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must keep golden
-  top-1 within ~0.5 point of the checkpoint-precision arm (GLM Flash ~89%
-  is the floor TJ accepts) and KL within 0.005 nat of it. Hugh's BF16
-  teacher (`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits`) is a second
-  reference where available.
+- **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must pass the
+  paired one-sided 95% non-inferiority bounds: top-1 loss <0.005 and KL
+  increase <0.005 nat on both full-tier scoring shapes. Use only qualified
+  goldens from official checkpoints, no external teacher (§11 of
+  `docs/fidelity-design.md`). The cross-family absolute floor stays at
+  top-1 >=90% / KL <=0.06 nat. Each config derives its own `expect` from
+  its repeated baselines; V4.1's calibrated `expect` is top-1 >=94% /
+  KL <=0.04 nat, not a common floor. Its FP8 vocabulary head
+  passes full decode and prefill (top-1 upper bounds 0.000937 / 0.001854;
+  KL upper bounds 0.000846 / 0.000305 nat). Quick is inconclusive, not fail;
+  independent agentic replay remains required and defaults are unchanged.
+- **Qwen reference ULP-sensitivity floor:** on SM121, changing official
+  eager QSA from variable K to zero-padded K2560 gives mean full-vocabulary
+  KL 0.0176858 (legacy) / 0.1790475 (a00), with seven confident top-1 flips
+  on a00. The unchanged-source variable-K arm reproduces both original
+  raw-F32 goldens byte-exactly; frozen attention padding agrees exactly on
+  CPU with FP64 inputs, including a true-FP64 softmax diagnostic. This is
+  consistent with GPU reduction-order perturbations amplifying through
+  48 layers, not observed runner/checkpoint drift. Both official-math
+  references remain valid; no regeneration, threshold relaxation or
+  default promotion. This two-window sensitivity measurement is not a
+  full-text-set noise bound; measuring that floor is a later item.
+- **GLM 5.3 EXL3 K4 open finding:** copy-heavy context rows d03/d04/a25
+  remain flagged. The aligned d04 versus c03 diagnostic shows an isolated
+  attention spike at layer 22 and content-specific late divergence after
+  about layer 46. The official d04 replay reproduces its confident answer;
+  the engine keeps copy-source token 1103 at every full-index layer after
+  physical-cache-slot IDs are mapped to logical positions. Late selected
+  sets overlap the reference by about 94.5-97.2% (c03: 97.4-98.5%);
+  selection drift is within about 5.5%, not a copy-source drop. A quant-ladder
+  lead: the EXL3 K4 package stores indexer wq_b/wk as FP8 E4M3, versus BF16
+  in the official checkpoint (weights_proj is BF16 in both). Queued, not
+  run: repack those indexer weights in BF16, rescore d03/d04/a25 and
+  controls, and compare context KL. A forced layer-50 attention check
+  cannot be reconstructed from current dumps:
+  per-layer K/V history and the MLA query/cache were not saved. Quantization
+  amplification is a hypothesis, not an engine-correctness verdict; no
+  further causal-debug hardware run is scheduled. Cross-architecture
+  reference sensitivity is also observed: d03 scored 1403 (input 1402)
+  gives token 6337 at p=0.94066 in the original SM121 golden, versus 7388
+  at p=0.68815 from the truncated SM120 residual with CPU official-head
+  replay (KL 2.37465). The neighboring d03 scored 1404 reproduces token
+  1419 (KL 0.00003495); d04 scored 2214 reproduces token 2638 (KL 0.001403,
+  not below 1e-4). Architecture, truncation and CPU head arithmetic differ;
+  this is reference sensitivity evidence, not an isolated architecture
+  cause or an engine-error exemption. Coordinator adjudication retains
+  qualification and fidelity-side upload readiness with this note; upload
+  still requires TJ's license decision and explicit approval.
+- **Gate provenance:** every gate seal JSON records the exact source commit
+  and a dirty flag, including untracked files, alongside the binary hash.
+  Rebuilt gates use task-private targets; never repin a changed shared binary.
 - **Exact speculation:** attempt byte-exact greedy speculation (drafts
   on/off, C1→C4) per family when it doesn't cost C1. Where it does, keep the
   faster path and accept proven rounding.
