@@ -92,6 +92,10 @@ mkdir -p "$build_dir" "$output_dir"
 export PYO3_PYTHON=python3
 export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/cuteafd_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export CARGO_TARGET_DIR="$build_dir/cargo-target"
+source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
+cuteafd_compiler_cache_setup "$build_dir"
+compiler_cache_cmake_args=()
+mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_dir/native")
 
 # The WIP sync chain (rsync -a + docker cp) can leave source mtimes older
 # than the previous build's fingerprints; cargo/ninja then silently reuse
@@ -124,6 +128,7 @@ cargo build \
   --release
 
 cmake \
+  "${compiler_cache_cmake_args[@]}" \
   -S "$source_dir/native" \
   -B "$build_dir/native" \
   -G Ninja \
@@ -162,6 +167,12 @@ cmake --build "$build_dir/native"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
+if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
+    "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
+elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
+  rm -f "$output_dir/COMPILER_PROVENANCE.json"
+fi
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 # The coordinator program manifest (DeepSeek V4, GLM, GLM Flash, MiMo, Qwen; an empty table
 # when none was built), as the release images carry it at /opt/cuteafd/share/PROGRAMS.json:
