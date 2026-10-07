@@ -16,13 +16,44 @@ pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
 pub const QWEN_CONFIG: &str = "qwen4-v2_20261005_fp8";
 pub const V4FLASH_REVISION: &str = "de92b14a7dabecd4d5dd4f7c799920842a5c3834";
 pub const V4FLASH_CONFIG: &str = "deepseek_v4-v2_20261005_v4flash";
+pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
+pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
+pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
+pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
+
+/// Sealed bench subset v1: agentic A at three context lengths, human code C,
+/// structured/tool D, plain E and the frozen context anchor. Never resample.
+pub const QUICK_WINDOWS: [&str; 8] = ["legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00"];
+
+pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
+    reference.validate()?;
+    let selected: Vec<_> = reference.windows.iter().filter(|w| QUICK_WINDOWS.contains(&w.id.as_str())).cloned().collect();
+    ensure!(selected.len() == 8, "dataset lacks the sealed 8-window quick subset v1");
+    ensure!(selected.iter().all(|w| w.positions.len() == 512), "quick subset row coverage differs");
+    ensure!(selected.iter().any(|w| w.block == "A") && selected.iter().any(|w| w.block == "E")
+        && ["ctx", "gen"].iter().all(|role| selected.iter().any(|w| w.positions.iter().any(|p| w.roles[p.pos] == *role))), "invalid quick subset");
+    Ok(selected)
+}
+
+pub fn ensure_valid_publication(repo: &str, commit: &str, config: &str) -> Result<()> {
+    ensure!(!(repo == REPOSITORY && commit == FLASH_REVISION && config == FLASH_CONFIG),
+        "MiMo Flash fidelity reference under revision, scores not valid (QKV scale bug); await replacement publication");
+    Ok(())
+}
+
+pub fn unavailable(model: &str) -> Option<String> {
+    let Some((commit, config)) = default_publication(model) else {
+        return Some(format!("no verified published fidelity config for {model}"));
+    };
+    ensure_valid_publication(REPOSITORY, commit, config).err().map(|e| e.to_string())
+}
 
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash-0731"] {
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
-            suffix.starts_with('-') && !suffix.to_ascii_lowercase().contains("speculator")
+            suffix.starts_with('-') && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
                 && !suffix.to_ascii_lowercase().contains("dflash")) {
             return Some(base);
         }
@@ -39,6 +70,8 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
         Some("GLM-5.3-Flash") => return Some((GLMF_REVISION, GLMF_CONFIG)),
         Some("DeepSeek-V4-Flash-0731") => return Some((V4FLASH_REVISION, V4FLASH_CONFIG)),
+        Some("DeepSeek-V4-Pro-0813") => return Some((V4PRO_REVISION, V4PRO_CONFIG)),
+        Some("GLM-5.3") => return Some((GLM_REVISION, GLM_CONFIG)),
         _ => {},
     }
     match model {
@@ -92,6 +125,7 @@ fn fetch(agent: &ureq::Agent, root: &Path, repo: &str, commit: &str, path: &str,
 
 pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, config: &str)
     -> Result<(Reference, String, Value)> {
+    ensure_valid_publication(repo, commit, config)?;
     ensure!(revision(commit), "dataset revision must be an immutable lowercase 40-hex HF commit");
     let parts: Vec<_> = repo.split('/').collect();
     ensure!(parts.len() == 2 && parts.iter().all(|p| component(p)) && component(config), "unsafe dataset identity");
@@ -104,6 +138,14 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
     let path = matches[0]["path"].as_str().context("config path")?;
     ensure!(path == format!("{config}/manifest.json"), "unexpected config manifest path");
     let bytes = fetch(agent, &root, repo, commit, path, Some(matches[0]["sha256"].as_str().context("manifest checksum")?))?;
+    if repo == REPOSITORY {
+        let expected = match (commit, config) {
+            (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
+            (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
+            _ => None,
+        };
+        if let Some(expected) = expected { ensure!(digest(&bytes) == expected, "pinned manifest checksum differs"); }
+    }
     let manifest: Value = serde_json::from_slice(&bytes)?;
     ensure!(manifest["config"] == config, "dataset config identity differs");
     let base = root.join(config);
@@ -204,6 +246,33 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publications_and_retired_mimo_fail_closed() {
+        assert_eq!(default_publication("wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"), Some((GLM_REVISION, GLM_CONFIG)));
+        assert_eq!(default_publication("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), Some((V4PRO_REVISION, V4PRO_CONFIG)));
+        assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap().contains("under revision"));
+        assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Pro-RL").is_some());
+        assert!(unavailable("zai-org/GLM-5.3-Flashlight").is_some());
+    }
+
+    #[test]
+    fn sealed_quick_subset_is_eight_balanced_windows_and_fails_closed() {
+        use crate::reference::{CompactPosition, Top};
+        let mut reference: Reference = serde_json::from_value(json!({"name":"synthetic", "models":[], "vocab":1,
+            "schema":"cuteafd.fidelity.reference/2", "checkpoint":"test", "set_sha256":"sealed",
+            "expect":{"top1_min":0.9,"kl_max":0.06}})).unwrap();
+        for id in QUICK_WINDOWS {
+            let role = if id == "legacy" || id == "c00" { "ctx" } else { "gen" };
+            reference.windows.push(Window { id: id.into(), block: if id.starts_with('a') { "A" } else { "E" }.into(),
+                bucket:"0-2K".into(), tokens:vec![0;513], roles:vec![role.into();513], score_from:1, top_k:1, media:vec![],
+                positions:(1..513).map(|pos| CompactPosition {pos,next:0,next_lp:0.0,
+                    top:vec![Top{id:0,lp:0.0}],tail_lp:f64::NEG_INFINITY}).collect() });
+        }
+        let selected = quick_windows(&reference).unwrap();
+        assert_eq!(selected.len(),8); assert_eq!(selected.iter().map(|w|w.positions.len()).sum::<usize>(),4096);
+        reference.windows.pop(); assert!(quick_windows(&reference).is_err());
+    }
+
     #[test]
     #[ignore = "requires published immutable HF commit and network access"]
     fn published_dataset_fetch_roundtrip() {

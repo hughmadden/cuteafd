@@ -1,11 +1,8 @@
-//! Compact top-k fidelity references (`references/*.json`, made by
-//! `scripts/bench/make-fidelity-reference.py` from a family golden run) and
-//! the scores of a teacher-forced pass against one.
+//! Sealed top-k reference types and teacher-forced fidelity scores.
 use cuteafd_api::openai::probe::ProbeRow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-include!(concat!(env!("OUT_DIR"), "/references.rs"));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Expect {
@@ -83,22 +80,6 @@ pub fn glob(pattern: &str, text: &str) -> bool {
 }
 
 impl Reference {
-    /// The reference for a served checkpoint id, from the compiled-in set or
-    /// `CUTEAFD_BENCH_REFERENCES` (a directory of the same files, searched first).
-    pub fn find(model: &str) -> Option<Self> {
-        let mut texts: Vec<String> = Vec::new();
-        if let Ok(dir) = std::env::var("CUTEAFD_BENCH_REFERENCES") {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-                paths.sort();
-                texts.extend(paths.iter().filter_map(|p| std::fs::read_to_string(p).ok()));
-            }
-        }
-        texts.extend(REFERENCES.iter().map(|(_, text)| text.to_string()));
-        texts.iter().filter_map(|text| serde_json::from_str::<Self>(text).ok())
-            .find(|r| r.models.iter().any(|pattern| glob(pattern, model)))
-    }
-
     /// Scored positions: `score_from..score_from + ids.len()`.
     pub fn positions(&self) -> std::ops::Range<usize> {
         self.score_from..self.score_from + self.ids.len()
@@ -431,20 +412,6 @@ mod tests {
         assert!(glob("zai-org/GLM-5.3", "zai-org/glm-5.3"));
         assert!(!glob("zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash"));
         assert!(glob("*/GLM-5.3-EXL3*", "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"));
-    }
-
-    #[test]
-    fn every_compiled_reference_parses_and_is_consistent() {
-        assert!(!REFERENCES.is_empty());
-        for (name, text) in REFERENCES {
-            let r: Reference = serde_json::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let n = r.ids.len();
-            assert!(n > 0 && r.lps.len() == n && r.tail_lp.len() == n && r.next_lp.len() == n, "{name}");
-            assert!(r.tokens.len() >= r.score_from + n, "{name}");
-            assert!(r.ids.iter().all(|ids| ids.len() == r.top_k), "{name}");
-        }
-        assert!(Reference::find("Qwen/Qwen3.8-Flash-Next-FP8").is_some());
-        assert!(Reference::find("nobody/unknown").is_none());
     }
 
     #[test]

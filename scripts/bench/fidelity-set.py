@@ -23,9 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
 
-LEGACY = {"deepseek_v41": "deepseek-v4.1-flash", "mimo_v2": "mimo-v2.6-pro",
-          "qwen4": "qwen3.8-flash-next", "glm5_flash": "glm-5.3-flash",
-          "deepseek_v4": "deepseek-v4-flash-0731", "glm5": "glm-5.3"}
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "glm5_flash", "deepseek_v4", "glm5")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -148,10 +146,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     if (legacy_reference is None) != (legacy_provenance is None):
         raise ValueError("explicit legacy reference requires its provenance")
     if legacy_reference is None:
-        legacy_path = root / "rust/crates/cuteafd-bench/references" / (LEGACY[family] + ".json")
-        legacy_reference = json.loads(legacy_path.read_text())
-        legacy_provenance = source(root, str(legacy_path.relative_to(root)))
-    elif not isinstance(legacy_provenance, dict) or not legacy_provenance.get("sha256"):
+        raise ValueError("text recipe requires an explicit sealed --legacy-reference")
+    if not isinstance(legacy_provenance, dict) or not legacy_provenance.get("sha256"):
         raise ValueError("explicit legacy reference requires a content hash")
     legacy = legacy_window(legacy_reference)
     windows = [{**legacy, "provenance": legacy_provenance}]
@@ -414,7 +410,9 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--family", required=True, choices=LEGACY)
+    p.add_argument("--family", required=True, choices=FAMILIES)
+    p.add_argument("--legacy-reference", type=pathlib.Path,
+                   help="sealed schema-1 reference or published schema-2 manifest containing the legacy window")
     p.add_argument("--version", required=True)
     p.add_argument("--model", required=True)
     p.add_argument("--checkpoint", required=True)
@@ -438,10 +436,12 @@ def main(argv=None):
             p.error("--file-list may contain only tracked first-party Rust, Python or CUDA files")
         if any(path.startswith("third_party/") for path in files):
             p.error("third-party sources are not part of the fidelity recipe")
+    if not a.media_fixtures and not a.legacy_reference:
+        p.error("text recipe requires --legacy-reference; use the sealed legacy window from a published manifest")
     from tokenizers import Tokenizer
     if a.media_fixtures:
-        if a.recording or a.file_list:
-            p.error("--media-fixtures cannot combine with text recipe recordings/files")
+        if a.recording or a.file_list or a.legacy_reference:
+            p.error("--media-fixtures cannot combine with text recipe recordings/files/legacy reference")
         manifest = build_vision_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
             arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
@@ -450,7 +450,10 @@ def main(argv=None):
             arm=json.loads(a.arm_manifest.read_text()), tokenizer=Tokenizer.from_file(str(a.tokenizer)),
             probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             recordings=[json.loads(path.read_text()) for path in a.recording],
-            files=json.loads(a.file_list.read_text()) if a.file_list else None)
+            files=json.loads(a.file_list.read_text()) if a.file_list else None,
+            legacy_reference=json.loads(a.legacy_reference.read_bytes()),
+            legacy_provenance={"path": str(a.legacy_reference),
+                "sha256": hashlib.sha256(a.legacy_reference.read_bytes()).hexdigest()})
     manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
     manifest["set_sha256"] = set_hash(manifest)
     out = a.out or ROOT / "set" / a.family / a.version / "windows.json"

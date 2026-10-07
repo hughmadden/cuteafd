@@ -89,6 +89,10 @@ def policy():
 
 
 def make(state, **kwargs):
+    if "legacy_reference" not in kwargs and "legacy_provenance" not in kwargs:
+        kwargs.update(legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64,
+                                      "tokens": list(range(576))},
+                      legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
     return builder.build_set(family=state["family"], model="test-model", checkpoint="test-model",
         version="test1", arm=policy(), tokenizer=FakeTokenizer(), probe=state["client"], **kwargs)
 
@@ -116,6 +120,14 @@ def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
     changed["windows"][0]["tokens"][0] += 1
     with pytest.raises(ValueError, match="hash mismatch"):
         builder.validate_set(changed)
+
+
+def test_text_recipe_requires_explicit_sealed_anchor(capsys):
+    with pytest.raises(SystemExit) as error:
+        builder.main(["--family", "qwen4", "--version", "test", "--model", "test",
+                      "--checkpoint", "test", "--tokenizer", "unused", "--arm-manifest", "unused"])
+    assert error.value.code == 2
+    assert "requires --legacy-reference" in capsys.readouterr().err
 
 
 def test_explicit_legacy_reference_keeps_variant_tokens_and_provenance(fake_server):

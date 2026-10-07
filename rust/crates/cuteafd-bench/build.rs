@@ -56,29 +56,10 @@ fn main() {
     if let Ok(value) = std::env::var("CUTEAFD_BUILD_COMMIT") {
         commit = value;
     }
-    references(Path::new(&manifest));
     agentic_repo(Path::new(&manifest));
     println!("cargo:rustc-env=CUTEAFD_BUILD_REMOTE={remote}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_DIRTY={dirty}");
-}
-
-/// `references/*.json` compiled in: `$OUT_DIR/references.rs` lists them.
-fn references(manifest: &Path) {
-    let dir = manifest.join("references");
-    println!("cargo:rerun-if-changed={}", dir.display());
-    let mut files: Vec<_> = std::fs::read_dir(&dir).map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "json")).collect()).unwrap_or_default();
-    files.sort();
-    let mut out = String::from("pub static REFERENCES: &[(&str, &str)] = &[\n");
-    for file in files {
-        println!("cargo:rerun-if-changed={}", file.display());
-        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-        out.push_str(&format!("    ({name:?}, include_str!({:?})),\n", file.display().to_string()));
-    }
-    out.push_str("];\n");
-    let target = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("references.rs");
-    std::fs::write(target, out).expect("write references.rs");
 }
 
 /// The agentic panel's fixture repository (scripts/fixtures/agentic-repo) compiled in:

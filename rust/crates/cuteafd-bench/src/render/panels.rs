@@ -28,6 +28,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "prefill" => prefill(doc, t, latest, w),
         "retained" => retained(doc, t, latest, w),
         "prefix_cache" => prefix_cache(doc, t, latest, w),
+        "fidelity" | "fidelity_full" => fidelity(doc, t, latest, w),
         "structured" => structured(doc, t, latest, w),
         "needle" => needle(doc, t, latest, w),
         "math" => scored(doc, t, latest, w, "correct", "rows", "question", "correct"),
@@ -38,6 +39,94 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "startup" => startup(doc, t, latest, w),
         _ => return None,
     })
+}
+
+fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    let mut y = 0.0;
+    let dataset = &v["dataset"];
+    let config = dataset["config"].as_str().unwrap_or("unpublished");
+    let revision = dataset["revision"].as_str().unwrap_or("?");
+    let identity = format!("{config} · {}", revision.chars().take(12).collect::<String>());
+    doc.titled(&identity);
+    doc.text(0.0, 14.0, Font::new(11.0, t.ink2), &super::svg::fit(&identity, 11.0, w));
+    doc.end();
+    y += 28.0;
+    for (path, verdict) in [("decode", &v["verdict"]), ("prefill", &v["prefill_verdict"])] {
+        if verdict.is_null() { continue; }
+        let status = if verdict["pass"] == true { "PASS" } else { "FAIL" };
+        let score = &verdict["generated"];
+        doc.text(0.0, y + 12.0, Font::new(12.0, t.ink).weight(600), &format!("{path} · {status} · {}",
+            seconds(num(&v[path], "seconds").unwrap_or(0.0))));
+        y += 22.0;
+        // Different units never share an axis. Percent metrics and KL get separate rows.
+        for (label, metric, bound, percent) in [("top-1", "top1", "top1_min", true),
+            ("KL", "kl", "kl_max", false), ("confident top-1", "confident_top1", "confident_top1_min", true),
+            ("top-3", "top3_contained", "top3_min", true)] {
+            let val = num(score, metric).map(|x| if percent { format!("{:.2}%", x*100.0) } else { format!("{x:.5} nat") })
+                .unwrap_or_else(|| "N/A".into());
+            let limit = num(verdict, bound).unwrap_or(0.0);
+            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), label);
+            if w < 420.0 { y += 18.0; }
+            doc.text(w, y + 12.0, Font::new(11.0, t.ink).anchor(Anchor::End), &format!("{val} · {} {}",
+                if metric == "kl" { "max" } else { "min" },
+                if percent { format!("{:.1}%", limit*100.0) } else { format!("{limit:.3}") }));
+            y += 20.0;
+        }
+        if let Some(reasons) = verdict["reasons"].as_array() {
+            for reason in reasons { doc.text(0.0, y + 11.0, Font::new(10.0, t.ink2), reason.as_str().unwrap_or("?")); y += 18.0; }
+        }
+        y += 10.0;
+    }
+    if let Some(error) = v["paired"]["unavailable"].as_str() {
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("Pair unavailable: {}", super::svg::fit(error, 11.0, w - 110.0)));
+        y += 26.0;
+    } else if let Some(pair) = v["paired"]["comparison"].as_object() {
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("Paired decode: {}",
+            if pair.get("pass") == Some(&Value::Bool(true)) { "PASS" } else { "FAIL" }));
+        y += 20.0;
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("{} generated rows · {} windows", pair["positions"], pair["windows"]));
+        y += 28.0;
+        let current = &v["verdict"]["generated"];
+        let prior = v["paired"]["earlier_score"].clone();
+        if let Ok(prior) = serde_json::from_value::<crate::reference::Fidelity>(prior) {
+            // Validated palette; direct labels and 2px gaps distinguish the pair in CVD/print.
+            let colors = ["#309dcc", "#ae6299"];
+            for (title, a, b, unit) in [("Top-1", num(current, "top1").unwrap_or(0.0)*100.0, prior.top1*100.0, "%"),
+                ("KL", num(current, "kl").unwrap_or(0.0), prior.kl, "nat")] {
+                doc.text(0.0, y + 12.0, Font::new(11.0, t.ink).weight(600), title);
+                y += 20.0;
+                y += legend(doc, t, 0.0, y + 8.0, &[("current", colors[0]), ("earlier", colors[1])]);
+                let max = a.max(b).max(1e-9) * 1.1;
+                let track = (w - 170.0).max(20.0);
+                for (label, value, color) in [("current", a, colors[0]), ("earlier", b, colors[1])] {
+                    let value_text = if unit == "nat" { format!("{value:.6} nat") } else { format!("{value:.3}%") };
+                    doc.titled(&format!("{label}: {value_text}"));
+                    doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), label);
+                    doc.rect(64.0, y + 3.0, track, 10.0, 3.0, t.well);
+                    doc.rect(64.0, y + 3.0, track * (value / max).clamp(0.0, 1.0), 10.0, 3.0, color);
+                    doc.text(w, y + 12.0, Font::new(10.0, t.ink).anchor(Anchor::End), &value_text);
+                    doc.end(); y += 22.0;
+                }
+                y += 10.0;
+            }
+        }
+    }
+    let groups = v["per_window"].as_object();
+    if let Some(groups) = groups {
+        doc.titled("Per-window top-1 / KL across all rows; table includes counts");
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), "Window · top-1 / KL (all rows)");
+        doc.end();
+        y += 24.0;
+        for (id, score) in groups {
+            doc.titled(&format!("{id}: {} rows, top-1 {:.2}%, KL {:.6}", score["positions"],
+                num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
+            doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2), id);
+            doc.text(w, y + 12.0, Font::new(10.5, t.ink).anchor(Anchor::End), &format!("{:.2}% / {:.5}",
+                num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
+            doc.end(); y += 18.0;
+        }
+    }
+    y
 }
 
 fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {

@@ -242,12 +242,33 @@ struct FileQuery {
     /// Panel exports: the body alone at this width (the dashboard's chart view).
     #[serde(default)]
     bare: Option<f64>,
+    /// Optional saved run to compare fidelity against; never starts inference.
+    compare: Option<String>,
+}
+
+fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, earlier_id: &str) {
+    for panel in report.panels.iter_mut().filter(|p| matches!(p.id.as_str(), "fidelity" | "fidelity_full")) {
+        let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+            .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["decode"].clone()).ok());
+        let latest = if let Some(partial) = &mut panel.partial { Some(partial) } else { panel.passes.last_mut() };
+        let Some(latest) = latest else { continue };
+        let paired = match (&previous, serde_json::from_value::<crate::fidelity::Run>(latest["decode"].clone())) {
+            (Some(previous), Ok(current)) => crate::panels::fidelity::record(&current, Some(previous))["paired"].clone(),
+            (None, _) => json!({"unavailable": "selected saved run has no matching fidelity decode result"}),
+            (_, Err(_)) => json!({"unavailable": "current decode result is not complete"}),
+        };
+        latest["paired"] = paired;
+        latest["paired"]["earlier_run"] = json!(earlier_id);
+    }
 }
 
 async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<FileQuery>) -> Response {
     let report = if id == "latest" { bench.latest() } else { bench.report(&id) };
-    let Some(report) = report else { return not_found("run") };
+    let Some(mut report) = report else { return not_found("run") };
+    if let Some(earlier_id) = &query.compare {
+        attach_fidelity_comparison(&mut report, bench.report(earlier_id).as_ref(), earlier_id);
+    }
     if let (Some(width), Some(panel)) = (query.bare, file.strip_prefix("panel-").and_then(|f| f.strip_suffix(".svg"))) {
         return svg(render::report::panel_body_svg(&report, panel, width.clamp(320.0, 2400.0)));
     }
@@ -364,6 +385,21 @@ mod tests {
         let response = routes(bench.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(bench.active().is_none());
+    }
+
+    #[test]
+    fn missing_saved_fidelity_pair_is_explicit_and_updates_partial_only() {
+        let mut report = Report { schema: crate::report::SCHEMA.into(), id: "current".into(),
+            created: String::new(), finished: None, status: crate::report::RunStatus::Running,
+            profile: "fidelity".into(), plan: vec![], server: Default::default(), fingerprint: String::new(),
+            baseline: None, panels: vec![crate::report::PanelResult {
+                id: "fidelity".into(), passes: vec![json!({"saved":true})], partial: Some(json!({"decode":null})),
+                ..Default::default() }], error: None };
+        attach_fidelity_comparison(&mut report, None, "missing");
+        let panel = report.panel("fidelity").unwrap();
+        assert_eq!(panel.latest().unwrap()["paired"]["earlier_run"], "missing");
+        assert!(panel.latest().unwrap()["paired"]["unavailable"].as_str().unwrap().contains("no matching"));
+        assert_eq!(panel.passes, vec![json!({"saved":true})]);
     }
 
     #[test]
