@@ -582,6 +582,11 @@ impl Opened {
                 "GLM Flash graph reserve above planner allowance");
             extra
         } else { 0 };
+        // Admit the package before KV sizing; measured free memory then excludes its buffers.
+        let mut scoring_dense = if args.full_prefill_logits && model.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
+            let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
+            Some(engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?)
+        } else { None };
         let pool_bound = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
             else { args.pool_tokens };
         let spark = args.peers.is_some();
@@ -592,8 +597,8 @@ impl Opened {
             lanes, peer_stream.is_some(), args.draft.is_some())?;
         let workspace_allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").workspace_bytes[0]
             * args.prefill_rows.max(1) as u64 / 4096;
-        let workspace_extra = workspace_reserve.saturating_sub(workspace_allowance);
-        tracing::info!(lanes, workspace_reserve_bytes = workspace_reserve, planner_allowance_bytes = workspace_allowance,
+        let workspace_extra = workspace_reserve.iter().copied().max().unwrap_or(0).saturating_sub(workspace_allowance);
+        tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve, planner_allowance_bytes = workspace_allowance,
             extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
         let pool_tokens = if args.pool_tokens == 0 || budgeted || startup_graphs || args.serving_graph_policy.is_some() {
             let precise_split = args.kda_fp32_partials || args.kda_output_shard;
@@ -604,13 +609,19 @@ impl Opened {
                     .chain(peer_stream.map(|(d, _)| d)).collect()
             };
             let extra = if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
-                else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
+                else if args.full_prefill_logits {
+                    engine::partial_exchange_reserve(args.prefill_rows, self.cfg.hidden,
+                        if args.kda_fp32_partials { 4 } else { 2 })
+                } else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 }) };
-            let extra = extra + if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
-                "glm5_flash", args.prefill_rows as u64, self.cfg.vocab_size as u64) } else { 0 };
-            crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
+            let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
+                crate::shared::memory_report::RankReserve {
+                    extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
+                    workspace_bytes: args.full_prefill_logits.then_some(workspace),
+                }).collect();
+            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, extra + graph_extra + workspace_extra)?
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves)?
         } else {
             args.pool_tokens
         };
@@ -645,7 +656,11 @@ impl Opened {
         }
         if engine.weights.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
             let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
-            engine.set_dense_nvfp4(engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?);
+            let dense = match scoring_dense.take() {
+                Some(dense) => dense,
+                None => engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?,
+            };
+            engine.set_dense_nvfp4(dense);
             tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
         }
         if (0..layers).any(|l| !self.cfg.dense[l]) {

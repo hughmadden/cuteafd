@@ -347,6 +347,11 @@ pub(crate) fn partial_reserve(prefill_rows: usize, hidden: usize, bytes: usize) 
         * hidden * bytes.saturating_sub(2)) as u64
 }
 
+/// Workspace deltas are already in the exact union; only enlarged exchange slots remain.
+pub(crate) fn partial_exchange_reserve(prefill_rows: usize, hidden: usize, bytes: usize) -> u64 {
+    (4 * PREFILL_LANES * prefill_rows.max(DECODE_ROWS) * hidden * bytes.saturating_sub(2)) as u64
+}
+
 /// Four additional parity/lane slots hold normalized heads until the peer consumes them.
 pub(crate) fn output_shard_reserve(prefill_rows: usize, hidden: usize) -> u64 {
     (2 * PREFILL_LANES * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
@@ -791,15 +796,24 @@ fn workspace_buffers(cfg: &GlmNextConfig, t: usize, decode: bool, pages: usize, 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn workspace_reserve(programs: &Programs<'_>, cfg: &GlmNextConfig, weights: &GlmfWeights<'_>,
     rows: usize, pool_tokens: usize, options: WorkspaceOptions, lanes: usize, peer: bool, drafter: bool)
-    -> Result<u64> {
+    -> Result<Vec<u64>> {
     let pages = pool_tokens.div_ceil(PAGE_ROWS).max(1).next_multiple_of(UNIT_PAGES);
     (0..if peer { 2 } else { 1 }).map(|rank| {
         let prefill = workspace_layout(programs, cfg, weights, rows, false, pages, pages / UNIT_PAGES, rank, options)?.bytes();
         let decode = workspace_layout(programs, cfg, weights, DECODE_ROWS, true, pages, pages / UNIT_PAGES, rank, options)?.bytes();
-        // The planner separately admits drafter storage. Its runtime overhead is additional.
-        let overhead = WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(rank == 0 && drafter)) as u64;
-        Ok(decode + lanes as u64 * prefill + overhead)
-    }).collect::<Result<Vec<u64>>>().map(|bytes| bytes.into_iter().max().unwrap_or(0))
+        Ok(workspace_union_bytes(prefill, decode, lanes, options.full_logits, rank == 0 && drafter))
+    }).collect()
+}
+
+fn scoring_workspace_count(lanes: usize) -> usize {
+    1 + if lanes > 1 { lanes } else { 0 }
+}
+
+fn workspace_union_bytes(prefill: u64, decode: u64, lanes: usize, full_logits: bool, drafter: bool) -> u64 {
+    let count = if full_logits { scoring_workspace_count(lanes) } else { lanes };
+    // Output bytes are already part of each workspace layout. Never add them again.
+    decode + count as u64 * prefill
+        + WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + count + usize::from(drafter)) as u64
 }
 
 fn prefill_workspace_count(spark: bool, complete: bool, value: Option<&str>) -> usize {
@@ -1467,8 +1481,9 @@ impl<'a> GlmfEngine<'a> {
         self.peer_workspaces(false, None)?;
         if self.pipelined() {
             let mut slots = self.lane_workspaces.borrow_mut();
-            while slots.len() < PREFILL_LANES { slots.push(self.workspace(self.prefill_rows, false)?); }
-            self.peer_workspaces(false, Some(PREFILL_LANES))?;
+            let count = scoring_workspace_count(PREFILL_LANES) - 1;
+            while slots.len() < count { slots.push(self.workspace(self.prefill_rows, false)?); }
+            self.peer_workspaces(false, Some(count))?;
         }
         Ok(())
     }
@@ -3197,6 +3212,22 @@ mod prefill_lane_tests {
     }
 
     #[test]
+    fn scoring_reserve_equals_serial_plus_configured_lanes() {
+        assert_eq!(super::partial_exchange_reserve(4096, 4096, 4), 268_435_456);
+        assert_eq!(super::partial_exchange_reserve(4096, 4096, 2), 0);
+        for lanes in [1, PREFILL_LANES] {
+            for rank in [0, 1] {
+                let prefill = if rank == 0 { 10000 } else { 3000 };
+                let decode = 500;
+                let allocated = 1 + if lanes > 1 { lanes } else { 0 };
+                let expected = decode + allocated as u64 * prefill
+                    + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + allocated) as u64;
+                assert_eq!(super::workspace_union_bytes(prefill, decode, lanes, true, false), expected);
+            }
+        }
+    }
+
+    #[test]
     fn startup_defaults_honor_both_explicit_disables() {
         assert!(super::startup_graph_policy(None, None));
         assert!(super::startup_graph_policy(Some("1"), Some("1")));
@@ -3242,6 +3273,11 @@ mod prefill_lane_tests {
         assert_eq!(peer.head_workspace, 256);
         assert_eq!(peer.logits, 256);
         assert!(peer.bytes() < prefill.bytes());
+        let peer_full = super::workspace_buffers(&cfg, 4096, false, 32768, 8192, 1,
+            super::WorkspaceOptions { full_logits: true, ..options }, 782236672, 558007296);
+        assert_eq!(peer_full.bytes(), peer.bytes());
+        let exact = super::workspace_union_bytes(full.bytes(), decode.bytes(), PREFILL_LANES, true, false);
+        assert_eq!(exact, decode.bytes() + 3 * full.bytes() + 4 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]

@@ -53,10 +53,9 @@ const SKIP_RANKS: usize = 4;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
 /// Most lanes a long Spark prefill chunk splits into (CUTEAFD_GLM_PREFILL_LANES,
-/// default [`DEFAULT_LANES`]; 1 is the serial path), and the fewest rows per
+/// default 3; 1 is the serial path), and the fewest rows per
 /// lane worth another exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 4;
-const DEFAULT_LANES: usize = 3;
 const MIN_LANE_ROWS: usize = 256;
 
 /// What precedes a decode segment's residual norm.
@@ -1814,10 +1813,10 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
         .collect::<Vec<_>>().join(" | "));
 }
 
-/// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default [`DEFAULT_LANES`].
+/// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default 3.
 pub(crate) fn configured_lanes() -> usize {
-    std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_LANES)
-        .clamp(1, PREFILL_LANES)
+    cuteafd_loader::plan::layout::glm_prefill_lanes(
+        std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())
 }
 
 /// The expert request of `t` staged rows: expert ids (U32) and gate

@@ -211,7 +211,29 @@ pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot
 pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
     devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
     requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64) -> anyhow::Result<usize> {
+    let reserves = vec![RankReserve { extra_bytes: extra_reserve_bytes, workspace_bytes: None }; devices.len()];
+    planned_pool_tokens_with_reserves(library, snapshot, devices, drafter, prefill_rows, slots,
+        requested, future_expert_bytes, &reserves)
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RankReserve {
+    pub extra_bytes: u64,
+    /// Exact workspace union replaces, rather than adds to, the planner allowance.
+    pub workspace_bytes: Option<u64>,
+}
+
+pub(crate) fn lead_reserves(ranks: usize, lead_bytes: u64) -> Vec<RankReserve> {
+    (0..ranks).map(|rank| RankReserve {
+        extra_bytes: if rank == 0 { lead_bytes } else { 0 }, workspace_bytes: None,
+    }).collect()
+}
+
+pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
+    devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
+    requested: Option<u64>, future_expert_bytes: u64, reserves: &[RankReserve]) -> anyhow::Result<usize> {
     use anyhow::Context;
+    anyhow::ensure!(reserves.len() == devices.len(), "reserve must cover every admitted GPU");
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
     let model = family.open(&checkpoint).map_err(|e| anyhow::anyhow!("{}", e.0))?;
@@ -231,15 +253,16 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
     anyhow::ensure!(ranks.len() == devices.len(), "cache geometry must cover every admitted GPU");
     let kv: Vec<KvDevice> = devices.iter().zip(&ranks).enumerate().map(|(index, (&device, rank))| {
         let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
-        let workspace = costs.workspace_bytes[role] * prefill_rows.max(1) as u64 / 4096;
+        let workspace = reserves[index].workspace_bytes.unwrap_or(
+            costs.workspace_bytes[role] * prefill_rows.max(1) as u64 / 4096);
         let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * slots as u64
-            + if cuteafd_ffi::coordinator_gpu_budget().is_some() { rank.speculative_replay_bytes } else { 0 };
+            + if cuteafd_ffi::coordinator_gpu_budget().is_some() || (glmf && reserves[index].workspace_bytes.is_some()) { rank.speculative_replay_bytes } else { 0 };
         let marks = rank.retained_mark_bytes * costs.mark_slots;
         KvDevice {
             device,
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
             reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 } + if index == 0 { draft } else { 0 }
-                + state + marks + costs.graph_bytes[role] + headroom + extra_reserve_bytes
+                + state + marks + costs.graph_bytes[role] + headroom + reserves[index].extra_bytes
                 + if index == 0 { future_expert_bytes } else { 0 },
         }
     }).collect();
@@ -252,6 +275,15 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
 mod budget_tests {
     use super::*;
     use cuteafd_loader::serving_capacity::{FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+
+    #[test]
+    fn full_logits_reserve_is_lead_only() {
+        for ranks in [1, 2] {
+            let reserves = lead_reserves(ranks, 12345);
+            assert_eq!(reserves[0].extra_bytes, 12345);
+            assert!(reserves.iter().skip(1).all(|r| r.extra_bytes == 0));
+        }
+    }
 
     #[test]
     fn glmf_split_admits_replicated_mla_and_half_kda_on_every_gpu() {
