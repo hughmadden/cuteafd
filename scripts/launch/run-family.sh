@@ -111,11 +111,12 @@ esac
 # GLM5_FLASH_MEMORY (GLM 5.3 Flash): standard (the default: the settings as configured), compact or
 # auto. compact is the profile measured on 1 RTX 5090 + 4 DGX Sparks at 16 sequences, each setting
 # gated: the compact DSA index and a BF16 KDA state over the checkpoint-precision KDA projections and
-# head (every compact measurement ran at checkpoint precision), prefix marks in the pool with a 64 GiB
-# host tier, the embedding in host RAM, 1 GiB of headroom, a 512 MiB graph budget with row buckets,
-# replay records in the prefill scratch, 128-row decode steps, the gb10 Spark schedule, the probed
-# bond split, the tensor-core W8A8 drafter and the tensor-core target head past 8 rows (1,683,456 KV
-# tokens beside 131,072-token requests, and one 1,048,576-token request). auto lays the standard
+# head (every compact measurement ran at checkpoint precision), prefix marks in the pool with a host
+# tier of half this host's RAM (at most 64 GiB: the measured 64 GiB on a 125 GiB host), the embedding
+# in host RAM, 1 GiB of headroom, a 512 MiB graph budget with row buckets, replay records in the
+# prefill scratch, 128-row decode steps, the gb10 Spark schedule, the probed bond split where an RDMA
+# port of this host is a bond, the tensor-core W8A8 drafter and the tensor-core target head past 8 rows
+# (1,683,456 KV tokens beside 131,072-token requests, and one 1,048,576-token request). auto lays the standard
 # settings out with `cuteafd plan --layout` on the coordinator GPU's free memory for CONCURRENCY
 # sequences and MAX_CONTEXT_TOKENS, keeps them when that pool holds one MAX_CONTEXT_TOKENS request and
 # 65,536 tokens for each other sequence, and takes compact when it cannot. GLM5_FLASH_PROFILE=rtx5090
@@ -130,6 +131,27 @@ glmf_compact=(GLM5_FLASH_KDA_FP8=off GLM5_FLASH_FP8_HEAD=off GLM5_FLASH_FP8_PREF
   GLM5_FLASH_GRAPH_BUDGET_MIB=512 GLM5_FLASH_DECODE_ROW_BUCKETS=on GLM5_FLASH_REPLAY_RECORDS=shared
   GLM5_FLASH_DECODE_ROWS=128 GLM5_FLASH_EXL3_SCHEDULE=gb10 GLM5_FLASH_EXL3_WORKER_PATH=async RDMA_BOND_BALANCE=probe
   GLM5_FLASH_DRAFT_HEAD=tensor GLM5_FLASH_DRAFT_LINEAR=w8a8 GLM5_FLASH_TARGET_HEAD=tensor)
+# Whether an RDMA port of this host is a bond (two or more members): a GID's netdev, or the one device
+# under a VLAN, with bonding members, as the engine's bond balance finds it (sysfs: CUTEAFD_SYSFS_ROOT).
+glmf_rdma_bond() {
+  local root="${CUTEAFD_SYSFS_ROOT:-/sys}" ndev name hop slaves lowers
+  for ndev in "$root"/class/infiniband/*/ports/*/gid_attrs/ndevs/*; do
+    name="$(cat "$ndev" 2>/dev/null || true)"
+    for hop in 1 2; do
+      [[ -n "$name" && -d "$root/class/net/$name" ]] || break
+      if [[ -r "$root/class/net/$name/bonding/slaves" ]]; then
+        slaves=()
+        read -r -a slaves < "$root/class/net/$name/bonding/slaves" || true
+        if ((${#slaves[@]} >= 2)); then return 0; fi
+        break
+      fi
+      lowers=("$root/class/net/$name"/lower_*)
+      [[ ${#lowers[@]} == 1 && -e "${lowers[0]}" ]] || break
+      name="${lowers[0]##*/lower_}"
+    done
+  done
+  return 1
+}
 # KEY=VALUE of a GLM 5.3 Flash precision key as the config sets it, under its current or pre-rename name.
 glmf_configured() {
   local old="GLMF_${1#GLM5_FLASH_}"
@@ -161,8 +183,18 @@ fi
 if [[ "$glmf_memory" == compact ]]; then
   [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_MEMORY=compact runs the routed experts on Sparks, as measured; this launch" \
     "runs them on the GPU (SPARK_COUNT=0 or EXPERT_BACKEND=local)" >&2; exit 2; }
+  # The host tier: half of this host's RAM (MemTotal, as the engine reads it; CUTEAFD_PROC_ROOT), whole
+  # GiB, at most 64 GiB.
+  glmf_mem_kib="$(awk '/^MemTotal:/ {print $2; exit}' "${CUTEAFD_PROC_ROOT:-/proc}/meminfo" 2>/dev/null || true)"
+  glmf_host_cache=""
+  if [[ "$glmf_mem_kib" =~ ^[1-9][0-9]*$ ]]; then
+    glmf_host_gib=$((glmf_mem_kib / 2 / 1048576))
+    if ((glmf_host_gib > 64)); then glmf_host_gib=64; fi
+    if ((glmf_host_gib >= 1)); then glmf_host_cache="${glmf_host_gib}GiB"; fi
+  fi
   for glmf_setting in "${glmf_compact[@]}"; do
     glmf_key="${glmf_setting%%=*}" glmf_value="${glmf_setting#*=}" glmf_old=""
+    if [[ "$glmf_key" == HOST_CACHE_BYTES && -n "$glmf_host_cache" ]]; then glmf_value="$glmf_host_cache"; fi
     case "$glmf_key" in GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL) glmf_old="GLMF_${glmf_key#GLM5_FLASH_}" ;; esac
     if [[ -n "${cfg[$glmf_key]:-}" ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact keeps $glmf_key=${cfg[$glmf_key]} as configured (compact: $glmf_value)" >&2
@@ -174,12 +206,21 @@ if [[ "$glmf_memory" == compact ]]; then
     elif [[ "$glmf_key" == GLM5_FLASH_TARGET_HEAD && "$(glmf_configured GLM5_FLASH_FP8_HEAD)" != *=off ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the tensor-core target head" \
         "runs the BF16 head, and the config keeps $(glmf_configured GLM5_FLASH_FP8_HEAD)" >&2
+    elif [[ "$glmf_key" == HOST_CACHE_BYTES && -z "$glmf_host_cache" ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: half of this host's RAM, at most 64 GiB):" \
+        "no MemTotal in ${CUTEAFD_PROC_ROOT:-/proc}/meminfo; pool marks then take the engine's automatic host tier" >&2
+    elif [[ "$glmf_key" == RDMA_BOND_BALANCE ]] && ! glmf_rdma_bond; then
+      echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): no RDMA port of this host" \
+        "is a bond" >&2
     elif [[ "$glmf_key" == GLM5_FLASH_GRAPH_BUDGET_MIB && "${cfg[GLM5_FLASH_STARTUP_GRAPHS]:-}" == on ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the budget bounds lazily" \
         "captured decode graphs, and the config captures every one at startup (GLM5_FLASH_STARTUP_GRAPHS=on)" >&2
     else
       cfg[$glmf_key]="$glmf_value"
       echo "note: GLM5_FLASH_MEMORY=compact sets $glmf_key=$glmf_value" >&2
+      if [[ "$glmf_key" == HOST_CACHE_BYTES ]]; then
+        echo "note: HOST_CACHE_BYTES=$glmf_value is half of this host's $((glmf_mem_kib / 1048576)) GiB of RAM, at most 64 GiB" >&2
+      fi
     fi
   done
 fi

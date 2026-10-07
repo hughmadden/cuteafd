@@ -1640,8 +1640,35 @@ _GLMF_PROFILE_COMMAND = [
     "--model-id", "glm-5.3-flash"]
 
 
-def _glmf_launch(tmp_path: Path, keys: str, **options) -> subprocess.CompletedProcess[str]:
-    return _family_launch_result(tmp_path, _GLMF, "test/glmf", keys, extra_snapshots=_GLMF_MODELS, **options)
+def _glmf_host(root: Path, mem_kib: int | None = 128 << 20, bond: str | None = "bond0") -> dict[str, str]:
+    """A coordinator host as the launcher reads it: /proc/meminfo with `mem_kib` of RAM (None: no
+    meminfo), and one RDMA port whose GID sits on `bond` (a two-member bond, or a VLAN on one: "bond0.7";
+    None: a plain port)."""
+    proc, sysfs = root / "proc", root / "sys"
+    proc.mkdir(parents=True, exist_ok=True)
+    if mem_kib is not None:
+        (proc / "meminfo").write_text(f"MemTotal: {mem_kib} kB\nMemAvailable: {mem_kib * 3 // 4} kB\n")
+    ndevs = sysfs / "class/infiniband/mlx5_0/ports/1/gid_attrs/ndevs"
+    ndevs.mkdir(parents=True, exist_ok=True)
+    (ndevs / "0").write_text((bond or "enp1s0f0np0") + "\n")
+    net = sysfs / "class/net"
+    if bond is None:
+        (net / "enp1s0f0np0").mkdir(parents=True, exist_ok=True)
+    else:
+        master = bond.split(".")[0]
+        (net / master / "bonding").mkdir(parents=True, exist_ok=True)
+        (net / master / "bonding" / "slaves").write_text("enp1s0f0np0 enp1s0f1np1\n")
+        if bond != master:
+            (net / bond).mkdir(parents=True, exist_ok=True)
+            (net / bond / f"lower_{master}").mkdir(exist_ok=True)
+    return {"CUTEAFD_PROC_ROOT": str(proc), "CUTEAFD_SYSFS_ROOT": str(sysfs)}
+
+
+def _glmf_launch(tmp_path: Path, keys: str, host: dict[str, str] | None = None, **options) -> subprocess.CompletedProcess[str]:
+    """The profile fixtures run on a 128 GiB coordinator host with a bonded RDMA port unless `host` says otherwise."""
+    env = {**(host if host is not None else _glmf_host(tmp_path / "host")), **(options.pop("extra_env", None) or {})}
+    return _family_launch_result(tmp_path, _GLMF, "test/glmf", keys, extra_snapshots=_GLMF_MODELS, extra_env=env,
+                                 **options)
 
 
 def _glmf_lines(result: subprocess.CompletedProcess[str], root: Path | None = None) -> tuple[str, list[str], list[str]]:
@@ -1957,3 +1984,59 @@ def test_glmf_auto_plans_lazily_captured_graphs_when_configured(tmp_path):
     assert result.returncode == 0, result.stderr
     (plan,) = _glmf_plans(result)
     assert "--startup-graphs off" in plan, plan
+
+
+@pytest.mark.parametrize("mem_gib,tier", [(32, "16GiB"), (64, "32GiB"), (125, "62GiB"), (128, "64GiB"), (256, "64GiB"),
+                                          (1, None)])
+def test_glmf_compact_sizes_the_host_tier_from_the_host(tmp_path, mem_gib, tier):
+    """compact's host tier is half this host's RAM, at most 64 GiB (the measured profile's 64 GiB on a
+    125 GiB host), not a constant; a host under 2 GiB gets none from compact."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\n",
+                          host=_glmf_host(tmp_path / "host", mem_kib=mem_gib << 20))
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    if tier is None:
+        assert any(note.startswith("note: GLM5_FLASH_MEMORY=compact leaves HOST_CACHE_BYTES unset") for note in notes)
+        assert "--host-cache-bytes auto" in coordinator
+    else:
+        assert f"note: GLM5_FLASH_MEMORY=compact sets HOST_CACHE_BYTES={tier}" in notes
+        assert f"note: HOST_CACHE_BYTES={tier} is half of this host's {mem_gib} GiB of RAM, at most 64 GiB" in result.stderr
+        assert f"--host-cache-bytes {tier} " in coordinator, coordinator
+
+
+def test_glmf_compact_without_meminfo_leaves_the_host_tier_to_the_engine(tmp_path):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\n",
+                          host=_glmf_host(tmp_path / "host", mem_kib=None))
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    assert any(note.startswith("note: GLM5_FLASH_MEMORY=compact leaves HOST_CACHE_BYTES unset") for note in notes), notes
+    # Pool marks turn the engine's automatic tier on (within available RAM and cgroup limits).
+    assert "--host-cache-bytes auto" in coordinator, coordinator
+
+
+def test_glmf_compact_keeps_a_configured_host_tier(tmp_path):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\nHOST_CACHE_BYTES=24GiB\n",
+                          host=_glmf_host(tmp_path / "host", mem_kib=256 << 20))
+    coordinator, _, notes = _glmf_lines(result)
+    assert "note: GLM5_FLASH_MEMORY=compact keeps HOST_CACHE_BYTES=24GiB as configured (compact: 64GiB)" in notes
+    assert "--host-cache-bytes 24GiB " in coordinator
+
+
+@pytest.mark.parametrize("bond,probe", [("bond0", True), ("bond0.7", True), (None, False)])
+def test_glmf_compact_probes_the_bond_split_only_over_a_bonded_rdma_port(tmp_path, bond, probe):
+    """The probed bond split places flows on a bond's members; on a host whose RDMA ports are no bond it
+    would only fix the flow labels, so compact leaves RDMA_BOND_BALANCE off there and says why."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\n",
+                          host=_glmf_host(tmp_path / "host", bond=bond))
+    assert result.returncode == 0, result.stderr
+    coordinator, workers, notes = _glmf_lines(result)
+    assert ("-e CUTEAFD_RDMA_BOND_BALANCE=probe" in coordinator) == probe, coordinator
+    assert ("note: GLM5_FLASH_MEMORY=compact sets RDMA_BOND_BALANCE=probe" in notes) == probe
+    if not probe:
+        assert ("note: GLM5_FLASH_MEMORY=compact leaves RDMA_BOND_BALANCE unset (compact: probe): no RDMA port of "
+                "this host is a bond") in notes
+        assert "CUTEAFD_RDMA_BOND_BALANCE" not in coordinator
+    # A config that names the mode keeps it, bond or not.
+    kept = _glmf_launch(tmp_path / "kept", _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\nRDMA_BOND_BALANCE=labels\n",
+                        host=_glmf_host(tmp_path / "kept-host", bond=bond))
+    assert "-e CUTEAFD_RDMA_BOND_BALANCE=labels" in _glmf_lines(kept)[0]
