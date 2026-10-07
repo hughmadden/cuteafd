@@ -348,6 +348,22 @@ impl<'a> PrefixCache<'a> {
         }
         Err(error)
     }
+    /// Whether `work` fits the pool as it is, evicting nothing.
+    pub fn fits(&self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<bool> {
+        as_fit(requests.cache().check_append_capacity(work))
+    }
+    /// Evict every retained snapshot whose eviction gains `work` only copies: those live tables
+    /// hold entirely that share a partial tail `work` appends to, such as the source a request
+    /// just reused. After a failed `make_room` this leaves `work` exactly the room it would have
+    /// with nothing cached.
+    pub fn release_copies(&mut self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<()> {
+        let pressure = self.pressure(requests.cache(), work)?;
+        let gain = |saved: &Saved<'a>| saved.target.parts().0.gain(&pressure).unwrap_or(Gain::Nothing);
+        while let Some((_, saved)) = self.retained.evict_one_where(&|saved| gain(saved) != Gain::Copies) {
+            self.host_dropped(saved);
+        }
+        Ok(())
+    }
     /// The cache's sources under `work`, after weighing every retained snapshot against them
     /// once: a snapshot whose sources do not match the cache's, in order, is an error.
     fn pressure(&self, cache: &BackboneCache<'a>, work: &[(CacheLease, u32)]) -> Result<Vec<Pressure>> {

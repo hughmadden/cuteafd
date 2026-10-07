@@ -1,5 +1,6 @@
 //! Token-budget admission is checked at a completed stack boundary.
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 pub(super) struct Prepared {
     pub job: NativeRequest,
@@ -51,7 +52,7 @@ pub(super) fn remaining_budget(tokens: usize, remaining_output: usize, committed
     Ok(append.try_into().context("request token budget exceeds u32")?)
 }
 
-/// Largest output allowance that fits without discarding a reused snapshot.
+/// Largest output allowance up to `maximum` that `fits`; `None` when not even one token does.
 /// A request with active peers waits instead; call only for an otherwise idle pool.
 pub(super) fn fit_output(maximum: usize, mut fits: impl FnMut(usize) -> Result<bool>) -> Result<Option<usize>> {
     if !fits(1)? { return Ok(None); }
@@ -63,17 +64,85 @@ pub(super) fn fit_output(maximum: usize, mut fits: impl FnMut(usize) -> Result<b
     Ok(Some(low))
 }
 
+static SHRUNK: AtomicU64 = AtomicU64::new(0);
+static WITHHELD: AtomicU64 = AtomicU64::new(0);
+
+/// An idle request whose prompt plus `requested` output tokens does not fit the KV pool gets
+/// the longest output allowance that `fits` the `room`, and `take` reserves it there. The
+/// caller first frees what only a cached prompt costs (`PrefixCache::release_copies`), so a
+/// cached prompt gets what the same request gets cold. Every shrink is counted for `stats`.
+/// `None`, with nothing taken, when not even one output token fits.
+pub(super) fn shrink<R>(room: &mut R, requested: usize, mut fits: impl FnMut(&R, usize) -> Result<bool>,
+    take: impl FnOnce(&mut R, usize) -> Result<()>) -> Result<Option<usize>> {
+    let Some(granted) = fit_output(requested, |output| fits(room, output))? else { return Ok(None); };
+    take(room, granted)?;
+    if granted < requested {
+        SHRUNK.fetch_add(1, Relaxed);
+        WITHHELD.fetch_add((requested - granted) as u64, Relaxed);
+    }
+    Ok(Some(granted))
+}
+
+/// Lifetime admission counters for the per-second `stats` payload: requests whose output
+/// allowance was shrunk to fit the KV pool, and the output tokens withheld from them.
+pub(super) fn stats() -> serde_json::Value {
+    serde_json::json!({
+        "output_shrinks": SHRUNK.load(Relaxed),
+        "output_tokens_withheld": WITHHELD.load(Relaxed),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn output_reservation_shrinks_without_touching_the_source() -> Result<()> {
+    fn output_reservation_is_the_longest_that_fits() -> Result<()> {
         for maximum in [1, 2, 1000] {
             for available in [0, 1, 2, 17, 1000] {
                 assert_eq!(fit_output(maximum, |output| Ok(output <= available))?,
                     (available > 0).then_some(maximum.min(available)));
             }
         }
+        Ok(())
+    }
+    /// The idle shrink over a pool modelled in output tokens: `free` is the room the request has
+    /// cold; a retained source sharing its tail (`copy`, one page of rows) costs that much more
+    /// until `release_copies` drops it, as `PrefixCache::release_copies` does.
+    struct Room { free: usize, copy: usize, taken: Option<usize> }
+    impl Room {
+        fn release_copies(&mut self) { self.copy = 0; }
+        fn fits(&self, output: usize) -> Result<bool> { Ok(output + self.copy <= self.free) }
+        fn take(&mut self, output: usize) -> Result<()> {
+            anyhow::ensure!(self.fits(output)?, "{output} does not fit");
+            self.taken = Some(output);
+            Ok(())
+        }
+    }
+    #[test]
+    fn shrink_grants_a_cached_prompt_what_the_same_request_gets_cold_and_counts_it() -> Result<()> {
+        let before = (SHRUNK.load(Relaxed), WITHHELD.load(Relaxed));
+        let mut cold = Room { free: 700, copy: 0, taken: None };
+        let mut cached = Room { free: 700, copy: 512, taken: None };
+        // Kept, the reused source would cost the cached request 512 tokens of output.
+        assert_eq!(fit_output(1000, |output| cached.fits(output))?, Some(188));
+        cached.release_copies();
+        for room in [&mut cold, &mut cached] {
+            let granted = shrink(room, 1000, Room::fits, Room::take)?;
+            assert_eq!((granted, room.taken), (Some(700), Some(700)));
+        }
+        // A request that fits whole is granted whole and is not counted as a shrink.
+        let mut whole = Room { free: 700, copy: 0, taken: None };
+        assert_eq!(shrink(&mut whole, 600, Room::fits, Room::take)?, Some(600));
+        // Not even one token: refused, nothing taken.
+        let mut full = Room { free: 0, copy: 0, taken: None };
+        assert_eq!(shrink(&mut full, 1000, Room::fits, Room::take)?, None);
+        assert_eq!(full.taken, None);
+        // A failed take is the request's error and is not counted.
+        let mut failing = Room { free: 50, copy: 0, taken: None };
+        assert!(shrink(&mut failing, 1000, Room::fits, |_, _| anyhow::bail!("take failed")).is_err());
+        // Two shrinks of 300 withheld tokens each. No other test shrinks.
+        assert_eq!((SHRUNK.load(Relaxed) - before.0, WITHHELD.load(Relaxed) - before.1), (2, 600));
+        assert_eq!(stats()["output_shrinks"], SHRUNK.load(Relaxed));
         Ok(())
     }
     #[test]
