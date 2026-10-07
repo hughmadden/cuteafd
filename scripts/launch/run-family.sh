@@ -597,6 +597,35 @@ if [[ $family == glm5_flash ]]; then
     partials) ;;
     *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_PREFILL_LANES (1-4) lanes of GLM5_FLASH_PREFILL_LANE_ROWS rows (whole 64-row
+  # pages up to 4096) take each Spark prefill chunk, every lane with its own exchange in flight;
+  # unset keeps the engine's two lanes of 4096.
+  prefill_lanes="$(get GLM5_FLASH_PREFILL_LANES)"
+  if [[ -n "$prefill_lanes" ]]; then
+    [[ "$prefill_lanes" =~ ^[1-4]$ ]] || { echo "GLM5_FLASH_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
+    family_args+=(--prefill-lanes "$prefill_lanes")
+  fi
+  lane_rows="$(get GLM5_FLASH_PREFILL_LANE_ROWS)"
+  if [[ -n "$lane_rows" ]]; then
+    if ! [[ "$lane_rows" =~ ^[1-9][0-9]*$ ]] || ((lane_rows > 4096 || lane_rows % 64 != 0)); then
+      echo "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
+    fi
+    family_args+=(--prefill-lane-rows "$lane_rows")
+  fi
+  # GLM5_FLASH_HEADROOM_GIB: GPU memory an automatic pool leaves free for runtime growth when
+  # every other allocation precedes it (unset: the engine's 2 GiB; a 32 GB card takes 1).
+  headroom="$(get GLM5_FLASH_HEADROOM_GIB)"
+  if [[ -n "$headroom" ]]; then
+    [[ "$headroom" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "GLM5_FLASH_HEADROOM_GIB must be a non-negative size in GiB" >&2; exit 2; }
+    family_args+=(--headroom-gib "$headroom")
+  fi
+  # GLM5_FLASH_GRAPH_BUDGET_MIB: device memory the captured decode graphs may hold (the least
+  # recently launched leave past it); unset: unbounded, with the planner's allowance reserved.
+  graph_budget="$(get GLM5_FLASH_GRAPH_BUDGET_MIB)"
+  if [[ -n "$graph_budget" ]]; then
+    [[ "$graph_budget" =~ ^[1-9][0-9]*$ ]] || { echo "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number of MiB" >&2; exit 2; }
+    family_args+=(--graph-budget-mib "$graph_budget")
+  fi
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
