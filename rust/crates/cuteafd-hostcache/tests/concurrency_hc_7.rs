@@ -14,6 +14,10 @@ use cuteafd_hostcache::metrics::Snapshot as Metrics;
 use cuteafd_hostcache::sim::clocked::{self, ClockedCache};
 use cuteafd_hostcache::sim::{EngineModel, RunReport, Simulator, Workload};
 use cuteafd_hostcache::{KV_BYTES_PER_TOKEN, PAGE_BYTES, TAIL_BYTES};
+use cuteafd_hostcache::snapshot::EvictionOrder;
+
+/// Both host eviction orders: the production `LeastRecent` first, then the legacy `Banks`.
+const ORDERS: [EvictionOrder; 2] = [EvictionOrder::LeastRecent, EvictionOrder::Banks];
 
 /// The churn run both suites drive: more conversations than the device banks can serve under
 /// page pressure, so returning visits miss the device and are served — or prefilled — through
@@ -58,10 +62,11 @@ fn quota() -> u64 {
     SESSIONS as u64 * snapshot_bytes(CONTEXT_TOKENS)
 }
 
-/// The cache under test: the real facade over the stub, on the dense fake device.
-fn sim(seed: u64) -> Simulator<ClockedCache> {
+/// The cache under test: the real facade over the stub, on the dense fake device, evicting
+/// in `order`.
+fn sim(seed: u64, order: EvictionOrder) -> Simulator<ClockedCache> {
     let model = model();
-    let cache = ClockedCache::new(clocked::config(quota()), clocked::engine(&model, quota()))
+    let cache = ClockedCache::with_order(clocked::config(quota()), clocked::engine(&model, quota()), order)
         .expect("cache builds");
     Simulator::new(model, cache, seed)
 }
@@ -133,8 +138,9 @@ fn check_churn(seed: u64, report: &RunReport, metrics: &Metrics) {
 
 #[test]
 fn churn_instrumentation_matches_the_ticket_ledger() {
-    for seed in [0xC0FFEE_u64, 0xD5_20_24_11_07, 42] {
-        let mut sim = sim(seed);
+    for (order, seed) in ORDERS.into_iter().flat_map(|order| [0xC0FFEE_u64, 0xD5_20_24_11_07, 42].map(|seed| (order, seed))) {
+        eprintln!("churn: {order:?}, seed {seed:#x}");
+        let mut sim = sim(seed, order);
         let report = sim.run(&workload());
         let metrics = sim.cache().cache().metrics();
         check_churn(seed, &report, &metrics);
@@ -153,23 +159,24 @@ fn churn_instrumentation_matches_the_ticket_ledger() {
 
 #[test]
 fn seeded_schedule_reproduces_the_instrumentation() {
-    let run = || sim(0xC0FFEE).run(&workload());
-    let first = run();
-    let second = run();
-    assert_eq!(first, second, "the same seed must reproduce report and log");
-    // The log names the interleaving the counters must match: eviction consultations,
-    // ticks, restores.
-    assert!(
-        eviction_consultations(&first) > 0,
-        "churn must evict from the device banks"
-    );
-    assert!(
-        first
-            .schedule_log
-            .iter()
-            .any(|line| line.starts_with("tick")),
-        "the schedule log records copy-engine ticks"
-    );
+    for order in ORDERS {
+        let run = || sim(0xC0FFEE, order).run(&workload());
+        let first = run();
+        assert_eq!(first, run(), "the same seed must reproduce report and log ({order:?})");
+        // The log names the interleaving the counters must match: eviction consultations,
+        // ticks, restores.
+        assert!(
+            eviction_consultations(&first) > 0,
+            "churn must evict from the device banks ({order:?})"
+        );
+        assert!(
+            first
+                .schedule_log
+                .iter()
+                .any(|line| line.starts_with("tick")),
+            "the schedule log records copy-engine ticks ({order:?})"
+        );
+    }
 }
 
 #[test]
@@ -178,7 +185,7 @@ fn step_rate_stays_above_the_floor() {
     // in `cargo test`, not in a human's bench review. The floor is an order of magnitude
     // below the observed debug step rate (~28,000 steps/s on the reference machine).
     let start = std::time::Instant::now();
-    let mut sim = sim(0xC0FFEE);
+    let mut sim = sim(0xC0FFEE, EvictionOrder::LeastRecent);
     let report = sim.run(&workload());
     let elapsed = start.elapsed();
     let steps_per_s = report.steps as f64 / elapsed.as_secs_f64();
@@ -196,6 +203,7 @@ mod properties {
     use cuteafd_hostcache::metrics::Snapshot as Metrics;
     use cuteafd_hostcache::sim::clocked::{self, ClockedCache};
     use cuteafd_hostcache::sim::{EngineModel, RunReport, Simulator, Workload};
+    use cuteafd_hostcache::snapshot::EvictionOrder;
     use cuteafd_hostcache::{KV_BYTES_PER_TOKEN, PAGE_BYTES};
     use proptest::prelude::*;
 
@@ -213,6 +221,7 @@ mod properties {
     #[test]
     fn random_small_churn_keeps_the_instruments_exact() {
         proptest!(|(seed: u64,
+                    banks: bool,
                     sessions in 4usize..16,
                     turns in 2usize..5,
                     context_tokens in 512usize..2_048,
@@ -239,7 +248,8 @@ mod properties {
                 context_tokens: context_tokens as u32,
                 live_ratio: 1.0,
             };
-            let cache = ClockedCache::new(clocked::config(quota), clocked::engine(&model, quota))
+            let order = if banks { EvictionOrder::Banks } else { EvictionOrder::LeastRecent };
+            let cache = ClockedCache::with_order(clocked::config(quota), clocked::engine(&model, quota), order)
                 .expect("cache builds");
             let mut sim = Simulator::new(model, cache, seed);
             let report = sim.run(&workload);

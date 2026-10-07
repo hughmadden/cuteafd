@@ -16,6 +16,10 @@ use cuteafd_hostcache::metrics::Snapshot as Metrics;
 use cuteafd_hostcache::sim::clocked::{self, ClockedCache};
 use cuteafd_hostcache::sim::{EngineModel, RunReport, Simulator, Workload};
 use cuteafd_hostcache::{KV_BYTES_PER_TOKEN, PAGE_BYTES, TAIL_BYTES};
+use cuteafd_hostcache::snapshot::EvictionOrder;
+
+/// Both host eviction orders: the production `LeastRecent` first, then the legacy `Banks`.
+const ORDERS: [EvictionOrder; 2] = [EvictionOrder::LeastRecent, EvictionOrder::Banks];
 use std::time::{Duration, Instant};
 
 const SESSIONS: usize = 64;
@@ -150,11 +154,11 @@ fn check_phase(seed: u64, phase: usize, baseline: u64, report: &RunReport, metri
     );
 }
 
-/// Run the phased soak (40 turns in 4 phases of 10) on a fresh simulator at `seed`,
-/// asserting the between-phase invariants after every phase.
-fn run_phased_soak(seed: u64) -> SoakSummary {
+/// Run the phased soak (40 turns in 4 phases of 10) on a fresh simulator at `seed`, evicting
+/// in `order`, asserting the between-phase invariants after every phase.
+fn run_phased_soak(seed: u64, order: EvictionOrder) -> SoakSummary {
     let model = model();
-    let cache = ClockedCache::new(clocked::config(quota()), clocked::engine(&model, quota()))
+    let cache = ClockedCache::with_order(clocked::config(quota()), clocked::engine(&model, quota()), order)
         .expect("cache builds");
     let mut sim = Simulator::new(model, cache, seed);
     let start = Instant::now();
@@ -208,8 +212,10 @@ fn run_phased_soak(seed: u64) -> SoakSummary {
 #[test]
 #[ignore = "soak: run explicitly with `cargo test -p cuteafd-hostcache -- --ignored soak`"]
 fn soak_phases_have_no_leak_and_balance_the_counters() {
-    let summary = run_phased_soak(0x50AC_0006);
-    assert_eq!(summary.phases, TURNS / PHASE_TURNS);
+    for order in ORDERS {
+        let summary = run_phased_soak(0x50AC_0006, order);
+        assert_eq!(summary.phases, TURNS / PHASE_TURNS);
+    }
 }
 
 /// The wall-clock variant: repeat the phase loop with fresh seeds until the 20-minute
@@ -227,7 +233,7 @@ fn soak_wall_clock_twenty_minutes() {
         let seed = 0x50AC_0006u64
             .wrapping_add(iterations)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        run_phased_soak(seed);
+        run_phased_soak(seed, ORDERS[iterations as usize % ORDERS.len()]);
         iterations += 1;
     }
     assert!(

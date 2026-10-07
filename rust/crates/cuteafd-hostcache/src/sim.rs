@@ -1814,8 +1814,9 @@ pub mod clocked {
     use crate::config::{Config, StoreMode};
     use crate::copy::{CopyModel, StubCopyEngine};
     use crate::pool::Layout;
-    use crate::snapshot::{DevicePageId, Key};
+    use crate::snapshot::{DevicePageId, EvictionOrder, Key};
     use crate::KV_BYTES_PER_TOKEN;
+    use cuteafd_core::prefix::ReuseRule;
 
     /// The HC-6 chunk granularity: 8 MiB chunks carve two tail slabs (2.6 MiB each) or 91 page
     /// slabs apiece, with little waste either way.
@@ -1863,11 +1864,17 @@ pub mod clocked {
     }
 
     impl ClockedCache {
-        /// Build the facade: `config` and `engine` exactly as the daemon would, over the engine
-        /// layout the simulator's snapshots are shaped for (`Layout::engine(0)`).
+        /// Build the facade: `config` and `engine` exactly as the daemon would (V4.1's reuse
+        /// rule, least-recent eviction), over the engine layout the simulator's snapshots are
+        /// shaped for (`Layout::engine(0)`).
         pub fn new(config: Config, engine: StubCopyEngine) -> anyhow::Result<Self> {
+            Self::with_order(config, engine, EvictionOrder::LeastRecent)
+        }
+
+        /// [`ClockedCache::new`] with host eviction in `order`; the HC-6 suites run both.
+        pub fn with_order(config: Config, engine: StubCopyEngine, order: EvictionOrder) -> anyhow::Result<Self> {
             Ok(Self {
-                cache: HostCache::new(config, Layout::engine(0), engine)?,
+                cache: HostCache::with_rule(config, Layout::engine(0), engine, ReuseRule::V41, order)?,
             })
         }
 
