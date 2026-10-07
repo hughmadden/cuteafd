@@ -753,9 +753,9 @@ Work, in priority order:
    1024-token image, measured), and history images come from the
    embedding and prefix caches. That beats spending RTX memory or a whole
    Spark on the tower. The −91% decode under back-to-back 4096-token
-   encodes is a stress case, not a gate for this default. MiMo launches
-   now default to `VISION=auto`; other generic families stay `off` until
-   their towers are qualified. Keep V4.1 vision unchanged.
+   encodes is a stress case, not a gate for this default. MiMo and GLM Flash
+   launches now default to `VISION=auto`; other generic families stay `off`
+   until their towers are qualified. Keep V4.1 vision unchanged.
    **Remote integration qualified:** MiMo serving uses `RemoteEncoder`
    with checked `vision_peers`, revision and `encoder_plan_hash`; readiness
    waits for every replica. Remote failure marks `/health` vision failed
@@ -776,12 +776,24 @@ Work, in priority order:
    over readiness, while wasteful load transforms into required tile formats
    must still be avoided. The readiness-only follow-up is cancelled, not run.
    Startup graphs are qualified for the `work/p0` merge, subject to the batch
-   V4.1 parity gate. This does not qualify GLM Flash `VISION=auto`: retained
-   G1-G7 evidence comes from prior matching-native builds; the frozen
-   three-arm baseline/off/auto text-parity sessions, default-quota served-image
-   interference at 256/1024/4096 tokens, encoder-only connection loss with
-   cached/new image 503 and text survival, and explicit off-mode runtime
-   verification remain pending. Keep GLM Flash vision off until those pass.
+   V4.1 parity gate. **GLM Flash vision qualified (2026-10-07):** retained
+   G1-G7 matching-native evidence plus the frozen three-session baseline/off/auto
+   text parity pass: median paired C1/C16 ratios are 0.99764/0.99731 for off and
+   1.00272/0.99656 for auto (bar 0.98). Default-quota served-image interference
+   at 256/1024/4096 tokens passes; first-delta latencies 569/1274/3159 ms include
+   admission and LM prefill, not isolated encoder stall. The separately sealed
+   loss/off v3 retry passes encoder-only connection loss, cached/new image 503,
+   continued active/new text and unchanged experts. Explicit `VISION=off` admits
+   zero encoder bytes, rejects images and leaves media counters zero. No runtime
+   graph captures are added by media/loss/off. GLM Flash now defaults to
+   `VISION=auto` in the launcher and direct CLI; off remains explicit. The planner
+   derives qualified resident weights from checkpoint headers (1,128,026,176 B)
+   plus fixed-capacity scratch (791,907,584 B): 1,919,933,760 B admitted, Spark-first
+   when capacity permits. Unsupported towers remain unsupported, not admitted;
+   checkpoints without a tower stay text-only. Quantized checkpoints lacking a
+   compatible bundled template still require explicit `CHAT_TEMPLATE_FROM`.
+   The original failed v1 loss evidence stays intact; v3 closes the remaining
+   gates. Shared code still requires the coordinator's batched V4.1 parity gate.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop

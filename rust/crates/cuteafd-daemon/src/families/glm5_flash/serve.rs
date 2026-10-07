@@ -76,7 +76,7 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     /// Resolved global vision policy, assigned before dispatch.
-    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub vision: cuteafd_loader::plan::MediaMode,
     /// Explicit vendor template source for vision: cached HF id or snapshot directory.
     #[arg(long)]
@@ -116,7 +116,7 @@ pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
-    let encoding = if args.vision == cuteafd_loader::plan::MediaMode::Off {
+    let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
         GlmEncoding::from_snapshot(&snapshot)?
     } else {
         GlmEncoding::from_snapshot_for_vision(&snapshot, args.chat_template_from.as_deref(), None)?

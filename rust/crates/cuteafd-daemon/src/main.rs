@@ -21,6 +21,27 @@ pub(crate) struct Probe {
     pub(crate) output: String,
 }
 
+fn resolve_vision(
+    family: Option<cuteafd_loader::plan::MediaMode>,
+    initial: Option<cuteafd_loader::plan::MediaMode>,
+) -> cuteafd_loader::plan::MediaMode {
+    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Auto)
+}
+
+#[cfg(test)]
+mod media_defaults_tests {
+    use super::resolve_vision;
+    use cuteafd_loader::plan::MediaMode;
+
+    #[test]
+    fn qualified_vision_defaults_auto_and_preserves_explicit_off() {
+        assert_eq!(resolve_vision(None, None), MediaMode::Auto);
+        assert_eq!(resolve_vision(None, Some(MediaMode::Off)), MediaMode::Off);
+        assert_eq!(resolve_vision(Some(MediaMode::Off), Some(MediaMode::Auto)), MediaMode::Off);
+        assert_eq!(resolve_vision(Some(MediaMode::Spark(Some(0))), None), MediaMode::Spark(Some(0)));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -46,11 +67,7 @@ async fn main() -> Result<()> {
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
     };
-    // GLM Flash vision stays opt-in until the tower and serving hardware gates pass.
-    let vision_default = if matches!(&command, Commands::ServeGlmf(_)) {
-        cuteafd_loader::plan::MediaMode::Off
-    } else { cuteafd_loader::plan::MediaMode::Auto };
-    let vision = family_vision.or(initial_vision).unwrap_or(vision_default);
+    let vision = resolve_vision(family_vision, initial_vision);
     let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; }

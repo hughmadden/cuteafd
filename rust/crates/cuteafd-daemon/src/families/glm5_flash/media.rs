@@ -5,7 +5,7 @@ use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
 
-fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
+pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     Ok(config.get("vision_config").is_some().then_some(config))
@@ -542,6 +542,15 @@ mod tests {
     fn off_vision_never_opens_config_or_tower_payloads() {
         assert!(vision_config(MediaMode::Off, std::path::Path::new("/does/not/exist")).unwrap().is_none());
         assert!(vision_config(MediaMode::Rtx(None), std::path::Path::new("/does/not/exist")).is_err());
+    }
+    #[test]
+    fn auto_without_a_tower_keeps_text_template_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("config.json"), b"{}").unwrap();
+        assert!(vision_config(MediaMode::Auto, temp.path()).unwrap().is_none());
+        std::fs::write(temp.path().join("config.json"), br#"{"vision_config":{"depth":24}}"#).unwrap();
+        assert!(vision_config(MediaMode::Auto, temp.path()).unwrap().is_some());
+        assert!(vision_config(MediaMode::Off, temp.path()).unwrap().is_none());
     }
     #[test]
     fn scoring_shape_is_honored_or_rejected_not_silently_ignored() {

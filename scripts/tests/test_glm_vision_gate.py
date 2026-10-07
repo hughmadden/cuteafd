@@ -94,6 +94,7 @@ def test_glm_pointwise_kernels_cover_capped_grid_tail():
 
 
 def test_glm_g1_reads_actual_nested_processor(tmp_path):
+    pytest.importorskip("PIL")
     import json
     path = ROOT / "scripts/qualify/media/preprocess-goldens.py"
     spec = importlib.util.spec_from_file_location("preprocess_goldens_glm", path)
