@@ -1,4 +1,6 @@
 //! CPU media preparation. V4.1 deliberately keeps its original processor and identity.
+pub mod audio;
+pub mod audio_tower;
 mod decode;
 mod exif;
 mod resize;

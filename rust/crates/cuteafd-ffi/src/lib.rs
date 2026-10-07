@@ -1,6 +1,6 @@
 mod families;
 mod shared;
-pub use shared::{fp8_moe, peer_exchange, programs, vision};
+pub use shared::{audio, fp8_moe, peer_exchange, programs, vision};
 pub use shared::vocab_head::VOCAB_HEAD_ROWS_MAX;
 pub use shared::v41_device_ops::{V41Bf16Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;

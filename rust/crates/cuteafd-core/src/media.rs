@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ImageKey(pub [u8; 32]);
 
+/// The full SHA-256 identity of canonical PCM, preprocessing and its audio tower.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct AudioKey(pub [u8; 32]);
+
 /// A contiguous span of image feature rows in the expanded native prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaSpan {

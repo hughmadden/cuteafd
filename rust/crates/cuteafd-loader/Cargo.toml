@@ -10,6 +10,9 @@ anyhow.workspace = true
 libc.workspace = true
 rayon.workspace = true
 image.workspace = true
+hound = "=3.5.1"
+claxon = "=0.4.3"
+nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
 turbojpeg.workspace = true
 cuteafd-core = { path = "../cuteafd-core" }
 serde.workspace = true

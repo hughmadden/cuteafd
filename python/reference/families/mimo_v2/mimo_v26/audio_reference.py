@@ -256,10 +256,10 @@ def tensor_bytes(tensor) -> bytes:
     return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
 
 
-def pipeline(pcm, codec, patch, speech, ns) -> dict:
+def pipeline(pcm, codec, patch, speech, ns, *, mel_fn=None) -> dict:
     import torch
     import torch.nn.functional as F
-    stages = {"pcm": pcm, "mel": log_mel(pcm)}
+    stages = {"pcm": pcm, "mel": (mel_fn or log_mel)(pcm)}
     handles = []
     for name, module in [("conv1", codec.conv1), ("conv2", codec.conv2),
                          ("tokenizer_norm", codec.layer_norm), ("pre_rvq", codec.down_sample_norm)]:
