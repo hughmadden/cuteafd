@@ -237,7 +237,8 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 2.0)]
     pub(crate) headroom_gib: f64,
     /// Decode graph budget (MiB) for --layout (GLM 5.3 Flash's --graph-budget-mib; unset: the
-    /// family's graph allowance).
+    /// family's graph allowance). One GPU with Spark experts and an automatic pool keeps the budget
+    /// itself, as its measured admission does; other layouts keep at least the allowance.
     #[arg(long)]
     pub(crate) graph_budget_mib: Option<u64>,
     /// Concurrent sequences for --layout (0: family default).

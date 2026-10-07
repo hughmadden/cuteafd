@@ -68,9 +68,11 @@ pub(crate) struct EngineArgs {
     /// cache state. The planner's default; 1 suits a 32 GB card.
     #[arg(long, default_value_t = 2.0)]
     pub headroom_gib: f64,
-    /// Device memory (MiB) the captured decode graphs may hold: past it the least recently
-    /// launched executables are destroyed between steps and recaptured when needed. Unset:
-    /// unbounded. An automatic pool keeps this much free for them (unset: the planner's 1.5 GiB).
+    /// Device memory (MiB) the captured decode graphs may hold on each GPU: past it the least
+    /// recently launched executables are destroyed between steps and recaptured when needed.
+    /// Unset: unbounded. The KV admission keeps this much free for them on every GPU, and one
+    /// planned before start-up (a head split, local experts, a fixed pool) at least the planner's
+    /// 1.5 GiB graph allowance (unset: the startup set's reserve, else the allowance).
     #[arg(long)]
     pub graph_budget_mib: Option<u64>,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
@@ -289,6 +291,101 @@ mod draft_cli_tests {
         assert_eq!(defaults.startup_graphs(), engine::startup_graphs_enabled());
     }
 
+    const SPARKS: [&str; 2] = ["--peers", "127.0.0.1:19441"];
+
+    /// `flags` with `--graph-budget-mib budget` when there is one.
+    fn with_budget(flags: &[&str], budget: Option<&str>) -> EngineArgs {
+        let mut flags = flags.to_vec();
+        if let Some(mib) = budget {
+            flags.extend(["--graph-budget-mib", mib]);
+        }
+        parse(&flags)
+    }
+
+    /// A fixed pool is admitted from the planner's costs, which kept only the 1.5 GiB graph allowance
+    /// on the GPU whatever the graph budget: at `--graph-budget-mib 4096`, 2,684,354,560 B short of what
+    /// lazily captured graphs may fill. It now keeps the budget or the allowance, whichever is larger,
+    /// with Spark or local experts, served or not (without a serving loop it was not admitted at all).
+    #[test]
+    fn a_fixed_pool_keeps_the_graph_budget_or_the_allowance_free() {
+        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes;
+        assert_eq!(allowance, [1_610_612_736; 3]);
+        for (budget, excess) in [("4096", 2_684_354_560), ("512", 0), ("1536", 0), ("1537", 1 << 20)] {
+            for experts in [&SPARKS[..], &["--local-experts"][..]] {
+                let mut args = with_budget(&[experts, &["--pool-tokens", "131072"][..]].concat(), Some(budget));
+                // The GPU's graph bytes: the planner's allowance (role 0) and the extra each GPU's reserve takes.
+                let extra = planned_graph_extra(&args, None, allowance[0]);
+                assert_eq!(extra, excess, "{budget} MiB");
+                assert_eq!(allowance[0] + extra, (budget.parse::<u64>().unwrap() << 20).max(allowance[0]));
+                for serving in [Some((16, true)), None] {
+                    args.serving_graph_policy = serving;
+                    assert_eq!(kv_admission(&args, false, false), KvAdmission::Planned, "{budget} MiB {serving:?}");
+                }
+            }
+        }
+        // Without a budget: served, planned; otherwise planned beside the startup set, else unchecked.
+        let mut lazy = with_budget(&[&SPARKS[..], &["--pool-tokens", "131072"][..]].concat(), None);
+        assert_eq!(kv_admission(&lazy, false, false),
+            if lazy.startup_graphs() { KvAdmission::Planned } else { KvAdmission::Unchecked });
+        lazy.serving_graph_policy = Some((16, true));
+        assert_eq!(kv_admission(&lazy, false, false), KvAdmission::Planned);
+    }
+
+    /// A head split is admitted from the planner's costs, its pool automatic or fixed, and each rank's
+    /// graph cache may fill the budget (`GlmfEngine::set_graph_budget`): both GPUs keep the budget or
+    /// the allowance, whichever is larger.
+    #[test]
+    fn a_head_split_keeps_the_graph_budget_or_the_allowance_free_on_both_gpus() {
+        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes;
+        for (budget, excess) in [("4096", 2_684_354_560u64), ("512", 0), ("1536", 0)] {
+            for pool in ["0", "131072"] {
+                let args = with_budget(&[&SPARKS[..], &["--split-device", "1", "--pool-tokens", pool][..]].concat(),
+                    Some(budget));
+                // A coordinator GPU budget measures one GPU only.
+                for gpu_budget in [false, true] {
+                    assert_eq!(kv_admission(&args, gpu_budget, true), KvAdmission::Planned,
+                        "{budget} MiB, pool {pool}");
+                }
+                // Both GPUs (the planner's roles 1 and 2) keep their allowance and the same extra.
+                let extra = planned_graph_extra(&args, None, allowance[0]);
+                assert_eq!(extra, excess, "{budget} MiB, pool {pool}");
+                for role in [1, 2] {
+                    assert_eq!(allowance[role] + extra, (budget.parse::<u64>().unwrap() << 20).max(allowance[role]));
+                }
+            }
+        }
+    }
+
+    /// The default path is unchanged: one GPU with Spark experts and an automatic pool, served or not,
+    /// or any one-GPU launch under a coordinator GPU budget, is admitted from measured free memory,
+    /// which keeps the graph budget itself, below the allowance or above it (else the allowance).
+    #[test]
+    fn the_measured_admission_keeps_the_graph_budget_itself() {
+        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0];
+        for (budget, kept) in [(None, allowance), (Some("512"), 536_870_912), (Some("4096"), 4_294_967_296)] {
+            let mut args = with_budget(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat(), budget);
+            for serving in [Some((16, true)), None] {
+                args.serving_graph_policy = serving;
+                assert_eq!(kv_admission(&args, false, false), KvAdmission::Measured, "{budget:?}");
+                assert_eq!(kv_admission(&args, true, false), KvAdmission::Measured, "{budget:?}");
+            }
+            assert_eq!(graph_reserve(&args), kept, "{budget:?}");
+            // A fixed pool or local experts: measured under a GPU budget, planned without one.
+            for flags in [&[&SPARKS[..], &["--pool-tokens", "131072"][..]].concat(), &vec!["--local-experts"]] {
+                let mut other = with_budget(flags, budget);
+                other.serving_graph_policy = Some((16, true));
+                assert_eq!(kv_admission(&other, true, false), KvAdmission::Measured, "{budget:?} {flags:?}");
+                assert_eq!(kv_admission(&other, false, false), KvAdmission::Planned, "{budget:?} {flags:?}");
+            }
+        }
+        // The startup set's planned extra is unchanged: its largest rank above the allowance.
+        let lazy = with_budget(&SPARKS, None);
+        assert_eq!(planned_graph_extra(&lazy, Some(&[5_000_000_000, 4_000_000_000]), allowance),
+            5_000_000_000 - allowance);
+        assert_eq!(planned_graph_extra(&lazy, Some(&[1_000_000_000]), allowance), 0);
+        assert_eq!(planned_graph_extra(&lazy, None, allowance), 0);
+    }
+
     #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
@@ -478,6 +575,46 @@ fn step_settings(args: &EngineArgs) -> engine::StepSettings {
 /// planner's allowance.
 fn graph_reserve(args: &EngineArgs) -> u64 {
     args.graph_budget_mib.map_or(cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0], |mib| mib << 20)
+}
+
+/// How a launch admits its KV pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvAdmission {
+    /// From the free memory measured once everything else is allocated: one GPU with Spark experts
+    /// and an automatic pool, or any one-GPU launch under a coordinator GPU budget. It keeps the
+    /// startup set's reserve free for decode graphs, else `graph_reserve`.
+    Measured,
+    /// From the planner's per-GPU costs before the engine allocates: a head split, local experts
+    /// without a GPU budget, a fixed pool. Every GPU keeps the planner's graph allowance and
+    /// `planned_graph_extra` free.
+    Planned,
+    /// None: a fixed pool taken as given by a command without a serving loop, a GPU budget or
+    /// all-row prefill logits, and with no decode graph memory to keep (neither the startup set nor
+    /// a graph budget).
+    Unchecked,
+}
+
+/// The KV admission of a launch with these arguments: `gpu_budget`, a coordinator GPU budget is set;
+/// `split`, a head split's second GPU serves.
+fn kv_admission(args: &EngineArgs, gpu_budget: bool, split: bool) -> KvAdmission {
+    if (args.pool_tokens == 0 || gpu_budget) && !split && (!args.local_experts || gpu_budget) {
+        KvAdmission::Measured
+    } else if args.pool_tokens == 0 || args.full_prefill_logits || gpu_budget || args.startup_graphs()
+        || args.graph_budget_mib.is_some() || args.serving_graph_policy.is_some() {
+        KvAdmission::Planned
+    } else {
+        KvAdmission::Unchecked
+    }
+}
+
+/// What a planned admission keeps free for decode graph executables on every GPU beyond the
+/// planner's `allowance`, which `planned_pool_tokens_with_reserves` charges each GPU: the startup
+/// set's largest rank when graphs are captured at startup, else the graph budget, which each rank's
+/// cache may fill (`GlmfEngine::set_graph_budget`). So every GPU keeps max(allowance, startup set or
+/// budget): a budget below the allowance keeps the allowance.
+fn planned_graph_extra(args: &EngineArgs, startup_reserve: Option<&[u64]>, allowance: u64) -> u64 {
+    let startup = startup_reserve.and_then(|reserve| reserve.iter().copied().max()).unwrap_or(0);
+    startup.max(args.graph_budget_mib.map_or(0, |mib| mib << 20)).saturating_sub(allowance)
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -684,7 +821,8 @@ impl Opened {
         // the pool takes the free memory they leave, less the headroom, the graph reserve and the
         // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`). With
         // all-row prefill logits the lanes' temporaries already hold them.
-        let eager = (args.pool_tokens == 0 || gpu_budget) && peer_stream.is_none() && (!args.local_experts || gpu_budget);
+        let admission = kv_admission(args, gpu_budget, peer_stream.is_some());
+        let eager = admission == KvAdmission::Measured;
         let mut early = None;
         // Admit the package before KV sizing; measured free memory then excludes its buffers (the
         // eager admission loads it with the rest of start-up).
@@ -722,9 +860,9 @@ impl Opened {
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
             early = Some((experts, drafter, dense, selector, workspaces));
             tokens
-        } else if args.pool_tokens == 0 || budgeted || startup_graphs || args.serving_graph_policy.is_some() {
-            // 0: automatic; budgeted fixed pools retain their requested size and
-            // refuse before allocation if the future storage would not fit.
+        } else if admission == KvAdmission::Planned {
+            // 0: automatic; fixed pools (budgeted, served, or beside decode graphs) retain their
+            // requested size and refuse before allocation if the future storage would not fit.
             let precise_split = args.kda_fp32_partials || args.kda_output_shard;
             let devices: Vec<i32> = if precise_split {
                 vec![args.device, args.split_device.context("precise head split")?]
@@ -756,11 +894,11 @@ impl Opened {
             let workspace_extra = workspace_reserve.iter().copied().max().unwrap_or(0).saturating_sub(workspace_allowance);
             tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve, planner_allowance_bytes = workspace_allowance,
                 extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
-            let graph_extra = startup_reserve.as_ref().map_or(0, |reserve| reserve.iter().copied().max().unwrap_or(0)
-                .saturating_sub(costs.graph_bytes[0]));
-            if startup_graphs {
-                tracing::info!(allowance_bytes = costs.graph_bytes[0], extra_reserve_bytes = graph_extra,
-                    "GLM Flash graph reserve above planner allowance");
+            // The startup set or the graph budget above the planner's graph allowance, on every GPU.
+            let graph_extra = planned_graph_extra(args, startup_reserve.as_deref(), costs.graph_bytes[0]);
+            if startup_graphs || args.graph_budget_mib.is_some() {
+                tracing::info!(allowance_bytes = costs.graph_bytes[0], graph_budget_mib = ?args.graph_budget_mib,
+                    extra_reserve_bytes = graph_extra, "GLM Flash graph reserve above planner allowance");
             }
             let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
                 crate::shared::memory_report::RankReserve {

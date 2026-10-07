@@ -40,7 +40,9 @@ pub struct LayoutOptions {
     pub full_prefill_logits: bool,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
-    /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance.
+    /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance
+    /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
+    /// else in its place only when larger.
     pub graph_budget_bytes: Option<u64>,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
@@ -543,13 +545,19 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
             context_tokens))).flatten();
 
+    // A GLM 5.3 Flash graph budget, kept as the engine's KV admission keeps it: from measured free
+    // memory (one GPU, Spark experts, an automatic pool) the budget itself, from the planner's costs
+    // (a head split, local experts, a fixed pool) the budget or the graph allowance, whichever is larger.
+    let glmf_measured = !split && automatic && matches!(report.placement, ExpertPlacement::Sparks { .. });
+
     // Fixed runtime costs.
     let gpus_now = active_gpus;
     for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
-        match options.graph_budget_bytes.filter(|_| family == "glm5_flash") {
+        match options.graph_budget_bytes.filter(|&budget| family == "glm5_flash"
+            && (glmf_measured || budget > costs.graph_bytes[role])) {
             Some(budget) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget, Basis::Formula)),
             None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role],
                 allowance_basis)),

@@ -942,6 +942,36 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert_eq!(graphs, [("graph budget", 512 << 20)]);
 }
 
+/// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
+/// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
+/// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
+#[test]
+fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
+    use cuteafd_core::memory_layout::DeviceKind;
+    let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let allowance = layout::family_costs("glm5_flash").graph_bytes;
+    // Each coordinator GPU's graph item for `gpus` GPUs, a pool (None: automatic), `ranks` Sparks (0:
+    // local experts) and a budget of `mib` MiB.
+    let graphs = |gpus: usize, pool: Option<u64>, ranks: usize, mib: u64| -> Vec<(String, u64)> {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            pool_tokens: pool, graph_budget_bytes: Some(mib << 20), ..Default::default() }), ..sparks(ranks) };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
+            .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
+    };
+    let budget = |mib: u64| ("graph budget".to_string(), mib << 20);
+    let kept = ("graph allowance".to_string(), allowance[0]);
+    // Measured: the budget itself, below the allowance or above it.
+    assert_eq!(graphs(1, None, 4, 512), [budget(512)]);
+    assert_eq!(graphs(1, None, 4, 4096), [budget(4096)]);
+    // Planned: a fixed pool, local experts, a head split (both GPUs).
+    for (gpus, pool, ranks) in [(1, Some(131_072), 4), (1, None, 0), (2, None, 4), (2, Some(131_072), 4)] {
+        assert_eq!(graphs(gpus, pool, ranks, 512), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
+        assert_eq!(graphs(gpus, pool, ranks, 1536), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
+        assert_eq!(graphs(gpus, pool, ranks, 4096), vec![budget(4096); gpus], "{gpus} {pool:?} {ranks}");
+    }
+}
+
 #[test]
 fn glm_next_facts_and_dflash2_drafter_are_described() {
     let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
