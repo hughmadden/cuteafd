@@ -3251,7 +3251,7 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            ("integration/cuteafd/glmf.py", 0x975b_8158_3e61_8bca_u64),
+            ("integration/cuteafd/glmf.py", 0x4cd0_3a4e_bfd1_f6fd_u64),
             ("integration/cuteafd/_glm_kernels.py", 0xabb3_5df9_3a4c_9796),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
