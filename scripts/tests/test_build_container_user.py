@@ -120,8 +120,9 @@ def test_dev_shell_execs_docker_with_the_group(tmp_path):
     stub = binary / "docker"
     stub.write_text(DOCKER_STUB)
     stub.chmod(0o755)
-    env = dict(
-        os.environ,
+    # The optional compiler cache rewraps argv; this test pins the plain launch.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CUTEAFD_KACHE")}
+    env.update(
         PATH=f"{binary}{os.pathsep}{os.environ['PATH']}",
         HOME=str(tmp_path / "home"),
         MOCK_DOCKER_LOG=str(log),
