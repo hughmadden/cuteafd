@@ -180,6 +180,8 @@ pub struct Verdict {
     pub confident_top1_min: f64,
     pub top3_min: f64,
     pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// One calibrated absolute verdict shared by the card, CLI and dashboard.
@@ -212,7 +214,10 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
-    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons }
+    let label = (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
+        run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
+            .unwrap_or("standard-v2").to_string());
+    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons, label }
 }
 
 fn absolute(run: &Run) -> bool {
@@ -264,8 +269,9 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(comparison_settings(&a.settings)? == comparison_settings(&b.settings)?,
         "runs use different nonprecision server settings");
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
-    ensure!(a.tier == "full" || a.path_shape == "decode-shaped", "quick and standard tiers must be decode-shaped");
-    ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(matches!(a.tier.as_str(), "full" | "standard-v2") || a.path_shape == "decode-shaped",
+        "Quick and legacy Standard must be decode-shaped");
+    ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "standard-v2" | "full"), "unknown tier");
     if a.tier != "quick" {
         ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
             && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
@@ -405,6 +411,31 @@ mod tests {
         assert!(!rejected.pass);
         assert!(rejected.reasons.iter().any(|reason| reason.contains(crate::fidelity_dataset::FLASH_CONFIG)));
         assert!(compare(&bad, &bad, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn standard_v2_labels_fallback_and_refuses_legacy_or_other_mode_pairing() {
+        let mut old = run(8,512); old.tier = "standard".into();
+        let mut split = old.clone(); split.tier = crate::fidelity_dataset::STANDARD_TIER.into();
+        assert!(compare(&split,&old,0.005,0.005,100,1).is_err());
+        split.dataset = Some(serde_json::json!({"standard_subset":{"mode":"32 decode / 32 prefill"}}));
+        assert!(compare(&split,&split,0.005,0.005,100,1).unwrap().pass);
+        split.path_shape = "prefill-shaped".into();
+        assert!(compare(&split,&split,0.005,0.005,100,1).unwrap().pass);
+        let mut regressed = split.clone();
+        for row in &mut regressed.score.records { row.kl = 0.2; }
+        assert!(!verdict(&regressed).pass);
+        assert!(verdict(&split).pass);
+        let mut fallback = split.clone(); fallback.path_shape = "decode-shaped".into();
+        fallback.dataset.as_mut().unwrap()["standard_subset"]["mode"] = serde_json::json!(crate::fidelity_dataset::STANDARD_FALLBACK);
+        let verdict = verdict(&fallback);
+        assert!(verdict.pass);
+        assert_eq!(verdict.label.as_deref(),Some(crate::fidelity_dataset::STANDARD_FALLBACK));
+        let report = crate::panels::fidelity::record(&fallback,None);
+        assert_eq!(report["mode"],crate::fidelity_dataset::STANDARD_FALLBACK);
+        assert_eq!(report["verdict"]["label"],crate::fidelity_dataset::STANDARD_FALLBACK);
+        split.path_shape = "decode-shaped".into();
+        assert!(compare(&split,&fallback,0.005,0.005,100,1).is_err());
     }
 
     #[test]

@@ -38,6 +38,68 @@ pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
     Ok(selected)
 }
 
+pub const STANDARD_TIER: &str = "standard-v2";
+pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a77734bc13e774d37e416eee65b";
+pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
+
+/// Sealed after balancing all seven published text sets, not sampled at runtime.
+/// Each half has A/B/C/D/E counts 13/6/5/3/5. The singleton legacy anchor
+/// belongs to prefill; decode has the comparable context-only C windows.
+pub const STANDARD_DECODE: [&str; 32] = [
+    "a00", "a01", "a04", "a05", "a08", "a09", "a10", "a12", "a17", "a19", "a21", "a24", "a25",
+    "b01", "b02", "b06", "b07", "b08", "b10", "c01", "c04", "c06", "c08", "c09",
+    "d01", "d02", "d04", "e00", "e02", "e05", "e06", "e07",
+];
+pub const STANDARD_PREFILL: [&str; 32] = [
+    "a02", "a03", "a06", "a07", "a11", "a13", "a14", "a15", "a16", "a18", "a20", "a22", "a23",
+    "b00", "b03", "b04", "b05", "b09", "b11", "c00", "c02", "c03", "c05", "c07",
+    "d00", "d03", "d05", "e01", "e03", "e04", "e08", "legacy",
+];
+
+pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
+    settings.iter().any(|s| s.name == "full-prefill-logits"
+        && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
+}
+
+/// Fail closed if a future publication changes the sealed split's composition.
+pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Result<Vec<Window>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    reference.validate()?;
+    let ids: BTreeSet<_> = STANDARD_DECODE.iter().chain(&STANDARD_PREFILL).copied().collect();
+    ensure!(reference.windows.len() == 64 && ids.len() == 64
+        && reference.windows.iter().all(|w| ids.contains(w.id.as_str()) && w.positions.len() == 512),
+        "dataset differs from sealed standard-v2 windows");
+    let halves: Vec<Vec<_>> = [STANDARD_DECODE, STANDARD_PREFILL].iter().map(|ids|
+        ids.iter().map(|id| reference.windows.iter().find(|w| w.id == *id).unwrap()).collect()).collect();
+    let mut buckets = Vec::new();
+    let mut generated = Vec::new();
+    for half in &halves {
+        let mut blocks = BTreeMap::new();
+        let mut counts = BTreeMap::new();
+        let mut roles = BTreeMap::new();
+        for w in half {
+            *blocks.entry(w.block.as_str()).or_insert(0) += 1;
+            *counts.entry(w.bucket.as_str()).or_insert(0i32) += 1;
+            for p in &w.positions { *roles.entry(w.roles[p.pos].as_str()).or_insert(0usize) += 1; }
+        }
+        ensure!(blocks == BTreeMap::from([("A",13), ("B",6), ("C",5), ("D",3), ("E",5)]),
+            "standard-v2 block stratification differs");
+        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0 && roles.get("gen").copied().unwrap_or(0) > 0,
+            "standard-v2 requires context and generated rows in each half");
+        generated.push(roles["gen"]);
+        buckets.push(counts);
+    }
+    ensure!(buckets[0].keys().chain(buckets[1].keys()).all(|k|
+        (buckets[0].get(k).copied().unwrap_or(0) - buckets[1].get(k).copied().unwrap_or(0)).abs() <= 1),
+        "standard-v2 context buckets are not balanced");
+    ensure!(*generated.iter().max().unwrap() as f64 <= 1.1 * *generated.iter().min().unwrap() as f64,
+        "standard-v2 generated row counts differ by more than 10%");
+    ensure!(matches!(path, "decode" | "prefill") && (admitted || path == "decode"),
+        "standard-v2 prefill scoring not admitted");
+    if !admitted { return Ok(reference.windows.clone()); }
+    Ok(halves[usize::from(path == "prefill")].iter().map(|w| (*w).clone()).collect())
+}
+
 pub fn ensure_valid_publication(repo: &str, commit: &str, config: &str) -> Result<()> {
     ensure!(!(repo == REPOSITORY && config == RETIRED_FLASH_CONFIG),
         "superseded MiMo Flash fidelity reference at {commit}, scores not valid (QKV scale bug); use {FLASH_CONFIG} at {FLASH_REVISION}");
@@ -266,6 +328,17 @@ mod tests {
     }
 
     #[test]
+    fn prefill_admission_uses_resolved_launch_setting_only() {
+        use crate::report::Setting;
+        assert!(!prefill_admitted(&[]));
+        for value in ["false", "off", "0", "true", "on", "1"] {
+            let setting = Setting { name:"full-prefill-logits".into(), value:Some(value.into()),
+                default:Some("false".into()), source:"cli".into() };
+            assert_eq!(prefill_admitted(&[setting]), matches!(value,"true"|"on"|"1"));
+        }
+    }
+
+    #[test]
     fn sealed_quick_subset_is_eight_balanced_windows_and_fails_closed() {
         use crate::reference::{CompactPosition, Top};
         let mut reference: Reference = serde_json::from_value(json!({"name":"synthetic", "models":[], "vocab":1,
@@ -284,6 +357,63 @@ mod tests {
     }
 
     #[test]
+    fn standard_split_is_sealed_stratified_and_order_independent() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut reference: Reference = serde_json::from_value(json!({"name":"synthetic", "models":[], "vocab":1,
+            "schema":"cuteafd.fidelity.reference/2", "checkpoint":"test", "set_sha256":"sealed",
+            "expect":{"top1_min":0.9,"kl_max":0.06}})).unwrap();
+        // Real sealed V4.1 metadata tests buckets and role counts without external files/network.
+        let panel: Value = serde_json::from_str(include_str!("../../../../set/deepseek_v41/v2_20261005/windows.json")).unwrap();
+        for raw in panel["windows"].as_array().unwrap() {
+            let mut raw = raw.clone(); raw["tokens"] = json!(vec![0u32; raw["roles"].as_array().unwrap().len()]);
+            raw["positions"] = json!([]); raw["top_k"] = json!(1);
+            let mut w: Window = serde_json::from_value(raw).unwrap();
+            w.positions = (w.score_from..w.tokens.len()).map(|pos| CompactPosition {
+                pos, next:0, next_lp:0.0, top:vec![Top{id:0,lp:0.0}], tail_lp:f64::NEG_INFINITY }).collect();
+            reference.windows.push(w);
+        }
+        let seal = STANDARD_DECODE.iter().chain(&STANDARD_PREFILL).copied().collect::<Vec<_>>().join("\n");
+        assert_eq!(digest(seal.as_bytes()),STANDARD_SPLIT_SHA256);
+        let decode = standard_windows(&reference,"decode",true).unwrap();
+        let prefill = standard_windows(&reference,"prefill",true).unwrap();
+        assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_DECODE);
+        assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_PREFILL);
+        assert_eq!((decode.len(),prefill.len()),(32,32));
+        let ids: BTreeSet<_> = decode.iter().chain(&prefill).map(|w| &w.id).collect();
+        assert_eq!(ids.len(),64);
+        for half in [&decode,&prefill] {
+            let mut blocks = BTreeMap::new();
+            for w in half { *blocks.entry(w.block.as_str()).or_insert(0) += 1; }
+            assert_eq!(blocks,BTreeMap::from([("A",13),("B",6),("C",5),("D",3),("E",5)]));
+        }
+        let gen = |half: &[Window]| half.iter().flat_map(|w| w.positions.iter().map(|p| &w.roles[p.pos])).filter(|r| *r == "gen").count();
+        assert_eq!((gen(&decode),gen(&prefill)),(8998,8658));
+        assert!(prefill.iter().any(|w| w.id == "legacy"));
+        reference.windows.reverse();
+        assert_eq!(standard_windows(&reference,"decode",true).unwrap().iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_DECODE);
+        assert_eq!(standard_windows(&reference,"decode",false).unwrap().len(),64);
+        assert!(standard_windows(&reference,"prefill",false).is_err());
+        let saved = reference.clone();
+        reference.windows[0].block = "A".into();
+        assert!(standard_windows(&reference,"decode",true).is_err());
+        reference = saved.clone();
+        for w in &mut reference.windows {
+            if STANDARD_DECODE.contains(&w.id.as_str()) { w.roles.fill("ctx".into()); }
+        }
+        assert!(standard_windows(&reference,"decode",true).is_err());
+        reference = saved.clone();
+        for w in &mut reference.windows {
+            if STANDARD_DECODE.contains(&w.id.as_str()) && w.block != "C" { w.roles.fill("gen".into()); }
+        }
+        assert!(standard_windows(&reference,"decode",true).unwrap_err().to_string().contains("more than 10%"));
+        reference = saved;
+        for w in &mut reference.windows {
+            if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }
+        }
+        assert!(standard_windows(&reference,"decode",true).is_err());
+    }
+
+    #[test]
     #[ignore = "requires published immutable HF commit and network access"]
     fn published_dataset_fetch_roundtrip() {
         let commit = std::env::var("CUTEAFD_FIDELITY_HF_REVISION").unwrap();
@@ -296,6 +426,8 @@ mod tests {
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
         assert_eq!(hash, expected_hash);
+        assert_eq!(standard_windows(&reference,"decode",true).unwrap().len(),32);
+        assert_eq!(standard_windows(&reference,"prefill",true).unwrap().len(),32);
         if commit == FLASH_REVISION && config == FLASH_CONFIG {
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.93, 0.04));
             let tripwires = reference.expect.tripwires.as_ref().unwrap();

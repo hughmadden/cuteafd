@@ -398,7 +398,13 @@ function tableFor(id, comparedResult = null) {
         + tableHtml(['metric', 'delta', 'upper 95%', 'margin'], [
           ['top-1 loss', pair.comparison.top1_loss.toFixed(6), pair.comparison.top1_upper95.toFixed(6), pair.comparison.top1_margin.toFixed(6)],
           ['KL delta (nat)', pair.comparison.kl_delta.toFixed(6), pair.comparison.kl_upper95.toFixed(6), pair.comparison.kl_margin.toFixed(6)]]) : '';
-    return `<p>${fmt.esc(pass.dataset?.config || '')} · ${fmt.esc(pass.dataset?.revision || '')}</p>` + pairedTable + sections
+    const prefillPair = pass.paired_prefill;
+    const pairedPrefillTable = prefillPair?.unavailable ? `<p>Prefill pair unavailable: ${fmt.esc(prefillPair.unavailable)}</p>`
+      : prefillPair?.comparison ? `<h3>Paired prefill · ${prefillPair.comparison.pass ? 'PASS' : 'FAIL'}</h3>`
+        + tableHtml(['metric', 'delta', 'upper 95%', 'margin'], [
+          ['top-1 loss', prefillPair.comparison.top1_loss.toFixed(6), prefillPair.comparison.top1_upper95.toFixed(6), prefillPair.comparison.top1_margin.toFixed(6)],
+          ['KL delta (nat)', prefillPair.comparison.kl_delta.toFixed(6), prefillPair.comparison.kl_upper95.toFixed(6), prefillPair.comparison.kl_margin.toFixed(6)]]) : '';
+    return `<p>${fmt.esc(pass.dataset?.config || '')} · ${fmt.esc(pass.dataset?.revision || '')}</p>` + pairedTable + pairedPrefillTable + sections
       .filter(([, verdict]) => verdict).map(([path, verdict, windows]) => {
         const g = verdict.generated;
         const pct = (v) => v == null ? 'N/A' : `${(v * 100).toFixed(3)}%`;
@@ -406,7 +412,8 @@ function tableFor(id, comparedResult = null) {
           ['KL (nat)', g.kl.toFixed(6), verdict.kl_max.toFixed(6), 'max'],
           ['confident top-1', pct(g.confident_top1), pct(verdict.confident_top1_min), 'min'],
           ['top-3', pct(g.top3_contained), pct(verdict.top3_min), 'min']];
-        return `<h3>${fmt.esc(path)} · ${verdict.pass ? 'PASS' : 'FAIL'}</h3>`
+        return `<h3>${fmt.esc(path)} · ${verdict.pass ? 'PASS' : 'FAIL'} · ${g.positions} generated rows</h3>`
+          + (verdict.label ? `<p>${fmt.esc(verdict.label)}</p>` : '')
           + tableHtml(['metric', 'measured (fraction / nat)', 'expect + floor', 'bound'], rows)
           + `<p>${fmt.esc((verdict.reasons || []).join('; '))}</p>`
           + tableHtml(['window', 'positions', 'top-1', 'KL (nat)', 'confident top-1', 'top-3', 'NLL'],

@@ -259,6 +259,16 @@ fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, ear
         };
         latest["paired"] = paired;
         latest["paired"]["earlier_run"] = json!(earlier_id);
+        if latest["tier"] == crate::fidelity_dataset::STANDARD_TIER && !latest["prefill"].is_null() {
+            let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+                .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["prefill"].clone()).ok());
+            latest["paired_prefill"] = match (&previous, serde_json::from_value::<crate::fidelity::Run>(latest["prefill"].clone())) {
+                (Some(previous), Ok(current)) => crate::panels::fidelity::record(&current, Some(previous))["paired"].clone(),
+                (None, _) => json!({"unavailable": "selected saved run has no matching fidelity prefill result"}),
+                (_, Err(_)) => json!({"unavailable": "current prefill result is not complete"}),
+            };
+            latest["paired_prefill"]["earlier_run"] = json!(earlier_id);
+        }
     }
 }
 
@@ -400,6 +410,23 @@ mod tests {
         assert_eq!(panel.latest().unwrap()["paired"]["earlier_run"], "missing");
         assert!(panel.latest().unwrap()["paired"]["unavailable"].as_str().unwrap().contains("no matching"));
         assert_eq!(panel.passes, vec![json!({"saved":true})]);
+    }
+
+    #[test]
+    fn standard_history_checks_both_paths_and_rejects_legacy_version() {
+        let mut current = crate::sample::full_report();
+        current.panels.retain(|p| p.id == "fidelity");
+        let mut earlier = current.clone();
+        attach_fidelity_comparison(&mut current,Some(&earlier),"earlier");
+        let latest = current.panel("fidelity").unwrap().latest().unwrap();
+        assert_eq!(latest["paired"]["comparison"]["pass"],true);
+        assert_eq!(latest["paired_prefill"]["comparison"]["pass"],true);
+        let old = earlier.panels[0].passes.last_mut().unwrap();
+        old["decode"]["tier"] = json!("standard"); old["prefill"]["tier"] = json!("standard");
+        attach_fidelity_comparison(&mut current,Some(&earlier),"legacy");
+        let latest = current.panel("fidelity").unwrap().latest().unwrap();
+        assert!(latest["paired"]["unavailable"].as_str().unwrap().contains("different tiers"));
+        assert!(latest["paired_prefill"]["unavailable"].as_str().unwrap().contains("different tiers"));
     }
 
     #[test]

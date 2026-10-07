@@ -37,6 +37,9 @@ pub enum Action {
     Compare {
         a: PathBuf,
         b: PathBuf,
+        /// Select a path from an automatic Standard report (also accepts standalone Run files).
+        #[arg(long, value_parser = ["decode", "prefill"], default_value = "decode")]
+        score_path: String,
         #[arg(long)]
         top1_margin: Option<f64>,
         #[arg(long)]
@@ -49,7 +52,7 @@ pub enum Action {
         out: Option<PathBuf>,
     },
 }
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub url: String,
@@ -82,7 +85,7 @@ pub struct RunArgs {
     /// New directory on server-local NVMe, also visible to this client for scoring.
     #[arg(long)]
     pub dump_dir: Option<PathBuf>,
-    /// Kernel shape to score; quick tier always uses decode.
+    /// Kernel shape to score; Quick uses decode, Standard automatically scores both admitted paths.
     #[arg(long, value_parser = ["decode", "prefill"], default_value = "decode")]
     pub score_path: String,
     #[arg(long)]
@@ -125,9 +128,9 @@ fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -
     }
 }
 
-pub fn run(args: &RunArgs) -> Result<Run> {
+pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
-    ensure!(args.tier == "full" || args.score_path == "decode", "quick and standard tiers must be decode-shaped");
+    ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(900)).build();
     let base = args.url.trim_end_matches('/');
@@ -135,11 +138,30 @@ pub fn run(args: &RunArgs) -> Result<Run> {
     let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
     let status: Value = agent.get(&format!("{base}/v1/bench/status")).call()?.into_json()?;
     let model = status["checkpoint"].as_str().unwrap_or(served);
-    let run = run_with(args, model, &models["data"][0], |body| {
+    let mut model_record = models["data"][0].clone();
+    model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
+    let mut runs = vec![run_with(args, model, &model_record, |body| {
         request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
-    }, |_, _, _| {})?;
-    std::fs::write(&args.out, serde_json::to_vec_pretty(&run)?)?;
-    Ok(run)
+    }, |_, _, _| {})?];
+    if args.tier == "standard" && model_record["full_prefill_logits"] == true {
+        let mut prefill_args = args.clone();
+        prefill_args.score_path = "prefill".into();
+        runs.push(run_with(&prefill_args, model, &model_record, |body| {
+            request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
+        }, |_, _, _| {})?);
+        ensure!(runs[0].engine == runs[1].engine && runs[0].settings == runs[1].settings
+            && runs[0].dataset == runs[1].dataset && runs[0].reference_sha256 == runs[1].reference_sha256,
+            "Standard scoring paths use different references or server settings");
+    }
+    let mut output = if args.tier == "standard" { crate::panels::fidelity::record(&runs[0], None) }
+        else { json!(runs[0]) };
+    if let Some(prefill) = runs.get(1) {
+        for (key, value) in crate::panels::fidelity::record(prefill, None).as_object().unwrap() {
+            if key.starts_with("prefill") { output[key] = value.clone(); }
+        }
+    }
+    std::fs::write(&args.out, serde_json::to_vec_pretty(&output)?)?;
+    Ok(runs)
 }
 
 /// Shared runner for remote CLI probes and the dashboard's already-held bench slot.
@@ -147,7 +169,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     mut probe_request: impl FnMut(Value) -> Result<Value>,
     mut progress: impl FnMut(usize, usize, &Run)) -> Result<Run> {
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
-    ensure!(args.tier == "full" || args.score_path == "decode", "quick and standard tiers must be decode-shaped");
+    ensure!(args.tier != "quick" || args.score_path == "decode", "Quick must be decode-shaped");
     let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(120)).build();
     let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source(args, model)? {
         crate::fidelity_dataset::ensure_valid_publication(repo, commit, config)?;
@@ -162,9 +184,23 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         bail!("no reference source; use a published dataset or --reference");
     };
     validate_served_reference(&reference, model, dataset_identity.is_some())?;
-    let windows = if args.tier == "quick" && dataset_identity.is_some() {
+    let standard = args.tier == "standard";
+    let admitted = model_record["full_prefill_logits"] == true;
+    let windows = if standard {
+        ensure!(dataset_identity.is_some(), "Standard-v2 requires a sealed published dataset");
+        crate::fidelity_dataset::standard_windows(&reference, &args.score_path, admitted)?
+    } else if args.tier == "quick" && dataset_identity.is_some() {
         crate::fidelity_dataset::quick_windows(&reference)?
     } else { reference.selected_windows(args.tier != "quick")? };
+    if standard {
+        dataset_identity.as_mut().unwrap()["standard_subset"] = json!({
+            "version": crate::fidelity_dataset::STANDARD_TIER,
+            "sha256": crate::fidelity_dataset::STANDARD_SPLIT_SHA256,
+            "mode": if admitted { "32 decode / 32 prefill" } else { crate::fidelity_dataset::STANDARD_FALLBACK },
+            "decode": crate::fidelity_dataset::STANDARD_DECODE,
+            "prefill": crate::fidelity_dataset::STANDARD_PREFILL,
+        });
+    }
     if let Some(limit) = model_record["max_context"].as_u64() {
         ensure!(windows.iter().all(|w| w.tokens.len() as u64 <= limit), "fidelity windows exceed server context ({limit})");
     }
@@ -196,7 +232,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         let mut score = Fidelity::from_records(records); score.missing = missing;
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
             set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
-            reference_sha256: digest.clone(), tier: args.tier.clone(), path_shape: shape,
+            reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
             kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
             dataset: dataset_identity.clone(), verify_rows: args.verify_rows, engine, settings,
@@ -205,7 +241,9 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     };
     for (i, window) in windows.iter().enumerate() {
         let end = window.positions.last().context("empty window")?.pos + 1;
-        let dump = args.dump_dir.as_ref().map(|d| d.join(format!("window-{i:03}")));
+        let dump = args.dump_dir.as_ref().map(|d| d.join(if standard {
+            format!("window-{}-{i:03}", args.score_path)
+        } else { format!("window-{i:03}") }));
         let mut spec = json!({"prompt_ids": window.tokens[..end], "score_from": window.score_from,
             "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true,
             "score_path": args.score_path});
@@ -266,10 +304,13 @@ fn run_pass(run: &Run) -> bool {
 pub fn execute(args: Args) -> Result<bool> {
     match args.action {
         Action::Run(args) => {
-            let run = run(&args)?;
-            eprintln!("{}: {} ({}) rows in {:.2}s; {} / {}", run.arm, run.score.positions,
-                run.score.missing, run.seconds, run.path_shape, run.kl_kind);
-            Ok(run_pass(&run))
+            let runs = run(&args)?;
+            for run in &runs {
+                eprintln!("{}: {} ({}) rows in {:.2}s; {} / {}", run.arm, run.score.positions,
+                    run.score.missing, run.seconds, run.path_shape, run.kl_kind);
+                if let Some(label) = crate::fidelity::verdict(run).label { eprintln!("{label}"); }
+            }
+            Ok(runs.iter().all(run_pass))
         }
         Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out } => {
             let load = |path: PathBuf| -> Result<Run> {
@@ -283,9 +324,14 @@ pub fn execute(args: Args) -> Result<bool> {
             eprintln!("Both full-tier statistical paths checked; separate agentic replay remains required.");
             Ok(comparison.pass)
         }
-        Action::Compare { a, b, top1_margin, kl_margin, bootstrap, seed, out } => {
-            let a: Run = serde_json::from_reader(std::fs::File::open(a)?)?;
-            let b: Run = serde_json::from_reader(std::fs::File::open(b)?)?;
+        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out } => {
+            let load = |path: PathBuf| -> Result<Run> {
+                let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
+                let value = if value["schema"] == "cuteafd.fidelity.run/2" { value } else { value[&score_path].clone() };
+                serde_json::from_value(value).context("missing selected scoring path")
+            };
+            let a = load(a)?;
+            let b = load(b)?;
             let margin = if a.tier == "quick" { 0.01 } else { 0.005 };
             let comparison = compare(&a, &b, top1_margin.unwrap_or(margin), kl_margin.unwrap_or(margin), bootstrap, seed)?;
             let text = serde_json::to_string_pretty(&comparison)?;
@@ -339,6 +385,20 @@ mod tests {
         assert_eq!(standard.tier,"standard");
         assert_eq!(dataset_source(&standard,"Qwen/Qwen3.8-Flash-Next-FP8").unwrap(),
             dataset_source(&parse(&["--tier","full"]),"Qwen/Qwen3.8-Flash-Next-FP8").unwrap());
+    }
+
+    #[test]
+    fn paired_cli_accepts_both_standard_report_paths() {
+        let report = crate::sample::full_report();
+        let panel = report.panel("fidelity").unwrap().latest().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("standard.json");
+        std::fs::write(&path,serde_json::to_vec(panel).unwrap()).unwrap();
+        for score_path in ["decode","prefill"] {
+            let args = Cli::try_parse_from(["fidelity","compare",path.to_str().unwrap(),path.to_str().unwrap(),
+                "--score-path",score_path,"--bootstrap","100"]).unwrap().args;
+            assert!(execute(args).unwrap());
+        }
     }
 
     #[test]

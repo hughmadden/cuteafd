@@ -55,9 +55,13 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         if verdict.is_null() { continue; }
         let status = if verdict["pass"] == true { "PASS" } else { "FAIL" };
         let score = &verdict["generated"];
-        doc.text(0.0, y + 12.0, Font::new(12.0, t.ink).weight(600), &format!("{path} · {status} · {}",
-            seconds(num(&v[path], "seconds").unwrap_or(0.0))));
+        doc.text(0.0, y + 12.0, Font::new(12.0, t.ink).weight(600), &format!("{path} · {status} · {} · n={}",
+            seconds(num(&v[path], "seconds").unwrap_or(0.0)), score["positions"]));
         y += 22.0;
+        if let Some(label) = verdict["label"].as_str() {
+            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), label);
+            y += 22.0;
+        }
         // Different units never share an axis. Percent metrics and KL get separate rows.
         for (label, metric, bound, percent) in [("top-1", "top1", "top1_min", true),
             ("KL", "kl", "kl_max", false), ("confident top-1", "confident_top1", "confident_top1_min", true),
@@ -111,19 +115,28 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
             }
         }
     }
-    let groups = v["per_window"].as_object();
-    if let Some(groups) = groups {
-        doc.titled("Per-window top-1 / KL across all rows; table includes counts");
-        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), "Window · top-1 / KL (all rows)");
-        doc.end();
-        y += 24.0;
-        for (id, score) in groups {
-            doc.titled(&format!("{id}: {} rows, top-1 {:.2}%, KL {:.6}", score["positions"],
-                num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
-            doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2), id);
-            doc.text(w, y + 12.0, Font::new(10.5, t.ink).anchor(Anchor::End), &format!("{:.2}% / {:.5}",
-                num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
-            doc.end(); y += 18.0;
+    if let Some(error) = v["paired_prefill"]["unavailable"].as_str() {
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("Prefill pair unavailable: {}", super::svg::fit(error, 11.0, w - 140.0)));
+        y += 26.0;
+    } else if let Some(pair) = v["paired_prefill"]["comparison"].as_object() {
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("Paired prefill: {} · n={}",
+            if pair.get("pass") == Some(&Value::Bool(true)) { "PASS" } else { "FAIL" }, pair["positions"]));
+        y += 26.0;
+    }
+    for (path, key) in [("decode", "per_window"), ("prefill", "prefill_per_window")] {
+        if let Some(groups) = v[key].as_object() {
+            doc.titled("Per-window top-1 / KL across all rows; table includes counts");
+            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("{path} window · top-1 / KL (all rows)"));
+            doc.end();
+            y += 24.0;
+            for (id, score) in groups {
+                doc.titled(&format!("{id}: {} rows, top-1 {:.2}%, KL {:.6}", score["positions"],
+                    num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
+                doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2), id);
+                doc.text(w, y + 12.0, Font::new(10.5, t.ink).anchor(Anchor::End), &format!("{:.2}% / {:.5}",
+                    num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
+                doc.end(); y += 18.0;
+            }
         }
     }
     y
