@@ -1,5 +1,7 @@
 use super::*;
-use crate::families::deepseek_v41::v41_compressor::{CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
+use crate::families::deepseek_v41::v41_compressor::{
+    release_snapshot_tails, snapshot_gain, CompressorPrefix, Gain, Pressure, COMPRESSOR_PREFIX_BYTES,
+};
 use crate::shared::memory::{SnapshotPool, SnapshotStorage};
 use crate::families::deepseek_v41::v41_window::{WindowPrefix, WINDOW_PREFIX_BYTES};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -17,6 +19,16 @@ impl BackbonePrefix<'_> {
     }
     pub fn end(&self) -> u64 {
         self.end
+    }
+    /// What evicting this snapshot gains an append transaction, given `BackboneCache::pressure`
+    /// (one per source, in `BackboneCache::sources` order). Its sources were retained from that
+    /// cache in the same order (`copy_prefix`); a mismatch is an error, not a guess.
+    pub fn gain(&self, pressure: &[Pressure]) -> Result<Gain> {
+        snapshot_gain(&self.sources, pressure)
+    }
+    /// Count this snapshot's references to the appended tails as dropped.
+    pub fn release_tails(&self, pressure: &mut [Pressure]) -> Result<()> {
+        release_snapshot_tails(&self.sources, pressure)
     }
 }
 fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {

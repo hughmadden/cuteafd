@@ -199,6 +199,7 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "copy_drafts": copy_drafts::stats(),
+        "admission": admission::stats(),
         "totals": console::totals::snapshot(),
     })
 }
@@ -305,22 +306,25 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
                     requests.cache().committed_end(lease)?)?));
                 if let Err(error) = prefixes.make_room(requests, &capacity) {
-                    if active_count != 0 || hit.is_none()
+                    if active_count != 0
                         || error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
                         return Err(error);
                     }
+                    // Idle and short. A snapshot that only costs this request a copy-on-write
+                    // tail (the source it reused) goes first, so a cached prompt has the room
+                    // the same request has cold; then the longest output that fits is granted.
                     let committed = requests.cache().committed_end(lease)?;
-                    let output = admission::fit_output(job.max_tokens, |output| {
-                        let append = admission::remaining_budget(prompt.len(), output, committed)?;
-                        match requests.cache().check_append_capacity(&[(lease, append)]) {
-                            Ok(()) => Ok(true),
-                            Err(error) if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some() => Ok(false),
-                            Err(error) => Err(error),
-                        }
-                    })?.ok_or(error)?;
-                    tracing::info!(request_id=id, requested=job.max_tokens, reserved=output,
-                        "shrinking output reservation to preserve reused device snapshot");
-                    job.max_tokens = output;
+                    let budget = |output| admission::remaining_budget(prompt.len(), output, committed);
+                    let requested = job.max_tokens;
+                    prefixes.release_copies(requests, &[(lease, budget(requested)?)])?;
+                    let granted = admission::shrink(&mut prefixes, requested,
+                        |prefixes, output| prefixes.fits(requests, &[(lease, budget(output)?)]),
+                        |prefixes, output| prefixes.make_room(requests, &[(lease, budget(output)?)]))?
+                        .ok_or(error)?;
+                    tracing::warn!(request_id=id, prompt_tokens=prompt.len(),
+                        cached_tokens=hit.as_ref().map_or(0, |(end, _)| *end), requested, granted,
+                        "max_tokens shrunk to fit the GPU KV pool");
+                    job.max_tokens = granted;
                 }
                 Ok((image_keys, hit, restore))
             })();
@@ -336,7 +340,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                             break;
                         }
                         let _ = events.send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
-                            "prompt plus max_tokens exceeds the GPU KV pool; reduce max_tokens or increase the pool".into())));
+                            "prompt leaves no room for output in the GPU KV pool; shorten the prompt or increase the pool".into())));
                     } else {
                         let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                             .cloned().unwrap_or_else(|| format!("{error:#}").into());

@@ -1,6 +1,6 @@
 //! Paired index/FP4 KV pages owned by compressor request leases.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Kv};
 use std::ffi::c_void;
 use std::{cell::RefCell, rc::Rc};
@@ -9,7 +9,7 @@ use ownership::PagePool;
 mod reservation;
 pub(crate) mod replica;
 use reservation::PageReservation;
-pub(crate) use ownership::SourcePrefix;
+pub(crate) use ownership::{Gain, Pressure, SourcePrefix};
 
 /// Capacity failure for one entry in the caller's ordered append transaction.
 /// Binding/ownership failures deliberately use different error types.
@@ -155,18 +155,22 @@ impl<'a> SourceCache<'a> {
         if let Some(replica)=&self.replica { replica.storage.install_metadata(slot,&[],0)?; }
         Ok(())
     }
-    /// The four device segments holding `page`'s rows (packed index, index scales, KV values,
-    /// KV scales), in the order the host cache stores them.
+    /// This pool under the append transaction `appends` (`reserve`'s `(slot, old rows, new
+    /// rows)`): the pages live request tables hold, and the partial tail pages the appends
+    /// write into. Host-side reads only.
+    pub fn pressure(&self, appends: &[(usize, usize, usize)]) -> Result<Pressure> {
+        let tables = &self.pages[..self.slots()];
+        Ok(Pressure::new(&self.pool, tables, append_tails(tables, appends)?))
+    }
     /// Pool pages: total, free, and referenced by active request slots
     /// (a page shared by two slots counts twice). Host-side reads only.
-    pub fn active_pages(&self) -> std::collections::HashSet<u32> {
-        self.pages.iter().flatten().copied().collect()
-    }
     pub fn occupancy(&self) -> [u64; 3] {
         let pool = self.pool.borrow();
         let held: usize = self.pages.iter().map(Vec::len).sum();
         [pool.capacity() as u64, pool.free.len() as u64, held as u64]
     }
+    /// The four device segments holding `page`'s rows (packed index, index scales, KV values,
+    /// KV scales), in the order the host cache stores them.
     pub fn page_segments(&self, page: u32) -> [CuteafdDeviceBuffer; 4] {
         let rows = |buffer: CuteafdDeviceBuffer, bytes: usize| {
             slice(buffer, page as usize * PAGE_ROWS * bytes, PAGE_ROWS * bytes)
@@ -300,83 +304,28 @@ impl<'a> SourceCache<'a> {
     /// participant. Disjoint plans may coexist and apply in either order. After
     /// queueing GPU writes, drain before applying or dropping the plan.
     pub fn reserve(&self, appends: &[(usize, usize, usize)]) -> Result<IndexPlan> {
-        let mut plan = IndexPlan {
-            additions: vec![],
-            used: 0,
-            lengths: vec![],
-            replacements: vec![],
-            reservation: None,
-        };
         let mut pool = self.pool.borrow_mut();
-        let mut seen = [false; 16];
-        for &(slot, old, new) in appends {
-            ensure!(
-                slot < self.lengths.buffer.bytes / 8 && !seen[slot],
-                "duplicate or invalid index slot"
-            );
-            self.ensure_idle(slot)?;
-            seen[slot] = true;
-            ensure!(
-                old == self.rows[slot]
-                    && old <= new
-                    && new <= 1048576
-                    && self.pages[slot].len() == old.div_ceil(PAGE_ROWS),
-                "index history binding differs"
-            );
-        }
-        for (position, &(slot, old, new)) in appends.iter().enumerate() {
-            plan.lengths.push((slot, new as u64));
-            if new > old && old % PAGE_ROWS != 0 {
-                let logical = old / PAGE_ROWS;
-                let source = self.pages[slot][logical];
-                if pool.shared(source) {
-                    // If every owner appends in this transaction, one can keep
-                    // the original. All tail copies precede every accepted write,
-                    // including writes by that owner. A snapshot or non-appending
-                    // owner prevents this optimization. Exclusive appends avoid
-                    // this bounded (at most sixteen owners) scan entirely.
-                    let mut writers = 0;
-                    let mut last = position;
-                    for (i, &(other, begin, end)) in appends.iter().enumerate() {
-                        if end > begin
-                            && begin % PAGE_ROWS != 0
-                            && self.pages[other][begin / PAGE_ROWS] == source
-                        {
-                            writers += 1;
-                            last = i;
-                        }
-                    }
-                    if writers != pool.references(source) || position != last {
-                        ensure!(
-                            plan.used < pool.free.len(),
-                            SourcePoolExhausted { work_index: position, needed: 1, available: pool.free.len() - plan.used }
-                        );
-                        let destination = pool.free[pool.free.len() - plan.used - 1];
-                        plan.used += 1;
-                        plan.replacements.push((slot, logical, source, destination));
-                    }
-                }
-            }
-            let extra = new.div_ceil(PAGE_ROWS) - self.pages[slot].len();
-            ensure!(
-                extra <= pool.free.len() - plan.used,
-                SourcePoolExhausted { work_index: position, needed: extra, available: pool.free.len() - plan.used }
-            );
-            let end = pool.free.len() - plan.used;
-            plan.additions.push((
-                slot,
-                pool.free[end - extra..end].iter().rev().copied().collect(),
-            ));
-            plan.used += extra;
-        }
+        let slots = self.slots();
+        let mut plan = plan_appends(&pool, &self.pages[..slots], &self.rows[..slots], self.writing.get(),
+            appends, &|_| 0)?;
         let remaining = pool.free.len() - plan.used;
         let pages = pool.free.split_off(remaining);
-        let mask = seen.iter().enumerate().fold(0u16, |mask, (slot, &used)|
-            mask | if used { 1 << slot } else { 0 });
+        let mask = appends.iter().fold(0u16, |mask, &(slot, _, _)| mask | 1 << slot);
         self.writing.set(self.writing.get() | mask);
         plan.reservation = Some(PageReservation { pool: self.pool.clone(), pages,
             flags: self.writing.clone(), mask });
         Ok(plan)
+    }
+    /// `reserve`'s capacity check for `appends`, as if the references `pressure` counts as
+    /// dropped were gone. Claims nothing. An error when `pressure` is another pool's.
+    pub fn check_released(&self, appends: &[(usize, usize, usize)], pressure: &Pressure) -> Result<()> {
+        ensure!(pressure.is_of(&self.pool), "source pressure checked against another source pool");
+        let slots = self.slots();
+        plan_appends(&self.pool.borrow(), &self.pages[..slots], &self.rows[..slots], self.writing.get(),
+            appends, &|page| pressure.released(page)).map(drop)
+    }
+    fn slots(&self) -> usize {
+        self.lengths.buffer.bytes / 8
     }
     pub fn destination(&self, plan: &IndexPlan, slot: usize, row: usize) -> Result<u64> {
         let logical_page = row / PAGE_ROWS;
@@ -421,6 +370,94 @@ impl<'a> SourceCache<'a> {
         drop(pool); // Reservation drop must not reborrow an active pool borrow.
         drop(reservation);
     }
+}
+
+/// Plan `appends` (`(slot, old rows, new rows)`) over the request `tables` without claiming
+/// anything: the copy-on-write replacements and the new pages, taken from the top of the free
+/// list in transaction order. `released(page)` references to a page count as dropped first;
+/// only references a live table also holds may be (`reserve` passes none), so no page is freed.
+fn plan_appends(pool: &PagePool, tables: &[Vec<u32>], rows: &[usize], writing: u16,
+    appends: &[(usize, usize, usize)], released: &dyn Fn(u32) -> usize) -> Result<IndexPlan> {
+    let mut plan = IndexPlan {
+        additions: vec![],
+        used: 0,
+        lengths: vec![],
+        replacements: vec![],
+        reservation: None,
+    };
+    let mut seen = [false; 16];
+    for &(slot, old, new) in appends {
+        ensure!(
+            slot < tables.len() && !seen[slot],
+            "duplicate or invalid index slot"
+        );
+        ensure!(writing & (1 << slot) == 0, "compressed cache slot has a pending append");
+        seen[slot] = true;
+        ensure!(
+            old == rows[slot]
+                && old <= new
+                && new <= 1048576
+                && tables[slot].len() == old.div_ceil(PAGE_ROWS),
+            "index history binding differs"
+        );
+    }
+    for (position, &(slot, old, new)) in appends.iter().enumerate() {
+        plan.lengths.push((slot, new as u64));
+        if new > old && old % PAGE_ROWS != 0 {
+            let logical = old / PAGE_ROWS;
+            let source = tables[slot][logical];
+            let references = pool.references(source).checked_sub(released(source)).filter(|&n| n > 0)
+                .context("released more references than the request tables leave")?;
+            if references > 1 {
+                // If every owner appends in this transaction, one can keep
+                // the original. All tail copies precede every accepted write,
+                // including writes by that owner. A snapshot or non-appending
+                // owner prevents this optimization. Exclusive appends avoid
+                // this bounded (at most sixteen owners) scan entirely.
+                let mut writers = 0;
+                let mut last = position;
+                for (i, &(other, begin, end)) in appends.iter().enumerate() {
+                    if end > begin
+                        && begin % PAGE_ROWS != 0
+                        && tables[other][begin / PAGE_ROWS] == source
+                    {
+                        writers += 1;
+                        last = i;
+                    }
+                }
+                if writers != references || position != last {
+                    ensure!(
+                        plan.used < pool.free.len(),
+                        SourcePoolExhausted { work_index: position, needed: 1, available: pool.free.len() - plan.used }
+                    );
+                    let destination = pool.free[pool.free.len() - plan.used - 1];
+                    plan.used += 1;
+                    plan.replacements.push((slot, logical, source, destination));
+                }
+            }
+        }
+        let extra = new.div_ceil(PAGE_ROWS) - tables[slot].len();
+        ensure!(
+            extra <= pool.free.len() - plan.used,
+            SourcePoolExhausted { work_index: position, needed: extra, available: pool.free.len() - plan.used }
+        );
+        let end = pool.free.len() - plan.used;
+        plan.additions.push((
+            slot,
+            pool.free[end - extra..end].iter().rev().copied().collect(),
+        ));
+        plan.used += extra;
+    }
+    Ok(plan)
+}
+
+/// The partial tail page each append of `appends` writes into: the pages `plan_appends` copies
+/// first when another owner shares them.
+fn append_tails(tables: &[Vec<u32>], appends: &[(usize, usize, usize)]) -> Result<std::collections::HashSet<u32>> {
+    appends.iter().filter(|&&(_, old, new)| new > old && old % PAGE_ROWS != 0).map(|&(slot, old, _)| {
+        tables.get(slot).and_then(|table| table.get(old / PAGE_ROWS)).copied()
+            .context("index history binding differs")
+    }).collect()
 }
 
 unsafe fn upload_metadata(library: &NativeLibrary, page_table: CuteafdDeviceBuffer,
@@ -487,6 +524,8 @@ fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDev
 
 #[cfg(test)]
 mod high_pages;
+#[cfg(test)]
+mod plan_tests;
 
 #[cfg(test)]
 mod tests {

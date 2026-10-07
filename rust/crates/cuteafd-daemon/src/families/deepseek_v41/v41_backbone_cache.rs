@@ -1,7 +1,7 @@
 //! One request lease spans every backbone window and compressed source.
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_compressor::{
-    CompressorChunk, CompressorLease, CompressorState, CompressorWave, IndexProposal,
+    CompressorChunk, CompressorLease, CompressorState, CompressorWave, IndexProposal, Pressure,
 };
 use crate::families::deepseek_v41::v41_index_selection::SelectionRequest;
 use crate::families::deepseek_v41::v41_sparse_attention::AttentionRequest;
@@ -453,16 +453,31 @@ impl<'a> BackboneCache<'a> {
             _ => end,
         })
     }
-    pub fn active_source_pages(&self) -> Vec<std::collections::HashSet<u32>> {
-        self.sources.iter().map(|source| source.active_pages()).collect()
+    /// Each compressed source's pool under the append transaction `work`, in `sources()` order:
+    /// what a retained snapshot's eviction is weighed against.
+    pub fn pressure(&self, work: &[(CacheLease, u32)]) -> Result<Vec<Pressure>> {
+        self.sources.iter().enumerate()
+            .map(|(i, source)| source.pressure(&self.source_work(i, work)?))
+            .collect()
     }
     pub fn check_append_capacity(&self, work: &[(CacheLease, u32)]) -> Result<()> {
         for (i, source) in self.sources.iter().enumerate() {
-            let appends = work.iter().map(|&(lease, tokens)|
-                Ok((self.request(lease)?.sources[i], tokens))).collect::<Result<Vec<_>>>()?;
-            source.check_append_capacity(&appends)?;
+            source.check_append_capacity(&self.source_work(i, work)?)?;
         }
         Ok(())
+    }
+    /// `check_append_capacity`, as if the references each source's `pressure` counts as
+    /// dropped were gone. Each pressure must be its own source's.
+    pub fn check_append_capacity_released(&self, work: &[(CacheLease, u32)], pressure: &[Pressure]) -> Result<()> {
+        ensure!(pressure.len() == self.sources.len(), "pressure for {} sources, the cache has {}",
+            pressure.len(), self.sources.len());
+        for (i, (source, pressure)) in self.sources.iter().zip(pressure).enumerate() {
+            source.check_append_capacity_released(&self.source_work(i, work)?, pressure)?;
+        }
+        Ok(())
+    }
+    fn source_work(&self, source: usize, work: &[(CacheLease, u32)]) -> Result<Vec<(CompressorLease, u32)>> {
+        work.iter().map(|&(lease, tokens)| Ok((self.request(lease)?.sources[source], tokens))).collect()
     }
     pub fn plan_replay(&self, work: &[CacheWork]) -> Result<CacheBatch> {
         self.plan_stage(work, true, false)
