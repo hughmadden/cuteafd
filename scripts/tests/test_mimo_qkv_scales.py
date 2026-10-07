@@ -28,7 +28,7 @@ class Tensor(np.ndarray):
         return np.repeat(self, repeats, axis=dim).view(Tensor)
 
 
-def reference_weights(value, scale, q, k, v, tp):
+def reference_weights(value, scale, q, k, v, tp, mtp_stage=None):
     # Execute the actual reader without importing torch or CUDA on the host.
     tree = ast.parse(REFERENCE.read_text())
     selected = [node for node in tree.body if
@@ -42,8 +42,27 @@ def reference_weights(value, scale, q, k, v, tp):
     exec(compile(module, str(REFERENCE), "exec"), namespace)
     weights = namespace["Weights"].__new__(namespace["Weights"])
     weights.ckpt_tp = tp
-    weights.qkv_shards = lambda layer: (q, k, v)
     weights.raw = lambda name: (scale if name.endswith("_scale_inv") else value).view(Tensor)
+    if mtp_stage is not None:
+        # Different full/SWA geometry also checks the actual MTP getter's layer argument.
+        weights.config = SimpleNamespace(hybrid_layer_pattern=[0, 1], num_attention_heads=4 * tp,
+                                         num_key_value_heads=2 * tp, head_dim=64, v_head_dim=64,
+                                         swa_num_attention_heads=q // 192 * tp,
+                                         swa_num_key_value_heads=k // 192 * tp,
+                                         swa_head_dim=192, swa_v_head_dim=v)
+        # Keep the MTP reference's actual --pro import/SWA getter connected.
+        mtp = ast.parse((ROOT / "python/reference/families/mimo_v2/mimo_mtp/reference.py").read_text())
+        pro = next(node for node in ast.walk(mtp) if isinstance(node, ast.If) and
+                   isinstance(node.test, ast.Attribute) and node.test.attr == "pro")
+        assert any(isinstance(node, ast.ImportFrom) and node.module == "mimo_v26.golden" and
+                   any(alias.name == "Weights" for alias in node.names) for node in pro.body)
+        getter = next(node for node in pro.body if isinstance(node, ast.Assign) and
+                      any(isinstance(target, ast.Name) and target.id == "get" for target in node.targets))
+        mtp_namespace = {"w": weights}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[getter], type_ignores=[])),
+                     "mimo_mtp/reference.py", "exec"), mtp_namespace)
+        return mtp_namespace["get"](f"model.mtp.layers.{mtp_stage}.self_attn.qkv_proj.weight")
+    weights.qkv_shards = lambda layer: (q, k, v)
     return weights.get("model.layers.0.self_attn.qkv_proj.weight", 0)
 
 
@@ -65,13 +84,16 @@ def deinterleave(value, q, k, v, tp):
                            for first, size in ((0, q), (q, k), (q + k, v))])
 
 
-@pytest.mark.parametrize("q,k,v,tp", [(3072, 192, 128, 4), (3072, 384, 256, 4), (3072, 192, 128, 8)])
-def test_reference_uses_whole_shard_grid(q, k, v, tp):
+@pytest.mark.parametrize("q,k,v,tp,mtp_stage", [
+    (3072, 192, 128, 4, None), (3072, 384, 256, 4, None), (3072, 192, 128, 8, None),
+    (3072, 192, 128, 8, 0), (3072, 192, 128, 8, 1), (3072, 192, 128, 8, 2),
+])
+def test_reference_uses_whole_shard_grid(q, k, v, tp, mtp_stage):
     rows = tp * (q + k + v)
     value = np.ones((rows, 128), dtype=np.float32)
     scales = np.arange(1, tp * ((q + k + v + 127) // 128) + 1, dtype=np.float32)[:, None]
     expected = deinterleave(value * scales[shard_rows(q, k, v, tp)], q, k, v, tp)
-    np.testing.assert_array_equal(reference_weights(value, scales, q, k, v, tp), expected)
+    np.testing.assert_array_equal(reference_weights(value, scales, q, k, v, tp, mtp_stage), expected)
     naive = deinterleave(value * scales[naive_segment_rows(q, k, v, tp)], q, k, v, tp)
     changed = np.flatnonzero(np.any(naive != expected, axis=1))
     affected = (np.concatenate([tp * (q + k) + s * v + np.arange(64) for s in range(tp)])
@@ -125,22 +147,29 @@ def test_checkpoint_qkv_has_amax_in_every_shard_block(model, revision, tp):
     config = json.loads((snapshot / "config.json").read_text())
     config = config.get("text_config", config)
     impossible_segments = []
-    for layer, swa in enumerate(config["hybrid_layer_pattern"]):
+    tensors = [(f"model.layers.{layer}.self_attn.qkv_proj.weight", swa)
+               for layer, swa in enumerate(config["hybrid_layer_pattern"])]
+    mtp = sorted(name for name in index["weight_map"] if
+                 name.startswith("model.mtp.layers.") and name.endswith("self_attn.qkv_proj.weight"))
+    assert len(mtp) == 3
+    tensors.extend((name, True) for name in mtp)
+    for name, swa in tensors:
         prefix = "swa_" if swa else ""
         q = config.get(prefix + "num_attention_heads", config["num_attention_heads"]) // tp * config.get(prefix + "head_dim", config["head_dim"])
         k = config.get(prefix + "num_key_value_heads", config["num_key_value_heads"]) // tp * config.get(prefix + "head_dim", config["head_dim"])
         v = config.get(prefix + "num_key_value_heads", config["num_key_value_heads"]) // tp * config.get(prefix + "v_head_dim", config["v_head_dim"])
         rows = q + k + v
-        name = f"model.layers.{layer}.self_attn.qkv_proj.weight"
         meta, raw = raw_tensor(snapshot, index["weight_map"], name)
         codes = np.frombuffer(raw, np.uint8).reshape(meta["shape"])
         assert meta["dtype"] == "F8_E4M3" and codes.shape[0] == tp * rows
         scale_meta, _ = raw_tensor(snapshot, index["weight_map"], name + "_scale_inv")
         assert scale_meta["shape"] == [tp * ((rows + 127) // 128), codes.shape[1] // 128]
         whole = [(s * rows + r, s * rows + min(r + 128, rows)) for s in range(tp) for r in range(0, rows, 128)]
-        assert saturated_blocks(codes, whole), f"{model} layer {layer}: inconsistent per-shard grid"
+        assert saturated_blocks(codes, whole), f"{model} {name}: inconsistent per-shard grid"
         parts = [(s * rows + first + r, s * rows + first + min(r + 128, size))
                  for s in range(tp) for first, size in ((0, q), (q, k), (q + k, v)) for r in range(0, size, 128)]
         if not saturated_blocks(codes, parts):
-            impossible_segments.append(layer)
+            impossible_segments.append(name)
     assert impossible_segments, "checkpoint no longer distinguishes the incorrect per-segment rule"
+    if model == "MiMo-V2.6-Pro-MOPD":
+        assert all(name in impossible_segments for name in mtp), "Pro MTP must distinguish the wrong grid"

@@ -317,7 +317,7 @@ impl MimoModel {
             format!("fused qkv_proj for checkpoint TP{tp} is E4M3 {expected:?} with FP32 [{}, {}] scales, found {}",
                 layout.scale_rows(), self.cfg.hidden.div_ceil(128), describe(operand))
         })?;
-        let segments = layout.segments().iter().map(|s| s.rows).collect();
+        let segments = vec![layout.q + layout.k + layout.v; layout.shards];
         operand.resolve_segments(128, segments).map_err(|e| format!("fused qkv_proj (TP{tp}): {e}"))?;
         require(operand.is_fp8_segmented(128, &[ScaleEncoding::F32]), || {
             format!("fused qkv_proj needs FP32 scales, found {}", describe(operand))
