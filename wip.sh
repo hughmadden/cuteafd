@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
+audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
+case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -24,6 +26,8 @@ CUTEAFD_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
 configuration builds no extra role and keeps the historical Spark TP4 shard.
 Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
+Set CUTEAFD_WIP_AUDIO_AOT=ON to build the optional audio tower on both SM120
+and SM121. Audio serving remains separately opt-in.
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
 
@@ -133,6 +137,7 @@ if ((dry_run)); then
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+  echo "  Audio AOT: $audio_aot"
   exit 0
 fi
 
@@ -506,6 +511,7 @@ build_coordinator() {
     "${cache_env[@]}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
+    -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
     -e "CUTEAFD_WIP_DSV4_AOT=${CUTEAFD_WIP_DSV4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_GLM_AOT=${CUTEAFD_WIP_GLM_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MIMO_AOT=${CUTEAFD_WIP_MIMO_AOT:-OFF}" \
@@ -539,7 +545,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

@@ -64,6 +64,8 @@ done
 # native expert path does not require the EXL3 package.
 exl3_aot="${CUTEAFD_WIP_EXL3_AOT:-ON}"
 nvfp4_aot="${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
+case "$audio_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" >&2; exit 2 ;; esac
 case "$exl3_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXL3_AOT must be ON or OFF, got: $exl3_aot" >&2; exit 2 ;; esac
 case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF, got: $nvfp4_aot" >&2; exit 2 ;; esac
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
@@ -135,6 +137,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
