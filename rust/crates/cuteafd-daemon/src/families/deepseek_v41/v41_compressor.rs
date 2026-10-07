@@ -12,9 +12,9 @@ mod source_cache;
 mod commit;
 use commit::PendingCommit;
 mod prefix;
-pub(crate) use prefix::{CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
+pub(crate) use prefix::{release_snapshot_tails, snapshot_gain, CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
 use source_cache::SourceCache;
-pub(crate) use source_cache::{IndexCacheView, KvCacheView, SourcePoolExhausted};
+pub(crate) use source_cache::{Gain, IndexCacheView, KvCacheView, Pressure, SourcePoolExhausted};
 pub(crate) use source_cache::replica::SourceReplica;
 static NEXT_PROPOSAL: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn reserve_source_snapshot() -> Result<u64> {
@@ -173,15 +173,25 @@ impl<'a> CompressorState<'a> {
     pub(crate) fn ensure_not_writing(&self, lease: CompressorLease) -> Result<()> {
         self.validate(lease).map(|_| ())
     }
-    pub fn active_pages(&self) -> std::collections::HashSet<u32> { self.index.active_pages() }
+    /// This source's pool under the append transaction `work` (`SourceCache::pressure`).
+    pub fn pressure(&self, work: &[(CompressorLease, u32)]) -> Result<Pressure> {
+        self.index.pressure(&self.appends(work)?)
+    }
     pub fn check_append_capacity(&self, work: &[(CompressorLease, u32)]) -> Result<()> {
+        self.index.reserve(&self.appends(work)?).map(|_| ())
+    }
+    /// `check_append_capacity`, as if the references `pressure` counts as dropped were gone.
+    pub fn check_append_capacity_released(&self, work: &[(CompressorLease, u32)], pressure: &Pressure) -> Result<()> {
+        self.index.check_released(&self.appends(work)?, pressure)
+    }
+    /// `work`'s source rows: `(slot, old rows, new rows)` for `SourceCache::reserve`.
+    fn appends(&self, work: &[(CompressorLease, u32)]) -> Result<Vec<(usize, usize, usize)>> {
         let ratio = ratio(self.layer)?;
-        let appends = work.iter().map(|&(lease, tokens)| {
+        work.iter().map(|&(lease, tokens)| {
             let slot = self.validate(lease)?;
             let old = self.slots[slot].end as usize;
             Ok((slot, old / ratio, (old + tokens as usize) / ratio))
-        }).collect::<Result<Vec<_>>>()?;
-        self.index.reserve(&appends).map(|_| ())
+        }).collect()
     }
     pub fn index_cache(&self, lease: CompressorLease) -> Result<IndexCacheView<'_>> {
         let slot = self.validate(lease)?;

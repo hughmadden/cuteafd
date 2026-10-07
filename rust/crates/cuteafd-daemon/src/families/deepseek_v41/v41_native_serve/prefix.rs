@@ -1,6 +1,7 @@
 use super::speculative::DraftChain;
 use super::*;
-use crate::families::deepseek_v41::v41_backbone_cache::{BackbonePrefix, CacheLease};
+use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, BackbonePrefix, CacheLease};
+use crate::families::deepseek_v41::v41_compressor::{Gain, Pressure};
 use crate::families::deepseek_v41::v41_requests::RequestPrefix;
 use speculative::DraftPrefix;
 mod images;
@@ -318,27 +319,135 @@ impl<'a> PrefixCache<'a> {
         }
         Ok(Some((end, Some(saved.next.clone()))))
     }
+    /// Evict retained snapshots until `work` fits, least useful loss first. First the oldest
+    /// snapshot (prompts before turns) some of whose pages no live request table holds:
+    /// evicting a whole inactive chain frees pages, so snapshot-only sharing protects nothing.
+    /// A snapshot the tables hold entirely frees no page. One that also shares a partial tail an
+    /// append writes (the source a request just reused, or a request's own prompt snapshot)
+    /// still costs that tail's copy, so those go last, and only when dropping all of them makes
+    /// `work` fit. The rest gain nothing and stay.
     pub fn make_room(&mut self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<()> {
-        let mut active_pages = None;
-        loop {
-            match requests.cache().check_append_capacity(work) {
+        let cache = requests.cache();
+        let mut error = match cache.check_append_capacity(work) {
+            Ok(()) => return Ok(()),
+            Err(error) if exhausted(&error) => error,
+            Err(error) => return Err(error),
+        };
+        // Built once, only under pressure: eviction never changes request tables.
+        let pressure = self.pressure(cache, work)?;
+        let gain = |saved: &Saved<'a>| saved.target.parts().0.gain(&pressure).unwrap_or(Gain::Nothing);
+        let mut copies_fit = None;
+        while let Some(saved) = next_victim(&mut self.retained, &gain, &mut copies_fit,
+            |retained| copies_released_fit(retained, cache, work, &pressure))? {
+            self.host_dropped(saved);
+            error = match cache.check_append_capacity(work) {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
-                        return Err(error);
-                    }
-                    // Build once, only under pressure. Snapshot-only sharing is
-                    // not protected: evicting a whole inactive chain can free pages.
-                    let active = active_pages.get_or_insert_with(|| requests.cache().active_source_pages());
-                    match self.retained.evict_one_where(&|saved| {
-                        let sources = saved.target.parts().0.parts().4;
-                        sources.iter().zip(active.iter()).all(|(source, pages)| source.parts().2.held_by(pages))
-                    }) {
-                        Some((_, saved)) => self.host_dropped(saved),
-                        None => return Err(error),
-                    }
-                }
-            }
+                Err(error) if exhausted(&error) => error,
+                Err(error) => return Err(error),
+            };
         }
+        Err(error)
+    }
+    /// The cache's sources under `work`, after weighing every retained snapshot against them
+    /// once: a snapshot whose sources do not match the cache's, in order, is an error.
+    fn pressure(&self, cache: &BackboneCache<'a>, work: &[(CacheLease, u32)]) -> Result<Vec<Pressure>> {
+        let pressure = cache.pressure(work)?;
+        for saved in self.retained.values() {
+            saved.target.parts().0.gain(&pressure)?;
+        }
+        Ok(pressure)
+    }
+}
+
+fn exhausted(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some()
+}
+
+/// A capacity check as a fit: exhaustion is `false`, any other failure an error.
+fn as_fit(check: Result<()>) -> Result<bool> {
+    match check {
+        Ok(()) => Ok(true),
+        Err(error) if exhausted(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `work` fits with every snapshot in `retained` whose eviction gains only copies
+/// counted as gone; `false` when there is none.
+fn copies_released_fit(retained: &Retention<Saved<'_>>, cache: &BackboneCache<'_>, work: &[(CacheLease, u32)],
+    pressure: &[Pressure]) -> Result<bool> {
+    let mut released = pressure.to_vec();
+    let mut sharers = 0;
+    for saved in retained.values() {
+        let backbone = saved.target.parts().0;
+        if backbone.gain(pressure)? == Gain::Copies {
+            backbone.release_tails(&mut released)?;
+            sharers += 1;
+        }
+    }
+    Ok(sharers > 0 && as_fit(cache.check_append_capacity_released(work, &released))?)
+}
+
+/// `make_room`'s next eviction, or `None` when nothing it may evict is left: the oldest entry
+/// (prompts before turns) whose eviction frees pages; once none is left, and only if
+/// `copies_fit` (asked once, the answer kept in `answer`) says dropping every entry that gains
+/// copies makes the work fit, the oldest of those. Entries that gain nothing always stay.
+fn next_victim<T>(retained: &mut Retention<T>, gain: &dyn Fn(&T) -> Gain, answer: &mut Option<bool>,
+    copies_fit: impl FnOnce(&Retention<T>) -> Result<bool>) -> Result<Option<T>> {
+    if let Some((_, victim)) = retained.evict_one_where(&|entry| gain(entry) != Gain::Pages) {
+        return Ok(Some(victim));
+    }
+    let fits = match *answer {
+        Some(fits) => fits,
+        None => *answer.insert(copies_fit(retained)?),
+    };
+    Ok(if fits {
+        retained.evict_one_where(&|entry| gain(entry) != Gain::Copies).map(|(_, victim)| victim)
+    } else {
+        None
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Entries are `(name, gain)`; the predicate wiring is `next_victim`'s gain closure.
+    fn retained(entries: &[(SnapshotKind, u32, Gain)]) -> Retention<(u32, Gain)> {
+        let mut retained = Retention::new(8);
+        for &(kind, name, gain) in entries {
+            retained.bank_mut(kind).insert(&[name], (name, gain));
+        }
+        retained
+    }
+
+    fn evictions(retained: &mut Retention<(u32, Gain)>, copies_fit: bool, asked: &std::cell::Cell<u32>) -> Vec<u32> {
+        let mut fits = None;
+        std::iter::from_fn(|| next_victim(retained, &|&(_, gain)| gain, &mut fits, |_| {
+            asked.set(asked.get() + 1);
+            Ok(copies_fit)
+        }).unwrap().map(|(name, _)| name)).collect()
+    }
+
+    #[test]
+    fn snapshots_that_free_pages_go_first_and_copy_sharers_only_when_that_fits() {
+        use SnapshotKind::{Prompt, Turn};
+        let entries = [(Turn, 1, Gain::Pages), (Prompt, 2, Gain::Copies), (Prompt, 3, Gain::Nothing),
+            (Prompt, 4, Gain::Pages), (Turn, 5, Gain::Copies), (Turn, 6, Gain::Nothing)];
+        let asked = std::cell::Cell::new(0);
+        // Pages first in bank order (prompts before turns, oldest first); then the copy sharers,
+        // the same way; the snapshots that gain nothing never.
+        let mut all = retained(&entries);
+        assert_eq!(evictions(&mut all, true, &asked), [4, 1, 2, 5]);
+        assert_eq!(asked.get(), 1, "the copy question is asked once per pressure episode");
+        assert_eq!(all.values().map(|&(name, _)| name).collect::<std::collections::BTreeSet<_>>(),
+            [3, 6].into());
+        // When dropping every copy sharer would still not fit, they all stay.
+        let mut kept = retained(&entries);
+        assert_eq!(evictions(&mut kept, false, &asked), [4, 1]);
+        assert_eq!(kept.values().count(), 4);
+        // With nothing that frees pages, a reused source is the only eviction left.
+        let mut reused = retained(&[(Prompt, 7, Gain::Copies), (Turn, 8, Gain::Nothing)]);
+        assert_eq!(evictions(&mut reused, true, &asked), [7]);
     }
 }
