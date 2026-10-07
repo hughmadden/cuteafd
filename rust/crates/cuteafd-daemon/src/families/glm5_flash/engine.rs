@@ -509,7 +509,7 @@ impl StepTables {
 /// rows to 64 and of 8 to 128. A bucket never crosses 64 rows, so a padded step runs its rows'
 /// program capacity (`_m64` or `_m128`), and within one the programs' routes do not depend on the
 /// rows (the sparse MLA split plan has buckets 1, 8 and the capacity; the GEMMs, from 17 rows, one
-/// route): a real row computes the same bits padded or not. The registry (`check_buckets`)
+/// route): a real row computes the same bits padded or not. The registry (`check_decode_thresholds`)
 /// checks the set at start-up like the default buckets.
 #[cfg(test)]
 pub(crate) fn decode_row_bucket(rows: usize) -> usize {
@@ -1380,8 +1380,9 @@ const WIDE_DECODE_THRESHOLDS: &[ProjectionThreshold] = &[
 
 /// Startup refuses a bucket set ([`DecodeBuckets`]: the default or fine speculative buckets, up to
 /// the verify budget with `--decode-rows 128`) whose padding would cross a registered arithmetic
-/// route.
-fn check_buckets(buckets: &DecodeBuckets, sequences: usize, speculation: bool) -> Result<()> {
+/// route, the `_m64` programs' capacity included. [`GlmfEngine::warm_decode_graphs`] runs it
+/// before readiness whenever decode runs graphed, however its graphs are captured.
+fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculation: bool) -> Result<()> {
     let thresholds: Vec<ProjectionThreshold> = DECODE_PROJECTION_THRESHOLDS.iter()
         .chain(if buckets.wide { WIDE_DECODE_THRESHOLDS } else { &[] }).copied().collect();
     check_bucket_thresholds(&buckets.plain_for(sequences), &thresholds)?;
@@ -1389,9 +1390,13 @@ fn check_buckets(buckets: &DecodeBuckets, sequences: usize, speculation: bool) -
     Ok(())
 }
 
-#[cfg(test)]
-fn check_decode_thresholds(sequences: usize, speculation: bool) -> Result<()> {
-    check_buckets(&DecodeBuckets::new(DECODE_ROWS, DECODE_ROWS, false), sequences, speculation)
+/// Whether a graphed decode step pads to a row bucket: always with startup graphs, and speculative
+/// steps with the fine row buckets (`--decode-row-buckets`). A step that may pad runs its MoE front
+/// and experts outside the graph at its real rows (`real_row_moe`): padded rows stay out of the
+/// router and off the expert wire, and their delta rows are cleared after the expert work. Only a
+/// step that never pads keeps the MoE front in its graph (every row of it is real).
+fn decode_pads(use_graphs: bool, startup_graphs: bool, spec: bool, row_buckets: bool) -> bool {
+    use_graphs && (startup_graphs || (spec && row_buckets))
 }
 
 // WP9 2026-10-07, RTX PRO 6000 SM120, runtime99c: each new LM lane
@@ -1656,9 +1661,15 @@ impl<'a> GlmfEngine<'a> {
 
     /// Capture the complete serving key set on masked rows, without expert traffic.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
-        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        if !self.use_graphs { return Ok(0); }
+        // Before readiness, however decode graphs are captured (at startup, or lazily within a
+        // graph budget): every bucket a serving step can pad to passes the registered thresholds.
         let policy = self.graph_policy(sequences, speculation)?;
-        check_buckets(&policy.buckets, sequences, speculation)?;
+        check_decode_thresholds(&policy.buckets, sequences, speculation)?;
+        tracing::info!(plain_rows = ?policy.buckets.plain_for(sequences), spec_rows = ?policy.buckets.spec,
+            wide = policy.buckets.wide, startup = self.startup_graphs, padded_spec = self.pads_decode(true),
+            padded_plain = self.pads_decode(false), "GLM Flash decode buckets pass the projection thresholds");
+        if !self.startup_graphs { return Ok(0); }
         let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), &policy);
         let segments = self.weights.layers.len() + 1;
         let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
@@ -2651,9 +2662,12 @@ impl<'a> GlmfEngine<'a> {
     /// a speculative step with the fine buckets (`--decode-row-buckets`); otherwise lazily captured
     /// graphs take exact rows.
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
-        if self.use_graphs && (self.startup_graphs || (spec && self.row_buckets.get())) {
-            self.buckets.borrow().bucket(rows, spec)
-        } else { rows }
+        if self.pads_decode(spec) { self.buckets.borrow().bucket(rows, spec) } else { rows }
+    }
+
+    /// [`decode_pads`] for this engine: whether its graphed `spec` steps pad to a row bucket.
+    fn pads_decode(&self, spec: bool) -> bool {
+        decode_pads(self.use_graphs, self.startup_graphs, spec, self.row_buckets.get())
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
@@ -3207,10 +3221,12 @@ impl<'a> GlmfEngine<'a> {
                 self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, cap)?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
-                } else if self.startup_graphs {
-                    // Real width is runtime data, not part of a bucket graph key.
+                } else if self.pads_decode(tables.spec) {
+                    // A step that may pad: real width is runtime data, not part of a bucket graph
+                    // key, so the MoE runs outside the graph at the real rows (below).
                     Ok(())
                 } else {
+                    // A step that never pads keeps the MoE front in its graph: every row is real.
                     self.moe_front(w, index, layer, t, rows, cap, &[Span { first: 0, rows: t }])
                 }
             })?;
@@ -3232,8 +3248,10 @@ impl<'a> GlmfEngine<'a> {
                 if self.warming_graphs.get() {
                     // Masked startup rows need no routed result; preserve peer event ordering.
                     self.exchange_window(index, true, true)?;
-                } else if self.startup_graphs {
-                    // The MoE front and experts run outside the graph at the real rows.
+                } else if self.pads_decode(tables.spec) {
+                    // The MoE front and experts run outside the graph at the real rows: padded rows
+                    // stay out of the router and off the expert wire (`_m128` steps too), and their
+                    // delta rows are cleared once the expert work is done.
                     crate::shared::decode_graph::real_row_moe(tables.exchange_rows(), t, |real| {
                         self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true,
                             &[Span { first: 0, rows: real }], real)
@@ -3252,10 +3270,10 @@ impl<'a> GlmfEngine<'a> {
                         }
                     })?;
                 } else {
-                    // Lazily captured steps keep the MoE front in the graph; a step padded to a fine
-                    // row bucket (`--decode-row-buckets`) sends only its real rows to the experts.
-                    let real = tables.exchange_rows();
-                    self.moe_experts(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true)?;
+                    // An unpadded step's MoE front ran in its graph over its rows, all of them real.
+                    ensure!(tables.exchange_rows() == t, "an unpadded decode step of {t} rows has {} real rows",
+                        tables.exchange_rows());
+                    self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
                 }
             }
             if index < layers.len() {
@@ -4375,19 +4393,30 @@ mod prefill_lane_tests {
         }
         assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
             [8, 160, 8, 8, 16, 32, 16, 16, 16, 16, 16]);
+        let default = super::DecodeBuckets::new(super::DECODE_ROWS, super::DECODE_ROWS, false);
         for sequences in [1, 8, 16, 17, 32, 64] {
-            super::check_decode_thresholds(sequences, false).unwrap();
-            super::check_decode_thresholds(sequences, true).unwrap();
+            super::check_decode_thresholds(&default, sequences, false).unwrap();
+            super::check_decode_thresholds(&default, sequences, true).unwrap();
         }
         let error = super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS)
             .unwrap_err().to_string();
         assert!(error.contains("index.iq"));
         assert!(super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).is_err());
         // The 128-row sets (default and fine buckets, 170 and 188 SMs) pass with the capacity
-        // threshold; a bucket that would pad a 64-row step into the `_m128` programs does not.
+        // threshold at every serving width; a bucket that would pad a 64-row step into the
+        // `_m128` programs does not.
         for (verify, fine) in [(127, false), (128, false), (127, true), (128, true), (99, true)] {
-            super::check_buckets(&super::DecodeBuckets::new(super::WIDE_DECODE_ROWS, verify, fine), 16, true).unwrap();
+            let buckets = super::DecodeBuckets::new(super::WIDE_DECODE_ROWS, verify, fine);
+            assert_eq!(buckets.spec.last(), Some(&verify));
+            for sequences in 1..=super::DECODE_ROWS {
+                super::check_decode_thresholds(&buckets, sequences, false).unwrap();
+                super::check_decode_thresholds(&buckets, sequences, true).unwrap();
+            }
         }
+        let crossing = super::DecodeBuckets { plain: vec![1, 4, 8, 16, 32, 64], spec: vec![2, 4, 8, 16, 32, 72, 127],
+            wide: true };
+        let error = super::check_decode_thresholds(&crossing, 16, true).unwrap_err().to_string();
+        assert!(error.contains("m64|m128"), "{error}");
         let error = super::check_bucket_thresholds(&[32, 72], super::WIDE_DECODE_THRESHOLDS).unwrap_err().to_string();
         assert!(error.contains("m64|m128"), "{error}");
     }
@@ -4538,6 +4567,45 @@ mod prefill_lane_tests {
         let reserve = super::serving_graph_reserve(131_072, 2_097_152, 2051, 45, false, &policy);
         assert_eq!(reserve, [2_413_754_097]);
         assert!(reserve[0] > (512 << 20) + 1_800_000_000);
+    }
+
+    /// A step that may pad (startup graphs; speculative steps with the fine buckets) runs its MoE at
+    /// the real rows outside the graph and clears the padded rows' delta after the expert work; at
+    /// 128 decode rows too. Only a step that never pads keeps the MoE front in its graph.
+    #[test]
+    fn padded_steps_keep_padding_out_of_the_router_and_off_the_expert_wire() {
+        use super::decode_pads;
+        for spec in [false, true] {
+            for buckets in [false, true] {
+                assert!(!decode_pads(false, true, spec, buckets), "eager decode never pads");
+                assert!(decode_pads(true, true, spec, buckets), "startup graphs pad every step");
+            }
+            assert!(!decode_pads(true, false, spec, false), "lazily captured steps run at their rows");
+        }
+        assert!(decode_pads(true, false, true, true) && !decode_pads(true, false, false, true));
+        let hidden = 4096;
+        for (fine, real, bucket) in [(false, 65, 127), (false, 100, 127), (true, 65, 72), (true, 121, 127),
+            (false, 17, 32), (true, 17, 20)] {
+            let buckets = super::DecodeBuckets::new(super::WIDE_DECODE_ROWS, 127, fine);
+            assert_eq!(buckets.bucket(real, true), bucket, "{real} rows (fine {fine})");
+            let mut tables = super::StepTables { decode: true, spec: true, page_stride: 8, pool_stride: 2,
+                positions: vec![5; real], kv_slots: vec![7; real], kda_slots: vec![1; real],
+                seq_first: (0..real as i32).collect(), pool_slots: vec![-1; real], cache_lengths: vec![2; real],
+                page_table: vec![3; real * 8], pool_table: vec![1; real * 2], real_rows: real, ..Default::default() };
+            super::pad_decode_tables(&mut tables, bucket);
+            assert_eq!((tables.exchange_rows(), tables.positions.len()), (real, bucket));
+            assert!(tables.kv_slots[real..].iter().chain(&tables.pool_slots[real..]).all(|&slot| slot == -1));
+            assert!(tables.kda_slots[real..].iter().all(|&slot| slot == -1));
+            assert_eq!(super::decode_cap(bucket), if bucket > super::DECODE_ROWS { "m128" } else { "m64" });
+            // The router, the wire and the experts take the real rows; then the padded tail clears,
+            // inside the decode workspace's delta rows (128 rows with `--decode-rows 128`).
+            let events = std::cell::RefCell::new(Vec::new());
+            crate::shared::decode_graph::real_row_moe(tables.exchange_rows(), bucket,
+                |rows| { events.borrow_mut().push((0, rows)); Ok(()) },
+                |tail| { events.borrow_mut().push((tail.start, tail.end)); Ok(()) }).unwrap();
+            assert_eq!(*events.borrow(), [(0, real), (real, bucket)]);
+            assert!(bucket * hidden * 2 <= super::WIDE_DECODE_ROWS * hidden * 2);
+        }
     }
 
     #[test]

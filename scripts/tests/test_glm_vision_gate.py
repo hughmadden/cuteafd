@@ -162,6 +162,24 @@ def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
         assert key in cache
 
 
+def test_glm_decode_buckets_are_checked_before_readiness_and_padding_skips_the_router():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families"
+    source = (root / "glm5_flash/engine.rs").read_text()
+    # The bucket/threshold assertion runs whenever decode runs graphed, lazily captured graphs
+    # included, before the startup-only capture; serving warms up before it reports ready.
+    warm = source.split("pub fn warm_decode_graphs(", 1)[1].split("\n    }\n", 1)[0]
+    assert warm.index("check_decode_thresholds(&policy.buckets") < warm.index("if !self.startup_graphs")
+    serve = (root / "glm5_flash/serve.rs").read_text().split("fn serve_loop(", 1)[1]
+    assert serve.index("engine.warm_decode_graphs(") < serve.index("schedule(engine")
+    # Every step that may pad (`decode_pads`, the predicate that pads it) runs its MoE at the real
+    # rows outside the graph and clears the padded rows after the expert work.
+    graphed = source.split("fn decode_graphed(", 1)[1].split("\n    fn ", 1)[0]
+    assert graphed.count("self.pads_decode(tables.spec)") == 2
+    assert "real_row_moe(tables.exchange_rows(), t" in graphed
+    padding = source.split("pub(crate) fn serving_decode_rows(", 1)[1].split("\n    }\n", 1)[0]
+    assert "self.pads_decode(spec)" in padding
+
+
 def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     root = ROOT / "rust/crates/cuteafd-daemon/src/families"
     source = (root / "glm5_flash/engine.rs").read_text()
