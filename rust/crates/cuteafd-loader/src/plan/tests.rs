@@ -232,8 +232,8 @@ fn segmented_fused_qkv_resolves_checkpoint_shards() {
     let report = plan(dir.path(), &sparks(6)).unwrap();
     let attention = component(&report, Component::Attention);
     assert_eq!(attention.status, Status::Ready, "{}", render(&report));
-    // 8 shards x [q | k | v]: 24 segments, each its own 128-row grid.
-    assert!(attention.formats.contains_key("fp8-block128x128/f32-segmented24"), "{:?}", attention.formats);
+    // 8 shards x [q | k | v]: one grid segment per whole checkpoint shard.
+    assert!(attention.formats.contains_key("fp8-block128x128/f32-segmented8"), "{:?}", attention.formats);
     assert!(report.executable(), "{}", render(&report));
     // The same rows read as TP4 shards do not tile the 216-row grid.
     let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(4));

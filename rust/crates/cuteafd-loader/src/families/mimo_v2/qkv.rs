@@ -1,7 +1,7 @@
 //! MiMo V2.6 fused `self_attn.qkv_proj`: FP8 E4M3 rows interleaved for
 //! `metadata.tp_size` in the checkpoint index (Flash TP4, Pro TP8).
-//! Every shard stores `[q | k | v]` with an independent 128x128 FP32 scale
-//! grid for each segment. Flash SWA shards contain two contiguous key heads;
+//! Every shard stores `[q | k | v]` with one 128x128 FP32 scale grid over
+//! the whole shard. Flash SWA shards contain two contiguous key heads;
 //! Pro has one key head per shard and pads it only in the program layout.
 //! The reference modeling code splits the de-interleaved `[q; k; v]`.
 use super::config::{MimoAttention, MimoV2Config};
@@ -13,11 +13,20 @@ use std::path::Path;
 pub struct QkvSegment {
     /// First row in the checkpoint tensor.
     pub source_row: usize,
-    /// First row of its 128-row blocks in the scale grid.
+    /// First grid row of this checkpoint shard, not this segment.
     pub scale_row: usize,
+    /// Segment's row offset within its checkpoint shard.
+    pub shard_offset: usize,
     /// First row in the de-interleaved `[q; k; v]`.
     pub dest_row: usize,
     pub rows: usize,
+}
+
+impl QkvSegment {
+    /// Hugh Madden (issue #3): a block may straddle k/v; never restart at v.
+    pub fn scale_row_of(&self, row: usize) -> usize {
+        self.scale_row + (self.shard_offset + row) / 128
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +66,7 @@ impl FusedQkvLayout {
     }
 
     pub fn scale_rows(&self) -> usize {
-        self.shards * (self.q.div_ceil(128) + self.k.div_ceil(128) + self.v.div_ceil(128))
+        self.shards * (self.q + self.k + self.v).div_ceil(128)
     }
 
     /// Every (shard, part) run, in checkpoint order.
@@ -71,19 +80,19 @@ impl FusedQkvLayout {
         self.shards * (self.q + key_stride + self.v)
     }
 
-    /// `segments` into the layout whose shard keys sit `key_stride` rows apart:
-    /// with one KV head per shard and `key_stride` a multiple of 128, every
-    /// checkpoint 128x128 block lands on a whole 128-row block (V2.6 Pro: 256).
+    /// `segments` into the layout whose shard keys sit `key_stride` rows apart.
+    /// Destination padding never participates in the checkpoint scale grid.
     pub fn segments_with_key_stride(&self, key_stride: usize) -> Vec<QkvSegment> {
         let (q_all, k_all) = (self.shards * self.q, self.shards * key_stride);
+        let shard_rows = self.q + self.k + self.v;
         let mut out = Vec::with_capacity(3 * self.shards);
-        let (mut source_row, mut scale_row) = (0, 0);
         for shard in 0..self.shards {
-            for (rows, dest_row) in [(self.q, shard * self.q), (self.k, q_all + shard * key_stride),
-                (self.v, q_all + k_all + shard * self.v)] {
-                out.push(QkvSegment { source_row, scale_row, dest_row, rows });
-                source_row += rows;
-                scale_row += rows.div_ceil(128);
+            let scale_row = shard * shard_rows.div_ceil(128);
+            for (shard_offset, rows, dest_row) in [(0, self.q, shard * self.q),
+                (self.q, self.k, q_all + shard * key_stride),
+                (self.q + self.k, self.v, q_all + k_all + shard * self.v)] {
+                out.push(QkvSegment { source_row: shard * shard_rows + shard_offset,
+                    scale_row, shard_offset, dest_row, rows });
             }
         }
         out
@@ -107,8 +116,30 @@ pub fn checkpoint_tp(snapshot: &Path) -> Result<usize> {
 mod tests {
     use super::*;
 
+    fn shard_grid_row(layout: &FusedQkvLayout, source_row: usize) -> usize {
+        let rows = layout.q + layout.k + layout.v;
+        source_row / rows * rows.div_ceil(128) + source_row % rows / 128
+    }
+
     #[test]
-    fn flash_tp4_keeps_two_swa_key_heads_contiguous_and_scales_segmented() -> Result<()> {
+    fn poisoned_segment_pad_is_never_read() {
+        // Hugh Madden's T2 (issue #3), adapted to 128-row blocks: the old
+        // per-part ceilings read a third grid row that the shard never uses.
+        let layout = FusedQkvLayout { shards: 2, q: 64, k: 64, v: 64 };
+        assert_eq!(layout.scale_rows(), 4);
+        let clean = [1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0];
+        let poisoned = [1.0f32, 2.0, 3.0, 4.0, 1e30, 1e30];
+        let read = |grid: &[f32]| layout.segments().iter().flat_map(|segment|
+            (0..segment.rows).map(|r| grid[segment.scale_row_of(r)]).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(read(&clean), read(&poisoned));
+        let naive = |grid: &[f32]| (0..layout.shards * 3).flat_map(|part|
+            std::iter::repeat_n(grid[part], 64)).collect::<Vec<_>>();
+        assert_ne!(naive(&clean), naive(&poisoned));
+        assert_ne!(naive(&poisoned), read(&poisoned));
+    }
+
+    #[test]
+    fn flash_tp4_keeps_two_swa_key_heads_contiguous_and_scales_per_shard() -> Result<()> {
         let mut value = crate::plan::testing::mimo_flash_config();
         value["model_type"] = serde_json::json!("mimo_v2");
         value["rope_theta"] = serde_json::json!(1e7);
@@ -120,14 +151,15 @@ mod tests {
             let layout = FusedQkvLayout::new(&cfg, kind, 4)?;
             let (width, segments) = layout.program_segments(&cfg)?;
             assert_eq!((width, layout.scale_rows(), layout.k), (rows, scales, key_rows));
-            // Label every checkpoint row by its own restarted scale-grid row,
-            // and prove de-interleaving leaves no holes or duplicate writes.
+            // Label each row by its shard grid; de-interleaving has no holes
+            // or duplicate writes, and never restarts scales at a part boundary.
             let mut dest = vec![usize::MAX; width];
             for segment in &segments {
                 for row in 0..segment.rows {
                     let at = segment.dest_row + row;
                     assert_eq!(dest[at], usize::MAX);
-                    dest[at] = segment.scale_row + row / 128;
+                    dest[at] = segment.scale_row_of(row);
+                    assert_eq!(dest[at], shard_grid_row(&layout, segment.source_row + row));
                 }
             }
             assert!(dest.iter().all(|&row| row < scales));
@@ -135,7 +167,13 @@ mod tests {
             for shard in 0..4 {
                 let key = segments[shard * 3 + 1];
                 assert_eq!(key.dest_row, q_all + shard * key_rows);
-                assert_eq!(dest[key.dest_row + key_rows - 1], key.scale_row + (key_rows - 1) / 128);
+                assert_eq!(dest[key.dest_row + key_rows - 1], key.scale_row_of(key_rows - 1));
+                let value = segments[shard * 3 + 2];
+                if kind == MimoAttention::Full {
+                    assert_eq!(dest[value.dest_row], dest[key.dest_row + 191]);
+                    assert_eq!(dest[value.dest_row + 63], shard * 27 + 25);
+                    assert_eq!(dest[value.dest_row + 64], shard * 27 + 26);
+                }
             }
             let share = cfg.head_split(2)?;
             let half = FusedQkvLayout::new(&share, kind, 2)?;
@@ -180,8 +218,27 @@ mod tests {
         let layout = FusedQkvLayout::new(&cfg, MimoAttention::Full, 8)?;
         assert_eq!((layout.rows(), layout.scale_rows()), (27136, 216));
         let segments = layout.segments();
-        assert_eq!(segments[1], QkvSegment { source_row: 3072, scale_row: 24, dest_row: 24576, rows: 192 });
-        assert_eq!(segments[5], QkvSegment { source_row: 3392 + 3264, scale_row: 27 + 26, dest_row: 26112 + 128, rows: 128 });
+        assert_eq!(segments[1], QkvSegment { source_row: 3072, scale_row: 0, shard_offset: 3072,
+            dest_row: 24576, rows: 192 });
+        assert_eq!(segments[5], QkvSegment { source_row: 3392 + 3264, scale_row: 27, shard_offset: 3264,
+            dest_row: 26112 + 128, rows: 128 });
+        let (width, padded) = layout.program_segments(&cfg)?;
+        assert_eq!(width, 8 * (3072 + 256 + 128));
+        let mut rows = vec![None; width];
+        for segment in &padded {
+            for r in 0..segment.rows {
+                assert!(rows[segment.dest_row + r].replace(segment.scale_row_of(r)).is_none());
+                assert_eq!(segment.scale_row_of(r), shard_grid_row(&layout, segment.source_row + r));
+            }
+        }
+        for shard in 0..8 {
+            let key = padded[shard * 3 + 1];
+            assert!(rows[key.dest_row + 192..key.dest_row + 256].iter().all(Option::is_none));
+            let value = padded[shard * 3 + 2];
+            assert_eq!(value.scale_row_of(0), shard * 27 + 25);
+            assert_eq!(value.scale_row_of(63), key.scale_row_of(191));
+            assert_eq!(value.scale_row_of(64), shard * 27 + 26);
+        }
         // A two-GPU head split: each GPU takes four whole checkpoint shards (64 query heads,
         // 4 KV heads), the same per-shard layout at half the rows and grid rows.
         let share = cfg.head_split(2)?;
