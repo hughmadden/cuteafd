@@ -35,6 +35,9 @@ rm -rf "$incoming"
 mkdir -p "$incoming/workspace/.cuteafd-wip"
 cp -a "$source_dir/." "$incoming/workspace/"
 install -m 0755 "$build_output/cuteafd" "$incoming/workspace/.cuteafd-wip/cuteafd"
+if [[ -f "$build_output/COMPILER_PROVENANCE.json" ]]; then
+  install -m 0644 "$build_output/COMPILER_PROVENANCE.json" "$incoming/workspace/.cuteafd-wip/COMPILER_PROVENANCE.json"
+fi
 install -m 0755 \
   "$build_output/libcuteafd_native.so" \
   "$incoming/workspace/.cuteafd-wip/libcuteafd_native.so"

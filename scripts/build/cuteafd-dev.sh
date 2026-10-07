@@ -16,7 +16,7 @@ case "$role" in
   expert|spark)
     image="${CUTEAFD_SPARK_EXPERT_DOCKER_DEV:-cuteafd-spark-expert-dev}"
     ;;
-  dev)
+  dev|cpu)
     image="${CUTEAFD_COORDINATOR_DOCKER_DEV:-cuteafd-coordinator-dev}"
     ;;
   *)
@@ -57,9 +57,20 @@ docker_args+=(
   -e "CARGO_HOME=$container_home/cargo"
 )
 
+if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
+  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$CUTEAFD_DEV_TARGET_DIR"
+  mkdir -p "$CUTEAFD_DEV_TARGET_DIR"
+  docker_args+=(--mount "type=bind,src=$CUTEAFD_DEV_TARGET_DIR,dst=/opt/cuteafd-target"
+                -e CARGO_TARGET_DIR=/opt/cuteafd-target)
+fi
+source "$repo_root/scripts/build/compiler-cache.sh"
+compiler_cache_args=()
+mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
+docker_args+=("${compiler_cache_args[@]}")
+
 if [[ "$role" == "expert" || "$role" == "spark" ]]; then
   docker_args+=(--gpus all)
-else
+elif [[ "$role" != cpu ]]; then
   source "$repo_root/scripts/lib/release-common.sh"
   release_load_config "${CUTEAFD_CONFIG:-$repo_root/cuteafd.config}"
   release_need nvidia-smi
@@ -99,4 +110,10 @@ if [[ $# -eq 0 ]]; then
   set -- bash
 fi
 
+if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
+  # Apply inside the matching toolchain, then preserve the caller's argv exactly.
+  set -- bash -c 'source /workspace/cuteafd/scripts/build/compiler-cache.sh;
+    cuteafd_compiler_cache_setup "${CARGO_TARGET_DIR:-$HOME/compiler-cache-build}";
+    exec "$@"' cuteafd-cache "$@"
+fi
 exec docker "${docker_args[@]}" "$image" "$@"

@@ -31,16 +31,20 @@ fn main() {
             }
         };
         (remote, commit, dirty) = (field("remote"), field("commit"), field("dirty"));
-    } else if let Some(head) = git(&root, &["rev-parse", "HEAD"]) {
-        commit = head;
-        remote = git(&root, &["config", "--get", "remote.origin.url"]).unwrap_or_default();
-        dirty = git(&root, &["status", "--porcelain", "--untracked-files=no"])
-            .map(|s| (!s.is_empty()).to_string()).unwrap_or_default();
-        for dir in [git(&root, &["rev-parse", "--git-dir"]), git(&root, &["rev-parse", "--git-common-dir"])]
-            .into_iter().flatten() {
-            let dir = if Path::new(&dir).is_absolute() { Path::new(&dir).to_path_buf() } else { root.join(&dir) };
-            println!("cargo:rerun-if-changed={}", dir.join("HEAD").display());
-            println!("cargo:rerun-if-changed={}", dir.join("index").display());
+    }
+    // Docker may create an empty bind-mount placeholder for the identity file.
+    if commit.is_empty() {
+        if let Some(head) = git(&root, &["rev-parse", "HEAD"]) {
+            commit = head;
+            remote = git(&root, &["config", "--get", "remote.origin.url"]).unwrap_or_default();
+            dirty = git(&root, &["status", "--porcelain", "--untracked-files=no"])
+                .map(|s| (!s.is_empty()).to_string()).unwrap_or_default();
+            for dir in [git(&root, &["rev-parse", "--git-dir"]), git(&root, &["rev-parse", "--git-common-dir"])]
+                .into_iter().flatten() {
+                let dir = if Path::new(&dir).is_absolute() { Path::new(&dir).to_path_buf() } else { root.join(&dir) };
+                println!("cargo:rerun-if-changed={}", dir.join("HEAD").display());
+                println!("cargo:rerun-if-changed={}", dir.join("index").display());
+            }
         }
     }
     // The daemon's stamp (wip.sh) when nothing else named the commit.
@@ -54,7 +58,12 @@ fn main() {
         }
     }
     if let Ok(value) = std::env::var("CUTEAFD_BUILD_COMMIT") {
-        commit = value;
+        if !value.trim().is_empty() {
+            commit = value;
+        }
+    }
+    if commit.trim().is_empty() {
+        commit = "unknown".to_string();
     }
     agentic_repo(Path::new(&manifest));
     println!("cargo:rustc-env=CUTEAFD_BUILD_REMOTE={remote}");
@@ -87,7 +96,9 @@ fn agentic_repo(manifest: &Path) {
     let mut out = String::from("pub static AGENTIC_REPO: &[(&str, &str)] = &[\n");
     for file in files {
         let relative = file.strip_prefix(&root).unwrap_or(&file).display().to_string();
-        out.push_str(&format!("    ({relative:?}, include_str!({:?})),\n", file.display().to_string()));
+        // Generated source must not carry the checkout path into the cache key.
+        let contents = std::fs::read_to_string(&file).expect("read agentic fixture");
+        out.push_str(&format!("    ({relative:?}, {contents:?}),\n"));
     }
     out.push_str("];\n");
     let target = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("agentic_repo.rs");
