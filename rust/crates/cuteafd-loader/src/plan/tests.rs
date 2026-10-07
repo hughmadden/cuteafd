@@ -927,6 +927,96 @@ fn capacity_counts_the_widest_rank_of_an_uneven_split() {
 }
 
 #[test]
+fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, GlmfStepShape};
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // The GLM programs' scratch of an export (the engine reads the same manifest).
+    let programs: Vec<Value> = [("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
+        ("glmf_ffn_i12288_m4096", 353_894_400)].into_iter()
+        .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+    let manifest = json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072},
+        "programs": programs});
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let lookup = glmf_manifest_scratch(&manifest);
+    // Two lanes of 4,096 rows and the default 2 GiB headroom; four lanes of 2,048 and 1 GiB.
+    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (4, 2048, 1 << 30)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
+            prefill_rows: rows, headroom_bytes: headroom, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
+            ..Default::default() }), ..sparks(4) };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let gpu = &memory.devices[0];
+        assert_eq!(gpu.capacity_bytes, (32 << 30) - headroom);
+        // What the engine allocates from the same arithmetic and manifest.
+        let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+            output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, &shape,
+            glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
+            glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
+        let steps = gpu.items.iter().find(|i| i.category == Category::Workspace && i.group == "steps").unwrap();
+        assert_eq!((steps.bytes, steps.basis), (engine + lanes * 4 * rows * 4096 * 2, Basis::Formula),
+            "the step workspaces and every lane's intake planes");
+    }
+    // Without a manifest: the one-GPU allowance, never below the default lanes' rows in flight.
+    let options = |lanes: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+        prefill_lanes: lanes, prefill_rows: rows, workspace_manifest: Some(dir.path().join("absent.json")),
+        ..Default::default() }), ..sparks(4) };
+    let steps = |lanes, rows| plan(dir.path(), &options(lanes, rows)).unwrap().memory_layout.unwrap().devices[0].items
+        .iter().find(|i| i.group == "steps").unwrap().bytes;
+    let allowance = layout::family_costs("glm5_flash").workspace_bytes[0];
+    assert_eq!(steps(2, 4096), allowance + 2 * 4 * 4096 * 4096 * 2);
+    assert_eq!(steps(4, 2048), allowance + 4 * 4 * 2048 * 4096 * 2);
+    assert_eq!(steps(4, 4096), 2 * allowance + 4 * 4 * 4096 * 4096 * 2);
+    // A graph budget replaces the graph allowance, as the engine's admission reserves it.
+    let mut budgeted = options(2, 4096);
+    budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);
+    let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
+    let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
+        .collect();
+    assert_eq!(graphs, [("graph budget", 512 << 20)]);
+}
+
+/// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
+/// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
+/// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
+#[test]
+fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
+    use cuteafd_core::memory_layout::DeviceKind;
+    let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let allowance = layout::family_costs("glm5_flash").graph_bytes;
+    // Each coordinator GPU's graph item for `gpus` GPUs, a pool (None: automatic), `ranks` Sparks (0:
+    // local experts) and a budget of `mib` MiB.
+    let graphs = |gpus: usize, pool: Option<u64>, ranks: usize, mib: u64| -> Vec<(String, u64)> {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            pool_tokens: pool, graph_budget_bytes: Some(mib << 20), ..Default::default() }), ..sparks(ranks) };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
+            .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
+    };
+    let budget = |mib: u64| ("graph budget".to_string(), mib << 20);
+    let kept = ("graph allowance".to_string(), allowance[0]);
+    // Measured: the budget itself, below the allowance or above it.
+    assert_eq!(graphs(1, None, 4, 512), [budget(512)]);
+    assert_eq!(graphs(1, None, 4, 4096), [budget(4096)]);
+    // Planned: a fixed pool, local experts, a head split (both GPUs).
+    for (gpus, pool, ranks) in [(1, Some(131_072), 4), (1, None, 0), (2, None, 4), (2, Some(131_072), 4)] {
+        assert_eq!(graphs(gpus, pool, ranks, 512), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
+        assert_eq!(graphs(gpus, pool, ranks, 1536), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
+        assert_eq!(graphs(gpus, pool, ranks, 4096), vec![budget(4096); gpus], "{gpus} {pool:?} {ranks}");
+    }
+}
+
+#[test]
 fn glm_next_facts_and_dflash2_drafter_are_described() {
     let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
