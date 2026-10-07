@@ -228,6 +228,9 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
+    // The mark arena `prefix_cache` will allocate, for the planned admission of a BF16 KDA state.
+    args.mark_arena = Some((max_sequences.min(DECODE_ROWS), prefix.prefix_cache_entries,
+        prefix.prefix_cache_mark_mib << 20));
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.experts().is_some(), "serve-glmf needs --peers (or --local-experts) for the routed experts");
