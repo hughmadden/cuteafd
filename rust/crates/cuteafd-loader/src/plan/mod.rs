@@ -42,6 +42,18 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
+/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Explicit placement still reports missing or unsupported checkpoint tensors.
+pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
+    if mode == MediaMode::Off { return Ok(mode); }
+    match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+        crate::media::audio_tower::AudioStorage::Fp32) {
+        Ok(_) => Ok(mode),
+        Err(_) if mode == MediaMode::Auto => Ok(MediaMode::Off),
+        Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
+    }
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 /// Rejected tensors kept per component (the count covers the rest).
 const REJECTIONS_KEPT: usize = 8;
@@ -218,7 +230,7 @@ impl Default for PlanOptions {
     fn default() -> Self {
         Self {
             vision: MediaMode::Auto,
-            audio: MediaMode::Off,
+            audio: MediaMode::Auto,
             placement: ExpertPlacement::Sparks { ranks: 4 },
             spark_budget_bytes: 100 << 30,
             coordinator_budget_bytes: 80 << 30,
@@ -273,7 +285,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
     let mut report = PlanReport {
         vision: options.vision,
-        audio: options.audio,
+        audio: resolve_audio(options.audio, snapshot)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
@@ -417,7 +429,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             rejections.truncate(REJECTIONS_KEPT);
         }
         let disabled = (*component == Component::Vision && options.vision == MediaMode::Off)
-            || (*component == Component::Audio && options.audio == MediaMode::Off);
+            || (*component == Component::Audio && report.audio == MediaMode::Off);
         let status = if disabled { Status::Disabled } else { match family.runtime() {
             RuntimeStatus::Planned => Status::Planned,
             RuntimeStatus::Serving if rejected == 0 => Status::Ready,
@@ -554,7 +566,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     let bytes_of = |owner: Owner| -> u64 {
-        report.components.iter().filter(|c| c.owner == owner && !(spec.family != "deepseek_v41" && c.component == Component::Vision)).map(|c| c.bytes).sum()
+        report.components.iter().filter(|c| c.owner == owner && !(spec.family != "deepseek_v41" && matches!(c.component, Component::Vision | Component::Audio))).map(|c| c.bytes).sum()
     };
     let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
     for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {

@@ -310,6 +310,24 @@ release_config_family() {
   printf '%s\n' "${described%% *}"
 }
 
+# Header-only eligibility; the Rust planner validates the complete tower contract.
+release_resolve_audio_mode() {
+  local mode="$1" snapshot="$2"
+  [[ "$mode" == auto ]] || { printf '%s' "$mode"; return; }
+  python3 - "$snapshot" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    c = json.loads((p / "config.json").read_text())
+    qualified = (c.get("model_type") == "mimo_v2" and c.get("hidden_size") in (4096, 6144)
+                 and bool(c.get("audio_config")) and (p / "audio_tokenizer/config.json").is_file()
+                 and (p / "audio_tokenizer/model.safetensors").is_file())
+except (OSError, ValueError):
+    qualified = False
+print("auto" if qualified else "off")
+PY
+}
+
 release_load_config() {
   local config="$1"
   local mode="${2:-launch}"
@@ -323,7 +341,7 @@ release_load_config() {
   MODEL_ID="$default_model_id"
   MODEL_VARIANT=flash
   VISION=auto
-  AUDIO=off
+  AUDIO=auto
   MODEL_REVISION=dba1be0a40aa45a94ad051997016db3960a90277
   EXPERT_FORMAT=native
   DSPARK=on
@@ -661,6 +679,7 @@ release_resolve_local_model_revision() {
     release_die "resolved model revision is not 40..64 lowercase hex: $RELEASE_MODEL_REVISION"
   [[ -d "$model_root/snapshots/$RELEASE_MODEL_REVISION" ]] ||
     release_die "model snapshot is missing: $RELEASE_MODEL_ID@$RELEASE_MODEL_REVISION"
+  AUDIO="$(release_resolve_audio_mode "$AUDIO" "$model_root/snapshots/$RELEASE_MODEL_REVISION")"
 }
 
 # Two or three Spark ranks without explicit SPARK_TP/SPARK_EP keys form the

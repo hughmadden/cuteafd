@@ -36,7 +36,7 @@ get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 table_backend="${table_override:-$(get TABLE_BACKEND "${CUTEAFD_TABLE_BACKEND:-mmap}")}"
 release_validate_table_backend "$table_backend"
 vision="$(get VISION off)"
-audio="$(get AUDIO off)"
+audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
 [[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
 [[ "$vision" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$vision" != auto:* && "$vision" != off:* ) ]] || release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
@@ -90,6 +90,8 @@ esac
 # Qualified MiMo, GLM Flash and Qwen encoders use Spark-first auto unless explicitly off.
 # Other generic families keep off until their towers are qualified.
 if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == qwen4 ) && -z "$(get VISION)" ]]; then vision=auto; fi
+# Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
+audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
@@ -768,16 +770,18 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
     selected_audio="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("audio_encoder")
-assert e is not None, "audio checkpoint lacks encoder plan"
-k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid audio plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]
     assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
     print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
 elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
+elif kind=="off" and sys.argv[1]=="auto":
+    if e and e.get("shortfall",0): print("audio auto disabled: "+e["reason"],file=sys.stderr)
+    print("off",h,"-")
 else: raise ValueError("enabled audio has no launchable admitted owner")
-' <<<"$plan_json")"
+' "$audio" <<<"$plan_json")"
     read -r audio audio_encoder_hash audio_rank_csv <<<"$selected_audio"
     if [[ "$audio" == spark:* ]]; then
       IFS=, read -r -a audio_encoder_ranks <<<"$audio_rank_csv"
