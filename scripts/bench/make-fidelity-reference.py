@@ -3,13 +3,13 @@
 
 The golden harnesses (python/reference/families/<id>/golden.py) write the
 reference model's full logits for a prompt (tokens.bin i32 [T], logits.bin
-f32 [T, vocab], meta.json). The benchmark's quick-quality check scores the
-served model on the same tokens and compares against a compact summary of
+f32 [T, vocab], meta.json). Explicit local diagnostic runs can score the
+served model on the same tokens and compare against a compact summary of
 those rows: per position the reference's top-k ids and log-probabilities,
 the log of the remaining tail mass and the next token's log-probability.
 
     make-fidelity-reference.py --golden runs/qwen4-golden --model 'Qwen/Qwen3.8-Flash-Next*' \
-        --out rust/crates/cuteafd-bench/references/qwen3.8-flash-next.json
+        --out runs/qwen4-reference.json
 """
 import argparse
 import hashlib

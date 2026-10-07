@@ -273,6 +273,8 @@ impl Bench {
             "readiness_s": crate::context::readiness_s(),
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
+            "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))
+                .or_else(|| info.as_ref().map(|i| i.checkpoint())),
             "baseline": baseline.as_ref().map(|b| json!({"run": b.run_id, "quality": b.quality.status,
                 "badge": b.quality.badge()})),
             "quality_failed": baseline.as_ref().is_some_and(|b| b.quality.status == crate::report::CheckStatus::Fail),

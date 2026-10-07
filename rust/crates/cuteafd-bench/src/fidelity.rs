@@ -171,6 +171,47 @@ fn pairs(run: &Run) -> Result<BTreeMap<(String, usize), &Position>> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Verdict {
+    pub pass: bool,
+    pub generated: Fidelity,
+    pub top1_min: f64,
+    pub kl_max: f64,
+    pub confident_top1_min: f64,
+    pub top3_min: f64,
+    pub reasons: Vec<String>,
+}
+
+/// One calibrated absolute verdict shared by the card, CLI and dashboard.
+/// Bounds apply to generated rows; context/code rows remain in the report.
+pub fn verdict(run: &Run) -> Verdict {
+    let mut generated = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
+    let (top1_min, kl_max) = (run.floor_top1.max(0.90), run.floor_kl.min(0.06));
+    let (confident_top1_min, top3_min) = run.tripwire_expect.as_ref()
+        .map_or((0.98, 0.99), |e| (e.confident_top1_min, e.top3_min));
+    let mut reasons = Vec::new();
+    if run.score.missing > 0 || run.score.non_finite > 0 { reasons.push("missing or nonfinite rows".into()); }
+    if generated.positions == 0 { reasons.push("no generated rows".into()); }
+    if !run.floor_top1.is_finite() || !run.floor_kl.is_finite() || !top1_min.is_finite() || !kl_max.is_finite() || !confident_top1_min.is_finite() || !top3_min.is_finite() {
+        reasons.push("nonfinite expectation".into());
+    }
+    if generated.top1 + 1e-12 < top1_min { reasons.push("generated top-1 below expect/floor".into()); }
+    if !generated.kl.is_finite() || generated.kl > kl_max { reasons.push("generated KL above expect/floor".into()); }
+    if generated.confident_top1.is_some_and(|v| v + 1e-12 < confident_top1_min) {
+        reasons.push("confident top-1 below calibrated tripwire".into());
+    }
+    if generated.top3_contained + 1e-12 < top3_min { reasons.push("top-3 below calibrated tripwire".into()); }
+    if generated.groups("window").values().any(|w| w.top1 + 1e-12 < 0.80) {
+        reasons.push("generated window top-1 below 80% floor".into());
+    }
+    if run.dataset.as_ref().is_some_and(|d| crate::fidelity_dataset::ensure_valid_publication(
+        d["repository"].as_str().unwrap_or(""), d["revision"].as_str().unwrap_or(""), d["config"].as_str().unwrap_or("")).is_err()) {
+        reasons.push("reference under revision, scores not valid".into());
+    }
+    generated.records.clear();
+    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons }
+}
+
 fn absolute(run: &Run) -> bool {
     let score = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
     score.positions > 0 && score.top1 + 1e-12 >= run.floor_top1.max(0.90) && score.kl <= run.floor_kl.min(0.06)
@@ -202,6 +243,14 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(top1_margin.is_finite() && top1_margin > 0.0 && kl_margin.is_finite() && kl_margin > 0.0,
         "margins must be positive and finite");
     ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
+    for run in [a, b] {
+        if let Some(dataset) = &run.dataset {
+            crate::fidelity_dataset::ensure_valid_publication(
+                dataset["repository"].as_str().unwrap_or(""),
+                dataset["revision"].as_str().unwrap_or(""),
+                dataset["config"].as_str().unwrap_or(""))?;
+        }
+    }
     ensure!(!a.checkpoint.is_empty() && !a.set_sha256.is_empty() && !a.reference_sha256.is_empty(), "missing provenance");
     ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
         "runs use different checkpoints, sets or references");
@@ -212,9 +261,9 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(comparison_settings(&a.settings)? == comparison_settings(&b.settings)?,
         "runs use different nonprecision server settings");
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
-    ensure!(a.tier != "quick" || a.path_shape == "decode-shaped", "quick tier must be decode-shaped");
-    ensure!(matches!(a.tier.as_str(), "quick" | "full"), "unknown tier");
-    if a.tier == "full" {
+    ensure!(a.tier == "full" || a.path_shape == "decode-shaped", "quick and standard tiers must be decode-shaped");
+    ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    if a.tier != "quick" {
         ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
             && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
                 r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())))),
@@ -336,6 +385,23 @@ mod tests {
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
     }
+    #[test]
+    fn standard_shares_full_decode_verdict_and_rejects_prefill() {
+        let full = run(8,512);
+        let mut standard = full.clone(); standard.tier = "standard".into();
+        assert_eq!(verdict(&full).pass, verdict(&standard).pass);
+        assert!(compare(&standard,&standard,0.005,0.005,100,1).unwrap().pass);
+        standard.path_shape = "prefill-shaped".into();
+        assert!(compare(&standard,&standard,0.005,0.005,100,1).is_err());
+        let mut bad = full.clone(); bad.floor_top1 = f64::NAN;
+        assert!(!verdict(&bad).pass);
+        bad = full.clone(); bad.score.missing = 1; assert!(!verdict(&bad).pass);
+        bad = full; bad.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
+            "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
+        assert!(!verdict(&bad).pass);
+        assert!(compare(&bad, &bad, 0.005, 0.005, 100, 1).is_err());
+    }
+
     #[test]
     fn full_decision_requires_both_paths_and_fixed_arms() {
         let decode = run(12, 512);

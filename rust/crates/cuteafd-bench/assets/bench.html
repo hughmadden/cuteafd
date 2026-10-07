@@ -61,6 +61,12 @@ select { color: var(--ink); background: var(--panel-2); border: 1px solid var(--
 @media (max-width: 1250px) { .grid > .span-third { grid-column: span 3; } }
 @media (max-width: 900px) { .grid > .span-half, .grid > .span-third { grid-column: span 6; } }
 .panel .chart svg { display: block; width: 100%; height: auto; }
+.fidelity-pair { max-width: 260px; min-width: 0; }
+@media (max-width: 600px) {
+  .panel:has(.fidelity-pair) .panel-head { flex-wrap: wrap; }
+  .panel:has(.fidelity-pair) .ctl { flex-wrap: wrap; width: 100%; }
+  .fidelity-pair { max-width: 100%; flex: 1 1 100%; }
+}
 .span-third .panel-head .hint { display: none; }
 .panel.failed { border-color: var(--bad); position: relative; }
 .panel.failed::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 7px; border-radius: 12px 12px 0 0;
@@ -260,6 +266,12 @@ function renderPanels() {
         <div class="pbar" hidden><div class="progress"><span></span></div><span class="pl"></span></div>
         <div class="desc"></div><div class="chart"></div><div class="table tablewrap" hidden></div>`;
       card.querySelector('.play').onclick = () => runPanel(id);
+      if (id === 'fidelity' || id === 'fidelity_full') {
+        const select = document.createElement('select');
+        select.className = 'fidelity-pair'; select.title = 'Optional saved fidelity run for paired comparison';
+        select.onchange = () => { store.set(`bench.compare.${id}`, select.value); renderPanels(); };
+        card.querySelector('.ctl').prepend(select);
+      }
       card.querySelectorAll('.seg button').forEach((b) => b.onclick = () => { store.set(`bench.mode.${id}`, b.dataset.mode); renderPanels(); });
       const exp = card.querySelector('.exp');
       exp.onclick = (e) => { e.stopPropagation(); const m = exp.nextElementSibling; m.hidden = !m.hidden; };
@@ -283,6 +295,13 @@ function renderPanels() {
     const busy = !!status.active;
     card.querySelector('.play').disabled = busy || (meta.unavailable != null);
     card.querySelector('.play').title = meta.unavailable || (id === 'baseline' ? 'Run the baseline (once per server and configuration)' : 'Run one pass of this panel');
+    const pairSelect = card.querySelector('.fidelity-pair');
+    if (pairSelect) {
+      const selectedPair = store.get(`bench.compare.${id}`) || '';
+      pairSelect.innerHTML = '<option value="">No paired comparison</option>' + runs.filter((r) => r.id !== report?.id)
+        .map((r) => `<option value="${fmt.esc(r.id)}">${fmt.esc(r.created.slice(0,16))} · ${fmt.esc(r.profile)}</option>`).join('');
+      pairSelect.value = selectedPair;
+    }
     const mode = store.get(`bench.mode.${id}`) || 'chart';
     card.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
     // Progress of the running panel.
@@ -296,16 +315,17 @@ function renderPanels() {
     const desc = card.querySelector('.desc');
     desc.textContent = hasData(id) ? '' : (meta.unavailable ? `Unavailable: ${meta.unavailable}` : (meta.description || ''));
     desc.hidden = !desc.textContent;
+    const paired = pairSelect?.value ? `compare=${encodeURIComponent(pairSelect.value)}` : '';
     const exportMenu = card.querySelector('.exp + div');
     exportMenu.innerHTML = report && hasData(id) ? ['svg', 'png'].map((k) =>
-      `<a href="/v1/bench/runs/${report.id}/panel-${id}.${k}" target="_blank" rel="noopener">panel-${id}.${k}</a>`).join('') : '<span class="empty">nothing to export yet</span>';
+      `<a href="/v1/bench/runs/${report.id}/panel-${id}.${k}${paired ? '?' + paired : ''}" target="_blank" rel="noopener">panel-${id}.${k}</a>`).join('') : '<span class="empty">nothing to export yet</span>';
     const chart = card.querySelector('.chart'), table = card.querySelector('.table');
     chart.hidden = mode !== 'chart' || !hasData(id);
     table.hidden = mode !== 'table' || !hasData(id);
     if (hasData(id)) {
       if (mode === 'chart') {
         const width = Math.max(320, Math.round((chart.clientWidth || card.clientWidth - 28) / 40) * 40);
-        const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}`;
+        const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}${paired ? '&' + paired : ''}`;
         // Inline SVG (its <title> tooltips show on hover), swapped only once
         // the new version arrived, so a filling chart never flickers.
         if (chart.dataset.src !== src) {
@@ -316,6 +336,14 @@ function renderPanels() {
         }
       } else {
         table.innerHTML = tableFor(id);
+        if (paired) {
+          const src = `/v1/bench/runs/${report.id}/report.json?${paired}&rev=${revs[id] || 0}`;
+          table.dataset.src = src;
+          fetch(src).then((r) => r.ok ? r.json() : null).then((saved) => {
+            const compared = saved?.panels?.find((p) => p.id === id);
+            if (compared && table.dataset.src === src) table.innerHTML = tableFor(id, compared);
+          }).catch(() => {});
+        } else { delete table.dataset.src; }
       }
     }
   });
@@ -324,7 +352,7 @@ function renderPanels() {
 const tableHtml = (columns, rows, cls = []) => `<table><thead><tr>${columns.map((c, i) => `<th class="${i === 0 ? 'l' : ''}">${fmt.esc(c)}</th>`).join('')}</tr></thead>
   <tbody>${rows.map((r, j) => `<tr class="${cls[j] || ''}">${r.map((v, i) => `<td class="${i === 0 ? 'l' : (String(v).length > 40 ? 'wrap' : '')}">${typeof v === 'number' ? fmt.n1(v) : fmt.esc(v ?? '')}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
 
-function tableFor(id) {
+function tableFor(id, comparedResult = null) {
   if (id === 'baseline') {
     const b = report.baseline;
     const rows = b.card.decode.map((d) => {
@@ -359,7 +387,33 @@ function tableFor(id) {
     return tableHtml(['tensor group', 'formats'], (c.quant || []).map((q) => [q.group, q.formats.join(' + ')]))
       + tableHtml(['option', 'value', 'default', 'source'], rows, settings.map((s) => differs(s) ? 'differs' : ''));
   }
-  const r = result(id);
+  const r = comparedResult || result(id);
+  if (id === 'fidelity' || id === 'fidelity_full') {
+    const pass = r.partial || r.passes?.[r.passes.length - 1];
+    if (!pass) return `<p>${fmt.esc(r.error || 'No scored windows yet')}</p>`;
+    const sections = [['decode', pass.verdict, pass.per_window], ['prefill', pass.prefill_verdict, pass.prefill_per_window]];
+    const pair = pass.paired;
+    const pairedTable = pair?.unavailable ? `<p>Pair unavailable: ${fmt.esc(pair.unavailable)}</p>`
+      : pair?.comparison ? `<h3>Paired decode · ${pair.comparison.pass ? 'PASS' : 'FAIL'}</h3>`
+        + tableHtml(['metric', 'delta', 'upper 95%', 'margin'], [
+          ['top-1 loss', pair.comparison.top1_loss.toFixed(6), pair.comparison.top1_upper95.toFixed(6), pair.comparison.top1_margin.toFixed(6)],
+          ['KL delta (nat)', pair.comparison.kl_delta.toFixed(6), pair.comparison.kl_upper95.toFixed(6), pair.comparison.kl_margin.toFixed(6)]]) : '';
+    return `<p>${fmt.esc(pass.dataset?.config || '')} · ${fmt.esc(pass.dataset?.revision || '')}</p>` + pairedTable + sections
+      .filter(([, verdict]) => verdict).map(([path, verdict, windows]) => {
+        const g = verdict.generated;
+        const pct = (v) => v == null ? 'N/A' : `${(v * 100).toFixed(3)}%`;
+        const rows = [['top-1', pct(g.top1), pct(verdict.top1_min), 'min'],
+          ['KL (nat)', g.kl.toFixed(6), verdict.kl_max.toFixed(6), 'max'],
+          ['confident top-1', pct(g.confident_top1), pct(verdict.confident_top1_min), 'min'],
+          ['top-3', pct(g.top3_contained), pct(verdict.top3_min), 'min']];
+        return `<h3>${fmt.esc(path)} · ${verdict.pass ? 'PASS' : 'FAIL'}</h3>`
+          + tableHtml(['metric', 'measured (fraction / nat)', 'expect + floor', 'bound'], rows)
+          + `<p>${fmt.esc((verdict.reasons || []).join('; '))}</p>`
+          + tableHtml(['window', 'positions', 'top-1', 'KL (nat)', 'confident top-1', 'top-3', 'NLL'],
+            Object.entries(windows || {}).map(([id, f]) => [id, f.positions, f.top1.toFixed(5), f.kl.toFixed(6),
+              f.confident_top1 == null ? 'N/A' : f.confident_top1.toFixed(5), f.top3_contained.toFixed(5), f.nll.toFixed(5)]));
+      }).join('');
+  }
   return (r.passes || []).map((pass, i) => {
     if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows);
     const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);

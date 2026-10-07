@@ -153,7 +153,25 @@ pub fn full_report() -> Report {
                 "hit_cap": l == 5 && k == 7, "reasoning_tokens": tokens, "solo_s": tokens as f64 / 180.0}));
         }
     }
+    let fidelity_score = crate::reference::Fidelity::from_records((0..64).flat_map(|window| (0..8).map(move |position|
+        crate::reference::Position { window: format!("a{window:02}"), block: "A".into(), bucket: "0-2K".into(),
+            role: "gen".into(), position, agree: true, confident: true, top3_contained: true, agree_text: true,
+            finite: true, kl: 0.005, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1 })).collect());
+    let mut fidelity_run = crate::fidelity::Run { schema: "cuteafd.fidelity.run/2".into(), arm: "synthetic".into(),
+        checkpoint: "synthetic".into(), set_sha256: "synthetic".into(), reference_sha256: "synthetic".into(),
+        tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
+        verify_rows: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
+            "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
+        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
+    let fidelity = crate::panels::fidelity::record(&fidelity_run, Some(&fidelity_run));
+    fidelity_run.tier = "full".into();
+    let mut full_fidelity = crate::panels::fidelity::record(&fidelity_run, Some(&fidelity_run));
+    fidelity_run.path_shape = "prefill-shaped".into(); fidelity_run.seconds = 240.0;
+    for (key, value) in crate::panels::fidelity::record(&fidelity_run, None).as_object().unwrap() {
+        if key.starts_with("prefill") { full_fidelity[key] = value.clone(); }
+    }
     report.panels = vec![
+        pass("fidelity", fidelity), pass("fidelity_full", full_fidelity),
         pass("decode_content", json!({"rows": rows})),
         pass("concurrency", json!({"points": ([1, 2, 4, 8, 16].iter().map(|&c| json!({"c": c,
             "aggregate_tok_s": 187.0 * (c as f64).powf(0.7), "per_request_tok_s": 187.0 / (c as f64).powf(0.3),
@@ -200,12 +218,19 @@ mod full_tests {
     fn every_panel_renders() {
         let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
         let report = super::full_report();
+        if let Some(dir) = &dir {
+            std::fs::write(dir.join("full-report.json"), serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
         for panel in &report.panels {
             let svg = crate::render::report::panel_svg(&report, &panel.id);
             assert!(!svg.contains("Pass 1"), "{} fell back to the generic body", panel.id);
             let png = crate::render::png::png(&svg, 1.0).unwrap();
             if let Some(dir) = &dir {
                 std::fs::write(dir.join(format!("full-{}.png", panel.id)), png).unwrap();
+                if panel.id.starts_with("fidelity") {
+                    let narrow = crate::render::report::panel_body_svg(&report, &panel.id, 320.0);
+                    std::fs::write(dir.join(format!("narrow-{}.png", panel.id)), crate::render::png::png(&narrow, 1.0).unwrap()).unwrap();
+                }
             }
         }
         let svg = crate::render::report::report_svg(&report);

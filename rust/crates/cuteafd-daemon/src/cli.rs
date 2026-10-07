@@ -400,6 +400,20 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn dsv4_golden_accepts_nll_and_requires_it_for_saved_logits() {
+        use clap::Parser;
+        let base = ["cuteafd", "dsv4-golden", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--golden", "/golden"];
+        let super::Commands::Dsv4Golden(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--nll", "--save-logits", "/rows"])).unwrap().command else {
+            panic!("expected DeepSeek V4 golden");
+        };
+        assert!(args.nll);
+        assert_eq!(args.save_logits.as_deref(), Some(std::path::Path::new("/rows")));
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--save-logits", "/rows"])).is_err());
+    }
+
+    #[test]
     fn dsv4_quantizer_defaults_to_device_geometry_and_keeps_tuning_optional() {
         use clap::Parser;
         let base = ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"];

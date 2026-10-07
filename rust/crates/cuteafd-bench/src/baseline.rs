@@ -1,11 +1,10 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
 //! with thinking off; 8K prefill rate and TTFT) and quick quality (logit
-//! fidelity against a compact reference, prefix-cache restore exactness,
+//! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
 use crate::client::{Chat, Client};
 use crate::panels::{Progress, Rates};
-use crate::reference::Reference;
 use crate::report::{
     now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ContentRate, PrefillRate, Quality, ServerInfo, StreamTiming,
 };
@@ -42,7 +41,7 @@ fn plain(text: &str, max_tokens: u64) -> Value {
 pub fn estimate_s(rates: &Rates) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
-    let fidelity = rates.seconds(700.0, 0.0) + 8.0 * 0.12;
+    let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
     let cache = rates.seconds(6.0 * 1500.0, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
@@ -188,97 +187,28 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    let Some(reference) = Reference::find(&run.info.model) else {
-        check.status = CheckStatus::Skipped;
-        check.summary = format!("no fidelity reference for {}", run.info.model);
-        return Ok(());
-    };
-    let started = Instant::now();
-    let windows = reference.selected_windows(false)?;
-    let media_payloads: Vec<_> = if windows.iter().any(|w| !w.media.is_empty()) {
-        let root = std::env::var_os("CUTEAFD_FIDELITY_MEDIA_ROOT")
-            .context("media quick fidelity needs CUTEAFD_FIDELITY_MEDIA_ROOT")?;
-        let model = run.client.model_record()?;
-        windows.iter().map(|w| crate::reference::media_probe_payload(w, &model, std::path::Path::new(&root)))
-            .collect::<Result<_>>()?
-    } else { vec![Vec::new(); windows.len()] };
-    let mut records = Vec::new();
-    let mut missing = 0;
-    let mut probes = Vec::new();
-    // Validate the whole quick set before spending time on an unsupported context.
-    if let Some(window) = windows.iter().find(|w| w.tokens.len() as u64 + 8 > run.max_context) {
-        check.status = CheckStatus::Skipped;
-        check.summary = format!("reference window {} needs {} context tokens", window.id, window.tokens.len());
+    if let Some(reason) = crate::fidelity_dataset::unavailable(&run.info.checkpoint()) {
+        check.status = CheckStatus::Unsupported;
+        check.summary = reason;
         return Ok(());
     }
-    for (index, window) in windows.iter().enumerate() {
-        let end = window.positions.last().context("empty reference window")?.pos + 1;
-        let spec = ProbeSpec { prompt_ids: Some(window.tokens[..end].to_vec()), score_from: Some(window.score_from),
-            top_k: window.top_k, want: window.want(), cold: true, no_speculation: true,
-            score_path: (!reference.windows.is_empty()).then(|| "decode".into()), ..ProbeSpec::default() };
-        let record_owned;
-        let chat;
-        let record = if window.media.is_empty() {
-            chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
-            probe_of(&chat)?
-        } else {
-            let mut wire = serde_json::to_value(spec)?;
-            wire["media"] = serde_json::json!(media_payloads[index]);
-            let response = run.client.media_probe(plain("fidelity probe", 1), wire)?;
-            crate::reference::verify_media_echo(window, &response["probe"])?;
-            record_owned = serde_json::from_value::<ProbeRecord>(response["probe"].clone())?;
-            anyhow::ensure!(record_owned.prompt_ids == window.tokens[..end], "engine ran different media tokens");
-            anyhow::ensure!(response["server"]["model"] == run.info.model, "media scoring checkpoint changed");
-            &record_owned
-        };
-        if !honoured(record) { unsupported(check); return Ok(()); }
-        if let Some(error) = &record.error { anyhow::bail!("scoring {}: {error}", window.id); }
-        anyhow::ensure!(record.cold && record.no_speculation && record.cached_tokens == 0,
-            "fidelity requires honored cold, drafts-off scoring");
-        anyhow::ensure!(reference.windows.is_empty() || record.score_path.as_deref() == Some("decode"),
-            "quick fidelity requires reported decode scoring");
-        let f = window.score(&record.rows);
-        missing += f.missing;
-        records.extend(f.records);
-        probes.push(serde_json::json!({"window": window.id, "probe": record}));
-    }
-    let all = crate::reference::Fidelity::from_records(records);
-    let mut f = if reference.windows.is_empty() { all.clone() } else {
-        crate::reference::Fidelity::from_records(all.records.iter().filter(|p| p.role == "gen").cloned().collect())
-    };
-    f.missing = missing;
-    check.set("kl", f.kl);
-    check.set("top1", f.top1);
-    check.set("nll", f.nll);
-    check.set("ref_nll", f.ref_nll);
-    check.set("positions", f.positions as u64);
-    check.set("missing", f.missing as u64);
-    check.set("kl_max", reference.expect.kl_max);
-    check.set("top1_min", reference.expect.top1_min);
-    check.set("reference", reference.name.clone());
-    check.set("seconds", started.elapsed().as_secs_f64());
-    check.set("confident_top1", serde_json::to_value(f.confident_top1)?);
-    check.set("top3_contained", f.top3_contained);
-    check.set("agree_text", f.agree_text);
-    check.set("per_window", serde_json::to_value(all.groups("window"))?);
-    check.set("per_block", serde_json::to_value(all.groups("block"))?);
-    check.set("per_role", serde_json::to_value(all.groups("role"))?);
-    check.set("per_bucket", serde_json::to_value(all.groups("bucket"))?);
-    // Keep schema-1 output compatible; schema-2 pairs retain all selected positions.
-    if reference.windows.is_empty() { check.set("probe", probes[0]["probe"].clone()); }
-    else { check.set("probes", serde_json::json!(probes)); }
-    let window_floor = reference.windows.is_empty() || f.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80);
-    let tripwire = !reference.windows.is_empty() &&
-        (f.confident_top1.is_some_and(|v| v < 0.98) || f.top3_contained < 0.99);
-    let (floor_top1, floor_kl) = if reference.windows.is_empty() {
-        (reference.expect.top1_min, reference.expect.kl_max)
-    } else { (reference.expect.top1_min.max(0.90), reference.expect.kl_max.min(0.06)) };
-    let ok = f.positions > 0 && f.missing == 0 && all.non_finite == 0 && f.kl <= floor_kl
-        && f.top1 + 1e-12 >= floor_top1 && window_floor && !tripwire;
-    check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
-    check.summary = format!("KL {:.3} · top-1 {:.1}% · NLL {:.3} vs {:.3} · {} tokens / {} windows{}",
-        f.kl, 100.0 * f.top1, f.nll, f.ref_nll, f.positions, windows.len(),
-        if f.missing > 0 { format!(" · {} rows missing", f.missing) } else { String::new() });
+    let scored = crate::panels::fidelity::score(run.client, run.info, "quick", "decode", run.progress,
+        0.45, 0.12, run.max_context)?;
+    let verdict = crate::fidelity::verdict(&scored);
+    let f = &verdict.generated;
+    check.set("kl", f.kl); check.set("top1", f.top1); check.set("nll", f.nll);
+    check.set("ref_nll", f.ref_nll); check.set("positions", f.positions as u64);
+    check.set("missing", scored.score.missing as u64);
+    check.set("kl_max", verdict.kl_max); check.set("top1_min", verdict.top1_min);
+    check.set("confident_top1", json!(f.confident_top1)); check.set("top3_contained", f.top3_contained);
+    check.set("dataset", json!(scored.dataset));
+    check.set("quick_subset", "bench-v1:legacy,a00,a04,a08,a20,c00,d00,e00");
+    check.set("per_window", json!(crate::panels::fidelity::window_summaries(&scored)));
+    check.set("verdict", json!(verdict));
+    check.set("run", json!(scored));
+    check.status = if verdict.pass { CheckStatus::Pass } else { CheckStatus::Fail };
+    check.summary = format!("KL {:.3} · top-1 {:.1}% · {} generated / 4096 total rows · 8 windows",
+        f.kl, 100.0 * f.top1, f.positions);
     Ok(())
 }
 

@@ -53,7 +53,7 @@ pub enum Action {
 pub struct RunArgs {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub url: String,
-    #[arg(long, value_parser = ["quick", "full"], default_value = "quick")]
+    #[arg(long, value_parser = ["quick", "standard", "full"], default_value = "quick")]
     pub tier: String,
     #[arg(long)]
     pub arm: String,
@@ -92,10 +92,10 @@ pub struct RunArgs {
 }
 
 fn dataset_source<'a>(args: &'a RunArgs, model: &str) -> Result<Option<(&'a str, &'a str, &'a str)>> {
-    let default_full = args.tier == "full" && args.reference.is_none() && args.rows.is_none();
+    let default_full = args.reference.is_none() && args.rows.is_none();
     let repo = args.dataset.as_deref().or(default_full.then_some(crate::fidelity_dataset::REPOSITORY));
     ensure!(args.dataset_revision.is_none() || repo.is_some(),
-        "--dataset-revision needs --dataset or the full-tier dataset default");
+        "--dataset-revision needs --dataset or the dataset default");
     let Some(repo) = repo else { return Ok(None); };
     let publication = crate::fidelity_dataset::default_publication(model);
     let config = args.dataset_config.as_deref().or(publication.map(|p| p.1))
@@ -126,15 +126,31 @@ fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -
 }
 
 pub fn run(args: &RunArgs) -> Result<Run> {
-    ensure!(matches!(args.tier.as_str(), "quick" | "full"), "unknown tier");
-    ensure!(args.tier != "quick" || args.score_path == "decode", "quick tier must be decode-shaped");
+    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(args.tier == "full" || args.score_path == "decode", "quick and standard tiers must be decode-shaped");
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(900)).build();
     let base = args.url.trim_end_matches('/');
     let models: Value = agent.get(&format!("{base}/v1/models")).call()?.into_json()?;
-    let model = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let (reference, digest, dataset_identity) = if let Some((repo, commit, config)) = dataset_source(args, model)? {
-        ensure!(args.tier == "full", "qualified compact dataset requires the full tier");
+    let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
+    let status: Value = agent.get(&format!("{base}/v1/bench/status")).call()?.into_json()?;
+    let model = status["checkpoint"].as_str().unwrap_or(served);
+    let run = run_with(args, model, &models["data"][0], |body| {
+        request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
+    }, |_, _, _| {})?;
+    std::fs::write(&args.out, serde_json::to_vec_pretty(&run)?)?;
+    Ok(run)
+}
+
+/// Shared runner for remote CLI probes and the dashboard's already-held bench slot.
+pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
+    mut probe_request: impl FnMut(Value) -> Result<Value>,
+    mut progress: impl FnMut(usize, usize, &Run)) -> Result<Run> {
+    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(args.tier == "full" || args.score_path == "decode", "quick and standard tiers must be decode-shaped");
+    let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(120)).build();
+    let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source(args, model)? {
+        crate::fidelity_dataset::ensure_valid_publication(repo, commit, config)?;
         let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
             std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
         let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, config)?;
@@ -143,29 +159,50 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         let bytes = std::fs::read(path)?;
         (serde_json::from_slice::<Reference>(&bytes)?, format!("{:x}", Sha256::digest(&bytes)), None)
     } else {
-        let r = Reference::find(model).context("no family reference; use --reference")?;
-        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&r)?));
-        (r, digest, None)
+        bail!("no reference source; use a published dataset or --reference");
     };
     validate_served_reference(&reference, model, dataset_identity.is_some())?;
-    let windows = reference.selected_windows(args.tier == "full")?;
+    let windows = if args.tier == "quick" && dataset_identity.is_some() {
+        crate::fidelity_dataset::quick_windows(&reference)?
+    } else { reference.selected_windows(args.tier != "quick")? };
+    if let Some(limit) = model_record["max_context"].as_u64() {
+        ensure!(windows.iter().all(|w| w.tokens.len() as u64 <= limit), "fidelity windows exceed server context ({limit})");
+    }
     let media_payloads: Vec<_> = windows.iter().map(|window| {
         if window.media.is_empty() { return Ok(Vec::new()); }
         let root = args.media_root.as_ref().context("media windows require --media-root")?;
-        crate::reference::media_probe_payload(window, &models["data"][0], root)
+        crate::reference::media_probe_payload(window, model_record, root)
     }).collect::<Result<_>>()?;
-    if args.tier == "full" { ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe"); }
-    let rows = if args.tier == "full" && dataset_identity.is_none() {
+    if args.tier != "quick" || dataset_identity.is_some() {
+        ensure!(args.dump_dir.is_some(), "qualified dataset scoring needs --dump-dir on server-local NVMe");
+    }
+    let rows = if args.tier != "quick" && dataset_identity.is_none() {
         let dir = args.rows.as_ref().context("full tier needs --rows / CUTEAFD_FIDELITY_ROWS")?;
         ensure!(args.dump_dir.is_some(), "full tier needs --dump-dir on server-local NVMe");
         let rows = crate::fidelity_rows::manifest(dir, &reference.checkpoint, &reference.set_sha256, reference.vocab)?;
         crate::fidelity_rows::coverage(&rows, &windows)?;
         Some(rows)
     } else { None };
+    if args.tier == "quick" {
+        if let Some(identity) = &mut dataset_identity {
+            identity["quick_subset"] = json!({"version":"bench-v1", "windows":crate::fidelity_dataset::QUICK_WINDOWS});
+        }
+    }
     let started = Instant::now();
     let mut records = Vec::new();
     let (mut missing, mut engine, mut settings) = (0usize, String::new(), Value::Null);
     let mut shape = String::new();
+    let make_run = |records: Vec<crate::reference::Position>, missing, engine: String, settings: Value, shape: String| {
+        let mut score = Fidelity::from_records(records); score.missing = missing;
+        Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
+            set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
+            reference_sha256: digest.clone(), tier: args.tier.clone(), path_shape: shape,
+            kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
+                else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
+            dataset: dataset_identity.clone(), verify_rows: args.verify_rows, engine, settings,
+            seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
+            floor_kl: reference.expect.kl_max, tripwire_expect: reference.expect.tripwires.clone() }
+    };
     for (i, window) in windows.iter().enumerate() {
         let end = window.positions.last().context("empty window")?.pos + 1;
         let dump = args.dump_dir.as_ref().map(|d| d.join(format!("window-{i:03}")));
@@ -173,10 +210,9 @@ pub fn run(args: &RunArgs) -> Result<Run> {
             "top_k": 32, "want": window.want(), "cold": true, "no_speculation": true,
             "score_path": args.score_path});
         if !media_payloads[i].is_empty() { spec["media"] = json!(media_payloads[i]); }
-        if args.tier == "full" { spec["dump_rows"] = json!(dump); }
+        if args.tier != "quick" || dataset_identity.is_some() { spec["dump_rows"] = json!(dump); }
         if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
-        let response = request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key,
-            &json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
+        let response = probe_request(json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
                 "temperature": 0}, "spec": spec}))?;
         crate::reference::verify_media_echo(window, &response["probe"])?;
         let probe: cuteafd_api::openai::probe::ProbeRecord = serde_json::from_value(response["probe"].clone())?;
@@ -184,7 +220,9 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         ensure!(probe.engine.is_some() && probe.cold && probe.no_speculation && probe.cached_tokens == 0,
             "engine did not honor cold, drafts-off scoring");
         ensure!(probe.prompt_ids == window.tokens[..end], "engine ran different prompt tokens");
-        ensure!(response["server"]["model"] == model, "checkpoint changed during scoring");
+        let checkpoint = response["server"]["snapshot"].as_str().and_then(crate::report::hub_repo)
+            .unwrap_or_else(|| response["server"]["model"].as_str().unwrap_or("").to_string());
+        ensure!(checkpoint == model, "checkpoint changed during scoring");
         let this_engine = probe.engine.clone().unwrap();
         let actual_path = probe.score_path.as_deref().context("engine did not report its scoring path")?;
         ensure!(actual_path == args.score_path, "engine did not honor requested scoring path");
@@ -209,19 +247,19 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         missing += f.missing;
         eprintln!("{}: {} rows, top1 {:.2}%, KL {:.6}", window.id, f.positions, 100.0 * f.top1, f.kl);
         records.extend(f.records);
+        progress(i + 1, windows.len(), &make_run(records.clone(), missing, engine.clone(), settings.clone(), shape.clone()));
     }
-    let mut score = Fidelity::from_records(records); score.missing = missing;
-    let run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
-        set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
-        reference_sha256: digest, tier: args.tier.clone(), path_shape: shape,
-        kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
-            else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
-        dataset: dataset_identity,
-        verify_rows: args.verify_rows, engine, settings, seconds: started.elapsed().as_secs_f64(), score,
-        floor_top1: reference.expect.top1_min, floor_kl: reference.expect.kl_max,
-        tripwire_expect: reference.expect.tripwires.clone() };
-    std::fs::write(&args.out, serde_json::to_vec_pretty(&run)?)?;
-    Ok(run)
+    Ok(make_run(records, missing, engine, settings, shape))
+}
+
+fn run_pass(run: &Run) -> bool {
+    // Explicit schema-1 compact references are diagnostic context-only probes,
+    // not a published assistant-row fidelity gate. Preserve their sanity verdict.
+    if run.dataset.is_none() && run.tier == "quick" && run.kl_kind == "top32-plus-tail"
+        && run.score.records.iter().all(|row| row.role == "ctx") {
+        return run.score.positions > 0 && run.score.missing == 0 && run.score.non_finite == 0;
+    }
+    crate::fidelity::verdict(run).pass
 }
 
 /// Exit 0 pass / 3 gate failure / 1 error is handled at the daemon edge.
@@ -231,7 +269,7 @@ pub fn execute(args: Args) -> Result<bool> {
             let run = run(&args)?;
             eprintln!("{}: {} ({}) rows in {:.2}s; {} / {}", run.arm, run.score.positions,
                 run.score.missing, run.seconds, run.path_shape, run.kl_kind);
-            Ok(run.score.missing == 0 && run.score.non_finite == 0)
+            Ok(run_pass(&run))
         }
         Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out } => {
             let load = |path: PathBuf| -> Result<Run> {
@@ -278,10 +316,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_context_only_quick_references_keep_diagnostic_sanity_verdict() {
+        let score = Fidelity::from_records(vec![crate::reference::Position {
+            window: "legacy".into(), block: "E".into(), bucket: "0-2K".into(), role: "ctx".into(),
+            position: 1, agree: true, confident: true, top3_contained: true, agree_text: true,
+            finite: true, kl: 0.0, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1,
+        }]);
+        let mut run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(),
+            checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
+            tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
+            verify_rows: None, dataset: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
+            score, floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None };
+        assert!(run_pass(&run));
+        run.score.missing = 1; assert!(!run_pass(&run));
+        run.score.missing = 0; run.score.non_finite = 1; assert!(!run_pass(&run));
+        run.score.non_finite = 0; run.dataset = Some(json!({})); assert!(!run_pass(&run));
+    }
+
+    #[test]
+    fn standard_parses_and_uses_the_same_published_default() {
+        let standard = parse(&["--tier", "standard"]);
+        assert_eq!(standard.tier,"standard");
+        assert_eq!(dataset_source(&standard,"Qwen/Qwen3.8-Flash-Next-FP8").unwrap(),
+            dataset_source(&parse(&["--tier","full"]),"Qwen/Qwen3.8-Flash-Next-FP8").unwrap());
+    }
+
+    #[test]
     fn verified_full_default_preserves_quick_and_local_sources() {
         let full = parse(&["--tier", "full"]);
         assert_eq!(dataset_source(&full, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::REVISION, crate::fidelity_dataset::CONFIG)));
-        assert_eq!(dataset_source(&parse(&[]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
+        assert_eq!(dataset_source(&parse(&[]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), dataset_source(&full, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap());
         assert_eq!(dataset_source(&parse(&["--tier", "full", "--reference", "reference.json"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
         assert_eq!(dataset_source(&parse(&["--tier", "full", "--rows", "rows"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), None);
         assert_eq!(dataset_source(&parse(&["--tier", "full", "--dataset"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), dataset_source(&full, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap());
@@ -294,7 +358,7 @@ mod tests {
             Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::FLASH_REVISION,
                 crate::fidelity_dataset::FLASH_CONFIG)));
         assert!(dataset_source(&args, "unknown/model").is_err());
-        assert_eq!(dataset_source(&parse(&[]), "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap(), None);
+        assert_eq!(dataset_source(&parse(&[]), "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap(), dataset_source(&args, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap());
         let explicit = parse(&["--tier", "full", "--dataset", "other/repo"]);
         assert!(dataset_source(&explicit, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_err());
         let explicit = parse(&["--tier", "full", "--dataset-config", "other-config"]);
@@ -308,7 +372,7 @@ mod tests {
         assert_eq!(dataset_source(&full, model).unwrap(),
             Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::GLMF_REVISION,
                 crate::fidelity_dataset::GLMF_CONFIG)));
-        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), dataset_source(&full, model).unwrap());
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
@@ -316,7 +380,7 @@ mod tests {
             "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1"] {
             assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
         }
-        for other in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flashlight", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
+        for other in ["zai-org/GLM-5.3-Flashlight", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
             assert!(dataset_source(&full, other).is_err());
         }
         assert!(dataset_source(&parse(&["--tier", "full", "--dataset", "other/repo"]), model).is_err());
@@ -330,7 +394,7 @@ mod tests {
         assert_eq!(dataset_source(&full, model).unwrap(),
             Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::QWEN_REVISION,
                 crate::fidelity_dataset::QWEN_CONFIG)));
-        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), dataset_source(&full, model).unwrap());
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
@@ -352,7 +416,7 @@ mod tests {
         assert_eq!(dataset_source(&full, model).unwrap(),
             Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::V4FLASH_REVISION,
                 crate::fidelity_dataset::V4FLASH_CONFIG)));
-        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), dataset_source(&full, model).unwrap());
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
@@ -399,7 +463,7 @@ mod tests {
         assert_eq!(dataset_source(&args, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some(("other/repo", "1111111111111111111111111111111111111111", crate::fidelity_dataset::CONFIG)));
         let args = parse(&["--tier", "full", "--dataset-revision", "2222222222222222222222222222222222222222"]);
         assert_eq!(dataset_source(&args, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some((crate::fidelity_dataset::REPOSITORY, "2222222222222222222222222222222222222222", crate::fidelity_dataset::CONFIG)));
-        assert!(dataset_source(&parse(&["--dataset-revision", "main"]), "deepseek-ai/DeepSeek-V4.1-Flash").is_err());
+        assert_eq!(dataset_source(&parse(&["--dataset-revision", "main"]), "deepseek-ai/DeepSeek-V4.1-Flash").unwrap().unwrap().1, "main");
         for local_flag in ["--reference", "--rows"] {
             assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "baseline", "--out", "run.json",
                 "--tier", "full", "--dataset", crate::fidelity_dataset::REPOSITORY, local_flag, "local"]).is_err());
