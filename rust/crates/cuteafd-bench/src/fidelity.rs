@@ -240,8 +240,10 @@ fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> 
             ensure!(!name.is_empty() && names.insert(name), "empty or duplicate server setting {name}");
             let value = setting.get("value").context("setting value missing")?;
             // Only precision switches may differ; scheduling, layout and unknown knobs stay fixed.
+            // GLM 5.3 Flash's kda-state (its KDA recurrent state's storage) and target-head (the
+            // target LM head's GEMM) change numerics only.
             if !matches!(name, "CUTEAFD_V41_FP8_HEAD" | "fp8-head" | "kda-fp8" | "fp8-prefill"
-                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "expert-input") {
+                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "expert-input" | "kda-state" | "target-head") {
                 fixed.insert(name.to_owned(), value.clone());
             }
         }
@@ -569,6 +571,51 @@ mod tests {
         a = b.clone(); a.settings["settings"] = serde_json::json!({});
         assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
         a = b.clone(); a.settings["family"] = serde_json::json!("other");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn pairing_accepts_glm_flash_kda_state_and_target_head_but_not_layout_or_scheduling() {
+        // A GLM 5.3 Flash baseline at checkpoint precision: FP32 KDA state, exact target head.
+        let mut b = run(3, 8);
+        b.settings = serde_json::json!({"model": "checkpoint", "settings": [
+            {"name": "concurrency", "value": "4", "source": "cli"},
+            {"name": "index-cache", "value": "keys", "source": "default"},
+            {"name": "kda-state", "value": "f32", "source": "default"},
+            {"name": "target-head", "value": "exact", "source": "default"}]});
+        let with = |kda: &str, head: &str| {
+            let mut a = b.clone();
+            a.settings["settings"][2] = serde_json::json!({"name": "kda-state", "value": kda, "source": "cli"});
+            a.settings["settings"][3] = serde_json::json!({"name": "target-head", "value": head, "source": "cli"});
+            a
+        };
+        // Either precision switch, or both, may differ, on each scoring shape and in a full decision.
+        for (kda, head) in [("bf16", "exact"), ("bf16-tile", "exact"), ("f32", "tensor"), ("bf16", "tensor")] {
+            let a = with(kda, head);
+            assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass, "{kda} / {head}");
+            let (mut a_prefill, mut b_prefill) = (a.clone(), b.clone());
+            for r in [&mut a_prefill, &mut b_prefill] {
+                r.path_shape = "prefill-shaped".into();
+                r.verify_rows = None;
+            }
+            assert!(compare_full(&a, &b, &a_prefill, &b_prefill, 100, 1).unwrap().pass, "{kda} / {head}");
+        }
+        // A nonprecision difference beside them is still refused: a cache layout ...
+        let mut a = with("bf16", "tensor");
+        a.settings["settings"][1]["value"] = serde_json::json!("compact");
+        let error = compare(&a, &b, 0.005, 0.005, 100, 1).unwrap_err().to_string();
+        assert!(error.contains("different nonprecision server settings"), "{error}");
+        // ... or scheduling.
+        a = with("bf16", "exact");
+        a.settings["settings"][0]["value"] = serde_json::json!("16");
+        let error = compare(&a, &b, 0.005, 0.005, 100, 1).unwrap_err().to_string();
+        assert!(error.contains("different nonprecision server settings"), "{error}");
+        // The precision settings themselves still need a value, once.
+        a = with("bf16", "exact");
+        a.settings["settings"][2].as_object_mut().unwrap().remove("value");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+        a = with("bf16", "exact");
+        a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": "kda-state", "value": "f32"}));
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
     }
 
