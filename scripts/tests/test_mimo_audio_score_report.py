@@ -11,6 +11,22 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_official_reference_requires_matching_serving_cuda_class(tmp_path):
+    with pytest.raises(ValueError, match='sealed CUDA'):
+        MODULE.reference_arm(tmp_path)
+    assert MODULE.reference_arm(tmp_path, 'cpu-info')['qualification_arm'] is False
+    record = {'role': 'official', 'reference_device': 'cuda', 'qualification_arm': True,
+              'tower_dtype': 'fp32', 'serving_sm': 121, 'runtime': {'sm': 121}}
+    path = tmp_path / 'reference.json'
+    path.write_text(json.dumps(record))
+    assert MODULE.reference_arm(tmp_path) == {'reference_device': 'cuda', 'qualification_arm': True}
+    for field, value in [('reference_device', 'cpu'), ('qualification_arm', False),
+                         ('tower_dtype', 'bf16'), ('serving_sm', 120)]:
+        path.write_text(json.dumps({**record, field: value}))
+        with pytest.raises(ValueError, match='sealed CUDA'):
+            MODULE.reference_arm(tmp_path)
+
+
 def test_kv_startup_record(tmp_path):
     path = tmp_path / 'startup.log'
     allocation = {'devices': [{'requested_pool_bytes': 128, 'fixed_bytes': 256}]}

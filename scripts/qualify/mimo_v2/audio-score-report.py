@@ -62,19 +62,40 @@ def check_response(response, tokens, span, score_from, mode, features):
         raise ValueError('unknown scoring mode')
 
 
-def compare(root, name):
+def reference_arm(features, role='official'):
+    path = features / 'reference.json'
+    if role == 'cpu-info':
+        if path.exists() and json.loads(path.read_text()).get('reference_device') != 'cpu':
+            raise ValueError('CPU informational arm has non-CPU provenance')
+        return {'reference_device': 'cpu', 'qualification_arm': False}
+    if role != 'official' or not path.exists():
+        raise ValueError('official scoring requires sealed CUDA reference provenance')
+    record = json.loads(path.read_text())
+    if (record.get('role') != 'official' or record.get('reference_device') != 'cuda'
+            or record.get('qualification_arm') is not True or record.get('tower_dtype') != 'fp32'
+            or record.get('runtime', {}).get('sm') not in (120, 121)
+            or record.get('runtime', {}).get('sm') != record.get('serving_sm')):
+        raise ValueError('official scoring requires sealed CUDA reference provenance')
+    return {'reference_device': 'cuda', 'qualification_arm': True}
+
+
+def compare(root, name, role='official'):
+    separate_cpu = role == 'cpu-info' and (root / 'features-cpu-info').exists()
+    features = root / ('features-cpu-info' if separate_cpu else 'features')
+    label = 'cpu-info' if separate_cpu else 'official'
+    arm = reference_arm(features, role)
     native = json.loads((root / 'scores' / (name + '-native.json')).read_text())
-    official = json.loads((root / 'scores' / (name + '-official.json')).read_text())
+    official = json.loads((root / 'scores' / (name + '-' + label + '.json')).read_text())
     if native['server'] != official['server']:
         raise ValueError('scoring server identity/settings differ')
     tokens = native['probe']['prompt_ids']
     span = native['probe']['audio'][0]
     first = native['probe']['rows'][0]['position']
     for mode, response in [('native', native), ('official', official)]:
-        check_response(response, tokens, span, first, mode, root / 'features')
+        check_response(response, tokens, span, first, mode, features)
     window = {'tokens': tokens, 'score_from': first}
     paths = [MEDIA.dump_rows(root / 'scores' / (name + '-' + mode), window, 152576)
-             for mode in ('native', 'official')]
+             for mode in ('native', label)]
     kl, agreement = [], []
     for pos in paths[0]:
         q, p = [MEDIA.log_probs(path[pos], 152576) for path in paths]
@@ -82,7 +103,8 @@ def compare(root, name):
         agreement.append(int(p.argmax() == q.argmax()))
     return {'id': name, 'rows': len(kl), 'vocab': 152576, 'kl_mean_nat': float(np.mean(kl)),
             'kl_max_nat': max(kl), 'top1_agreement': float(np.mean(agreement)), 'kl_per_row_nat': kl,
-            'direction': 'KL(official CPU features || native Spark features)',
+            'direction': f"KL(official {arm['reference_device']} features || native Spark features)",
+            **arm,
             'cold_both': True, 'cached_tokens_both': 0, 'prompt_ids_and_audio_identical': True}
 
 
@@ -90,9 +112,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--reference-role', choices=('official', 'cpu-info'), default='official')
     args = parser.parse_args()
     existing = json.loads((args.root / 'scoring-report.json').read_text())
-    rows = [compare(args.root, x['id']) for x in existing['native_vs_official']]
+    rows = [compare(args.root, x['id'], args.reference_role) for x in existing['native_vs_official']]
     kv = {mode: kv_records(args.root / ('cuteafd-mm-audio-flash-e2e-' + name + '.log'))
           for mode, name in [('off', 'off'), ('on', 'spark-0')]}
     args.output.write_text(json.dumps({'kind': 'cpu_audio_score_artifact_audit', 'native_vs_official': rows,

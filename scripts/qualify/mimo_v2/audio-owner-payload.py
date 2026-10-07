@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Retain admitted serving-library audio payloads; compare with sealed CPU features.
+"""Retain serving audio payloads and seal official CUDA scoring features.
 
-Capture runs in the matching architecture image under its hardware lock. Compare
-is CPU-only. This exercises the serving library ABI, not the Rust resident-owner
-thread, and does not by itself qualify LM scoring or prefix restores.
+Capture and CUDA reference export run in the matching image under a hardware
+lock. Comparison is CPU-only; CPU reference export is informational, not the
+qualification arm. This does not by itself qualify LM scoring or prefix restores.
 """
 import argparse
 import ctypes as C
@@ -97,10 +97,79 @@ def capture(args):
         native.check(lib.cuteafd_audio_destroy(owner), 'destroy')
 
 
+def reference_device(role):
+    if role not in ('official', 'cpu-info'):
+        raise ValueError('unknown reference role')
+    return 'cuda' if role == 'official' else 'cpu'
+
+
+def validate_reference_sm(actual, serving):
+    native.projection_limit(actual)
+    if actual != serving:
+        raise ValueError(f'official reference SM{actual} differs from serving SM{serving}')
+
+
+def reference_pcm(clip):
+    pcm = np.fromfile(clip['pcm'], dtype='<f4')
+    span = clip['span']
+    if (not np.isfinite(pcm).all() or pcm.size != span['samples']
+            or oracle.token_geometry(pcm.size)['tokens'] != span['len']
+            or oracle.digest(pcm.tobytes()) != span['pcm_sha256']):
+        raise ValueError('canonical reference PCM identity mismatch')
+    return pcm
+
+
+def reference(args):
+    import torch
+    from families.mimo_v2.mimo_v26 import audio_cuda_reference as diagnostic
+    from mimo_media import snapshot_identity
+
+    device = reference_device(args.role)
+    torch.set_num_threads(8)
+    torch.use_deterministic_algorithms(True)
+    if args.output.exists():
+        raise ValueError('reference output must be new')
+    if device == 'cuda':
+        if (torch.__version__, torch.version.cuda) != (diagnostic.TORCH_VERSION, diagnostic.CUDA_VERSION):
+            raise ValueError('official scoring arm requires the pinned CUDA image')
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        sm = int('%d%d' % torch.cuda.get_device_capability())
+        validate_reference_sm(sm, args.serving_sm)
+        mel_fn, _ = diagnostic.official_processor(args.source_dir, torch.device(device))
+        runtime = {'torch': torch.__version__, 'cuda': torch.version.cuda, 'sm': sm,
+                   'device': torch.cuda.get_device_name()}
+    else:
+        runtime = oracle.verify_runtime(ROOT)
+        mel_fn = None
+    codec, patch, speech, namespace, provenance = oracle.load_modules(args.snapshot)
+    for module in (codec, patch, speech):
+        module.to(device)
+        if any(p.dtype != torch.float32 for p in module.parameters()):
+            raise ValueError('reference tower must remain FP32')
+    args.output.mkdir(parents=True)
+    report = {'role': args.role, 'reference_device': device, 'serving_sm': args.serving_sm,
+              'qualification_arm': device == 'cuda',
+              'runtime': runtime, 'tower_dtype': 'fp32', 'tensors': provenance, 'clips': []}
+    identity = snapshot_identity(args.snapshot)
+    with torch.autocast(device_type=device, enabled=False):
+        for clip in json.loads(args.panel.read_text()):
+            pcm = reference_pcm(clip)
+            span = clip['span']
+            stages = oracle.pipeline(torch.from_numpy(pcm.copy()).to(device), codec, patch,
+                                     speech, namespace, mel_fn=mel_fn)
+            meta = oracle.write_probe_features(args.output, span,
+                stages['bf16_rows'].view(torch.uint16).cpu().numpy(),
+                stages['codes'].cpu().numpy(), identity)
+            report['clips'].append({'id': clip['id'], 'span': span, 'features': meta})
+            (args.output / 'reference.json').write_text(json.dumps(report, indent=2) + '\n')
+
+
 def compare(args):
     from mimo_media import snapshot_identity
     report = json.loads((args.capture / 'capture.json').read_text())
     identity = snapshot_identity(args.snapshot)
+    hidden = json.loads((args.snapshot / 'config.json').read_text())['hidden_size']
     results = []
     for clip in report['clips']:
         prefix = args.capture / clip['payload_prefix']
@@ -109,7 +178,7 @@ def compare(args):
         for suffix, field in (('.bf16', 'bf16_sha256'), ('.codes.i64', 'codes_sha256')):
             if sha256(Path(str(prefix) + suffix)) != clip[field]:
                 raise ValueError('capture payload hash differs')
-        expected, meta = oracle.read_probe_features(args.features, clip['span'], 4096, identity)
+        expected, meta = oracle.read_probe_features(args.features, clip['span'], hidden, identity)
         actual = np.fromfile(str(prefix) + '.bf16', dtype='<u2').reshape(expected.shape)
         codes = np.fromfile(str(prefix) + '.codes.i64', dtype='<i8').reshape(-1, 20)
         ref_codes = np.fromfile(args.features / (clip['span']['key'] + '.codes.i64'), dtype='<i8').reshape(codes.shape)
@@ -122,7 +191,11 @@ def compare(args):
             'rvq_positions_frame_codebook': mismatch.tolist(),
             'rvq_values_native_official': [[int(codes[tuple(p)]), int(ref_codes[tuple(p)])] for p in mismatch],
             'bf16': metric})
-    args.output.write_text(json.dumps({'kind': 'cpu_sealed_payload_comparison',
+    reference_record = args.features / 'reference.json'
+    reference_identity = json.loads(reference_record.read_text()) if reference_record.exists() else {}
+    args.output.write_text(json.dumps({'kind': 'sealed_payload_comparison',
+        'reference_device': reference_identity.get('reference_device', 'legacy_cpu'),
+        'reference_sm': reference_identity.get('runtime', {}).get('sm'),
         'native_library_sha256': report['library_sha256'], 'backend': report['backend'],
         'results': results}, indent=2) + '\n')
 
@@ -134,11 +207,17 @@ def main():
     for name in ('library', 'arena', 'panel', 'output'):
         cap.add_argument('--' + name, type=Path, required=True)
     cap.add_argument('--max-samples', type=int, default=7200000)
+    ref = sub.add_parser('reference', help='seal scoring features; CUDA is official, CPU is informational')
+    for name in ('snapshot', 'panel', 'source-dir', 'output'):
+        ref.add_argument('--' + name, type=Path, required=True)
+    ref.add_argument('--role', choices=('official', 'cpu-info'), default='official')
+    ref.add_argument('--serving-sm', type=int, choices=(120, 121), required=True,
+                     help='official CUDA reference must match the serving encoder device class')
     cmp = sub.add_parser('compare')
     for name in ('capture', 'features', 'snapshot', 'output'):
         cmp.add_argument('--' + name, type=Path, required=True)
     args = parser.parse_args()
-    (capture if args.mode == 'capture' else compare)(args)
+    {'capture': capture, 'reference': reference, 'compare': compare}[args.mode](args)
 
 
 if __name__ == '__main__':
