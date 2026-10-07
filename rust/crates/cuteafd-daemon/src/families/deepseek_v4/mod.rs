@@ -45,6 +45,9 @@ pub(crate) struct EngineArgs {
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
+    /// Admit every prefill row's logits at startup for fidelity probes.
+    #[arg(long)]
+    pub full_prefill_logits: bool,
     /// Total tokens the compressed-cache pools hold across sequences; 0 uses
     /// planner admission from measured free memory before cache allocation.
     #[arg(long, default_value_t = 262_144)]
@@ -75,6 +78,12 @@ pub(crate) struct GoldenArgs {
     /// Directory with tokens.bin, layerNN.bin and logits.bin from golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
+    #[arg(long)]
+    pub nll: bool,
+    /// With --nll, also save tokens.bin and F32 logits.bin for a reference run.
+    #[arg(long, requires = "nll")]
+    pub save_logits: Option<PathBuf>,
     /// Compare only the first N layers' streams (all logits still compared).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -154,7 +163,8 @@ fn embed_source(catalog: &cuteafd_loader::OfficialV41Catalog, dim: usize) -> Res
     crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata, dim)
 }
 
-pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
+pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.full_prefill_logits |= args.nll;
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -377,6 +387,7 @@ pub(crate) fn with_engine<T>(
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
     }
+    if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.
@@ -403,8 +414,76 @@ fn golden(args: GoldenArgs) -> Result<()> {
     with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| match args.token_check {
         Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
         None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
+        None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
         None => golden_run(&args, &cfg, engine, transports, runtime),
     })
+}
+
+/// `--nll` scores the complete prompt with prefill-shaped kernels, never decode fallbacks.
+fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_>,
+    transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+    ensure!(bytes.len() % 4 == 0, "tokens.bin must contain U32 tokens");
+    let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let vocab = cfg.vocab_size;
+    ensure!(tokens.len() >= 2 && tokens.iter().all(|&t| (t as usize) < vocab), "invalid golden tokens");
+    let golden = match std::fs::read(args.golden.join("logits.bin")) {
+        Ok(bytes) => {
+            ensure!(bytes.len() == tokens.len() * vocab * 4, "golden logits row coverage differs");
+            Some(f32s(&bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut placement = allocator.admit(tokens.len())?;
+    let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
+    ensure!(chunk > 0, "prefill chunk must be positive");
+    let started = Instant::now();
+    let mut logits = Vec::new();
+    for tokens in tokens.chunks(chunk) {
+        logits.extend(engine.prefill(&mut placement, tokens, transports, runtime, tokens.len(), None)?);
+    }
+    allocator.release(placement);
+    let seconds = started.elapsed().as_secs_f64();
+    ensure!(logits.len() == tokens.len() * vocab && logits.iter().all(|v| v.is_finite()),
+        "missing or nonfinite engine logits");
+    if let Some(dir) = &args.save_logits {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), bytes)?;
+        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    }
+    let lp = |row: &[f32]| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = max + row.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln();
+        row.iter().map(|&v| v as f64 - lse).collect::<Vec<_>>()
+    };
+    let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a,b| a.1.total_cmp(b.1)).unwrap().0;
+    let (mut nll, mut reference_nll, mut kl, mut agree) = (0.0, 0.0, 0.0, 0usize);
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
+    logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
+    for (r, ours) in logits.chunks_exact(vocab).enumerate() {
+        let q = lp(ours);
+        if let Some(&next) = tokens.get(r + 1) { nll -= q[next as usize]; }
+        if let Some(golden) = &golden {
+            let theirs = &golden[r * vocab..][..vocab];
+            ensure!(theirs.iter().all(|v| v.is_finite()), "nonfinite golden row {r}");
+            agree += usize::from(argmax(ours) == argmax(theirs));
+            let p = lp(theirs);
+            kl += p.iter().zip(&q).map(|(p,q)| p.exp() * (p-q)).sum::<f64>();
+            if let Some(&next) = tokens.get(r + 1) { reference_nll -= p[next as usize]; }
+        }
+    }
+    let rows = tokens.len();
+    if golden.is_some() {
+        println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden {:.4} | mean KL(golden||engine) {:.5}",
+            100.0 * agree as f64 / rows as f64, nll / (rows-1) as f64, reference_nll / (rows-1) as f64, kl / rows as f64);
+    } else {
+        println!("prefill logits: {rows} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
+            nll / (rows-1) as f64, digest.finish());
+    }
+    Ok(())
 }
 
 /// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.

@@ -1062,6 +1062,23 @@ impl<'a> MimoEngine<'a> {
         independent_prefill_rows(self.prefill_rows, self.lanes_ready(), self.prefill_output, self.mtp.is_some(), rows)
     }
 
+    pub fn full_prefill_logits(&self) -> bool {
+        self.prefill_output == MimoPrefillOutput::AllRows
+    }
+
+    /// Allocate the diagnostic head before requests can be admitted.
+    pub fn prepare_scoring_prefill(&self) -> Result<()> {
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(0, self.prefill_rows, false)?);
+        }
+        if let Some(peer) = &self.peer {
+            if peer.workspace.borrow().is_none() {
+                *peer.workspace.borrow_mut() = Some(self.workspace(1, self.prefill_rows, false)?);
+            }
+        }
+        Ok(())
+    }
+
     pub fn prepare_prefill_pair(&mut self) -> Result<()> {
         if self.can_prefill_pair([1, 1]) {
             if let Some(drafter) = &mut self.drafter {

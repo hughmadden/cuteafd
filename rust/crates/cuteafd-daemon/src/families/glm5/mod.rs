@@ -289,13 +289,18 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pool_tokens = if args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
+        let pool_tokens = if args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
             // The planner's GLM costs stay free on each GPU; records fill the rest.
             let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
             // GLM 5.3's pages are its whole state: no recurrent slots, no mark arena.
-            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
+            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, 0, 0,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0)?
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0,
+                &crate::shared::memory_report::lead_reserves(devices.len(),
+                    if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(
+                        "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64,
+                        if args.peers.is_some() { engine::configured_lanes() } else { 1 }) } else { 0 }),
+                Default::default(), 4, cuteafd_loader::serving_capacity::GLMF_DECODE_ROWS)?
         } else {
             args.pool_tokens
         };
@@ -402,6 +407,7 @@ impl Opened {
             && (transport.is_some() || args.skip_routed_experts) {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
         }
+        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         drop(transport);

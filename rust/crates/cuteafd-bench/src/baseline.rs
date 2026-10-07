@@ -1,11 +1,10 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
 //! with thinking off; 8K prefill rate and TTFT) and quick quality (logit
-//! fidelity against a compact reference, prefix-cache restore exactness,
+//! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
 use crate::client::{Chat, Client};
 use crate::panels::{Progress, Rates};
-use crate::reference::Reference;
 use crate::report::{
     now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ContentRate, PrefillRate, Quality, ServerInfo, StreamTiming,
 };
@@ -42,7 +41,7 @@ fn plain(text: &str, max_tokens: u64) -> Value {
 pub fn estimate_s(rates: &Rates) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
-    let fidelity = rates.seconds(700.0, 0.0) + 8.0 * 0.12;
+    let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
     let cache = rates.seconds(6.0 * 1500.0, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
@@ -188,48 +187,28 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    let Some(reference) = Reference::find(&run.info.model) else {
-        check.status = CheckStatus::Skipped;
-        check.summary = format!("no fidelity reference for {}", run.info.model);
-        return Ok(());
-    };
-    let n = reference.ids.len();
-    let tokens = reference.tokens[..reference.score_from + n].to_vec();
-    if tokens.len() as u64 + 8 > run.max_context {
-        check.status = CheckStatus::Skipped;
-        check.summary = format!("the reference needs {} tokens of context", tokens.len());
+    if let Some(reason) = crate::fidelity_dataset::unavailable(&run.info.checkpoint()) {
+        check.status = CheckStatus::Unsupported;
+        check.summary = reason;
         return Ok(());
     }
-    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: reference.top_k,
-        want: reference.want(), cold: true, ..ProbeSpec::default() };
-    let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
-    let record = probe_of(&chat)?;
-    if !honoured(record) {
-        unsupported(check);
-        return Ok(());
-    }
-    if let Some(error) = &record.error {
-        anyhow::bail!("scoring: {error}");
-    }
-    let f = reference.score(&record.rows);
-    check.set("kl", f.kl);
-    check.set("top1", f.top1);
-    check.set("nll", f.nll);
-    check.set("ref_nll", f.ref_nll);
-    check.set("positions", f.positions as u64);
-    check.set("missing", f.missing as u64);
-    check.set("kl_max", reference.expect.kl_max);
-    check.set("top1_min", reference.expect.top1_min);
-    check.set("reference", reference.name.clone());
-    // Preserve the teacher-forced rows so two weight policies can be compared
-    // on the same positions, including top-1 flips hidden by aggregate scores.
-    check.set("probe", serde_json::to_value(record)?);
-    let ok = f.missing == 0 && f.non_finite == 0 && f.kl <= reference.expect.kl_max
-        && f.top1 >= reference.expect.top1_min;
-    check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
-    check.summary = format!("KL {:.3} · top-1 {:.1}% · NLL {:.3} vs {:.3} · {} tokens vs {} reference{}",
-        f.kl, 100.0 * f.top1, f.nll, f.ref_nll, f.positions, reference.name,
-        if f.missing > 0 { format!(" · {} rows missing", f.missing) } else { String::new() });
+    let scored = crate::panels::fidelity::score(run.client, run.info, "quick", "decode", run.progress,
+        0.45, 0.12, run.max_context)?;
+    let verdict = crate::fidelity::verdict(&scored);
+    let f = &verdict.generated;
+    check.set("kl", f.kl); check.set("top1", f.top1); check.set("nll", f.nll);
+    check.set("ref_nll", f.ref_nll); check.set("positions", f.positions as u64);
+    check.set("missing", scored.score.missing as u64);
+    check.set("kl_max", verdict.kl_max); check.set("top1_min", verdict.top1_min);
+    check.set("confident_top1", json!(f.confident_top1)); check.set("top3_contained", f.top3_contained);
+    check.set("dataset", json!(scored.dataset));
+    check.set("quick_subset", "bench-v1:legacy,a00,a04,a08,a20,c00,d00,e00");
+    check.set("per_window", json!(crate::panels::fidelity::window_summaries(&scored)));
+    check.set("verdict", json!(verdict));
+    check.set("run", json!(scored));
+    check.status = if verdict.pass { CheckStatus::Pass } else { CheckStatus::Fail };
+    check.summary = format!("KL {:.3} · top-1 {:.1}% · {} generated / 4096 total rows · 8 windows",
+        f.kl, 100.0 * f.top1, f.positions);
     Ok(())
 }
 

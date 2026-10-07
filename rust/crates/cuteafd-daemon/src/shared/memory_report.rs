@@ -246,7 +246,33 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
     requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64,
     glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache, kda_state_bytes: u64, glmf_decode_rows: u64)
     -> anyhow::Result<usize> {
+    let reserves = vec![RankReserve { extra_bytes: extra_reserve_bytes, workspace_bytes: None }; devices.len()];
+    planned_pool_tokens_with_reserves(library, snapshot, devices, drafter, prefill_rows, slots, mark_slots,
+        requested, future_expert_bytes, &reserves, glmf_index, kda_state_bytes, glmf_decode_rows)
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RankReserve {
+    pub extra_bytes: u64,
+    /// Exact workspace union replaces, rather than adds to, the planner allowance.
+    pub workspace_bytes: Option<u64>,
+}
+
+pub(crate) fn lead_reserves(ranks: usize, lead_bytes: u64) -> Vec<RankReserve> {
+    (0..ranks).map(|rank| RankReserve {
+        extra_bytes: if rank == 0 { lead_bytes } else { 0 }, workspace_bytes: None,
+    }).collect()
+}
+
+/// As `planned_pool_tokens_with_extra`, with each GPU's own reserve (`reserves`, lead first).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
+    devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize, mark_slots: u64,
+    requested: Option<u64>, future_expert_bytes: u64, reserves: &[RankReserve],
+    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache, kda_state_bytes: u64, glmf_decode_rows: u64)
+    -> anyhow::Result<usize> {
     use anyhow::Context;
+    anyhow::ensure!(reserves.len() == devices.len(), "reserve must cover every admitted GPU");
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
     let model = family.open(&checkpoint).map_err(|e| anyhow::anyhow!("{}", e.0))?;
@@ -261,9 +287,9 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
         costs: cuteafd_loader::plan::layout::family_costs(family.id()),
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes,
         draft: drafter.map_or(0, |d| safetensors_bytes(d) + (1300 << 20)),
-        prefill_rows, slots, mark_slots, extra: extra_reserve_bytes, future_experts: future_expert_bytes,
+        prefill_rows, slots, mark_slots, future_experts: future_expert_bytes,
     };
-    let kv = kv_devices(&geometry, glmf, devices, &reserve)?;
+    let kv = kv_devices(&geometry, glmf, devices, &reserve, reserves)?;
     let tokens = admitted_pool_tokens(library, &kv, geometry.logical_unit_rows.max(1),
         cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS, requested)?;
     Ok(usize::try_from(tokens)?)
@@ -280,24 +306,26 @@ struct Reserve {
     slots: usize,
     /// Prefix mark arena slots on every GPU.
     mark_slots: u64,
-    extra: u64,
     future_experts: u64,
 }
 
 /// Per-GPU KV admission: records per token, and every byte the GPU must still hold after the
-/// pool: workspaces, peer exchange, the drafter, the recurrent state of `slots` sequences with
-/// its speculative replay records and the prefix mark arena (both exactly as the runtime
-/// allocates them, budget or not), graph executables and headroom.
+/// pool: workspaces (the planner's allowance, or each GPU's exact union in `reserves`), peer
+/// exchange, the drafter, the recurrent state of `slots` sequences with its speculative replay
+/// records and the prefix mark arena (both exactly as the runtime allocates them, budget or not),
+/// graph executables, headroom and each GPU's extra reserve.
 fn kv_devices(geometry: &cuteafd_loader::serving_capacity::FamilyCacheGeometry, glmf: bool, devices: &[i32],
-    reserve: &Reserve) -> anyhow::Result<Vec<KvDevice>> {
+    reserve: &Reserve, reserves: &[RankReserve]) -> anyhow::Result<Vec<KvDevice>> {
     let costs = &reserve.costs;
     let unit = geometry.logical_unit_rows.max(1);
     let split = devices.len() == 2;
     let ranks = admission_cache_ranks(geometry, glmf && split);
     anyhow::ensure!(ranks.len() == devices.len(), "cache geometry must cover every admitted GPU");
+    anyhow::ensure!(reserves.len() == devices.len(), "reserve must cover every admitted GPU");
     Ok(devices.iter().zip(&ranks).enumerate().map(|(index, (&device, rank))| {
         let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
-        let workspace = costs.workspace_bytes[role] * reserve.prefill_rows.max(1) as u64 / 4096;
+        let workspace = reserves[index].workspace_bytes.unwrap_or(
+            costs.workspace_bytes[role] * reserve.prefill_rows.max(1) as u64 / 4096);
         let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * reserve.slots as u64
             + rank.speculative_replay_bytes;
         let marks = rank.retained_mark_bytes * reserve.mark_slots;
@@ -308,7 +336,7 @@ fn kv_devices(geometry: &cuteafd_loader::serving_capacity::FamilyCacheGeometry, 
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
             reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 }
                 + if index == 0 { reserve.draft } else { 0 }
-                + state + marks + costs.graph_bytes[role] + reserve.headroom + reserve.extra
+                + state + marks + costs.graph_bytes[role] + reserve.headroom + reserves[index].extra_bytes
                 + if index == 0 { reserve.future_experts } else { 0 },
         }
     }).collect())
@@ -318,6 +346,15 @@ fn kv_devices(geometry: &cuteafd_loader::serving_capacity::FamilyCacheGeometry, 
 mod budget_tests {
     use super::*;
     use cuteafd_loader::serving_capacity::{FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+
+    #[test]
+    fn full_logits_reserve_is_lead_only() {
+        for ranks in [1, 2] {
+            let reserves = lead_reserves(ranks, 12345);
+            assert_eq!(reserves[0].extra_bytes, 12345);
+            assert!(reserves.iter().skip(1).all(|r| r.extra_bytes == 0));
+        }
+    }
 
     #[test]
     fn glmf_split_admits_replicated_mla_and_half_kda_on_every_gpu() {
@@ -349,15 +386,21 @@ mod budget_tests {
             ranks: vec![rank] };
         let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
         let reserve = |mark_slots| Reserve { costs, headroom: 7, draft: 11, prefill_rows: 4096, slots: 16,
-            mark_slots, extra: 13, future_experts: 17 };
+            mark_slots, future_experts: 17 };
+        let extra = |gpus| vec![RankReserve { extra_bytes: 13, workspace_bytes: None }; gpus];
         let fixed = |role: usize| costs.workspace_bytes[role] + costs.graph_bytes[role] + 7 + 13;
-        let one = kv_devices(&geometry, true, &[0], &reserve(34)).unwrap();
+        let one = kv_devices(&geometry, true, &[0], &reserve(34), &extra(1)).unwrap();
         assert_eq!(one[0].bytes_per_token, 5);
         assert_eq!(one[0].reserve_bytes, fixed(0) + 11 + 17 + 768 + 16 * 2048 + 512 + 34 * 2048);
-        let pool_marks = kv_devices(&geometry, true, &[0], &reserve(0)).unwrap();
+        let pool_marks = kv_devices(&geometry, true, &[0], &reserve(0), &extra(1)).unwrap();
         assert_eq!(one[0].reserve_bytes - pool_marks[0].reserve_bytes, 34 * 2048);
-        let split = kv_devices(&geometry, true, &[0, 1], &reserve(34)).unwrap();
+        let split = kv_devices(&geometry, true, &[0, 1], &reserve(34), &extra(2)).unwrap();
         assert_eq!(split[0].reserve_bytes, fixed(1) + costs.exchange_bytes + 11 + 17 + 768 + 16 * 1024 + 256 + 34 * 1024);
         assert_eq!(split[1].reserve_bytes, fixed(2) + costs.exchange_bytes + 768 + 16 * 1024 + 256 + 34 * 1024);
+        // An exact workspace union (all-row prefill logits) replaces the planner's allowance on its GPU.
+        let exact = [RankReserve { extra_bytes: 13, workspace_bytes: Some(1_000) }];
+        let scoring = kv_devices(&geometry, true, &[0], &reserve(34), &exact).unwrap();
+        assert_eq!(one[0].reserve_bytes - scoring[0].reserve_bytes, costs.workspace_bytes[0] - 1_000);
+        assert!(kv_devices(&geometry, true, &[0, 1], &reserve(34), &extra(1)).is_err());
     }
 }

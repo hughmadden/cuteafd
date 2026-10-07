@@ -300,16 +300,6 @@ fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
     Ok(())
 }
 
-pub(super) fn scoring_rows(probe: &crate::shared::probe::ProbeRef, capacity: usize) -> Result<usize> {
-    let probe = probe.as_ref().context("scoring probe required")?;
-    anyhow::ensure!(probe.spec.score_path.as_deref().is_none_or(|p| p == "decode"),
-        "MiMo serving admits decode scoring only; prefill needs an AllRows diagnostic engine");
-    let rows = probe.spec.verify_rows.unwrap_or(capacity);
-    anyhow::ensure!(rows > 0 && rows <= capacity, "verify_rows outside admitted decode capacity");
-    probe.selected_score_path("decode");
-    Ok(rows)
-}
-
 fn key_hex(key: cuteafd_loader::media::ImageKey) -> String {
     key.0.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -522,17 +512,6 @@ mod tests {
     fn off_vision_never_opens_config_or_tower_payloads() {
         assert!(vision_config(MediaMode::Off, std::path::Path::new("/does/not/exist")).unwrap().is_none());
         assert!(vision_config(MediaMode::Rtx(None), std::path::Path::new("/does/not/exist")).is_err());
-    }
-    #[test]
-    fn scoring_shape_is_honored_or_rejected_not_silently_ignored() {
-        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
-        let p = Some(Probe::new(ProbeSpec { verify_rows: Some(1), score_path: Some("decode".into()), ..Default::default() }));
-        assert_eq!(scoring_rows(&p, 4).unwrap(), 1);
-        assert_eq!(p.unwrap().record().score_path.as_deref(), Some("decode"));
-        for (rows, path) in [(0, "decode"), (5, "decode"), (1, "prefill"), (1, "typo")] {
-            let p = Some(Probe::new(ProbeSpec { verify_rows: Some(rows), score_path: Some(path.into()), ..Default::default() }));
-            assert!(scoring_rows(&p, 4).is_err());
-        }
     }
     #[test]
     fn expanded_image_ids_and_prefix_hints_are_separate() {

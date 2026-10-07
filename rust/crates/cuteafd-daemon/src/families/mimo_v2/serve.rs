@@ -209,7 +209,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
-        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
+        if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
+        else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
@@ -484,6 +485,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         failures.watch(&job.events);
+                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits()) {
+                            let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
+                            continue;
+                        }
                         if !job.media.is_empty() && !media.encoder().available() {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
@@ -592,14 +597,13 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = (|| {
-                    let rows = super::media::scoring_rows(&job.probe, DECODE_ROWS)?;
-                    probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    rows, &mut placement,
-                    |placement, chunk, _last_logits| engine.prefill_media_device(placement, chunk, false, None, None, Some(&request_media)),
+                let scored = probe::score(engine.library, &job.probe, &tokens, from,
+                    if engine.full_prefill_logits() { engine.prefill_rows } else { engine.prefill_capacity() },
+                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
+                    |placement, chunk, rows| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
+                        .map(probe::ScoreLogits::Device)),
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
-                        .context("scoring needs every layer"))
-                })();
+                        .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => {

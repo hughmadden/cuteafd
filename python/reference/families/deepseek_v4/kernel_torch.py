@@ -85,14 +85,16 @@ def _dequant_act(a: torch.Tensor, a_s: torch.Tensor) -> torch.Tensor:
 def fp8_gemm(a, a_s, b, b_s, scale_dtype=torch.float32):
     n, k = b.shape
     bs = b_s.float().repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
-    out = _dequant_act(a, a_s) @ (b.float() * bs).t()
+    from shape_invariant import linear
+    out = linear(_dequant_act(a, a_s), b.float() * bs)
     return out.to(torch.get_default_dtype())
 
 
 def fp4_gemm(a, a_s, b, b_s, scale_dtype=torch.float32):
     w = unpack_fp4(b) if b.dtype != torch.float32 else b
     w = w * b_s.float().repeat_interleave(32, 1)[:, : w.shape[1]]
-    out = _dequant_act(a, a_s) @ w.t()
+    from shape_invariant import linear
+    out = linear(_dequant_act(a, a_s), w)
     return out.to(torch.get_default_dtype())
 
 

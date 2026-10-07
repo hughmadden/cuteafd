@@ -102,6 +102,14 @@ worktree. The compiler receives a copy without Git metadata after host-side
 submodule verification; Docker image assembly still reads the live checkout. CUTEAFD_RELEASE_SOURCE_MANIFEST can
 supply an existing manifest. Source archives without .git must provide
 CUTEAFD_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
+
+CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID skips only the coordinator dev-image build.
+Requires retained image-ID-bound BuildKit provenance and Git history: matching
+Dockerfile.dev, entrypoint, Rust toolchain, installed SparkInfer source/lock,
+and the build revision's Transformers lock against the verified mounted source.
+Missing proof or mismatches refuse reuse. Unset retains the normal Docker build.
+The immutable reused ID and verification hashes ship in dist/DEV_IMAGE_REUSE.json
+(checksummed by dist/SHA256SUMS) and the coordinator image's reused-dev label.
 EOF
 }
 
@@ -639,15 +647,30 @@ if [[ -n "$release_build_root" ]]; then
     release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
 fi
 
-echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
-docker build \
-  --build-arg CUTEAFD_ROLE=coordinator \
-  --build-arg CUDA_ARCH=120 \
-  --build-arg TARGET_PLATFORM=linux/amd64 \
-  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
-  -f "$repo_root/docker/Dockerfile.dev" \
-  -t "$COORDINATOR_DOCKER_DEV" \
-  "$repo_root"
+release_dev_reuse_manifest=""
+release_dev_reuse_label_args=()
+if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
+  echo "== verifying reused coordinator development image: $CUTEAFD_RELEASE_DEV_IMAGE =="
+  dev_verification_root="${release_build_root:-$HOME/.cache/cuteafd/builds/release-source}"
+  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$dev_verification_root"
+  mkdir -p "$dev_verification_root"
+  dev_verification_dir="$(mktemp -d "$dev_verification_root/dev-image-verification.XXXXXXXX")"
+  release_dev_reuse_manifest="$dev_verification_dir/DEV_IMAGE_REUSE.json"
+  COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/verify-release-dev-image.py" \
+    --source "$repo_root" --image "$CUTEAFD_RELEASE_DEV_IMAGE" \
+    --output "$release_dev_reuse_manifest")" || release_die "coordinator dev image reuse verification failed"
+  release_dev_reuse_label_args=(--label "io.cuteafd.dev-image.reused=$COORDINATOR_DOCKER_DEV")
+else
+  echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
+  docker build \
+    --build-arg CUTEAFD_ROLE=coordinator \
+    --build-arg CUDA_ARCH=120 \
+    --build-arg TARGET_PLATFORM=linux/amd64 \
+    --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
+    -f "$repo_root/docker/Dockerfile.dev" \
+    -t "$COORDINATOR_DOCKER_DEV" \
+    "$repo_root"
+fi
 
 echo "== compiling coordinator release artifacts in GPU-enabled development container =="
 mkdir -p "$artifact_dir"
@@ -710,6 +733,7 @@ trap - EXIT
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 docker build \
   "${release_source_label_args[@]}" \
+  "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=coordinator \
   --build-arg CUDA_ARCH=120 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -1038,6 +1062,10 @@ release_sync --delete \
   "$seed_host:$remote_dir/dist/spark-expert/" \
   "$repo_root/dist/spark-expert/"
 dist_source_manifest=()
+if [[ -n "$release_dev_reuse_manifest" ]]; then
+  install -m 0644 "$release_dev_reuse_manifest" "$repo_root/dist/DEV_IMAGE_REUSE.json"
+  dist_source_manifest+=(DEV_IMAGE_REUSE.json)
+fi
 if [[ -n "$source_manifest" ]]; then
   install -m 0644 "$source_manifest" "$repo_root/dist/SOURCE_SHA256SUMS"
   dist_source_manifest+=(SOURCE_SHA256SUMS)

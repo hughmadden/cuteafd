@@ -53,6 +53,9 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Admit every prefill row's logits at startup for fidelity probes.
+    #[arg(long)]
+    pub full_prefill_logits: bool,
     /// Hold the GDN and attention in/out projections (target and MTP layers)
     /// as E4M3 with FP32 128x128 block scales, quantized at load, INSTEAD of
     /// the checkpoint's BF16 (no BF16 copy stays resident): every step shape
@@ -340,7 +343,7 @@ impl Opened {
         let startup_admission = args.planner_graph_modes.is_some() && engine::startup_graphs_enabled(
             std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-        let budget_admission = args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() || startup_admission;
+        let budget_admission = args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() || startup_admission;
         let admitted_experts = if budget_admission {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
@@ -373,6 +376,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.

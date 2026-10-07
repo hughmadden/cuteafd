@@ -128,7 +128,7 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
+  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   no failing ids since the codex/v1 merge (808 pass); add none.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
@@ -151,11 +151,16 @@ before → after tables with conditions.
 - Correctness first, then warm-up, then identical-config A/B, interleaved,
   three runs for a final number. Judge speculation by emitted tok/s, not
   acceptance. Profiling perturbs timing.
-- Benchmark each model on two reference configs only: the natural minimum
-  (1× RTX + the fewest Sparks it fits) and the maximum (2× RTX + 4 or 6
-  Sparks, whichever divides the model sensibly). Qwen's natural minimum is
-  a 32 GB RTX + 1 Spark; maximum one RTX PRO 6000. Other layouts need
-  correctness gates, not perf tables; the planner's estimates cover them.
+- Benchmark each model on three card columns only (TJ, 2026-10-07):
+  **5090** (1× RTX 5090 + the fewest Sparks it fits; measured on Hugh
+  Madden's hardware by his agent), **1× RTX** (1× RTX PRO 6000 + the fewest
+  Sparks it fits) and **2× RTX** (2× RTX PRO 6000 + 4 or 6 Sparks,
+  whichever divides the model sensibly). A column whose GPUs hold the whole
+  model is a **0-Spark** card: layer onboarding would leave the Sparks idle,
+  so don't attach any. `cuteafd plan --layout` decides fit. Supplementary
+  cards (e.g. GLM Flash on 2× RTX, 0 Sparks, for a quant that fits) are
+  allowed. Other layouts need correctness gates, not perf tables; the
+  planner's estimates cover them.
 - Until the first official release, be frugal: measure only what a decision
   needs, one launch per arm, no repeat sessions unless a number is borderline.
   Release prep runs the "Release smoke" profile (basic card + quick quality,
@@ -188,7 +193,8 @@ before → after tables with conditions.
 ## Results publishing
 
 - The root README holds the only exhaustive table: the basic benchmark
-  profile for every family on its natural-minimum and maximum hardware.
+  profile for every family and quant in the three card columns (5090,
+  1× RTX, 2× RTX; 0 Sparks where the GPUs hold the model).
   Re-run a family's rows after changes that target that family's code (or a
   shared hot path that plausibly moves it); skip irrelevant changes,
   staleness is fine.

@@ -2,8 +2,9 @@
 
 Working draft. Decides how a precision or kernel default (FP8 KDA/head, A8,
 W4A4, speculation paths) is judged against the checkpoint-precision engine,
-replacing the single 512-token PLAN.md passage. Everything here is a plan;
-nothing has run.
+replacing the single 512-token PLAN.md passage. The qualified V4.1
+calibration and first paired decision are complete (see §8); other-family
+references and the independent agentic replay gate remain in progress.
 
 ## 0. Recommendation in one box
 
@@ -19,9 +20,17 @@ nothing has run.
   90% is a floor the set is built to clear by several points, not the
   target; it fails only for broken kernels or a stale reference.
 - **Tripwires (report, fail only when gross):** confident-top-1 (reference
-  p₁ ≥ 0.5) ≥ 98%; candidate argmax in reference top-3 ≥ 99%; NLL on human
-  code within +0.01 nat of the BF16 arm; zero invalid tool-call JSON in the
-  agentic replay.
+  p₁ ≥ 0.5) and candidate argmax in reference top-3 use family/config
+  expectations: round the minimum repeated baseline down to a whole
+  percentage point, then subtract 2 points, using the least restrictive
+  decode/prefill expectation. Fail below those calibrated expectations, or
+  when the one-sided 95% lower bound of baseline minus candidate exceeds
+  **1.0 point** for confident-top-1 or **0.5 point** for top-3. Always report
+  raw baseline/candidate values, loss, and lower/upper bounds. V4.1's 98%/99%
+  constants are legacy context, not universal floors; frozen legacy reports
+  without calibrated fields retain their original constants and verdicts.
+  NLL on human code stays within +0.01 nat of the baseline arm; zero invalid
+  tool-call JSON in the agentic replay.
 - **Set:** 64 windows, 32,768 scored positions per family, chat-templated
   agentic coding (reasoning + tool calls + diffs) 40%, long-context code
   reading 20%, plain repository code 15%, JSON/tool grammar 10%, prose and
@@ -69,8 +78,8 @@ judged on sensitivity to that, cost, and statistical tractability:
 |---|---|---|
 | **Top-1 agreement** with the reference argmax, teacher-forced | per-step greedy divergence probability | **Carries the bar.** Direct model of greedy decoding. Noise from near-ties is removed by pairing (both arms see the same near-ties) and by the confident-top-1 tripwire. |
 | Top-N containment, N ≥ 3 ("reference argmax in our top-N") | nothing about greedy output; ~99.9% for any sane engine | reject as a bar |
-| Candidate argmax ∈ reference top-3 | whether our greedy pick is at least plausible to the reference | **Tripwire ≥ 99%**: catches a broken kernel that keeps aggregate agreement; cheap (already have `top`). |
-| Confident top-1 (positions with reference p₁ ≥ 0.5) | flips that cannot be near-ties | **Tripwire ≥ 98%** and the first thing to read when the bar fails: a flip here is a real error. |
+| Candidate argmax ∈ reference top-3 | whether our greedy pick is at least plausible to the reference | **Calibrated gross tripwire (§0)**: catches a broken kernel that keeps aggregate agreement; cheap (already have `top`); 99% is V4.1 legacy context. |
+| Confident top-1 (positions with reference p₁ ≥ 0.5) | flips that cannot be near-ties | **Calibrated gross tripwire (§0)** and the first thing to read when the bar fails; 98% is V4.1 legacy context, not a universal floor. |
 | **Full-vocab KL(ref ‖ engine)** | continuous distance; sensitive to mass shifts near-ties hide; paired differences are precise | **Carries the 0.005 bar** (full tier, full-vocab f16 rows). Quick tier keeps top-32 + tail as a lower-bound proxy. |
 | NLL on the fixed text, paired | absolute competence, independent of the reference's arithmetic | **Supporting**: reported per role; tripwire +0.01 nat on human-written code. The one metric robust to reference mismatch (the MiMo lesson). |
 | NLL on reference-sampled continuations | ≈ cross-entropy to the reference; redundant with KL | report only |
@@ -237,9 +246,22 @@ golden: 70 layers in 295 s for 1.5K tokens, 4.2 s/layer average, 7–10 s on
 MoE layers), so running every window of the set inside each layer visit is
 nearly free: expert compute for 400K tokens × 8 experts is ≈ 160 TFLOP per
 layer (≈ 1–2 s on an RTX PRO 6000), eager attention per window is small
-below 16K (scores [H, T, T] at T = 16K ≈ 33 GB transient; 32K ≈ 130 GB does
-not fit and needs query-chunked attention in `golden.py`). Hidden streams
-for 400K tokens × 4 × 4096 × 2 B = 13 GB stay on the GPU between layers.
+only with bounded query blocks: at 16K, eager [H,T,T] scores plus FP32
+softmax temporaries already exhaust GB10 unified memory. Goldens call the
+unchanged official eager function on at most 1024 queries against all keys,
+slicing the query mask and retaining row-wise arithmetic; unused attention
+weights are discarded. Official DeepSeek sparse hooks use 128-query blocks
+before their KV gather. GLM KDA keeps its official 64-token recurrent chunks
+and bounds independent head groups instead. Small CPU byte-exact gates and
+the actual common-prefix qualification precede every full panel. Hidden
+streams for 400K tokens x 4 x 4096 x 2 B = 13 GB stay on CPU between layers.
+
+Read each layer once through `/mnt/sparknest`; do not replicate weights for
+a one-time golden. GLM Flash BF16 is spread over Spark NVMe and streams via
+RoCE (~5 GB/s, ~3 s per ~13 GB layer, about two minutes extra total). Qwen
+BF16 is in the scratch archive (~500 MB/s, about 20 minutes extra total).
+These are planning estimates, not measurements. Replication is for serving,
+which rereads weights at each launch.
 The eager per-expert Python loop (288 experts, `index_add_`) is the real
 cost: budget 10–30 s per MoE layer at 400K tokens. Estimate: **GLM Flash
 (45 layers) 15–30 min, MiMo V2.6 Pro (70 layers) 30–45 min, DeepSeek V4.1
@@ -248,11 +270,49 @@ writing 10 GB of f16 log-probs. Once per family per set version. Measure on
 the first run and record it in the commit; batching tokens per expert
 across windows is the first optimization if it runs long.
 
-Storage per family: full-vocab f16 log-softmax rows, 32,768 × vocab × 2 B
-(GLM Flash: 10.1 GB; V4.1: ≈ 8.4 GB) on `/mnt/sparknest/fidelity/<family>/
-<set-version>/` with a sha256 manifest in the repo; the compact quick-tier
-reference (12 windows, top-32 ids u32 + log-probs f16 + tail + next, ≈ 1.3
-MB binary) compiled into `cuteafd-bench` as today.
+Reference roots use vendor BF16 originals when published: GLM 5.3 Flash
+`zai-org/GLM-5.3-Flash-BF16`, Qwen 3.8 `Qwen/Qwen3.8-Flash-Next`, and GLM 5.3
+`zai-org/GLM-5.3-BF16`. V4.1, V4 Flash/Pro and MiMo MOPD keep their official
+FP8/MXFP4 releases because no vendor BF16 master is published. Manifests pin
+root checkpoint, precision, snapshot/config/tokenizer hashes separately
+from the text-generation arm. FP8-serve-generated GLM text may remain;
+Qwen FP8 serve is wanted, with explicitly labelled EXL3 generation retained
+only as an interim fallback. A root change creates a new set/reference hash
+and requires fresh prefix qualification, never reuse of an old proof.
+
+The full tier ships reference top-1024 token ids u32 and log-probs f16,
+plus f32 tail log-mass and next-token log-prob in safetensors, one HF dataset
+config per family/set-version in `wrldsuksgo2mars/cuteafd-fidelity`. The support is
+reference-fixed; normalize the 1024 values plus aggregate tail bin together
+and evaluate the engine on the same support with one aggregate engine tail.
+This is a coarse-grained KL, not mathematically identical full-vocabulary
+KL. Saved V4.1 FP8-head decode/prefill paired deltas and upper95 bounds agree
+with full-vocabulary results within 1.18e-7 nat (required <=1e-4), with both
+PASS verdicts unchanged; f16 entries and f32 tail were included. Full-vocab
+rows remain local validation evidence, not a required download. The bench
+defaults the full tier (without local `--reference`/`--rows`) to
+`wrldsuksgo2mars/cuteafd-fidelity`, config `deepseek_v41-v2_20261005`, revision
+`01a0948a62a478a0a9355dd5b57fe4a49bc6cca0`. Explicit `--dataset`,
+`--dataset-config FAMILY-VERSION` and `--dataset-revision IMMUTABLE_40_HEX_COMMIT`
+override that source; branches and tags are rejected. Future family configs
+are added to the same repository and require their own verified revision.
+The revision/config/repository and manifest SHA are retained
+in run results and must match across arms. It checks the index, manifest,
+window, qualification and safetensors hashes before scoring. Engine full-row
+dumps remain local and provide the actual omitted mass, avoiding subtraction
+of rounded top probabilities. Actual Rust absolute and tripwire gates have
+also revalidated the saved compact pair, with both PASS verdicts unchanged.
+Publication provenance carries artifact hashes/fork pins and rank topology,
+not host paths, addresses or credentials; decoded source text is audited too.
+The coordinator handles the public upload. The pinned publication passed
+immutable Hub readback of all 72 files (212,253,166 bytes), including the
+Hub-added `.gitattributes`; every frozen-file checksum and the manifest hash
+chain matched. Manifest SHA256:
+`6f2b22f3ed4882765c759b565baab960f7e1563a7fe2be2bbd05540ac4f2f70c`. Set/reference hashes, file hashes,
+root/generation provenance and per-checkpoint licence terms accompany each
+config. Text is ours, with source-file licence obligations preserved; logits
+derive from the named official checkpoint and do not erase its terms.
+Quick tier remains top-32 plus tail compiled into `cuteafd-bench`.
 
 **Engine scoring** (figures from GLM Flash on 1 RTX + 2 Sparks: 8K prefill
 ≈ 5,100 tok/s, decode step ≈ 40 ms):
@@ -274,14 +334,116 @@ prose; Hugh's engine reads 0.025 and 95% to a BF16 teacher on low-entropy
 packed text. Two effects mix: text entropy (3.45 vs 0.8 nat) and arithmetic
 (eager BF16 attention with an FP32 routed sum vs the served kernels, plus
 official FP8 experts vs EXL3). The first run of the new set separates them:
-the BF16 arm's absolute number on the model's own text, plus the GLM Flash
-cross-check against Hugh's teacher on its 25 windows. Expect the absolute
-KL to land in 0.02–0.04 and top-1 in 93–96%; if the BF16 arm sits below 92%
+the BF16 arm's absolute number on the model's own text, using only references
+we generate from official checkpoints (no external teacher, §11.7). The
+initial expectation was KL 0.02–0.04 and top-1 93–96%; if the BF16 arm sits below 92%
 on its own greedy text, the golden itself is suspect (routing or norm
 differences), and that is a finding about the reference, to fix before any
 precision decision.
 
-The paired bar does not wait for that: it is valid at any absolute level.
+Absolute agreement also contains a reference-noise component. In the first
+V4.1 investigation, the same 576-token prefix evaluated alone versus with a
+64-token suffix changed 39/512 argmax rows (7.6171875%). The original
+640-token run reproduced exactly, as did the serial versus multi-window
+576-token run. The first difference was 12 values in layer-0 `attn.wq_a`
+(max 1.52587890625e-5), before compressor/indexer state: sequence-shaped
+GEMM rounding amplified through the model, not a demonstrated causal-mask
+failure. This does not justify relaxing the absolute floors or the paired bar.
+
+Reference arithmetic now fixes row-wise GEMMs to M=128 with zero-padded
+final chunks, including quantized-kernel adapters, HC linears and LM heads;
+V4.1 grouped projection/attention einsums use the same fixed query geometry.
+Before generating a full family panel, its actual layer-major golden must
+pass a fail-closed 576/640-token common-prefix check: all 512 scored f32
+vocabulary rows finite and bit-identical. A passing proof is bound to the
+family, snapshot identity and pinned set hash, and required by the schema-2
+converter. This is a necessary sampled arithmetic/state gate, not a proof
+for all sequence lengths or GPU architectures. Other families must pass on
+the architecture that actually generates their references; a shared hook
+alone does not qualify their attention or recurrent kernels.
+
+The cancelled V4.1 baseline quick decode measured 96.9877% generated-position
+top-1, compact KL 0.0111367 nat and 56.3449 s scoring (2,689 generated of
+6,144 scored positions, 1 RTX + 4 Sparks, BF16 head, verify width 8). It used
+the unqualified shape-sensitive reference and is informational only, not a
+calibration or precision gate. Full decode failed on a missing dump parent;
+no candidate, full-prefill or paired discordance result exists from that run.
+
+### Qualified V4.1 calibration (2026-10-05)
+
+The first qualified head-off calibration uses the pinned 64-window set
+`16f94cfc43ad1c59879b497194cfa6ddeb793cb98f8225206dc0f747ea33cc91`,
+checkpoint revision `dba1be0a40aa45a94ad051997016db3960a90277`, daemon
+`090a5c3`, one RTX GPU0 and ostrich/dodo/emu/kiwi TP4. Drafts and prefix
+cache are off; the decode verification width is 8. "Head off" is the
+checkpoint-precision arm, not a claim that the family's native FP4 KV or
+FP8 SWA/expert formats are all BF16. The SM120 reference passed its finite,
+bit-exact common-prefix gate; full generation took 3203.17 s including
+qualification, below the 60-minute stop bar.
+
+All numbers here score actual generated positions, not context padding.
+Quick KL is top-32-plus-tail; full KL is full-vocabulary. Scoring times
+include requests and row scoring, not model loading or reference generation.
+
+| Tier / shape | Generated positions | Top-1 | KL (nat) | Scoring (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Quick / decode | 2,689 | 97.1737% | 0.010847 | 55.56 |
+| Full / decode | 17,656 | 96.9529% | 0.008547 | 346.31 |
+| Full / prefill | 17,656 | 97.0888% | 0.008573 | 262.75 |
+
+| Generated block | Quick top-1 / KL | Full decode top-1 / KL | Full prefill top-1 / KL |
+| --- | ---: | ---: | ---: |
+| A, agentic | 97.8349% / 0.004431 | 98.4574% / 0.004352 | 98.4392% / 0.004283 |
+| B, code reading | 96.8750% / 0.007576 | 96.4030% / 0.008658 | 96.5495% / 0.008471 |
+| D, JSON/tool | 96.1353% / 0.031786 | 97.8479% / 0.013373 | 97.2023% / 0.016861 |
+| E, prose/reasoning | 97.6562% / 0.009719 | 95.6163% / 0.011955 | 96.1589% / 0.011331 |
+
+Block C has no generated positions. Its context top-1/KL is 95.3125% /
+0.014620 quick, 97.9688% / 0.008652 full decode, and 97.7734% / 0.008343
+full prefill. Across all context positions, KL is 0.040108 quick, 0.096022
+full decode and 0.053880 full prefill. D's appended context dominates this
+mismatch (0.605894 / 0.268443 nat on the two full shapes); it is reported
+separately and does not become assistant text or enter the generated bar.
+D also has the highest generated-span KL in every tier/shape.
+
+Every generated aggregate clears the 92% stop bar, the confident-position
+98% and reference-top-3 99% tripwires pass, and the worst generated window
+is 94.3359% on either full path. The old 90% floor is comfortably met on
+agentic text. Applying §10's whole-percentage-point round-down minus two
+literally gives 95% for quick and full prefill, but **94% for full decode**
+(96.9529% rounds down to 96%, not up to 97%). V4.1's published `expect`,
+shared across its scoring paths, therefore uses `top1_min = 0.94`;
+per-path calibration retains 0.95/0.94/0.95. The KL ceiling uses conservative
+upward 0.01-nat rounding plus 0.02 nat, capped at 0.06: 0.04 quick, 0.03 on
+each full path; V4.1's shared `expect` uses `kl_max = 0.04`. These are
+config-specific sanity gates calibrated from V4.1, not cross-family floors.
+The common floor remains top-1 >=0.90 / KL <=0.06; the precision-decision
+bar remains paired 0.005 top-1 / 0.005 nat on both full scoring shapes.
+
+### First paired V4.1 FP8 vocabulary-head decision (2026-10-05)
+
+The FP8-head candidate uses the same immutable reference, build, checkpoint,
+resolved nonprecision settings and GPU0 + TP4 layout as calibration. The
+**full tier passes on both shapes**; all absolute gates and statistical
+tripwires pass. The quick tier is **inconclusive**, not a demonstrated
+regression: its top-1 upper bound exceeds the quick margin, while the
+prespecified full-tier bounds comfortably clear the precision bar.
+
+| Tier / shape | Generated positions | Baseline-only / candidate-only agreements | Discordance | Top-1 loss upper 95% | KL delta upper 95% (nat) | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Quick / decode | 2,689 | 56 / 37 | 3.4585% | 0.012199 | 0.001923 | Inconclusive |
+| Full / decode | 17,656 | 250 / 269 | 2.9395% | 0.000937 | 0.000846 | Pass |
+| Full / prefill | 17,656 | 252 / 255 | 2.8715% | 0.001854 | 0.000305 | Pass |
+
+Candidate scoring takes 55.10 / 346.43 / 255.64 s for quick decode / full
+decode / full prefill. Independent agentic replay validity remains an
+unfulfilled separate gate; this statistical verdict does not promote a
+default. Baseline decode versus prefill has 524/17,656 differing agreement
+indicators and 547/17,656 argmax differences; those describe shape
+sensitivity, not precision-arm discordance.
+
+The paired bar remains the precision decision rule at any absolute level,
+subject to the independent absolute gates and reference qualification.
 
 ## 9. Migration: what evolves, what stays
 
@@ -296,11 +458,27 @@ The paired bar does not wait for that: it is valid at any absolute level.
 | engine probe (`cuteafd-api::probe`, `cuteafd-daemon::shared::probe`) | rows carry top-k + wanted ids | add `dump_rows: Option<PathBuf>` (f32 or f16 log-softmax rows to a safetensors file, streamed per step, for full-vocab KL); add `verify_rows` override for speculation-width scoring; phase 2: `prefill_rows_logits: bool` returning every row's logits from prefill chunks (the LM head on all rows of the chunk, as Hugh's `score_each`) |
 | `references/*.json` (7 families) | 512-position PLAN.md | regenerated as schema 2 with the legacy passage as window 0; the old thresholds (`kl_max 0.15`, `top1_min 0.80`) become per-window sanity bounds, the new floors live in `expect` |
 | `release-smoke` | quick quality = this check | unchanged shape; the quick tier is what runs |
-| Hugh's teacher | second reference "where available" (PLAN) | a `cuteafd bench fidelity external --teacher DIR` path for GLM Flash only; absolute figures, no pairing with our set |
+| External teacher | not used | no external dataset; references generated from official checkpoints only (§11.7) |
 
-Nothing already green becomes red by the schema change alone: the legacy
-window reproduces today's numbers (same tokens, same positions, top-12 ⊂
-top-32).
+The legacy converter remains byte-compatible for identical input logits
+(same tokens, positions, top-12 subset of top-32): converting the old raw
+640-token golden reproduces the shipped JSON. This proves the converter,
+not the old reference arithmetic. The old V4.1 JSON scores a 576-token
+prefix of a 640-token run; evaluating those same tokens at length 576
+changes 39/512 argmax rows, and the qualified fixed-M128 legacy differs
+from the shipped JSON at 48/512 rows. The old reference is arithmetically
+unqualified. Requiring a shape-invariant golden to reproduce it byte for
+byte would preserve the defect, so that regeneration-equality gate is
+retired, without relaxing the absolute floors or paired decision rule.
+
+Replacement reference gates are: (1) the actual finite, bit-exact
+common-prefix proof bound to the family, snapshot and set; (2) conversion
+of the old raw logits reproduces the old JSON, retaining converter
+compatibility; and (3) a newly generated qualified legacy window is
+published as window 0 of schema 2. Publish schema-2 replacements only
+after qualified baseline calibration. Regenerate the old schema-1 V4.1
+JSON from qualified logits when the bench switches over; retain the old
+raw evidence for diagnosis, not as a certification target.
 
 ## 10. Implementation plan (brief for a Codex agent)
 
@@ -327,8 +505,11 @@ hardware runs, small commits, tables in commit messages).
    logits for V4.1 Flash first (TJ's anchor; the V4.1 FP8-head decision is
    pending), then MiMo V2.6 Pro, MiMo V2.6 Flash MOPD, Qwen (GLM Flash is
    Hugh Madden's now); `make-fidelity-reference.py` schema 2 and the
-   sparknest manifest. Gate: the legacy window's compact reference equals
-   today's file bit for bit (same top-12 ids and log-probs to 5 decimals).
+   sparknest manifest. Reference gates: finite bit-exact common-prefix
+   qualification; old raw logits still reproduce the shipped legacy JSON
+   (converter compatibility); regenerate and publish the qualified legacy
+   window in schema 2. Old-versus-new golden equality is retired for the
+   arithmetic reason and measured evidence in §9.
 4. **Engine probe.** `dump_rows`, `verify_rows` override; family `serve.rs`
    call sites pass them through (`deepseek_v4`, `glm5`, `glm5_flash`,
    `mimo_v2`, `qwen4`). Gate: loopback test writes rows whose top-k equals
@@ -339,9 +520,16 @@ hardware runs, small commits, tables in commit messages).
    FP8 KDA/head arm on both tiers, run `compare`. Deliverables in the commit
    message: the absolute numbers per block and bucket, δ̂ and bounds for
    both paths, the discordance rate d actually observed (feeds §5). No
-   external teacher cross-check (TJ, 2026-10-05). This run calibrates the floors in `expect`: floor = BF16
-   arm's top-1 rounded down to the point minus 2, never below 0.90; KL
-   floor similarly, never above 0.06.
+   external teacher cross-check (TJ, 2026-10-05). Each family/config derives
+   its own per-path `expect` from repeated default-precision baselines:
+   top-1 minimum = agreement rounded down to a whole percentage point
+   minus 2 points, never below 0.90; KL maximum = KL rounded up to
+   0.01 nat plus 0.02 nat, capped at 0.06. Use the lower repeated top-1
+   and higher repeated KL for each path, and the least restrictive of
+   those path-specific gates for the config's shared `expect`. Label it
+   "calibrated from this config's baselines". Keep the common 0.90/0.06
+   floor and paired 0.005/0.005 decision bar separate. Repeatability
+   qualification of a reference is not a precision-default verdict.
 6. **Wire the tiers.** Quick tier in `baseline.rs`; `cuteafd bench
    fidelity run/compare`; Release smoke unchanged in shape. Re-run the
    current `release-smoke` matrix entry for GLM Flash to show the ≤ 5 min

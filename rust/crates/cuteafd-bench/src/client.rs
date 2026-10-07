@@ -23,7 +23,7 @@ pub struct Client {
 }
 
 /// One completed chat request.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Chat {
     pub timing: StreamTiming,
     pub content: String,
@@ -77,6 +77,33 @@ impl Client {
         let record = models["data"].get(0).cloned().context("/v1/models lists no model")?;
         self.model = record["id"].as_str().context("model id")?.to_string();
         Ok(record)
+    }
+
+    pub fn model_record(&self) -> Result<Value> {
+        let models = self.get("/v1/models")?;
+        models["data"].as_array().and_then(|records| records.iter()
+            .find(|record| record["id"].as_str() == Some(self.model.as_str())))
+            .cloned().context("served model is no longer advertised")
+    }
+
+    /// HTTP media probes bypass the older in-process ProbeSpec registration shape.
+    pub fn media_probe(&self, mut body: Value, spec: Value) -> Result<Value> {
+        self.check()?;
+        body["model"] = json!(self.model);
+        body["stream"] = json!(false);
+        let mut request = self.agent.post(&format!("{}/v1/bench/probe", self.base))
+            .set("content-type", "application/json");
+        if let Some(token) = &self.token {
+            request = request.set(BENCH_HEADER, token).set("Authorization", &format!("Bearer {token}"));
+        }
+        match request.send_json(serde_json::json!({"body": body, "spec": spec})) {
+            Ok(response) => Ok(response.into_json()?),
+            Err(ureq::Error::Status(code, response)) => {
+                let detail = response.into_string().unwrap_or_default();
+                bail!("media probe HTTP {code}: {}", detail.chars().take(400).collect::<String>());
+            }
+            Err(error) => Err(error).context("media probe request"),
+        }
     }
 
     pub fn stats(&self) -> Result<Value> {
@@ -235,6 +262,43 @@ mod tests {
         let upstream = error.downcast_ref::<UpstreamHttpError>().unwrap();
         assert_eq!(upstream.code, 503);
         assert_eq!(upstream.body, "vision encoder unavailable");
+    }
+
+    #[test]
+    fn media_probe_uses_http_token_and_model() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /v1/bench/probe "));
+            let (mut length, mut auth) = (0usize, false);
+            loop {
+                line.clear(); reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line.to_lowercase().starts_with("x-cuteafd-bench: secret") { auth = true; }
+            }
+            assert!(auth);
+            let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["body"]["model"], "model");
+            assert_eq!(request["body"]["stream"], false);
+            assert_eq!(request["spec"]["media"][0]["key"], "key");
+            drop(reader);
+            use std::io::Write;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+        });
+        let mut client = Client::new(&format!("http://{address}"), Some("secret".into()), Arc::new(AtomicBool::new(false)));
+        client.model = "model".into();
+        client.media_probe(json!({"messages": []}), json!({"media": [{"key":"key"}]})).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

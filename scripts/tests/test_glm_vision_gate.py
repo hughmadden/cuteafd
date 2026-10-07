@@ -199,8 +199,18 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
     assert "kda.in[24896|12576,4096]" in source
     opening = (root / "glm5_flash/mod.rs").read_text().split("pub fn with_engine", 1)[1]
-    assert opening.index("workspace_reserve(") < opening.index("planned_pool_tokens_with_extra(")
-    assert "graph_extra + workspace_extra" in opening
+    admission = opening.index("planned_pool_tokens_with_reserves(")
+    assert opening.index("workspace_reserve(") < admission
+    assert "extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }" in opening
+    assert "workspace_bytes: args.full_prefill_logits.then_some(workspace)" in opening
+    assert opening.index("let mut scoring_dense") < admission
+    assert "match scoring_dense.take()" in opening
+    assert "partial_exchange_reserve(" in opening
+    assert 'full_prefill_logits_bytes(' not in opening
+    # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
+    scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("\n    }\n", 1)[0]
+    assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
+    assert opening.index("engine.prepare_scoring_prefill()") < opening.index("let result = body(&engine)")
     assert opening.index("engine.prepare_serving_workspaces()") < opening.index("let result = body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
     # Shared DFlash only gains an explicit API; all existing users keep lazy timing.

@@ -18,7 +18,7 @@ fn planned(ids: &[&str]) -> Vec<PlannedPanel> {
 }
 
 const SPEED: [&str; 7] = ["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "startup", "agentic"];
-const QUALITY: [&str; 6] = ["tool_eval", "structured", "ifeval", "code", "math", "needle"];
+const QUALITY: [&str; 7] = ["tool_eval", "structured", "ifeval", "code", "math", "needle", "fidelity"];
 
 /// The built-in profiles, in dialog order.
 pub fn builtin() -> Vec<Profile> {
@@ -35,6 +35,7 @@ pub fn builtin() -> Vec<Profile> {
             &["decode_content", "concurrency", "agentic", "tool_eval", "prefix_cache", "structured"]),
         p("quality", "Quality", "Tool eval, structured output, IFEval, code pass@1, math, long-context needle.",
             &QUALITY),
+        p("fidelity", "Fidelity", "All 64 sealed windows, decode only; calibrated fidelity verdicts.", &["fidelity"]),
         p("quant", "Quant check", "Quality panels that move with quantization: tool eval, IFEval, math, code.",
             &["tool_eval", "ifeval", "math", "code"]),
         p("long", "Long context", "Prefill to the model maximum, decode vs retained context, needle heatmap, \

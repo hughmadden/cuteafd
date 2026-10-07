@@ -58,6 +58,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     context_slots: args.draft_context_slots,
                     sequences: args.draft_sequences,
                 }),
+                full_prefill_logits: args.full_prefill_logits,
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
                 native_mtp_layers: args.native_mtp_layers,
@@ -145,6 +146,7 @@ mod tests {
             headroom_gib: 2.0,
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
+            full_prefill_logits: false,
             concurrency: 8,
             prefix_slots: None,
             prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
@@ -285,6 +287,18 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
+        }
+    }
+
+    #[test]
+    fn diagnostic_prefill_flag_is_forwarded_to_layout() {
+        use clap::Parser;
+        for enabled in [false, true] {
+            let mut argv = vec!["cuteafd", "plan", "/not-read", "--layout"];
+            if enabled { argv.push("--full-prefill-logits"); }
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().full_prefill_logits, enabled);
         }
     }
 

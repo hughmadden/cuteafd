@@ -1046,7 +1046,11 @@ impl Opened {
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights resident (one copy each)");
-        let budgeted = cuteafd_ffi::coordinator_gpu_budget().is_some();
+        // All-row prefill logits (`--full-prefill-logits`) admit as a GPU budget does: experts before the
+        // pool, and a fixed pool checked against the exact workspaces. Only a GPU budget also widens the
+        // eager admission below.
+        let gpu_budget = cuteafd_ffi::coordinator_gpu_budget().is_some();
+        let budgeted = args.full_prefill_logits || gpu_budget;
         // With a ceiling, establish local expert ownership before KV spends
         // the remaining budget. Lazy EXL3 owners reserve their loader peak.
         let mut future_expert_bytes = 0;
@@ -1102,12 +1106,17 @@ impl Opened {
         // admitted under the budget): the drafter, the Spark transports and intake, the dense
         // package, the token selector and every step workspace exist before the pool is sized, so
         // the pool takes the free memory they leave, less the headroom, the graph reserve and the
-        // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`).
-        let eager = (args.pool_tokens == 0 || budgeted) && peer_stream.is_none() && (!args.local_experts || budgeted);
+        // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`). With
+        // all-row prefill logits the lanes' temporaries already hold them.
+        let eager = (args.pool_tokens == 0 || gpu_budget) && peer_stream.is_none() && (!args.local_experts || gpu_budget);
         ensure!(eager || args.replay_records == engine::ReplayRecords::Own, "--replay-records shared needs the step \
             workspaces before the KV pool: one GPU, an automatic pool (--pool-tokens 0) and Spark experts (--peers)");
         let mut early = None;
         let mut records = None;
+        // Admit the package before KV sizing; measured free memory then excludes its buffers (the
+        // eager admission loads it with the rest of start-up).
+        let mut scoring_dense = if args.full_prefill_logits && !eager { self.load_dense(args, &model.layers)? }
+            else { None };
         let pool_tokens = if eager {
             let experts = if moe {
                 match admitted_experts.take() { Some(experts) => experts, None => self.experts(args)? }
@@ -1163,16 +1172,22 @@ impl Opened {
                 std::iter::once(args.device)
                     .chain(peer_stream.map(|(d, _)| d)).collect()
             };
+            // The head split's partials (with all-row logits the exact union below holds the workspaces'
+            // deltas, so only the exchange slots), a wider sampler and the pool marks' reserved units.
+            let wide = crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS, self.cfg.vocab_size);
             let extra = if args.kda_output_shard {
                 engine::output_shard_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden)
+            } else if args.full_prefill_logits {
+                engine::partial_exchange_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
+                    if args.kda_fp32_partials { 4 } else { 2 })
             } else {
                 engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 })
-            };
-            // The step workspaces this engine makes before readiness (`workspace_reserve`: the decode
-            // workspace at the decode rows, the prefill lanes over their shared temporaries, the
-            // longer-extent top-k's scratch, and the measured runtime allowance per workspace),
-            // past the planner's workspace allowance; a wider sampler adds to it too.
+            } + wide + reserved_bytes;
+            // The step workspaces this engine makes before readiness (`workspace_reserve`, per rank: the
+            // decode workspace at the decode rows, the prefill lanes over their shared temporaries, the
+            // longer-extent top-k's scratch, and the measured runtime allowance per workspace), past the
+            // planner's workspace allowance; with all-row prefill logits, their exact union replaces it.
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
                 step_settings(args, index_cache)).with_experts(args.local_experts, args.peers.is_some());
             let lanes = engine::configured_prefill_lanes(args.peers.is_some(), layers == self.cfg.layers,
@@ -1181,8 +1196,8 @@ impl Opened {
                 args.draft.is_some())?;
             let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
             let workspace_allowance = costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096;
-            let workspace_extra = workspace_reserve.saturating_sub(workspace_allowance);
-            tracing::info!(lanes, workspace_reserve_bytes = workspace_reserve, planner_allowance_bytes = workspace_allowance,
+            let workspace_extra = workspace_reserve.iter().copied().max().unwrap_or(0).saturating_sub(workspace_allowance);
+            tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve, planner_allowance_bytes = workspace_allowance,
                 extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
             let graph_extra = startup_reserve.as_ref().map_or(0, |reserve| reserve.iter().copied().max().unwrap_or(0)
                 .saturating_sub(costs.graph_bytes[0]));
@@ -1190,11 +1205,14 @@ impl Opened {
                 tracing::info!(allowance_bytes = costs.graph_bytes[0], extra_reserve_bytes = graph_extra,
                     "GLM Flash graph reserve above planner allowance");
             }
-            let wide = crate::shared::token_io::sampler_growth(args.decode_rows, engine::DECODE_ROWS, self.cfg.vocab_size);
-            crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot, &devices,
+            let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
+                crate::shared::memory_report::RankReserve {
+                    extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
+                    workspace_bytes: args.full_prefill_logits.then_some(workspace),
+                }).collect();
+            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                 args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes,
-                extra + wide + reserved_bytes + graph_extra + workspace_extra,
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
                 index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?
         } else {
             args.pool_tokens
@@ -1240,7 +1258,11 @@ impl Opened {
             }
             None => {
                 engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
-                if let Some(dense) = self.load_dense(args, &engine.weights.layers)? {
+                let dense = match scoring_dense.take() {
+                    Some(dense) => Some(dense),
+                    None => self.load_dense(args, &engine.weights.layers)?,
+                };
+                if let Some(dense) = dense {
                     engine.set_dense_nvfp4(dense);
                 }
                 if moe {
@@ -1257,6 +1279,7 @@ impl Opened {
             }
         }
         if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
+        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the streams is gone.

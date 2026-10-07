@@ -705,6 +705,12 @@ pub(crate) fn partial_reserve(lanes: usize, prefill_rows: usize, hidden: usize, 
         * hidden * bytes.saturating_sub(2)) as u64
 }
 
+/// Workspace deltas are already in the exact union; only the enlarged exchange slots of `lanes`
+/// prefill lanes remain.
+pub(crate) fn partial_exchange_reserve(lanes: usize, prefill_rows: usize, hidden: usize, bytes: usize) -> u64 {
+    (4 * lanes * prefill_rows.max(DECODE_ROWS) * hidden * bytes.saturating_sub(2)) as u64
+}
+
 /// Two additional parity slots per lane hold normalized heads until the peer consumes them.
 pub(crate) fn output_shard_reserve(lanes: usize, prefill_rows: usize, hidden: usize) -> u64 {
     (2 * lanes * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
@@ -1404,17 +1410,18 @@ fn decode_pads(use_graphs: bool, startup_graphs: bool, spec: bool, row_buckets: 
 // measured/calibrated allowance is not exact cuBLAS allocator ownership.
 const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
 
-/// The device bytes a GPU's step workspaces take before the KV pool, for an admission that sizes
-/// the pool before they exist: the decode workspace (`plan`'s decode rows), `lanes` prefill lanes of
-/// `prefill_rows` rows over their one set of shared temporaries, plus a measured 72 MiB of untracked
-/// runtime memory per workspace (the drafter's included). The largest of the ranks (a head split
-/// has two).
+/// Per rank, the device bytes its step workspaces take before the KV pool, for an admission that
+/// sizes the pool before they exist: the decode workspace (`plan`'s decode rows), `lanes` prefill
+/// lanes of `prefill_rows` rows over their one set of shared temporaries, plus a measured 72 MiB of
+/// untracked runtime memory per workspace (the drafter's included). A plan with all-row prefill
+/// logits (`--full-prefill-logits`) gives the exact union scoring runs in: a serial prefill runs in
+/// lane 0, and the logits live once, in the lanes' shared temporaries.
 pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, lanes: usize, peer: bool,
-    drafter: bool) -> Result<u64> {
+    drafter: bool) -> Result<Vec<u64>> {
     (0..if peer { 2 } else { 1 }).map(|rank| {
         // The planner separately admits drafter storage. Its runtime overhead is additional.
         Ok(workspace_reserve_bytes(plan.workspace_bytes(rank, prefill_rows, lanes)?, lanes, rank == 0 && drafter))
-    }).collect::<Result<Vec<u64>>>().map(|bytes| bytes.into_iter().max().unwrap_or(0))
+    }).collect()
 }
 
 /// A rank's `tracked` workspace bytes with the untracked runtime memory of its decode workspace,
@@ -2185,6 +2192,18 @@ impl<'a> GlmfEngine<'a> {
         Ok(self.programs.spec(&format!("glmf_{name}"))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
+    /// Every prefill workspace teacher-forced scoring runs in, before readiness (`--full-prefill-logits`
+    /// admits them): both ranks' prefill lanes, as a Spark prefill takes them. A serial prefill, a
+    /// short chunk and the prefix captures run in lane 0, so there is no third workspace, and the
+    /// all-row logits live once, in the lanes' shared temporaries.
+    pub fn prepare_scoring_prefill(&self) -> Result<()> {
+        let lanes = if self.pipelined() { self.prefill_lane_count } else { 1 };
+        for rank in 0..self.ranks() {
+            drop(self.prefill_lanes_of(rank, lanes)?);
+        }
+        Ok(())
+    }
+
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
@@ -2396,6 +2415,15 @@ impl<'a> GlmfEngine<'a> {
     pub fn prefill_media_device(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
         self.prefill_step(placement, tokens, None, None, false, true, Some(media))?.map(StepLogits::device).transpose()
+    }
+
+    /// Keep ordered all-row logits and media injection on the admitted scoring path.
+    pub(crate) fn prefill_scoring_media(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        self.prefill_step(placement, tokens, None, None, true, false, Some(media))?
+            .map(|logits| Ok(crate::shared::probe::ScoreLogits::Host {
+                values: logits.into_host(self.library)?, vocab: self.cfg.vocab_size,
+            })).transpose()
     }
 
     fn prefill_step(&self, placement: &mut GlmfPlacement, tokens: &[u32],
@@ -4422,6 +4450,23 @@ mod prefill_lane_tests {
     }
 
     #[test]
+    fn scoring_reserve_is_the_configured_lanes_with_a_serial_prefill_in_lane_0() {
+        assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 4), 268_435_456);
+        assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 2), 0);
+        assert_eq!(super::partial_exchange_reserve(4, 2048, 4096, 4), super::partial_exchange_reserve(2, 4096, 4096, 4));
+        // Whole workspaces kept a serial one beside the lanes (1 + lanes past one lane); shared lanes
+        // run a serial prefill in lane 0, so scoring's union is the configured lanes' (with all-row
+        // logits in their temporaries: `workspace_reserve_is_the_shared_lane_layout_...`), one
+        // allowance per workspace.
+        for lanes in 1..=MAX_PREFILL_LANES {
+            for drafter in [false, true] {
+                assert_eq!(super::workspace_reserve_bytes(10_000, lanes, drafter),
+                    10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(drafter)) as u64);
+            }
+        }
+    }
+
+    #[test]
     fn startup_defaults_honor_both_explicit_disables() {
         assert!(super::startup_graph_policy(None, None));
         assert!(super::startup_graph_policy(Some("1"), Some("1")));
@@ -4461,6 +4506,16 @@ mod prefill_lane_tests {
         assert!(reserve >= tracked(2, 4096) + 2 * 71_942_144 + 71_942_144 + 68_269_888);
         // Four lanes of 2,048 rows: two more workspaces' allowance over a smaller layout.
         assert_eq!(super::workspace_reserve_bytes(tracked(4, 2048), 4, false), 2_567_772_336 + 5 * (72 << 20));
+        // Scoring's exact union (`--full-prefill-logits`): the same lanes, a serial prefill in lane 0,
+        // the all-row logits once in their shared temporaries, which rank 1 never holds. Whole
+        // workspaces held them three times (a serial workspace and two lanes) at four allowances.
+        let full = GlmfStepShape { full_prefill_logits: true, ..shape };
+        let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
+        assert_eq!(scoring - tracked(2, 4096), (4096 - 64) * 154_880 * 4);
+        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 3 * (72 << 20));
+        let peer = GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape };
+        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &GlmfStepShape { full_prefill_logits: true, ..peer },
+            decode, prefill), glmf_step_workspaces(&cfg, 2, 4096, 64, &peer, decode, prefill));
     }
 
     /// The graph set a policy reaches, for every capacity and position a pool admits: as

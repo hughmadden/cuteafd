@@ -73,6 +73,8 @@ pub struct LayoutOptions {
     /// (weights, context rings, tap buffers, draft workspace, FP8 scratch); any other drafter takes
     /// the family's allowance.
     pub glmf_draft: Option<GlmfDraft>,
+    /// Admit the probe-only all-row vocabulary output on the lead GPU.
+    pub full_prefill_logits: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -121,6 +123,7 @@ impl Default for LayoutOptions {
             glmf_startup_graphs: true,
             glmf_draft: None,
             graph_budget_bytes: None,
+            full_prefill_logits: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
@@ -149,6 +152,70 @@ pub struct GlmfDraft {
     pub context_slots: Option<u64>,
     /// The most sequences one draft step takes (`--draft-sequences`), at most the rings.
     pub sequences: u64,
+}
+
+/// Shared with the GLM runtime so admission and allocation use the same lanes.
+pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
+    value.and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 4)
+}
+
+/// Additional lead-GPU output bytes for admitted all-row fidelity probes.
+/// GLM uses its configured lanes; GLM Flash's lanes (a serial prefill runs in
+/// the first) share one set of temporaries and so one logits buffer.
+/// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
+pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
+    let lanes = glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref());
+    full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
+}
+
+fn effective_glm_prefill_lanes(sparks: bool, value: Option<&str>) -> usize {
+    if sparks { glm_prefill_lanes(value) } else { 1 }
+}
+
+pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64, glm_lanes: usize) -> u64 {
+    let (lanes, ordinary_rows) = match family {
+        "mimo_v2" => (1, 1),
+        "qwen4" => (1, 1),
+        "glm5" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
+        "glm5_flash" => (1, rows.min(64)),
+        _ => return 0,
+    };
+    let extra_rows = rows.saturating_sub(ordinary_rows);
+    let logits = extra_rows.saturating_mul(lanes).saturating_mul(vocab).saturating_mul(4);
+    // Qwen's output workspace also owns one argmax and selection pair per row.
+    logits.saturating_add(if family == "qwen4" { extra_rows.saturating_mul(16) } else { 0 })
+}
+
+#[cfg(test)]
+mod scoring_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
+        assert!(!LayoutOptions::default().full_prefill_logits);
+        assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
+        assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
+        assert_eq!(glm_prefill_lanes(None), 3);
+        assert_eq!(effective_glm_prefill_lanes(false, None), 1);
+        assert_eq!(effective_glm_prefill_lanes(false, Some("4")), 1);
+        assert_eq!(effective_glm_prefill_lanes(true, None), 3);
+        for lanes in 1..=4 {
+            assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
+            assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
+                lanes as u64 * 64 * 1000 * 4);
+        }
+        assert_eq!(glm_prefill_lanes(Some("0")), 1);
+        assert_eq!(glm_prefill_lanes(Some("9")), 4);
+        assert_eq!(glm_prefill_lanes(Some("invalid")), 3);
+        assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
+        for family in ["deepseek_v4", "deepseek_v41"] {
+            assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
+        }
+        for family in ["mimo_v2", "qwen4", "glm5", "glm5_flash"] {
+            assert_eq!(full_prefill_logits_bytes(family, 1, 1000), 0);
+            assert_eq!(full_prefill_logits_bytes(family, u64::MAX, u64::MAX), u64::MAX);
+        }
+    }
 }
 
 /// How a component's weights sit on two coordinator GPUs.
@@ -628,6 +695,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some() && index == 0) { Basis::Formula }
             else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
+        if options.full_prefill_logits && index == 0 {
+            device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
+                full_prefill_logits_bytes_with_lanes(family, prefill_rows, model.spec().vocab as u64,
+                    effective_glm_prefill_lanes(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+                        std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())), Basis::Formula));
+        }
         if split {
             let exact_peer = if family == "deepseek_v4" {
                 crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows).ok()
