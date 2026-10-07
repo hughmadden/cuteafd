@@ -13,6 +13,32 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_official_scoring_reference_is_cuda_and_cpu_is_informational():
+    assert MODULE.reference_device('official') == 'cuda'
+    assert MODULE.reference_device('cpu-info') == 'cpu'
+    with pytest.raises(ValueError, match='unknown reference role'):
+        MODULE.reference_device('auto')
+    MODULE.validate_reference_sm(121, 121)
+    with pytest.raises(ValueError, match='differs from serving'):
+        MODULE.validate_reference_sm(120, 121)
+
+
+def test_reference_pcm_rejects_identity_and_geometry_changes(tmp_path):
+    path = tmp_path / 'pcm.f32'
+    np.zeros(481, dtype='<f4').tofile(path)
+    span = {'samples': 481, 'len': 1, 'pcm_sha256': MODULE.sha256(path)}
+    clip = {'pcm': path, 'span': span}
+    assert MODULE.reference_pcm(clip).shape == (481,)
+    for field, bad in [('samples', 482), ('len', 2), ('pcm_sha256', '0' * 64)]:
+        changed = {**clip, 'span': {**span, field: bad}}
+        with pytest.raises(ValueError, match='canonical reference PCM identity'):
+            MODULE.reference_pcm(changed)
+    np.full(481, np.nan, dtype='<f4').tofile(path)
+    clip['span']['pcm_sha256'] = MODULE.sha256(path)
+    with pytest.raises(ValueError, match='canonical reference PCM identity'):
+        MODULE.reference_pcm(clip)
+
+
 def test_bf16_round_matches_serving_nearest_even():
     values = np.array([0x3f800000, 0x80000000, 0x3f808000, 0x3f818000], dtype=np.uint32).view(np.float32)
     assert MODULE.bf16_round(values).tolist() == [0x3f80, 0x8000, 0x3f80, 0x3f82]
