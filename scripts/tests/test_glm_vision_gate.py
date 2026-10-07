@@ -218,3 +218,14 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("fn workspace(", 1)[0]
     assert "self.workspace(self.max_sequences)" in prepare
     assert "prepare_workspace()" not in drafter
+
+
+def test_glm_flash_prefill_scoring_stays_launch_admitted():
+    """Prefill-shaped probe scoring is admitted at launch (--full-prefill-logits) and refused on receipt
+    otherwise, text prompts included; both scoring paths run through probe::score."""
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/serve.rs").read_text()
+    assert "probe::validate_scoring(&job.probe, engine.full_prefill_logits)" in serve
+    assert "score_prefill_path" not in serve
+    scoring = serve.split("if let Some(from) = probe::scoring(&job.probe)", 1)[1].split("match scored", 1)[0]
+    assert scoring.count("probe::score(") == 1 and "engine.full_prefill_logits" in scoring
+    assert "engine.prefill_scoring_media(" in scoring

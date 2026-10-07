@@ -201,31 +201,6 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Teacher-forced scoring on the prefill path (probe `score_path: prefill`): the rows predicting
-/// `tokens[from..]` (those the probe wants) come from prompt chunks of the engine's prefill
-/// capacity, computed as a prompt's own prefill computes them (prefill GEMMs, the chunked KDA
-/// recurrence above 64 rows, the lanes). Returns the rows scored.
-fn score_prefill_path(engine: &GlmfEngine<'_>, probe: &probe::ProbeRef, tokens: &[u32], from: usize,
-    placement: &mut GlmfPlacement) -> Result<usize> {
-    let p = probe.as_ref().context("scoring without a probe")?;
-    anyhow::ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
-    p.selected_score_path("prefill");
-    let from = from.clamp(1, tokens.len() - 1);
-    // Row r (after tokens[..=r]) predicts token r + 1: the last token's row predicts nothing here.
-    let capacity = engine.prefill_capacity();
-    let mut scored = 0;
-    for (index, chunk) in tokens[..tokens.len() - 1].chunks(capacity).enumerate() {
-        let start = index * capacity;
-        let wanted = |r: usize| start + r + 1 >= from && p.wants(start + r + 1);
-        engine.score_prefill(placement, chunk, &wanted, &mut |r, logits| {
-            p.row(start + r + 1, logits);
-            scored += 1;
-            Ok(())
-        })?;
-    }
-    Ok(scored)
-}
-
 /// What the live console shows for GLM 5.3 Flash.
 fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     use console::{Color::*, StepGroup};
@@ -872,8 +847,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
-                        // A text prompt also scores on the prefill path without all-row logits (`score_prefill_path`).
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits || job.media.is_empty()) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -985,33 +959,22 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained. The
                 // decode path (the default) runs verify steps of the probe's rows within the verify
                 // budget (64 unless it asks, at most the engine's --decode-rows); the prefill path
-                // (`score_path: prefill`) the prompt chunks a prompt's prefill runs, with every row's
-                // logits when the launch admitted them (--full-prefill-logits), else (a text prompt)
-                // with the head over the wanted rows 64 at a time after each chunk.
+                // (`score_path: prefill`, admitted at launch with --full-prefill-logits and refused on
+                // receipt otherwise) the prompt chunks a prompt's prefill runs, with every row's logits.
                 let mut placement = admitted.placement;
                 let prefill_path = job.probe.as_ref().and_then(|p| p.spec.score_path.as_deref()) == Some("prefill");
-                let scored = if prefill_path && !engine.full_prefill_logits {
-                    if request_media.spans().is_empty() {
-                        score_prefill_path(engine, &job.probe, &tokens, from, &mut placement)
-                    } else {
-                        Err(anyhow::anyhow!("prefill-shaped probe scoring of a prompt with media requires \
-                            --full-prefill-logits at server launch (FULL_PREFILL_LOGITS=on)"))
-                    }
-                } else {
-                    let rows = probe::verify_rows(&job.probe).or((!prefill_path).then_some(DECODE_ROWS.min(verify_rows)));
-                    probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                        verify_rows, rows, engine.full_prefill_logits, &mut placement,
-                        |placement, chunk, rows| {
-                            if rows > 1 {
-                                engine.prefill_scoring_media(placement, chunk, &request_media)
-                            } else {
-                                Ok(engine.prefill_media_device(placement, chunk, &request_media)?
-                                    .map(probe::ScoreLogits::Device))
-                            }
-                        },
-                        |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk,
-                            &request_media)?.context("scoring needs every layer"))
-                };
+                let rows = probe::verify_rows(&job.probe).or((!prefill_path).then_some(DECODE_ROWS.min(verify_rows)));
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    verify_rows, rows, engine.full_prefill_logits, &mut placement,
+                    |placement, chunk, rows| {
+                        if rows > 1 {
+                            engine.prefill_scoring_media(placement, chunk, &request_media)
+                        } else {
+                            Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
+                        }
+                    },
+                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
+                        .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
