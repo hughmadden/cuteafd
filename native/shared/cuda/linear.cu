@@ -7,6 +7,8 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <pthread.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -925,6 +927,15 @@ cuteafd_status_t triton_driver_kernel(const char* cubin_path,
   return CUTEAFD_STATUS_OK;
 }
 
+void log_blas_handle_created(const char* library) {
+  char thread_name[16] = "unknown";
+  (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+  std::fprintf(stderr,
+               "cuteafd BLAS handle created library=%s thread=%s "
+               "configured_workspace=runtime-default configured_workspace_bytes=unknown\n",
+               library, thread_name);
+}
+
 cuteafd_status_t cublas_handle(cublasHandle_t* out) {
   if (out == nullptr) {
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
@@ -935,6 +946,7 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out) {
     if (status != CUBLAS_STATUS_SUCCESS) {
       return status_from_cublas(status);
     }
+    log_blas_handle_created("cublas");
   }
   *out = handle;
   return CUTEAFD_STATUS_OK;
@@ -1207,8 +1219,11 @@ struct CublasLtM1ParityBatchedPlan {
 
 cublasLtHandle_t cublaslt_handle() {
   static thread_local cublasLtHandle_t handle = nullptr;
-  if (handle == nullptr && cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
-    return nullptr;
+  if (handle == nullptr) {
+    if (cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+      return nullptr;
+    }
+    log_blas_handle_created("cublasLt");
   }
   return handle;
 }
@@ -1283,6 +1298,13 @@ CublasLtM1ParityBatchedPlan* create_cublaslt_m1_parity_plan(
     delete plan;
     return nullptr;
   }
+  char thread_name[16] = "unknown";
+  (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+  std::fprintf(stderr,
+               "cuteafd BLAS plan workspace allocated library=cublasLt thread=%s "
+               "rows=%zu input_dim=%zu output_dim=%zu workspace_bytes=%zu "
+               "scope=device-shape-cache allocator=cudaMalloc\n",
+               thread_name, rows, input_dim, output_dim, plan->workspace_bytes);
   plan->algorithm = result.algo;
   return plan;
 }

@@ -70,6 +70,12 @@ sparkinfer_revision="$(
     --print-revision
 )"
 
+transformers_revision="$(python3 "$source_dir/scripts/build/verify-transformers-source.py" \
+  --source "$incoming/workspace/third_party/transformers" \
+  --lock "$incoming/workspace/third_party/transformers.lock.json" --print-revision)"
+transformers_source_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_tree_sha256"])' \
+  "$incoming/workspace/third_party/transformers.lock.json")"
+
 python3 - "$incoming/META.json" \
   "$incoming/workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json" <<PY
 import hashlib
@@ -95,6 +101,8 @@ metadata = {
     "source_manifest_sha256": ${source_manifest_sha256@Q},
     "artifact_manifest_sha256": ${artifact_sha256@Q},
     "sparkinfer_revision": ${sparkinfer_revision@Q},
+    "transformers_revision": ${transformers_revision@Q},
+    "transformers_source_sha256": ${transformers_source_digest@Q},
     "spark_tp_roles": roles,
     "v41_expert_tp_manifest_sha256": hashlib.sha256(tp_manifest_bytes).hexdigest(),
     "built_unix": int(time.time()),

@@ -354,12 +354,22 @@ impl Bench {
             }
             *slot = Some(active.clone());
         }
+        let report = Arc::new(Mutex::new(Report {
+            schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
+            profile: name, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
+            panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
+                title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
+                ..PanelResult::default() }).collect(),
+            error: (!dropped.is_empty()).then(|| format!("panels not in this build: {}", dropped.join(", "))),
+        }));
+        // Publish the starting run before its id can reach a polling client.
+        self.live.lock().expect("live lock").insert(id.clone(), report.clone());
         let bench = self.clone();
         // The run is active from here (the lockout is already refusing other
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, name, plan, dropped, text);
+            bench.execute(active, base, plan, report, text);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -372,18 +382,9 @@ impl Bench {
         }
     }
 
-    fn execute(self: Arc<Self>, active: ActiveRun, base: String, profile: String, plan: Vec<PlannedPanel>,
-        dropped: Vec<String>, text: Option<BenchText>) {
+    fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
+        report: Arc<Mutex<Report>>, text: Option<BenchText>) {
         let id = active.id.clone();
-        let report = Arc::new(Mutex::new(Report {
-            schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
-            profile, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
-            panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
-                title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
-                ..PanelResult::default() }).collect(),
-            error: (!dropped.is_empty()).then(|| format!("panels not in this build: {}", dropped.join(", "))),
-        }));
-        self.live.lock().expect("live lock").insert(id.clone(), report.clone());
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
         let ticker = {

@@ -671,7 +671,7 @@ pub fn render(report: &PlanReport) -> String {
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(encoder) = &report.encoder {
         let arch = if matches!(encoder.kind, encoder::EncoderKind::Rtx { .. }) { "vision.sm120" } else { "vision.sm121" };
-        let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} (MiMo key-0 attention); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
+        let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {}; shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
         let _ = writeln!(out, "media hash {}", report.encoder_plan_hash);
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);

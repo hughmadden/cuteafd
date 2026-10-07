@@ -701,6 +701,14 @@ impl<'a> GlmDrafter<'a> {
         self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
     }
 
+    /// Explicit serving startup admission; other callers retain lazy allocation.
+    pub(crate) fn prepare_workspace(&self) -> Result<()> {
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
+        }
+        Ok(())
+    }
+
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;

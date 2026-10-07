@@ -1,8 +1,19 @@
 // Resident owner and preallocated MiMo driver. Pointwise/attention arithmetic
 // is donated from Hugh Madden's mimo26f-afd v1.3.0 (see vision.cu).
 #include "vision.cu"
+#include <cstddef>
 #include <cstring>
 #include <type_traits>
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+#include "cuteafd_vision_attention_internal.h"
+#endif
+
+static_assert(sizeof(cuteafd_vision_block) == 96, "vision block ABI");
+static_assert(offsetof(cuteafd_vision_spec, blocks) == 64, "vision prefix ABI");
+static_assert(offsetof(cuteafd_vision_spec, hidden) == 2752, "vision ABI 1 size");
+static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 2792, "vision bias ABI");
+static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 2896, "vision norm ABI");
+static_assert(sizeof(cuteafd_vision_spec) == 3792, "vision ABI 2 size");
 
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
@@ -21,7 +32,9 @@ struct Owner {
   uint8_t* rgb = nullptr;
   float* lut = nullptr;
   int32_t *hw_row = nullptr, *hw_col = nullptr, *col = nullptr, *inverse = nullptr;
-  void* workspace = nullptr;
+  int32_t *pos_indices = nullptr, *cu_seqlens = nullptr;
+  float *pos_weights = nullptr, *lse = nullptr;
+  void *attention = nullptr, *workspace = nullptr;
   bool uploaded = false;
 };
 int device_ok(Owner* o) {
@@ -108,11 +121,47 @@ int observe(Owner* o, cuteafd_vision_observer cb, void* ctx, int stage, const vo
   if(!cb)return 0;
   int e=drain(o,0); return e ? e : cb(ctx,stage,data,rows,width,int(col));
 }
+__global__ void vision_lengths(int32_t* lengths,int n) { lengths[0]=0;lengths[1]=n; }
+int mha_attention(Owner* o,int n) {
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  vision_lengths<<<1,1,0,o->stream>>>(o->cu_seqlens,n);
+  int e=cudaGetLastError();if(e)return e;
+  return cuteafd_vision_attention_launch(o->attention,o->q,o->k,o->v,o->attn,
+    o->lse,o->cu_seqlens,1.f/sqrtf(float(o->spec.head_dim)),o->stream);
+#else
+  return cudaErrorNotSupported;
+#endif
+}
+#include "vision_qwen.cuh"
+#if __has_include("vision_glm.cuh")
+#include "vision_glm.cuh"
+#define CUTEAFD_HAVE_GLM_VISION 1
+#endif
+bool valid_tower(const cuteafd_vision_spec& s) {
+  if(s.abi_version==1)return valid_spec(s);
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(s.reserved==2)return valid_qwen(s);
+#ifdef CUTEAFD_HAVE_GLM_VISION
+  if(s.reserved==3)return valid_glm(s);
+#endif
+#endif
+  return false;
+}
+size_t scratch_tower(Owner* o) {
+  const auto& s=o->spec;
+  if(s.abi_version==2 && s.reserved==2)return scratch_qwen(o,s.max_tokens,s.output_width);
+#ifdef CUTEAFD_HAVE_GLM_VISION
+  if(s.abi_version==2 && s.reserved==3)return scratch_glm(o,s.max_tokens,s.output_width);
+#endif
+  return scratch(o,s.max_tokens,s.output_width);
+}
 }
 
 extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out) {
-  if(!s || !out || !valid_spec(*s))return cudaErrorInvalidValue;
-  Owner o; size_t bytes=scratch(&o,s->max_tokens,s->output_width);
+  if(!s || !out || !valid_tower(*s))return cudaErrorInvalidValue;
+  Owner o;
+  std::memcpy(&o.spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  size_t bytes=scratch_tower(&o);
   *out={s->weight_bytes,bytes-BLAS_BYTES,BLAS_BYTES,0,0}; return 0;
 }
 extern "C" int32_t cuteafd_vision_destroy(void* owner) {
@@ -121,6 +170,9 @@ extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   // Restore the owning device before draining/releasing all storage.
   int previous=-1; cudaGetDevice(&previous); cudaSetDevice(o->device);
   int first=o->stream ? drain(o,0) : 0;
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
+#endif
   if(o->blas)cublasDestroy(o->blas);
   if(o->weights)cudaFree(o->weights);
   if(o->arena)cudaFree(o->arena);
@@ -135,19 +187,26 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   if(admitted < ledger.weights+ledger.scratch+ledger.blas_workspace)return cudaErrorMemoryAllocation;
   e=cudaSetDevice(device);if(e)return e;
   auto* o=new(std::nothrow)Owner; if(!o)return cudaErrorMemoryAllocation;
-  o->spec=*s; o->ledger=ledger; o->device=device;
+  // ABI 1 callers (including old qualification clients) own only the prefix.
+  std::memcpy(&o->spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  o->ledger=ledger; o->device=device;
   auto fail=[&](int rc){cuteafd_vision_destroy(o);return rc;};
   int low,high; e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
   e=cudaMalloc(reinterpret_cast<void**>(&o->weights),s->weight_bytes);if(e)return fail(e);++o->ledger.device_allocations;
   e=cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace);if(e)return fail(e);++o->ledger.device_allocations;
-  scratch(o,s->max_tokens,s->output_width);
+  scratch_tower(o);
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(s->abi_version==2) {
+    e=cuteafd_vision_attention_create(s->head_dim,&o->attention);if(e)return fail(e);
+  }
+#endif
   e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
   e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
   e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
   e=blas_status(cublasSetStream(o->blas,o->stream));if(e)return fail(e);
   e=blas_status(cublasSetWorkspace(o->blas,o->workspace,BLAS_BYTES));if(e)return fail(e);
-  e=cudaFuncSetAttribute(vit_attn_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttnSmem));if(e)return fail(e);
+  if(s->abi_version==1) { e=cudaFuncSetAttribute(vit_attn_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttnSmem));if(e)return fail(e); }
   *out=o;return 0;
 }
 extern "C" int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const void* data, uint64_t bytes) {
@@ -167,6 +226,10 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   int32_t gh, int32_t gw, uint16_t* output, uint64_t output_bytes, cuteafd_vision_observer cb, void* ctx) {
   if(!owner || !rgb || !lut || !output)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner); const auto& s=o->spec;
+  if(s.abi_version==2 && s.reserved==2)return encode_qwen(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
+#ifdef CUTEAFD_HAVE_GLM_VISION
+  if(s.abi_version==2 && s.reserved==3)return encode_glm(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
+#endif
   int64_t count=int64_t(gh)*gw;
   if(!o->uploaded || gh<2 || gw<2 || gh%2 || gw%2 || count>int64_t(s.max_tokens)*4 ||
      rgb_bytes!=uint64_t(count)*16*16*3 || output_bytes!=uint64_t(count/4)*s.output_width*2)return cudaErrorInvalidValue;

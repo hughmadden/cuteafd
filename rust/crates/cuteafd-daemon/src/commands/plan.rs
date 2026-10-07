@@ -129,6 +129,27 @@ mod tests {
     }
 
     #[test]
+    fn planner_and_glm_flash_share_auto_default_and_explicit_off() {
+        use clap::Parser;
+        use cuteafd_loader::plan::MediaMode;
+        for command in ["plan", "serve-glmf"] {
+            for mode in [None, Some("off")] {
+                let mut argv = vec!["cuteafd", command, "--snapshot", "/not-read", "--native-lib", "/not-loaded"];
+                if command == "plan" { argv = vec!["cuteafd", command, "/not-read"]; }
+                if let Some(mode) = mode { argv.extend(["--vision", mode]); }
+                let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+                let expected = if mode.is_some() { MediaMode::Off } else { MediaMode::Auto };
+                assert_eq!(crate::resolve_vision(cli.vision, None), expected);
+                match cli.command {
+                    crate::cli::Commands::Plan(args) => assert_eq!(args.vision, MediaMode::Auto),
+                    crate::cli::Commands::ServeGlmf(args) => assert_eq!(args.vision, MediaMode::Auto),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn replicas_require_an_explicit_layout_inventory() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
         request.layout = false;

@@ -37,6 +37,27 @@ pub struct VisionSpec {
     pub merger_fc2: u64,
     pub inv_freq: u64,
     pub blocks: [VisionBlock; 28],
+    // ABI 2 suffix. ABI 1 MiMo callers retain their original prefix/numerics.
+    pub hidden: u32,
+    pub depth: u32,
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub intermediate: u32,
+    pub patch_size: u32,
+    pub merger_width: u32,
+    pub norm_eps: f32,
+    pub geometry_reserved: u32,
+    pub patch_bias: u64,
+    pub pos_embed: u64,
+    pub merger_norm_bias: u64,
+    pub merger_fc1_bias: u64,
+    pub merger_fc2_bias: u64,
+    pub merger_extra: [u64; 8],
+    pub norm1_bias: [u64; 28],
+    pub norm2_bias: [u64; 28],
+    pub q_norm: [u64; 28],
+    pub k_norm: [u64; 28],
 }
 
 #[repr(C)]
@@ -112,6 +133,7 @@ pub struct NativeVision {
     destroy: Destroy,
     max_tokens: usize,
     output_width: usize,
+    patch_size: usize,
     // CUDA and the BLAS handle never migrate away from their owner thread.
     _thread: PhantomData<Rc<()>>,
 }
@@ -163,6 +185,7 @@ impl NativeVision {
                 _library: library,
                 max_tokens: spec.max_tokens as usize,
                 output_width: spec.output_width as usize,
+                patch_size: if spec.abi_version == 1 { 16 } else { spec.patch_size as usize },
                 _thread: PhantomData,
             };
             check(create(spec, device, admitted_bytes, &mut result.owner))?;
@@ -196,7 +219,7 @@ impl NativeVision {
             || h % 2 != 0
             || w % 2 != 0
             || patches > self.max_tokens * 4
-            || rgb.len() != patches * 768
+            || rgb.len() != patches * self.patch_size * self.patch_size * 3
             || output.len() != patches / 4 * self.output_width
         {
             return Err(VisionError::InvalidInput(
@@ -385,8 +408,11 @@ mod tests {
     #[test]
     fn c_header_layout_is_stable() {
         assert_eq!(std::mem::size_of::<VisionBlock>(), 96);
-        assert_eq!(std::mem::size_of::<VisionSpec>(), 2752);
+        assert_eq!(std::mem::size_of::<VisionSpec>(), 3792);
         assert_eq!(std::mem::size_of::<VisionLedger>(), 40);
         assert_eq!(std::mem::offset_of!(VisionSpec, blocks), 64);
+        assert_eq!(std::mem::offset_of!(VisionSpec, hidden), 2752);
+        assert_eq!(std::mem::offset_of!(VisionSpec, patch_bias), 2792);
+        assert_eq!(std::mem::offset_of!(VisionSpec, norm1_bias), 2896);
     }
 }

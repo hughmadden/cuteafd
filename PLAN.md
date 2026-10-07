@@ -753,9 +753,9 @@ Work, in priority order:
    1024-token image, measured), and history images come from the
    embedding and prefix caches. That beats spending RTX memory or a whole
    Spark on the tower. The −91% decode under back-to-back 4096-token
-   encodes is a stress case, not a gate for this default. MiMo launches
-   now default to `VISION=auto`; other generic families stay `off` until
-   their towers are qualified. Keep V4.1 vision unchanged.
+   encodes is a stress case, not a gate for this default. MiMo and GLM Flash
+   launches now default to `VISION=auto`; other generic families stay `off`
+   until their towers are qualified. Keep V4.1 vision unchanged.
    **Merge note (Qwen WP-7 + GLM Flash WP-9):** the cold_steps echo allowlist in
    `cuteafd-api/src/openai/probe.rs` is `mimo_v2|qwen4` on WP-7 and
    `mimo_v2|glm5_flash` on WP-9. Each branch lists only families whose
@@ -772,6 +772,37 @@ Work, in priority order:
    C1 three-arm parity, chart/G6, exact G7 a/e, single-image interference
    and vision-only connection-loss gates pass. Explicit `VISION=off` skips
    tower startup; checkpoints without a tower remain text-only.
+   **GLM Flash startup promotion `5e6652d3` (2026-10-07):** the matching
+   SM120/ARM64 SM121 build and five-host installed audit pass. The same-image
+   C1 confirmation is 66.88 -> 70.54 emitted tok/s (1.05483x); startup C16 is
+   176.64 tok/s. Ready-to-text and both ordinary-media passes add zero graph
+   captures; all reachable LM/drafter workspaces are resident at readiness,
+   tracked growth is zero, and the 2 MiB global residual is within 16 MiB.
+   Readiness is 72 -> 78 s: graph capture measures 4.21 s; the remaining
+   approximately 1.8 s is unisolated launch/load/poll variation, not attributed
+   to workspace precreation (both arms precreate the same storage).
+   TJ accepts the 4.21 s graph-capture cost: runtime performance takes priority
+   over readiness, while wasteful load transforms into required tile formats
+   must still be avoided. The readiness-only follow-up is cancelled, not run.
+   Startup graphs are qualified for the `work/p0` merge, subject to the batch
+   V4.1 parity gate. **GLM Flash vision qualified (2026-10-07):** retained
+   G1-G7 matching-native evidence plus the frozen three-session baseline/off/auto
+   text parity pass: median paired C1/C16 ratios are 0.99764/0.99731 for off and
+   1.00272/0.99656 for auto (bar 0.98). Default-quota served-image interference
+   at 256/1024/4096 tokens passes; first-delta latencies 569/1274/3159 ms include
+   admission and LM prefill, not isolated encoder stall. The separately sealed
+   loss/off v3 retry passes encoder-only connection loss, cached/new image 503,
+   continued active/new text and unchanged experts. Explicit `VISION=off` admits
+   zero encoder bytes, rejects images and leaves media counters zero. No runtime
+   graph captures are added by media/loss/off. GLM Flash now defaults to
+   `VISION=auto` in the launcher and direct CLI; off remains explicit. The planner
+   derives qualified resident weights from checkpoint headers (1,128,026,176 B)
+   plus fixed-capacity scratch (791,907,584 B): 1,919,933,760 B admitted, Spark-first
+   when capacity permits. Unsupported towers remain unsupported, not admitted;
+   checkpoints without a tower stay text-only. Quantized checkpoints lacking a
+   compatible bundled template still require explicit `CHAT_TEMPLATE_FROM`.
+   The original failed v1 loss evidence stays intact; v3 closes the remaining
+   gates. Shared code still requires the coordinator's batched V4.1 parity gate.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
@@ -830,6 +861,23 @@ Work, in priority order:
    accumulation in V4 expert combine or exchange, and launch-time kernel or
    split choices. This widens paired precision noise for V4 Flash and
    blocks byte-exact speculation there.
+   **Separate task: GLM Flash speculative decode is not launch-deterministic
+   (2026-10-07, WP-9):** greedy, temperature 0 / seed 0, identical prompt and
+   tokenizer diverge at token 6 between launches on the unchanged lazy path
+   (retokenized SSE text, not a raw generated-ID trace). Lazy/startup also
+   diverge; the lazy/lazy control rules out attributing this to bucket padding
+   alone. Find the input: adaptive draft length or copy policy reading timing,
+   or nondeterministic Spark reduce order. The draft cost model demonstrably
+   observes live draft and verify wall time and replans within a request;
+   timing -> proposal width -> arithmetic is a candidate, not a causal trace.
+   Principled fix: make verify logits width-invariant for real rows, extending
+   aligned-bucket invariance across widths and buckets so greedy output is
+   independent of scheduling. Alternative: seed from a fixed cost table and
+   update it only between requests, not mid-stream. Goal: same prompt, same
+   config, same token stream. Until fixed, every performance A/B on a
+   speculative-decoding family needs at least three launches per arm; retain
+   every pair and judge the median paired emitted-throughput ratio. This is a
+   separate determinism task, not part of WP-9 vision/default promotion.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state

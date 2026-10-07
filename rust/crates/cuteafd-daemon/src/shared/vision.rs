@@ -1,6 +1,8 @@
 //! Cold-path tower description, resident runtime and bounded local owner service.
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
+mod glm_flash;
+mod qwen;
 pub mod local;
 pub mod remote;
 pub mod worker;
@@ -130,59 +132,81 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
 }
+fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
+    let mut files = BTreeSet::new();
+    let index_path = snapshot.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let index: serde_json::Value = serde_json::from_reader(File::open(index_path)?)?;
+        let map = index["weight_map"]
+        .as_object()
+        .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
+        for (name, file) in map {
+        if name.starts_with(prefix) {
+            let file = file.as_str().ok_or_else(|| {
+            VisionError::Unsupported(format!("invalid file for {name}"))
+            })?;
+            let path = Path::new(file);
+            if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+            return Err(VisionError::Unsupported(format!(
+                "invalid shard path {file}"
+            )));
+            }
+            files.insert(snapshot.join(path));
+        }
+        }
+    } else {
+        for entry in std::fs::read_dir(snapshot)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|s| s == "safetensors") {
+            files.insert(path);
+        }
+        }
+    }
+    let mut tensors = BTreeMap::new();
+    for path in files {
+        for metadata in read_safetensors_metadata(&path)
+        .map_err(|e| VisionError::Unsupported(e.to_string()))?
+        {
+        if metadata.name.starts_with(prefix) {
+            let name = metadata.name.clone();
+            if tensors
+            .insert(name.clone(), (path.clone(), metadata))
+            .is_some()
+            {
+            return Err(VisionError::Unsupported(format!("duplicate {name}")));
+            }
+        }
+        }
+    }
+    Ok(tensors)
+}
+
 impl TowerSpec {
+    pub fn from_snapshot(snapshot: &Path, max_tokens: usize) -> Result<Self> {
+        let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        match cfg["model_type"].as_str() {
+            Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
+            Some("qwen4_exp") => Self::qwen(snapshot, max_tokens),
+            Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
+        }
+    }
+    pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
+        use cuteafd_loader::media::ImageFamily;
+        match self.native.reserved {
+            2 => ImageFamily::Qwen,
+            3 => ImageFamily::GlmFlash,
+            _ => ImageFamily::Mimo,
+        }
+    }
     pub fn mimo(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: MimoConfig = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
         cfg.validate(max_tokens)?;
-        let mut files = BTreeSet::new();
-        let index_path = snapshot.join("model.safetensors.index.json");
-        if index_path.exists() {
-            let index: serde_json::Value = serde_json::from_reader(File::open(index_path)?)?;
-            let map = index["weight_map"]
-                .as_object()
-                .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
-            for (name, file) in map {
-                if name.starts_with("visual.") {
-                    let file = file.as_str().ok_or_else(|| {
-                        VisionError::Unsupported(format!("invalid file for {name}"))
-                    })?;
-                    let path = Path::new(file);
-                    if path.is_absolute()
-                        || path
-                            .components()
-                            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-                    {
-                        return Err(VisionError::Unsupported(format!(
-                            "invalid shard path {file}"
-                        )));
-                    }
-                    files.insert(snapshot.join(path));
-                }
-            }
-        } else {
-            for entry in std::fs::read_dir(snapshot)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|s| s == "safetensors") {
-                    files.insert(path);
-                }
-            }
-        }
-        let mut tensors = BTreeMap::new();
-        for path in files {
-            for metadata in read_safetensors_metadata(&path)
-                .map_err(|e| VisionError::Unsupported(e.to_string()))?
-            {
-                if metadata.name.starts_with("visual.") {
-                    let name = metadata.name.clone();
-                    if tensors
-                        .insert(name.clone(), (path.clone(), metadata))
-                        .is_some()
-                    {
-                        return Err(VisionError::Unsupported(format!("duplicate {name}")));
-                    }
-                }
-            }
-        }
+        let tensors = tower_catalog(snapshot, "visual.")?;
         for bias in [
             "visual.merger.ln_q.bias",
             "visual.merger.mlp.0.bias",
@@ -289,7 +313,12 @@ impl TowerSpec {
             (m.name.clone(), serde_json::json!({"dtype": format!("{:?}", m.dtype),
                 "shape": m.shape, "byte_offset": m.byte_offset, "byte_length": m.byte_length}))
         }).collect();
-        cuteafd_loader::media::EncoderId::derive("mimo_v2", revision, &headers, 1, sm)
+        let family = match self.image_family() {
+            cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
+            cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
+            cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+        };
+        cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }
 
     fn load_weights(&self) -> Result<Vec<u8>> {
@@ -311,8 +340,9 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
-        for i in 0..16 {
-            let value = 1.0f32 / 10000f32.powf(i as f32 / 16.0);
+        let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
+        for i in 0..frequencies {
+            let value = 1.0f32 / 10000f32.powf(i as f32 / frequencies as f32);
             let start = self.native.inv_freq as usize + i * 4;
             weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -394,12 +424,30 @@ struct Work {
     reply: mpsc::SyncSender<Result<Vec<u16>>>,
     cancelled: Arc<AtomicBool>,
 }
+struct OwnerHealth(Arc<AtomicBool>);
+impl Drop for OwnerHealth {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+fn terminal_encode_failure(result: &Result<Vec<u16>>) -> bool {
+    matches!(result, Err(VisionError::Unavailable | VisionError::Native(
+        cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_))))
+}
+
+fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>, result: Result<Vec<u16>>) -> bool {
+    let terminal = terminal_encode_failure(&result);
+    if terminal { healthy.store(false, Ordering::Release); }
+    let _ = reply.send(result);
+    terminal
+}
+
 /// Bounded queue, one image at a time. Every CUDA call stays on this thread.
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
     queue: Option<mpsc::SyncSender<Work>>,
     owner: Option<JoinHandle<()>>,
     pub ledger: VisionLedger,
+    healthy: Arc<AtomicBool>,
 }
 impl EncoderService {
     pub fn start(
@@ -410,9 +458,12 @@ impl EncoderService {
     ) -> Result<Self> {
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
+        let healthy = Arc::new(AtomicBool::new(false));
+        let owner_health = healthy.clone();
         let owner = thread::Builder::new()
             .name("vision-owner".into())
             .spawn(move || {
+                let _health = OwnerHealth(owner_health.clone());
                 let mut runtime = match VitRuntime::load(spec, &library, device, admitted_bytes) {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -427,6 +478,7 @@ impl EncoderService {
                         return;
                     }
                 };
+                owner_health.store(true, Ordering::Release);
                 if ready.send(Ok(ledger)).is_err() {
                     return;
                 }
@@ -452,7 +504,8 @@ impl EncoderService {
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "vision job failed");
                     }
-                    let _ = work.reply.send(result);
+                    // CUDA errors poison this owner: queued tickets fail closed.
+                    if reply_encode(&owner_health, &work.reply, result) { break; }
                 }
             })?;
         match readiness.recv() {
@@ -460,6 +513,7 @@ impl EncoderService {
                 queue: Some(queue),
                 owner: Some(owner),
                 ledger,
+                healthy,
             }),
             Ok(Err(error)) => {
                 drop(queue);
@@ -474,9 +528,11 @@ impl EncoderService {
         }
     }
     pub fn healthy(&self) -> bool {
-        self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
+        self.healthy.load(Ordering::Acquire) && self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
     }
+    pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
+        if !self.healthy() { return Err(VisionError::Unavailable); }
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let work = Work {
@@ -507,6 +563,57 @@ impl Drop for EncoderService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_exit_and_panic_publish_health_without_scheduler_polling() {
+        for panic in [false, true] {
+            let health = Arc::new(AtomicBool::new(true));
+            let observed = health.clone();
+            let owner = thread::spawn(move || {
+                let _health = OwnerHealth(health);
+                if panic { panic!("injected vision owner failure"); }
+            });
+            assert_eq!(owner.join().is_err(), panic);
+            assert!(!observed.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn only_terminal_native_errors_poison_owner_before_reply() {
+        for error in [VisionError::QueueFull, VisionError::Cancelled,
+            VisionError::Native(cuteafd_ffi::vision::VisionError::InvalidInput("bad grid"))] {
+            assert!(!terminal_encode_failure(&Err(error)));
+        }
+        for error in [VisionError::Unavailable,
+            VisionError::Native(cuteafd_ffi::vision::VisionError::Native(1)),
+            VisionError::Native(cuteafd_ffi::vision::VisionError::Runtime("CUDA failure".into()))] {
+            assert!(terminal_encode_failure(&Err(error)));
+        }
+    }
+    #[test]
+    fn terminal_reply_publishes_unhealthy_and_disconnects_queued_tickets() {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let owner_health = healthy.clone();
+        let (reply, result) = mpsc::sync_channel(0);
+        let (queued_reply, queued_result) = mpsc::sync_channel(1);
+        let owner = thread::spawn(move || {
+            let _health = OwnerHealth(owner_health.clone());
+            assert!(reply_encode(&owner_health, &reply, Err(VisionError::Native(
+                cuteafd_ffi::vision::VisionError::Native(1)))));
+            drop(queued_reply);
+        });
+        assert!(matches!(result.recv().unwrap(), Err(VisionError::Native(_))));
+        assert!(!healthy.load(Ordering::Acquire));
+        let queued = EncoderTicket { result: queued_result, cancelled: Arc::new(AtomicBool::new(false)) };
+        owner.join().unwrap();
+        assert!(matches!(queued.poll(), Err(VisionError::Unavailable)));
+
+        for error in [VisionError::QueueFull, VisionError::Cancelled] {
+            healthy.store(true, Ordering::Release);
+            let (reply, result) = mpsc::sync_channel(1);
+            assert!(!reply_encode(&healthy, &reply, Err(error)));
+            assert!(result.recv().unwrap().is_err());
+            assert!(healthy.load(Ordering::Acquire));
+        }
+    }
     #[test]
     fn reject_unimplemented_geometry_before_weights() {
         let cfg = MimoConfig {

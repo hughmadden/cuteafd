@@ -83,9 +83,9 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# MiMo's qualified remote encoder uses Spark-first auto unless explicitly off.
+# Qualified MiMo and GLM Flash encoders use Spark-first auto unless explicitly off.
 # Other generic families keep off until their towers are qualified.
-if [[ "$family" == mimo_v2 && -z "$(get VISION)" ]]; then vision=auto; fi
+if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && -z "$(get VISION)" ]]; then vision=auto; fi
 # Auto/spark placement is resolved by the encoder plan below.
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
@@ -232,6 +232,26 @@ draft_args=()
 embedding="$(get EMBEDDING gpu)"
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 family_args=(--embedding-placement "$embedding")
+chat_template_mounts=()
+# Vision-only override: no template inference and no changes to text-only prompts.
+chat_template_from="$(get CHAT_TEMPLATE_FROM)"
+if [[ -n "$chat_template_from" && "$vision" != off ]]; then
+  [[ "$family" == glm5_flash ]] || release_die "CHAT_TEMPLATE_FROM currently applies only to GLM Flash vision"
+  if [[ -d "$chat_template_from" ]]; then
+    chat_template_from="$(readlink -f "$chat_template_from")"
+    release_validate_path_setting CHAT_TEMPLATE_FROM "$chat_template_from"
+    if release_path_within "$chat_template_from" "$hub"; then
+      chat_template_from="/root/.cache/huggingface/hub${chat_template_from#"$hub"}"
+    else
+      chat_template_mounts=(-v "$chat_template_from:$chat_template_from:ro")
+    fi
+  else
+    [[ "$chat_template_from" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] &&
+      release_path_has_no_dot_segment "$chat_template_from" || release_die "CHAT_TEMPLATE_FROM must be an existing snapshot or ORG/MODEL HF id"
+    snapshot_of "$chat_template_from" "" >/dev/null || exit 2
+  fi
+  family_args+=(--chat-template-from "$chat_template_from")
+fi
 family_args+=(--vision "$vision" --audio "$audio")
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
@@ -289,9 +309,11 @@ case $family in
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
-if [[ $family == mimo_v2 ]]; then
+if [[ $family == mimo_v2 || $family == glm5_flash ]]; then
   # Optional host embedding quota; unset retains the engine's admitted default.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
+fi
+if [[ $family == mimo_v2 ]]; then
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
   # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
   # prefill unchanged); a number pins the pool.
@@ -655,7 +677,7 @@ vision_peers=()
 encoder_ranks=()
 encoder_hash=""
 encoder_port=$((port + 1))
-if [[ "$family" == mimo_v2 && "$vision" != off ]] &&
+if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS 32768)"; [[ "$plan_pool" != auto ]] || plan_pool=0
@@ -687,7 +709,7 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
   fi
 elif [[ "$vision" == spark* || "$vision" == rtx* ]]; then
-  release_die "explicit encoder placement requires a supported MiMo vision checkpoint"
+  release_die "explicit encoder placement requires a supported MiMo or GLM Flash vision checkpoint"
 fi
 # Replace the original policy with the selected placement, without duplicated flags.
 for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
@@ -845,7 +867,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${chat_template_mounts[@]}" "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

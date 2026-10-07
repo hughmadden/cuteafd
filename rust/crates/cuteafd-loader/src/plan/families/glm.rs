@@ -52,8 +52,8 @@ impl Family for Glm {
     }
 
     fn optional(&self, component: Component) -> bool {
-        // Text serving runs without the native MTP layer and the vision tower
-        // (speculation uses a DFlash2 drafter checkpoint).
+        // Text serving does not require vision or native MTP weights;
+        // speculation uses a separate drafter checkpoint.
         matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
     }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
@@ -314,7 +314,9 @@ impl Glm {
                 "SwiGLU clamp {limit} (gate <= {limit}, |up| <= {limit}) in dense, shared and routed experts"
             ));
         }
-        Ok(GlmModel { id: self.id, cache_cfg, spec: ModelSpec {
+        let vision = if self.id == "glm5_flash" { glm_flash_vision_resident_weights(checkpoint) }
+            else { Err("this GLM family's vision tower is not qualified".into()) };
+        Ok(GlmModel { id: self.id, cache_cfg, vision, spec: ModelSpec {
             family: self.id,
             architecture: self.architecture.into(),
             hidden: usize_field(text, "hidden_size")?,
@@ -330,10 +332,72 @@ impl Glm {
 
 }
 
+pub(crate) fn glm_flash_vision_tensors() -> Vec<(String, Vec<usize>)> {
+    let mut tensors = vec![("patch_embed.proj.weight".into(), vec![1024, 3, 2, 14, 14]),
+        ("patch_embed.proj.bias".into(), vec![1024])];
+    for layer in 0..24 {
+        for (name, shape) in [
+            ("attn.qkv.weight", vec![3072, 1024]), ("attn.qkv.bias", vec![3072]),
+            ("attn.proj.weight", vec![1024, 1024]), ("attn.proj.bias", vec![1024]),
+            ("mlp.gate_proj.weight", vec![4096, 1024]), ("mlp.gate_proj.bias", vec![4096]),
+            ("mlp.up_proj.weight", vec![4096, 1024]), ("mlp.up_proj.bias", vec![4096]),
+            ("mlp.down_proj.weight", vec![1024, 4096]), ("mlp.down_proj.bias", vec![1024]),
+            ("norm1.weight", vec![1024]), ("norm2.weight", vec![1024]),
+            ("attn.q_norm.weight", vec![64]), ("attn.k_norm.weight", vec![64]),
+        ] { tensors.push((format!("blocks.{layer}.{name}"), shape)); }
+    }
+    for (name, shape) in [
+        ("post_layernorm.weight", vec![1024]), ("downsample.weight", vec![4096, 1024, 2, 2]),
+        ("downsample.bias", vec![4096]), ("merger.proj.weight", vec![4096, 4096]),
+        ("merger.post_projection_norm.weight", vec![4096]), ("merger.post_projection_norm.bias", vec![4096]),
+        ("merger.gate_proj.weight", vec![10240, 4096]), ("merger.up_proj.weight", vec![10240, 4096]),
+        ("merger.down_proj.weight", vec![4096, 10240]),
+    ] { tensors.push((name.into(), shape)); }
+    tensors
+}
+
+fn glm_flash_vision_shape(stem: &str) -> Option<Vec<usize>> {
+    let name = stem.strip_prefix("model.visual.")?;
+    glm_flash_vision_tensors().into_iter().find_map(|(tensor, shape)|
+        (tensor.strip_suffix(".weight") == Some(name)).then_some(shape))
+}
+
+pub(crate) fn glm_flash_vision_resident_weights(checkpoint: &Checkpoint) -> Result<u64, String> {
+    let config = &checkpoint.config;
+    let v = &config["vision_config"];
+    for (name, expected) in [("depth", 24), ("hidden_size", 1024), ("intermediate_size", 4096),
+        ("num_heads", 16), ("out_hidden_size", 4096), ("patch_size", 14), ("temporal_patch_size", 2),
+        ("spatial_merge_size", 2), ("projection_intermediate_size", 10240), ("in_channels", 3)] {
+        if v[name].as_u64() != Some(expected) { return Err(format!("GLM vision_config.{name} needs {expected}; add a tower kernel")); }
+    }
+    if config["model_type"] != "glm5_next" || config["text_config"]["hidden_size"] != 4096
+        || v["attention_bias"] != true || v["hidden_act"] != "silu"
+        || v["rms_norm_eps"].as_f64() != Some(1e-5) || v["swiglu_limit"].as_f64() != Some(10.0)
+        || v.get("rope_parameters").is_some_and(|rope| rope["rope_type"] != "axial" || rope["rope_theta"].as_f64() != Some(10000.0)) {
+        return Err("GLM Flash vision/LM geometry is not supported by the resident tower".into());
+    }
+    let tensors: std::collections::BTreeMap<_, _> = checkpoint.tensors.iter()
+        .filter_map(|t| t.meta.name.strip_prefix("model.visual.").map(|name| (name, &t.meta))).collect();
+    let expected = glm_flash_vision_tensors();
+    if tensors.len() != expected.len() { return Err(format!("GLM resident tower needs {} tensors, found {}", expected.len(), tensors.len())); }
+    let mut bytes = 0;
+    for (name, shape) in expected {
+        let tensor = tensors.get(name.as_str()).ok_or_else(|| format!("missing model.visual.{name}"))?;
+        if tensor.dtype != cuteafd_core::DType::Bf16 || tensor.shape != shape
+            || tensor.byte_length != (shape.iter().product::<usize>() * 2) as u64 {
+            return Err(format!("model.visual.{name} needs BF16 {shape:?}"));
+        }
+        // The native arena promotes vectors to FP32; every supported extent is 256-byte aligned.
+        bytes += tensor.byte_length * if shape.len() == 1 { 2 } else { 1 };
+    }
+    Ok(bytes + 64) // Runtime-generated axial rotary frequencies, not checkpoint data.
+}
+
 struct GlmModel {
     id: &'static str,
     spec: ModelSpec,
     cache_cfg: GlmCacheConfig,
+    vision: Result<u64, String>,
 }
 
 enum GlmCacheConfig {
@@ -468,7 +532,12 @@ impl FamilyModel for GlmModel {
             Component::Speculator | Component::SpeculatorExpert => {
                 Err("the native MTP layer is not run (speculation uses a DFlash2 drafter)".into())
             }
-            Component::Vision => Err("text-only: the vision tower is not run".into()),
+            Component::Vision => {
+                self.vision.clone()?;
+                let shape = glm_flash_vision_shape(stem).ok_or_else(|| format!("{stem} is not read by the resident GLM Flash tower"))?;
+                require(operand.is_plain(&[crate::plan::format::Encoding::Bf16]) && operand.logical == shape, ||
+                    format!("{stem} needs BF16 {shape:?}, found {}", describe(operand)))
+            },
             // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),

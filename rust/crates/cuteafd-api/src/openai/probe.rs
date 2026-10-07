@@ -41,7 +41,7 @@ pub struct ProbeSpec {
     /// Decode-shaped scoring width, bounded by the family's verify capacity.
     #[serde(default)]
     pub verify_rows: Option<usize>,
-    /// MiMo-only cold generation replay, reproducing the source prefill/decode geometry.
+    /// MiMo/GLM Flash cold generation replay, reproducing the source prefill/decode geometry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cold_steps: Vec<ProbeColdStep>,
     /// Scoring kernel shape: `decode` or `prefill`. When absent, retain the
@@ -239,7 +239,7 @@ impl Probe {
             r.engine = Some(engine.to_owned());
             r.prompt_ids = prompt_ids.to_vec();
             r.cached_tokens = cached_tokens;
-            if engine == "mimo_v2" { r.cold_steps = self.spec.cold_steps.clone(); }
+            if matches!(engine, "mimo_v2" | "glm5_flash") { r.cold_steps = self.spec.cold_steps.clone(); }
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
@@ -483,9 +483,14 @@ mod tests {
                 ProbeColdStep { end: 9, decode: true }, ProbeColdStep { end: 12, decode: false }],
             ..Default::default() };
         assert!(spec.validate_cold_steps(12, 8, 2).is_ok());
-        let probe = Probe::new(spec.clone());
-        probe.admitted("mimo_v2", &[0; 12], 0);
-        assert_eq!(probe.record().cold_steps, spec.cold_steps);
+        for engine in ["mimo_v2", "glm5_flash"] {
+            let probe = Probe::new(spec.clone());
+            probe.admitted(engine, &[0; 12], 0);
+            assert_eq!(probe.record().cold_steps, spec.cold_steps);
+        }
+        let unsupported = Probe::new(spec.clone());
+        unsupported.admitted("qwen4", &[0; 12], 0);
+        assert!(unsupported.record().cold_steps.is_empty());
         assert!(spec.validate_cold_steps(12, 7, 2).is_err());
         assert!(spec.validate_cold_steps(13, 8, 2).is_err());
         spec.cold_steps[1].end = 8;

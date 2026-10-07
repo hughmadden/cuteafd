@@ -507,16 +507,64 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
 
 
 @pytest.mark.parametrize("quota", [None, "4MiB", "0"])
-def test_mimo_embedding_cache_quota_is_explicit_only(tmp_path, quota):
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
-    keys = "" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n"
-    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+@pytest.mark.parametrize("family,serve", [("mimo_v2_flash", "serve-mimo"), ("glm5_next", "serve-glmf")])
+def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, family, serve):
+    config = {"model_type": family, "num_hidden_layers": 2}
+    config.update({"moe_layer_freq": [0, 1]} if family == "mimo_v2_flash" else
+                  {"mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]})
+    keys = "SPECULATOR=off\n" + ("" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n")
+    model = "test/mimo" if family == "mimo_v2_flash" else "zai-org/GLM-5.3-Flash"
+    result = _family_launch_result(tmp_path, config, model, keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     if quota is None:
         assert "--media-cache-bytes" not in launch
     else:
         assert f"--media-cache-bytes {quota}" in launch
+
+
+@pytest.mark.parametrize("source_kind", ["hf", "hub_snapshot", "external_snapshot"])
+def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path, source_kind):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    source = "test/model"
+    expected = source
+    if source_kind == "hub_snapshot":
+        source = str(tmp_path / "hf/hub/models--test--model/snapshots/abc")
+        expected = "/root/.cache/huggingface/hub/models--test--model/snapshots/abc"
+    elif source_kind == "external_snapshot":
+        source = str(tmp_path / "vendor")
+        Path(source).mkdir()
+        expected = source
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--chat-template-from {expected}" in launch
+    if source_kind == "external_snapshot":
+        assert f"-v {source}:{source}:ro" in launch
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert "--chat-template-from" not in worker and source not in worker
+
+
+def test_text_only_glm_ignores_template_override(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=off\nCHAT_TEMPLATE_FROM=missing/vendor\n")
+    assert result.returncode == 0, result.stderr
+    assert "--chat-template-from" not in result.stderr and "missing/vendor" not in result.stderr
+
+
+@pytest.mark.parametrize("source", ["../vendor", "vendor/../flash", "vendor/..", "missing/vendor"])
+def test_glm_template_override_invalid_source_refused_before_workers(tmp_path, source):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+    assert result.returncode == 2, result.stderr
+    assert "CHAT_TEMPLATE_FROM" in result.stderr or "missing snapshot" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr and "cuteafd serve-glmf" not in result.stderr
 
 
 @pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
@@ -952,11 +1000,34 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
         assert f"--vision {mode or 'auto'}" in preflight
 
 
+@pytest.mark.parametrize("mode,kind", [(None, "spark"), ("off", "off"), ("auto", "spark"),
+                                      ("spark:0", "spark"), ("rtx:0", "rtx")])
+def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode, kind):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = "RTX_GPUS=1\nSPECULATOR=off\n" + (f"VISION={mode}\n" if mode else "")
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--vision {kind}" in launch
+    assert ("--encoder-listen" in result.stderr) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in launch and "--encoder-revision abc" in launch
+    assert ("cuteafd plan" in result.stderr) == (kind != "off")
+    if kind != "off":
+        preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+        assert f"--vision {mode or 'auto'}" in preflight
+
+
 @pytest.mark.parametrize("family_config,serve", [
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
-    ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
-      "layer_types": ["linear_attention", "deepseek_sparse_attention"]}, "serve-glmf"),
     ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
       "layer_types": ["linear_attention", "full_attention"]}}, "serve-qwen4"),
 ])
@@ -969,11 +1040,17 @@ def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_conf
     assert "--encoder-listen" not in result.stderr and "--vision-peers" not in launch
 
 
-def test_text_only_mimo_auto_default_does_not_start_a_tower(tmp_path):
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
-    result = _family_launch_result(tmp_path, config, "test/mimo", "SPECULATOR=off\n")
+@pytest.mark.parametrize("config,model,serve", [
+    ({"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+     "test/mimo", "serve-mimo"),
+    ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+      "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
+     "zai-org/GLM-5.3-Flash", "serve-glmf"),
+])
+def test_text_only_qualified_family_auto_default_does_not_start_a_tower(tmp_path, config, model, serve):
+    result = _family_launch_result(tmp_path, config, model, "SPECULATOR=off\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     assert "--vision auto" in launch
     assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
 
