@@ -1,4 +1,4 @@
-use super::{keys::validate_spans, EmbeddingLease, ImageKey, MediaError, MediaSpan};
+use super::{keys::validate_spans, EmbeddingLease, MediaKey, MediaError, MediaSpan};
 
 /// Lazy per-span BF16 features. Prefix restores need only the span descriptors.
 #[derive(Clone, Debug)]
@@ -83,7 +83,8 @@ impl RequestMedia {
     /// Probe-only override: bypasses the encoder with an admitted, domain-separated
     /// feature lease. The real span identity stays unchanged; callers must cold-admit
     /// the probe and disable every prefix snapshot. Never cache overrides by image key.
-    pub fn attach_probe_override(&mut self, image_key: ImageKey, lease: EmbeddingLease) -> Result<(), MediaError> {
+    pub fn attach_probe_override(&mut self, image_key: impl Into<MediaKey>, lease: EmbeddingLease) -> Result<(), MediaError> {
+        let image_key = image_key.into();
         if lease.key() == image_key { return Err(MediaError::Features); }
         let rows = lease.features().ok_or(MediaError::NotReady(lease.key()))?;
         let mut found = false;
@@ -97,7 +98,8 @@ impl RequestMedia {
         if !found { return Err(MediaError::Spans); }
         Ok(())
     }
-    pub fn has_features(&self, key: ImageKey) -> bool {
+    pub fn has_features(&self, key: impl Into<MediaKey>) -> bool {
+        let key = key.into();
         self.spans
             .iter()
             .zip(&self.features)
@@ -151,17 +153,18 @@ impl RequestMedia {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ImageKey;
     use crate::media::EmbeddingCache;
     use std::sync::Arc;
     #[test]
     fn probe_override_uses_a_separate_budgeted_cache_identity() {
         let image = ImageKey([7; 32]); let override_key = ImageKey([8; 32]);
-        let mut request = RequestMedia::new(vec![MediaSpan { start: 1, len: 1, key: image }], 2, 3).unwrap();
+        let mut request = RequestMedia::new(vec![MediaSpan { start: 1, len: 1, key: image.into() }], 2, 3).unwrap();
         let mut cache = EmbeddingCache::new(4);
         let pin = cache.reserve(override_key, 4).unwrap();
         let lease = cache.complete(override_key, Arc::from([0, 0, 0x80, 0x3f])).unwrap();
         request.attach_probe_override(image, lease).unwrap(); drop(pin);
-        assert_eq!(request.spans()[0].key, image);
+        assert_eq!(request.spans()[0].key, image.into());
         assert!(!cache.contains(image)); assert!(cache.contains(override_key));
         assert!(cache.reserve(image, 4).is_err(), "override remains admitted and pinned");
         let mut chunk = MediaChunk::default(); request.write_chunk(0, 3, &mut chunk).unwrap();
@@ -176,7 +179,7 @@ mod tests {
         let span = MediaSpan {
             start: 2,
             len: 3,
-            key,
+            key: key.into(),
         };
         let mut request = RequestMedia::new(vec![span], 2, 6).unwrap();
         assert!(request.ready(5, 6));

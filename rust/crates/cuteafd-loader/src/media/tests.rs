@@ -157,7 +157,7 @@ fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
         [MediaSpan {
             start: 2,
             len: 4,
-            key: image.key
+            key: image.key.into()
         }]
     );
     assert!(expander.expand(&[1, 12, 2], &[image.clone()], 128).is_err());
