@@ -10,16 +10,17 @@ use common_hc_5::{
     cache, config, default_cache, device_pages, restored_bytes, settle, snapshot, store_resident,
     stored_bytes, target, tokens, write_snapshot, Device, FailAfter, Payload, DEVICE_BYTES,
 };
+use cuteafd_core::prefix::ReuseRule;
 use cuteafd_hostcache::cache::{
-    DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, SkipReason, StoreOutcome,
+    DevicePage, DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, SkipReason, StoreOutcome,
     StoreTicket, TickReport,
 };
-use cuteafd_hostcache::config::StoreMode;
+use cuteafd_hostcache::config::{Config, StoreMode};
 use cuteafd_hostcache::copy::{CopyFault, CopyModel, DeviceRange, Stream, StubCopyEngine};
 use cuteafd_hostcache::pool::testing::{layout, CHUNK};
 use cuteafd_hostcache::pool::Layout;
-use cuteafd_hostcache::snapshot::{DevicePageId, Key};
-use cuteafd_hostcache::SnapshotKind;
+use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, Key, SnapshotMeta};
+use cuteafd_hostcache::{SnapshotKind, COMPRESSORS};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -485,6 +486,50 @@ fn class_exhaustion_evicts_until_it_fits() {
         cache.store(&snapshot, 99),
         StoreOutcome::Skipped(SkipReason::Exhausted)
     );
+}
+
+/// A snapshot of one page in compressor 0 over `tokens`, as the eviction tests size them.
+fn one_page(device: &mut Device, kind: SnapshotKind, tokens: &[u32], page: u32) -> DeviceSnapshot {
+    let layout = layout();
+    let mut pages: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    pages[0].push(DevicePage {
+        id: DevicePageId { compressor: 0, page, generation: 0 },
+        segments: vec![device.range(layout.page)],
+    });
+    DeviceSnapshot {
+        meta: SnapshotMeta { kind, tokens: tokens.to_vec(), end: tokens.len() as u32, has_draft: false },
+        pages,
+        tail: vec![device.range(layout.tail)],
+        draft: None,
+        scores: vec![device.range(layout.scores)],
+    }
+}
+
+/// One poll commits every store that completed since the last at one clock reading.
+/// `LeastRecent` still evicts them in commit order, whatever their kind; the per-poll
+/// timestamp tied them and evicted the newer prompt snapshot first.
+#[test]
+fn stores_committed_by_one_poll_are_evicted_in_commit_order() {
+    // Four 8 KiB chunks hold two one-page snapshots; a third store's tail evicts one.
+    let config = Config { bytes: 4 * 8192, chunk_bytes: 8192, ..config(0, StoreMode::OnRetain) };
+    let engine = StubCopyEngine::new(CopyModel::default(), DEVICE_BYTES, config.bytes as usize);
+    let mut cache: HostCache<StubCopyEngine, Payload> =
+        HostCache::with_rule(config, layout(), engine, ReuseRule::V41, EvictionOrder::LeastRecent).expect("cache");
+    let mut device = Device::new(DEVICE_BYTES);
+    // A turn snapshot, then another conversation's prompt snapshot, completed by one poll.
+    let turn: Vec<u32> = (100..120).collect();
+    let prompt: Vec<u32> = (200..220).collect();
+    let first = one_page(&mut device, SnapshotKind::Turn, &turn, 1);
+    let second = one_page(&mut device, SnapshotKind::Prompt, &prompt, 2);
+    assert!(matches!(cache.store(&first, 1), StoreOutcome::Issued(_)));
+    assert!(matches!(cache.store(&second, 2), StoreOutcome::Issued(_)));
+    settle(&mut cache);
+    assert_eq!(cache.tick().completed.len(), 2);
+    let third = one_page(&mut device, SnapshotKind::Turn, &(300..320).collect::<Vec<u32>>(), 3);
+    store_resident(&mut cache, &third, 3);
+    assert_eq!(cache.metrics().host_evictions, 1);
+    assert!(cache.lookup(&turn).is_none(), "the first commit is the least recently used");
+    assert!(cache.lookup(&prompt).is_some(), "the newer prompt snapshot stays");
 }
 
 /// A stub that fails the `skip + 1`-th store-stream copy, with a configurable copy budget.

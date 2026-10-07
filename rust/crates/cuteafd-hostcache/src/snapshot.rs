@@ -37,9 +37,10 @@ pub enum EvictionOrder {
     /// Legacy order: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
     #[default]
     Banks,
-    /// Least recently used; at equal use a prompt snapshot first (a prompt
-    /// snapshot shares its pages with its turn snapshot, so bank order deleted fresh prompts
-    /// before stale turns and made retries prefill from cold).
+    /// Least recently used: the smallest use count (`HostSnapshot::last_use`), whichever bank.
+    /// A prompt snapshot shares its pages with its turn snapshot, so bank order deleted fresh
+    /// prompts before stale turns and made retries prefill from cold. A conversation stores its
+    /// prompt snapshot before its turn snapshot, so a stale pair still goes prompt first.
     LeastRecent,
 }
 
@@ -78,8 +79,12 @@ pub struct HostSnapshot {
     pub draft: Option<Slab>,
     /// The scores row, when the layout enables the class.
     pub scores: Option<Slab>,
-    /// Virtual-clock time of the last lookup hit, for eviction order.
+    /// Virtual-clock time of the store, then of the last lookup hit.
     pub last_access_ns: u64,
+    /// The store's use count at this snapshot's store or last lookup hit: unique among
+    /// resident snapshots, so `LeastRecent` order is strict even when one poll commits
+    /// several stores at the same clock reading.
+    pub last_use: u64,
     /// Restores in flight; a pinned snapshot is never evicted.
     pub pins: u32,
 }
@@ -142,6 +147,8 @@ pub struct Snapshots {
     device_map: HashMap<DevicePageId, PageRef>,
     next_key: Key,
     order: EvictionOrder,
+    /// Stores plus lookup hits so far: the clock `HostSnapshot::last_use` is stamped from.
+    uses: u64,
 }
 
 impl Snapshots {
@@ -162,6 +169,7 @@ impl Snapshots {
             free_pages: Vec::new(),
             device_map: HashMap::new(),
             next_key: 0,
+            uses: 0,
         }
     }
 
@@ -260,6 +268,7 @@ impl Snapshots {
             }
         }
         self.retention.bank_mut(kind).insert(&meta.tokens, key);
+        self.uses += 1;
         self.snapshots.insert(
             key,
             HostSnapshot {
@@ -270,6 +279,7 @@ impl Snapshots {
                 draft,
                 scores,
                 last_access_ns: now_ns,
+                last_use: self.uses,
                 pins: 0,
             },
         );
@@ -283,15 +293,18 @@ impl Snapshots {
         self.release_slabs(plan.tail, plan.draft, plan.scores);
     }
 
-    /// The engine's reuse rule over host snapshots; refreshes the hit's access clock. Invariant:
-    /// a hit is exactly a `Retention::lookup_reusable` hit over the resident snapshots.
+    /// The engine's reuse rule over host snapshots; refreshes the hit's access clock and use.
+    /// Invariant: a hit is exactly a `Retention::lookup_reusable` hit over the resident
+    /// snapshots.
     pub fn lookup(&mut self, tokens: &[u32], now_ns: u64) -> Option<Hit> {
         let (common, frontier, key) = {
             let (common, frontier, &key) = self.retention.lookup_reusable(tokens)?;
             (common, frontier, key)
         };
         let snapshot = self.snapshots.get_mut(&key)?;
+        self.uses += 1;
         snapshot.last_access_ns = now_ns;
+        snapshot.last_use = self.uses;
         Some(Hit {
             key,
             kind: snapshot.meta.kind,
@@ -303,7 +316,9 @@ impl Snapshots {
     /// Refresh a verified engine-selected hit without selecting a different radix candidate.
     pub(crate) fn touch(&mut self, key: Key, now_ns: u64) -> bool {
         let Some(snapshot) = self.snapshots.get_mut(&key) else { return false; };
+        self.uses += 1;
         snapshot.last_access_ns = now_ns;
+        snapshot.last_use = self.uses;
         true
     }
 
@@ -350,15 +365,16 @@ impl Snapshots {
         }
     }
 
-    /// Evict the least recently used unpinned snapshot; returns its key and the bytes freed, or
-    /// `None` when only pinned snapshots remain. Invariant: a pinned snapshot is never evicted.
+    /// Evict the next unpinned snapshot in this store's `EvictionOrder`; returns its key and the
+    /// bytes freed, or `None` when only pinned snapshots remain. Invariant: a pinned snapshot is
+    /// never evicted.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
         if self.order == EvictionOrder::LeastRecent {
             let key = self
                 .snapshots
                 .values()
                 .filter(|snapshot| snapshot.pins == 0)
-                .min_by_key(|s| (s.last_access_ns, s.meta.kind == SnapshotKind::Turn, s.key))
+                .min_by_key(|snapshot| snapshot.last_use)
                 .map(|snapshot| snapshot.key)?;
             let before = self.pool.bytes_used();
             self.remove(key);
@@ -740,29 +756,38 @@ mod tests {
         let b = store.commit_store(b, 2);
         assert_eq!(store.peek(&[1, 2]).unwrap().key, a);
         assert_eq!(store.get(a).unwrap().last_access_ns, 1);
+        assert_eq!(store.get(a).unwrap().last_use, 1);
         assert!(store.touch(a, 3));
         assert!(!store.touch(u64::MAX, 4));
         assert_eq!(store.evict_one().unwrap().0, b);
         assert_eq!(store.get(a).unwrap().last_access_ns, 3);
+        assert_eq!(store.get(a).unwrap().last_use, 3);
     }
 
     #[test]
-    fn least_recent_order_evicts_by_use_then_prompt_first() {
+    fn least_recent_order_follows_uses_whatever_the_clock_reads() {
         let pool = crate::pool::testing::pool(1 << 30).0;
         let mut store = Snapshots::with_rule(pool, ReuseRule::EXACT, EvictionOrder::LeastRecent);
         let commit = |store: &mut Snapshots, kind, tokens: &[u32], page: u32, now| {
             let plan = store.plan_store(meta(kind, tokens, false), &pages(&[id(page)])).expect("plan");
             store.commit_store(plan, now)
         };
+        // Stores and hits are ordered as they happen. Clock readings that tie (one poll
+        // committing several stores) or run backwards order nothing.
         let old_turn = commit(&mut store, SnapshotKind::Turn, &[1, 2, 3], 1, 1);
         let fresh_prompt = commit(&mut store, SnapshotKind::Prompt, &[4, 5], 2, 9);
-        let tied_turn = commit(&mut store, SnapshotKind::Turn, &[6, 7, 8], 3, 5);
-        let tied_prompt = commit(&mut store, SnapshotKind::Prompt, &[6, 7], 4, 5);
+        let same_poll_turn = commit(&mut store, SnapshotKind::Turn, &[6, 7, 8], 3, 5);
+        let same_poll_prompt = commit(&mut store, SnapshotKind::Prompt, &[6, 7], 4, 5);
         // Exact-frontier rule: a partial match is no hit, an exact ancestor is.
         assert!(store.lookup(&[1, 2, 9], 10).is_none());
         assert_eq!(store.lookup(&[4, 5, 6], 3).map(|hit| hit.key), Some(fresh_prompt));
+        let uses: Vec<u64> = [old_turn, fresh_prompt, same_poll_turn, same_poll_prompt].iter()
+            .map(|&key| store.get(key).unwrap().last_use).collect();
+        assert_eq!(uses, [1, 5, 3, 4]);
         let order: Vec<Key> = std::iter::from_fn(|| store.evict_one().map(|(key, _)| key)).collect();
-        assert_eq!(order, vec![old_turn, fresh_prompt, tied_prompt, tied_turn]);
+        // The per-poll clock tied the same-poll pair and evicted the prompt first; the use
+        // count keeps their commit order.
+        assert_eq!(order, vec![old_turn, same_poll_turn, same_poll_prompt, fresh_prompt]);
         assert!(store.is_empty() && store.retention().bank(SnapshotKind::Prompt).is_empty());
     }
 
@@ -921,7 +946,9 @@ mod tests {
         assert_eq!(hit.kind, SnapshotKind::Turn);
         assert_eq!((hit.common, hit.frontier), (4, 4));
         assert_eq!(store.get(key).expect("snapshot").last_access_ns, 42);
+        assert_eq!(store.get(key).expect("snapshot").last_use, 2);
         assert!(store.lookup(&[9], 43).is_none());
+        assert_eq!(store.get(key).expect("snapshot").last_use, 2, "a miss is no use");
     }
 
     #[test]
