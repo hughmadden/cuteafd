@@ -138,7 +138,9 @@ impl Family for MiMo {
         });
         let checkpoint_tp = checkpoint_tp(&checkpoint.snapshot).map_err(|e| format!("{e:#}"));
         let vision = vision_geometry(&checkpoint.config, cfg.hidden);
-        Ok(Box::new(MimoModel { cfg, spec, programs, checkpoint_tp, vision }))
+        let audio = crate::media::audio_tower::AudioTowerPlan::from_snapshot(&checkpoint.snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32).map_err(|e| e.to_string());
+        Ok(Box::new(MimoModel { cfg, spec, programs, checkpoint_tp, vision, audio }))
     }
 
     fn expert_catalog(&self) -> bool {
@@ -284,6 +286,7 @@ struct MimoModel {
     /// The checkpoint's tensor-parallel degree (fused qkv row shards).
     checkpoint_tp: Result<usize, String>,
     vision: Result<(), String>,
+    audio: Result<crate::media::audio_tower::AudioTowerPlan, String>,
 }
 
 fn vision_geometry(config: &serde_json::Value, hidden: usize) -> Result<(), String> {
@@ -427,7 +430,11 @@ impl FamilyModel for MimoModel {
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if role.component == Component::Audio {
-            return Err("MiMo audio is not qualified; use --audio off".into());
+            let plan = self.audio.as_ref().map_err(Clone::clone)?;
+            let read = plan.reads().iter().find(|(name, _)| name.strip_suffix(".weight").unwrap_or(name) == stem)
+                .map(|(_, read)| read).ok_or_else(|| format!("{stem} is not read by the bundled MiMo audio tower"))?;
+            return require(operand.is_plain(&[Encoding::Bf16, Encoding::F32]) && operand.logical == read.metadata.shape, ||
+                format!("{stem} needs plain BF16/FP32 {:?}; found {}", read.metadata.shape, describe(operand)));
         }
         if role.component == Component::Vision {
             self.vision.clone()?;

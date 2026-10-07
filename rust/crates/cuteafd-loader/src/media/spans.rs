@@ -42,6 +42,82 @@ impl SpanExpander {
         }
         Ok(expander)
     }
+    pub fn from_audio_config(config: &serde_json::Value, vocabulary: u32) -> Result<Self> {
+        let image_markers = serde_json::json!({
+            "image_token_id": config.get("audio_token_id"),
+            "vision_start_token_id": config.get("audio_start_token_id"),
+            "vision_end_token_id": config.get("audio_end_token_id"),
+        });
+        Self::from_config(&image_markers, vocabulary)
+    }
+
+    /// Expand both modalities in one pass so every span uses final LM offsets.
+    pub fn expand_media(
+        config: &serde_json::Value,
+        vocabulary: u32,
+        tokens: &[u32],
+        images: &[PreparedImage],
+        audio: &[super::audio::PreparedAudio],
+        context_limit: usize,
+    ) -> Result<ExpandedMediaPrompt> {
+        let image_markers = config.get("image_token_id").map(|_| Self::from_config(config, vocabulary)).transpose()?;
+        let audio_markers = config.get("audio_token_id").map(|_| Self::from_audio_config(config, vocabulary)).transpose()?;
+        if vocabulary == 0 || vocabulary >= 1 << 31 || tokens.iter().any(|&id| id >= vocabulary) {
+            return Err(invalid("token outside checkpoint vocabulary"));
+        }
+        if let (Some(image), Some(audio)) = (image_markers, audio_markers) {
+            if [image.placeholder, image.start, image.end].iter().any(|id|
+                [audio.placeholder, audio.start, audio.end].contains(id)) {
+                return Err(invalid("image and audio marker ids overlap"));
+            }
+        }
+        let mut descriptors = Vec::new();
+        if let Some(markers) = image_markers {
+            descriptors.push((markers, images.iter().map(|image| (image.tokens, image.key.into())).collect::<Vec<(usize, cuteafd_core::MediaKey)>>()));
+        } else if !images.is_empty() { return Err(invalid("checkpoint has no image markers")); }
+        if audio.len() > super::audio::MAX_CLIPS || audio.iter().try_fold(0usize,
+            |samples, clip| samples.checked_add(clip.pcm.len())).is_none_or(|samples| samples > super::audio::MAX_REQUEST_SAMPLES) {
+            return Err(invalid("audio request exceeds clip count or total duration"));
+        }
+        if let Some(markers) = audio_markers {
+            let mut rows = Vec::new();
+            for clip in audio {
+                let geometry = super::audio::AudioGeometry::for_samples(clip.pcm.len())
+                    .map_err(|e| invalid(e.to_string()))?;
+                if geometry != clip.geometry { return Err(invalid("audio geometry differs from PCM")); }
+                rows.push((geometry.tokens, clip.key.into()));
+            }
+            descriptors.push((markers, rows));
+        } else if !audio.is_empty() { return Err(invalid("checkpoint has no audio markers")); }
+        let mut expanded_len = tokens.len();
+        for (markers, rows) in &descriptors {
+            if tokens.iter().filter(|&&id| id == markers.placeholder).count() != rows.len() {
+                return Err(invalid("media placeholder count differs from supplied inputs"));
+            }
+            for (len, _) in rows {
+                if *len == 0 { return Err(invalid("media has no LM rows")); }
+                expanded_len = expanded_len.checked_add(len - 1).ok_or_else(|| invalid("media prompt length overflow"))?;
+            }
+        }
+        if expanded_len > context_limit { return Err(invalid("expanded media prompt exceeds context limit")); }
+        let mut expanded = Vec::with_capacity(expanded_len);
+        let mut media = Vec::with_capacity(images.len() + audio.len());
+        let mut positions = vec![0; descriptors.len()];
+        for (i, &token) in tokens.iter().enumerate() {
+            if let Some(kind) = descriptors.iter().position(|(markers, _)| markers.placeholder == token) {
+                let (markers, rows) = &descriptors[kind];
+                if i == 0 || tokens.get(i - 1) != Some(&markers.start) || tokens.get(i + 1) != Some(&markers.end) {
+                    return Err(invalid("media placeholder must be enclosed by its start/end tokens"));
+                }
+                let (len, key) = rows[positions[kind]];
+                positions[kind] += 1;
+                media.push(MediaSpan { start: expanded.len(), len, key });
+                expanded.extend(std::iter::repeat_n(token, len));
+            } else { expanded.push(token); }
+        }
+        Ok(ExpandedMediaPrompt { tokens: expanded, media })
+    }
+
     pub fn expand(
         &self,
         tokens: &[u32],

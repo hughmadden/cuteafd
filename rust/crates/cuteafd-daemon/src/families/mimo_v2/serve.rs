@@ -73,6 +73,8 @@ pub(crate) struct ServeArgs {
     /// Resolved global vision policy, assigned before dispatch.
     #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
     pub vision: cuteafd_loader::plan::MediaMode,
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    pub audio: cuteafd_loader::plan::MediaMode,
     /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
     pub media_cache_bytes: Option<u64>,
@@ -114,13 +116,19 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
+    let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, media_cache_bytes, remote));
-    if let Some((preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
-        profile = profile.with_loaded_vision(preparer);
-        profile.vision_health = health;
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote));
+    if let Some((preparer, audio_preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
+        if let Some(preparer) = preparer {
+            profile = profile.with_loaded_vision(preparer);
+            profile.vision_health = health.clone();
+        }
+        if let Some(preparer) = audio_preparer {
+            profile = profile.with_loaded_audio(preparer, health.context("audio owner health")?);
+        }
     }
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
@@ -186,11 +194,12 @@ struct Policy {
 const PRO_TP6_STEP_MS: [(usize, f64); 9] = [(1, 31.6), (2, 39.5), (4, 54.1), (8, 77.1), (16, 114.4), (24, 166.7),
     (32, 197.8), (48, 258.3), (64, 304.4)];
 
-type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
+type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,
+    Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
+    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -198,11 +207,12 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, audio, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
-    let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
+    let preparer = vision.as_ref().and_then(|vision| vision.preparer.clone());
+    let audio_preparer = vision.as_ref().and_then(|vision| vision.audio_preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
         (vision.encoder, vision.cache_bytes));
     let health = encoder.health_handle();
@@ -223,15 +233,15 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             tracing::info!(graphs, rows = DECODE_ROWS, elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo decode graphs captured");
         }
-        anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
+        anyhow::ensure!((preparer.is_none() && audio_preparer.is_none()) || media.encoder().available(), "vision encoder unavailable before readiness");
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(preparer.clone().map(|p| (p, health.clone()))));
+            let _ = ready.send(Ok((preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone()))));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
             args.token_io.token_select, host_config, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| preparer.map(|p| (p, health))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health))).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -489,7 +499,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
-                        if !job.media.is_empty() && !media.encoder().available() {
+                        if (!job.media.is_empty() || !job.audio.is_empty()) && !media.encoder().available() {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
@@ -528,7 +538,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                 },
             };
-            if !ready.job().job.media.is_empty() && !media.encoder().available() {
+            if (!ready.job().job.media.is_empty() || !ready.job().job.audio.is_empty()) && !media.encoder().available() {
                 let _ = ready.job().job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                 continue;
             }

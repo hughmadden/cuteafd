@@ -227,6 +227,21 @@ impl AudioTowerPlan {
     pub fn weight_bytes(&self) -> u64 {
         self.weight_bytes
     }
+    /// Mirrors native/shared/cuda/audio_runtime.cu scratch() (including BLAS/FFT).
+    pub fn scratch_bytes(&self, samples: usize) -> Result<u64> {
+        let geometry = super::audio::AudioGeometry::for_samples(samples).map_err(|e| unsupported(e.to_string()))?;
+        let m = geometry.mel_frames.min(6000) as u64;
+        let c = m.div_ceil(2);
+        let p = geometry.codes.div_ceil(4) as u64 * 4;
+        let n = m.max(p);
+        let mut buffers = vec![samples as u64 * 4, 960*4, 481*128*4, c*64*4, 4*64*4,
+            m*960*4, m*481*8, m*481*4, m*128*4, m*3072*4];
+        buffers.extend(std::iter::repeat_n(n*1024*4, 11));
+        buffers.extend([n*4096*4, (c*c*16).max(p*4*16)*4, c*1024*4, c*1024*4,
+            c*4, 20*1024*4, geometry.codes as u64*20*4, p*1024*4,
+            p/4*self.output_width as u64*4, (n*4096).max(p/4*16384)*4, 4<<20, 64<<20]);
+        Ok(buffers.into_iter().map(|bytes| bytes.div_ceil(256)*256).sum())
+    }
     pub fn reads(&self) -> &BTreeMap<String, AudioTensorRead> {
         &self.reads
     }
@@ -486,6 +501,20 @@ mod tests {
             plan.encoder_id("snapshot", 120, "cufft13.3/cublas13.2")
         );
         assert_ne!(key, plan.encoder_id("other", 120, "cufft13.2/cublas13.2"));
+    }
+    #[test]
+    fn scratch_matches_qualified_native_capacity_and_includes_library_workspaces() {
+        for (width, qualified, maximum) in [(4096, 1_292_613_376, 1_482_328_832),
+            (6144, 1_295_693_568, 1_497_697_024)] {
+            let plan = AudioTowerPlan { output_width: width, storage: AudioStorage::Fp32,
+                weight_bytes: 0, reads: BTreeMap::new() };
+            // The 44-fixture native run admitted 1,440,960 samples; its scratch
+            // ledger excludes the separately reported 4 MiB BLAS + 64 MiB FFT.
+            assert_eq!(plan.scratch_bytes(1_440_960).unwrap(), qualified);
+            assert_eq!(plan.scratch_bytes(super::super::audio::MAX_CLIP_SAMPLES).unwrap(), maximum);
+            assert!(plan.scratch_bytes(480).is_err());
+            assert!(plan.scratch_bytes(super::super::audio::MAX_CLIP_SAMPLES + 1).is_err());
+        }
     }
     #[test]
     fn missing_inference_tensor_is_named() {

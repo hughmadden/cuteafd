@@ -75,6 +75,45 @@ def test_official_group_padding_repeats_last_code():
     assert torch.equal(grouped[1], codes[-1:].expand(4, -1))
 
 
+def test_official_template_and_transformers_processor_pin_audio_span():
+    import os
+    import sys
+    import json
+    import types
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+    transformers = pytest.importorskip("transformers")
+    source_dir = Path(os.environ.get("CUTEAFD_MIMO_AUDIO_SOURCE_DIR", "/nonexistent"))
+    source = source_dir / "vllm" / audio.SOURCES["vllm"]["path"]
+    snapshot = Path("/mnt/sparknest/hf-home/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots") / audio.SNAPSHOTS["flash"]
+    if not source.exists() or not snapshot.exists():
+        pytest.skip("checked processor source and official snapshot required")
+    module = types.ModuleType("checked_mimo_processor_template_test")
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(audio.checked_source(source, audio.SOURCES["vllm"]["sha256"]), str(source), "exec"), module.__dict__)
+        # The bundled tokenizer is standard; no model's custom Python is executed.
+        tokenizer = transformers.AutoTokenizer.from_pretrained(snapshot, local_files_only=True, trust_remote_code=False)
+        messages = [{"role": "user", "content": [{"type": "text", "text": "before"},
+            {"type": "input_audio", "input_audio": {"data": "unused", "format": "wav"}},
+            {"type": "text", "text": "after"}]}]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        assert prompt == "<|im_start|>user\nbefore<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>after<|im_end|><|im_start|>assistant\n<think></think>"
+        config = json.loads((snapshot / "config.json").read_text())
+        keys = ["image_token_id", "video_token_id", "audio_token_id", "vision_start_token_id", "vision_end_token_id",
+                "audio_start_token_id", "audio_end_token_id"]
+        processor = module.MiMoOmniProcessor(tokenizer, audio_channels=20, audio_zeroemb_idx=1024,
+                                            **{key: config[key] for key in keys if key in config})
+        result = processor(text=prompt, audio=[(torch.zeros(24000), 24000)], return_tensors="pt")
+        assert result["audio_features"][0].shape == (101, 128)
+        assert result["audio_token_lens"].tolist() == [7]
+        assert audio.token_geometry(24000)["tokens"] == 7
+        assert result["input_ids"].tolist()[0] == [151644, 872, 198, 14801, 151673,
+            *([151669] * 7), 151674, 10694, 151645, 151644, 77091, 198, 151667, 151668]
+    finally:
+        sys.modules.pop(module.__name__, None)
+
+
 def test_cuda_geometry_gate_is_decisive_not_energy_error_only():
     path = PATH.with_name("audio_cuda_reference.py")
     spec = importlib.util.spec_from_file_location("mimo_audio_cuda_reference", path)
