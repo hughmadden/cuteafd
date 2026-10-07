@@ -831,6 +831,41 @@ pub(crate) fn startup_graphs_enabled() -> bool {
         std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").ok().as_deref())
 }
 
+/// The startup decode graph set's bytes on its largest rank (`serving_graph_reserve`), and the
+/// planner's graph allowance, which lazily captured graphs keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupGraphReserve {
+    pub reserve: u64,
+    pub allowance: u64,
+}
+
+/// Admits the KV pool beside the startup decode graphs (`startup`), falling back to lazily captured
+/// graphs only on a real shortfall: the admission with the startup set's bytes above the allowance
+/// is refused for want of memory (`memory_report::kv_shortfall`), and the same admission with lazily
+/// captured graphs, which keep only the allowance, admits a pool. `admit(extra)` is the planned
+/// admission with `extra` graph bytes per GPU above the allowance. Returns the pool and whether
+/// decode graphs are captured at startup; every other refusal stands as it is.
+pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
+    mut admit: impl FnMut(u64) -> Result<usize>) -> Result<(usize, bool)> {
+    let Some(graphs) = startup else { return Ok((admit(0)?, false)) };
+    let extra = graphs.reserve.saturating_sub(graphs.allowance);
+    let refused = match admit(extra) {
+        Ok(tokens) => return Ok((tokens, true)),
+        Err(error) if extra > 0 && crate::shared::memory_report::kv_shortfall(&error) => error,
+        Err(error) => return Err(error),
+    };
+    let tokens = match admit(0) {
+        Ok(tokens) => tokens,
+        // The startup set is not what leaves the pool out: the refusal stands.
+        Err(_) => return Err(refused),
+    };
+    tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
+        startup_extra_bytes = extra, lazy_pool_tokens = tokens, startup_admission = %format!("{refused:#}"),
+        "GLM Flash startup decode graphs leave no room for a KV pool: capturing decode graphs lazily within the \
+        graph allowance instead (CUTEAFD_GLMF_STARTUP_GRAPHS=0 chooses this outright)");
+    Ok((tokens, false))
+}
+
 fn decode_bucket(rows: usize, spec: bool) -> usize {
     if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
     else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
@@ -993,6 +1028,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Own every ordinary text/media workspace before readiness; no shared BLAS handles.
+    /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
+    /// (the KV admission found no room for it: `admit_beside_decode_graphs`).
+    pub(crate) fn capture_graphs_lazily(&mut self) {
+        self.startup_graphs = false;
+    }
+
     pub fn prepare_serving_workspaces(&self) -> Result<()> {
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
@@ -3225,6 +3266,47 @@ mod prefill_lane_tests {
                 assert_eq!(super::workspace_union_bytes(prefill, decode, lanes, true, false), expected);
             }
         }
+    }
+
+    /// The startup set's fallback, against an admission modelled on a 5090 at 131,072 tokens and 16
+    /// sequences: 49,408 tokens of 11,804 B fit beside the planner's 1.5 GiB graph allowance, and the
+    /// startup set needs 3,388,063,576 B more (28,060 graphs).
+    #[test]
+    fn startup_graphs_fall_back_to_lazy_capture_only_on_a_real_shortfall() {
+        use super::{admit_beside_decode_graphs, StartupGraphReserve};
+        use crate::shared::memory_report::NoKvRoom;
+        let allowance = 1_610_612_736;
+        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
+        // Whole 256-token units of 11,804 B in the room past the fixed costs and `extra`.
+        let modelled = |room: u64| move |extra: u64| -> anyhow::Result<usize> {
+            let tokens = room.saturating_sub(extra) / 11_804 / 256 * 256;
+            anyhow::ensure!(tokens >= 256, NoKvRoom { free_after_reserve: vec![room as i64 - extra as i64] });
+            Ok(tokens as usize)
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let counted = |room: u64| { let admit = modelled(room); let calls = &calls;
+            move |extra: u64| { calls.borrow_mut().push(extra); admit(extra) } };
+        // Fits: startup capture, one admission with the startup set's extra.
+        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(8_000_000_000)).unwrap();
+        assert!(at_startup && tokens == 390_656);
+        assert_eq!(calls.take(), [3_388_063_576]);
+        // A real shortfall: no room beside the startup set, 49,408 tokens with lazily captured graphs.
+        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(49_408 * 11_804)).unwrap();
+        assert!(!at_startup && tokens == 49_408);
+        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        // No room either way: the startup admission's refusal stands.
+        let error = admit_beside_decode_graphs(startup, counted(1_000)).unwrap_err();
+        assert!(error.to_string().contains(&format!("{}", 1_000 - 3_388_063_576_i64)), "{error}");
+        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        // Any other refusal is not a shortfall: no retry.
+        let failing = |_: u64| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
+        assert!(admit_beside_decode_graphs(startup, failing).unwrap_err().to_string().contains("CUDA error"));
+        // A startup set within the allowance adds nothing to retry without; startup capture off runs lazily.
+        let within = Some(StartupGraphReserve { reserve: allowance, allowance });
+        assert!(admit_beside_decode_graphs(within, counted(1_000)).is_err());
+        assert_eq!(calls.take(), [0]);
+        assert_eq!(admit_beside_decode_graphs(None, counted(49_408 * 11_804)).unwrap(), (49_408, false));
+        assert_eq!(calls.take(), [0]);
     }
 
     #[test]
