@@ -17,6 +17,8 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4.1
 
+- 2026-10-07 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · build 439a1aad96ff · [report](deepseek_v41/2026-10-07-smoke-deepseek-v4-1-flash-1rtx-4spark-rtx5090-defaults-c16/report.svg)
+- 2026-10-07 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · build 439a1aad96ff · [report](deepseek_v41/2026-10-07-smoke-deepseek-v4-1-flash-1rtx-4spark-rtx5090-bf16-head-copy-drafts-c16/report.svg)
 - 2026-10-04 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc2 · [report](deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/report.svg)
 - 2026-10-04 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg)
 - 2026-10-04 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg)
