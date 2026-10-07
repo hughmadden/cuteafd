@@ -180,6 +180,12 @@ if [[ "$xgrammar" == ON ]]; then
 fi
 
 export PYO3_PYTHON=python3
+compiler_cache_cmake_args=()
+if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
+  cuteafd_compiler_cache_setup "$build_root"
+  mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
+fi
 CARGO_TARGET_DIR="$cargo_target_dir" cargo build \
   --manifest-path "$build_root/source/rust/Cargo.toml" \
   -p cuteafd-daemon \
@@ -189,6 +195,7 @@ CARGO_TARGET_DIR="$cargo_target_dir" cargo build \
 # retained for development commands, but must not add legacy generated kernels
 # or ABI coupling to the release artifact.
 cmake \
+  "${compiler_cache_cmake_args[@]}" \
   -S "$build_root/source/native" \
   -B "$build_root/native" \
   -G Ninja \
@@ -229,6 +236,10 @@ cmake --build "$build_root/native"
 
 install -d "$output_dir"
 install -m 0755 "$cargo_target_dir/release/cuteafd" "$output_dir/cuteafd"
+if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
+    "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
+fi
 install -m 0755 "$build_root/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 exl3_family_tags=()
 IFS=';' read -ra exl3_family_list <<<"$exl3_bit_families"

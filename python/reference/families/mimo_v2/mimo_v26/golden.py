@@ -224,6 +224,9 @@ def main() -> None:
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--windows", type=Path, help="pinned fidelity set; scored-row logits; streams saved only with --layers")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--tokens", type=Path, help="explicit JSON array of expanded token ids")
+    p.add_argument("--audio", type=Path, help="echoed ProbeAudio descriptor array JSON")
+    p.add_argument("--audio-features", type=Path, help="immutable official FP32 audio feature directory")
     p.add_argument("--max-tokens", type=int, help="keep the first N tokens")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
@@ -236,6 +239,10 @@ def main() -> None:
     a = p.parse_args()
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
+    if (a.audio or a.audio_features) and not (a.audio and a.audio_features and a.tokens):
+        p.error("audio requires --audio --audio-features --tokens")
+    if a.tokens and (a.text is not None or a.text_file or a.windows or a.max_tokens or a.media):
+        p.error("explicit tokens cannot mix with text/windows/truncation/image media")
     if (a.media or a.media_root or a.media_features_out) and not (a.media and a.windows):
         p.error("media options require --media --windows")
 
@@ -260,9 +267,28 @@ def main() -> None:
         a.out.mkdir(parents=True, exist_ok=True)
         run_windows(a, config, Layer, Rotary, Norm, weights)
         return
-    text = a.text_file.read_text() if a.text_file else a.text
-    tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
-    tokens = tokens[:a.max_tokens] if a.max_tokens else tokens
+    if a.tokens:
+        tokens = json.loads(a.tokens.read_text())
+        if not isinstance(tokens, list) or not tokens or any(type(t) is not int or not 0 <= t < config.vocab_size for t in tokens):
+            p.error("explicit tokens must be a nonempty in-vocabulary integer array")
+    else:
+        text = a.text_file.read_text() if a.text_file else a.text
+        if text is None:
+            p.error("one of --text, --text-file or --tokens is required")
+        tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
+        tokens = tokens[:a.max_tokens] if a.max_tokens else tokens
+    audio_features, audio_provenance = [], []
+    if a.tokens and getattr(config, "audio_token_id", None) in tokens and not a.audio:
+        p.error("expanded audio tokens require official --audio --audio-features; refusing text-only scoring")
+    if a.audio:
+        from audio_reference import validate_probe_audio, read_probe_features
+        from mimo_media import snapshot_identity
+        identity = snapshot_identity(a.snapshot)
+        spans = validate_probe_audio(json.loads(a.audio.read_text()), tokens, json.loads((a.snapshot / "config.json").read_text()))
+        for span in spans:
+            bits, metadata = read_probe_features(a.audio_features, span, config.hidden_size, identity)
+            audio_features.append((span, torch.from_numpy(bits).view(torch.bfloat16)))
+            audio_provenance.append(metadata)
     weights = Weights(a.snapshot, config)
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
@@ -276,6 +302,8 @@ def main() -> None:
     started = time.time()
     with torch.inference_mode():
         h = torch.nn.functional.embedding(ids, weights.get("model.embed_tokens.weight"))
+        for span, features in audio_features:
+            h[0, span["start"]:span["start"] + span["len"]].copy_(features.to(device=h.device, dtype=h.dtype))
         cos_sin = {"full_attention": Rotary(config=config, is_swa=False).cuda()(h, positions),
                    "sliding_window_attention": Rotary(config=config, is_swa=True).cuda()(h, positions)}
         memory = CheckpointStorage(torch.cuda, weights)
@@ -315,6 +343,7 @@ def main() -> None:
                      "MXFP4 experts widened exactly",
         "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok, "mean_nll": nll,
         "seconds": time.time() - started,
+        **({"audio_reference_features": audio_provenance} if audio_provenance else {}),
     }, indent=1))
     print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
 

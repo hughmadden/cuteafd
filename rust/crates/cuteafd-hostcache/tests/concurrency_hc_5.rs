@@ -7,9 +7,9 @@
 mod common;
 mod common_hc_5;
 
-use common::{reconcile, Model};
+use common::{reconcile, Model, ORDERS};
 use common_hc_5::{
-    default_cache, device_pages, restored_bytes, settle, snapshot, stored_bytes, target, tokens,
+    device_pages, ordered_cache, restored_bytes, settle, snapshot, stored_bytes, target, tokens,
     write_snapshot, Device, Payload, DEVICE_BYTES,
 };
 use cuteafd_hostcache::cache::{
@@ -18,7 +18,7 @@ use cuteafd_hostcache::cache::{
 use cuteafd_hostcache::config::StoreMode;
 use cuteafd_hostcache::copy::{CopyEngine, StubCopyEngine};
 use cuteafd_hostcache::pool::testing::CHUNK;
-use cuteafd_hostcache::snapshot::Key;
+use cuteafd_hostcache::snapshot::{EvictionOrder, Key};
 use cuteafd_hostcache::{SnapshotKind, COMPRESSORS};
 use std::collections::{HashMap, HashSet};
 
@@ -80,10 +80,10 @@ struct State {
 }
 
 impl State {
-    fn new(quota: u64) -> Self {
+    fn new(quota: u64, order: EvictionOrder) -> Self {
         Self {
-            cache: default_cache(quota, StoreMode::OnRetain),
-            model: Model::new(),
+            cache: ordered_cache(quota, StoreMode::OnRetain, order),
+            model: Model::with_order(order),
             device: Device::new(DEVICE_BYTES),
             quota,
             evict_quota: quota,
@@ -338,10 +338,10 @@ fn lane_script(lane: usize, rng: &mut Rng) -> Vec<Step> {
         .collect()
 }
 
-fn run_seed(seed: u64) -> Vec<String> {
+fn run_seed(seed: u64, order: EvictionOrder) -> Vec<String> {
     let mut rng = Rng::new(seed);
     let mut lanes: Vec<Vec<Step>> = (0..8).map(|lane| lane_script(lane, &mut rng)).collect();
-    let mut state = State::new(6 * CHUNK as u64);
+    let mut state = State::new(6 * CHUNK as u64, order);
     let mut log = Vec::new();
     let mut step = 0;
     while lanes.iter().any(|lane| !lane.is_empty()) {
@@ -355,7 +355,7 @@ fn run_seed(seed: u64) -> Vec<String> {
             state.apply(op, &mut rng);
         }));
         if let Err(payload) = outcome {
-            eprintln!("seed {seed}: invariant failed after step {step}");
+            eprintln!("seed {seed}, {order:?}: invariant failed after step {step}");
             for line in &log {
                 eprintln!("  {line}");
             }
@@ -382,16 +382,18 @@ fn run_seed(seed: u64) -> Vec<String> {
 
 #[test]
 fn seeded_lanes_interleave_under_quota_pressure() {
-    let log = run_seed(0x5EED_1234_ABCD_0005);
-    assert_eq!(log.len(), 2000, "schedule length");
-    assert!(log[0].starts_with("0: lane "));
+    for order in ORDERS {
+        let log = run_seed(0x5EED_1234_ABCD_0005, order);
+        assert_eq!(log.len(), 2000, "schedule length");
+        assert!(log[0].starts_with("0: lane "));
+    }
 }
 
 #[test]
 fn every_seed_reproduces_and_keeps_the_invariants() {
-    for seed in 1..=4 {
-        let first = run_seed(seed);
-        let second = run_seed(seed);
-        assert_eq!(first, second, "seed {seed} did not reproduce");
+    for (seed, order) in (1..=4).flat_map(|seed| ORDERS.map(|order| (seed, order))) {
+        let first = run_seed(seed, order);
+        let second = run_seed(seed, order);
+        assert_eq!(first, second, "seed {seed} ({order:?}) did not reproduce");
     }
 }

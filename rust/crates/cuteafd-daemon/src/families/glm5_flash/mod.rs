@@ -828,7 +828,7 @@ impl Opened {
         // eager admission loads it with the rest of start-up).
         let mut scoring_dense = if args.full_prefill_logits && !eager { self.load_dense(args, &model.layers)? }
             else { None };
-        let pool_tokens = if eager {
+        let (pool_tokens, startup_graphs) = if eager {
             let experts = if moe {
                 match admitted_experts.take() { Some(experts) => experts, None => self.experts(args)? }
             } else { None };
@@ -859,7 +859,7 @@ impl Opened {
                 (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
             early = Some((experts, drafter, dense, selector, workspaces));
-            tokens
+            (tokens, startup_graphs)
         } else if admission == KvAdmission::Planned {
             // 0: automatic; fixed pools (budgeted, served, or beside decode graphs) retain their
             // requested size and refuse before allocation if the future storage would not fit.
@@ -895,25 +895,37 @@ impl Opened {
             tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve, planner_allowance_bytes = workspace_allowance,
                 extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
             // The startup set or the graph budget above the planner's graph allowance, on every GPU.
-            let graph_extra = planned_graph_extra(args, startup_reserve.as_deref(), costs.graph_bytes[0]);
+            let allowance = costs.graph_bytes[0];
             if startup_graphs || args.graph_budget_mib.is_some() {
-                tracing::info!(allowance_bytes = costs.graph_bytes[0], graph_budget_mib = ?args.graph_budget_mib,
-                    extra_reserve_bytes = graph_extra, "GLM Flash graph reserve above planner allowance");
+                tracing::info!(allowance_bytes = allowance, graph_budget_mib = ?args.graph_budget_mib,
+                    extra_reserve_bytes = planned_graph_extra(args, startup_reserve.as_deref(), allowance),
+                    "GLM Flash graph reserve above planner allowance");
             }
-            let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
-                crate::shared::memory_report::RankReserve {
-                    extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
-                    workspace_bytes: args.full_prefill_logits.then_some(workspace),
-                }).collect();
-            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, args.slots,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves)?
+            // If the startup set leaves no room for a pool, decode graphs are captured lazily instead,
+            // keeping the graph budget or the allowance (`admit_beside_decode_graphs`).
+            let lazy_extra = planned_graph_extra(args, None, allowance);
+            let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
+                reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
+            engine::admit_beside_decode_graphs(startup, |graph_extra| {
+                let graph_extra = graph_extra.max(lazy_extra);
+                let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
+                    crate::shared::memory_report::RankReserve {
+                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
+                        workspace_bytes: args.full_prefill_logits.then_some(workspace),
+                    }).collect();
+                crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
+                    args.draft.as_deref(), args.prefill_rows, args.slots,
+                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves)
+            })?
         } else {
-            args.pool_tokens
+            (args.pool_tokens, startup_graphs)
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding)?;
+        if !startup_graphs {
+            engine.capture_graphs_lazily();
+        }
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
@@ -921,7 +933,6 @@ impl Opened {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
         }
-        engine.startup_graphs = startup_graphs;
         engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);

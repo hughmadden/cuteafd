@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/build/compiler-cache.sh"
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
 [[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
@@ -698,6 +699,8 @@ trap 'release_export_cleanup; rm -rf "$release_source_dir"' EXIT
 release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
 export_watchdog_pid=$!
 coordinator_export_status=0
+compiler_cache_args=()
+mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
 timeout "$export_timeout" docker run --rm --name "$coordinator_export_container" \
   --gpus "device=$export_gpu_uuid" \
   --ipc=host \
@@ -705,6 +708,7 @@ timeout "$export_timeout" docker run --rm --name "$coordinator_export_container"
   -e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid" \
   -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
   "${release_build_user_args[@]}" \
+  "${compiler_cache_args[@]}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
@@ -797,7 +801,10 @@ build_spark_release_leg() {
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
   "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
-  "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" <<'REMOTE'
+  "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
+  "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -843,6 +850,14 @@ if [[ -n "$source_manifest_sha256" ]]; then
   )
 fi
 cd "$remote_dir"
+compiler_cache_args=()
+if [[ "${16:-__legacy__}" != __legacy__ ]]; then
+  export CUTEAFD_KACHE="${16}"
+  [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_REMOTE="${17}"
+  [[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
+  source scripts/build/compiler-cache.sh
+  mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
+fi
 phase="${13:?}"
 export_container="${14:?}"
 native_build_jobs="${15-__legacy__}"
@@ -920,6 +935,7 @@ container_home=/tmp/cuteafd-home
 cleanup_export_container() { docker rm -f "$export_container" >/dev/null 2>&1 || true; }
 trap 'cleanup_export_container' EXIT HUP INT TERM
 docker run --rm --name "$export_container" \
+  "${compiler_cache_args[@]}" \
   --user "$(id -u):$(id -g)" \
   -e "HOME=$container_home" \
   -e "USER=$(id -un)" \

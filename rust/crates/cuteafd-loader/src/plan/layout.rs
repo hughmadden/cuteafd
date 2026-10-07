@@ -423,7 +423,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         .filter(|c| (c.owner == Owner::Rtx
             || (c.owner == Owner::SparkSliced && report.placement == ExpertPlacement::Local))
             && c.status != Status::Unused && c.status != Status::Disabled
-            && !(family != "deepseek_v41" && c.component == Component::Vision) && !covered(c.component)) {
+            && !(family != "deepseek_v41" && matches!(c.component, Component::Vision | Component::Audio)) && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -1060,6 +1060,48 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
     }
     notes.push(format!("vision {:?}: {}; {} bytes admitted; shortfall {} bytes", placement.kind, placement.reason, placement.admitted_bytes(), placement.shortfall));
     report.encoder = Some(placement);
+    if report.audio == super::MediaMode::Off { return; }
+    let plan = if report.family.as_deref() == Some("mimo_v2") {
+        crate::media::audio_tower::AudioTowerPlan::from_snapshot(&checkpoint.snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32).map_err(|e| e.to_string())
+    } else { Err("checkpoint family has no bundled audio runtime".into()) };
+    let audio = plan.and_then(|plan| plan.scratch_bytes(crate::media::audio::MAX_CLIP_SAMPLES)
+        .map(|scratch| (plan.weight_bytes(), scratch)).map_err(|e| e.to_string()));
+    let (weights, scratch) = match audio {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            report.placement_supported = false;
+            report.hints.push(super::Hint { what: format!("audio tower unavailable: {reason}"),
+                how: "Use --audio off or add the bundled tensors/exporter".into() });
+            report.audio_encoder = Some(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
+                replicas: vec![], shortfall: 0, reason });
+            return;
+        }
+    };
+    // Vision was admitted first: audio sees its reservation and may choose another Spark.
+    let hardware = EncoderHardware { v41: false,
+        gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64,
+            kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
+        sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
+            idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
+            free_bytes: d.free_bytes().max(0) as u64 }).collect() };
+    let placement = encoder_placement(report.audio, &hardware, weights, scratch, 1);
+    let add = |d: &mut DeviceLayout| {
+        d.items.push(Item::new(Category::Weights, "audio tower", "FP32 native", placement.weights, Basis::Formula));
+        d.items.push(Item::new(Category::Workspace, "audio scratch", "resident BLAS/FFT included", placement.scratch, Basis::Formula));
+    };
+    match placement.kind {
+        EncoderKind::Rtx { gpu } => add(&mut rtx[gpu]),
+        EncoderKind::Spark { rank } => { if let Some(d) = sparks.iter_mut().find(|d| d.index as usize == rank) { add(d); } },
+        _ => {
+            report.placement_supported = false;
+            report.hints.push(super::Hint { what: format!("audio placement unavailable: {}", placement.reason),
+                how: "Select an encoder with tower + scratch + guard headroom, or --audio off".into() });
+        }
+    }
+    notes.push(format!("audio {:?}: {}; {} bytes admitted; shortfall {} bytes", placement.kind,
+        placement.reason, placement.admitted_bytes(), placement.shortfall));
+    report.audio_encoder = Some(placement);
 }
 
 fn mimo_scratch_bytes(width: u64) -> u64 {

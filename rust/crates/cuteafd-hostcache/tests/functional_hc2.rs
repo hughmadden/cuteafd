@@ -7,9 +7,9 @@ use common::{apply, Model, Op};
 use cuteafd_hostcache::pool::testing::CHUNK;
 use cuteafd_hostcache::pool::{Class, Layout};
 use cuteafd_hostcache::snapshot::testing::{
-    id, meta, pages, resident_snapshots, snapshots, snapshots_with_layout,
+    id, meta, pages, resident_snapshots, snapshots, snapshots_ordered, snapshots_with_layout,
 };
-use cuteafd_hostcache::snapshot::DevicePageId;
+use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder};
 use cuteafd_hostcache::SnapshotKind;
 use proptest::prelude::*;
 
@@ -173,7 +173,7 @@ fn a_snapshot_pinned_twice_survives_one_unpin() {
 
 #[test]
 fn eviction_order_is_prompts_before_turns_oldest_first() {
-    let mut store = snapshots(1 << 30);
+    let mut store = snapshots_ordered(1 << 30, EvictionOrder::Banks);
     let p1 = store
         .plan_store(meta(SnapshotKind::Prompt, &[1], false), &pages(&[id(1)]))
         .expect("plan");
@@ -411,9 +411,11 @@ fn operation() -> impl Strategy<Value = Op> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
-    fn random_sequences_match_the_model(ops in prop::collection::vec(operation(), 1..40)) {
-        let mut store = snapshots(1 << 24);
-        let mut model = Model::new();
+    fn random_sequences_match_the_model(ops in prop::collection::vec(operation(), 1..40), banks: bool) {
+        // Each case runs in one eviction order, the model in the same.
+        let order = if banks { EvictionOrder::Banks } else { EvictionOrder::LeastRecent };
+        let mut store = snapshots_ordered(1 << 24, order);
+        let mut model = Model::with_order(order);
         for (step, op) in ops.iter().enumerate() {
             apply(&mut store, &mut model, op, step as u64, &mut None);
         }

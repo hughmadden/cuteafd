@@ -19,6 +19,9 @@ pub struct Run {
     pub verify_rows: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<serde_json::Value>,
+    /// Informational split balance, separate from the comparison-stable dataset identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_balance: Option<serde_json::Value>,
     pub engine: String,
     pub settings: serde_json::Value,
     pub seconds: f64,
@@ -180,6 +183,8 @@ pub struct Verdict {
     pub confident_top1_min: f64,
     pub top3_min: f64,
     pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// One calibrated absolute verdict shared by the card, CLI and dashboard.
@@ -204,12 +209,18 @@ pub fn verdict(run: &Run) -> Verdict {
     if generated.groups("window").values().any(|w| w.top1 + 1e-12 < 0.80) {
         reasons.push("generated window top-1 below 80% floor".into());
     }
-    if run.dataset.as_ref().is_some_and(|d| crate::fidelity_dataset::ensure_valid_publication(
-        d["repository"].as_str().unwrap_or(""), d["revision"].as_str().unwrap_or(""), d["config"].as_str().unwrap_or("")).is_err()) {
-        reasons.push("reference under revision, scores not valid".into());
+    if let Some(dataset) = &run.dataset {
+        if let Err(error) = crate::fidelity_dataset::ensure_valid_publication(
+            dataset["repository"].as_str().unwrap_or(""), dataset["revision"].as_str().unwrap_or(""),
+            dataset["config"].as_str().unwrap_or("")) {
+            reasons.push(error.to_string());
+        }
     }
     generated.records.clear();
-    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons }
+    let label = (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
+        run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
+            .unwrap_or("standard-v2").to_string());
+    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons, label }
 }
 
 fn absolute(run: &Run) -> bool {
@@ -261,8 +272,9 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
     ensure!(comparison_settings(&a.settings)? == comparison_settings(&b.settings)?,
         "runs use different nonprecision server settings");
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
-    ensure!(a.tier == "full" || a.path_shape == "decode-shaped", "quick and standard tiers must be decode-shaped");
-    ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(matches!(a.tier.as_str(), "full" | "standard-v2") || a.path_shape == "decode-shaped",
+        "Quick and legacy Standard must be decode-shaped");
+    ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "standard-v2" | "full"), "unknown tier");
     if a.tier != "quick" {
         ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
             && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
@@ -381,7 +393,7 @@ mod tests {
         })).collect();
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
-            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None,
+            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, standard_balance: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
     }
@@ -397,9 +409,75 @@ mod tests {
         assert!(!verdict(&bad).pass);
         bad = full.clone(); bad.score.missing = 1; assert!(!verdict(&bad).pass);
         bad = full; bad.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
-            "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
-        assert!(!verdict(&bad).pass);
+            "revision":crate::fidelity_dataset::RETIRED_FLASH_REVISION,"config":crate::fidelity_dataset::RETIRED_FLASH_CONFIG}));
+        let rejected = verdict(&bad);
+        assert!(!rejected.pass);
+        assert!(rejected.reasons.iter().any(|reason| reason.contains(crate::fidelity_dataset::FLASH_CONFIG)));
         assert!(compare(&bad, &bad, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn standard_v2_labels_fallback_and_refuses_legacy_or_other_mode_pairing() {
+        let mut old = run(8,512); old.tier = "standard".into();
+        let mut split = old.clone(); split.tier = crate::fidelity_dataset::STANDARD_TIER.into();
+        assert!(compare(&split,&old,0.005,0.005,100,1).is_err());
+        split.dataset = Some(serde_json::json!({"standard_subset":{"mode":"32 decode / 32 prefill"}}));
+        assert!(compare(&split,&split,0.005,0.005,100,1).unwrap().pass);
+        split.path_shape = "prefill-shaped".into();
+        assert!(compare(&split,&split,0.005,0.005,100,1).unwrap().pass);
+        let mut regressed = split.clone();
+        for row in &mut regressed.score.records { row.kl = 0.2; }
+        assert!(!verdict(&regressed).pass);
+        assert!(verdict(&split).pass);
+        let mut fallback = split.clone(); fallback.path_shape = "decode-shaped".into();
+        fallback.dataset.as_mut().unwrap()["standard_subset"]["mode"] = serde_json::json!(crate::fidelity_dataset::STANDARD_FALLBACK);
+        let verdict = verdict(&fallback);
+        assert!(verdict.pass);
+        assert_eq!(verdict.label.as_deref(),Some(crate::fidelity_dataset::STANDARD_FALLBACK));
+        let report = crate::panels::fidelity::record(&fallback,None);
+        assert_eq!(report["mode"],crate::fidelity_dataset::STANDARD_FALLBACK);
+        assert_eq!(report["verdict"]["label"],crate::fidelity_dataset::STANDARD_FALLBACK);
+        split.path_shape = "decode-shaped".into();
+        assert!(compare(&split,&fallback,0.005,0.005,100,1).is_err());
+    }
+
+    #[test]
+    fn standard_balance_is_optional_and_preserves_saved_run_comparability() {
+        let mut legacy = run(8,512);
+        for tier in ["quick", "standard", "full", crate::fidelity_dataset::STANDARD_TIER] {
+            legacy.tier = tier.into();
+            let saved = serde_json::to_value(&legacy).unwrap();
+            assert!(saved.get("standard_balance").is_none());
+            assert!(serde_json::from_value::<Run>(saved).unwrap().standard_balance.is_none());
+        }
+        legacy.dataset = Some(serde_json::json!({"standard_subset":{"mode":"32 decode / 32 prefill"}}));
+        let mut current = legacy.clone();
+        current.standard_balance = Some(serde_json::json!({
+            "decode":{"context_buckets":{"0-2K":13,"2-8K":10,"8-16K":9},"generated_positions":8786},
+            "prefill":{"context_buckets":{"0-2K":16,"2-8K":7,"8-16K":9},"generated_positions":7832}}));
+        let saved = serde_json::to_value(&current).unwrap();
+        assert_eq!(saved["standard_balance"], current.standard_balance.as_ref().unwrap().clone());
+        assert!(saved["dataset"]["standard_subset"].get("balance").is_none());
+        assert_eq!(serde_json::to_vec(&current.dataset).unwrap(), serde_json::to_vec(&legacy.dataset).unwrap());
+        let restored: Run = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.standard_balance, current.standard_balance);
+        assert!(compare(&legacy, &restored, 0.005, 0.005, 100, 1).unwrap().pass);
+    }
+
+    #[test]
+    fn fixed_mimo_publication_uses_calibrated_bounds() {
+        let mut fixed = run(8, 512);
+        fixed.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
+            "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
+        fixed.floor_top1 = 0.93;
+        fixed.floor_kl = 0.04;
+        fixed.tripwire_expect = Some(crate::reference::TripwireExpect {
+            confident_top1_min:0.96,top3_min:0.97,confident_drop_margin:0.01,top3_drop_margin:0.005 });
+        let result = verdict(&fixed);
+        assert!(result.pass);
+        assert_eq!((result.top1_min,result.kl_max,result.confident_top1_min,result.top3_min),
+            (0.93,0.04,0.96,0.97));
+        assert!(compare(&fixed, &fixed, 0.005, 0.005, 100, 1).unwrap().pass);
     }
 
     #[test]

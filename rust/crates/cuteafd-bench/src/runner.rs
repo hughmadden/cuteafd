@@ -271,6 +271,7 @@ impl Bench {
             "active": active.as_ref().map(|a| json!({"id": a.id, "panel": a.panel, "fraction": a.fraction,
                 "eta_s": a.eta_s, "elapsed_s": a.started.elapsed().as_secs_f64()})),
             "readiness_s": crate::context::readiness_s(),
+            "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
             "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))
@@ -498,11 +499,18 @@ impl Bench {
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: Some(&baseline), rates, progress, pass,
                     history: &earlier, max_context, max_output };
+                let table_before = panels::common::mapped_counters(&client);
                 let outcome = panel.run(&ctx);
+                let table_after = panels::common::mapped_counters(&client);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
                 match outcome {
-                    Ok(value) => {
+                    Ok(mut value) => {
+                        let tables = panels::common::mapped_interval(&table_before, &table_after);
+                        if !tables.is_empty() {
+                            value["mapped_tables"] = json!(tables);
+                            value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
+                        }
                         r.panels[index].passes.push(value);
                         r.panels[index].partial = None;
                     }
@@ -616,6 +624,21 @@ mod tests {
     use super::panel_eta_s;
 
     fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
+
+    #[test]
+    fn fidelity_catalog_defers_unknown_server_until_basic_card_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let bench = super::Bench::new(crate::store::Store::open(directory.path()).unwrap());
+        let catalog = bench.catalog();
+        for id in ["fidelity", "fidelity_full"] {
+            let panel = catalog["panels"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap();
+            let reason = panel["unavailable"].as_str().unwrap();
+            assert!(reason.contains("Discovering server configuration"));
+            assert!(!reason.contains("no verified"));
+        }
+        let baseline = catalog["panels"].as_array().unwrap().iter().find(|p| p["id"] == "baseline").unwrap();
+        assert!(baseline["unavailable"].is_null());
+    }
 
     #[test]
     fn panel_eta_uses_the_estimate_before_a_pass_has_data() {

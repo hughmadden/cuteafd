@@ -128,6 +128,22 @@ mod tests {
         assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Rtx { gpu: 0 });
     }
     #[test]
+    fn independent_audio_placement_sees_vision_reservation_and_preserves_kv() {
+        let mut h = hw(2, 2, 96);
+        for spark in &mut h.sparks { spark.expert_bytes = 80 * GIB; }
+        let vision = encoder_placement(MediaMode::Auto, &h, 2 * GIB, GIB, 1);
+        assert_eq!(vision.kind, EncoderKind::Spark { rank: 0 });
+        h.sparks[0].free_bytes -= vision.admitted_bytes();
+        let audio = encoder_placement(MediaMode::Auto, &h, 3 * GIB, 2 * GIB, 1);
+        assert_eq!(audio.kind, EncoderKind::Spark { rank: 1 });
+        assert_eq!(encoder_placement(MediaMode::Off, &h, 3 * GIB, 2 * GIB, 1).admitted_bytes(), 0);
+        for spark in &mut h.sparks { spark.free_bytes = 6 * GIB - 1; }
+        assert_eq!(encoder_placement(MediaMode::Auto, &h, 3 * GIB, 2 * GIB, 1).kind, EncoderKind::Rtx { gpu: 1 });
+        h.gpus[1].free_bytes = 13 * GIB - 1;
+        assert_eq!(encoder_placement(MediaMode::Auto, &h, 3 * GIB, 2 * GIB, 1).shortfall, 1);
+        assert_eq!(encoder_placement(MediaMode::Spark(None), &h, 3 * GIB, 2 * GIB, 1).shortfall, 1);
+    }
+    #[test]
     fn idle_explicit_replicas_and_off() {
         let mut h = hw(2, 4, 96);
         h.sparks[0].idle = true;

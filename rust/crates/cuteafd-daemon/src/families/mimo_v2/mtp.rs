@@ -106,7 +106,7 @@ mod tests {
         let mut cache = EmbeddingCache::new(12);
         let pin = cache.reserve(key, 12).unwrap();
         let lease = cache.complete(key, Arc::from((0u8..12).collect::<Vec<_>>())).unwrap();
-        let mut media = RequestMedia::new(vec![MediaSpan { start: 3, len: 3, key }], 2, 8).unwrap();
+        let mut media = RequestMedia::new(vec![MediaSpan { start: 3, len: 3, key: key.into() }], 2, 8).unwrap();
         media.attach(lease).unwrap();
         drop(pin);
         let seqs = [MtpSeq { ring: 1, len: 8, tokens: &[], media: Some(&media) },

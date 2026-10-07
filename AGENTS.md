@@ -108,6 +108,8 @@ before → after tables with conditions.
 - Build only under `~/.cache/cuteafd/builds/<task>` on root NVMe; run
   `scripts/build/assert-build-filesystem.py` on every path first. Never reuse a
   Cargo cache that has seen filesystem errors.
+- Initialize submodules recursively at their pinned commits in every fresh
+  worktree before building or testing. Hold `build.lock` only while compiling.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: serialize
@@ -130,6 +132,38 @@ before → after tables with conditions.
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   no failing ids since the codex/v1 merge (808 pass); add none.
+- Optional compiler cache: set `CUTEAFD_KACHE=/absolute/path/to/kache` (v1.0.0)
+  and optionally `CUTEAFD_KACHE_REMOTE=/shared/cache/directory`. Unset means
+  unchanged plain builds; missing kache or inaccessible remote warns and falls
+  back. Cache invocations time out after 300 seconds (`CUTEAFD_KACHE_TIMEOUT_SECONDS`
+  overrides for very slow compilers), then retry plain and disable caching for the
+  rest of that build. Never make kache a gate prerequisite. Never run plain and
+  kache Cargo builds on the same target directory: kache restores outputs as
+  read-only hardlinks into its store, so a later plain build fails with "output
+  file ... .rmeta is not writeable". Use a separate target per mode. Use a static executable compatible
+  with the dev image; the Homebrew host toolchain and container do not share keys.
+  `CUTEAFD_KACHE_CACHE_DIR` selects the NVMe local index/blob parent (architecture
+  leaves are automatic); keep fresh per-task Cargo targets and hold `build.lock`.
+  For host gates, source `scripts/build/compiler-cache.sh`, then call
+  `cuteafd_compiler_cache_setup "$HOME/.cache/cuteafd/builds/<task>"` before Cargo.
+  For Spark builds, `CUTEAFD_KACHE_SPARK` names a native ARM executable already
+  installed on the Spark and `CUTEAFD_KACHE_SPARK_CACHE_DIR` its local cache.
+  WIP mounts require `--recreate` when enabling/changing cache paths. Build-script
+  execution caching stays off; Rust and native C/C++/CMake compiles are wrapped.
+  CUDA launchers are wired but were not exercised by the CPU-only pilot.
+  `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
+  `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
+  targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
+  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute. Prefer canonical CPU gates
+  for cross-worktree hits; never normalize `CARGO_MANIFEST_DIR` away (it is a real runtime input).
+  Opt-in artifacts carry `COMPILER_PROVENANCE.json`: source commit/dirty, toolchain,
+  actual cache mode/fallback, flags/remapping and binary SHA256. Vanilla hashes may
+  differ from kache due to path remapping; identical-input kache cold/warm must match.
+  Both sparknest and NFS-over-RDMA passed concurrent restores/checksums. Prefer a
+  raptor-owned NVMe NFS cache for explicit placement; do not change exports or
+  sparknest policy. SQLite stays local, never on either remote. Remote manifests
+  may lose concurrent additions (misses, not corrupt artifacts). No BuildKit mount
+  is needed in `Dockerfile.release`: it packages prebuilt artifacts, not compilers.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a

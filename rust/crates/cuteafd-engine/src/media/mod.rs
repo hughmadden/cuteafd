@@ -8,9 +8,9 @@ mod stats;
 
 pub use admission::{MediaAdmission, MediaPoll, MediaReady, MediaWaiter};
 pub use cache::{EmbeddingCache, EmbeddingLease};
-pub use cuteafd_core::{ImageKey, MediaSpan};
-pub use encoder::{EncodeJob, EncodeOutput, EncoderClient, EncoderTicket, FakeEncoder};
-pub use keys::{image_token_id, round_frontier, snapshot_media, verify_media, MediaKeys};
+pub use cuteafd_core::{AudioKey, ImageKey, MediaKey, MediaSpan};
+pub use encoder::{EncodeInput, EncodeJob, EncodeOutput, EncoderClient, EncoderTicket, FakeEncoder};
+pub use keys::{image_token_id, media_token_id, round_frontier, snapshot_media, verify_media, MediaKeys};
 pub use request::{MediaChunk, RequestMedia};
 pub use stats::MediaStats;
 use thiserror::Error;
@@ -24,7 +24,7 @@ pub enum MediaError {
     #[error("media feature geometry or byte length is invalid")]
     Features,
     #[error("media features are not ready for {0:?}")]
-    NotReady(ImageKey),
+    NotReady(MediaKey),
     #[error("image needs {needed} bytes > media cache capacity {capacity}")]
     ImageTooLarge { needed: usize, capacity: usize },
     #[error("embedding cache budget exhausted: need {needed} bytes, {free} free of {capacity}")]

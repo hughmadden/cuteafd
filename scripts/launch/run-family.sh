@@ -12,15 +12,17 @@ config="$repo_root/cuteafd.config"
 restart=0
 family=""
 embedding_override=""
+table_override=""
 wip_slot=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
     --family) family="${2:?--family requires ID}"; shift 2 ;;
+    --table-backend) table_override="${2:?--table-backend requires uring, mmap or mincore-routed}"; shift 2 ;;
     --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--restart] [--wip SLOT]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--table-backend uring|mmap|mincore-routed] [--restart] [--wip SLOT]" >&2; exit 2 ;;
   esac
 done
 # Plain KEY=VALUE lines; the launch reads only the keys below.
@@ -31,12 +33,14 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+table_backend="${table_override:-$(get TABLE_BACKEND "${CUTEAFD_TABLE_BACKEND:-mmap}")}"
+release_validate_table_backend "$table_backend"
 vision="$(get VISION off)"
 audio="$(get AUDIO off)"
 vision_replicas="$(get VISION_REPLICAS 1)"
 [[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
 [[ "$vision" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$vision" != auto:* && "$vision" != off:* ) ]] || release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
-case "$audio" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
+[[ "$audio" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$audio" != auto:* && "$audio" != off:* ) ]] || release_die "AUDIO must be auto, off, rtx[:gpu] or spark[:rank]"
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
 coordinator_budget_args=()
@@ -83,9 +87,9 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Qualified MiMo and GLM Flash encoders use Spark-first auto unless explicitly off.
+# Qualified MiMo, GLM Flash and Qwen encoders use Spark-first auto unless explicitly off.
 # Other generic families keep off until their towers are qualified.
-if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && -z "$(get VISION)" ]]; then vision=auto; fi
+if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == qwen4 ) && -z "$(get VISION)" ]]; then vision=auto; fi
 # Auto/spark placement is resolved by the encoder plan below.
 # EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
 # their weights plus serving reservations on the selected GPU. SPARK_COUNT is
@@ -722,8 +726,13 @@ encoder_ranks=()
 encoder_hash=""
 encoder_max_tokens=4096
 encoder_port=$((port + 1))
-if [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
-   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
+audio_encoder_port=$((port + 2))
+audio_encoder_ranks=()
+audio_peers=()
+audio_encoder_hash=""
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
+   [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-95.5}"
@@ -733,9 +742,9 @@ if [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) 
     --rtx "$plan_rtx" --rtx-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas")"
   selected="$(python3 -c '
 import json,sys
-p=json.load(sys.stdin); e=p.get("encoder"); assert e is not None, "image checkpoint lacks encoder plan"
+p=json.load(sys.stdin); e=p.get("encoder")
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
-k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
 cap=p.get("max_image_tokens") or (1024 if sys.argv[1]=="qwen4" else 4096)
 assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
@@ -755,12 +764,36 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
     done
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
   fi
-elif [[ "$vision" == spark* || "$vision" == rtx* ]]; then
-  release_die "explicit encoder placement requires a supported MiMo, Qwen or GLM Flash vision checkpoint"
+  if [[ "$audio" != off ]]; then
+    selected_audio="$(python3 -c '
+import json,sys
+p=json.load(sys.stdin); e=p.get("audio_encoder")
+assert e is not None, "audio checkpoint lacks encoder plan"
+k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid audio plan hash"
+if kind=="spark":
+    ranks=[k["rank"]]+e["replicas"]
+    assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
+    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
+elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
+else: raise ValueError("enabled audio has no launchable admitted owner")
+' <<<"$plan_json")"
+    read -r audio audio_encoder_hash audio_rank_csv <<<"$selected_audio"
+    if [[ "$audio" == spark:* ]]; then
+      IFS=, read -r -a audio_encoder_ranks <<<"$audio_rank_csv"
+      for audio_rank in "${audio_encoder_ranks[@]}"; do
+        audio_peers+=("$(get "SPARK_${audio_rank}_LANE_A"):$audio_encoder_port")
+      done
+      family_args+=(--audio-peers "$(IFS=,; printf '%s' "${audio_peers[*]}")" --audio-encoder-plan-hash "$audio_encoder_hash" --audio-encoder-revision "$revision")
+    fi
+  fi
+elif [[ "$vision" == spark* || "$vision" == rtx* || "$audio" != off ]]; then
+  release_die "explicit media placement requires a supported bundled vision/audio checkpoint"
 fi
 # Replace the original policy with the selected placement, without duplicated flags.
 for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
   [[ "${family_args[arg]}" != --vision ]] || family_args[arg+1]="$vision"
+  [[ "${family_args[arg]}" != --audio ]] || family_args[arg+1]="$audio"
 done
 peers=()
 # --restart removes this launcher's containers; stop.sh accepts the same keys.
@@ -868,6 +901,11 @@ for ((rank = 0; rank < ranks; rank++)); do
       encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens $encoder_max_tokens"
     fi
   done
+  for audio_rank in "${audio_encoder_ranks[@]}"; do
+    if [[ "$rank" == "$audio_rank" ]]; then
+      encoder_args+=" --audio-encoder --audio-encoder-listen 0.0.0.0:$audio_encoder_port --audio-encoder-plan-hash $audio_encoder_hash --audio-encoder-revision $revision"
+    fi
+  done
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
@@ -887,6 +925,22 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Bind cache identity to the actual SM121 export, never the coordinator's SM120
+# backend. The worker publishes this only after native admission and owner readiness.
+if ((${#audio_encoder_ranks[@]})); then
+  audio_backend=""
+  for audio_rank in "${audio_encoder_ranks[@]}"; do
+    host="$(get "SPARK_${audio_rank}_HOST")"
+    backend="$(ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1" | python3 -c '
+import re,sys
+matches=re.findall(r"mimo_audio_fp32_v1/cuda[0-9]+/cufft[0-9]+/cublas[0-9.]+/cute_aot_sm121/export[0-9a-f]{64}",sys.stdin.read())
+assert matches and len(set(matches))==1, "missing or conflicting ready audio backend identity"
+print(matches[0])')"
+    [[ -z "$audio_backend" || "$audio_backend" == "$backend" ]] || release_die "audio replicas have different backend exports"
+    audio_backend="$backend"
+  done
+  family_args+=(--audio-encoder-backend "$audio_backend")
+fi
 # Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
 # workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
 # cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
@@ -906,12 +960,15 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 # CONSOLE_TEXT=on lets the live console at / stream generated token text (anyone who
 # can reach the API port can then read every session's output).
+family_args+=(--table-backend "$table_backend")
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
+table_env_args=()
+[[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${chat_template_mounts[@]}" "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \

@@ -9,7 +9,7 @@ use cuteafd_hostcache::config::{Config, StoreMode};
 use cuteafd_hostcache::copy::{CopyEngine, CopyModel, DeviceRange, Event, Stream, StubCopyEngine};
 use cuteafd_hostcache::pool::testing::{layout, CHUNK};
 use cuteafd_hostcache::pool::{HostChunk, HostRange, PinnedMemory};
-use cuteafd_hostcache::snapshot::{DevicePageId, SnapshotMeta};
+use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, SnapshotMeta};
 use cuteafd_hostcache::{SnapshotKind, COMPRESSORS};
 
 /// The payload the suites attach to a store.
@@ -73,6 +73,13 @@ pub fn cache(
 /// A cache with the default copy model and [`DEVICE_BYTES`] of fake device memory.
 pub fn default_cache(bytes: u64, store: StoreMode) -> HostCache<StubCopyEngine, Payload> {
     cache(config(bytes, store), CopyModel::default(), DEVICE_BYTES)
+}
+
+/// [`default_cache`] evicting in `order`, for the suites that run both orders.
+pub fn ordered_cache(bytes: u64, store: StoreMode, order: EvictionOrder) -> HostCache<StubCopyEngine, Payload> {
+    let config = config(bytes, store);
+    let engine = StubCopyEngine::new(CopyModel::default(), DEVICE_BYTES, config.bytes as usize);
+    HostCache::with_rule(config, layout(), engine, cuteafd_core::prefix::ReuseRule::V41, order).expect("cache")
 }
 
 /// A snapshot of `pages` pages per compressor over `tokens`, with the layout's part sizes and

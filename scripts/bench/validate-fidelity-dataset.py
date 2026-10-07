@@ -219,14 +219,16 @@ def main():
                   shapes={})
     windows = {w['id']: w for w in panel['windows']}
     files = {f['window']: f for f in dataset['files']}
-    assert len(windows) == len(files) == len(manifest['windows']) == 64
+    assert len(windows) == len(files) == len(manifest['windows']) == len(panel['windows'])
+    scored_positions = sum(len(w['tokens']) - w['score_from'] for w in panel['windows'])
+    assert scored_positions == sum(len(w['positions']) for w in manifest['windows'])
 
     for shape, runs in projected.items():
         compact_runs = copy.deepcopy(runs)
         maps = [{(r['window'], r['position']): r for r in run['score']['records']} for run in runs]
         compact_maps = [{(r['window'], r['position']): r for r in run['score']['records']}
                         for run in compact_runs]
-        assert all(len(m) == 32768 for m in maps)
+        assert all(len(m) == scored_positions for m in maps)
 
         def window_work(item):
             number, meta = item

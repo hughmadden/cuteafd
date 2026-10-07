@@ -552,6 +552,50 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
 }
 
 #[test]
+fn mimo_audio_missing_bundle_is_unsupported_not_silently_disabled() {
+    let dir = snapshot_tp(mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+    let off = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(off.audio_encoder.is_none());
+    let on = plan(dir.path(), &PlanOptions { audio: MediaMode::Auto, ..sparks(4) }).unwrap();
+    assert!(!on.executable());
+    assert_eq!(on.audio_encoder.as_ref().unwrap().kind, encoder::EncoderKind::Off);
+    assert!(on.hints.iter().any(|hint| hint.what.contains("audio tower unavailable")));
+    assert_ne!(off.encoder_plan_hash, on.encoder_plan_hash);
+}
+
+#[test]
+fn mounted_mimo_audio_inventory_is_independently_admitted() {
+    use encoder::EncoderKind;
+    use cuteafd_core::memory_layout::DeviceKind;
+    const GIB: u64 = 1 << 30;
+    let hub = std::path::Path::new("/mnt/sparknest/hf-home/hub");
+    for (model, revision, ranks, gpus) in [
+        ("Flash", "2479e2d0029eca9a34cc7e7f55a121925f81908e", 4, 1),
+        ("Pro", "adea8e2c5373181e5a973fa1ecb343cb31af214b", 6, 2),
+    ] {
+        let snapshot = hub.join(format!("models--XiaomiMiMo--MiMo-V2.6-{model}-MOPD/snapshots/{revision}"));
+        if !snapshot.exists() { continue; }
+        let options = PlanOptions { audio: MediaMode::Auto, vision: MediaMode::Auto,
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 * GIB; gpus], spark_bytes: 121 * GIB,
+                ..Default::default() }), ..sparks(ranks) };
+        let on = plan(&snapshot, &options).unwrap();
+        let audio = on.audio_encoder.as_ref().unwrap();
+        assert!(matches!(audio.kind, EncoderKind::Spark { .. }), "{}", render(&on));
+        assert!(audio.weights > 2 * GIB && audio.scratch > GIB);
+        assert_eq!(component(&on, Component::Audio).status, Status::Ready, "{}", render(&on));
+        let owner = match audio.kind { EncoderKind::Spark { rank } => format!("spark{rank} audio"), _ => unreachable!() };
+        assert_eq!(on.bytes_by_owner[&owner], audio.admitted_bytes());
+        let memory = on.memory_layout.as_ref().unwrap();
+        assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).flat_map(|d| &d.items).filter(|item| item.group == "audio tower")
+            .map(|item| item.bytes).sum::<u64>(), audio.weights);
+        assert!(!memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| &d.items).any(|item| item.group == "audio tower" || item.group == "audio"));
+        let off = plan(&snapshot, &PlanOptions { audio: MediaMode::Off, ..options }).unwrap();
+        assert!(off.audio_encoder.is_none());
+        assert_ne!(on.encoder_plan_hash, off.encoder_plan_hash);
+    }
+}
+
+#[test]
 fn mimo_vision_accepts_only_resident_tower_geometry_and_bf16() {
     let mut config = mimo_flash_mopd_config();
     config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
@@ -1413,12 +1457,14 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
     assert_eq!(auto.encoder.as_ref().unwrap().weights, 898_680_904);
     assert_eq!(auto.encoder.as_ref().unwrap().scratch, 447_778_048);
+    assert_eq!(auto.encoder.as_ref().unwrap().admitted_bytes(), 1_346_458_952);
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, 32768);
     let vision = auto.components.iter().find(|c| c.component == Component::Vision).unwrap();
     assert_eq!(vision.status, Status::Ready);
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     assert_eq!(off.max_image_tokens, Some(1024));
     assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(), 0);
     assert_ne!(auto.encoder_plan_hash, off.encoder_plan_hash);
     cfg["vision_config"]["intermediate_size"] = json!(4305);
     let invalid = snapshot(cfg, &tensors);

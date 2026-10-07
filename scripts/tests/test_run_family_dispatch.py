@@ -55,6 +55,10 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--embedding-placement", "host")
     assert result.returncode == 0, result.stderr
     assert "--embedding-placement host" in result.stdout
+    for backend in ("uring", "mincore-routed"):
+        result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--table-backend", backend)
+        assert result.returncode == 0, result.stderr
+        assert f"--table-backend {backend}" in result.stdout
     # A ./wip.sh slot reaches run-family.sh, which serves it from the development images.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--wip", "s1", "--restart")
     assert result.returncode == 0, result.stderr
@@ -122,7 +126,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n' +
+                                    'case "$*" in *"docker logs"*) echo "worker ready"; '
+                                    'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
@@ -1086,6 +1091,32 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
         assert f"--vision {mode or 'auto'}" in preflight
 
 
+@pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])
+def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path, vision_kind, audio_kind):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
+              "vision_config": {"depth": 28}, "audio_token_id": 151669}
+    def placement(kind):
+        return {"kind": {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0} if kind == "rtx" else {})}, "replicas": []}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": placement(vision_kind), "audio_encoder": placement(audio_kind)}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={vision_kind}\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert f"--audio {audio_kind}:0" in launch
+    assert ("--audio-encoder-listen 0.0.0.0:19443" in worker) == (audio_kind == "spark")
+    assert ("--encoder-listen 0.0.0.0:19442" in worker) == (vision_kind == "spark")
+    assert ("--audio-peers 10.0.0.1:19443" in launch) == (audio_kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (vision_kind == "spark")
+    if audio_kind == "spark":
+        assert f"--audio-encoder-plan-hash {'ab' * 32}" in worker
+        assert f"--audio-encoder-plan-hash {'ab' * 32}" in launch
+        assert "--audio-encoder-revision abc" in launch
+        assert "--audio-encoder-backend mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32 in launch
+    else:
+        assert "--audio-encoder-backend" not in launch
+
+
 @pytest.mark.parametrize("mode,kind", [(None, "spark"), ("off", "off"), ("auto", "spark"),
                                       ("spark:0", "spark"), ("rtx:0", "rtx")])
 def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode, kind):
@@ -1114,8 +1145,6 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
 @pytest.mark.parametrize("family_config,serve", [
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
-    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
-      "layer_types": ["linear_attention", "full_attention"]}}, "serve-qwen4"),
 ])
 def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_config, serve):
     model = "zai-org/GLM-5.3-Flash" if serve == "serve-glmf" else "test/model"
@@ -1132,6 +1161,8 @@ def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_conf
     ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
       "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
      "zai-org/GLM-5.3-Flash", "serve-glmf"),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+      "layer_types": ["linear_attention", "full_attention"]}}, "test/qwen", "serve-qwen4"),
 ])
 def test_text_only_qualified_family_auto_default_does_not_start_a_tower(tmp_path, config, model, serve):
     result = _family_launch_result(tmp_path, config, model, "SPECULATOR=off\n")
@@ -1224,8 +1255,8 @@ def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
     assert result.returncode == 2 and "RDMA_BOND_BALANCE must be off, labels or probe" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 @pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"),
-                                        ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
-def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
+                                        ("rtx:0", "rtx"), ("off", "off"), (None, "spark")])
+def test_qwen_encoder_explicit_placement_and_default_auto(tmp_path, mode, kind):
     config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
               "layer_types": ["linear_attention", "full_attention"]}, "vision_config": {"depth": 27}}
     placement = {"kind": kind}

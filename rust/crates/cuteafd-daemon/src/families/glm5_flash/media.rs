@@ -161,7 +161,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
                 anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
                     && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
                     "probe image rows/marker boundaries differ");
-                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: image.key });
+                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: image.key.into() });
             }
             anyhow::ensure!(tokens.iter().filter(|&&id| id == expander.placeholder).count()
                 == spans.iter().map(|span| span.len).sum::<usize>(), "unbound probe image placeholders");
@@ -185,9 +185,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     }
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
-    let jobs = job.media.iter().map(|image| EncodeJob { key: image.key,
-        grid: [image.grid.t, image.grid.h, image.grid.w], rgb8: image.rgb8.clone(),
-        tokens: image.tokens, hidden_width: hidden }).collect();
+    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
@@ -313,8 +311,8 @@ fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
     Ok(())
 }
 
-fn key_hex(key: cuteafd_loader::media::ImageKey) -> String {
-    key.0.iter().map(|b| format!("{b:02x}")).collect()
+fn key_hex(key: impl Into<cuteafd_core::MediaKey>) -> String {
+    key.into().bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -362,7 +360,7 @@ mod tests {
         assert!(matches!(failure(MediaError::Features), NativeFailure::BadRequest(_)));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images,
+        NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, probe: None }
     }
@@ -402,7 +400,7 @@ mod tests {
         let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
         apply_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).unwrap();
         assert!(media.ready(0, prompt.tokens.len()));
-        assert_eq!(media.spans()[0].key, image().key);
+        assert_eq!(media.spans()[0].key, image().key.into());
         assert!(!cache.contains(image().key), "reference override must never enter the plain-image cache");
         assert_eq!((cache.bytes(), cache.len()), (16, 1));
         assert!(crate::shared::probe::cold(&prompt.job.probe), "scheduler must bypass prefix restore and captures");
@@ -424,7 +422,7 @@ mod tests {
         let mut cache = EmbeddingCache::new(16);
         apply_probe_features(&prompt, &mut request, &mut cache, root.path(), &identity).unwrap();
         let input = image();
-        let jobs = vec![EncodeJob { key: input.key, grid: [1,4,4], rgb8: input.rgb8.clone(), tokens: 4, hidden_width: 2 }];
+        let jobs = vec![EncodeJob::image(input.key, [1,4,4], input.rgb8.clone(), 4, 2)];
         let waiter = MediaWaiter::new(prompt, request, jobs, 0).unwrap();
         let mut admission = MediaAdmission::new(cache, Encoder::Off, 1);
         assert!(admission.enqueue(waiter).is_ok());
@@ -554,7 +552,7 @@ mod tests {
         assert!(!media.ready(0, 8));
         assert!(media.ready(6, 8));
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].grid, [1, 4, 4]);
+        assert_eq!(jobs[0].image_input().unwrap().0, [1, 4, 4]);
         assert_eq!(jobs[0].feature_bytes().unwrap(), 16);
     }
     #[test]

@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/build/compiler-cache.sh"
+audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
+case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -23,6 +26,8 @@ CUTEAFD_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
 configuration builds no extra role and keeps the historical Spark TP4 shard.
 Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
+Set CUTEAFD_WIP_AUDIO_AOT=ON to build the optional audio tower on both SM120
+and SM121. Audio serving remains separately opt-in.
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
 
@@ -132,6 +137,7 @@ if ((dry_run)); then
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+  echo "  Audio AOT: $audio_aot"
   exit 0
 fi
 
@@ -308,6 +314,9 @@ ensure_local_container() {
     -e CUDA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )
+  local -a cache_args=()
+  mapfile -t cache_args < <(cuteafd_compiler_cache_docker_args)
+  args+=("${cache_args[@]}")
   [[ ! -e /dev/infiniband ]] || args+=(--device=/dev/infiniband)
   # sparknest keeps hub/ as a symlink into its mount; expose it at the same path.
   [[ ! -d /mnt/sparknest ]] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
@@ -316,12 +325,41 @@ ensure_local_container() {
 }
 
 ensure_remote_container() {
-  local host="$1"
+  local host="$1" cache_staging= cache_helper_dir
+  if [[ -n "${CUTEAFD_KACHE_SPARK:-}" ]]; then
+    if cache_staging="$(ssh -o BatchMode=yes "$host" 'printf "%s/.cache/cuteafd/kache-helper" "$HOME"')"; then
+      printf -v cache_helper_dir '%q' "$cache_staging/scripts/build"
+      if ! ssh -o BatchMode=yes "$host" "mkdir -p $cache_helper_dir" ||
+         ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$host:$cache_staging/scripts/build/"; then
+        cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
+        cache_staging=
+      fi
+    else
+      cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
+      cache_staging=
+    fi
+  fi
   ssh -o BatchMode=yes "$host" bash -s -- \
-    "$spark_container" "$SPARK_EXPERT_DOCKER_DEV" <<'REMOTE'
+    "$spark_container" "$SPARK_EXPERT_DOCKER_DEV" \
+    "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__unset__}")" \
+    "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__unset__}")" \
+    "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__unset__}")" \
+    "$(printf '%q' "${cache_staging:-__unset__}")" <<'REMOTE'
 set -euo pipefail
 container="$1"
 image="$2"
+cache_args=()
+if [[ "${3:-__unset__}" != __unset__ ]]; then
+  export CUTEAFD_KACHE="$3"
+  [[ "${4:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_REMOTE="$4"
+  [[ "${5:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_CACHE_DIR="$5"
+  if [[ -f "$6/scripts/build/compiler-cache.sh" ]]; then
+    source "$6/scripts/build/compiler-cache.sh"
+    mapfile -t cache_args < <(cuteafd_compiler_cache_docker_args)
+  else
+    printf 'warning: Spark kache helper not staged; using plain compilers\n' >&2
+  fi
+fi
 image_id="$(docker image inspect -f '{{.Id}}' "$image")"
 if docker container inspect "$container" >/dev/null 2>&1; then
   container_id="$(docker inspect -f '{{.Image}}' "$container")"
@@ -341,6 +379,7 @@ args=(
   -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
   -e HF_HOME="$hf_home"
 )
+args+=("${cache_args[@]}")
 [ ! -e /dev/infiniband ] || args+=(--device=/dev/infiniband)
 [ ! -d /mnt/sparknest ] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
 docker "${args[@]}" "$image" sleep infinity >/dev/null
@@ -460,9 +499,19 @@ build_coordinator() {
   sync_local_source
   local image_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+  local -a cache_env=(-e CUTEAFD_KACHE=)
+  if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
+    if docker exec "$coordinator_container" test -x /opt/cuteafd-kache; then
+      cache_env=(-e CUTEAFD_KACHE=/opt/cuteafd-kache)
+    else
+      cuteafd_compiler_cache_warn 'WIP cache mounts absent; --recreate to enable caching'
+    fi
+  fi
   docker exec \
+    "${cache_env[@]}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
+    -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
     -e "CUTEAFD_WIP_DSV4_AOT=${CUTEAFD_WIP_DSV4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_GLM_AOT=${CUTEAFD_WIP_GLM_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MIMO_AOT=${CUTEAFD_WIP_MIMO_AOT:-OFF}" \
@@ -485,10 +534,18 @@ build_expert() {
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  local cache_wrapper=
+  if [[ -n "${CUTEAFD_KACHE_SPARK:-}" ]]; then
+    if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -x /opt/cuteafd-kache; then
+      cache_wrapper=/opt/cuteafd-kache
+    else
+      cuteafd_compiler_cache_warn 'Spark WIP cache mounts absent; --recreate to enable caching'
+    fi
+  fi
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

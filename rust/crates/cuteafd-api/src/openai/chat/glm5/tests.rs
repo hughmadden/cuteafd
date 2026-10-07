@@ -68,12 +68,13 @@ fn thinking_off_forms() -> [Value; 7] {
         json!({"chat_template_kwargs": {"reasoning_effort": "minimal"}})]
 }
 
-/// By default every off form renders the template's Low effort with the think
-/// block open: byte for byte the Transformers golden for `reasoning_effort` "low".
+/// With the opt-in `low` setting every off form renders the template's Low
+/// effort with the think block open: byte for byte the Transformers golden
+/// for `reasoning_effort` "low".
 #[test]
 fn thinking_off_renders_the_low_effort_golden() {
-    let encoding = encoding();
-    assert_eq!(encoding.thinking_off(), GlmThinkingOff::Low);
+    assert_eq!(encoding().thinking_off(), GlmThinkingOff::Empty);
+    let encoding = encoding().with_thinking_off(GlmThinkingOff::Low);
     let case = goldens().into_iter().find(|case| case["name"] == "low_effort_multi_turn_reasoning").unwrap();
     let mut request = request_for(&case["context"]);
     request.as_object_mut().unwrap().remove("reasoning_effort");
@@ -85,11 +86,11 @@ fn thinking_off_renders_the_low_effort_golden() {
     }
 }
 
-/// The `empty` setting keeps glmrt's form for every off form, "minimal"
-/// included: an empty think block after the default (Max) effort.
+/// By default (`empty`) every off form, "minimal" included, renders glmrt's
+/// form: an empty think block after the default (Max) effort.
 #[test]
 fn the_empty_setting_closes_an_empty_think_block() {
-    let encoding = encoding().with_thinking_off(GlmThinkingOff::Empty);
+    let encoding = encoding();
     for off in thinking_off_forms() {
         let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
         body.as_object_mut().unwrap().extend(off.as_object().unwrap().clone());
@@ -181,7 +182,7 @@ mod vision_template {
         let selected = GlmEncoding::from_snapshot_for_vision(&served, Some(vendor.to_str().unwrap()), None)
             .unwrap().with_thinking_off(GlmThinkingOff::Low);
         assert_eq!(selected.template_provenance().unwrap().selection, "explicit");
-        let old = GlmEncoding::from_snapshot(&served).unwrap();
+        let old = GlmEncoding::from_snapshot(&served).unwrap().with_thinking_off(GlmThinkingOff::Low);
         let low_image = json!({"messages":body()["messages"], "reasoning_effort":"low"});
         let expected_image = selected.render(&low_image, &prompt_options(&low_image, selected.thinking_off())).unwrap();
         assert!(expected_image.contains("Reasoning Effort: Low"));
@@ -828,15 +829,16 @@ mod router {
 
     #[tokio::test]
     async fn thinking_toggles_and_model_metadata() {
-        // Every off form renders the Low effort with the think block open, so
-        // the model's short plan comes back as reasoning.
+        // Under the opt-in `low` setting every off form renders the Low effort
+        // with the think block open, so the model's short plan comes back as
+        // reasoning.
         let efforts = thinking_off_forms().into_iter().map(|off| (off, "Low"))
             .chain([(json!({"reasoning_effort": "low"}), "Low"), (json!({"reasoning_effort": "high"}), "High"),
                 (json!({"reasoning_effort": "max"}), "Max"), (json!({}), "Max")]);
         for (options, effort) in efforts {
             let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]});
             body.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
-            let (status, bytes) = serve(body, "Greet.</think>Hello.", move |job| {
+            let (status, bytes) = serve_with(encoding().with_thinking_off(GlmThinkingOff::Low), body, "Greet.</think>Hello.", move |job| {
                 assert_eq!(job.prompt, format!("[gMASK]<sop><|system|>Reasoning Effort: {effort}<|user|>Hi<|assistant|><think>"));
             }).await;
             assert_eq!(status, StatusCode::OK);
@@ -851,15 +853,14 @@ mod router {
         assert_eq!((value["data"][0]["id"].as_str(), value["data"][0]["owned_by"].as_str()), (Some(MODEL), Some("wrldsuksgo2mars")));
     }
 
-    /// With the `empty` setting an off request keeps glmrt's empty think block,
-    /// and the reply is content only.
+    /// By default (`empty`) an off request keeps glmrt's empty think block, and
+    /// the reply is content only.
     #[tokio::test]
     async fn the_empty_thinking_off_setting_answers_without_reasoning() {
         for options in [json!({"thinking": {"type": "disabled"}}), json!({"reasoning_effort": "minimal"})] {
             let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]});
             body.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
-            let encoding = encoding().with_thinking_off(GlmThinkingOff::Empty);
-            let (status, bytes) = serve_with(encoding, body, "Hello.", |job| {
+            let (status, bytes) = serve_with(encoding(), body, "Hello.", |job| {
                 assert_eq!(job.prompt, "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think></think>");
             }).await;
             assert_eq!(status, StatusCode::OK);

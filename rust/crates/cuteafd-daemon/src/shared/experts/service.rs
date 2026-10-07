@@ -22,10 +22,17 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
             max_tokens: args.encoder_max_tokens as usize,
         })
     } else { None };
-    if args.encoder_only {
-        let encoder = encoder.context("encoder-only config")?;
+    let audio_encoder = if args.audio_encoder || args.audio_encoder_only {
+        Some(crate::shared::vision::worker::AudioWorkerConfig {
+            listen: args.audio_encoder_listen.clone(),
+            plan_hash: crate::shared::vision::worker::parse_plan_hash(args.audio_encoder_plan_hash.as_deref().context("--audio-encoder-plan-hash required")?)?,
+            revision: args.audio_encoder_revision.clone().or_else(|| args.snapshot.file_name().and_then(|s| s.to_str()).map(str::to_owned)).context("audio encoder revision required")?,
+        })
+    } else { None };
+    if args.encoder_only || args.audio_encoder_only {
         return tokio::task::spawn_blocking(move || -> Result<()> {
-            let (_server, _) = crate::shared::vision::worker::start(&encoder, &args.snapshot, args.native_lib, args.device_budget_bytes as u64)?;
+            let (_vision, _audio, _) = crate::shared::vision::worker::start_encoders(encoder.as_ref(), audio_encoder.as_ref(),
+                &args.snapshot, args.native_lib, args.device_budget_bytes as u64)?;
             loop { thread::park(); }
         }).await.context("encoder-only owner failed")?;
     }
@@ -59,6 +66,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         topology,
         native_spark_tp2: false,
         encoder,
+        audio_encoder,
     };
     tokio::task::spawn_blocking(move || local::run(config, &args.listen))
         .await
@@ -67,6 +75,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
 
 pub(crate) struct NativeExpertServiceConfig {
     pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
+    pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
     pub library: PathBuf,
     pub exl3_aot_dir: Option<PathBuf>,
     /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
@@ -472,6 +481,7 @@ mod tests {
             topology,
             native_spark_tp2: false,
             encoder: None,
+            audio_encoder: None,
         }
     }
 

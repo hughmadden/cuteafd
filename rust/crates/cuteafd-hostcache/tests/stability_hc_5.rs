@@ -6,7 +6,7 @@ mod common_hc_5;
 
 use common::{reconcile, Model};
 use common_hc_5::{
-    default_cache, device_pages, restored_bytes, settle, snapshot, stored_bytes, target, tokens,
+    device_pages, ordered_cache, restored_bytes, settle, snapshot, stored_bytes, target, tokens,
     write_snapshot, Device, Payload, DEVICE_BYTES,
 };
 use cuteafd_hostcache::cache::{
@@ -15,7 +15,7 @@ use cuteafd_hostcache::cache::{
 use cuteafd_hostcache::config::StoreMode;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_hostcache::pool::testing::CHUNK;
-use cuteafd_hostcache::snapshot::Key;
+use cuteafd_hostcache::snapshot::{EvictionOrder, Key};
 use cuteafd_hostcache::SnapshotKind;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -62,10 +62,10 @@ struct Soak {
 }
 
 impl Soak {
-    fn new(quota: u64, seed: u64) -> Self {
+    fn new(quota: u64, seed: u64, order: EvictionOrder) -> Self {
         Self {
-            cache: default_cache(quota, StoreMode::OnRetain),
-            model: Model::new(),
+            cache: ordered_cache(quota, StoreMode::OnRetain, order),
+            model: Model::with_order(order),
             device: Device::new(DEVICE_BYTES),
             quota,
             evict_quota: quota,
@@ -276,10 +276,10 @@ fn soak_seconds() -> u64 {
         .unwrap_or(60)
 }
 
-#[test]
-fn soak_has_no_leak_and_balances_the_counters() {
+/// The soak in one eviction order. The two orders run as separate tests, side by side.
+fn run_soak(order: EvictionOrder) {
     let deadline = Instant::now() + Duration::from_secs(soak_seconds());
-    let mut soak = Soak::new(8 * CHUNK as u64, 0x50AC_0005);
+    let mut soak = Soak::new(8 * CHUNK as u64, 0x50AC_0005, order);
     let mut phases = 0;
     while Instant::now() < deadline {
         let phase_end = Instant::now() + Duration::from_secs(10);
@@ -299,4 +299,14 @@ fn soak_has_no_leak_and_balances_the_counters() {
         soak.cache.metrics().host_hits > 0,
         "the soak never hit the host cache"
     );
+}
+
+#[test]
+fn soak_has_no_leak_and_balances_the_counters() {
+    run_soak(EvictionOrder::LeastRecent);
+}
+
+#[test]
+fn soak_in_bank_order_has_no_leak_and_balances_the_counters() {
+    run_soak(EvictionOrder::Banks);
 }

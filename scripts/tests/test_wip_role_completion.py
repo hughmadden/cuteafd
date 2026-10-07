@@ -13,6 +13,63 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize('role,arch', [('coordinator', '120'), ('expert', '121')])
+@pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
+def test_wip_audio_aot_reaches_both_native_architectures(role, arch, value):
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    options = 'exl3_aot=' + script.split('exl3_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
+    cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\ncmake --build', 1)[0]
+    env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
+    if value is not None:
+        env['CUTEAFD_WIP_AUDIO_AOT'] = value
+    command = ('set -euo pipefail\nrole=$1; cuda_arch=$2; source_dir=fixture; build_dir=fixture\n'
+               'coordinator_aot=OFF; xgrammar=OFF; spark_tp_roles=; expert_families=; bf16_families=\n'
+               'compiler_cache_cmake_args=()\n'
+               'cmake() { printf "%s\\n" "$@"; }\n' + options + '\n' + cmake)
+    result = subprocess.run(['bash', '-c', command, 'test', role, arch], env=env,
+                            capture_output=True, text=True, timeout=10)
+    if value not in (None, 'ON', 'OFF'):
+        assert result.returncode == 2
+        assert 'CUTEAFD_WIP_AUDIO_AOT must be ON or OFF' in result.stderr
+        assert not result.stdout
+        return
+    assert result.returncode == 0, result.stderr
+    assert f'-DCUTEAFD_ENABLE_AUDIO_AOT={value or "OFF"}' in result.stdout.splitlines()
+    assert f'-DCUTEAFD_CUDA_ARCHITECTURES={arch}' in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
+def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
+    script = (ROOT / 'wip.sh').read_text()
+    validation = 'audio_aot=' + script.split('audio_aot=', 1)[1].split('\nbf16_families=', 1)[0]
+    env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
+    if value is not None:
+        env['CUTEAFD_WIP_AUDIO_AOT'] = value
+    coordinator = 'build_coordinator() {' + script.split('build_coordinator() {', 1)[1].split('\nbuild_expert()', 1)[0]
+    expert = 'build_expert() {' + script.split('build_expert() {', 1)[1].split('\ncase "$role"', 1)[0]
+    command = ('set -euo pipefail\nrelease_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + validation + '\n'
+               'slot=test; coordinator_container=coordinator; spark_container=spark; seed_host=fixture\n'
+               'COORDINATOR_DOCKER_DEV=fixture; SPARK_EXPERT_DOCKER_DEV=fixture\n'
+               'wip_spark_tp_roles=; bf16_families=\n'
+               'sync_local_source() { :; }; sync_seed_source() { :; }\n'
+               'docker() { printf "docker %s\\n" "$*"; }\n'
+               'ssh() { printf "ssh %s\\n" "$*"; }\n' + coordinator + '\n' + expert + '\n'
+               'build_coordinator\nbuild_expert\n')
+    result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=10)
+    if value not in (None, 'ON', 'OFF'):
+        assert result.returncode == 2
+        assert 'CUTEAFD_WIP_AUDIO_AOT must be ON or OFF' in result.stderr
+        assert 'docker' not in result.stdout and 'ssh' not in result.stdout
+        return
+    assert result.returncode == 0, result.stderr
+    builds = [line for line in result.stdout.splitlines() if '/build-wip-artifacts.sh' in line]
+    assert len(builds) == 2
+    assert all(f'CUTEAFD_WIP_AUDIO_AOT={value or "OFF"}' in line for line in builds)
+    assert 'coordinator 120' in builds[0]
+    assert 'expert 121' in builds[1]
+    assert script.index(validation) < script.index('release_load_config "$config"')
+
+
 def check_readiness(tmp_path, role, present, from_slot=''):
     text = (ROOT / 'wip.sh').read_text()
     block = text.split('# wip-slot-readiness:start', 1)[1].split('# wip-slot-readiness:end', 1)[0]

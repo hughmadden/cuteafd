@@ -66,6 +66,10 @@ but bounded engineering still goes to Sol.
   with a resume note pointing at its STATUS.md (its background jobs keep
   running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
+- **Stop the original before relaunching.** An agent hit by `usage_limit_reached` can keep running
+  for a while (some of its calls still complete). Stop it explicitly and confirm its worktree is
+  quiet (`git status` stable) before a replacement takes over that worktree; otherwise two agents
+  write the same tree (2026-10-07, MiMo audio).
 - **Transient 429s:** a stream cut off after `response.created` with HTTP 429 (no `usage_limit_reached`) is OpenAI-side capacity, not a subscription limit, so switching subscription doesn't help (TJ, 2026-10-05). Resume the agent after a few minutes from its STATUS.md; keep briefs and STATUS current so a mid-task death costs little.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a

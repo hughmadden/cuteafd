@@ -618,6 +618,33 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## MiMo audio input preparation
+
+The bounded audio adapters use unmodified published Rust crates through their
+public APIs, with versions and checksums recorded in `rust/Cargo.lock`:
+
+- Hound 3.5.1 (WAV), <https://github.com/ruuda/hound>, Apache-2.0.
+- Claxon 0.4.3 (FLAC), <https://github.com/ruuda/claxon>, Apache-2.0.
+- nanomp3 and nanomp3-core 0.2.0 (MP3),
+  <https://github.com/robbie01/nanomp3>, MIT OR Apache-2.0; selected under
+  Apache-2.0. Their safe Rust decoder retains its upstream minimp3 provenance.
+
+The preprocessing parameters follow Xiaomi's Apache-2.0
+MiMo-Audio-Tokenizer processor, pinned at
+`b62b59922979bf9f389b373169298a251587653f`, and torchaudio 2.9.1 (BSD-2-Clause),
+source `a224ab24a7f4797f6707051257265e223e12576f`. The resampler is a fresh
+implementation of the documented Hann-windowed sinc geometry; no codec
+sources are copied or modified. The qualification-only Python oracle executes
+checked upstream definitions from the official checkpoint and processor source.
+Build-time audio RoPE constants are exact FP32 outputs of Xiaomi's bundled
+`AudioTokenizerRotaryEmbedding` and Hugging Face Transformers' Qwen2 rotary
+module (Apache-2.0), captured under NGC PyTorch 26.05. The exporter records
+checkpoint-source and Qwen2-source digests, the Transformers revision and raw
+constant-byte SHA-256 values; these mathematical tables contain no model weights
+or audio recordings. Offline exports reconstruct them without GPU execution.
+Codec licence texts remain in the published crates; the Apache licence is
+available at <https://www.apache.org/licenses/LICENSE-2.0>.
+
 ## Test-Case Provenance
 
 The upstream-derived test suites under `rust/**/tests/upstream_*.rs`,

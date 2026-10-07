@@ -4,7 +4,8 @@
 //! template: raw messages with tool-call arguments decoded to objects, the
 //! OpenAI `tools` list, `reasoning_effort` and `clear_thinking`. The template
 //! has no off switch, so a request that turns thinking off renders the
-//! server's [`GlmThinkingOff`] form, Low effort by default. As in glmrt,
+//! server's [`GlmThinkingOff`] form: strictly off (an empty think block) by
+//! default, or Low effort when the server opts in. As in glmrt,
 //! `tool_choice` and `response_format` requirements are stated in leading
 //! system messages.
 use serde_json::{json, Map, Value};
@@ -26,10 +27,11 @@ pub enum GlmToolChoice {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GlmThinkingOff {
     /// The template's Low effort with `<think>` left open: the model writes
-    /// a short plan as reasoning, then answers.
-    #[default]
+    /// a short plan as reasoning, then answers. Opt-in.
     Low,
-    /// glmrt's form: an empty `<think></think>` after the default Max effort.
+    /// Off means off: an empty `<think></think>` after the default Max
+    /// effort (glmrt's form), so the reply has no reasoning.
+    #[default]
     Empty,
 }
 

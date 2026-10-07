@@ -141,6 +141,7 @@ pub struct PlanReport {
     pub audio: MediaMode,
     pub disabled_media_bytes: u64,
     pub encoder: Option<encoder::EncoderPlacement>,
+    pub audio_encoder: Option<encoder::EncoderPlacement>,
     pub encoder_plan_hash: String,
     /// Qualified family ceiling in merged image rows, even when vision is off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +276,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         audio: options.audio,
         disabled_media_bytes: 0,
         encoder: None,
+        audio_encoder: None,
         encoder_plan_hash: String::new(),
         max_image_tokens: None,
         snapshot: snapshot.display().to_string(),
@@ -506,14 +508,41 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         };
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
+    if let Some(encoder) = &report.audio_encoder {
+        let owner = match &encoder.kind {
+            encoder::EncoderKind::Rtx { gpu } => Some(format!("rtx{gpu} audio")),
+            encoder::EncoderKind::Spark { rank } => Some(format!("spark{rank} audio")),
+            encoder::EncoderKind::SparkIdle { host } => Some(format!("{host} audio")),
+            encoder::EncoderKind::Off => None,
+        };
+        if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
+    }
     use sha2::{Digest, Sha256};
     let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision))
+        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
+            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
         .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
-    let contract = serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement, report.vision, report.audio, &report.encoder)).expect("plan serializes");
+    // Preserve the vision-only peer contract exactly while audio is disabled.
+    let contract = if report.audio == MediaMode::Off {
+        serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement,
+            report.vision, report.audio, &report.encoder))
+    } else {
+        serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement,
+            report.vision, report.audio, &report.encoder, &report.audio_encoder))
+    }.expect("plan serializes");
     let mut hash = Sha256::new();
     hash.update(contract);
     if let Some(cap) = report.max_image_tokens { hash.update((cap as u64).to_le_bytes()); }
+    if report.audio != MediaMode::Off {
+        if let Ok(plan) = crate::media::audio_tower::AudioTowerPlan::from_snapshot(&checkpoint.snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32) {
+            for (name, read) in plan.reads() {
+                hash.update(name.as_bytes());
+                hash.update(format!("{:?}:{:?}:{}:{}", read.metadata.dtype, read.metadata.shape,
+                    read.metadata.byte_offset, read.metadata.byte_length).as_bytes());
+            }
+        }
+    }
     report.encoder_plan_hash = format!("{:x}", hash.finalize());
     report.spec = Some(spec.clone());
     Ok(report)
@@ -691,6 +720,11 @@ pub fn render(report: &PlanReport) -> String {
         };
         let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} ({attention}); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
         let _ = writeln!(out, "media hash {}", report.encoder_plan_hash);
+    }
+    if let Some(encoder) = &report.audio_encoder {
+        let arch = if matches!(encoder.kind, encoder::EncoderKind::Rtx { .. }) { "audio.sm120" } else { "audio.sm121" };
+        let _ = writeln!(out, "audio      {:?}: {}; weights {} scratch {} bytes; {}; shortfall {} bytes", encoder.kind,
+            encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));

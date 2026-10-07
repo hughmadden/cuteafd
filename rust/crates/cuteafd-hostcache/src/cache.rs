@@ -323,12 +323,14 @@ impl<'a> RestorePlan<'a> {
 
 impl<E: CopyEngine, P> HostCache<E, P> {
     /// Validates `config`, allocates the pinned pool through `engine` (nothing when disabled).
+    /// V4.1's reuse rule with least-recent eviction, the order the daemon and the generic
+    /// engine serve with.
     pub fn new(config: Config, layout: Layout, engine: E) -> anyhow::Result<Self> {
-        Self::with_rule(config, layout, engine, ReuseRule::V41, EvictionOrder::Banks)
+        Self::with_rule(config, layout, engine, ReuseRule::V41, EvictionOrder::LeastRecent)
     }
 
     /// A cache whose lookups follow a generic family's reuse `rule` and whose eviction follows
-    /// `order`; [`HostCache::new`] is V4.1's (`ReuseRule::V41`, bank order).
+    /// `order`; [`HostCache::new`] is `ReuseRule::V41` with `EvictionOrder::LeastRecent`.
     pub fn with_rule(config: Config, layout: Layout, engine: E, rule: ReuseRule, order: EvictionOrder)
         -> anyhow::Result<Self> {
         config.validate()?;
@@ -917,8 +919,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         }
     }
 
-    /// Evict the least recently used unpinned snapshot, dropping its payload; `false` when only
-    /// pinned snapshots remain. Invariant: a pinned snapshot is never evicted.
+    /// Evict the next unpinned snapshot in the store's order (least recently used unless built
+    /// with `EvictionOrder::Banks`), dropping its payload; `false` when only pinned snapshots
+    /// remain. Invariant: a pinned snapshot is never evicted.
     fn evict_one(&mut self) -> bool {
         let Some(snapshots) = self.snapshots.as_mut() else {
             return false;
@@ -940,7 +943,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         self.evict_to(self.config.bytes);
     }
 
-    /// Plan a store, evicting the least recently used unpinned snapshot on `PoolExhausted` and
+    /// Plan a store, evicting the next unpinned snapshot (`evict_one`) on `PoolExhausted` and
     /// retrying, bounded by the resident snapshot count. `None` when every unpinned snapshot has
     /// been evicted and a class is still exhausted.
     fn plan_store_evicting(

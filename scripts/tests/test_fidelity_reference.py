@@ -23,6 +23,54 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
+def validator_panel_counts(panel, manifest, files, record_counts):
+    tree = ast.parse((ROOT / "scripts/bench/validate-fidelity-dataset.py").read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    start = next(i for i, node in enumerate(main.body)
+                 if isinstance(node, ast.Assign) and node.targets[0].id == "windows")
+    shape_loop = main.body[start + 5]
+    row_assert = next(node for node in shape_loop.body if isinstance(node, ast.Assert))
+    checks = ast.Module(body=main.body[start:start + 5] + [row_assert], type_ignores=[])
+    scope = dict(panel=panel, manifest=manifest, dataset=dict(files=files),
+                 maps=[dict.fromkeys(range(n)) for n in record_counts])
+    exec(compile(checks, "validator-panel-counts", "exec"), scope)
+    return scope["scored_positions"]
+
+
+def panel_count_fixture(count):
+    panel = dict(windows=[dict(id=f"w{i}", tokens=[0] * 576, score_from=64)
+                          for i in range(count)])
+    manifest = dict(windows=[dict(id=f"w{i}", positions=list(range(64, 576)))
+                             for i in range(count)])
+    files = [dict(window=f"w{i}") for i in range(count)]
+    return panel, manifest, files
+
+
+@pytest.mark.parametrize("count, rows", [(64, 32768), (8, 4096)])
+def test_dataset_validator_admits_declared_text_and_media_geometry(count, rows):
+    assert validator_panel_counts(*panel_count_fixture(count), [rows, rows]) == rows
+
+
+@pytest.mark.parametrize("count", [64, 8])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("changed", ["manifest_windows", "files", "panel_windows", "manifest_rows", "report_rows"])
+def test_dataset_validator_rejects_count_mismatch(count, direction, changed):
+    panel, manifest, files = panel_count_fixture(count)
+    records = [count * 512] * 2
+    if changed == "manifest_windows":
+        manifest["windows"] = manifest["windows"][:-1] if direction < 0 else manifest["windows"] + [dict(id="extra", positions=list(range(512)))]
+    elif changed == "files":
+        files = files[:-1] if direction < 0 else files + [dict(window="extra")]
+    elif changed == "panel_windows":
+        panel["windows"] = panel["windows"][:-1] if direction < 0 else panel["windows"] + [dict(id="extra", tokens=[0] * 576, score_from=64)]
+    elif changed == "manifest_rows":
+        manifest["windows"][0]["positions"] = list(range(512 + direction))
+    else:
+        records[1] += direction
+    with pytest.raises(AssertionError):
+        validator_panel_counts(panel, manifest, files, records)
+
+
 def tiny_set():
     windows = []
     for name in ("legacy", "a00"):
@@ -218,6 +266,65 @@ def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_p
     with pytest.raises(ValueError, match="email"):
         check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
               "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
+
+
+def finalizer_media_checks():
+    from fidelity_windows import validate_public_metadata, validate_public_text
+    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("validate_media_input", "validate_output_file")]
+    namespace = {"Path": pathlib.Path, "json": json,
+                 "digest": lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+                 "validate_public_metadata": validate_public_metadata, "validate_public_text": validate_public_text}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "media-output-privacy", "exec"), namespace)
+    return namespace
+
+
+def png_fixture(metadata=None):
+    import struct
+    import zlib
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    if metadata is not None:
+        data += chunk(metadata, b"Comment\0/home/private-user/private-file")
+    return data + chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b"")
+
+
+@pytest.mark.parametrize("suffix, payload", [(".bf16", b"\xff\xff"), (".png", png_fixture())])
+def test_dataset_finalizer_accepts_only_matching_declared_binary_media(tmp_path, suffix, payload):
+    checks = finalizer_media_checks()
+    path = tmp_path / ("input" + suffix)
+    path.write_bytes(payload)
+    entry = dict(path=path.name, bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    manifest = dict(media_inputs=[entry])
+    checks["validate_media_input"](tmp_path, entry)
+    checks["validate_output_file"](path, tmp_path, manifest)
+    with pytest.raises(UnicodeDecodeError):
+        checks["validate_output_file"](path, tmp_path, {})
+    entry["sha256"] = "0" * 64
+    with pytest.raises(AssertionError, match="size/checksum"):
+        checks["validate_output_file"](path, tmp_path, manifest)
+    entry["sha256"] = hashlib.sha256(payload).hexdigest()
+    entry["bytes"] += 1
+    with pytest.raises(AssertionError, match="size/checksum"):
+        checks["validate_media_input"](tmp_path, entry)
+
+
+@pytest.mark.parametrize("metadata", [b"tEXt", b"iTXt", b"zTXt", b"eXIf"])
+def test_dataset_finalizer_rejects_png_privacy_metadata(tmp_path, metadata):
+    payload = png_fixture(metadata)
+    path = tmp_path / "private.png"
+    path.write_bytes(payload)
+    entry = dict(path=path.name, bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    with pytest.raises(AssertionError, match="privacy metadata"):
+        finalizer_media_checks()["validate_output_file"](path, tmp_path, dict(media_inputs=[entry]))
+
+
+@pytest.mark.parametrize("relative", ["../escape.bf16", "/absolute.bf16"])
+def test_dataset_finalizer_rejects_unsafe_media_paths(tmp_path, relative):
+    with pytest.raises(AssertionError, match="Unsafe media input"):
+        finalizer_media_checks()["validate_media_input"](tmp_path, dict(path=relative, bytes=2, sha256="0" * 64))
 
 
 def test_measured_dataset_validator_self_tests():

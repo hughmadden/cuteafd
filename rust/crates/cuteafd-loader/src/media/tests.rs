@@ -157,7 +157,7 @@ fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
         [MediaSpan {
             start: 2,
             len: 4,
-            key: image.key
+            key: image.key.into()
         }]
     );
     assert!(expander.expand(&[1, 12, 2], &[image.clone()], 128).is_err());
@@ -176,6 +176,31 @@ fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
     }
     .expand(&[], &[], 128)
     .is_err());
+}
+
+#[test]
+fn mixed_audio_image_spans_use_final_offsets_and_checkpoint_markers() {
+    use super::audio::prepare_pcm;
+    let config = serde_json::json!({"image_token_id":12,"vision_start_token_id":11,"vision_end_token_id":13,
+        "audio_token_id":22,"audio_start_token_id":21,"audio_end_token_id":23});
+    let image = ProcessorConfig::for_family(ImageFamily::Mimo)
+        .prepare_rgb(rgb(64, 64), EncoderId([0; 32])).unwrap();
+    let clip = prepare_pcm(vec![0.0; 4800], EncoderId([0; 32])).unwrap();
+    let native = [1, 21, 22, 23, 11, 12, 13, 21, 22, 23, 2];
+    let expanded = SpanExpander::expand_media(&config, 100, &native, &[image.clone()], &[clip.clone(), clip.clone()], 32).unwrap();
+    assert_eq!(expanded.tokens, [1, 21, 22, 22, 23, 11, 12, 12, 12, 12, 13, 21, 22, 22, 23, 2]);
+    assert_eq!(expanded.media, [MediaSpan { start: 2, len: 2, key: clip.key.into() },
+        MediaSpan { start: 6, len: 4, key: image.key.into() }, MediaSpan { start: 12, len: 2, key: clip.key.into() }]);
+    assert!(SpanExpander::expand_media(&config, 100, &native, &[image.clone()], &[clip.clone()], 32).is_err());
+    assert!(SpanExpander::expand_media(&config, 100, &native, &[image.clone()], &[clip.clone(), clip.clone()], 15).is_err());
+    assert!(SpanExpander::expand_media(&config, 100, &[22], &[], &[clip.clone()], 32).is_err());
+    let mut bad = clip.clone(); bad.geometry.tokens += 1;
+    assert!(SpanExpander::expand_media(&config, 100, &[21,22,23], &[], &[bad], 32).is_err());
+    let old = SpanExpander::from_config(&config, 100).unwrap().expand(&[11,12,13], &[image.clone()], 32).unwrap();
+    let new = SpanExpander::expand_media(&config, 100, &[11,12,13], &[image], &[], 32).unwrap();
+    assert_eq!(old.tokens, new.tokens); assert_eq!(old.media, new.media);
+    let text = SpanExpander::expand_media(&config, 100, &[1,2,3], &[], &[], 32).unwrap();
+    assert_eq!(text.tokens, [1,2,3]); assert!(text.media.is_empty());
 }
 
 #[test]

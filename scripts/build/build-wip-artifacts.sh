@@ -64,6 +64,8 @@ done
 # native expert path does not require the EXL3 package.
 exl3_aot="${CUTEAFD_WIP_EXL3_AOT:-ON}"
 nvfp4_aot="${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
+case "$audio_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" >&2; exit 2 ;; esac
 case "$exl3_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXL3_AOT must be ON or OFF, got: $exl3_aot" >&2; exit 2 ;; esac
 case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF, got: $nvfp4_aot" >&2; exit 2 ;; esac
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
@@ -92,6 +94,10 @@ mkdir -p "$build_dir" "$output_dir"
 export PYO3_PYTHON=python3
 export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/cuteafd_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export CARGO_TARGET_DIR="$build_dir/cargo-target"
+source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
+cuteafd_compiler_cache_setup "$build_dir"
+compiler_cache_cmake_args=()
+mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_dir/native")
 
 # The WIP sync chain (rsync -a + docker cp) can leave source mtimes older
 # than the previous build's fingerprints; cargo/ninja then silently reuse
@@ -124,12 +130,14 @@ cargo build \
   --release
 
 cmake \
+  "${compiler_cache_cmake_args[@]}" \
   -S "$source_dir/native" \
   -B "$build_dir/native" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
@@ -162,6 +170,12 @@ cmake --build "$build_dir/native"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
+if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
+    "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
+elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
+  rm -f "$output_dir/COMPILER_PROVENANCE.json"
+fi
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 # The coordinator program manifest (DeepSeek V4, GLM, GLM Flash, MiMo, Qwen; an empty table
 # when none was built), as the release images carry it at /opt/cuteafd/share/PROGRAMS.json:

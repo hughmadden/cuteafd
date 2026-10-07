@@ -952,6 +952,48 @@ pub(crate) fn startup_graphs_enabled() -> bool {
         std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").ok().as_deref())
 }
 
+/// The startup decode graph set's bytes on its largest rank (`serving_graph_reserve`), and the
+/// planner's graph allowance, which lazily captured graphs keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupGraphReserve {
+    pub reserve: u64,
+    pub allowance: u64,
+}
+
+/// Admits the KV pool beside the startup decode graphs (`startup`), falling back to lazily captured
+/// graphs only on a real shortfall: the admission with the startup set's bytes above the allowance
+/// is refused for want of memory (`memory_report::kv_shortfall`), and the same admission with lazily
+/// captured graphs, which keep only the allowance, admits a pool. `admit(extra)` is the planned
+/// admission with `extra` graph bytes per GPU above the allowance. Returns the pool and whether
+/// decode graphs are captured at startup. Every other refusal stands: the first admission's own
+/// error when it is not a shortfall; the startup refusal when the retry is short of memory too; and
+/// the retry's own error, with the startup refusal as context, when the retry fails for another
+/// reason (its memory sample, an overflow, a CUDA query, a checkpoint read).
+pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
+    mut admit: impl FnMut(u64) -> Result<usize>) -> Result<(usize, bool)> {
+    use crate::shared::memory_report::kv_shortfall;
+    let Some(graphs) = startup else { return Ok((admit(0)?, false)) };
+    let extra = graphs.reserve.saturating_sub(graphs.allowance);
+    let refused = match admit(extra) {
+        Ok(tokens) => return Ok((tokens, true)),
+        Err(error) if extra > 0 && kv_shortfall(&error) => error,
+        Err(error) => return Err(error),
+    };
+    let tokens = match admit(0) {
+        Ok(tokens) => tokens,
+        // No room either way: the startup set is not what leaves the pool out, so its refusal stands.
+        Err(retry) if kv_shortfall(&retry) => return Err(refused),
+        // The retry failed for another reason: that failure is the diagnostic.
+        Err(retry) => return Err(retry.context(format!("admitting the GLM Flash KV pool with lazily captured \
+            decode graphs, after the startup set's admission was refused ({refused:#})"))),
+    };
+    tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
+        startup_extra_bytes = extra, lazy_pool_tokens = tokens, startup_admission = %format!("{refused:#}"),
+        "GLM Flash startup decode graphs leave no room for a KV pool: capturing decode graphs lazily within the \
+        graph allowance instead (CUTEAFD_GLMF_STARTUP_GRAPHS=0 chooses this outright)");
+    Ok((tokens, false))
+}
+
 fn decode_bucket(rows: usize, spec: bool) -> usize {
     if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
     else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
@@ -1123,6 +1165,12 @@ impl<'a> GlmfEngine<'a> {
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
             kda_prefill_expanded: false, l2: None, embedding, selector: RefCell::new(None) })
+    }
+
+    /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
+    /// (the KV admission found no room for it: `admit_beside_decode_graphs`).
+    pub(crate) fn capture_graphs_lazily(&mut self) {
+        self.startup_graphs = false;
     }
 
     /// Own every ordinary text/media workspace before readiness: both ranks' decode workspaces and
@@ -3437,6 +3485,106 @@ mod prefill_lane_tests {
             for drafter in [false, true] {
                 assert_eq!(super::workspace_reserve_bytes(10_000, lanes, drafter),
                     10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(drafter)) as u64);
+            }
+        }
+    }
+
+    /// The startup set's fallback, against an admission modelled on a 5090 at 131,072 tokens and 16
+    /// sequences: 49,408 tokens of 11,804 B fit beside the planner's 1.5 GiB graph allowance, and the
+    /// startup set needs 3,388,063,576 B more (28,060 graphs).
+    #[test]
+    fn startup_graphs_fall_back_to_lazy_capture_only_on_a_real_shortfall() {
+        use super::{admit_beside_decode_graphs, StartupGraphReserve};
+        use crate::shared::memory_report::NoKvRoom;
+        let allowance = 1_610_612_736;
+        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
+        // Whole 256-token units of 11,804 B in the room past the fixed costs and `extra`.
+        let modelled = |room: u64| move |extra: u64| -> anyhow::Result<usize> {
+            let tokens = room.saturating_sub(extra) / 11_804 / 256 * 256;
+            anyhow::ensure!(tokens >= 256, NoKvRoom { free_after_reserve: vec![room as i64 - extra as i64] });
+            Ok(tokens as usize)
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let counted = |room: u64| { let admit = modelled(room); let calls = &calls;
+            move |extra: u64| { calls.borrow_mut().push(extra); admit(extra) } };
+        // Fits: startup capture, one admission with the startup set's extra.
+        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(8_000_000_000)).unwrap();
+        assert!(at_startup && tokens == 390_656);
+        assert_eq!(calls.take(), [3_388_063_576]);
+        // A real shortfall: no room beside the startup set, 49,408 tokens with lazily captured graphs.
+        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(49_408 * 11_804)).unwrap();
+        assert!(!at_startup && tokens == 49_408);
+        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        // No room either way: the startup admission's refusal stands.
+        let error = admit_beside_decode_graphs(startup, counted(1_000)).unwrap_err();
+        assert!(error.to_string().contains(&format!("{}", 1_000 - 3_388_063_576_i64)), "{error}");
+        assert_eq!(calls.take(), [3_388_063_576, 0]);
+        // Any other refusal is not a shortfall: no retry.
+        let failing = |_: u64| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
+        assert!(admit_beside_decode_graphs(startup, failing).unwrap_err().to_string().contains("CUDA error"));
+        // A startup set within the allowance adds nothing to retry without; startup capture off runs lazily.
+        let within = Some(StartupGraphReserve { reserve: allowance, allowance });
+        assert!(admit_beside_decode_graphs(within, counted(1_000)).is_err());
+        assert_eq!(calls.take(), [0]);
+        assert_eq!(admit_beside_decode_graphs(None, counted(49_408 * 11_804)).unwrap(), (49_408, false));
+        assert_eq!(calls.take(), [0]);
+    }
+
+    /// The lazy retry after each refusal for want of memory: a pool falls back to lazy capture; a retry
+    /// short of memory too (either kind) keeps the startup refusal; a retry that fails for another
+    /// reason returns its own error, with the startup refusal as context. Same startup set as above.
+    #[test]
+    fn the_lazy_retry_keeps_the_startup_refusal_only_when_it_is_short_too() {
+        use super::{admit_beside_decode_graphs, StartupGraphReserve};
+        use crate::shared::memory_report::{kv_shortfall, NoKvRoom};
+        use cuteafd_core::serving_capacity::CapacityError;
+        // The modelled launch above (49,408 tokens of 11,804 B fit beside the allowance alone).
+        fn no_room() -> anyhow::Error {
+            NoKvRoom { free_after_reserve: vec![583_212_032 - 3_388_063_576] }.into()
+        }
+        // An automatic pool's one-unit check (`GpuMemoryBudget::admit`), as a 5090 refused it at 131,072
+        // tokens and 16 sequences with host embedding; the retry then admitted 91,904 tokens.
+        fn over_budget() -> anyhow::Error {
+            CapacityError::GpuBudgetExceeded { device: 0, required: 36_016_220_192, budget: 33_711_521_792,
+                shortfall: 2_304_698_400 }.into()
+        }
+        // The retry's refreshed memory sample or checkpoint read failing: none is a shortfall.
+        let others: [fn() -> anyhow::Error; 4] = [
+            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
+            || CapacityError::Overflow("GPU allocation budget").into(),
+            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
+            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)).context("opening config.json"),
+        ];
+        let allowance = 1_610_612_736;
+        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
+        let calls = std::cell::RefCell::new(Vec::new());
+        // The admission with the startup set's extra is refused with `first`; the retry answers `retry`.
+        let scripted = |first: anyhow::Error, retry: anyhow::Result<usize>| {
+            let mut answers = vec![retry, Err(first)];
+            let calls = &calls;
+            move |extra: u64| { calls.borrow_mut().push(extra); answers.pop().expect("at most two admissions") }
+        };
+        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
+        let refusals: [(fn() -> anyhow::Error, usize); 2] = [(no_room, 49_408), (over_budget, 91_904)];
+        for (refusal, pool) in refusals {
+            // A pool with lazily captured graphs: lazy capture.
+            let admitted = admit_beside_decode_graphs(startup, scripted(refusal(), Ok(pool))).unwrap();
+            assert_eq!(admitted, (pool, false));
+            assert_eq!(calls.take(), [3_388_063_576, 0]);
+            // Short either way: the startup refusal, unchanged.
+            for (short, _) in refusals {
+                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(short()))).unwrap_err();
+                assert!(kv_shortfall(&error));
+                assert_eq!(chain(&error), chain(&refusal()));
+                assert_eq!(calls.take(), [3_388_063_576, 0]);
+            }
+            // Another failure: the retry's own error, whole, beneath the startup refusal as context.
+            for other in others {
+                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(other()))).unwrap_err();
+                assert!(!kv_shortfall(&error), "{error:#}");
+                assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
+                assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
+                assert_eq!(calls.take(), [3_388_063_576, 0]);
             }
         }
     }

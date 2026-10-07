@@ -64,10 +64,10 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
-    /// How a request that turns thinking off renders: low (the template's
-    /// Low effort, think block open) or empty (an empty think block after
-    /// the default Max effort).
-    #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "low")]
+    /// How a request that turns thinking off renders: empty (strictly off,
+    /// an empty think block after the default Max effort) or low (the
+    /// template's Low effort, think block open, a short plan as reasoning).
+    #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
     /// Decode one token per step (no copy-window drafts).
     #[arg(long)]
@@ -405,7 +405,7 @@ fn media_digest(tokens: &[u32], spans: &[cuteafd_loader::media::MediaSpan]) -> u
     let mut state = tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t));
     // Radix hints truncate image identity; speculative grouping must see every key byte.
     for span in spans {
-        for byte in span.start.to_le_bytes().into_iter().chain(span.len.to_le_bytes()).chain(span.key.0) {
+        for byte in span.start.to_le_bytes().into_iter().chain(span.len.to_le_bytes()).chain(*span.key.bytes()) {
             state = digest(state, u32::from(byte));
         }
     }
@@ -471,8 +471,8 @@ mod media_tests {
         use cuteafd_loader::media::{ImageKey, MediaSpan};
         let tokens = [1, 4, 5, 6, 2];
         assert_eq!(super::media_digest(&tokens, &[]), tokens.iter().fold(super::DIGEST_SEED, |d, &t| super::digest(d, t)));
-        let a = MediaSpan { start: 2, len: 1, key: ImageKey([0; 32]) };
-        let mut b = a.clone(); b.key.0[31] = 1;
+        let a = MediaSpan { start: 2, len: 1, key: ImageKey([0; 32]).into() };
+        let mut b = a.clone(); let mut bytes = *b.key.bytes(); bytes[31] = 1; b.key = ImageKey(bytes).into();
         assert_ne!(super::media_digest(&tokens, &[a]), super::media_digest(&tokens, &[b]));
     }
 }

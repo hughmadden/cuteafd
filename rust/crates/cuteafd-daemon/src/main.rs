@@ -32,7 +32,7 @@ fn resolve_qwen_vision(
     family: Option<cuteafd_loader::plan::MediaMode>,
     initial: Option<cuteafd_loader::plan::MediaMode>,
 ) -> cuteafd_loader::plan::MediaMode {
-    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Off)
+    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Auto)
 }
 
 #[cfg(test)]
@@ -41,11 +41,25 @@ mod media_defaults_tests {
     use cuteafd_loader::plan::MediaMode;
 
     #[test]
-    fn qwen_vision_stays_off_until_explicitly_enabled() {
-        assert_eq!(resolve_qwen_vision(None, None), MediaMode::Off);
+    fn qualified_qwen_vision_defaults_auto_and_preserves_overrides() {
+        assert_eq!(resolve_qwen_vision(None, None), MediaMode::Auto);
+        assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Off)), MediaMode::Off);
         assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Auto)), MediaMode::Auto);
         assert_eq!(resolve_qwen_vision(Some(MediaMode::Off), Some(MediaMode::Auto)), MediaMode::Off);
         assert_eq!(resolve_qwen_vision(Some(MediaMode::Spark(Some(0))), None), MediaMode::Spark(Some(0)));
+    }
+
+    #[test]
+    fn qwen_direct_cli_defaults_auto_and_resolves_explicit_off() {
+        use clap::Parser;
+        use super::cli::{Cli, Commands};
+        let base = ["cuteafd", "serve-qwen4", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let defaults = Cli::try_parse_from(base).unwrap();
+        let Commands::ServeQwen4(args) = defaults.command else { panic!("expected Qwen serving"); };
+        assert_eq!(args.vision, MediaMode::Auto);
+        assert_eq!(resolve_qwen_vision(defaults.vision, None), MediaMode::Auto);
+        let off = Cli::try_parse_from(base.into_iter().chain(["--vision", "off"])).unwrap();
+        assert_eq!(resolve_qwen_vision(off.vision, None), MediaMode::Off);
     }
 
     #[test]
@@ -65,13 +79,13 @@ async fn main() -> Result<()> {
 
     let parse = |matches: clap::ArgMatches| {
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch),
+            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch, cli.table_backend),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch) = parse(Cli::command().get_matches());
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend) = parse(Cli::command().get_matches());
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, family_table_backend) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -80,8 +94,12 @@ async fn main() -> Result<()> {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
+        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend.clone()),
     };
+    // Preserve the original explicit option when family resolution reparses argv.
+    if let Some(backend) = initial_table_backend.or(family_table_backend) {
+        cuteafd_loader::TableBackend::set_override(backend.parse().expect("clap validates table backend"));
+    }
     let vision = if matches!(&command, Commands::ServeQwen4(_)) {
         resolve_qwen_vision(family_vision, initial_vision)
     } else {
@@ -89,7 +107,7 @@ async fn main() -> Result<()> {
     };
     let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
-    if let Commands::ServeMimo(args) = &mut command { args.vision = vision; }
+    if let Commands::ServeMimo(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
     if let Commands::ServeQwen4(args) = &mut command {
         args.vision = vision;

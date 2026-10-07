@@ -36,6 +36,7 @@ fn main() {
             Err(_) => (String::new(), false),
         },
     };
+    let commit = if commit.trim().is_empty() { "unknown" } else { &commit };
     println!("cargo:rustc-env=CUTEAFD_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_DIRTY={}", u8::from(dirty));
 }

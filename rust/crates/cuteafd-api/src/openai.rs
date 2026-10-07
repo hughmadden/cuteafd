@@ -80,6 +80,8 @@ pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
+    pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
+    pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
     pub capabilities: MediaCapabilities,
     pub id: String,
@@ -94,7 +96,8 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None }
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None,
+            audio_preparer: None, audio_health: None }
     }
 
     /// Install only after the matching encoder is loaded and ready. A processor
@@ -102,6 +105,13 @@ impl ModelProfile {
     pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
+        self
+    }
+
+    pub fn with_loaded_audio(mut self, preparer: Arc<media::audio::AudioPreparer>, health: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.audio_preparer = Some(preparer);
+        self.audio_health = Some(health);
+        self.capabilities.audio = true;
         self
     }
 
@@ -172,6 +182,7 @@ pub struct NativeRequest {
     pub images: Vec<cuteafd_loader::V41Image>,
     /// Generic-family media, in template order. V4.1 only uses `images`.
     pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
+    pub audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
     pub max_tokens: usize,
     /// Resolved target-sampling parameters. `TargetSamplingParams::greedy()`
     /// keeps the legacy device-argmax route; anything else selects from the
@@ -193,6 +204,7 @@ struct NativeState {
     limits: NativeLimits,
     images: images::ImageDecoder,
     stats: SharedStats,
+    tables: cuteafd_loader::MappedTableStatsReader,
     admission: admission::Admission,
     profile: Arc<ModelProfile>,
 }
@@ -222,6 +234,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         profile.capabilities.vision &= vision;
         profile.capabilities.audio &= audio;
     }
+    let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
@@ -238,18 +251,37 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/models", get(models))
         .route("/v1/stats", get(stats_route))
         .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
-        .with_state(NativeState { queue, limits, images, stats, admission, profile: Arc::new(profile) })
+        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
+        .with_state(NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) })
         .merge(console_routes)
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
+    refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     Json(value)
 }
+// Preserve scheduler-published interval/device diagnostics; refresh only the
+// cumulative counters and backend metadata, including before the first publish.
+fn refresh_mapped_tables(value: &mut Value, reader: &cuteafd_loader::MappedTableStatsReader) {
+    let tables = reader.snapshot();
+    if tables.is_empty() { return; }
+    let fresh = tables.into_iter().map(|table| {
+        let mut entry = value["mapped_tables"].as_array().and_then(|cached| cached.iter()
+            .find(|entry| entry["name"].as_str() == Some(&table.name)))
+            .cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+        entry["name"] = json!(table.name);
+        entry["backend"] = json!(table.backend);
+        entry["accounting"] = json!(table.accounting);
+        entry["cumulative"] = json!(table.cumulative);
+        entry
+    }).collect::<Vec<_>>();
+    value["mapped_tables"] = json!(fresh);
+}
+
 async fn models(State(state): State<NativeState>) -> Json<Value> {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
     let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
@@ -263,13 +295,15 @@ async fn models(State(state): State<NativeState>) -> Json<Value> {
 }
 async fn health(State(state): State<NativeState>) -> Response {
     let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));
-    let status = if state.queue.is_closed() || vision == Some(false) {
+    let audio = state.profile.audio_health.as_ref().map(|h| h.load(Ordering::Acquire));
+    let status = if state.queue.is_closed() || vision == Some(false) || audio == Some(false) {
         StatusCode::SERVICE_UNAVAILABLE
     } else { StatusCode::OK };
-    match vision {
-        Some(healthy) => (status, Json(json!({"vision": if healthy { "ready" } else { "failed" }}))).into_response(),
-        None => status.into_response(),
-    }
+    if vision.is_none() && audio.is_none() { return status.into_response(); }
+    let mut readiness = serde_json::Map::new();
+    if let Some(healthy) = vision { readiness.insert("vision".into(), json!(if healthy { "ready" } else { "failed" })); }
+    if let Some(healthy) = audio { readiness.insert("audio".into(), json!(if healthy { "ready" } else { "failed" })); }
+    (status, Json(Value::Object(readiness))).into_response()
 }
 fn error_body(message: impl ToString) -> Value {
     // Bound upstream parse/validation details before they reach the response
@@ -404,6 +438,23 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             p.fail("probe media requires a loaded encoder");
             return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
         }
+        if !p.spec.audio.is_empty() && (!state.profile.capabilities.audio || state.profile.audio_preparer.is_none()) {
+            p.fail("probe audio requires a loaded encoder");
+            return error(StatusCode::BAD_REQUEST, "probe audio requires a loaded encoder");
+        }
+    }
+    let audio_sources = if state.profile.capabilities.audio {
+        if state.profile.audio_preparer.is_none() { return error(StatusCode::SERVICE_UNAVAILABLE, "audio processor unavailable"); }
+        match media::audio::take_audio_sources(&mut body) {
+            Ok(sources) => sources,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        }
+    } else { Vec::new() };
+    if probe.as_ref().is_some_and(|p| !p.spec.audio.is_empty() && p.spec.audio.len() != audio_sources.len()) {
+        return error(StatusCode::BAD_REQUEST, "probe audio count differs from input_audio sources");
+    }
+    if !audio_sources.is_empty() && state.profile.audio_health.as_ref().is_none_or(|h| !h.load(Ordering::Acquire)) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "audio encoder unavailable");
     }
     let media_sources = match &state.profile.media_preparer {
         Some(preparer) => match media::extract_image_sources(&body, preparer.limits.images) {
@@ -511,6 +562,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         },
         _ => None,
     };
+    if !audio_sources.is_empty() {
+        if glm_request.is_none() { return error(StatusCode::BAD_REQUEST, "audio requires a checkpoint chat template"); }
+        media::audio::strip_adapter_audio(&mut body);
+    }
     let mut parsed: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -568,7 +623,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
-    let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty());
+    let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
     let (prompt, image_sources, processor) = match glm_request {
         Some((Templated::Glm(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -682,7 +737,24 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
         }
     };
+    let audio = if audio_sources.is_empty() { Vec::new() } else {
+        let preparer = state.profile.audio_preparer.as_ref().expect("sources require audio preparer").clone();
+        let slot = match preparer.slots.clone().acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "media preparation is closed"),
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let sources = audio_sources.iter().map(|(data, format)| media::audio::AudioSource { data, format: *format }).collect::<Vec<_>>();
+            preparer.prepare(&sources)
+        }).await {
+            Ok(Ok(prepared)) => prepared.clips,
+            Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    };
     let image_tokens: usize = media.iter().map(|image| image.tokens).sum();
+    let audio_tokens: usize = audio.iter().map(|clip| clip.geometry.tokens).sum();
     // Unbounded on purpose: inference threads send without ever blocking, so a
     // client that stops reading cannot stall the shared scheduler. A request's
     // backlog is bounded by its own max_tokens.
@@ -692,6 +764,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let prompt = if prepared.is_empty() { prompt }
         else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
     let job = NativeRequest {
+        audio,
         media,
         prompt,
         constraint,
@@ -774,7 +847,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 match chunk {
                     Ok(chunk) => {
                         let mut value = serde_json::to_value(&chunk).unwrap();
-                        add_image_usage(&mut value, image_tokens);
+                        add_media_usage(&mut value, image_tokens, audio_tokens);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -827,17 +900,21 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Some(message) = failure.lock().unwrap().clone() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
-    if image_tokens == 0 { return Json(response).into_response(); }
+    if image_tokens == 0 && audio_tokens == 0 { return Json(response).into_response(); }
     let mut value = serde_json::to_value(response).expect("chat response serializes");
-    add_image_usage(&mut value, image_tokens);
+    add_media_usage(&mut value, image_tokens, audio_tokens);
     Json(value).into_response()
 }
 
-fn add_image_usage(response: &mut Value, image_tokens: usize) {
-    if image_tokens == 0 { return; }
+fn add_media_usage(response: &mut Value, image_tokens: usize, audio_tokens: usize) {
+    if image_tokens == 0 && audio_tokens == 0 { return; }
     if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
         let details = usage.entry("prompt_tokens_details").or_insert_with(|| json!({}));
-        if let Some(details) = details.as_object_mut() { details.insert("image_tokens".into(), json!(image_tokens)); }
+        if let Some(details) = details.as_object_mut() {
+            // Keep image-only responses unchanged; add only present modalities.
+            if image_tokens > 0 { details.insert("image_tokens".into(), json!(image_tokens)); }
+            if audio_tokens > 0 { details.insert("audio_tokens".into(), json!(audio_tokens)); }
+        }
     }
 }
 
@@ -900,6 +977,123 @@ mod tests {
     use tower::ServiceExt;
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
+    }
+    #[tokio::test]
+    async fn stats_read_live_tables_before_first_publish_and_after_idle_batch() {
+        use cuteafd_loader::{MappedTable, RowFormat, TableBackend, TablePart};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        // SAFETY: the test owns the file and keeps its length fixed while mapped.
+        let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(),
+            offset: 0, rows: 4 }], RowFormat::of(cuteafd_core::DType::U8, 16).unwrap()).unwrap() };
+        table.select_backend(TableBackend::Mmap);
+        let name = format!("stats-live-{}", file.path().display());
+        table.name_stats(name.clone());
+        for profile in [ModelProfile::default(),
+            ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))] {
+            let (tx, _rx) = mpsc::channel(4);
+            let cached = Arc::new(Mutex::new(Value::Null));
+            let app = router_for_model(tx, NativeLimits::default(), cached.clone(),
+                std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+            for expected in [table.stats().snapshot().gathers, table.stats().snapshot().gathers + 1] {
+                let response = app.clone().oneshot(axum::http::Request::get("/v1/stats")
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                let entry = value["mapped_tables"].as_array().unwrap().iter()
+                    .find(|entry| entry["name"] == name).unwrap();
+                assert_eq!(entry["backend"], "mmap");
+                assert_eq!(entry["cumulative"]["gathers"], expected);
+                assert_eq!(value["http_queue_len"], 0);
+                if cached.lock().unwrap().is_null() {
+                    assert_eq!(entry["cumulative"]["rows"], expected * 2);
+                } else {
+                    assert_eq!(value["family_marker"], "unchanged");
+                    assert_eq!(entry["interval"]["gathers"], 77);
+                    assert_eq!(entry["host_wide_device_reads"][0]["bytes"], 123);
+                }
+                // No scheduler publication is necessary after recording a batch.
+                table.stats().record_gather(2, 32, std::time::Duration::from_micros(3), [0; 3]);
+                *cached.lock().unwrap() = json!({"family_marker":"unchanged",
+                    "mapped_tables":[{"name":name,"backend":"stale","cumulative":{"gathers":0},
+                        "interval":{"gathers":77},"host_wide_device_reads":[{"device":"test","bytes":123}]}]});
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_without_tables_preserve_published_family_fields() {
+        let published = json!({"family":"qwen4", "active":0, "nested":{"tokens":12}});
+        let (queue, _receive) = mpsc::channel(4);
+        let state = NativeState { queue, limits: NativeLimits::default(),
+            images: images::ImageDecoder::new(4), stats: Arc::new(Mutex::new(published.clone())),
+            tables: cuteafd_loader::MappedTableStatsReader::default(),
+            admission: admission::Admission::new(4, std::time::Duration::from_secs(25)),
+            profile: Arc::new(ModelProfile::default()) };
+        let Json(value) = stats_route(State(state)).await;
+        for (key, expected) in published.as_object().unwrap() { assert_eq!(&value[key], expected); }
+        assert_eq!(value["http_queue_len"], 0);
+        assert!(value.get("mapped_tables").is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_request_prepares_pcm_without_payload_in_prompt_and_fails_closed() {
+        use base64::Engine;
+        let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/2479e2d0029eca9a34cc7e7f55a121925f81908e");
+        if !snapshot.exists() { return; }
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF"); wav.extend(48036u32.to_le_bytes()); wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes()); wav.extend(1u16.to_le_bytes()); wav.extend(1u16.to_le_bytes());
+        wav.extend(24000u32.to_le_bytes()); wav.extend(48000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes()); wav.extend(16u16.to_le_bytes()); wav.extend(b"data");
+        wav.extend(48000u32.to_le_bytes()); wav.resize(48044, 0);
+        let data = base64::engine::general_purpose::STANDARD.encode(wav);
+        for streaming in [false, true] {
+            let health = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let profile = ModelProfile::new("mimo-audio-test", ModelEncoding::Qwen(Arc::new(
+                qwen4::QwenEncoding::from_snapshot(snapshot).unwrap())))
+                .with_loaded_audio(Arc::new(media::audio::AudioPreparer::new(
+                    cuteafd_loader::media::EncoderId([1;32]), Arc::new(tokio::sync::Semaphore::new(1)))), health.clone());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert_eq!(job.audio.len(), 1); assert_eq!(job.audio[0].pcm.len(), 24000);
+                assert_eq!(job.audio[0].geometry.tokens, 7);
+                assert!(job.media.is_empty());
+                assert_eq!(job.prompt, "<|im_start|>user\nbefore<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>after<|im_end|><|im_start|>assistant\n<think></think>");
+                for event in [InferenceChunk::Ready {system_fingerprint:None,
+                    prompt_usage:PromptUsage {prompt_tokens:20,prompt_cache_hit_tokens:0}},
+                    InferenceChunk::Finish {finish_reason:InferenceFinishReason::Stop}] {
+                    job.events.send(Ok(event)).unwrap();
+                }
+                rx
+            });
+            let mut body = json!({"model":"mimo-audio-test","enable_thinking":false,"max_tokens":8,
+                "stream":streaming,"messages":[{"role":"user","content":[
+                    {"type":"text","text":"before"},{"type":"input_audio","input_audio":{"data":data,"format":"wav"}},
+                    {"type":"text","text":"after"}]}]});
+            if streaming { body["stream_options"] = json!({"include_usage":true}); }
+            let request = || axum::http::Request::post("/v1/chat/completions").header("content-type","application/json")
+                .body(Body::from(body.to_string())).unwrap();
+            let response = app.clone().oneshot(request()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            let usage: Value = if streaming {
+                std::str::from_utf8(&bytes).unwrap().split("data: ")
+                    .filter_map(|s| s.trim_end().parse::<Value>().ok()).find(|v| v["choices"] == json!([])).unwrap()
+            } else { serde_json::from_slice(&bytes).unwrap() };
+            assert_eq!(usage["usage"]["prompt_tokens_details"]["audio_tokens"], 7);
+            assert!(usage["usage"]["prompt_tokens_details"]["image_tokens"].is_null());
+            let mut rx = worker.await.unwrap();
+            health.store(false, Ordering::Release);
+            assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(app.oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap()).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
@@ -1113,6 +1307,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn expanded_audio_probe_binds_ordinary_sources_without_chat_rendering() {
+        use base64::Engine;
+        use cuteafd_loader::media::EncoderId;
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF"); wav.extend(48036u32.to_le_bytes()); wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes()); wav.extend(1u16.to_le_bytes()); wav.extend(1u16.to_le_bytes());
+        wav.extend(24000u32.to_le_bytes()); wav.extend(48000u32.to_le_bytes()); wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes()); wav.extend(b"data"); wav.extend(48000u32.to_le_bytes()); wav.resize(48044,0);
+        let source = base64::engine::general_purpose::STANDARD.encode(wav);
+        let preparer = Arc::new(media::audio::AudioPreparer::new(EncoderId([1;32]), Arc::new(tokio::sync::Semaphore::new(1))));
+        let clip = preparer.prepare(&[media::audio::AudioSource { data: &source, format: cuteafd_loader::media::audio::AudioFormat::Wav }]).unwrap().clips.remove(0);
+        let spec = probe::ProbeSpec { prompt_ids: Some(vec![1;11]), audio: vec![probe::ProbeAudio { start:2,len:7,samples:24000,
+            key: clip.key.0.iter().map(|v| format!("{v:02x}")).collect(), pcm_sha256:"ab".repeat(32) }], ..Default::default() };
+        for source_present in [false,true] {
+            let (id, _) = probe::registry().register(spec.clone());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let expected = clip.key;
+            let worker = source_present.then(|| tokio::spawn(async move {
+                let job = rx.recv().await.unwrap(); assert!(job.prompt.is_empty() && job.media.is_empty());
+                assert_eq!(job.audio.len(),1); assert_eq!(job.audio[0].key,expected);
+                job.events.send(Ok(InferenceChunk::Ready { system_fingerprint:None,
+                    prompt_usage:PromptUsage {prompt_tokens:11,prompt_cache_hit_tokens:0} })).unwrap();
+                job.events.send(Ok(InferenceChunk::Finish {finish_reason:InferenceFinishReason::Length})).unwrap();
+            }));
+            let profile = ModelProfile::new(MODEL,ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))
+                .with_loaded_audio(preparer.clone(),Arc::new(std::sync::atomic::AtomicBool::new(true)));
+            let app = router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(1),ConsoleHub::disabled(),profile);
+            let content = if source_present { json!([{"type":"input_audio","input_audio":{"data":source,"format":"wav"}}]) } else { json!("probe") };
+            let body = json!({"model":MODEL,"messages":[{"role":"user","content":content}],"max_tokens":1});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").header(probe::HEADER,id)
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),if source_present {StatusCode::OK} else {StatusCode::BAD_REQUEST});
+            if let Some(worker) = worker { worker.await.unwrap(); }
+        }
+    }
     #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;

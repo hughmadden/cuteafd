@@ -757,8 +757,8 @@ Policy decisions:
   still requires TJ's license decision and explicit approval.
 - **v2.0.0 payload (TJ, 2026-10-07):**
   - Multimodal: vision by default for MiMo V2.6 Flash/Pro, GLM 5.3 Flash and
-    Qwen 3.8 (once its tower passes the WP-9 gates), with the encoder on an
-    expert Spark (D1); V4.1 vision unchanged.
+    Qwen 3.8 (qualified WP-7 availability and single-image gates), with the
+    encoder on an expert Spark (D1); V4.1 vision unchanged.
   - GLM 5.3 Flash beast mode: startup graphs, real-row MoE dispatch,
     precreated workspaces, Hugh's Wave A, then his Waves B/C (1.6M-token
     pool, 1M extent, C16 speed) as they land.
@@ -779,6 +779,28 @@ Policy decisions:
     image), PLAT-2 (the 32 GB plan) and PLAT-3 (GeForce defaults), with 5090
     cards produced by Hugh's agent at release-candidate time
     (hughmadden/cuteafd-collab item T-3).
+  - Audio: MiMo V2.6 Flash/Pro `input_audio` (WP-10, work/mm-mimo-audio;
+    the CPU reference is on work/p0 at 8acabb99), AUDIO=auto following VISION
+    once its gates pass. Video (native in MiMo, GLM Flash and Qwen) only if
+    image and audio are done while we still wait on Hugh's v2 pieces; plan
+    NVDEC decode on the encoder's device, gated against a CPU reference.
+  - Lower priority (TJ, 2026-10-07): **scoring without a launch flag.**
+    Full-tier prefill scoring needs all-row prefill logits, which today must
+    be admitted at launch (FULL_PREFILL_LOGITS=on reserves the extra
+    logits/workspace before KV sizing), so the bench console can't run Full,
+    or Standard's prefill half, against a default server. Instead, borrow the
+    memory from the KV pool per scoring request: a scoring request reserves
+    whole free KV pages, enough for its all-row logits and enlarged workspace,
+    for its duration, through the same admission path as any KV allocation.
+    It waits or returns a 429 with a reason when the pages aren't free, and
+    it never evicts live sequences or shrinks admitted requests. The pages
+    return when it finishes. The engine must run the all-row prefill in that
+    borrowed storage with the same kernels and geometry as the launch-flag
+    path, so the scores are byte-identical (gate: borrowed vs launch-admitted
+    scoring, identical per-row records on Quick/Standard/Full). Then the
+    console gets proper Full measurements on any server, and
+    FULL_PREFILL_LOGITS remains as an explicit reservation for dedicated
+    fidelity hosts.
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.
@@ -838,8 +860,9 @@ Work, in priority order:
    embedding and prefix caches. That beats spending RTX memory or a whole
    Spark on the tower. The −91% decode under back-to-back 4096-token
    encodes is a stress case, not a gate for this default. MiMo and GLM Flash
-   launches now default to `VISION=auto`; other generic families stay `off`
-   until their towers are qualified. Keep V4.1 vision unchanged.
+   launches now default to `VISION=auto`; Qwen joins them on the qualification
+   below. Other generic families stay `off` until their towers are qualified.
+   Keep V4.1 vision unchanged.
    **Merge note (Qwen WP-7 + GLM Flash WP-9):** the cold_steps echo allowlist in
    `cuteafd-api/src/openai/probe.rs` is `mimo_v2|qwen4` on WP-7 and
    `mimo_v2|glm5_flash` on WP-9. Each branch lists only families whose
@@ -888,14 +911,31 @@ Work, in priority order:
    The original failed v1 loss evidence stays intact; v3 closes the remaining
    gates. Shared code still requires the coordinator's batched V4.1 parity gate.
    **Qwen image capacity:** 1024 merged tokens per image, `detail=low` 256,
-   BF16 residual; explicit `VISION=auto` still enables the tower (RTX on the
-   zero-Spark minimum). Qwen tower >1024 tokens: BF16 fails calibrated G2 at
+   BF16 residual; omitted `VISION` now defaults to `auto` in the launcher and
+   direct CLI (RTX on the zero-Spark minimum); explicit `off` remains unchanged.
+   Frozen full-image v4 three-session availability medians pass: auto/off C1
+   1.00208 and C16 0.99546 (bar 0.98). Single-image interference at 256/1024,
+   the distinct 1024-cap witness at default quota, encoder-only loss with
+   cached/new image 503 and surviving active/new text, unchanged experts,
+   official-off checks and zero runtime graph captures pass. Planner admission
+   equals native: 898,680,904 B weights + 447,778,048 B scratch = 1,346,458,952 B.
+   The original sealed rolling-traffic analyzer remains FAIL; TJ classifies
+   rolling submissions as stress, not a v2 promotion gate (2026-10-07).
+   Known limit: under continuous image traffic (2 of 16 slots resubmitting
+   image chats), text decode drops to ~22% of the off rate; likely the
+   prefill_share floor; not addressed in v2. This is relative to off C16
+   scaled by 14/16. CPU inspection confirms image LM prefills use shared
+   rounds at decode_share=0.2; about 74-76% of the 90 s window is image LM
+   prefill busy time, not the roughly 40 ms encoder alone. The fixed floor
+   is a hypothesis, not proven: settle clears debt when the queue empties.
+   GLM Flash shares this policy; its retained gates cover single images,
+   not rolling traffic. No scheduler change is made for v2.
+   Qwen tower >1024 tokens: BF16 fails calibrated G2 at
    2048/4096; FP32 residual fixes 4096 but regresses 256/1024 worst-row.
    Bounded diagnostic: patch row 863 has dominant channel 514; block-27 cosine
    0.99997 collapses at merger LayerNorm (0.588 versus BF16's 0.870).
    Hypothesis: a massive-activation outlier and LN amplification, not a
-   demonstrated row-handling bug. Serving gates remain required before changing
-   the Qwen launcher default.
+   demonstrated row-handling bug. Larger image caps remain unqualified.
    **WP-7 concurrency workload:** the Python concurrent benchmark defaults to
    one identical prompt for every request (`scripts/bench/deepseek_v41/bench-concurrent-api.py:45`).
    Qwen's retained C16 Copy comparison generated mostly lockstep lazy outputs
@@ -930,7 +970,8 @@ Work, in priority order:
    measured graph bytes fit the graph reserve, and post-startup CUDA free
    exceeds the separate headroom. Readiness is measured at the first genuine
    completion, not API-open. This confirms the promoted image, not a new
-   three-pair performance measurement; VISION stays off.
+   three-pair performance measurement. The separate v4 availability and
+   single-image qualification above promotes VISION to auto.
    **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
    + 4 Sparks, correctness only; Qwen has no coordinator head split and the
    second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image
