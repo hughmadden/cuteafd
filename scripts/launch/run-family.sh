@@ -161,6 +161,8 @@ layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
+# Options only the Spark expert workers take.
+spark_worker_args=""
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
@@ -680,6 +682,17 @@ if [[ $family == glm5_flash ]]; then
     spark_worker_env+=" -v $exl3_route_dump:$exl3_route_dump -e CUTEAFD_EXL3_ROUTE_DUMP=$exl3_route_dump/routes"
     spark_worker_env+=" -e CUTEAFD_EXL3_ROUTE_DUMP_CALLS=$exl3_route_dump_calls"
   fi
+  # GLM5_FLASH_EXL3_SCHEDULE: the Spark EXL3 decode schedule, default or gb10. gb10 runs the
+  # m1-gb10/m80-gb10 TP4 exports: the same products and sums (the same bits), with the weight
+  # words staged evict-first in L2, and at m80 64x128 tiles at two CTAs per SM.
+  exl3_schedule="$(get GLM5_FLASH_EXL3_SCHEDULE default)"
+  case "$exl3_schedule" in
+    default) ;;
+    gb10)
+      [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_EXL3_SCHEDULE=gb10 is a Spark expert schedule; SPARK_COUNT=0 runs none" >&2; exit 2; }
+      spark_worker_args+=" --exl3-schedule gb10" ;;
+    *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -910,7 +923,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
+    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args$spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
 done
 wait

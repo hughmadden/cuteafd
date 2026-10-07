@@ -54,6 +54,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
     let config = NativeExpertServiceConfig {
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
+        exl3_schedule: args.exl3_schedule,
         fp8_package: args.fp8_package,
         snapshot: args.snapshot,
         rank: args.rank as usize,
@@ -78,6 +79,9 @@ pub(crate) struct NativeExpertServiceConfig {
     pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
     pub library: PathBuf,
     pub exl3_aot_dir: Option<PathBuf>,
+    /// Decode schedule of the EXL3 exports (`m<capacity>` or, for GB10,
+    /// the GLM 5.3 Flash `m<capacity>-gb10` siblings; the same bits).
+    pub exl3_schedule: crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule,
     /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
     pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
@@ -469,6 +473,7 @@ mod tests {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),
             exl3_aot_dir: None,
+            exl3_schedule: Default::default(),
             fp8_package: None,
             snapshot: PathBuf::from("/model"),
             rank,
