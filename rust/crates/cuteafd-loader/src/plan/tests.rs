@@ -552,15 +552,23 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
 }
 
 #[test]
-fn mimo_audio_missing_bundle_is_unsupported_not_silently_disabled() {
+fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() {
+    for config in [mimo_flash_mopd_config(), v41_config(), qwen4_config(1),
+        json!({"model_type": "glm5_next"}), json!({"model_type": "deepseek_v4"})] {
+        let dir = snapshot(config, &[]);
+        assert_eq!(resolve_audio(PlanOptions::default().audio, dir.path()).unwrap(), MediaMode::Off);
+        assert_eq!(resolve_audio(MediaMode::Off, dir.path()).unwrap(), MediaMode::Off);
+        for mode in [MediaMode::Rtx(None), MediaMode::Spark(Some(0))] {
+            assert!(resolve_audio(mode, dir.path()).is_err());
+        }
+    }
     let dir = snapshot_tp(mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
-    let off = plan(dir.path(), &sparks(4)).unwrap();
-    assert!(off.audio_encoder.is_none());
-    let on = plan(dir.path(), &PlanOptions { audio: MediaMode::Auto, ..sparks(4) }).unwrap();
-    assert!(!on.executable());
-    assert_eq!(on.audio_encoder.as_ref().unwrap().kind, encoder::EncoderKind::Off);
-    assert!(on.hints.iter().any(|hint| hint.what.contains("audio tower unavailable")));
-    assert_ne!(off.encoder_plan_hash, on.encoder_plan_hash);
+    let off = plan(dir.path(), &PlanOptions { audio: MediaMode::Off, ..sparks(4) }).unwrap();
+    let auto = plan(dir.path(), &sparks(4)).unwrap();
+    assert_eq!(auto.audio, MediaMode::Off);
+    assert!(auto.audio_encoder.is_none());
+    assert_eq!(off.encoder_plan_hash, auto.encoder_plan_hash);
+    assert_eq!(off.hints.iter().map(|h| &h.what).collect::<Vec<_>>(), auto.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
 }
 
 #[test]
@@ -575,7 +583,9 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
     ] {
         let snapshot = hub.join(format!("models--XiaomiMiMo--MiMo-V2.6-{model}-MOPD/snapshots/{revision}"));
         if !snapshot.exists() { continue; }
-        let options = PlanOptions { audio: MediaMode::Auto, vision: MediaMode::Auto,
+        assert_eq!(resolve_audio(PlanOptions::default().audio, &snapshot).unwrap(), MediaMode::Auto);
+        assert_eq!(resolve_audio(MediaMode::Off, &snapshot).unwrap(), MediaMode::Off);
+        let options = PlanOptions { vision: MediaMode::Auto,
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 * GIB; gpus], spark_bytes: 121 * GIB,
                 ..Default::default() }), ..sparks(ranks) };
         let on = plan(&snapshot, &options).unwrap();
@@ -591,7 +601,18 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
         assert!(!memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| &d.items).any(|item| item.group == "audio tower" || item.group == "audio"));
         let off = plan(&snapshot, &PlanOptions { audio: MediaMode::Off, ..options }).unwrap();
         assert!(off.audio_encoder.is_none());
+        assert_eq!(on.bytes_by_owner.get("rtx"), off.bytes_by_owner.get("rtx"), "Spark audio must not charge RTX weights");
         assert_ne!(on.encoder_plan_hash, off.encoder_plan_hash);
+        let constrained = PlanOptions { vision: MediaMode::Off, layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![1; gpus], spark_bytes: 1, ..Default::default()
+        }), ..sparks(ranks) };
+        let fallback = plan(&snapshot, &constrained).unwrap();
+        assert_eq!(fallback.audio, MediaMode::Off);
+        assert_eq!(component(&fallback, Component::Audio).status, Status::Disabled);
+        assert!(fallback.placement_supported);
+        assert!(fallback.audio_encoder.as_ref().unwrap().shortfall > 0);
+        let explicit = plan(&snapshot, &PlanOptions { audio: MediaMode::Spark(Some(0)), ..constrained }).unwrap();
+        assert!(!explicit.placement_supported);
     }
 }
 

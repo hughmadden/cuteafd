@@ -1093,6 +1093,14 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
     match placement.kind {
         EncoderKind::Rtx { gpu } => add(&mut rtx[gpu]),
         EncoderKind::Spark { rank } => { if let Some(d) = sparks.iter_mut().find(|d| d.index as usize == rank) { add(d); } },
+        EncoderKind::Off if report.audio == super::MediaMode::Auto => {
+            report.audio = super::MediaMode::Off;
+            if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Audio) {
+                report.disabled_media_bytes += c.bytes;
+                c.bytes = 0;
+                c.status = Status::Disabled;
+            }
+        }
         _ => {
             report.placement_supported = false;
             report.hints.push(super::Hint { what: format!("audio placement unavailable: {}", placement.reason),
