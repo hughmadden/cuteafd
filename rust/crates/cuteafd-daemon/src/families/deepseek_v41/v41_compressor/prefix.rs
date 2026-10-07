@@ -251,3 +251,22 @@ impl CompressorPrefix {
         Self { owner, end, source }
     }
 }
+
+/// What evicting a snapshot whose compressed sources are `sources` gains an append
+/// transaction, given each source's `pressure` in the same order: the most any source gains.
+/// The order is checked, not assumed: counts that differ, or a source weighed against another
+/// source's pool, are an error.
+pub(crate) fn snapshot_gain(sources: &[CompressorPrefix], pressure: &[Pressure]) -> Result<Gain> {
+    ensure!(sources.len() == pressure.len(), "snapshot has {} compressed sources, the cache {}",
+        sources.len(), pressure.len());
+    sources.iter().zip(pressure).try_fold(Gain::Nothing, |gain, (prefix, pressure)| {
+        Ok(gain.max(prefix.source.gain(pressure)?))
+    })
+}
+
+/// Count a snapshot's references to the appended tails as dropped, source by source. The order
+/// is checked as in `snapshot_gain` before anything is counted.
+pub(crate) fn release_snapshot_tails(sources: &[CompressorPrefix], pressure: &mut [Pressure]) -> Result<()> {
+    snapshot_gain(sources, pressure)?;
+    sources.iter().zip(pressure).try_for_each(|(prefix, pressure)| pressure.release(&prefix.source))
+}

@@ -198,6 +198,12 @@ impl<T> Node<T> {
             .strip_prefix(child.edge.as_slice())
             .and_then(|rest| child.exact_clock(rest))
     }
+    fn collect<'n>(&'n self, values: &mut Vec<&'n T>) {
+        values.extend(self.value.as_ref().map(|(_, value)| value));
+        for child in self.children.values() {
+            child.collect(values);
+        }
+    }
     fn oldest_where(&self, keep: &dyn Fn(&T) -> bool) -> Option<u64> {
         self.value
             .as_ref()
@@ -301,6 +307,12 @@ impl<T> Radix<T> {
     pub fn entries(&self) -> usize {
         self.entries
     }
+    /// Every retained entry, in no particular order. Read-only: no clock or LRU order changes.
+    pub fn values(&self) -> Vec<&T> {
+        let mut values = Vec::with_capacity(self.entries);
+        self.root.collect(&mut values);
+        values
+    }
     /// The bound this bank was created with; zero disables retention entirely.
     pub fn limit(&self) -> usize {
         self.limit
@@ -394,6 +406,10 @@ impl<T> Retention<T> {
             .evict_oldest()
             .map(|value| (SnapshotKind::Prompt, value))
             .or_else(|| self.turns.evict_oldest().map(|value| (SnapshotKind::Turn, value)))
+    }
+    /// Every retained entry of both banks, in no particular order. Read-only.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.prompts.values().into_iter().chain(self.turns.values())
     }
     /// `evict_oldest` restricted to entries for which `keep` is false, same bank order.
     pub fn evict_one_where(&mut self, keep: &dyn Fn(&T) -> bool) -> Option<(SnapshotKind, T)> {
@@ -516,6 +532,22 @@ mod tests {
         let mut disabled = Retention::new(0);
         disabled.bank_mut(SnapshotKind::Turn).insert(&[1], (true, 1));
         assert!(disabled.lookup_reusable(&[1]).is_none());
+    }
+
+    #[test]
+    fn values_visit_every_entry_of_both_banks_without_touching_lru_order() {
+        let mut retained = Retention::new(8);
+        retained.bank_mut(SnapshotKind::Prompt).insert(&[1, 2], 12);
+        retained.bank_mut(SnapshotKind::Prompt).insert(&[1, 2, 3], 123);
+        retained.bank_mut(SnapshotKind::Prompt).insert(&[4], 4);
+        retained.bank_mut(SnapshotKind::Turn).insert(&[1, 2, 3, 5], 1235);
+        let mut values: Vec<u32> = retained.values().copied().collect();
+        values.sort_unstable();
+        assert_eq!(values, [4, 12, 123, 1235]);
+        // [1, 2] is still the oldest prompt entry: visiting refreshed nothing.
+        assert_eq!(retained.evict_oldest(), Some((SnapshotKind::Prompt, 12)));
+        assert_eq!(retained.values().count(), 3);
+        assert_eq!(Retention::<u32>::new(4).values().count(), 0);
     }
 
     /// Contract pin: generated-turn retention is opportunistic, prompt-prefix
