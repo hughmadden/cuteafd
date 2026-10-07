@@ -120,8 +120,11 @@ esac
 # sequences and MAX_CONTEXT_TOKENS, keeps them when that pool holds one MAX_CONTEXT_TOKENS request and
 # 65,536 tokens for each other sequence, and takes compact when it cannot. GLM5_FLASH_PROFILE=rtx5090
 # names compact. A key the config sets keeps its value: the profile fills in the others (the BF16 KDA
-# state and the tensor-core target head only over the BF16 KDA projections and head they run on), and
-# the launch notes each value it sets, keeps or leaves unset.
+# state and the tensor-core target head only over the BF16 KDA projections and head they run on, the
+# graph budget only when the config does not capture every decode graph at startup), and the launch
+# notes each value it sets, keeps or leaves unset. The graph budget captures decode graphs lazily: the
+# whole startup set (GLM5_FLASH_STARTUP_GRAPHS, the engine's default otherwise) would take 2.4 GB of a
+# 5090 at 131,072 tokens. VISION keeps its own default (auto: a checkpoint's tower on a Spark).
 glmf_compact=(GLM5_FLASH_KDA_FP8=off GLM5_FLASH_FP8_HEAD=off GLM5_FLASH_FP8_PREFILL=off GLM5_FLASH_INDEX_CACHE=compact
   GLM5_FLASH_KDA_STATE=bf16 GLM5_FLASH_PREFIX_MARKS=pool HOST_CACHE_BYTES=64GiB EMBEDDING=host GLM5_FLASH_HEADROOM_GIB=1
   GLM5_FLASH_GRAPH_BUDGET_MIB=512 GLM5_FLASH_DECODE_ROW_BUCKETS=on GLM5_FLASH_REPLAY_RECORDS=shared
@@ -171,6 +174,9 @@ if [[ "$glmf_memory" == compact ]]; then
     elif [[ "$glmf_key" == GLM5_FLASH_TARGET_HEAD && "$(glmf_configured GLM5_FLASH_FP8_HEAD)" != *=off ]]; then
       echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the tensor-core target head" \
         "runs the BF16 head, and the config keeps $(glmf_configured GLM5_FLASH_FP8_HEAD)" >&2
+    elif [[ "$glmf_key" == GLM5_FLASH_GRAPH_BUDGET_MIB && "${cfg[GLM5_FLASH_STARTUP_GRAPHS]:-}" == on ]]; then
+      echo "note: GLM5_FLASH_MEMORY=compact leaves $glmf_key unset (compact: $glmf_value): the budget bounds lazily" \
+        "captured decode graphs, and the config captures every one at startup (GLM5_FLASH_STARTUP_GRAPHS=on)" >&2
     else
       cfg[$glmf_key]="$glmf_value"
       echo "note: GLM5_FLASH_MEMORY=compact sets $glmf_key=$glmf_value" >&2
@@ -565,6 +571,19 @@ if [[ -n "$trace" ]]; then
   mkdir -p "$(dirname "$trace")"
   trace_args=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
+fi
+# GLM 5.3 Flash serving captures every decode graph at startup (CUTEAFD_GLMF_STARTUP_GRAPHS) unless a
+# graph budget (GLM5_FLASH_GRAPH_BUDGET_MIB) asks for lazily captured ones; preserve explicit overrides.
+if [[ $family == glm5_flash ]]; then
+  case "$(get GLM5_FLASH_STARTUP_GRAPHS)" in
+    "") ;;
+    on)
+      [[ -z "$(get GLM5_FLASH_GRAPH_BUDGET_MIB)" ]] || { echo "GLM5_FLASH_STARTUP_GRAPHS=on holds every decode graph;" \
+        "GLM5_FLASH_GRAPH_BUDGET_MIB bounds lazily captured ones: set one of them" >&2; exit 2; }
+      trace_args+=(-e CUTEAFD_GLMF_STARTUP_GRAPHS=1) ;;
+    off) trace_args+=(-e CUTEAFD_GLMF_STARTUP_GRAPHS=0) ;;
+    *) echo "GLM5_FLASH_STARTUP_GRAPHS must be on or off" >&2; exit 2 ;;
+  esac
 fi
 # Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
 if [[ $family == qwen4 ]]; then
@@ -994,6 +1013,8 @@ if [[ "$glmf_memory" == auto ]]; then
       esac
     done
     [[ "${draft_args[0]:-}" != --draft ]] || glmf_plan+=(--draft "${draft_args[1]}")
+    # Lazily captured graphs keep the graph allowance (a budget is forwarded above).
+    [[ "$(get GLM5_FLASH_STARTUP_GRAPHS)" != off ]] || glmf_plan+=(--startup-graphs off)
     # A WIP slot plans with its own binary and program manifest, copied apart from the layout a
     # running launch may hold.
     glmf_plan_run=(cuteafd plan "$snapshot") glmf_plan_mounts=() glmf_plan_dir=""

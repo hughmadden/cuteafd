@@ -1809,7 +1809,8 @@ def test_glmf_auto_plans_the_standard_launch_with_its_own_flags(tmp_path):
                      "--fp8-head false", "--decode-rows 128", "--decode-row-buckets", "--draft-linear wide",
                      "--draft-context-slots 8", f"--draft {_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc"):
         assert expected in flags, (expected, flags)
-    for absent in ("--index-cache", "--kda-state", "--prefix-marks", "--replay-records", "--graph-budget-mib"):
+    for absent in ("--index-cache", "--kda-state", "--prefix-marks", "--replay-records", "--graph-budget-mib",
+                   "--startup-graphs"):
         assert absent not in flags, absent
     # 1,048,576 + 3 x 65,536 = 1,245,184 fit in 1,441,792.
     assert _glmf_lines(result)[2] == [
@@ -1910,3 +1911,49 @@ def test_glmf_auto_restart_credits_its_coordinator_with_the_device_used_memory_w
     assert f"--rtx-gib {free_mib / 1024} " in plan
     assert f"on GPU 0 ({free_mib / 1024} GiB free)" in _glmf_lines(result)[2][0]
 
+
+@pytest.mark.parametrize("keys,env", [("", None), ("GLM5_FLASH_STARTUP_GRAPHS=on\n", "1"),
+                                      ("GLM5_FLASH_STARTUP_GRAPHS=off\n", "0")])
+def test_glmf_startup_graphs_key_reaches_only_the_coordinator(tmp_path, keys, env):
+    """Startup capture of every decode graph is the engine's default: the key passes an explicit
+    setting to the coordinator, never to the Spark workers."""
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    assert "CUTEAFD_GLMF_STARTUP_GRAPHS" not in worker
+    if env is None:
+        assert "CUTEAFD_GLMF_STARTUP_GRAPHS" not in coordinator
+    else:
+        assert f"CUTEAFD_GLMF_STARTUP_GRAPHS={env}" in coordinator, coordinator
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_STARTUP_GRAPHS=yes\n", "GLM5_FLASH_STARTUP_GRAPHS must be on or off"),
+    ("GLM5_FLASH_STARTUP_GRAPHS=on\nGLM5_FLASH_GRAPH_BUDGET_MIB=512\n", "set one of them"),
+])
+def test_glmf_startup_graphs_key_rejects_bad_requests_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_glmf_compact_leaves_the_graph_budget_to_a_config_with_startup_graphs(tmp_path):
+    """compact's 512 MiB graph budget captures decode graphs lazily; a config that asks for every
+    graph at startup keeps that, and compact leaves the budget unset and says why."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=compact\nGLM5_FLASH_STARTUP_GRAPHS=on\n")
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    assert "--graph-budget-mib" not in coordinator and "CUTEAFD_GLMF_STARTUP_GRAPHS=1" in coordinator
+    assert any(note.startswith("note: GLM5_FLASH_MEMORY=compact leaves GLM5_FLASH_GRAPH_BUDGET_MIB unset")
+               for note in notes), notes
+
+
+def test_glmf_auto_plans_lazily_captured_graphs_when_configured(tmp_path):
+    keys = _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nGLM5_FLASH_STARTUP_GRAPHS=off\n"
+    result = _glmf_launch(tmp_path, keys, physical_gpus=(0,), gpu_memory=(90000, 97887),
+                          layout_plan=_glmf_plan_json(1_441_792))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    assert "--startup-graphs off" in plan, plan
