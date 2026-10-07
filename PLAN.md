@@ -779,6 +779,28 @@ Policy decisions:
     image), PLAT-2 (the 32 GB plan) and PLAT-3 (GeForce defaults), with 5090
     cards produced by Hugh's agent at release-candidate time
     (hughmadden/cuteafd-collab item T-3).
+  - Audio: MiMo V2.6 Flash/Pro `input_audio` (WP-10, work/mm-mimo-audio;
+    the CPU reference is on work/p0 at 8acabb99), AUDIO=auto following VISION
+    once its gates pass. Video (native in MiMo, GLM Flash and Qwen) only if
+    image and audio are done while we still wait on Hugh's v2 pieces; plan
+    NVDEC decode on the encoder's device, gated against a CPU reference.
+  - Lower priority (TJ, 2026-10-07): **scoring without a launch flag.**
+    Full-tier prefill scoring needs all-row prefill logits, which today must
+    be admitted at launch (FULL_PREFILL_LOGITS=on reserves the extra
+    logits/workspace before KV sizing), so the bench console can't run Full,
+    or Standard's prefill half, against a default server. Instead, borrow the
+    memory from the KV pool per scoring request: a scoring request reserves
+    whole free KV pages, enough for its all-row logits and enlarged workspace,
+    for its duration, through the same admission path as any KV allocation.
+    It waits or returns a 429 with a reason when the pages aren't free, and
+    it never evicts live sequences or shrinks admitted requests. The pages
+    return when it finishes. The engine must run the all-row prefill in that
+    borrowed storage with the same kernels and geometry as the launch-flag
+    path, so the scores are byte-identical (gate: borrowed vs launch-admitted
+    scoring, identical per-row records on Quick/Standard/Full). Then the
+    console gets proper Full measurements on any server, and
+    FULL_PREFILL_LOGITS remains as an explicit reservation for dedicated
+    fidelity hosts.
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.
