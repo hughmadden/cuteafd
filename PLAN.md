@@ -804,8 +804,17 @@ Work, in priority order:
    now selects `POOL_TOKENS=auto` (explicit fixed pools still override), using
    existing free-memory admission after resident weights with workspace,
    state, prefix, graph and headroom reserves. A fresh identical-config A/B
-   uses 73,728 tokens in both arms so all sixteen requests fit; its runtime
-   and readiness results remain required before startup-graph promotion.
+   uses 73,728 tokens in both arms so all sixteen requests fit. The distinct
+   three-pair full-width medians pass the 0.98 floor for plain and Copy;
+   startup graphs now default on for serving, with `QWEN_STARTUP_GRAPHS=off`
+   restoring lazy capture. Golden/diagnostic engines keep exact-shape behavior.
+   Before KV allocation, admission solves the candidate pool's enumerated
+   graph count (actual context, layers, sequence count and speculative modes)
+   times the 2026-10-07 measured 149,712 bytes/graph, plus a margin of the
+   larger of 10% or 256 MiB; headroom remains a separate reserve. The prior
+   fixed 0.5 GiB serving estimate is not used for startup graphs. Default-unset
+   auto-KV readiness, memory accounting and zero steady captures still need
+   one confirmation turn after WP9 and V4 Pro calibration; VISION stays off.
    **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
    + 4 Sparks, correctness only; Qwen has no coordinator head split and the
    second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image

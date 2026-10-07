@@ -193,6 +193,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
+    args.planner_graph_modes = Some((max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None)));
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {

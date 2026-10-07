@@ -144,6 +144,17 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           env=env, capture_output=True, text=True, timeout=30)
 
 
+@pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
+def test_qwen_startup_graph_default_is_owned_by_engine(tmp_path, setting, expected):
+    keys = "" if not setting else f"QWEN_STARTUP_GRAPHS={setting}\n"
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", keys)
+    assert result.returncode == 0, result.stderr
+    if expected is None:
+        assert "CUTEAFD_QWEN4_STARTUP_GRAPHS=" not in result.stderr
+    else:
+        assert f"CUTEAFD_QWEN4_STARTUP_GRAPHS={expected}" in result.stderr
+
+
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
     result = _family_launch_result(tmp_path, config, "test/model",

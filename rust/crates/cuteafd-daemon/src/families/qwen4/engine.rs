@@ -67,6 +67,10 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "attention.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
 ];
 
+pub(super) fn startup_graphs_enabled(graphs: Option<&str>, startup: Option<&str>) -> bool {
+    graphs != Some("0") && startup.map_or(true, |value| value == "1")
+}
+
 fn decode_bucket(rows: usize, spec: bool) -> usize {
     let buckets = if spec { SPEC_BUCKETS } else { PLAIN_BUCKETS };
     buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
@@ -322,6 +326,16 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
+        use super::startup_graphs_enabled;
+        assert!(startup_graphs_enabled(None, None));
+        assert!(startup_graphs_enabled(None, Some("1")));
+        assert!(!startup_graphs_enabled(None, Some("0")));
+        assert!(!startup_graphs_enabled(Some("0"), None));
+        assert!(!startup_graphs_enabled(Some("0"), Some("1")));
+    }
 
     #[test]
     fn serving_graph_counts_and_modes_cover_the_qualified_layout() {
@@ -743,6 +757,15 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
     geometries
 }
 
+pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usize,
+    sequences: usize, speculation: bool, layers: usize) -> Result<usize> {
+    let pages = pool_tokens.div_ceil(UNIT_ROWS).checked_mul(UNIT_PAGES)
+        .context("Qwen graph page count overflow")?;
+    serving_graph_shapes(context, pages, dense, sequences, speculation).len()
+        .checked_mul(layers.checked_add(1).context("Qwen graph segment count overflow")?)
+        .context("Qwen graph count overflow")
+}
+
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
     let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
@@ -863,10 +886,16 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").is_ok_and(|v| v == "1"),
+            startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
+    }
+
+    pub(super) fn enable_startup_graphs(&mut self) {
+        self.startup_graphs = startup_graphs_enabled(
+            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
+            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
