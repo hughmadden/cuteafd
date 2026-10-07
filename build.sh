@@ -418,7 +418,7 @@ release_select_idle_export_gpu() {
         paste -sd';' - || true
     )"
     (( SECONDS < deadline )) || break
-    echo "$(hostname): waiting for an idle RTX for the AOT export ($(date -Is)): ${last_report:-nvidia-smi reported no devices}"
+    echo "$(hostname): waiting for an idle RTX for the AOT export ($(date -Is)): ${last_report:-nvidia-smi reported no devices}" >&2
     sleep 15
   done
   release_die "no idle RTX (at most ${release_idle_gpu_limit_mib} MiB used) for the AOT export within ${release_idle_wait_seconds}s on $(hostname): ${last_report:-nvidia-smi unavailable}; stop the concurrent run or raise CUTEAFD_RELEASE_IDLE_WAIT_SECONDS"

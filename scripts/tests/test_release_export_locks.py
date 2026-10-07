@@ -105,6 +105,40 @@ def test_build_takes_a_cpu_lock_and_only_guards_its_export_gpus():
     assert helper.index('flock -w "$wait_seconds" 9') < helper.index('flock -w "$wait_seconds" 8')
 
 
+def test_idle_export_selector_keeps_wait_status_off_stdout(tmp_path):
+    build = (ROOT / 'build.sh').read_text()
+    selector = build.split('release_select_idle_export_gpu() {', 1)[1].split('\n}\n', 1)[0]
+    state = tmp_path / 'idle'
+    script = f'''set -euo pipefail
+release_idle_wait_seconds=30
+release_idle_gpu_limit_mib=512
+release_die() {{ printf '%s\\n' "$*" >&2; exit 2; }}
+nvidia-smi() {{
+  if [[ $1 == --query-gpu=index,uuid,memory.used ]]; then
+    if [[ -e '{state}' ]]; then
+      printf '0, GPU-busy, 39222\\n1, GPU-idle, 12\\n'
+    else
+      printf '0, GPU-busy, 39222\\n1, GPU-idle, 45194\\n'
+    fi
+  else
+    printf '0, 39222\\n1, 45194\\n'
+  fi
+}}
+sleep() {{ [[ $1 == 15 ]]; touch '{state}'; }}
+release_select_idle_export_gpu() {{{selector}
+}}
+pick="$(release_select_idle_export_gpu)"
+read -r index uuid used <<<"$pick"
+[[ $index == 1 && $uuid == GPU-idle && $used == 12 ]]
+printf '%s\\n' "$pick"
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert state.exists(), 'fixture must exercise the waiting path'
+    assert result.stdout == '1 GPU-idle 12\n'
+    assert 'waiting for an idle RTX' in result.stderr
+
+
 def test_term_stops_the_export_before_releasing_locks(tmp_path):
     result = run_export(tmp_path, "bash -c 'kill -TERM \"$PPID\"'")
     assert result.returncode == 143, result.stderr
