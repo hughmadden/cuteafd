@@ -128,7 +128,18 @@ fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -
     }
 }
 
+fn prepare_dump_dir(args: &RunArgs) -> Result<()> {
+    if let Some(dir) = &args.dump_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create --dump-dir {}", dir.display()))?;
+        tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("--dump-dir {} is not writable", dir.display()))?;
+    }
+    Ok(())
+}
+
 pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
+    prepare_dump_dir(args)?;
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
     ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
@@ -168,6 +179,7 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
 pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     mut probe_request: impl FnMut(Value) -> Result<Value>,
     mut progress: impl FnMut(usize, usize, &Run)) -> Result<Run> {
+    prepare_dump_dir(args)?;
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
     ensure!(args.tier != "quick" || args.score_path == "decode", "Quick must be decode-shaped");
     let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(120)).build();
@@ -359,6 +371,39 @@ mod tests {
         argv.extend_from_slice(extra);
         let Action::Run(args) = Cli::try_parse_from(argv).unwrap().args.action else { panic!("run action") };
         args
+    }
+
+    #[test]
+    fn dump_parent_is_created_without_creating_or_replacing_window_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let dump = temp.path().join("new/arm/dump");
+        let args = parse(&["--dump-dir", dump.to_str().unwrap()]);
+        prepare_dump_dir(&args).unwrap();
+        assert!(dump.is_dir());
+        assert_eq!(std::fs::read_dir(&dump).unwrap().count(), 0);
+        let leaf = dump.join("window-000");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::write(leaf.join("sealed"), b"unchanged").unwrap();
+        prepare_dump_dir(&args).unwrap();
+        assert_eq!(std::fs::read(leaf.join("sealed")).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn unusable_dump_parent_fails_with_path_before_any_probe_or_network_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"keep").unwrap();
+        let dump = file.join("dump");
+        let args = parse(&["--dump-dir", dump.to_str().unwrap(), "--url", "http://127.0.0.1:1"]);
+        let mut requests = 0;
+        let error = run_with(&args, "test", &json!({}), |_| {
+            requests += 1;
+            bail!("unexpected probe")
+        }, |_, _, _| {}).unwrap_err();
+        assert!(error.to_string().contains(dump.to_str().unwrap()));
+        assert_eq!(requests, 0);
+        assert!(run(&args).unwrap_err().to_string().contains(dump.to_str().unwrap()));
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
     }
 
     #[test]

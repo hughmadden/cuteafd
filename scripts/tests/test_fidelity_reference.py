@@ -268,6 +268,65 @@ def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_p
               "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
 
 
+def finalizer_media_checks():
+    from fidelity_windows import validate_public_metadata, validate_public_text
+    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("validate_media_input", "validate_output_file")]
+    namespace = {"Path": pathlib.Path, "json": json,
+                 "digest": lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+                 "validate_public_metadata": validate_public_metadata, "validate_public_text": validate_public_text}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "media-output-privacy", "exec"), namespace)
+    return namespace
+
+
+def png_fixture(metadata=None):
+    import struct
+    import zlib
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    if metadata is not None:
+        data += chunk(metadata, b"Comment\0/home/private-user/private-file")
+    return data + chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b"")
+
+
+@pytest.mark.parametrize("suffix, payload", [(".bf16", b"\xff\xff"), (".png", png_fixture())])
+def test_dataset_finalizer_accepts_only_matching_declared_binary_media(tmp_path, suffix, payload):
+    checks = finalizer_media_checks()
+    path = tmp_path / ("input" + suffix)
+    path.write_bytes(payload)
+    entry = dict(path=path.name, bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    manifest = dict(media_inputs=[entry])
+    checks["validate_media_input"](tmp_path, entry)
+    checks["validate_output_file"](path, tmp_path, manifest)
+    with pytest.raises(UnicodeDecodeError):
+        checks["validate_output_file"](path, tmp_path, {})
+    entry["sha256"] = "0" * 64
+    with pytest.raises(AssertionError, match="size/checksum"):
+        checks["validate_output_file"](path, tmp_path, manifest)
+    entry["sha256"] = hashlib.sha256(payload).hexdigest()
+    entry["bytes"] += 1
+    with pytest.raises(AssertionError, match="size/checksum"):
+        checks["validate_media_input"](tmp_path, entry)
+
+
+@pytest.mark.parametrize("metadata", [b"tEXt", b"iTXt", b"zTXt", b"eXIf"])
+def test_dataset_finalizer_rejects_png_privacy_metadata(tmp_path, metadata):
+    payload = png_fixture(metadata)
+    path = tmp_path / "private.png"
+    path.write_bytes(payload)
+    entry = dict(path=path.name, bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    with pytest.raises(AssertionError, match="privacy metadata"):
+        finalizer_media_checks()["validate_output_file"](path, tmp_path, dict(media_inputs=[entry]))
+
+
+@pytest.mark.parametrize("relative", ["../escape.bf16", "/absolute.bf16"])
+def test_dataset_finalizer_rejects_unsafe_media_paths(tmp_path, relative):
+    with pytest.raises(AssertionError, match="Unsafe media input"):
+        finalizer_media_checks()["validate_media_input"](tmp_path, dict(path=relative, bytes=2, sha256="0" * 64))
+
+
 def test_measured_dataset_validator_self_tests():
     subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
                     "--self-test"], check=True, timeout=60)
