@@ -163,7 +163,19 @@ pub fn full_report() -> Report {
         verify_rows: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
         score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
-    let fidelity = crate::panels::fidelity::record(&fidelity_run, Some(&fidelity_run));
+    let full_score = fidelity_run.score.clone();
+    fidelity_run.score = crate::reference::Fidelity::from_records(full_score.records.iter().filter(|p| p.window[1..].parse::<usize>().unwrap() < 32).cloned().collect());
+    fidelity_run.tier = crate::fidelity_dataset::STANDARD_TIER.into();
+    fidelity_run.dataset.as_mut().unwrap()["standard_subset"] = json!({"version":"standard-v2", "mode":"32 decode / 32 prefill"});
+    let mut fidelity = crate::panels::fidelity::record(&fidelity_run, Some(&fidelity_run));
+    fidelity_run.path_shape = "prefill-shaped".into();
+    fidelity_run.score = crate::reference::Fidelity::from_records(full_score.records.iter().filter(|p| p.window[1..].parse::<usize>().unwrap() >= 32).cloned().collect());
+    for (key, value) in crate::panels::fidelity::record(&fidelity_run, None).as_object().unwrap() {
+        if key.starts_with("prefill") { fidelity[key] = value.clone(); }
+    }
+    fidelity_run.path_shape = "decode-shaped".into();
+    fidelity_run.dataset.as_mut().unwrap().as_object_mut().unwrap().remove("standard_subset");
+    fidelity_run.score = full_score;
     fidelity_run.tier = "full".into();
     let mut full_fidelity = crate::panels::fidelity::record(&fidelity_run, Some(&fidelity_run));
     fidelity_run.path_shape = "prefill-shaped".into(); fidelity_run.seconds = 240.0;

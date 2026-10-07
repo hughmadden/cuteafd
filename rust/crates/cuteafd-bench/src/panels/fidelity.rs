@@ -14,8 +14,7 @@ pub static FULL: FidelityPanel = FidelityPanel { full: true };
 pub struct FidelityPanel { full: bool }
 
 pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
-    let admitted = info.configuration.settings.iter().any(|s| s.name == "full-prefill-logits"
-        && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")));
+    let admitted = crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
     (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
 }
 
@@ -34,6 +33,7 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
         verify_rows: None, api_key: None };
     let mut model_record = client.model_record()?;
     model_record["max_context"] = json!(max_context);
+    model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
     let checkpoint = info.checkpoint();
     // The checkpoint, not an aliased served name, binds the reference and history.
     run_with(&args, &checkpoint, &model_record, |request| {
@@ -58,7 +58,9 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
         }
         // The qualified compact scorer has consumed these multi-gigabyte rows.
         // Dashboard passes retain scores, not full-vocabulary scratch dumps.
-        let _ = std::fs::remove_dir_all(scratch.path().join(format!("window-{:03}", done - 1)));
+        let name = if tier == "standard" { format!("window-{path}-{:03}", done - 1) }
+            else { format!("window-{:03}", done - 1) };
+        let _ = std::fs::remove_dir_all(scratch.path().join(name));
     }).and_then(|run| {
         anyhow::ensure!(run.score.records.iter().all(|p| p.position < max_context as usize), "fidelity exceeds server context");
         Ok(run)
@@ -74,6 +76,9 @@ pub fn record(run: &Run, previous: Option<&Run>) -> Value {
         ("prefill", "prefill_verdict", "prefill_per_window")
     } else { ("decode", "verdict", "per_window") };
     let mut value = json!({"tier": run.tier, "dataset": run.dataset, "paired": paired});
+    if run.tier == crate::fidelity_dataset::STANDARD_TIER {
+        value["mode"] = run.dataset.as_ref().map(|d| d["standard_subset"]["mode"].clone()).unwrap_or(Value::Null);
+    }
     value[path] = json!(run);
     value[verdict_key] = json!(verdict(run));
     value[window_key] = json!(window_summaries(run));
@@ -93,11 +98,14 @@ impl Panel for FidelityPanel {
     fn title(&self) -> &'static str { if self.full { "Fidelity · Full" } else { "Fidelity" } }
     fn description(&self) -> &'static str {
         if self.full { "64 sealed windows, decode + prefill; calibrated top-1, KL and tripwires. Requires launch-admitted prefill logits." }
-        else { "Standard: all 64 sealed windows, decode only; calibrated top-1, KL and tripwires. Optional paired history comparison." }
+        else { "Standard-v2: sealed, balanced 32 decode / 32 prefill windows; separate calibrated verdicts. Without prefill admission: all 64 decode only. Optional paired history comparison." }
     }
-    fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
+    fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
         let decode = 32768.0 / rates.decode_tok_s + 350000.0 / rates.prefill_tok_s;
-        if self.full { decode + 380000.0 / rates.prefill_tok_s } else { decode }
+        let prefill = 380000.0 / rates.prefill_tok_s;
+        if self.full { decode + prefill }
+        else if prefill_unavailable(info).is_none() { (decode + prefill) / 2.0 }
+        else { decode }
     }
     fn unavailable(&self, info: &ServerInfo) -> Option<String> {
         if info.checkpoint().is_empty() {
@@ -108,12 +116,18 @@ impl Panel for FidelityPanel {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let tier = if self.full { "full" } else { "standard" };
+        let both_paths = self.full || prefill_unavailable(ctx.info).is_none();
         let decode = score(ctx.client, ctx.info, tier, "decode", ctx.progress, 0.0,
-            if self.full { 0.5 } else { 1.0 }, ctx.max_context)?;
+            if both_paths { 0.5 } else { 1.0 }, ctx.max_context)?;
         // History stays optional: a missing/incompatible earlier run never masquerades as a pass.
         let mut result = record(&decode, None);
-        if self.full {
+        if both_paths {
             let prefill = score(ctx.client, ctx.info, tier, "prefill", ctx.progress, 0.5, 0.5, ctx.max_context)?;
+            if !self.full {
+                anyhow::ensure!(decode.engine == prefill.engine && decode.settings == prefill.settings
+                    && decode.dataset == prefill.dataset && decode.reference_sha256 == prefill.reference_sha256,
+                    "Standard scoring paths use different references or server settings");
+            }
             result["prefill_verdict"] = json!(verdict(&prefill));
             result["prefill_per_window"] = json!(window_summaries(&prefill));
             result["prefill"] = json!(prefill);
