@@ -397,6 +397,13 @@ impl SelectBatch {
 
 pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
 
+/// Device bytes a [`TokenSelector`] of `rows` rows (its output rows and the GPU sampler it
+/// allocates, at most 128 rows wide) holds beyond one of `base` rows over `vocab` logits.
+pub(crate) fn sampler_growth(rows: usize, base: usize, vocab: usize) -> u64 {
+    let bytes = |rows: usize| (rows * 12 + TargetSamplingWave::device_bytes(rows.clamp(1, 128), vocab)) as u64;
+    bytes(rows).saturating_sub(bytes(base))
+}
+
 /// Selects next tokens from device logits (see the module docs).
 pub(crate) struct TokenSelector<'a> {
     library: &'a NativeLibrary,
@@ -480,6 +487,15 @@ impl<'a> TokenSelector<'a> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
             landing: HostAllocation::new(library, capacity * 12)?, wave: None, counts: [0; 3] })
+    }
+
+    /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
+    /// selection does.
+    pub fn reserve_sampler(&mut self) -> Result<()> {
+        if self.wave.is_none() && self.placement != SelectPlacement::Host {
+            self.wave = Some(TargetSamplingWave::new(self.library, self.capacity.min(128), self.vocab)?);
+        }
+        Ok(())
     }
 
     /// Selects `batch.rows[i]` from logits row `i`.
@@ -842,5 +858,15 @@ mod tests {
         let logits = [1.0f32, 2.0, 3.0, f32::NEG_INFINITY];
         let z: f64 = [1.0f64, 2.0, 3.0].iter().map(|v| (v - 3.0f64).exp()).sum();
         assert!((host_logprob(&logits, 2) - (-(z.ln()) as f32)).abs() < 1e-6);
+    }
+
+    /// A selector of 128 rows over GLM 5.3 Flash's 154,880 logits: 12 output bytes and 50,144
+    /// sampler bytes per row (two 4,840-word masks, parameters, scratch, histogram, rank order).
+    #[test]
+    fn a_wider_selector_grows_by_its_rows() {
+        assert_eq!(super::sampler_growth(64, 64, 154_880), 0);
+        assert_eq!(super::sampler_growth(128, 64, 154_880), 64 * (12 + 50_144));
+        // The sampler wave stops at 128 rows.
+        assert_eq!(super::sampler_growth(256, 128, 154_880), 128 * 12);
     }
 }

@@ -1,5 +1,6 @@
 //! `cuteafd plan`: inspect a checkpoint and report what this build can serve.
 use anyhow::{Context, Result};
+use cuteafd_loader::families::glm5::draft_representation::GlmDraftLinear;
 use cuteafd_loader::plan::{budget_bytes, plan, plan_preferred, render, ExpertPlacement, PlanError, PlanOptions};
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
@@ -30,6 +31,33 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
+                prefill_lanes: args.prefill_lanes,
+                glmf_decode_rows: args.decode_rows,
+                headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
+                graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
+                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
+                glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
+                glmf_index_cache: args.index_cache.into(),
+                glmf_kda_state: args.kda_state.into(),
+                glmf_kda_fp8: match args.kda_fp8 {
+                    crate::families::glm5_flash::fp8::KdaFp8::Off => cuteafd_loader::plan::layout::GlmfKdaFp8::Off,
+                    crate::families::glm5_flash::fp8::KdaFp8::Row128 => cuteafd_loader::plan::layout::GlmfKdaFp8::Row128,
+                    crate::families::glm5_flash::fp8::KdaFp8::Channel => cuteafd_loader::plan::layout::GlmfKdaFp8::Channel,
+                },
+                glmf_fp8_head: args.fp8_head,
+                glmf_row_buckets: args.decode_row_buckets,
+                glmf_startup_graphs: args.startup_graphs == crate::shared::prefix::Toggle::On,
+                glmf_draft: args.draft.clone().map(|snapshot| cuteafd_loader::plan::layout::GlmfDraft {
+                    snapshot,
+                    fp8: args.draft_fp8 != Some(false),
+                    linear: match args.draft_linear {
+                        crate::shared::fp8_linear::Fp8Rows::W8a16 => GlmDraftLinear::W8a16,
+                        crate::shared::fp8_linear::Fp8Rows::Wide => GlmDraftLinear::Wide,
+                        crate::shared::fp8_linear::Fp8Rows::W8a8 => GlmDraftLinear::W8a8,
+                    },
+                    context_slots: args.draft_context_slots,
+                    sequences: args.draft_sequences,
+                }),
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
                 native_mtp_layers: args.native_mtp_layers,
@@ -112,10 +140,65 @@ mod tests {
             local_expert_layers: None,
             context_tokens: 262144,
             prefill_rows: 4096,
+            prefill_lanes: 0,
+            decode_rows: 0,
+            headroom_gib: 2.0,
+            graph_budget_mib: None,
+            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
             prefix_slots: None,
+            prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
+            index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
+            kda_state: crate::families::glm5_flash::engine::KdaState::F32,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off,
+            fp8_head: false,
+            decode_row_buckets: false,
+            startup_graphs: crate::shared::prefix::Toggle::On,
+            draft: None,
+            draft_fp8: None,
+            draft_linear: crate::shared::fp8_linear::Fp8Rows::W8a16,
+            draft_context_slots: None,
+            draft_sequences: 16,
             native_mtp_layers: 3,
             workspace_manifest: None,
+        }
+    }
+
+    /// serve-glmf's memory flags reach the layout under the same names, so a launcher can size
+    /// exactly the flags it serves with.
+    #[test]
+    fn glm_flash_serving_flags_reach_the_layout() {
+        use clap::Parser;
+        use cuteafd_loader::plan::layout::GlmfKdaFp8;
+        use cuteafd_loader::serving_capacity::{GlmfIndexCache, GlmfKdaState};
+        let parse = |extra: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout"].into_iter()
+                .chain(extra.iter().copied()));
+            let crate::cli::Commands::Plan(args) = cli.unwrap().command else { panic!("plan") };
+            options(&args).unwrap().layout.unwrap()
+        };
+        let defaults = parse(&[]);
+        assert_eq!((defaults.glmf_index_cache, defaults.glmf_kda_state, defaults.glmf_kda_fp8, defaults.glmf_fp8_head,
+            defaults.glmf_row_buckets), (GlmfIndexCache::Keys, GlmfKdaState::F32, GlmfKdaFp8::Off, false, false));
+        // Startup graphs, as serve-glmf captures them by default; `off` plans lazily captured ones.
+        assert!(defaults.glmf_startup_graphs && !parse(&["--startup-graphs", "off"]).glmf_startup_graphs);
+        assert!(defaults.glmf_draft.is_none());
+        let profile = parse(&["--index-cache", "compact", "--kda-state", "bf16", "--kda-fp8", "off", "--fp8-head", "false",
+            "--decode-row-buckets", "--draft", "/drafter", "--draft-linear", "w8a8", "--prefill-lane-rows", "4096"]);
+        assert_eq!((profile.glmf_index_cache, profile.glmf_kda_state, profile.glmf_row_buckets, profile.prefill_rows),
+            (GlmfIndexCache::Compact, GlmfKdaState::Bf16, true, 4096));
+        let draft = profile.glmf_draft.unwrap();
+        assert_eq!((draft.snapshot, draft.fp8, draft.linear, draft.context_slots, draft.sequences),
+            (std::path::PathBuf::from("/drafter"), true, GlmDraftLinear::W8a8, None, 16));
+        let precise = parse(&["--kda-fp8", "row128", "--fp8-head", "--draft", "/d", "--draft-fp8", "false",
+            "--draft-context-slots", "20", "--draft-sequences", "8"]);
+        assert_eq!((precise.glmf_kda_fp8, precise.glmf_fp8_head), (GlmfKdaFp8::Row128, true));
+        let draft = precise.glmf_draft.unwrap();
+        assert_eq!((draft.fp8, draft.context_slots, draft.sequences), (false, Some(20), 8));
+        for bad in [&["--index-cache", "tails"][..], &["--kda-state", "f16"], &["--kda-fp8", "row64"]] {
+            let parsed = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout"].into_iter()
+                .chain(bad.iter().copied()));
+            assert!(parsed.is_err(), "{bad:?}");
         }
     }
 
@@ -147,6 +230,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn glm_flash_prefix_marks_reach_the_layout() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, pool) in [(&[][..], false), (&["--prefix-marks", "arena"][..], false),
+            (&["--prefix-marks", "pool"][..], true)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_pool_marks, pool);
+        }
+        assert!(parse(&["--prefix-marks", "host"]).is_err());
+    }
+
+    #[test]
+    fn glm_flash_decode_rows_reach_the_layout() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, rows) in [(&[][..], 0), (&["--decode-rows", "64"][..], 64), (&["--decode-rows", "128"][..], 128)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_decode_rows, rows);
+        }
+        assert!(parse(&["--decode-rows", "96"]).is_err());
     }
 
     #[test]

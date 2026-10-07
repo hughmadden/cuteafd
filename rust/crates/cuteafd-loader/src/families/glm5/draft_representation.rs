@@ -177,6 +177,131 @@ impl GlmDraftRuntimeLayout {
     }
 }
 
+/// Rows of one DFlash2 context ring (the drafter's sliding window, `dflash::RING`).
+pub const GLM_DRAFT_RING: u64 = 2048;
+/// Rows of the drafter's tap buffers (`dflash::TAP_ROWS`).
+pub const GLM_DRAFT_TAP_ROWS: u64 = 2048;
+/// The vocabulary head's cuBLAS workspace of a draft step (`VOCABULARY_HEAD_WORKSPACE`).
+const GLM_DRAFT_HEAD_WORKSPACE: u64 = 4 << 20;
+/// Smallest device allocation the drafter makes.
+const FLOOR: u64 = 256;
+
+/// A DFlash2 checkpoint's drafter geometry and block size from its `config.json` (the fields
+/// `glm5::dflash::DflashConfig::read` takes); None for any other drafter (dSpark).
+pub fn glm_dflash_geometry(config: &serde_json::Value) -> Option<(GlmDraftGeometry, u64)> {
+    let int = |value: &serde_json::Value, key: &str| value[key].as_u64();
+    let d = config.get("dflash_config")?;
+    Some((GlmDraftGeometry {
+        hidden: int(config, "hidden_size")?, intermediate: int(config, "intermediate_size")?,
+        layers: int(config, "num_hidden_layers")?, heads: int(config, "num_attention_heads")?,
+        kv_heads: int(config, "num_key_value_heads")?, head_dim: int(config, "head_dim")?,
+        taps: d["target_layer_ids"].as_array()?.len() as u64, vocab: int(config, "vocab_size")?,
+        conv_group: int(d, "conv_group_size")?, selector_rank: int(d, "selector_rank")?,
+    }, int(d, "block_size")?))
+}
+
+/// How the FP8 drafter's GEMMs run (GLM 5.3 Flash's `--draft-linear`, the native
+/// `cuteafd_fp8_linear` modes): what their scratch holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GlmDraftLinear {
+    /// W8A16 in passes of 64 rows.
+    #[default]
+    W8a16,
+    /// The same bits in passes of 128 rows.
+    Wide,
+    /// E4M3 activations per row and 128-wide K block past one draft block, in passes of 128 rows.
+    W8a8,
+}
+
+/// SMs the FP8 GEMMs' split-K plans for when the planner sizes their scratch without a device:
+/// the RTX PRO 6000's 188, the most of the SM120 cards one build serves. More SMs split K
+/// further, so the scratch is at most this (an RTX 5090's 170 SMs need 2 MiB less for DFlash2).
+pub const GLM_DRAFT_SCRATCH_SMS: u64 = 188;
+
+/// `cuteafd_fp8_linear_workspace` (native `fp8_gemv.cu` `layout_bytes`): one call's row scales,
+/// B fragments, W8A8 activation scales and split-K partials, for a device of `sms` SMs.
+pub fn fp8_linear_workspace_bytes(rows: u64, k: u64, n: u64, linear: GlmDraftLinear, sms: u64) -> u64 {
+    if n < 16 || k < 128 {
+        return 0;
+    }
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    let chunk = if linear == GlmDraftLinear::W8a16 { 64 } else { 128 };
+    let m = rows.min(chunk);
+    let (tiles, kbs) = (n / 16, k / 128);
+    let wanted = (sms * 16).div_ceil(tiles);
+    let s = wanted.clamp(1, kbs.max(1));
+    let kb_per_split = kbs.div_ceil(s);
+    let splits = kbs.div_ceil(kb_per_split);
+    align(2 * chunk * 4) + align(k * chunk * 2)
+        + if linear == GlmDraftLinear::W8a8 { align(k / 128 * chunk * 4) } else { 0 }
+        + if splits > 1 { align(splits * m * n * 4) } else { 0 }
+}
+
+/// Device bytes of a loaded DFlash2 drafter (`glm5::dflash::GlmDrafter::load`, its draft-step
+/// workspace for the largest batch and its FP8 GEMM scratch), every allocation floored as the
+/// drafter allocates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlmDraftDeviceBytes {
+    /// Own weights in their one resident representation.
+    pub weights: u64,
+    /// Every layer's K and V rings for the context slots.
+    pub rings: u64,
+    /// The tap rows, their fused and normed rows, the context K | V rows, positions and ring slots.
+    pub taps: u64,
+    /// One draft step's buffers for the largest batch, with the native attention and top-k
+    /// scratch and the vocabulary head's workspace (the ledger's `drafter/workspace`).
+    pub workspace: u64,
+    /// The FP8 GEMMs' scratch (the ledger's `workspace/fp8-linear`); 0 for a BF16 drafter.
+    pub fp8_scratch: u64,
+}
+
+impl GlmDraftDeviceBytes {
+    /// The ledger's `drafter` scope: weights, rings and tap buffers.
+    pub fn resident(&self) -> u64 {
+        self.weights + self.rings + self.taps
+    }
+
+    pub fn total(&self) -> u64 {
+        self.resident() + self.workspace + self.fp8_scratch
+    }
+}
+
+impl GlmDraftRuntimeLayout {
+    /// Device bytes of this drafter with draft blocks of `block` rows (`block - 1` drafts), its
+    /// FP8 GEMMs in `linear` mode on a device of `sms` SMs.
+    pub fn device_bytes(&self, g: &GlmDraftGeometry, block: u64, linear: GlmDraftLinear, sms: u64)
+        -> Result<GlmDraftDeviceBytes, GlmDraftStorageError> {
+        let floor = |bytes: u64| bytes.max(FLOOR);
+        let (h, kv) = (g.hidden, mul(g.kv_heads, g.head_dim)?);
+        let slots = self.capacity.context_slots as u64;
+        let rings = mul(mul(g.layers, 2)?, mul(mul(slots, GLM_DRAFT_RING)?, mul(kv, 2)?)?)?;
+        let tap = GLM_DRAFT_TAP_ROWS;
+        let taps = sum([mul(tap, mul(mul(g.taps, h)?, 2)?)?, mul(tap, h * 2)?, mul(tap, h * 2)?,
+            mul(tap, mul(2, kv * 2)?)?, tap * 8, tap * 4].map(floor))?;
+        let sequences = self.capacity.max_batch_sequences as u64;
+        let rows = mul(sequences, block)?;
+        let drafted = mul(sequences, block.saturating_sub(1))?;
+        let attention = mul(g.heads, g.head_dim)?;
+        // `cuteafd_glm_dflash_attention_workspace` over the ring and a block (128-key chunks of
+        // 64 queries, 128 values and the max | sum pair, FP32), `cuteafd_glm_dflash_topk_workspace`
+        // (64 chunks of 16 value | index pairs per drafted row).
+        let chunks = (GLM_DRAFT_RING + block).div_ceil(128);
+        let attention_workspace = mul(mul(mul(sequences, g.kv_heads)?, chunks)?, 64 * (128 + 2) * 4)?;
+        let topk_workspace = mul(drafted, 64 * 16 * 8)?;
+        let workspace = sum([rows * h * 2, rows * h * 2, rows * h * 2, rows * (4 * h / g.conv_group) * 2,
+            rows * (attention + 2 * kv) * 2, rows * attention * 2, rows * kv * 2, rows * kv * 2,
+            rows * attention * 2, rows * h * 2, rows * 2 * g.intermediate * 2, rows * g.intermediate * 2,
+            mul(rows, g.vocab * 4)?, drafted * 16 * 4, drafted * 16 * 4, rows * g.selector_rank * 2,
+            sequences * 4, rows * 4, drafted * 4, drafted * 16, rows * 8, 3 * sequences * 4,
+            attention_workspace, topk_workspace, GLM_DRAFT_HEAD_WORKSPACE].map(floor))?;
+        let fp8_scratch = self.fp8_scratch.as_ref().map_or(0, |scratch| {
+            scratch.shapes.iter().map(|s| fp8_linear_workspace_bytes(scratch.rows as u64, s.k, s.n, linear, sms))
+                .max().unwrap_or(0).max(FLOOR)
+        });
+        Ok(GlmDraftDeviceBytes { weights: self.weights.resident_bytes()?, rings, taps, workspace, fp8_scratch })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +354,53 @@ mod tests {
         let cap = GlmDraftCapacity::new(300, 300, 8).unwrap();
         let l = GlmDraftRuntimeLayout::new(geometry(true), GlmDraftRepresentation::Fp8Only, cap, 2048).unwrap();
         assert_eq!(l.fp8_scratch.unwrap().rows, 2400);
+    }
+
+    /// The GLM 5.3 Flash DFlash2 drafter's start-up ledger on an RTX 5090 (170 SMs), FP8 weights:
+    /// the 5090 profile at 16 sequences (16 rings, `--draft-linear w8a8`) and an earlier build's
+    /// defaults at 16 sequences (20 rings, w8a16), both with draft batches of 16.
+    #[test]
+    fn device_bytes_reproduce_the_measured_drafter_ledgers() {
+        let g = geometry(true);
+        let bytes = |slots: usize, linear: GlmDraftLinear| {
+            GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, GlmDraftCapacity::new(slots, 16, 8).unwrap(),
+                GLM_DRAFT_TAP_ROWS as usize).unwrap().device_bytes(&g, 8, linear, 170).unwrap()
+        };
+        let candidate = bytes(16, GlmDraftLinear::W8a8);
+        assert_eq!(candidate.resident(), 2_081_647_104);
+        assert_eq!(candidate.workspace, 174_999_744);
+        assert_eq!(candidate.fp8_scratch, 28_394_496);
+        let base = bytes(20, GlmDraftLinear::W8a16);
+        assert_eq!(base.resident(), 2_249_419_264);
+        assert_eq!(base.workspace, 174_999_744);
+        assert_eq!(base.fp8_scratch, 14_156_288);
+        // Each ring is 2,048 rows x 5 layers x K and V x 1,024 BF16 values.
+        assert_eq!(base.rings - candidate.rings, 4 * 41_943_040);
+        // `wide` has the same row passes as w8a8 without its activation scales; more SMs split K further.
+        assert!(bytes(16, GlmDraftLinear::Wide).fp8_scratch < candidate.fp8_scratch);
+        let pro = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, GlmDraftCapacity::new(16, 16, 8)
+            .unwrap(), 2048).unwrap().device_bytes(&g, 8, GlmDraftLinear::W8a8, GLM_DRAFT_SCRATCH_SMS).unwrap();
+        assert_eq!(pro.fp8_scratch - candidate.fp8_scratch, 2 << 20);
+        // A BF16 drafter has no FP8 scratch.
+        let bf16 = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Bf16Only, GlmDraftCapacity::new(16, 16, 8)
+            .unwrap(), 2048).unwrap().device_bytes(&g, 8, GlmDraftLinear::W8a8, 170).unwrap();
+        assert_eq!((bf16.fp8_scratch, bf16.rings, bf16.workspace), (0, candidate.rings, candidate.workspace));
+    }
+
+    #[test]
+    fn the_dflash2_config_gives_the_drafter_geometry() {
+        let config = serde_json::json!({"hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 5,
+            "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "vocab_size": 154880,
+            "sliding_window": 2048, "dflash_config": {"block_size": 8, "conv_group_size": 16, "selector_rank": 256,
+                "target_layer_ids": [1, 10, 20, 30, 40]}});
+        let (g, block) = glm_dflash_geometry(&config).unwrap();
+        assert_eq!(block, 8);
+        let flash = geometry(true);
+        assert_eq!((g.hidden, g.intermediate, g.layers, g.heads, g.kv_heads, g.head_dim, g.taps, g.vocab,
+            g.conv_group, g.selector_rank), (flash.hidden, flash.intermediate, flash.layers, flash.heads,
+            flash.kv_heads, flash.head_dim, flash.taps, flash.vocab, flash.conv_group, flash.selector_rank));
+        // A dSpark (or any other) drafter is not DFlash2.
+        assert!(glm_dflash_geometry(&serde_json::json!({"hidden_size": 4096})).is_none());
     }
 
     #[test]

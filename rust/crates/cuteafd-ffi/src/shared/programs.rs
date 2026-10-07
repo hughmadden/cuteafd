@@ -19,12 +19,19 @@ use std::path::Path;
 pub struct ProgramCapacities {
     pub decode_rows: Option<usize>,
     pub prefill_rows: Option<usize>,
+    /// The extent every indexed family's programs cover (`capacities.max_context`).
     pub max_context: Option<usize>,
+    /// GLM 5.3 Flash's own extent (`families.glmf.max_context`, CMake `CUTEAFD_GLMF_MAX_CONTEXT`):
+    /// past `max_context` its index top-k is exported again at this extent (`*_ctx{N}` programs).
+    /// None in manifests that predate it (then `max_context`).
+    pub glmf_max_context: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramCapacityError {
     Invalid { field: &'static str },
+    /// `families.<family>.max_context` is present but not a positive integer.
+    InvalidFamilyContext { family: &'static str },
     MissingContext { family: &'static str },
     ContextExceeded { family: &'static str, requested: usize, compiled: usize },
 }
@@ -33,7 +40,10 @@ impl fmt::Display for ProgramCapacityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid { field } => write!(f, "program manifest capacities.{field} must be a positive integer that fits usize"),
+            Self::InvalidFamilyContext { family } => write!(f, "program manifest families.{family}.max_context must be a positive integer that fits usize"),
             Self::MissingContext { family } => write!(f, "{family}: program manifest lacks capacities.max_context; export matching coordinator programs with an explicit --max-context before loading weights"),
+            // GLM 5.3 Flash's extent is its own build setting (its index top-k at a second extent).
+            Self::ContextExceeded { family: "glm5_flash", requested, compiled } => write!(f, "glm5_flash: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_GLMF_MAX_CONTEXT={requested} (--glmf-max-context {requested}), or lower --max-context to {compiled}"),
             Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context to {compiled}"),
         }
     }
@@ -49,15 +59,29 @@ impl ProgramCapacities {
             Some(value) => value.as_u64().and_then(|v| usize::try_from(v).ok()).filter(|&v| v > 0)
                 .map(Some).ok_or(ProgramCapacityError::Invalid { field: name }),
         };
+        let glmf_max_context = match manifest["families"]["glmf"].get("max_context") {
+            None => None,
+            Some(value) => Some(value.as_u64().and_then(|v| usize::try_from(v).ok()).filter(|&v| v > 0)
+                .ok_or(ProgramCapacityError::InvalidFamilyContext { family: "glmf" })?),
+        };
         Ok(Self { decode_rows: field("decode_rows")?, prefill_rows: field("prefill_rows")?,
-            max_context: field("max_context")? })
+            max_context: field("max_context")?, glmf_max_context })
+    }
+
+    /// The longest context `family`'s programs serve: GLM 5.3 Flash's own extent where the
+    /// manifest records one, else the shared `max_context`.
+    pub fn context_of(self, family: &str) -> Option<usize> {
+        match family {
+            "glm5_flash" => self.glmf_max_context.or(self.max_context),
+            _ => self.max_context,
+        }
     }
 
     /// Indexed families must not send a wider page table than the compiled
     /// top-k route or its scratch can hold. Check before engine allocations.
     pub fn require_context(self, family: &'static str, requested: usize)
         -> std::result::Result<(), ProgramCapacityError> {
-        let compiled = self.max_context.ok_or(ProgramCapacityError::MissingContext { family })?;
+        let compiled = self.context_of(family).ok_or(ProgramCapacityError::MissingContext { family })?;
         if requested > compiled {
             return Err(ProgramCapacityError::ContextExceeded { family, requested, compiled });
         }
@@ -198,12 +222,26 @@ impl<'a> Programs<'a> {
     /// Loads every program's kernels on the current device (startup, before
     /// the first request pays for it).
     pub fn load_all(&self) -> Result<()> {
+        self.load_matching(|_| true).map(|_| ())
+    }
+
+    /// Loads the kernels of the programs whose names `keep` accepts on the current device, and
+    /// returns how many it loaded and skipped. A skipped program still loads when it is first
+    /// resolved ([`Self::program`]), so `keep` must accept every program a caller launches where
+    /// a lazy load cannot happen (inside a stream capture).
+    pub fn load_matching(&self, keep: impl Fn(&str) -> bool) -> Result<(usize, usize)> {
+        let (mut loaded, mut skipped) = (0, 0);
         for (name, (index, _)) in &self.programs {
+            if !keep(name) {
+                skipped += 1;
+                continue;
+            }
             // SAFETY: loading reads the static table and loads a CUDA library.
             let status = unsafe { (self.load)(*index) };
             ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+            loaded += 1;
         }
-        Ok(())
+        Ok((loaded, skipped))
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -304,7 +342,38 @@ mod tests {
             assert_eq!(error, ProgramCapacityError::ContextExceeded {
                 family, requested: 131073, compiled: 131072,
             });
-            assert!(error.to_string().contains("CUTEAFD_DSV4_MAX_CONTEXT=131073"));
+            // GLM 5.3 Flash names its own build setting.
+            let knob = if family == "glm5_flash" { "CUTEAFD_GLMF_MAX_CONTEXT=131073" } else { "CUTEAFD_DSV4_MAX_CONTEXT=131073" };
+            assert!(error.to_string().contains(knob), "{error}");
+        }
+    }
+
+    /// `families.glmf.max_context` (CUTEAFD_GLMF_MAX_CONTEXT) extends GLM 5.3 Flash alone; a
+    /// manifest without it keeps the shared extent.
+    #[test]
+    fn glm_flash_reads_its_own_extent() {
+        let manifest = serde_json::json!({"capacities": {"max_context": 131072},
+            "families": {"glmf": {"max_context": 1048576, "index_topk": 2048}, "glmf2": {"index_topk": 2048}}});
+        let limits = ProgramCapacities::from_manifest(&manifest).unwrap();
+        assert_eq!((limits.max_context, limits.glmf_max_context), (Some(131072), Some(1048576)));
+        assert_eq!((limits.context_of("glm5_flash"), limits.context_of("glm5")), (Some(1048576), Some(131072)));
+        limits.require_context("glm5_flash", 1048576).unwrap();
+        let error = limits.require_context("glm5_flash", 1048577).unwrap_err();
+        assert_eq!(error, ProgramCapacityError::ContextExceeded { family: "glm5_flash", requested: 1048577,
+            compiled: 1048576 });
+        assert!(error.to_string().contains("CUTEAFD_GLMF_MAX_CONTEXT=1048577"), "{error}");
+        for family in ["glm5", "qwen4"] {
+            assert!(limits.require_context(family, 131073).is_err());
+        }
+        // Older manifests: no GLM Flash extent, the shared one serves it.
+        let old = ProgramCapacities::from_manifest(&serde_json::json!({"capacities": {"max_context": 131072},
+            "families": {"glmf": {"index_topk": 2048}}})).unwrap();
+        assert_eq!((old.glmf_max_context, old.context_of("glm5_flash")), (None, Some(131072)));
+        for value in [serde_json::json!(0), serde_json::json!("1048576"), serde_json::json!(null)] {
+            let manifest = serde_json::json!({"capacities": {"max_context": 131072},
+                "families": {"glmf": {"max_context": value}}});
+            assert_eq!(ProgramCapacities::from_manifest(&manifest),
+                Err(ProgramCapacityError::InvalidFamilyContext { family: "glmf" }));
         }
     }
 
@@ -324,12 +393,17 @@ mod tests {
     }
 }
 
+type HeadLaunchFn = unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32;
+
 /// cuBLAS vocabulary head at the model width with pedantic FP32 accumulation
-/// (the reference promotes the projection to FP32).
+/// (the reference promotes the projection to FP32); drafts may take the
+/// tensor-op launch instead ([`VocabularyHead::launch_tensor_op`]).
 pub struct VocabularyHead<'a> {
     library: &'a NativeLibrary,
     handle: *mut c_void,
-    launch: unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32,
+    launch: HeadLaunchFn,
+    /// `cuteafd_vocabulary_head_launch_tensor_op`, when the native library has it.
+    launch_tensor_op: Option<HeadLaunchFn>,
 }
 
 /// Bytes of caller-owned cuBLAS workspace the head needs.
@@ -343,12 +417,13 @@ impl NativeLibrary {
         type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
     }
 }
 
@@ -561,13 +636,14 @@ impl NativeLibrary {
         type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
                 i32::try_from(vocab)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
     }
 }
 
@@ -579,6 +655,22 @@ impl VocabularyHead<'_> {
         stream: *mut c_void) -> Result<()> {
         let status = unsafe { (self.launch)(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
         ensure!(status == 0, "vocabulary head launch failed with {status}");
+        Ok(())
+    }
+
+    /// [`Self::launch`] as a BF16 tensor-core GEMM with FP32 accumulation and
+    /// FP32 logits, reading the head once for every row count: for a
+    /// drafter's head, whose proposals the target verifies. The target's own
+    /// logits keep [`Self::launch`]'s pedantic FP32 promotion.
+    ///
+    /// # Safety
+    /// As [`Self::launch`].
+    pub unsafe fn launch_tensor_op(&self, input: *const u16, weight: *const u16, logits: *mut f32, rows: u32,
+        stream: *mut c_void) -> Result<()> {
+        let launch = self.launch_tensor_op.context(
+            "this native library has no cuteafd_vocabulary_head_launch_tensor_op (rebuild it with this checkout)")?;
+        let status = unsafe { launch(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "tensor-op vocabulary head launch of {rows} rows failed with {status}");
         Ok(())
     }
 }

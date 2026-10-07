@@ -59,6 +59,7 @@ impl<'a> Weights<'a> {
                 ),
                 config.capacity,
                 remaining,
+                config.exl3_schedule,
             )?),
             Self::Fp8(experts) => {
                 ensure!(Fp8Worker::workspace_bytes(config.capacity as usize) <= remaining,
@@ -190,10 +191,11 @@ pub(super) fn load_exl3<'a>(
         .map(|manifest| manifest.decoder_tiers())
         .unwrap_or(&[]);
     let exl3_directory = config.exl3_directory_for(exl3_tiers);
-    let partition = Exl3Worker::partition(&exl3_directory, config.capacity, config.rank)?;
+    let partition = Exl3Worker::partition(&exl3_directory, config.capacity, config.rank,
+        config.exl3_schedule)?;
     ensure!(config.world == 4 || partition == cuteafd_loader::V41Exl3Partition::Disjoint,
         "an implicit Spark TP2/TP3 group cannot use paired TP4 artifacts");
-    let workspace = Exl3Worker::plan(&exl3_directory, config.capacity)
+    let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
     let plans = config.resident_layers(catalog.routed_experts().layers)?
         .map(|layer| {
@@ -218,7 +220,8 @@ pub(super) fn load_exl3<'a>(
     );
     tracing::info!(rank=config.rank, world=config.world, first_layer=config.first_layer,
         layer_count=plans.len(), resident_bytes=resident, workspace_bytes=workspace,
-        device_budget_bytes=config.device_budget, "EXL3 Spark residency plan");
+        device_budget_bytes=config.device_budget, schedule=config.exl3_schedule.name(),
+        "EXL3 Spark residency plan");
     let mut weights = Vec::with_capacity(plans.len());
     let mut remaining = config.device_budget;
     for (index, plan) in plans.iter().enumerate() {

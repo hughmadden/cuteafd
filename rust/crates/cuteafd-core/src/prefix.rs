@@ -409,10 +409,46 @@ impl<T> Retention<T> {
     }
 }
 
+/// Retained snapshots per bank a server keeps unless told otherwise (`--prefix-cache-entries`).
+pub const DEFAULT_ENTRIES: usize = 20;
+/// Device memory for retained marks unless told otherwise, MiB (`--prefix-cache-mark-mib`).
+pub const DEFAULT_MARK_BUDGET_MIB: usize = 2048;
+
+/// Slots of a generic family's device mark arena (`cuteafd_engine::prefix::MarkArena`): the
+/// runtime allocates exactly this many and every planner reserves exactly this many. At least
+/// `2 * lanes + 2` (a capture and a restore in flight per decoding lane plus two retained),
+/// raised to two marks per retained entry pair (`2 * entries + 2`: both banks full plus the
+/// pending pair) while that fits `budget_bytes`; none when retention is off. Recurrent families
+/// (hundred-MiB marks) stay on the lane floor and lean on the host tier; MiMo's 25-39 MB marks
+/// fit a full retention of both banks.
+pub fn mark_slots(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize) -> usize {
+    if entries == 0 {
+        return 0;
+    }
+    let floor = 2 * lanes.max(1) + 2;
+    let wanted = 2 * entries + 2;
+    let affordable = budget_bytes / slot_bytes.max(1);
+    wanted.min(affordable).max(floor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn mark_slots_keep_the_lane_floor_within_the_budget() {
+        const MIB: usize = 1 << 20;
+        let budget = DEFAULT_MARK_BUDGET_MIB * MIB;
+        // MiMo V2.6 Pro: 39.3 MB marks fit both banks at 8 or 16 lanes; 24 lanes raise the floor.
+        assert_eq!(mark_slots(16, DEFAULT_ENTRIES, 39_321_600, budget), 42);
+        assert_eq!(mark_slots(24, DEFAULT_ENTRIES, 39_321_600, budget), 50);
+        // GLM 5.3 Flash: 147.6 MB FP32 marks stay on the floor, 2C + 2.
+        assert_eq!(mark_slots(8, DEFAULT_ENTRIES, 147_619_840, budget), 18);
+        assert_eq!(mark_slots(16, DEFAULT_ENTRIES, 147_619_840, budget), 34);
+        // Retention off takes nothing, whatever the lanes.
+        assert_eq!(mark_slots(16, 0, 147_619_840, budget), 0);
+    }
 
     /// V4.1's rule is pinned: `Radix::new`/`Retention::new` keep {2, Some(128)}, which is the
     /// formula the engine shipped with (`(common / 2 * 2) - 128` for partial matches).

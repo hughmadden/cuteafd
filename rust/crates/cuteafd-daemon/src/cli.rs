@@ -223,15 +223,75 @@ pub(crate) struct PlanArgs {
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,
-    /// Prefill workspace capacity for --layout (0: family/image default).
-    #[arg(long, default_value_t = 0)]
+    /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
+    #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 0)]
     pub(crate) prefill_rows: u64,
+    /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_lanes: u64,
+    /// The most rows of one decode or verify step for --layout (GLM 5.3 Flash's --decode-rows: its
+    /// decode workspace and replay records; 0: the decode programs' 64).
+    #[arg(long, default_value_t = 0, value_parser = clap::builder::TypedValueParser::map(
+        clap::builder::PossibleValuesParser::new(["0", "64", "128"]), |rows| rows.parse::<u64>().expect("a listed row count")))]
+    pub(crate) decode_rows: u64,
+    /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
+    /// engines' --headroom-gib).
+    #[arg(long, default_value_t = 2.0)]
+    pub(crate) headroom_gib: f64,
+    /// Decode graph budget (MiB) for --layout (GLM 5.3 Flash's --graph-budget-mib; unset: the
+    /// family's graph allowance).
+    #[arg(long)]
+    pub(crate) graph_budget_mib: Option<u64>,
+    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU).
+    #[arg(long, value_enum, default_value = "own")]
+    pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
+    /// GLM 5.3 Flash's prefix marks for --layout (`pool`: in pool units, no arena, one reserved
+    /// unit beside the pool).
+    #[arg(long, value_enum, default_value = "arena")]
+    pub(crate) prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks,
+    /// GLM 5.3 Flash's DSA index cache for --layout (serve-glmf's --index-cache: `compact` holds
+    /// 6,172 B per token, `keys` 11,804).
+    #[arg(long, value_enum, default_value = "keys")]
+    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
+    /// GLM 5.3 Flash's KDA recurrent state for --layout (serve-glmf's --kda-state).
+    #[arg(long, value_enum, default_value = "f32")]
+    pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
+    /// GLM 5.3 Flash's KDA in/out projections for --layout (serve-glmf's --kda-fp8).
+    #[arg(long, value_enum, default_value = "off")]
+    pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
+    /// GLM 5.3 Flash's E4M3 LM head for --layout (serve-glmf's --fp8-head).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
+        action = clap::ArgAction::Set)]
+    pub(crate) fp8_head: bool,
+    /// GLM 5.3 Flash's decode row buckets for --layout (serve-glmf's --decode-row-buckets).
+    #[arg(long)]
+    pub(crate) decode_row_buckets: bool,
+    /// GLM 5.3 Flash's decode graphs for --layout: `on` (serve-glmf's default,
+    /// `CUTEAFD_GLMF_STARTUP_GRAPHS`) reserves every serving graph captured at startup; `off`
+    /// reserves the graph allowance for lazily captured ones. A --graph-budget-mib takes its budget.
+    #[arg(long, value_enum, default_value = "on")]
+    pub(crate) startup_graphs: crate::shared::prefix::Toggle,
+    /// The drafter checkpoint for --layout (serve-glmf's --draft): GLM 5.3 Flash lays a DFlash2
+    /// drafter out from its config, with one context ring per sequence (--draft-context-slots
+    /// overrides); other drafters take the family's allowance.
+    #[arg(long)]
+    pub(crate) draft: Option<PathBuf>,
+    /// The drafter's weights in E4M3 (unset or true, the default) or the checkpoint's BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: Option<bool>,
+    /// How the FP8 drafter's GEMMs run (serve-glmf's --draft-linear): their scratch.
+    #[arg(long, value_enum, default_value = "w8a16")]
+    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
+    #[arg(long)]
+    pub(crate) draft_context_slots: Option<u64>,
+    #[arg(long, default_value_t = 16)]
+    pub(crate) draft_sequences: u64,
     /// Native drafter stages, 0 disables the native drafter.
     #[arg(long, default_value_t = 3)]
     pub(crate) native_mtp_layers: usize,
@@ -293,6 +353,11 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the native EXL3 rank directory containing m1, m16 and larger capacities.
     #[arg(long)]
     pub(crate) exl3_aot_dir: Option<PathBuf>,
+    /// EXL3 decode schedule: default, or gb10 for the GLM 5.3 Flash TP4 decode exports
+    /// (m1-gb10, m80-gb10): the same bits, with weight words staged L2 evict-first and, at
+    /// m80, 64x128 tiles at two CTAs per SM.
+    #[arg(long, value_enum, default_value_t = crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule::Default)]
+    pub(crate) exl3_schedule: crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule,
     /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,

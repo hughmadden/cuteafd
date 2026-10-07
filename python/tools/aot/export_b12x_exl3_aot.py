@@ -124,7 +124,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
-           ws_dynamic_tiles: bool = False) -> dict:
+           ws_dynamic_tiles: bool = False, decode_schedule: str | None = None) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -175,6 +175,13 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         raise ValueError("dynamic tile claims apply to the warp-specialized kernel only")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
+    # Decode schedule (b12x parse_decode_schedule: a preset such as gb10, or
+    # l2/pf1/pf2/pdl options): when and with which L2 policy the cooperative
+    # kernel fetches weight words. Bit-identical to the default schedule; the
+    # manifest records the canonical options, and only when one is set.
+    if decode_schedule is not None and (paired_boundary is not None or warp_specialized
+                                        or len(bits) != 2):
+        raise ValueError("a decode schedule applies to cooperative disjoint two-tier exports")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     import torch
@@ -233,8 +240,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                 rotation["ws_input_stages"] = ws_input_stages
             if ws_dynamic_tiles:
                 rotation["ws_dynamic_tiles"] = True
+        schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
-                                      force_blocks_per_sm=blocks_per_sm, **rotation)
+                                      force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     elif len(bits) == 3:
         launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2])
     else:
@@ -307,6 +315,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         manifest["token_major_rotation"] = True
     if paired_boundary is not None:
         manifest.update(paired_boundary=paired_boundary, descriptor_rows=4, native_info_version=3)
+    if getattr(launch, "decode_schedule", None) is not None:
+        manifest["decode_schedule"] = launch.decode_schedule
     write_bridge(output, manifest)
     if not direct:
         from export_b12x_exl3_routes_aot import export as export_routes
@@ -352,6 +362,9 @@ def main() -> None:
                         help="Warp-specialized CTAs claim tiles from a workspace counter")
     parser.add_argument("--token-major-rotation", action="store_true",
                         help="Rotate each token's input once for all of its routes (packed routes)")
+    parser.add_argument("--decode-schedule",
+                        help="Cooperative-kernel decode schedule: a b12x preset (gb10) or "
+                             "l2=,pf1=,pf2=,pdl= options; bit-identical to the default")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
@@ -362,7 +375,8 @@ def main() -> None:
            fused_input_rotation=args.fused_input_rotation,
            warp_specialized=args.warp_specialized, wire_input=args.wire_input,
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
-           swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit))
+           swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
+           decode_schedule=args.decode_schedule)
 
 
 if __name__ == "__main__":

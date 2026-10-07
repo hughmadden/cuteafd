@@ -9,7 +9,10 @@ One object and header per program, a manifest with every program's pointer
 ABI and scratch sizes at its capacity, and ``dsv4_programs.h``: the table the
 generic native shim (native/shared/src/dsv4_programs.cc) launches from. Capacities are
 compile-time: decode programs cover ``--decode-rows``, prefill programs
-``--prefill-rows``, and cache extents follow ``--max-context``.
+``--prefill-rows``, and cache extents follow ``--max-context``. GLM 5.3 Flash also
+exports its decode programs at ``--glmf-wide-decode-rows`` (wider verify steps), and its
+index top-k at ``--glmf-max-context`` when that is longer (contexts up to 1,048,576
+tokens), after every other program.
 """
 
 from __future__ import annotations
@@ -251,6 +254,9 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
         ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
+        # The compact index cache (--index-cache compact): the commit that also rebuilds the
+        # sequences' index tails, and below the producers without per-token keys.
+        ("kda_commit_c", "kda_commit", {"index_cache": "compact"}, lambda: glmf.compile_glmf_kda_commit_c_aot(g)),
     ]
     # MLA, dense and shared-expert projections take only E4M3 weights with 128x128 scales
     # (the official FP8 release's): decode rows up to ``fp8_rows`` on the GEMV, W8A16
@@ -266,6 +272,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out += [
             (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
              lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
+            (f"index_producer_c_m{rows}", "index_producer", {"max_rows": rows, "index_cache": "compact"},
+             lambda r=rows: glmf.compile_glmf_index_producer_c_aot(g, max_rows=r)),
             (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": pool_pages},
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
@@ -286,7 +294,105 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
                         lambda r=rows, i=inter, m=mode: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r,
                                                                                   fp8_only=m)))
+    # BF16 KDA recurrent state (serve --kda-state bf16): the BF16-projection KDA programs and the
+    # replay commit over a BF16 state, computed in FP32 and rounded after every decode, verify and
+    # commit row and where each chunked-prefill window stores it (``s16t``: after every 16-row
+    # tile). New stems: the FP32 programs above, and their objects, are unchanged.
+    for rows, f8, tag, rounding in ((decode_rows, True, "s16", "window"), (prefill_rows, "prefill", "s16", "window"),
+                                    (prefill_rows, "prefill", "s16t", "tile")):
+        out.append((f"kda_{tag}_m{rows}", "kda",
+                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding},
+                    lambda r=rows, f=f8, sr=rounding: glmf.compile_glmf_kda_aot(
+                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr)))
+    out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
+                lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
+    # Both: the compact index cache's commit (state and index tails in one launch) over a BF16 state.
+    out.append(("kda_commit_c_s16", "kda_commit", {"index_cache": "compact", "state_dtype": "bfloat16"},
+                lambda: glmf.compile_glmf_kda_commit_c_aot(g, state_dtype="bfloat16")))
     return out
+
+
+def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: int):
+    """GLM 5.3 Flash decode and verify steps of ``decode_rows`` < rows <= ``wide_rows`` (serve
+    ``--decode-rows``): every decode program a step launches again at ``wide_rows`` rows, as new
+    stems ``*_m{wide_rows}``, and the replay commits over records of that many rows
+    (``kda_commit*_m{wide_rows}``). The KDA programs keep the decode structures at that capacity
+    (the token-sequential recurrence, which records every verify row) and the mHC mix its decode
+    route. None when ``wide_rows`` does not exceed ``decode_rows``. Steps of up to ``decode_rows``
+    rows keep the ``glmf_programs`` above, whose stems and objects this list leaves alone (the
+    exporter compiles it after every other program)."""
+    if wide_rows <= decode_rows:
+        return []
+    from b12x.integration.cuteafd import dsv4_mhc as mhc
+    from b12x.integration.cuteafd import glm_sparse_mla as mla
+    from b12x.integration.cuteafd import glmf
+
+    mg = glmf.mhc_geometry(g)
+    pool_pages = -(-max_context // (g.index_kpool * PAGE_ROWS))
+    r = int(wide_rows)
+    out = [
+        (f"index_producer_m{r}", "index_producer", {"max_rows": r},
+         lambda: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
+        (f"index_producer_c_m{r}", "index_producer", {"max_rows": r, "index_cache": "compact", "replay_rows": r},
+         lambda: glmf.compile_glmf_index_producer_c_aot(g, max_rows=r, verify_rows=r)),
+        (f"index_topk_decode_m{r}", "index_topk", {"mode": "decode", "max_rows": r, "max_pages": pool_pages},
+         lambda: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode="decode")),
+        (f"mhc_post_pre_m{r}", "mhc_post_pre", {"max_rows": r, "route": "decode"},
+         lambda: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route="decode")),
+        (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True)),
+        (f"kda_w8_m{r}", "kda", {"max_rows": r, "fp8_only": "decode"},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only="decode")),
+        (f"kda_s16_m{r}", "kda", {"max_rows": r, "fp8": True, "state_dtype": "bfloat16", "state_rounding": "window"},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window")),
+        (f"mla_producer_m{r}", "mla_producer", {"max_rows": r, "fp8_only": "decode"},
+         lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
+        (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},
+         lambda: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only="decode")),
+        # One split for the 128-row bucket, as the 64-row program's 64-row bucket: the split
+        # planner finds no split count within its waves once the unsplit launch exceeds them
+        # (128 rows x 4 head blocks, 512 CTAs on 170 SMs) and would split it 33 ways, FP32
+        # partials of 33 chunks per row and head in a 554,729,472-byte scratch.
+        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "full_launch_splits": 1},
+         lambda: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
+                                                fp32_partials=True, full_launch_splits=1)),
+    ]
+    for inter in (g.moe_inter, g.dense_inter):
+        out.append((f"ffn_i{inter}_m{r}", "ffn", {"max_rows": r, "inter": inter, "fp8_only": "decode"},
+                    lambda i=inter: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r, fp8_only="decode")))
+    # The commits read the speculative step's records: r rows per layer (glmf_kda_commit's 64).
+    for stem, params, state in (("kda_commit", {}, "float32"), ("kda_commit_s16", {"state_dtype": "bfloat16"}, "bfloat16")):
+        out.append((f"{stem}_m{r}", "kda_commit", {**params, "replay_rows": r},
+                    lambda s=state: glmf.compile_glmf_kda_commit_aot(g, state_dtype=s, replay_rows=r)))
+    for stem, params, state in (("kda_commit_c", {}, "float32"),
+                                ("kda_commit_c_s16", {"state_dtype": "bfloat16"}, "bfloat16")):
+        out.append((f"{stem}_m{r}", "kda_commit", {"index_cache": "compact", **params, "replay_rows": r},
+                    lambda s=state: glmf.compile_glmf_kda_commit_c_aot(g, state_dtype=s, replay_rows=r)))
+    return out
+
+
+def glmf_extent_programs(g, decode_rows: int, prefill_rows: int, wide_rows: int, max_context: int,
+                         glmf_max_context: int):
+    """GLM 5.3 Flash contexts past ``max_context`` (serve ``--max-context`` up to
+    ``glmf_max_context``, e.g. 1,048,576 tokens): the index top-k over ``glmf_max_context``
+    tokens' pools (at 1M, 262,144 pools in 4,096 pool pages) at every capacity a step launches it
+    (decode, prefill, and the wide decode rows when exported), as new stems
+    ``index_topk_*_ctx{glmf_max_context}``. A step runs one only when its pool table is wider than
+    ``max_context``'s, so shorter contexts keep the ``max_context`` programs, their objects and
+    their scratch; no other program bakes in an extent. None when ``glmf_max_context`` does not
+    exceed ``max_context``."""
+    if glmf_max_context <= max_context:
+        return []
+    from b12x.integration.cuteafd import glmf
+
+    pool_pages = -(-glmf_max_context // (g.index_kpool * PAGE_ROWS))
+    caps = [("decode", decode_rows), ("prefill", prefill_rows)]
+    if wide_rows > decode_rows:
+        caps.append(("decode", wide_rows))
+    return [(f"index_topk_{mode}_m{rows}_ctx{glmf_max_context}", "index_topk",
+             {"mode": mode, "max_rows": rows, "max_pages": pool_pages, "max_context": glmf_max_context},
+             lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m))
+            for mode, rows in caps]
 
 
 def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
@@ -300,7 +406,10 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     keep = ("kda_m", "kda_w8_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
     from b12x.integration.cuteafd import glmf
 
-    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    # The head split keeps the per-token index keys and an FP32 KDA state (no compact index cache
+    # or BF16-state ``_s16`` programs on two GPUs yet).
+    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context)
+                if item[0].startswith(keep) and not item[0].startswith("kda_commit_c") and "_s16" not in item[0]]
     programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
     programs.append(("join_heads", "join", {"half_width": g.kda_width},
                      lambda: glmf.compile_glmf_join_aot(g.kda_width)))
@@ -405,10 +514,21 @@ def main() -> None:
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
+    parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
+                        help="with glmf: also the decode and verify programs at this many rows (serve "
+                             "--decode-rows 128), new stems after every other program; 0 exports none")
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
+    parser.add_argument("--glmf-max-context", type=int, default=0,
+                        help="with glmf: GLM 5.3 Flash's context extent (e.g. 1048576), recorded as "
+                             "families.glmf.max_context; when longer than --max-context its index top-k is also "
+                             "exported at it (new stems after every other program); 0: --max-context")
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     args = parser.parse_args()
+    glmf_max_context = args.glmf_max_context or args.max_context
+    if glmf_max_context < args.max_context:
+        raise SystemExit(f"--glmf-max-context {glmf_max_context} is shorter than --max-context {args.max_context}: "
+                         "every GLM 5.3 Flash program covers --max-context")
 
     import torch
     from b12x.integration.cuteafd import (
@@ -480,6 +600,15 @@ def main() -> None:
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
+    if "glmf" in geometries:
+        # Last, so every program above compiles exactly as before.
+        work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
+                                                                       args.glmf_wide_decode_rows, args.max_context)]
+        work += [("glmf", *item) for item in glmf_extent_programs(
+            GLM53_FLASH, args.decode_rows, args.prefill_rows, args.glmf_wide_decode_rows, args.max_context,
+            glmf_max_context)]
+        # The longest context GLM 5.3 Flash serves (the serving engine's limit).
+        manifest["families"]["glmf"]["max_context"] = glmf_max_context
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

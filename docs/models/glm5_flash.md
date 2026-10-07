@@ -42,11 +42,20 @@ Attention (KDA), a minority run MLA + DSA.
   indexer and shared experts quantize to FP8 blocks at load by default
   (`CUTEAFD_GLM_BF16=native` keeps them BF16 at a coordinator-step cost).
 - KV format: FP8 MLA latent record on the MLA+DSA layers; a recurrent FP32
-  state per KDA layer plus short-convolution state.
+  state per KDA layer plus short-convolution state. `GLM5_FLASH_KDA_STATE=bf16`
+  (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
+  recurrent state in BF16, rounded after every decode, verify and commit row
+  and at each chunked-prefill window end: half the state and prefix-mark bytes.
 - RTX/Spark layouts: scales from 1 RTX with local experts up through
   multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
   two-GPU head split when both coordinator GPUs are available;
   `RTX_GPUS=1` or `COORDINATOR_SPLIT=off` serves from one GPU.
+- Spark EXL3 decode schedule: `GLM5_FLASH_EXL3_SCHEDULE=gb10`
+  (`expertd-native --exl3-schedule gb10`, opt-in) runs the TP4 decode exports
+  `m1-gb10` and `m80-gb10`: the default exports' products and sums, so the
+  same bits, with the weight words staged L2 evict-first (the b12x `gb10`
+  decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
+  an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
 - Spark EXL3 worker host path: a call's routes are written straight into
   pinned staging and uploaded with one batched asynchronous copy, the wire
   decode reads the hidden rows in the mapped request frame (no device copy),
@@ -62,6 +71,34 @@ Attention (KDA), a minority run MLA + DSA.
   --routes file:PATH` replays them.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
+- Context: the DSA index top-k is the one program with an extent compiled in
+  (131,072 tokens, `CUTEAFD_DSV4_MAX_CONTEXT`). Builds with
+  `CUTEAFD_GLMF_MAX_CONTEXT=1048576` (`CUTEAFD_WIP_GLMF_MAX_CONTEXT`,
+  `CUTEAFD_RELEASE_GLMF_MAX_CONTEXT`) also export it over 262,144 pools
+  (`glmf_index_topk_*_ctx1048576`, recorded as `families.glmf.max_context`), and
+  `MAX_CONTEXT_TOKENS` (`--max-context`) goes up to 1,048,576. Only steps whose
+  pool table is wider than 512 pages (a row past 131,072 tokens) run the 1M
+  programs; shorter steps keep the 131,072-token ones and their bits. With
+  `--max-context` past 131,072 their scratch adds 33.5 MB to the prefill
+  temporaries and 0.5 MB to the decode workspace (1 MB at `--decode-rows 128`).
+- Admission and verify rows (defaults). Prompts that wait together prefill in one pass, up to
+  the first prefill lane's rows (`--prefill-batch`, `GLM5_FLASH_PREFILL_BATCH`; `off` for one
+  pass per prompt): each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head run
+  over its own rows as its own pass would, the rest over all rows, with one Spark wave per MoE
+  layer for the burst. `glmf-golden --packed-check N` compares every sequence with its own pass,
+  logits, KDA state and paged bytes: identical with the Sparks, keys/FP32 and compact/BF16. Verify
+  rows follow `--verify-policy auto` (`GLM5_FLASH_VERIFY_POLICY`): from the sequence count where
+  the even split of the verify budget leaves a sequence fewer drafts than it proposes (9 at 64
+  rows, 16 at 127 with `GLM5_FLASH_DECODE_ROWS=128` on an RTX 5090;
+  `GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES` overrides), each sequence's drafts are cut at
+  `GLM5_FLASH_SPEC_TAU` (0.7) of cumulative draft probability and the least likely drafts across
+  sequences go first when a step exceeds its rows; below it, the same room for every sequence and
+  the cost model's depth (`cost`; `chain` uses the chain cut at every count). On 1 RTX 5090 + 4
+  Sparks with the 2 x 4,096-lane 5090 profile, 16 sequences and 64 decode rows, packed prefill
+  gave code C16 +4.0%, mixed C16 +2.7%, C4 +2.2-5.0% and C16 time to first token 2.27 -> 0.85 s
+  at max; with the chain cut as well, code C16 +10.2% and mixed C16 +6.2%. At one stream the chain
+  cut moved the bench both ways (512-token streams +7%, 1,024-token runs 1-3% slower), so `auto`
+  leaves it to the cost model there.
 
 ## Default precision (single residency)
 
@@ -146,6 +183,49 @@ ablations put most of the added KL in KDA; retaining FP32 output partials
 improves the paired golden result. Full-K token-row ownership removes that
 partial-rounding/reduction change at the KDA output. It does not prove
 end-to-end batch or speculative numerical invariance.
+
+## Memory profiles (`GLM5_FLASH_MEMORY`)
+
+One launcher key picks the device-memory profile: `standard` (the default:
+the settings as configured), `compact` or `auto`; `GLM5_FLASH_PROFILE=rtx5090`
+names `compact`.
+
+- `compact` is the profile measured on 1 RTX 5090 + 4 DGX Sparks at 16
+  sequences, each setting gated: `GLM5_FLASH_INDEX_CACHE=compact`,
+  `GLM5_FLASH_KDA_STATE=bf16` over checkpoint-precision KDA projections and
+  head (`GLM5_FLASH_KDA_FP8=off`, `GLM5_FLASH_FP8_HEAD=off`,
+  `GLM5_FLASH_FP8_PREFILL=off`), `GLM5_FLASH_PREFIX_MARKS=pool` with
+  `HOST_CACHE_BYTES=64GiB`, `EMBEDDING=host`, `GLM5_FLASH_HEADROOM_GIB=1`,
+  `GLM5_FLASH_GRAPH_BUDGET_MIB=512` with `GLM5_FLASH_DECODE_ROW_BUCKETS=on`,
+  `GLM5_FLASH_REPLAY_RECORDS=shared`, `GLM5_FLASH_DECODE_ROWS=128`,
+  `GLM5_FLASH_EXL3_SCHEDULE=gb10`, `GLM5_FLASH_EXL3_WORKER_PATH=async`,
+  `RDMA_BOND_BALANCE=probe`, `GLM5_FLASH_DRAFT_HEAD=tensor`,
+  `GLM5_FLASH_DRAFT_LINEAR=w8a8` and `GLM5_FLASH_TARGET_HEAD=tensor` (KL gate
+  against `exact`: −7e-8 nats, no top-1 flips). It admitted 1,683,456 KV tokens beside
+  131,072-token requests (1,676,288 with the 1,048,576-token extent) and serves
+  one 1,048,576-token request. It needs one GPU, Spark experts and an automatic
+  pool.
+- `auto` lays the standard settings out with `cuteafd plan --layout` on the
+  coordinator GPU's free memory (nvidia-smi; under `--restart` with this
+  launch's coordinator crediting the device's used memory when it is the GPU's
+  only compute process) for `CONCURRENCY` sequences and
+  `MAX_CONTEXT_TOKENS`, with every memory flag the standard launch would pass,
+  and keeps them when that pool holds one `MAX_CONTEXT_TOKENS` request and
+  65,536 tokens for each other sequence; otherwise it runs the launch as
+  `compact`. The choice follows the measured bytes, not the card's name: as
+  planned, 16 sequences of 131,072 tokens take `compact` on an RTX 5090 and
+  `standard` on an RTX PRO 6000. A head split or local experts keep `standard`.
+- A key the configuration sets keeps its value; the profile fills in the
+  others and the launch notes each value it sets and each it keeps. The BF16
+  KDA state and the tensor-core target head run over the BF16 KDA projections
+  and head: with FP8 ones kept, compact leaves them unset and says so.
+
+`cuteafd plan --layout` takes serve-glmf's memory flags under their own names
+(`--index-cache`, `--kda-state`, `--kda-fp8`, `--fp8-head`, `--prefix-marks`,
+`--replay-records`, `--decode-rows`, `--decode-row-buckets`, `--prefill-lanes`,
+`--prefill-lane-rows`, `--headroom-gib`, `--graph-budget-mib`, `--draft`,
+`--draft-linear`, `--draft-context-slots`) and sizes the profile within 0.03%
+of the pools above.
 
 ## Split KDA token-row opt-in
 

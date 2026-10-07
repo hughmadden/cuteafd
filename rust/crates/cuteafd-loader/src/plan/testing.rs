@@ -303,6 +303,110 @@ pub fn glm5_flash_config(layers: usize) -> Value {
     })
 }
 
+/// GLM 5.3 Flash as published (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, an exllamav3 tr3 4bpw
+/// release): 45 layers, MLA + DSA on every fourth from layer 3 and KDA on the rest, the first three
+/// MLPs dense.
+pub fn glm53_flash_tr3_config() -> Value {
+    let mut config = glm5_flash_config(45);
+    let text = &mut config["text_config"];
+    text["vocab_size"] = 154_880.into();
+    text["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    text["mlp_layer_types"] = json!((0..45).map(|l| if l < 3 { "dense" } else { "sparse" }).collect::<Vec<_>>());
+    text["max_position_embeddings"] = 1_048_576.into();
+    text["index_n_heads"] = 32.into();
+    text["index_head_dim"] = 128.into();
+    config
+}
+
+/// The coordinator tensors of [`glm53_flash_tr3_config`]'s checkpoint, with their stored dtypes
+/// and shapes (its routed experts and native MTP layer omitted).
+pub fn glm53_flash_tr3_tensors() -> Vec<Tensor> {
+    let mut out = vec![t("lm_head.weight", "BF16", &[154_880, 4096]),
+        t("model.language_model.embed_tokens.weight", "BF16", &[154_880, 4096]),
+        t("model.language_model.norm.weight", "BF16", &[4096])];
+    for layer in 0..45 {
+        let p = format!("model.language_model.layers.{layer}");
+        for site in ["attn", "ffn"] {
+            out.extend([t(format!("{p}.hc_{site}_base"), "F32", &[24]), t(format!("{p}.hc_{site}_fn"), "BF16", &[24, 16_384]),
+                t(format!("{p}.hc_{site}_scale"), "F32", &[3])]);
+        }
+        out.extend([t(format!("{p}.input_layernorm.weight"), "BF16", &[4096]),
+            t(format!("{p}.post_attention_layernorm.weight"), "BF16", &[4096])]);
+        let a = |name: &str| format!("{p}.self_attn.{name}");
+        if layer % 4 == 3 {
+            out.extend([t(a("q_a_proj.weight"), "BF16", &[1536, 4096]), t(a("q_a_layernorm.weight"), "BF16", &[1536]),
+                t(a("q_b_proj.weight"), "BF16", &[16_384, 1536]), t(a("kv_a_proj_with_mqa.weight"), "BF16", &[512, 4096]),
+                t(a("kv_a_layernorm.weight"), "BF16", &[512]), t(a("kv_b_proj.weight"), "BF16", &[32_768, 512]),
+                t(a("o_proj.weight"), "BF16", &[4096, 16_384]), t(a("indexer.wq_b.weight"), "BF16", &[4096, 1536]),
+                t(a("indexer.wk.weight"), "BF16", &[128, 4096]), t(a("indexer.weights_proj.weight"), "BF16", &[32, 4096]),
+                t(a("indexer.index_kpool_compress_gate"), "BF16", &[128, 4096]),
+                t(a("indexer.index_kpool_compress_ape"), "BF16", &[4, 128]), t(a("indexer.k_norm.weight"), "BF16", &[128]),
+                t(a("indexer.k_norm.bias"), "BF16", &[128])]);
+        } else {
+            for proj in ["q_proj", "k_proj", "v_proj"] {
+                out.push(t(a(&format!("{proj}.weight")), "BF16", &[8192, 4096]));
+            }
+            for conv in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                out.push(t(a(&format!("{conv}.weight")), "BF16", &[8192, 1, 4]));
+            }
+            out.extend([t(a("f_a_proj.weight"), "BF16", &[128, 4096]), t(a("f_b_proj.weight"), "BF16", &[8192, 128]),
+                t(a("g_a_proj.weight"), "BF16", &[128, 4096]), t(a("g_b_proj.weight"), "BF16", &[8192, 128]),
+                t(a("b_proj.weight"), "BF16", &[64, 4096]), t(a("A_log"), "F32", &[64]), t(a("dt_bias"), "F32", &[8192]),
+                t(a("o_norm.weight"), "BF16", &[128]), t(a("o_proj.weight"), "BF16", &[4096, 8192])]);
+        }
+        if layer < 3 {
+            out.extend([t(format!("{p}.mlp.gate_proj.weight"), "BF16", &[12_288, 4096]),
+                t(format!("{p}.mlp.up_proj.weight"), "BF16", &[12_288, 4096]),
+                t(format!("{p}.mlp.down_proj.weight"), "BF16", &[4096, 12_288])]);
+        } else {
+            out.extend([t(format!("{p}.mlp.gate.weight"), "BF16", &[288, 4096]),
+                t(format!("{p}.mlp.gate.e_score_correction_bias"), "F32", &[288]),
+                t(format!("{p}.mlp.shared_experts.gate_proj.weight"), "BF16", &[2048, 4096]),
+                t(format!("{p}.mlp.shared_experts.up_proj.weight"), "BF16", &[2048, 4096]),
+                t(format!("{p}.mlp.shared_experts.down_proj.weight"), "BF16", &[4096, 2048])]);
+        }
+    }
+    out
+}
+
+/// The DFlash2 drafter's `config.json` (`incoai/GLM-5.3-Flash-DFlash2`).
+pub fn glm53_flash_dflash2_config() -> Value {
+    json!({"architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "hidden_size": 4096,
+        "intermediate_size": 12_288, "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "vocab_size": 154_880, "sliding_window": 2048, "rms_norm_eps": 1e-5,
+        "rope_parameters": {"rope_theta": 10_000.0, "rope_type": "default"},
+        "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": 154_856,
+            "selector_rank": 256, "selector_top_k": 16, "target_layer_ids": [5, 14, 24, 33, 42]}})
+}
+
+/// The GLM 5.3 Flash programs' scratch at capacity of an RTX 5090 export with GLM 5.3 Flash's
+/// 1,048,576-token extent (`CUTEAFD_GLMF_MAX_CONTEXT`): every single-GPU `glmf_*` program a step
+/// can launch, as `PROGRAMS.json` records them.
+pub fn glmf_5090_programs_manifest() -> Value {
+    let scratch: [(&str, u64); 39] = [("glmf_mhc_pre", 26_214_400), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_producer_c_m64", 593_920), ("glmf_index_topk_decode_m64", 8_653_824),
+        ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720), ("glmf_kda_w8_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_producer_c_m4096", 38_010_880), ("glmf_index_topk_prefill_m4096", 558_007_296),
+        ("glmf_mhc_post_pre_m4096", 26_214_400), ("glmf_kda_m4096", 782_236_672), ("glmf_kda_w8_m4096", 782_236_672),
+        ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744), ("glmf_sparse_mla_prefill_m4096", 1_048_576),
+        ("glmf_ffn_i2048_m4096", 67_633_152), ("glmf_ffn_i12288_m4096", 353_894_400), ("glmf_kda_s16_m64", 10_526_720),
+        ("glmf_kda_s16_m4096", 782_236_672), ("glmf_kda_s16t_m4096", 782_236_672), ("glmf_index_producer_m128", 1_122_304),
+        ("glmf_index_producer_c_m128", 1_187_840), ("glmf_index_topk_decode_m128", 17_304_576),
+        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_kda_w8_m128", 21_053_440),
+        ("glmf_kda_s16_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592), ("glmf_o_m128", 4_194_304),
+        ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
+        ("glmf_ffn_i12288_m128", 9_437_184), ("glmf_index_topk_decode_m64_ctx1048576", 9_178_112)];
+    let long = [("glmf_index_topk_prefill_m4096_ctx1048576", 591_561_728u64),
+        ("glmf_index_topk_decode_m128_ctx1048576", 18_353_152)];
+    let programs: Vec<Value> = scratch.iter().chain(&long)
+        .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+    json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072},
+        "families": {"glmf": {"max_context": 1_048_576}}, "programs": programs})
+}
+
 /// Qwen 3.8 Flash Next's config with `layers` layers (every fourth full attention).
 pub fn qwen4_config(layers: usize) -> Value {
     json!({

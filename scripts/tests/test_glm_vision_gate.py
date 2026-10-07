@@ -126,7 +126,9 @@ def test_glm_memory_diagnostics_do_not_change_cuda_state():
     idle = serving.split("fn publish(", 1)[1].split("fn schedule(", 1)[0]
     assert idle.index("if active == 0 && prefilling == 0") < idle.index("current_cuda_memory_snapshot()")
     assert '"first_prefill_boundaries"' in idle
-    assert "first_prefill_sample(&first_prefill_seen" in serving
+    # The prefill paths (one prompt, or a packed group) sample around the first prefill of each kind.
+    assert "first_prefill_sample(self.seen" in serving
+    assert serving.count("diagnostics.before(") == 2 and serving.count("diagnostics.after(") == 2
     assert "media encoder preparation precedes this boundary" in serving
 
 
@@ -163,20 +165,24 @@ def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
 def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     root = ROOT / "rust/crates/cuteafd-daemon/src/families"
     source = (root / "glm5_flash/engine.rs").read_text()
-    construction = source.split("fn workspace_here(", 1)[1].split("/// Streams start", 1)[0]
-    assert "workspace_layout(" in construction
-    assert "self.alloc(layout.streams)" in construction
-    assert "self.alloc(layout.scratch)" in construction
+    # Every workspace buffer comes from the loader's arithmetic, which the reserve and the planner
+    # charge: a lane's own buffers over its GPU's shared temporaries.
+    temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
+    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
+    lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
+    assert "glmf_lane_bytes(" in lane and "self.alloc(bytes.streams)" in lane
+    reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
+    assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
-    for required in ("self.decode_workspace", "self.pipelined()", "PREFILL_LANES",
-                     "self.peer_workspaces", "drafter.prepare_workspace()", "self.synchronize()"):
+    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_lane_count",
+                     "self.prefill_lanes_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
     assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in source
     assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
     assert "kda.in[24896|12576,4096]" in source
     opening = (root / "glm5_flash/mod.rs").read_text().split("pub fn with_engine", 1)[1]
     assert opening.index("workspace_reserve(") < opening.index("planned_pool_tokens_with_extra(")
-    assert "extra + graph_extra + workspace_extra" in opening
+    assert "graph_extra + workspace_extra" in opening
     assert opening.index("engine.prepare_serving_workspaces()") < opening.index("let result = body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
     # Shared DFlash only gains an explicit API; all existing users keep lazy timing.

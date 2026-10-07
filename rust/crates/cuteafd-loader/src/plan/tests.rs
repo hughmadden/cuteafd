@@ -883,6 +883,315 @@ fn capacity_counts_the_widest_rank_of_an_uneven_split() {
 }
 
 #[test]
+fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, GlmfStepShape};
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // The GLM programs' scratch of an export (the engine reads the same manifest).
+    let programs: Vec<Value> = [("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
+        ("glmf_ffn_i12288_m4096", 353_894_400)].into_iter()
+        .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+    let manifest = json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072},
+        "programs": programs});
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let lookup = glmf_manifest_scratch(&manifest);
+    // Two lanes of 4,096 rows and the default 2 GiB headroom; four lanes of 2,048 and 1 GiB.
+    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (4, 2048, 1 << 30)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
+            prefill_rows: rows, headroom_bytes: headroom, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
+            ..Default::default() }), ..sparks(4) };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let gpu = &memory.devices[0];
+        assert_eq!(gpu.capacity_bytes, (32 << 30) - headroom);
+        // What the engine allocates from the same arithmetic and manifest.
+        let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+            output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, 64, &shape,
+            glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
+            glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
+        let steps = gpu.items.iter().find(|i| i.category == Category::Workspace && i.group == "steps").unwrap();
+        let selector = crate::serving_capacity::glmf_selector_bytes(64, cfg.vocab_size as u64);
+        assert_eq!((steps.bytes, steps.basis), (engine + selector + lanes * 4 * rows * 4096 * 2, Basis::Formula),
+            "the step workspaces, the token selector and every lane's intake planes");
+    }
+    // Without a manifest: the one-GPU allowance, never below the default lanes' rows in flight.
+    let options = |lanes: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+        prefill_lanes: lanes, prefill_rows: rows, workspace_manifest: Some(dir.path().join("absent.json")),
+        ..Default::default() }), ..sparks(4) };
+    let steps = |lanes, rows| plan(dir.path(), &options(lanes, rows)).unwrap().memory_layout.unwrap().devices[0].items
+        .iter().find(|i| i.group == "steps").unwrap().bytes;
+    let allowance = layout::family_costs("glm5_flash").workspace_bytes[0];
+    assert_eq!(steps(2, 4096), allowance + 2 * 4 * 4096 * 4096 * 2);
+    assert_eq!(steps(4, 2048), allowance + 4 * 4 * 2048 * 4096 * 2);
+    assert_eq!(steps(4, 4096), 2 * allowance + 4 * 4 * 4096 * 4096 * 2);
+    // A graph budget replaces the graph allowance, as the engine's admission reserves it.
+    let mut budgeted = options(2, 4096);
+    budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);
+    let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
+    let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
+        .collect();
+    assert_eq!(graphs, [("graph budget", 512 << 20)]);
+}
+
+/// `--decode-rows 128`: the planner charges the decode workspace the engine allocates at 128 rows
+/// (over the `_m64` and `_m128` programs' scratch) and the 128-row replay records.
+#[test]
+fn glm5_flash_layout_charges_the_wide_decode_workspace_and_replay_records() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glm_flash_rank_cache_geometry_rows, glmf_manifest_scratch, glmf_step_scratch,
+        glmf_step_workspaces, GlmfIndexCache, GlmfStepShape};
+    use cuteafd_core::memory_layout::Category;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // The base export's scratch, and the wide programs' from the first 128-row export, but for the
+    // sparse MLA decode's: its 128-row bucket at one split (that export's planner took 33).
+    let programs: Vec<(&str, u64)> = vec![("glmf_mhc_pre", 26_214_400), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
+        ("glmf_ffn_i12288_m4096", 353_894_400)];
+    let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_304_576),
+        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
+        ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
+        ("glmf_ffn_i12288_m128", 9_437_184)];
+    let manifest = |with_wide: bool| {
+        let extra: &[(&str, u64)] = if with_wide { &wide } else { &[] };
+        let all: Vec<Value> = programs.iter().chain(extra)
+            .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+        json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072}, "programs": all})
+    };
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest(true).to_string()).unwrap();
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let options = |decode_rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+        context_tokens: 131_072, workspace_manifest: Some(path.clone()), glmf_decode_rows: decode_rows,
+        ..Default::default() }), ..sparks(4) };
+    let item = |decode_rows: u64, category: Category, group: &str| plan(dir.path(), &options(decode_rows)).unwrap()
+        .memory_layout.unwrap().devices[0].items.iter().find(|i| i.category == category && i.group == group).unwrap()
+        .bytes;
+    let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+        output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+    let full = manifest(true);
+    let lookup = glmf_manifest_scratch(&full);
+    let engine = |decode_rows: u64| glmf_step_workspaces(&cfg, 2, 4096, decode_rows, &shape,
+        glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
+        glmf_step_scratch(&lookup, &cfg, Default::default(), 4096, false).unwrap()).device_bytes();
+    let intake = 2 * 4 * 4096 * 4096 * 2;
+    for decode_rows in [0, 64, 128] {
+        let rows = if decode_rows == 0 { 64 } else { decode_rows };
+        let selector = crate::serving_capacity::glmf_selector_bytes(rows, cfg.vocab_size as u64);
+        assert_eq!(item(decode_rows, Category::Workspace, "steps"), engine(rows) + selector + intake,
+            "{decode_rows} rows");
+    }
+    // The wide programs' scratch stays under mhc_pre's (prefill capacity); the top-k's grows.
+    let narrow = glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap();
+    let both = glmf_step_scratch(&lookup, &cfg, Default::default(), 128, true).unwrap();
+    assert_eq!((narrow.programs, both.programs, narrow.topk, both.topk), (26_214_400, 26_214_400, 8_653_824, 17_304_576));
+    // The state item carries the replay records at the decode rows.
+    let replay = |rows: u64| glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap()
+        .ranks[0].clone();
+    let (r64, r128) = (replay(64), replay(128));
+    assert_eq!(item(128, Category::Kv, "state") - item(64, Category::Kv, "state"),
+        (r128.speculative_replay_bytes + r128.fixed_state_bytes) - (r64.speculative_replay_bytes + r64.fixed_state_bytes));
+    // A build without the wide programs: no formula at 128 rows (the planner falls back to its allowance).
+    let base = manifest(false);
+    assert!(glmf_step_scratch(glmf_manifest_scratch(&base), &cfg, Default::default(), 128, true).is_err());
+}
+
+#[test]
+fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
+    use crate::serving_capacity::glm_flash_kda_replay_bytes;
+    use cuteafd_core::memory_layout::Category;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // `small`: every prefill program's scratch 1 MiB, under the records.
+    let manifest = |small: bool| {
+        let prefill = |bytes: u64| if small { 1 << 20 } else { bytes };
+        let programs: Vec<Value> = [("glmf_mhc_pre", prefill(26_214_400)), ("glmf_index_producer_m64", 561_152),
+            ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+            ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+            ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592),
+            ("glmf_index_producer_m4096", prefill(35_913_728)), ("glmf_index_topk_prefill_m4096", 558_007_296),
+            ("glmf_mhc_post_pre_m4096", prefill(26_214_400)), ("glmf_kda_m4096", prefill(782_236_672)),
+            ("glmf_mla_producer_m4096", prefill(168_296_448)), ("glmf_o_m4096", prefill(203_423_744)),
+            ("glmf_sparse_mla_prefill_m4096", prefill(1_048_576)), ("glmf_ffn_i2048_m4096", prefill(67_633_152)),
+            ("glmf_ffn_i12288_m4096", prefill(353_894_400))].into_iter()
+            .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+        json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072}, "programs": programs})
+    };
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    // One KDA layer's records at 64 rows (the fixture has one KDA and one MLA layer).
+    let records = glm_flash_kda_replay_bytes(&cfg, 2, 1, 64).unwrap();
+    assert_eq!(records, 9_453_568);
+    let item = |path: &std::path::Path, shared: bool, category: Category, group: &str| {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+            context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()), glmf_shared_replay: shared,
+            ..Default::default() }), ..sparks(4) };
+        plan(dir.path(), &options).unwrap().memory_layout.unwrap().devices[0].items.iter()
+            .find(|i| i.category == category && i.group == group).unwrap().bytes
+    };
+    // The export's prefill scratch (782 MB, the 4,096-row KDA programs) holds the records: the state
+    // sheds them and the step workspaces do not grow.
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest(false).to_string()).unwrap();
+    assert_eq!(item(&path, false, Category::Kv, "state") - item(&path, true, Category::Kv, "state"), records);
+    assert_eq!(item(&path, false, Category::Workspace, "steps"), item(&path, true, Category::Workspace, "steps"));
+    // A prefill scratch smaller than the records grows to hold them.
+    let small = dir.path().join("SMALL.json");
+    std::fs::write(&small, manifest(true).to_string()).unwrap();
+    assert_eq!(item(&small, true, Category::Workspace, "steps"),
+        item(&small, false, Category::Workspace, "steps") + records - (1 << 20));
+    assert_eq!(item(&small, false, Category::Kv, "state") - item(&small, true, Category::Kv, "state"), records);
+}
+
+/// GLM 5.3 Flash on one RTX 5090 (33,711,521,792 bytes visible to CUDA) + 4 Sparks at 16
+/// sequences, laid out with `options` (the published tr3 checkpoint's coordinator tensors, the
+/// DFlash2 drafter, a 5090 export's programs).
+fn glmf_5090_layout(context: u64, options: impl FnOnce(&mut layout::LayoutOptions))
+    -> cuteafd_core::memory_layout::MemoryLayout {
+    let target = snapshot(glm53_flash_tr3_config(), &glm53_flash_tr3_tensors());
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"), glm53_flash_dflash2_config().to_string()).unwrap();
+    let manifest = target.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, glmf_5090_programs_manifest().to_string()).unwrap();
+    let mut layout = layout::LayoutOptions { rtx_bytes: vec![33_711_521_792], concurrency: 16, context_tokens: context,
+        workspace_manifest: Some(manifest), glmf_draft: Some(layout::GlmfDraft { snapshot: drafter.path().into(),
+            fp8: true, linear: Default::default(), context_slots: None, sequences: 16 }), ..Default::default() };
+    options(&mut layout);
+    let options = PlanOptions { vision: MediaMode::Off, layout: Some(layout), ..sparks(4) };
+    plan(target.path(), &options).unwrap().memory_layout.unwrap()
+}
+
+/// The 5090 profile as it was measured: compact index, BF16 KDA state over
+/// the BF16 KDA projections and head, pool marks, host embedding, 1 GiB headroom, the 512 MiB graph
+/// budget with row buckets, shared replay records, 128 decode rows, the W8A8 drafter.
+fn glmf_compact_profile(layout: &mut layout::LayoutOptions) {
+    use crate::families::glm5::draft_representation::GlmDraftLinear;
+    use crate::serving_capacity::{GlmfIndexCache, GlmfKdaState};
+    layout.host_embedding = true;
+    layout.glmf_index_cache = GlmfIndexCache::Compact;
+    layout.glmf_kda_state = GlmfKdaState::Bf16;
+    layout.glmf_pool_marks = true;
+    layout.glmf_shared_replay = true;
+    layout.glmf_decode_rows = 128;
+    layout.glmf_row_buckets = true;
+    layout.headroom_bytes = 1 << 30;
+    layout.graph_budget_bytes = Some(512 << 20);
+    layout.glmf_draft.as_mut().unwrap().linear = GlmDraftLinear::W8a8;
+}
+
+/// `cuteafd plan --layout` sizes the 5090 profile within 1% of the pool the engine admitted (at 16
+/// sequences: 1,683,456 tokens at a 131,072-token context and 1,676,288 at 1,048,576),
+/// each fixed cost from the formulas the start-up ledger reproduces: the weights, drafter, step
+/// workspaces with the intake and token selector, and the cache state to the byte, the drafter's FP8
+/// scratch at the larger card's split plan (2 MiB over the 5090's), the runtime as measured at
+/// 1,048,576 (118,784 bytes over the 131,072-token launch's). Those launches also held the row
+/// buckets' scratch page (371,712 bytes) that masked padded rows no longer need: one unit under.
+#[test]
+fn glm5_flash_plan_sizes_the_5090_profile_within_one_percent_of_the_measured_pools() {
+    use cuteafd_core::memory_layout::Category;
+    for (context, measured, planned, workspace) in [(131_072u64, 1_683_456u64, 1_683_200u64, 2_937_306_624u64),
+        (1_048_576, 1_676_288, 1_676_032, 2_981_228_032)] {
+        let memory = glmf_5090_layout(context, glmf_compact_profile);
+        let gpu = &memory.devices[0];
+        let item = |group: &str| gpu.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+        let categories = gpu.by_category();
+        // The start-up ledgers' scopes (`memory ledger sequence=0` at either context).
+        assert_eq!(categories[&Category::Weights], 14_034_716_416, "weights (embedding host-mapped)");
+        assert_eq!(item("drafter"), 2_081_647_104, "drafter: FP8 weights, 16 rings, taps");
+        assert_eq!(item("drafter workspace"), 174_999_744);
+        assert_eq!(item("drafter fp8 scratch"), 28_394_496 + (2 << 20), "w8a8 scratch at 188 SMs (170: 28,394,496)");
+        // workspace + spark-intake + sampler + the selector's greedy outputs (`other`).
+        assert_eq!(item("steps"), workspace + 268_435_456 + 6_418_432 + 1_536, "{context}");
+        // `kv` less the records: 16 slots of BF16 state and tails, the index records and commit
+        // tables (padded decode rows are masked: no scratch page); then the reserved unit.
+        assert_eq!(item("state"), 1_222_434_048 - 11 * 64 * 528);
+        assert_eq!(item("reserved units"), 1_579_780);
+        assert_eq!(item("graph budget"), 512 << 20);
+        assert_eq!(item("context+modules"), 954_490_432, "with the wide decode programs");
+        assert_eq!(gpu.capacity_bytes, 33_711_521_792 - (1 << 30));
+        let error = memory.pool_tokens.abs_diff(measured) as f64 / measured as f64;
+        assert!(error < 0.01, "{context}: planned {} against measured {measured}", memory.pool_tokens);
+        assert_eq!(memory.pool_tokens, planned, "{context}: within a unit of the measured pool (no scratch page)");
+    }
+}
+
+/// The premise of the launcher's `GLM5_FLASH_MEMORY=auto`: at 16 sequences and 131,072 tokens the
+/// standard settings (the keys index, FP32 state, an arena of marks, the embedding on the GPU, the
+/// 2 GiB headroom, 64 decode rows) admit a fraction of one 131,072-token request plus 65,536 tokens
+/// for every other sequence on an RTX 5090, and the whole of it on a 96 GB card; the compact profile
+/// admits it on the 5090. With lazily captured graphs (the graph allowance) the standard plan is the
+/// pool the standard launch admitted on the 5090 (49,408 tokens: every fixed cost its start-up
+/// ledger shows, and its untracked bytes at admission with the 64-row decode programs); serve-glmf's
+/// default startup graphs (12,420 graphs: 270 shapes of 46 segments at this context) leave none.
+#[test]
+fn glm5_flash_standard_settings_fall_short_on_a_5090_and_not_on_a_96_gb_card() {
+    use cuteafd_core::memory_layout::Category;
+    let need = 131_072 + 15 * 65_536;
+    let lazy = glmf_5090_layout(131_072, |layout| layout.glmf_startup_graphs = false);
+    assert_eq!(lazy.pool_tokens, 49_408);
+    let gpu = &lazy.devices[0];
+    let item = |group: &str| gpu.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let categories = gpu.by_category();
+    // The standard launch's ledger: weights, the GPU embedding, the drafter (16 rings, w8a16), the step
+    // workspaces with the intake and the 64-row selector, FP32 state for 16 slots, 34 arena marks.
+    assert_eq!((categories[&Category::Weights], categories[&Category::Embedding]), (14_034_716_416, 1_268_776_960));
+    assert_eq!((item("drafter"), item("drafter workspace")), (2_081_647_104, 174_999_744));
+    assert_eq!(item("drafter fp8 scratch"), 14_156_288 + (1 << 20), "w8a16 scratch at 188 SMs (170: 14,156,288)");
+    assert_eq!(item("steps"), 2_872_700_160 + 268_435_456 + 3_209_216 + 768);
+    assert_eq!((item("state"), item("marks")), (2_683_339_520, 34 * 147_619_840));
+    assert_eq!((item("context+modules"), item("graph allowance")), (946_248_768, 1_610_612_736));
+    assert!(lazy.pool_tokens < need / 4, "{}", lazy.pool_tokens);
+    let standard = glmf_5090_layout(131_072, |_| {});
+    let startup = standard.devices[0].items.iter().filter(|i| i.group == "startup graphs").map(|i| i.bytes).sum::<u64>();
+    assert_eq!(startup, crate::serving_capacity::glmf_graph_reserve_bytes(270 * 46, 188));
+    assert_eq!(startup, 2_249_933_800);
+    assert_eq!(standard.pool_tokens, 0);
+    let large = glmf_5090_layout(131_072, |layout| layout.rtx_bytes = vec![95 * (1 << 30) + (512 << 20)]);
+    assert!(large.pool_tokens >= need, "{}", large.pool_tokens);
+    assert!(glmf_5090_layout(131_072, glmf_compact_profile).pool_tokens >= need);
+    // At 1,048,576 tokens (one request plus 15 x 65,536 = 2,031,616) the compact profile falls short too:
+    // the request alone is what the 5090 admits beside the other sequences' 1,048,576.
+    let compact_1m = glmf_5090_layout(1_048_576, glmf_compact_profile).pool_tokens;
+    assert!(compact_1m < 1_048_576 + 15 * 65_536 && compact_1m > 1_048_576, "{compact_1m}");
+}
+
+/// `--kda-fp8` and `--fp8-head` change only the resident projections and the head: E4M3 values with
+/// FP32 scales per row and 128-wide K block in place of the BF16 copies.
+#[test]
+fn glm5_flash_fp8_projections_and_head_shrink_the_resident_weights() {
+    use cuteafd_core::memory_layout::Category;
+    let weights = |kda: layout::GlmfKdaFp8, head: bool| glmf_5090_layout(131_072, |layout| {
+        layout.glmf_kda_fp8 = kda;
+        layout.glmf_fp8_head = head;
+        layout.host_embedding = true;
+    }).devices[0].by_category()[&Category::Weights];
+    let bf16 = weights(layout::GlmfKdaFp8::Off, false);
+    // 34 KDA layers: in-projection rows [24,896 x 4,096] and o_proj [4,096 x 8,192].
+    let kda = 34 * ((24_896 * 4096 + 4096 * 8192) * 2 - (24_896 * 4096 + 4096 * 8192) - (24_896 + 4096 * 2) * 32 * 4);
+    assert_eq!(bf16 - weights(layout::GlmfKdaFp8::Row128, false), kda);
+    assert_eq!(weights(layout::GlmfKdaFp8::Channel, false), weights(layout::GlmfKdaFp8::Row128, false));
+    let head = 154_880 * 4096 * 2 - (154_880 * 4096 + 154_880 * 32 * 4);
+    assert_eq!(bf16 - weights(layout::GlmfKdaFp8::Off, true), head);
+    // The embedding on the GPU is the BF16 table.
+    let gpu = glmf_5090_layout(131_072, |_| {}).devices[0].by_category()[&Category::Embedding];
+    assert_eq!(gpu, 154_880 * 4096 * 2);
+}
+
+#[test]
 fn glm_next_facts_and_dflash2_drafter_are_described() {
     let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
@@ -1317,4 +1626,85 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     let invalid = plan(invalid.path(), &options).unwrap();
     assert!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap()
         .rejections.iter().any(|r| r.reason.contains("intermediate_size")));
+}
+
+/// Every generic family's layout reserves the mark arena its server allocates at the default
+/// knobs (`cuteafd_core::prefix::mark_slots`, the rule of the runtime's `MarkArena`), and GLM
+/// 5.3 Flash's state carries its speculative replay records.
+#[test]
+fn layouts_reserve_the_mark_arena_their_servers_allocate() {
+    use crate::families::mimo_v2::MimoKvCache;
+    use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_core::prefix::{mark_slots, DEFAULT_ENTRIES, DEFAULT_MARK_BUDGET_MIB};
+    let arena = |concurrency: u64, mark: u64| mark_slots(concurrency as usize, DEFAULT_ENTRIES, mark as usize,
+        DEFAULT_MARK_BUDGET_MIB << 20) as u64;
+    let marks = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].by_category()
+        .get(&Category::Prefix).copied().unwrap_or(0);
+    let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(4) };
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    let mut config = glm5_flash_config(45);
+    config["text_config"]["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+    assert_eq!(rank.retained_mark_bytes, 147_619_840);
+    let dir = snapshot(config, &[]);
+    for (concurrency, slots) in [(8, 18), (16, 34)] {
+        let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
+        assert_eq!(arena(concurrency, rank.retained_mark_bytes), slots);
+        assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
+        // serve-glmf keeps KDA state for max(8, --max-sequences) slots.
+        let state = memory.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
+            + rank.speculative_replay_bytes);
+        assert_eq!(rank.speculative_replay_bytes, 321_421_312);
+    }
+    // An explicit arena (0: marks kept in the page pool) is taken as given.
+    let mut pooled = layout(96 << 30, 16);
+    pooled.layout.as_mut().unwrap().prefix_slots = Some(0);
+    assert_eq!(marks(&plan(dir.path(), &pooled).unwrap().memory_layout.unwrap()), 0);
+    // MiMo: both banks while 2C + 2 stays below 42; at C24 the lane floor (50) wins.
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+    let mark = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap()
+        .ranks[0].retained_mark_bytes;
+    for concurrency in [8, 24] {
+        let memory = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+            head_split: false, concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(6) })
+            .unwrap().memory_layout.unwrap();
+        assert_eq!(marks(&memory), arena(concurrency, mark) * mark, "MiMo at C{concurrency}");
+    }
+    assert!(arena(24, mark) > arena(8, mark));
+}
+
+/// `--prefix-marks pool` for GLM 5.3 Flash: no mark arena, and the units pool marks reserve
+/// (`GLMF_POOL_MARK_RESERVED_UNITS`, never handed out) charged beside the pool, so the pool the
+/// layout admits is the pool requests can use.
+#[test]
+fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
+    use crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS;
+    let mut config = glm5_flash_config(45);
+    config["text_config"]["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+    let unit = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+    let dir = snapshot(config, &[]);
+    let layout = |pool_marks: bool, prefix_slots: Option<u64>| plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![48 << 30], concurrency: 16, pool_tokens: Some(0),
+            glmf_pool_marks: pool_marks, prefix_slots, ..Default::default() }), ..sparks(4) })
+        .unwrap().memory_layout.unwrap();
+    let item = |memory: &cuteafd_core::memory_layout::MemoryLayout, group: &str| memory.devices[0].items.iter()
+        .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let (pool, none) = (layout(true, None), layout(false, Some(0)));
+    assert_eq!((item(&pool, "marks"), item(&pool, "reserved units")), (0, GLMF_POOL_MARK_RESERVED_UNITS * unit));
+    assert_eq!((item(&none, "marks"), item(&none, "reserved units")), (0, 0));
+    // Pool marks ignore an arena request; the reserved unit's bytes come out of the pool.
+    assert_eq!(item(&layout(true, Some(34)), "marks"), 0);
+    assert!(none.pool_tokens - pool.pool_tokens <= 256 && pool.pool_tokens > 0, "{} {}", none.pool_tokens, pool.pool_tokens);
+    assert_eq!(none.devices[0].free_bytes() - pool.devices[0].free_bytes(),
+        (GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - (none.pool_tokens - pool.pool_tokens) as i64 * unit as i64 / 256);
 }

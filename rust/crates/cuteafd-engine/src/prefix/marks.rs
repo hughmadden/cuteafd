@@ -25,19 +25,11 @@ impl MarkArena {
         Self { free: (0..count).rev().collect(), slots, slot_bytes }
     }
 
-    /// Slots to preallocate: at least `2 * lanes + 2` (a capture and a restore in flight per
-    /// lane plus two retained), raised to hold two marks per retained entry pair
-    /// (`2 * entries + 2`, both banks full plus the pending pair) while that fits `budget_bytes`.
-    /// Recurrent families (hundred-MiB marks) stay near the lane floor and lean on the host tier;
-    /// MiMo's 25-39 MB marks fit a full retention of both banks.
+    /// Slots to preallocate: [`cuteafd_core::prefix::mark_slots`], the rule every planner
+    /// reserves by (at least `2 * lanes + 2`, two marks per retained entry pair while they fit
+    /// `budget_bytes`, none when retention is off).
     pub fn slots_for(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize) -> usize {
-        let floor = 2 * lanes.max(1) + 2;
-        if entries == 0 {
-            return 0;
-        }
-        let wanted = 2 * entries + 2;
-        let affordable = budget_bytes / slot_bytes.max(1);
-        wanted.min(affordable).max(floor)
+        cuteafd_core::prefix::mark_slots(lanes, entries, slot_bytes, budget_bytes)
     }
 
     pub fn slots(&self) -> usize {

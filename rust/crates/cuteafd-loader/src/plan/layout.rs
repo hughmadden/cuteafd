@@ -8,11 +8,15 @@
 //! (`scripts/bench/memory-audit.py`, PLAN.md Phase 6 audit). The KV pool takes
 //! what the tightest KV-owning device has left, capped at the target.
 use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
-use crate::serving_capacity::{CacheOptions, KvPlacement};
+use crate::families::glm5::draft_representation::GlmDraftLinear;
+use crate::serving_capacity::{CacheOptions, GlmfIndexCache, GlmfKdaState, KvPlacement};
 use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
 mod deepseek_v4;
+mod glm5_flash;
 mod v41;
+
+pub use glm5_flash::GlmfKdaFp8;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -34,8 +38,41 @@ pub struct LayoutOptions {
     /// Two coordinator GPUs split attention heads (generic families) rather
     /// than V4.1's layer ranges.
     pub head_split: bool,
-    /// Prefill rows per step (workspace shape).
+    /// Prefill rows per step (workspace shape; GLM 5.3 Flash: per lane).
     pub prefill_rows: u64,
+    /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
+    pub prefill_lanes: u64,
+    /// Rows of GLM 5.3 Flash's widest decode and verify step (`--decode-rows`: its decode workspace
+    /// and replay records); 0 selects the decode programs' 64.
+    pub glmf_decode_rows: u64,
+    /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance.
+    pub graph_budget_bytes: Option<u64>,
+    /// GLM 5.3 Flash's KDA replay records in the prefill lanes' scratch (`--replay-records shared`,
+    /// one GPU): out of the state, and the scratch holds at least them.
+    pub glmf_shared_replay: bool,
+    /// GLM 5.3 Flash's prefix marks in pool units (`--prefix-marks pool`): no mark arena, and
+    /// `GLMF_POOL_MARK_RESERVED_UNITS` units allocated beside the pool and never handed out.
+    pub glmf_pool_marks: bool,
+    /// GLM 5.3 Flash's DSA index cache (`--index-cache`): its records per token, the sequences'
+    /// index tails and the compact producers' scratch. A head split keeps `keys`, as the engine.
+    pub glmf_index_cache: GlmfIndexCache,
+    /// GLM 5.3 Flash's KDA recurrent state (`--kda-state`): its bytes per element and programs.
+    pub glmf_kda_state: GlmfKdaState,
+    /// GLM 5.3 Flash's KDA in/out projections (`--kda-fp8`) and E4M3 head (`--fp8-head`): their
+    /// resident bytes, and the KDA `w8` programs' scratch.
+    pub glmf_kda_fp8: GlmfKdaFp8,
+    pub glmf_fp8_head: bool,
+    /// GLM 5.3 Flash's fine decode row buckets (`--decode-row-buckets`): no device bytes (padded
+    /// rows are masked and write nothing), but more startup graph shapes.
+    pub glmf_row_buckets: bool,
+    /// GLM 5.3 Flash's decode graphs captured at startup (serve-glmf's default; `--startup-graphs
+    /// off`, or a graph budget, captures them lazily): every serving graph's bytes
+    /// (`glmf_startup_graph_bytes`) in place of the graph allowance.
+    pub glmf_startup_graphs: bool,
+    /// GLM 5.3 Flash's external drafter (`--draft`): a DFlash2 checkpoint is laid out exactly
+    /// (weights, context rings, tap buffers, draft workspace, FP8 scratch); any other drafter takes
+    /// the family's allowance.
+    pub glmf_draft: Option<GlmfDraft>,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -72,6 +109,18 @@ impl Default for LayoutOptions {
             spark_bytes: 108 * GIB,
             head_split: true,
             prefill_rows: 0,
+            prefill_lanes: 0,
+            glmf_decode_rows: 0,
+            glmf_shared_replay: false,
+            glmf_pool_marks: false,
+            glmf_index_cache: GlmfIndexCache::Keys,
+            glmf_kda_state: GlmfKdaState::F32,
+            glmf_kda_fp8: GlmfKdaFp8::Off,
+            glmf_fp8_head: false,
+            glmf_row_buckets: false,
+            glmf_startup_graphs: true,
+            glmf_draft: None,
+            graph_budget_bytes: None,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
@@ -86,6 +135,20 @@ impl Default for LayoutOptions {
             workspace_manifest: None,
         }
     }
+}
+
+/// GLM 5.3 Flash's external drafter as `serve-glmf` loads it (`--draft` and its options).
+#[derive(Debug, Clone)]
+pub struct GlmfDraft {
+    pub snapshot: std::path::PathBuf,
+    /// E4M3 weights (the default) or the checkpoint's BF16 (`--draft-fp8 false`).
+    pub fp8: bool,
+    /// How its FP8 GEMMs run (`--draft-linear`): their scratch.
+    pub linear: GlmDraftLinear,
+    /// Context rings (`--draft-context-slots`); None: one per sequence, as `serve-glmf` gives.
+    pub context_slots: Option<u64>,
+    /// The most sequences one draft step takes (`--draft-sequences`), at most the rings.
+    pub sequences: u64,
 }
 
 /// How a component's weights sit on two coordinator GPUs.
@@ -114,7 +177,8 @@ pub struct FamilyCosts {
     pub exchange_bytes: u64,
     /// The family's default drafter (weights and its buffers) on the lead GPU.
     pub drafter_bytes: u64,
-    /// Prefix-cache mark slots resident on the device (per GPU).
+    /// V4.1's snapshot arena slots, and Qwen's admission fallback for commands without a
+    /// serving arena. Generic families' serving arenas follow [`default_mark_slots`].
     pub mark_slots: u64,
     /// Native MTP layers stay resident (false: the default drafter replaces them).
     pub mtp_resident: bool,
@@ -130,6 +194,11 @@ pub struct FamilyCosts {
     pub spark_host_bytes: u64,
 }
 
+
+/// What GLM 5.3 Flash's wide decode programs (`--decode-rows 128`: the 17 `_m128` programs its
+/// start-up then loads) add to one GPU's untracked bytes at admission: 954,490,432 measured with them
+/// against 946,248,768 without (RTX 5090, the same build, 16 sequences).
+pub const GLMF_WIDE_DECODE_RUNTIME: u64 = 954_490_432 - 946_248_768;
 
 const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
@@ -173,19 +242,22 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             workspace_bytes: [gib(290), gib(249), gib(120)],
             exchange_bytes: gib(38),
             drafter_bytes: gib(321),
-            mark_slots: 42,
             mtp_resident: false,
             spark_workspace_bytes: gib(51),
             spark_ring_bytes: gib(117),
             ..generic
         },
-        // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split).
+        // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split). Without a program manifest,
+        // one GPU's step workspaces: decode and two lanes of 4,096 rows over shared temporaries
+        // (`serving_capacity::glmf_step_workspaces` of the 5090 export, 2.68 GiB). One GPU's runtime:
+        // the untracked bytes when the measured admission sized the pool, every start-up allocation
+        // made (RTX 5090 + 4 Sparks, 16 sequences, its programs loaded GLM-only): 946,248,768 with
+        // the 64-row decode programs; the wide decode programs add `GLMF_WIDE_DECODE_RUNTIME`.
         "glm5_flash" => FamilyCosts {
-            runtime_bytes: [gib(78), gib(78), gib(78)],
+            runtime_bytes: [946_248_768, gib(78), gib(78)],
             graph_bytes: [gib(150), gib(150), gib(150)],
-            workspace_bytes: [gib(472), gib(472), gib(472)],
+            workspace_bytes: [gib(268), gib(472), gib(472)],
             drafter_bytes: gib(324),
-            mark_slots: 18,
             mtp_resident: false,
             spark_workspace_bytes: gib(56),
             spark_ring_bytes: gib(78),
@@ -196,7 +268,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             graph_bytes: [gib(35), gib(40), gib(25)],
             workspace_bytes: [gib(480), gib(414), gib(355)],
             exchange_bytes: gib(31),
-            mark_slots: 18,
             spark_workspace_bytes: gib(35),
             spark_ring_bytes: gib(52),
             ..generic
@@ -222,6 +293,16 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         },
         _ => generic,
     }
+}
+
+/// The device mark arena a generic family's server allocates for `concurrency` decoding
+/// sequences at the default prefix knobs ([`cuteafd_core::prefix::mark_slots`], the rule the
+/// runtime's `MarkArena` sizes by), for marks of `mark_bytes` over every rank.
+pub fn default_mark_slots(concurrency: u64, mark_bytes: u64) -> u64 {
+    use cuteafd_core::prefix::{mark_slots, DEFAULT_ENTRIES, DEFAULT_MARK_BUDGET_MIB};
+    let lanes = usize::try_from(concurrency).unwrap_or(usize::MAX);
+    let bytes = usize::try_from(mark_bytes).unwrap_or(usize::MAX);
+    mark_slots(lanes, DEFAULT_ENTRIES, bytes, DEFAULT_MARK_BUDGET_MIB << 20) as u64
 }
 
 fn share_of(family: &str, component: Component) -> Share {
@@ -320,7 +401,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     if let Some(ranks) = &v41_weights {
         for (device, items) in devices.iter_mut().zip(ranks) { device.items.extend(items.iter().cloned()); }
     }
-    let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0);
+    // GLM 5.3 Flash on one GPU: its loader's resident operands (falling back to the component
+    // estimate for a checkpoint this layout does not cover).
+    let exact = if family == "glm5_flash" && !split {
+        glm5_flash::resident_weights(checkpoint, options.glmf_kda_fp8, options.glmf_fp8_head).map(|groups| vec![groups])
+    } else { resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0) };
     if let Some(ranks) = &exact {
         for (device, rank) in devices.iter_mut().zip(ranks) {
             for (group, format, bytes) in rank {
@@ -441,10 +526,26 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             exl3_workspace.unwrap_or(gib(115) * prefill_rows / 4096),
             if exl3_workspace.is_some() { Basis::Formula } else { allowance_basis }));
     }
-    // The drafter lives on the lead GPU (taps and head are there under a head split).
-    let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
-    if drafter > 0 {
-        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
+    // The drafter lives on the lead GPU (taps and head are there under a head split). GLM 5.3
+    // Flash's DFlash2 is laid out from its own config with serve-glmf's rings (one per sequence).
+    let glmf_draft = if family == "glm5_flash" {
+        options.glmf_draft.as_ref().and_then(|draft| glmf_draft_bytes(draft, concurrency, &mut notes))
+    } else { None };
+    match glmf_draft {
+        Some(draft) => {
+            devices[0].items.push(Item::new(Category::Drafter, "drafter", "", draft.resident(), Basis::Formula));
+            devices[0].items.push(Item::new(Category::Drafter, "drafter workspace", "", draft.workspace, Basis::Formula));
+            if draft.fp8_scratch > 0 {
+                devices[0].items.push(Item::new(Category::Workspace, "drafter fp8 scratch", "", draft.fp8_scratch,
+                    Basis::Formula));
+            }
+        }
+        None => {
+            let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
+            if drafter > 0 {
+                devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
+            }
+        }
     }
 
     let v4_workspace = if family == "deepseek_v4" {
@@ -461,24 +562,61 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
     }
 
+    // GLM 5.3 Flash on one GPU: the step workspaces its engine allocates, from the program manifest.
+    let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
+        else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
+    let glmf_decode_rows = if options.glmf_decode_rows > 0 { options.glmf_decode_rows }
+        else { crate::serving_capacity::GLMF_DECODE_ROWS };
+    // Shared replay records: the KDA records of the decode rows, in the prefill scratch.
+    let glmf_shared_records = if family == "glm5_flash" && !split && options.glmf_shared_replay {
+        crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()
+            .and_then(|cfg| crate::serving_capacity::glm_flash_kda_replay_bytes(&cfg, cfg.layers, 1, glmf_decode_rows).ok())
+            .unwrap_or(0)
+    } else { 0 };
+    let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
+        .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, options, glmf_lanes,
+            prefill_rows, context_tokens, glmf_decode_rows, glmf_shared_records))).flatten();
+
     // Fixed runtime costs.
     let gpus_now = active_gpus;
     for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
-        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
-            allowance_basis));
-        device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], allowance_basis));
-        let workspace = v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
-            || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
-            |rank| rank.fixed_device_bytes);
-        // V4 keeps one 4096-row intake plane per Spark and prefill lane.
-        // Decode reuses lane zero; every plane belongs to the lead GPU.
-        let intake = if family == "deepseek_v4" && index == 0 {
-            match report.placement {
-                ExpertPlacement::Sparks { ranks } => 2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2,
-                _ => 0,
-            }
+        let wide_modules = if family == "glm5_flash" && role == 0 && glmf_decode_rows > crate::serving_capacity::GLMF_DECODE_ROWS {
+            GLMF_WIDE_DECODE_RUNTIME
         } else { 0 };
+        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role] + wide_modules,
+            allowance_basis));
+        let glmf_startup = (family == "glm5_flash" && role == 0 && options.glmf_startup_graphs).then(||
+            crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()).flatten();
+        match (options.graph_budget_bytes.filter(|_| family == "glm5_flash"), glmf_startup) {
+            (Some(budget), _) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget,
+                Basis::Formula)),
+            (None, Some(cfg)) => device.items.push(Item::new(Category::Runtime, "startup graphs", "",
+                crate::serving_capacity::glmf_startup_graph_bytes(&cfg, context_tokens as usize,
+                    options.pool_tokens.filter(|&p| p > 0).unwrap_or(options.target_pool_tokens) as usize,
+                    concurrency as usize, glmf_decode_rows as usize, options.glmf_row_buckets), Basis::Formula)),
+            (None, None) => device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role],
+                allowance_basis)),
+        }
+        let workspace = match glmf_steps {
+            Some(steps) if index == 0 => steps,
+            // The allowance covers the default lanes' rows in flight; more rows in flight take more.
+            None if family == "glm5_flash" && role == 0 =>
+                costs.workspace_bytes[role] * (glmf_lanes * prefill_rows.max(1)).max(8192) / 8192,
+            _ => v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
+                || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
+                |rank| rank.fixed_device_bytes),
+        };
+        // V4 keeps one 4096-row intake plane per Spark and prefill lane; GLM 5.3 Flash one plane
+        // of a lane's rows per Spark and lane. Decode reuses lane zero; every plane belongs to the
+        // lead GPU.
+        let intake = match (family, report.placement) {
+            ("deepseek_v4", ExpertPlacement::Sparks { ranks }) if index == 0 =>
+                2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2,
+            ("glm5_flash", ExpertPlacement::Sparks { ranks }) if index == 0 && !split =>
+                glmf_lanes * ranks as u64 * prefill_rows * model.spec().hidden as u64 * 2,
+            _ => 0,
+        };
         let workspace = workspace + intake;
         if family == "deepseek_v4" {
             // --reserve-gib 10 covers the future workspace and graph budget;
@@ -487,7 +625,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 .max(options.headroom_bytes).max(3 * GIB);
             device.capacity_bytes = options.rtx_bytes[index].saturating_sub(headroom);
         }
-        let workspace_basis = if v4_workspace.is_some() { Basis::Formula } else { allowance_basis };
+        let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some() && index == 0) { Basis::Formula }
+            else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
         if split {
             let exact_peer = if family == "deepseek_v4" {
@@ -517,7 +656,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         if let Ok(Some(cache)) = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
             native_mtp_layers: cache_native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
             let mark_bytes: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-            let slots = options.prefix_slots.unwrap_or(42.min(2 * GIB / mark_bytes.max(1)).max(2 * concurrency + 2));
+            let slots = options.prefix_slots.unwrap_or_else(|| default_mark_slots(concurrency, mark_bytes));
             let state = cache.ranks[0].active_state_per_sequence_bytes * options.state_slots.unwrap_or(concurrency)
                 + cache.ranks[0].fixed_state_bytes + cache.ranks[0].context_table_bytes_per_token * context_tokens;
             let role = if active_gpus == 1 { 0 } else { 1 };
@@ -597,10 +736,13 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
-    // KV pool: per-device bytes per logical token from the family geometry.
+    // KV pool: per-device bytes per logical token from the family geometry. GLM 5.3 Flash's index
+    // cache and KDA state as the engine runs them (a head split keeps the keys cache).
+    let glmf_index = if split { GlmfIndexCache::Keys } else { options.glmf_index_cache };
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
-        prefill_rows: prefill_rows, ..Default::default() });
+        prefill_rows: prefill_rows, glmf_decode_rows, glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
+        ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
         Ok(Some(mut geometry)) => {
@@ -611,25 +753,39 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     _ => 0,
                 };
             }
-            let marks = options.prefix_slots.unwrap_or_else(|| {
-                if matches!(family, "deepseek_v4" | "qwen4") {
+            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks;
+            let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
+                if family == "deepseek_v41" { costs.mark_slots } else {
+                    // A generic family's arena, as its server sizes it at the default knobs.
                     let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                    42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
-                } else { costs.mark_slots }
-            });
+                    default_mark_slots(concurrency, bytes)
+                }
+            }) };
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
             // Reserve fixed state and marks before sizing records. Otherwise
             // an automatic pool consumes the bytes those allocations need.
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
-                let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency } else { concurrency + 2 });
+                // GLM 5.3 Flash's server holds KDA state for max(8, --max-sequences) slots.
+                let state_slots = options.state_slots.unwrap_or(match family {
+                    "qwen4" | "deepseek_v4" | "deepseek_v41" => concurrency,
+                    "glm5_flash" => concurrency.max(8),
+                    _ => concurrency + 2,
+                });
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
                     + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
-                    + rank.speculative_replay_bytes + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
+                    + rank.speculative_replay_bytes.saturating_sub(glmf_shared_records)
+                    + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
+                }
+                // Pool marks: the reserved units beside the pool (never handed out, so outside its tokens).
+                if pool_marks {
+                    device.items.push(Item::new(Category::Prefix, "reserved units", "",
+                        (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
+                            * crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
                 }
             }
             if family == "deepseek_v41" {
@@ -700,6 +856,66 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     }
     devices.extend(spark_devices);
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine
+/// allocates for the decode workspace of `decode_rows` rows and `lanes` prefill lanes of `rows`
+/// rows (`serving_capacity::glmf_*`, which the engine sizes its buffers from), and its token
+/// selector with the GPU sampler the start-up reserves.
+#[allow(clippy::too_many_arguments)]
+fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
+    layout: &LayoutOptions, lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64) -> Option<u64> {
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_selector_bytes, glmf_step_scratch, glmf_step_workspaces,
+        glmf_table_pages, GlmfScratchOptions, GlmfStepShape, GlmfTopkExtents};
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
+    let lookup = glmf_manifest_scratch(manifest);
+    let base = manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072);
+    let context = if context > 0 { context } else { base };
+    // The programs the steps launch: FP8 KDA projections run the w8 programs, the compact index
+    // its producers, a BF16 state its KDA programs; a context past the plain index top-k's extent
+    // also runs the longer-extent top-k (GLM 5.3 Flash's own).
+    let topk = GlmfTopkExtents::for_context(base, manifest["families"]["glmf"]["max_context"].as_u64(), context);
+    let options = GlmfScratchOptions { kda_w8: layout.glmf_kda_fp8 != GlmfKdaFp8::Off,
+        index_compact: layout.glmf_index_cache == GlmfIndexCache::Compact, kda_state: layout.glmf_kda_state,
+        topk_long: topk.long, ..Default::default() };
+    let (table_pages, table_pool_pages) = glmf_table_pages(context);
+    let spark = matches!(placement, ExpertPlacement::Sparks { .. });
+    let shape = GlmfStepShape { lead: true, split: false, local_experts: !spark, spark, partial_bytes: 2,
+        output_shard: false, full_prefill_logits: false, table_pages, table_pool_pages };
+    let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
+    let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
+    // Shared replay records live in the prefill scratch.
+    prefill.programs = prefill.programs.max(shared_records);
+    // A lane needs a Spark transport of its own: local experts prefill in one.
+    let lanes = if spark { lanes } else { 1 };
+    Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, decode_rows, &shape, decode, prefill)
+        .device_bytes() + glmf_selector_bytes(decode_rows, cfg.vocab_size as u64))
+}
+
+/// GLM 5.3 Flash's DFlash2 drafter on the lead GPU as `serve-glmf` loads it for `concurrency`
+/// sequences; None, with a note, for a drafter this layout does not model (the allowance stands).
+fn glmf_draft_bytes(draft: &GlmfDraft, concurrency: u64, notes: &mut Vec<String>)
+    -> Option<crate::families::glm5::draft_representation::GlmDraftDeviceBytes> {
+    use crate::families::glm5::draft_representation::{glm_dflash_geometry, GlmDraftCapacity, GlmDraftRepresentation,
+        GlmDraftRuntimeLayout, GLM_DRAFT_SCRATCH_SMS, GLM_DRAFT_TAP_ROWS};
+    let config = super::checkpoint::read_json(&draft.snapshot.join("config.json"));
+    let Some((geometry, block)) = config.as_ref().ok().and_then(glm_dflash_geometry) else {
+        notes.push(format!("drafter {}: no DFlash2 config; the family's drafter allowance stands",
+            draft.snapshot.display()));
+        return None;
+    };
+    let slots = draft.context_slots.unwrap_or(concurrency).max(1);
+    let representation = if draft.fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only };
+    let bytes = GlmDraftCapacity::new(slots as usize, draft.sequences.clamp(1, slots) as usize, block as usize)
+        .and_then(|capacity| GlmDraftRuntimeLayout::new(geometry, representation, capacity, GLM_DRAFT_TAP_ROWS as usize))
+        .and_then(|layout| layout.device_bytes(&geometry, block, draft.linear, GLM_DRAFT_SCRATCH_SMS));
+    match bytes {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            notes.push(format!("drafter {}: {error}; the family's drafter allowance stands", draft.snapshot.display()));
+            None
+        }
+    }
 }
 
 fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {

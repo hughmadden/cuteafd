@@ -46,9 +46,16 @@ if(CUTEAFD_ENABLE_QWEN4_AOT)
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
+# GLM 5.3 Flash's own extent: its index top-k at CUTEAFD_DSV4_MAX_CONTEXT, and also at this one
+# when it is longer (new stems; every other program is the CUTEAFD_DSV4_MAX_CONTEXT export).
+set(glmf_max_context "${CUTEAFD_GLMF_MAX_CONTEXT}")
+if(glmf_max_context STREQUAL "")
+  set(glmf_max_context "${CUTEAFD_DSV4_MAX_CONTEXT}")
+endif()
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
-  --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}")
+  --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
+  --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --glmf-max-context "${glmf_max_context}")
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one

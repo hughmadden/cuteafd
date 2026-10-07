@@ -3,7 +3,7 @@
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use super::{bf16s, similarity, GoldenArgs, Opened};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use crate::families::glm5::dflash::{ContextRow, DraftSeq, RING, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -153,6 +153,94 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             (--fp8-head) has no BF16 copy to replay against")?.buffer.ptr, start)
 }
 
+/// The settings [`draft_modes`] compares: both heads under every linear mode an FP8 drafter's
+/// scratch admits (`admitted`, its load's mode, and the modes before it), the head alone for a
+/// BF16 drafter. The first is the default (exact head, W8A16).
+fn draft_mode_settings(fp8: bool, admitted: crate::shared::fp8_linear::Fp8Rows)
+    -> Vec<(crate::families::glm5::DraftHead, crate::shared::fp8_linear::Fp8Rows)> {
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+    [Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].into_iter()
+        .filter(|&linear| linear == Fp8Rows::W8a16 || (fp8 && linear <= admitted))
+        .flat_map(|linear| [DraftHead::Exact, DraftHead::Tensor].map(|head| (head, linear)))
+        .collect()
+}
+
+/// Draft-kernel A/B (`--draft-modes N`): after the --prefill tokens (default 1024), the golden
+/// tokens go through the target in teacher-forced steps that tap the drafter's ring slot 0, and
+/// before each window of N anchors (positions p..p + N) the window drafts in one step of N
+/// sequences (8N rows; each anchor at its own position on the one ring) under every --draft-head
+/// and --draft-linear setting the drafter admits, and each anchor alone (8 rows, the same bits
+/// under every setting). A window's context ends at p + N - 2 and an anchor at q reads only
+/// positions before q; windows stop at the ring's length, so no entry an anchor reads has been
+/// overwritten. Prints, per setting, the drafts kept as a prefix of the text, the share of drafts
+/// identical to the first setting's and to the anchors' own, and the median step time.
+pub(super) fn draft_modes(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequences: usize) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-modes needs --draft")?;
+    ensure!((1..=drafter.max_batch_sequences()).contains(&sequences),
+        "--draft-modes takes 1 to {} sequences (--draft-sequences)", drafter.max_batch_sequences());
+    let tokens = tokens(args)?;
+    let drafts = drafter.drafts();
+    let prefill = args.prefill.unwrap_or(1024);
+    // The last window's context ends at the ring's last position; its drafts score `drafts` tokens.
+    let end = (RING + 1).min(tokens.len().saturating_sub(drafts));
+    ensure!(prefill >= 1 && prefill + sequences <= end, "--draft-modes needs --prefill + {sequences} <= {end} \
+        (the ring holds {RING} positions; tokens.bin has {} tokens)", tokens.len());
+    let fp8 = drafter.replay().resident_modes().iter().any(|mode| mode.name == "FP8");
+    let settings = draft_mode_settings(fp8, args.engine.draft_linear);
+    let mut placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
+    prefill_with_taps(engine, &mut placement, &tokens[..prefill], 0)?;
+    let kept = |draft: &[u32], position: usize| draft.iter().zip(&tokens[position + 1..]).take_while(|(d, t)| d == t).count();
+    // Per setting: drafts kept, identical to the first setting's, identical to the anchors' own; step seconds.
+    let mut totals = vec![(0usize, 0usize, 0usize, Vec::new()); settings.len()];
+    let (mut alone_kept, mut anchors, mut done, mut p) = (0usize, 0usize, prefill, prefill);
+    while p + sequences <= end {
+        while done + 1 < p + sequences {
+            let rows = (p + sequences - 1 - done).min(engine.decode_rows);
+            engine.verify(&mut [(&mut placement, rows)], &tokens[done..done + rows], None)?
+                .context("--draft-modes needs every layer")?;
+            drafter.update(&(0..rows).map(|r| ContextRow { tap_row: r, slot: 0, position: done + r }).collect::<Vec<_>>())?;
+            done += rows;
+        }
+        let seqs: Vec<DraftSeq> = (p..p + sequences)
+            .map(|q| DraftSeq { slot: 0, anchor: tokens[q], position: q, valid_from: 0 }).collect();
+        drafter.set_draft_head(settings[0].0);
+        drafter.set_draft_linear(settings[0].1)?;
+        let alone = seqs.iter().map(|seq| Ok(drafter.draft_device(std::slice::from_ref(seq), &engine.embedding,
+            engine.draft_head())?.remove(0).tokens)).collect::<Result<Vec<_>>>()?;
+        alone_kept += alone.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+        let mut first: Option<Vec<Vec<u32>>> = None;
+        for (&(head, linear), total) in settings.iter().zip(&mut totals) {
+            drafter.set_draft_head(head);
+            drafter.set_draft_linear(linear)?;
+            let timer = Instant::now();
+            let wide: Vec<Vec<u32>> = drafter.draft_device(&seqs, &engine.embedding, engine.draft_head())?
+                .into_iter().map(|d| d.tokens).collect();
+            total.3.push(timer.elapsed().as_secs_f64());
+            total.0 += wide.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+            total.1 += wide.iter().zip(first.get_or_insert_with(|| wide.clone()).iter()).filter(|(a, b)| a == b).count();
+            total.2 += wide.iter().zip(&alone).filter(|(a, b)| a == b).count();
+        }
+        anchors += sequences;
+        p += sequences;
+    }
+    drafter.set_draft_head(args.engine.draft_head);
+    drafter.set_draft_linear(args.engine.draft_linear)?;
+    let n = anchors.max(1) as f64;
+    println!("draft modes ({} drafter, {}): {anchors} anchors from {prefill} in steps of {sequences} sequences \
+        ({} rows); drafts kept as a prefix of the text, of {drafts}:", drafter.name(), if fp8 { "FP8" } else { "BF16" },
+        sequences * drafter.block());
+    println!("  each anchor alone ({} rows): kept {:.3}", drafter.block(), alone_kept as f64 / n);
+    for (&(head, linear), (kept, same, same_alone, times)) in settings.iter().zip(&mut totals) {
+        times.sort_by(f64::total_cmp);
+        println!("  head {head:?}, linear {linear:?}: kept {:.3}, identical to the first setting {:.2}%, to the \
+            anchors' own {:.2}%, step median {:.3} ms (p10 {:.3}, p90 {:.3})", *kept as f64 / n,
+            100.0 * *same as f64 / n, 100.0 * *same_alone as f64 / n, 1e3 * times[times.len() / 2],
+            1e3 * times[times.len() / 10], 1e3 * times[times.len() * 9 / 10]);
+    }
+    Ok(())
+}
+
 /// Prefills the golden prompt's first --prefill tokens, then decodes one row
 /// per step (teacher-forced on tokens.bin, or greedy with --generate),
 /// drafting with DFlash2 before every step; reports the accepted prefix per
@@ -218,29 +306,41 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
     Ok(())
 }
 
-/// Bytes that differ and the largest FP32 difference over the recurrent part
-/// (`fp32_bytes`) of two slot-state copies.
-fn state_delta(a: &[u8], b: &[u8], fp32_bytes: usize) -> (usize, f32) {
+/// Element `i` of a recurrent state of `element`-byte values (FP32 or BF16).
+fn state_value(state: &[u8], i: usize, element: usize) -> f32 {
+    if element == 4 {
+        f32::from_le_bytes(state[i * 4..i * 4 + 4].try_into().unwrap())
+    } else {
+        f32::from_bits(u32::from(u16::from_le_bytes(state[i * 2..i * 2 + 2].try_into().unwrap())) << 16)
+    }
+}
+
+/// Bytes that differ and the largest difference over the recurrent part (`recurrent_bytes` of
+/// `element`-byte values) of two slot-state copies.
+fn state_delta(a: &[u8], b: &[u8], recurrent_bytes: usize, element: usize) -> (usize, f32) {
     let differ = a.iter().zip(b).filter(|(x, y)| x != y).count();
-    let word = |s: &[u8], i: usize| f32::from_le_bytes(s[i * 4..i * 4 + 4].try_into().unwrap());
-    let worst = (0..fp32_bytes / 4).map(|i| (word(a, i) - word(b, i)).abs()).fold(0f32, f32::max);
+    let worst = (0..recurrent_bytes / element)
+        .map(|i| (state_value(a, i, element) - state_value(b, i, element)).abs()).fold(0f32, f32::max);
     (differ, worst)
 }
 
-fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>) -> Result<usize> {
-    ensure!(rows > 0 && rows <= super::engine::DECODE_ROWS && rows < tokens,
-        "--replay-check needs 1..={} rows and at least one prefill token", super::engine::DECODE_ROWS);
+/// The prefill length of a check of `rows`-row steps over `tokens` tokens, on an engine taking
+/// steps of up to `cap` rows (`--decode-rows`).
+fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>, cap: usize) -> Result<usize> {
+    ensure!(rows > 0 && rows <= cap && rows < tokens,
+        "--replay-check needs 1..={cap} rows (--decode-rows {cap}) and at least one prefill token");
     let prefill = prefill.unwrap_or(64).min(tokens - rows);
     ensure!(prefill > 0, "--replay-check needs at least one prefill token");
     Ok(prefill)
 }
 
-fn finite_state(state: &[u8], fp32_bytes: usize) -> Result<()> {
-    ensure!(fp32_bytes <= state.len() && fp32_bytes % 4 == 0, "invalid recurrent state layout");
-    for (i, word) in state[..fp32_bytes].chunks_exact(4).enumerate() {
-        ensure!(f32::from_le_bytes(word.try_into().unwrap()).is_finite(), "non-finite KDA recurrent word {i}");
+fn finite_state(state: &[u8], recurrent_bytes: usize, element: usize) -> Result<()> {
+    ensure!(recurrent_bytes <= state.len() && matches!(element, 2 | 4) && recurrent_bytes % element == 0,
+        "invalid recurrent state layout");
+    for i in 0..recurrent_bytes / element {
+        ensure!(state_value(state, i, element).is_finite(), "non-finite KDA recurrent word {i}");
     }
-    for (i, word) in state[fp32_bytes..].chunks_exact(2).enumerate() {
+    for (i, word) in state[recurrent_bytes..].chunks_exact(2).enumerate() {
         ensure!(f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16).is_finite(),
             "non-finite KDA convolution word {i}");
     }
@@ -262,7 +362,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     let sequence = tokens(args)?;
     let rows = args.step_rows;
     ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut serial = allocator.admit(prefill + rows)?;
     let mut wide = allocator.admit(prefill + rows)?;
@@ -292,13 +392,15 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     let embed = &sequence[prefill..prefill + rows];
-    let family = super::prefix::GlmfPrefix::new(engine, |_| 0)?;
+    let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
     let kda_layers = engine.weights.layers.iter()
         .filter(|l| l.attention == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda).count();
-    let fp32_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * 4;
+    // The recurrent part of a slot's state (FP32 or BF16, `--kda-state`), then its conv windows.
+    let element = engine.kda_state.bytes();
+    let recurrent_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * element;
     let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
     let fresh = || -> Result<GlmfPlacement> {
         let mut placement = allocator.borrow_mut().admit(prefill + rows + 1)?;
@@ -317,7 +419,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         let mut spec = fresh()?;
         let start = spec.len;
         let initial = engine.slot_state(spec.slot)?;
-        finite_state(&initial, fp32_bytes)?;
+        finite_state(&initial, recurrent_bytes, element)?;
         let logits = engine.verify_spec(&mut [(&mut spec, rows)], embed)?.context("replay check needs every layer")?;
         finite_logits(&logits)?;
         ensure!(engine.slot_state(spec.slot)? == initial, "{rows}-row speculative verify changed uncommitted KDA state");
@@ -325,8 +427,8 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         spec.len = start + keep;
         spec.kda_len = spec.len;
         let retained = engine.slot_state(spec.slot)?;
-        finite_state(&retained, fp32_bytes)?;
-        let (differ, worst) = state_delta(&engine.slot_state(serial.slot)?, &retained, fp32_bytes);
+        finite_state(&retained, recurrent_bytes, element)?;
+        let (differ, worst) = state_delta(&engine.slot_state(serial.slot)?, &retained, recurrent_bytes, element);
         let logit = (0..serial_logits.len()).map(|j|
             max_logit(&logits[j * logits.len() / rows..][..logits.len() / rows], &serial_logits[j])).fold(0f32, f32::max);
         let serial_flat: Vec<f32> = serial_logits.iter().flatten().copied().collect();
@@ -334,7 +436,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         let vocab = engine.cfg.vocab_size;
         let kl = super::mean_kl(&logits[..keep * vocab], &serial_flat, 0, vocab);
         println!("keep {keep}/{rows}: speculative verify + commit vs {keep} serial steps: {differ} state bytes differ \
-            (max FP32 |delta| {worst:.3e}); kept-row logits max |delta| {logit:.3e}, mean KL(serial || verify) \
+            (max |delta| {worst:.3e}); kept-row logits max |delta| {logit:.3e}, mean KL(serial || verify) \
             {kl:.6} nat (geometry diagnostic)");
         // Keep the execution geometry fixed. A later rejected token may change
         // neither an earlier logit nor the committed recurrent/paged state.
@@ -350,12 +452,12 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         alternate.len = start + keep;
         alternate.kda_len = alternate.len;
         let alternate_state = engine.slot_state(alternate.slot)?;
-        finite_state(&alternate_state, fp32_bytes)?;
-        let (differ, worst) = state_delta(&retained, &alternate_state, fp32_bytes);
+        finite_state(&alternate_state, recurrent_bytes, element)?;
+        let (differ, worst) = state_delta(&retained, &alternate_state, recurrent_bytes, element);
         ensure!(exact_logits(&logits[..keep * vocab], &alternate_logits[..keep * vocab]),
             "keep {keep}/{rows}: rejected suffix changed kept-row logits (same geometry)");
         ensure!(differ == 0, "keep {keep}/{rows}: rejected suffix changed {differ} committed KDA state bytes \
-            (max FP32 |delta| {worst:.3e}, first byte {:?})", retained.iter().zip(&alternate_state).position(|(a, b)| a != b));
+            (max |delta| {worst:.3e}, first byte {:?})", retained.iter().zip(&alternate_state).position(|(a, b)| a != b));
         ensure!(super::prefix::paged_rows(&family, &spec, spec.len)?
             == super::prefix::paged_rows(&family, &alternate, alternate.len)?,
             "keep {keep}/{rows}: rejected suffix changed committed MLA cache rows");
@@ -365,10 +467,10 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
                 .context("replay check needs every layer")?;
             finite_logits(&plain_logits)?;
             let plain_state = engine.slot_state(plain.slot)?;
-            finite_state(&plain_state, fp32_bytes)?;
-            let (differ, worst) = state_delta(&plain_state, &retained, fp32_bytes);
+            finite_state(&plain_state, recurrent_bytes, element)?;
+            let (differ, worst) = state_delta(&plain_state, &retained, recurrent_bytes, element);
             println!("keep {keep}/{rows}: speculative verify + commit vs a plain {rows}-row verify: {differ} state bytes \
-                differ (max FP32 |delta| {worst:.3e})");
+                differ (max |delta| {worst:.3e})");
             ensure!(differ == 0 && exact_logits(&plain_logits, &logits),
                 "full {rows}-row replay commit differs from plain verify (same geometry)");
             allocator.borrow_mut().release(plain);
@@ -379,8 +481,8 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         finite_logits(&a)?;
         finite_logits(&b)?;
         let (a_state, b_state) = (engine.slot_state(spec.slot)?, engine.slot_state(alternate.slot)?);
-        finite_state(&a_state, fp32_bytes)?;
-        finite_state(&b_state, fp32_bytes)?;
+        finite_state(&a_state, recurrent_bytes, element)?;
+        finite_state(&b_state, recurrent_bytes, element)?;
         ensure!(exact_logits(&a, &b) && a_state == b_state
             && super::prefix::paged_rows(&family, &spec, spec.len)?
                 == super::prefix::paged_rows(&family, &alternate, alternate.len)?,
@@ -427,27 +529,93 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
 mod tests {
     #[test]
     fn replay_check_rejects_invalid_bounds_before_subtracting() {
-        assert!(super::replay_bounds(10, 11, None).is_err());
-        assert!(super::replay_bounds(0, 0, None).is_err());
-        assert!(super::replay_bounds(10, 0, None).is_err());
-        assert!(super::replay_bounds(10, 10, None).is_err());
-        assert!(super::replay_bounds(100, super::super::engine::DECODE_ROWS + 1, None).is_err());
-        assert!(super::replay_bounds(10, 4, Some(0)).is_err());
-        assert_eq!(super::replay_bounds(10, 4, Some(20)).unwrap(), 6);
+        use super::super::engine::{DECODE_ROWS, WIDE_DECODE_ROWS};
+        assert!(super::replay_bounds(10, 11, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(0, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 10, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(100, DECODE_ROWS + 1, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 4, Some(0), DECODE_ROWS).is_err());
+        assert_eq!(super::replay_bounds(10, 4, Some(20), DECODE_ROWS).unwrap(), 6);
+        // --decode-rows 128: a 128-row window (the wide programs) after the default 64-token prefill.
+        assert_eq!(super::replay_bounds(3000, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
+        assert!(super::replay_bounds(3000, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
     }
 
     #[test]
     fn replay_check_does_not_accept_non_finite_state_or_logits() {
-        assert!(super::finite_state(&f32::NAN.to_le_bytes(), 4).is_err());
-        assert!(super::finite_state(&0x7f80u16.to_le_bytes(), 0).is_err());
+        assert!(super::finite_state(&f32::NAN.to_le_bytes(), 4, 4).is_err());
+        assert!(super::finite_state(&0x7f80u16.to_le_bytes(), 0, 4).is_err());
         assert!(super::finite_logits(&[f32::INFINITY]).is_err());
-        assert!(super::finite_state(&1f32.to_le_bytes(), 4).is_ok());
+        assert!(super::finite_state(&1f32.to_le_bytes(), 4, 4).is_ok());
+        // A BF16 recurrent state: its words are BF16 too.
+        assert!(super::finite_state(&[0x7f80u16.to_le_bytes(), 0x3f80u16.to_le_bytes()].concat(), 2, 2).is_err());
+        assert!(super::finite_state(&[0x3f80u16.to_le_bytes(), 0x3f80u16.to_le_bytes()].concat(), 2, 2).is_ok());
+        let (a, b) = ([0x3f80u16.to_le_bytes(), 0u16.to_le_bytes()].concat(), [0x4000u16.to_le_bytes(), 0u16.to_le_bytes()].concat());
+        assert_eq!(super::state_delta(&a, &b, 2, 2), (2, 1.0));
         assert!(super::finite_logits(&[1.0, -2.0]).is_ok());
         assert!(!super::exact_logits(&[0.0], &[-0.0]));
     }
 }
 
 /// See `GoldenArgs::bench_verify`.
+/// glmf-golden --bucket-check N: every speculative verify step of 17..=N rows (one sequence)
+/// that a fine row bucket (`--decode-row-buckets`) pads runs padded (a graphed serving step, masked
+/// rows to its bucket) and unpadded (an eager step at its rows) from the same prefilled state; the
+/// real rows' logits, the committed KDA state and the sequence's paged rows must be the same bits.
+pub(super) fn bucket_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
+    ensure!(engine.row_buckets_available(), "--bucket-check pads one GPU's graphed decode steps (no head split, \
+        CUTEAFD_GLMF_GRAPHS unset)");
+    engine.set_row_buckets(true)?;
+    let sequence = tokens(args)?;
+    let max_rows = max_rows.min(engine.decode_rows);
+    let prefill = replay_bounds(sequence.len(), max_rows, args.prefill, engine.decode_rows)?;
+    let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
+    let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
+    let fresh = || -> Result<GlmfPlacement> {
+        let mut placement = allocator.borrow_mut().admit(prefill + max_rows + 1)?;
+        engine.prefill(&mut placement, &sequence[..prefill], None)?;
+        Ok(placement)
+    };
+    let (mut padded_steps, mut identical) = (0usize, 0usize);
+    for rows in 17..=max_rows {
+        let bucket = engine.serving_decode_rows(rows, true);
+        if bucket == rows {
+            continue;
+        }
+        padded_steps += 1;
+        let embed = &sequence[prefill..prefill + rows];
+        let mut arms = Vec::new();
+        for padded in [false, true] {
+            let mut placement = fresh()?;
+            let start = placement.len;
+            let logits = if padded {
+                engine.verify_device(&mut [(&mut placement, rows)], embed, true)?
+                    .context("--bucket-check needs every layer")?.to_host(engine.library)?
+            } else {
+                engine.verify_spec(&mut [(&mut placement, rows)], embed)?.context("--bucket-check needs every layer")?
+            };
+            finite_logits(&logits)?;
+            engine.commit(&[(placement.slot, 0, rows)])?;
+            placement.len = start + rows;
+            placement.kda_len = placement.len;
+            let state = engine.slot_state(placement.slot)?;
+            let paged = super::prefix::paged_rows(&family, &placement, placement.len)?;
+            arms.push((logits, state, paged));
+            allocator.borrow_mut().release(placement);
+        }
+        let (logits, state, paged) = (exact_logits(&arms[0].0, &arms[1].0), arms[0].1 == arms[1].1,
+            arms[0].2 == arms[1].2);
+        let verdict = |same: bool| if same { "identical" } else { "DIFFER" };
+        println!("{rows} rows padded to {bucket}: logits {}, committed KDA state {}, paged rows {}",
+            verdict(logits), verdict(state), verdict(paged));
+        identical += usize::from(logits && state && paged);
+    }
+    println!("bucket check: {identical}/{padded_steps} padded steps identical to their unpadded steps");
+    ensure!(identical == padded_steps, "padded decode steps differ from their unpadded steps");
+    Ok(())
+}
+
 pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
     let count = args.bench_sequences.max(1);
@@ -460,19 +628,18 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         Ok(placement)
     }).collect::<Result<Vec<_>>>()?;
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
-    println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
-    for rows in 1..=max_rows {
-        if count * rows > super::engine::DECODE_ROWS {
-            break;
-        }
-        let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
+    // One step of `shares[i]` rows for sequence i: (median, min) seconds of 7 and per-step phases.
+    let mut time_step = |shares: &[usize]| -> Result<(f64, f64, [f64; 3])> {
+        let tokens: Vec<u32> = shares.iter().enumerate()
+            .flat_map(|(i, &rows)| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
         let mut times = Vec::new();
         *engine.profile.borrow_mut() = [0.0; 3];
         for round in 0..9 {
             for (placement, &start) in placements.iter_mut().zip(&starts) {
                 placement.len = start;
             }
-            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|p| (p, rows)).collect();
+            let mut step: Vec<(&mut GlmfPlacement, usize)> =
+                placements.iter_mut().zip(shares).map(|(p, &rows)| (p, rows)).collect();
             let timer = Instant::now();
             engine.verify_spec(&mut step, &tokens)?;
             if round >= 2 {
@@ -484,9 +651,47 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         times.sort_by(f64::total_cmp);
         let phases = std::mem::take(&mut *engine.profile.borrow_mut());
         let n = times.len() as f64;
+        Ok((times[times.len() / 2], times[0], phases.map(|p| p / n)))
+    };
+    println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
+    for rows in 1..=max_rows {
+        if count * rows > engine.decode_rows {
+            break;
+        }
+        let (median, min, phases) = time_step(&vec![rows; count])?;
         println!("  {rows} rows/sequence ({} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, Spark exchanges \
-            {:.2} ms, head {:.2} ms", count * rows, 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
-            1e3 * phases[1] / n, 1e3 * phases[2] / n);
+            {:.2} ms, head {:.2} ms", count * rows, 1e3 * median, 1e3 * min, 1e3 * phases[0], 1e3 * phases[1],
+            1e3 * phases[2]);
+    }
+    // The verify budget's own step where an even share leaves rows over, as the `cost` policy
+    // schedules it (127 rows at 16 sequences on 170 SMs: 15 sequences of 8 rows and one of 7).
+    let (share, over) = (engine.verify_rows / count, engine.verify_rows % count);
+    if over > 0 && share > 0 && share < max_rows {
+        let shares: Vec<usize> = (0..count).map(|i| share + usize::from(i < over)).collect();
+        let (median, min, phases) = time_step(&shares)?;
+        println!("  verify budget, {} rows ({over} of {} rows/sequence, {} of {share}): {:.2} ms (min {:.2}); GPU until \
+            exchanges {:.2} ms, Spark exchanges {:.2} ms, head {:.2} ms", engine.verify_rows, share + 1, count - over,
+            1e3 * median, 1e3 * min, 1e3 * phases[0], 1e3 * phases[1], 1e3 * phases[2]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod draft_mode_tests {
+    use super::*;
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+
+    #[test]
+    fn draft_modes_compare_both_heads_under_every_admitted_linear_mode() {
+        let all = draft_mode_settings(true, Fp8Rows::W8a8);
+        assert_eq!(all, [(DraftHead::Exact, Fp8Rows::W8a16), (DraftHead::Tensor, Fp8Rows::W8a16),
+            (DraftHead::Exact, Fp8Rows::Wide), (DraftHead::Tensor, Fp8Rows::Wide),
+            (DraftHead::Exact, Fp8Rows::W8a8), (DraftHead::Tensor, Fp8Rows::W8a8)]);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::Wide).len(), 4);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::W8a16), [(DraftHead::Exact, Fp8Rows::W8a16),
+            (DraftHead::Tensor, Fp8Rows::W8a16)]);
+        // A BF16 drafter has no FP8 GEMMs: the head alone.
+        assert_eq!(draft_mode_settings(false, Fp8Rows::W8a8), draft_mode_settings(true, Fp8Rows::W8a16));
+    }
 }

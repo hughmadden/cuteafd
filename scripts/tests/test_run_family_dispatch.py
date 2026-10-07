@@ -103,10 +103,15 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
-                          extra_args: tuple[str, ...] = (), with_nest: bool = True,
-                          extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                          with_nest: bool = True, extra_env: dict[str, str] | None = None,
+                          extra_args: tuple[str, ...] = (), extra_snapshots: tuple[str, ...] = (),
+                          layout_plan: str | None = None, gpu_memory: tuple[int, int] | None = None,
+                          gpu_used_mib: int = 2) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
-    that print their argv) and return what it would launch."""
+    that print their argv) and return what it would launch. `extra_snapshots` are more models
+    in the cache (drafters, FP8 releases); `layout_plan` is what `cuteafd plan --layout` prints
+    for a GLM 5.3 Flash memory plan; `gpu_memory` (free, total MiB) and `gpu_used_mib` answer
+    nvidia-smi's memory queries while it still lists `physical_gpus`."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
@@ -116,6 +121,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
+    for extra in extra_snapshots:
+        _snapshot(hf, extra, {})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
@@ -131,17 +138,26 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      " ".join(map(str, container_pids)) + " ;; esac\n"
                                      if tool == "docker" and container_pids else '') +
                                     (f"case \"$*\" in inspect*) echo '[\"serve-qwen4\",\"--peers\",\"{previous_peers}\"]' ;; esac\n"
-                                     if tool == "docker" and previous_peers is not None else ''))
+                                     if tool == "docker" and previous_peers is not None else '') +
+                                    (f"case \"$*\" in *\" plan \"*\"--layout\"*) printf '%s\\n' '{layout_plan}' ;; esac\n"
+                                     if tool == "docker" and layout_plan is not None else ''))
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
-    (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
-                                         " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
-                                         '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
-                                         ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
-                                         ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
-                                         " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
-                                         ' ;; *) echo 0; echo 1 ;; esac\n')
+    allocations = " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations)
+    if gpu_memory is not None:
+        (bin_dir / "nvidia-smi").write_text(
+            f'#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo {gpu_memory[0]} ;; *memory.total*) echo {gpu_memory[1]}'
+            f" ;; *memory.used*) echo {gpu_used_mib}"
+            f" ;; *query-compute-apps*) printf '%s\\n' {allocations} ;; *) printf '%s\\n' "
+            + " ".join(map(str, physical_gpus)) + " ;; esac\n")
+    else:
+        (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
+                                             " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
+                                             '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
+                                             ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
+                                             ' ;; *query-compute-apps*) printf \'%s\\n\' ' + allocations +
+                                             ' ;; *) echo 0; echo 1 ;; esac\n')
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
@@ -327,6 +343,7 @@ def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     ("GLMF_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
     ("GLM5_FLASH_FP8_PREFILL", "kda-o,ffn", "GLM5_FLASH_KDA_FP8=row128"),
     ("GLM5_FLASH_FP8_HEAD", "maybe", "GLM5_FLASH_FP8_HEAD must be"),
+    ("GLM5_FLASH_INDEX_CACHE", "tails", "GLM5_FLASH_INDEX_CACHE must be"),
 ])
 def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
@@ -335,6 +352,204 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
     result = _family_launch_result(tmp_path, config, "test/glmf",
                                   f"GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
     assert result.returncode == 2 and message in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("", [], ["--prefill-lanes", "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"]),
+    ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
+     ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
+    ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-lanes"]),
+    ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
+])
+def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, launch
+    for option in absent:
+        assert option not in launch, launch
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("GLM5_FLASH_PREFILL_LANES", "0", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
+    ("GLM5_FLASH_PREFILL_LANES", "5", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
+    ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
+    ("GLM5_FLASH_GRAPH_BUDGET_MIB", "0", "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number"),
+])
+def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{key}={value}\n")
+    assert result.returncode == 2 and message in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
+                                           ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
+def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--prefix-marks" not in launch, launch
+    else:
+        assert f"--prefix-marks {expected}" in launch, launch
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("GLM5_FLASH_PREFIX_MARKS=pool\n", "auto"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", "64GiB"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=0\n", None),
+    ("GLM5_FLASH_PREFIX_MARKS=arena\n", None),
+    ("", None),
+])
+def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--host-cache-bytes" not in launch, launch
+    else:
+        assert launch.count("--host-cache-bytes") == 1 and f"--host-cache-bytes {expected}" in launch, launch
+
+
+def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
+    assert result.returncode == 2 and "GLM5_FLASH_PREFIX_MARKS must be" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_glmf_default_launch_passes_no_memory_profile_option(tmp_path):
+    """The memory profile's launcher keys are opt-in: without them the coordinator gets none of
+    their options and starts with today's index keys, FP32 KDA state, arena marks without the
+    host tier, two prefill lanes of 4,096 rows, 2 GiB headroom and unbounded decode graphs."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in ("--index-cache", "--kda-state", "--prefix-marks", "--host-cache-bytes", "--prefill-lanes",
+                   "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib", "--decode-rows",
+                   "--replay-records", "--decode-row-buckets"):
+        assert option not in launch, (option, launch)
+
+
+GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
+    """Packed admission prefill and the auto verify policy are the engine's defaults: a launch without
+    their keys passes none of their options."""
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in ("--prefill-batch", "--verify-policy", "--verify-chain-min-sequences", "--spec-tau"):
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("GLM5_FLASH_PREFILL_BATCH=off\n", ("--prefill-batch false",), ()),
+    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch true",), ()),
+    ("GLM5_FLASH_VERIFY_POLICY=auto\n", ("--verify-policy auto",), ("--verify-chain-min-sequences",)),
+    ("GLM5_FLASH_VERIFY_POLICY=cost\n", ("--verify-policy cost",), ()),
+    ("GLM5_FLASH_VERIFY_POLICY=chain\n", ("--verify-policy chain",), ("--spec-tau",)),
+    ("GLM5_FLASH_VERIFY_POLICY=chain\nGLM5_FLASH_SPEC_TAU=0.5\n", ("--verify-policy chain", "--spec-tau 0.5"), ()),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=12\n", ("--verify-chain-min-sequences 12",), ("--verify-policy",)),
+    ("GLM5_FLASH_SPEC_TAU=1\n", ("--spec-tau 1",), ("--verify-policy",)),
+    ("GLM5_FLASH_PREFILL_BATCH=off\nGLM5_FLASH_VERIFY_POLICY=cost\n", ("--prefill-batch false", "--verify-policy cost"), ()),
+])
+def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, absent):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, (option, launch)
+    for option in absent:
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
+    ("GLM5_FLASH_VERIFY_POLICY=greedy\n", "GLM5_FLASH_VERIFY_POLICY must be"),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=0\n", "GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES must be"),
+    ("GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES=nine\n", "GLM5_FLASH_VERIFY_CHAIN_MIN_SEQUENCES must be"),
+    ("GLM5_FLASH_SPEC_TAU=0\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=0.0\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=1.5\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=abc\n", "GLM5_FLASH_SPEC_TAU must be"),
+])
+def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,compact", [("", False), ("GLM5_FLASH_INDEX_CACHE=keys\n", False),
+                                         ("GLM5_FLASH_INDEX_CACHE=compact\n", True)])
+def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--index-cache compact" in launch) == compact, launch
+    assert "--index-cache keys" not in launch
+
+
+@pytest.mark.parametrize("keys,schedule", [("", None), ("GLM5_FLASH_EXL3_SCHEDULE=default\n", None),
+                                            ("GLM5_FLASH_EXL3_SCHEDULE=gb10\n", "gb10")])
+def test_glmf_exl3_schedule_reaches_only_the_spark_workers(tmp_path, keys, schedule):
+    """The Spark EXL3 decode schedule is a worker option: gb10 is forwarded to every Spark
+    rank as --exl3-schedule gb10, the default passes nothing, the coordinator never sees it."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert "--exl3-schedule" not in coordinator
+    if schedule is None:
+        assert "--exl3-schedule" not in worker, worker
+    else:
+        assert f"--exl3-schedule {schedule} " in worker, worker
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_EXL3_SCHEDULE=fast\n", "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10"),
+    ("GLM5_FLASH_EXL3_SCHEDULE=gb10\nSPARK_COUNT=0\n", "GLM5_FLASH_EXL3_SCHEDULE=gb10 is a Spark expert schedule"),
+])
+def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, message):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
@@ -380,6 +595,209 @@ def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys,
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
+                                             ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
+                                             ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
+def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, forwarded):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if forwarded is None:
+        assert "--kda-state" not in launch
+    else:
+        assert f"--kda-state {forwarded}" in launch and launch.count("--kda-state") == 1
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_STATE=bf16\n", "GLM5_FLASH_KDA_FP8=off"),
+    ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
+])
+def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,wide", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                       ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_decode_rows_are_forwarded_only_when_wide(tmp_path, keys, wide):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--decode-rows 128" in launch) == wide, launch
+    assert "--decode-rows 64" not in launch and launch.count("--decode-rows") == int(wide)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROWS=128\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=96\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+])
+def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,context", [("", "8192"), ("MAX_CONTEXT_TOKENS=131072\n", "131072"),
+                                          ("MAX_CONTEXT_TOKENS=1048576\n", "1048576")])
+def test_glmf_max_context_reaches_the_engine_up_to_1m(tmp_path, keys, context):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--max-context {context} " in launch and launch.count("--max-context") == 1, launch
+
+
+@pytest.mark.parametrize("value", ["1048577", "0", "2097152", "12345678901234567890", "1m"])
+def test_glmf_max_context_past_1m_fails_before_launch(tmp_path, value):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nMAX_CONTEXT_TOKENS={value}\n")
+    assert result.returncode == 2 and "MAX_CONTEXT_TOKENS must be 1 to 1048576" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,note", [
+    ("MAX_CONTEXT_TOKENS=1048576\nGLM5_FLASH_PREFIX_MARKS=pool\n", True),
+    ("MAX_CONTEXT_TOKENS=1048576\nHOST_CACHE_BYTES=auto\n", True),
+    ("MAX_CONTEXT_TOKENS=1048576\nGLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", False),
+    ("MAX_CONTEXT_TOKENS=131072\nGLM5_FLASH_PREFIX_MARKS=pool\n", False),
+])
+def test_glmf_1m_context_notes_an_automatic_host_tier(tmp_path, keys, note):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    assert ("note: HOST_CACHE_BYTES=auto sizes the RAM tier" in result.stderr) == note, result.stderr
+
+
+@pytest.mark.parametrize("keys,shared", [("", False), ("GLM5_FLASH_REPLAY_RECORDS=own\n", False),
+                                        ("GLM5_FLASH_REPLAY_RECORDS=shared\n", True)])
+def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shared):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--replay-records shared" in launch) == shared, launch
+    assert "--replay-records own" not in launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_REPLAY_RECORDS=shared\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_REPLAY_RECORDS=host\n", "GLM5_FLASH_REPLAY_RECORDS must be own or shared"),
+])
+def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,on", [("", False), ("GLM5_FLASH_DECODE_ROW_BUCKETS=off\n", False),
+                                    ("GLM5_FLASH_DECODE_ROW_BUCKETS=on\n", True)])
+def test_glmf_decode_row_buckets_are_forwarded_only_when_on(tmp_path, keys, on):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--decode-row-buckets" in launch) == on, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROW_BUCKETS=yes\n", "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off"),
+])
+def test_glmf_decode_row_buckets_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,tensor", [("", False), ("GLM5_FLASH_DRAFT_HEAD=exact\n", False),
+                                        ("GLM5_FLASH_DRAFT_HEAD=tensor\n", True)])
+def test_glmf_draft_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--draft-head tensor" in launch) == tensor, launch
+    assert ("--draft-head" in launch) == tensor, launch
+
+
+def test_glmf_draft_head_rejects_unknown_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_HEAD=fp8\n")
+    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_DRAFT_LINEAR=w8a16\n", None),
+                                           ("GLM5_FLASH_DRAFT_LINEAR=wide\n", "wide"),
+                                           ("GLM5_FLASH_DRAFT_LINEAR=w8a8\n", "w8a8")])
+def test_glmf_draft_linear_is_forwarded_only_past_w8a16(tmp_path, keys, forwarded):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if forwarded is None:
+        assert "--draft-linear" not in launch, launch
+    else:
+        assert f"--draft-linear {forwarded}" in launch and launch.count("--draft-linear") == 1, launch
+
+
+def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_LINEAR=w4a16\n")
+    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
+        result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,tensor", [("GLM5_FLASH_FP8_HEAD=off\n", False),
+                                        ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=exact\n", False),
+                                        ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=tensor\n", True),
+                                        ("GLM5_FLASH_TARGET_HEAD=exact\n", False)])
+def test_glmf_target_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--target-head tensor" in launch) == tensor, launch
+    assert ("--target-head" in launch) == tensor, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=fp8\n", "GLM5_FLASH_TARGET_HEAD must be exact or tensor"),
+    # The launcher's FP8 head default (auto) is on: the tensor target head needs the BF16 head.
+    ("GLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+    ("GLM5_FLASH_FP8_HEAD=on\nGLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+])
+def test_glmf_target_head_rejects_bad_values_and_the_fp8_head_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
+    root = tmp_path / "dumps"
+    root.mkdir()
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"-v {root}:{root} -e CUTEAFD_PROBE_DUMP_ROOT={root}" in launch
+    result = _family_launch_result(tmp_path / "unset", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n")
+    assert result.returncode == 0 and "CUTEAFD_PROBE_DUMP_ROOT" not in result.stderr
+    result = _family_launch_result(tmp_path / "missing", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nPROBE_DUMP_ROOT={tmp_path}/absent\n")
+    assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
 
 
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
@@ -1186,3 +1604,309 @@ def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off":
         assert "cuteafd plan" not in result.stderr
+
+
+# GLM5_FLASH_MEMORY: the memory profile switch. The base configuration of the measured 5090 profile
+# (checkpoint precision, 16 sequences, 131,072-token requests, the DFlash2 drafter), and the
+# profile's own keys as that configuration spelled them out before the switch existed.
+_GLMF_BASE = ("GLM5_FLASH_FP8_MODEL_ID=zai-org/GLM-5.3-Flash\nSPECULATOR=dflash2\n"
+              "SPECULATOR_MODEL_ID=incoai/GLM-5.3-Flash-DFlash2\nEXPERT_BACKEND=spark\nRTX_GPUS=1\nCOORDINATOR_GPU=0\n"
+              "MAX_CONTEXT_TOKENS=131072\nMAX_OUTPUT_TOKENS=8192\nCONCURRENCY=16\nPOOL_TOKENS=auto\n"
+              "PREFIX_CACHE_ENTRIES=20\nSERVED_MODEL_ID=glm-5.3-flash\nADDR=0.0.0.0:8400\nEXPERT_PORT=19495\n"
+              "SPARK_DEVICE_BUDGET_BYTES=107374182400\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_FP8_HEAD=off\n"
+              "GLM5_FLASH_FP8_PREFILL=off\n")
+_GLMF_PROFILE_KEYS = ("GLM5_FLASH_INDEX_CACHE=compact\nGLM5_FLASH_KDA_STATE=bf16\nGLM5_FLASH_PREFIX_MARKS=pool\n"
+                      "GLM5_FLASH_HEADROOM_GIB=1\nGLM5_FLASH_GRAPH_BUDGET_MIB=512\nEMBEDDING=host\n"
+                      "GLM5_FLASH_REPLAY_RECORDS=shared\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\nHOST_CACHE_BYTES=64GiB\n"
+                      "GLM5_FLASH_DECODE_ROWS=128\nGLM5_FLASH_EXL3_SCHEDULE=gb10\nRDMA_BOND_BALANCE=probe\n"
+                      "GLM5_FLASH_EXL3_WORKER_PATH=async\nGLM5_FLASH_DRAFT_HEAD=tensor\nGLM5_FLASH_DRAFT_LINEAR=w8a8\n"
+                      "GLM5_FLASH_TARGET_HEAD=tensor\n")
+_GLMF_MODELS = ("zai-org/GLM-5.3-Flash", "incoai/GLM-5.3-Flash-DFlash2")
+_HUB = "/root/.cache/huggingface/hub"
+# The measured profile's serve-glmf command line (1 RTX 5090 + 4 DGX Sparks, 131,072 tokens, with the
+# tensor-core target head), with this fixture's snapshots and its one Spark rank. VISION is the
+# launcher's GLM Flash default, auto (the measured launch passed off, the default then): a checkpoint
+# without a tower serves text as before, and one with a tower places it on a Spark.
+_GLMF_PROFILE_COMMAND = [
+    "--snapshot", f"{_HUB}/models--test--glmf/snapshots/abc", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+    "--peers", "10.0.0.1:19495", "--listen", "0.0.0.0:8400", "--max-sequences", "16", "--max-context", "131072",
+    "--max-output", "8192", "--embedding-placement", "host", "--vision", "auto", "--audio", "off",
+    "--prefix-cache-entries", "20", "--host-cache-bytes", "64GiB", "--fp8-decode", "--fp8-snapshot",
+    f"{_HUB}/models--zai-org--GLM-5.3-Flash/snapshots/abc", "--kda-fp8", "off", "--pool-tokens", "0",
+    "--headroom-gib", "1", "--graph-budget-mib", "512", "--index-cache", "compact", "--fp8-head", "false",
+    "--fp8-prefill", "none", "--prefix-marks", "pool", "--kda-state", "bf16", "--decode-rows", "128",
+    "--replay-records", "shared", "--decode-row-buckets", "--draft-head", "tensor", "--draft-linear", "w8a8",
+    "--target-head", "tensor", "--draft", f"{_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc",
+    "--model-id", "glm-5.3-flash"]
+
+
+def _glmf_launch(tmp_path: Path, keys: str, **options) -> subprocess.CompletedProcess[str]:
+    return _family_launch_result(tmp_path, _GLMF, "test/glmf", keys, extra_snapshots=_GLMF_MODELS, **options)
+
+
+def _glmf_lines(result: subprocess.CompletedProcess[str], root: Path | None = None) -> tuple[str, list[str], list[str]]:
+    """The coordinator's docker run line, the Spark workers' and the launcher's notes (with the
+    fixture's directory `root` written ROOT)."""
+    lines = result.stderr.replace(str(root), "ROOT").splitlines() if root else result.stderr.splitlines()
+    coordinator = next(line for line in lines if line.startswith("docker run -d --name cuteafd-coordinator")
+                       and " serve-glmf " in line)
+    workers = [line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line]
+    return coordinator, workers, [line for line in lines if line.startswith("note: GLM5_FLASH_MEMORY")]
+
+
+def _glmf_plan_json(pool: int, fits: bool = True) -> str:
+    return json.dumps({"fits": fits, "memory_layout": {"pool_tokens": pool, "devices": []}})
+
+
+@pytest.mark.parametrize("switch", ["GLM5_FLASH_MEMORY=compact\n", "GLM5_FLASH_PROFILE=rtx5090\n",
+                                    "GLM5_FLASH_PROFILE=rtx5090\nGLM5_FLASH_MEMORY=compact\n"])
+def test_glmf_compact_reproduces_the_measured_profile_command(tmp_path, switch):
+    """One switch on the base configuration launches what the profile's dozen keys did: the same
+    coordinator command (each serve-glmf option, in order), the bond probe, and the gb10 workers."""
+    spelled = _glmf_launch(tmp_path / "keys", _GLMF_BASE + _GLMF_PROFILE_KEYS)
+    switched = _glmf_launch(tmp_path / "switch", _GLMF_BASE + switch)
+    assert spelled.returncode == 0, spelled.stderr
+    assert switched.returncode == 0, switched.stderr
+    (coordinator, workers, notes) = _glmf_lines(switched, tmp_path / "switch")
+    (spelled_coordinator, spelled_workers, _) = _glmf_lines(spelled, tmp_path / "keys")
+    assert coordinator == spelled_coordinator
+    assert workers == spelled_workers and len(workers) == 1
+    serve = coordinator.split()
+    assert serve[serve.index("serve-glmf") + 1:] == _GLMF_PROFILE_COMMAND
+    assert "-e CUTEAFD_RDMA_BOND_BALANCE=probe" in coordinator
+    assert "--exl3-schedule gb10" in workers[0] and "CUTEAFD_EXL3_WORKER_PATH" not in workers[0]
+    # The base configuration already sets the three precision keys; the profile sets the other sixteen.
+    assert len([n for n in notes if " sets " in n]) == 16, notes
+    assert len([n for n in notes if " keeps " in n]) == 3, notes
+    assert "note: GLM5_FLASH_MEMORY=compact keeps GLM5_FLASH_KDA_FP8=off as configured (compact: off)" in notes
+
+
+def test_glmf_standard_is_the_default_and_launches_as_before(tmp_path):
+    """Unset and standard launch the configuration as it stands: no plan, no note, the same lines."""
+    unset = _glmf_launch(tmp_path / "unset", _GLMF_BASE, gpu_memory=(32148, 32607))
+    standard = _glmf_launch(tmp_path / "standard", _GLMF_BASE + "GLM5_FLASH_MEMORY=standard\n", gpu_memory=(32148, 32607))
+    assert unset.returncode == 0 and standard.returncode == 0, unset.stderr + standard.stderr
+    assert _glmf_lines(unset, tmp_path / "unset") == _glmf_lines(standard, tmp_path / "standard")
+    assert _glmf_lines(unset)[2] == []
+    assert " plan " not in unset.stderr + standard.stderr
+    coordinator = _glmf_lines(unset)[0]
+    for option in ("--index-cache", "--kda-state", "--prefix-marks", "--decode-rows", "--replay-records",
+                   "--draft-head", "--draft-linear", "CUTEAFD_RDMA_BOND_BALANCE"):
+        assert option not in coordinator, option
+
+
+def test_glmf_compact_fills_in_only_what_the_config_leaves_unset(tmp_path):
+    """Explicit keys win, under their current or pre-rename names; the launch notes every value the
+    profile sets and every one it keeps, and fills in the rest (here from engine-default precision)."""
+    keys = ("GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_MEMORY=compact\nGLM5_FLASH_DECODE_ROWS=64\n"
+            "GLMF_FP8_HEAD=on\nEMBEDDING=gpu\n")
+    result = _glmf_launch(tmp_path, keys)
+    assert result.returncode == 0, result.stderr
+    coordinator, workers, notes = _glmf_lines(result)
+    assert "note: GLM5_FLASH_MEMORY=compact keeps GLM5_FLASH_DECODE_ROWS=64 as configured (compact: 128)" in notes
+    assert ("note: GLM5_FLASH_MEMORY=compact keeps GLMF_FP8_HEAD=on as configured (compact: GLM5_FLASH_FP8_HEAD=off)"
+            in notes)
+    assert "note: GLM5_FLASH_MEMORY=compact keeps EMBEDDING=gpu as configured (compact: host)" in notes
+    # The tensor-core target head runs the BF16 head: with the FP8 head kept, compact leaves it out.
+    assert ("note: GLM5_FLASH_MEMORY=compact leaves GLM5_FLASH_TARGET_HEAD unset (compact: tensor): the tensor-core "
+            "target head runs the BF16 head, and the config keeps GLMF_FP8_HEAD=on") in notes
+    for setting in ("GLM5_FLASH_KDA_FP8=off", "GLM5_FLASH_FP8_PREFILL=off", "GLM5_FLASH_INDEX_CACHE=compact",
+                    "GLM5_FLASH_KDA_STATE=bf16", "GLM5_FLASH_PREFIX_MARKS=pool", "HOST_CACHE_BYTES=64GiB",
+                    "GLM5_FLASH_HEADROOM_GIB=1", "GLM5_FLASH_GRAPH_BUDGET_MIB=512", "GLM5_FLASH_DECODE_ROW_BUCKETS=on",
+                    "GLM5_FLASH_REPLAY_RECORDS=shared", "GLM5_FLASH_EXL3_SCHEDULE=gb10",
+                    "GLM5_FLASH_EXL3_WORKER_PATH=async", "RDMA_BOND_BALANCE=probe", "GLM5_FLASH_DRAFT_HEAD=tensor",
+                    "GLM5_FLASH_DRAFT_LINEAR=w8a8"):
+        assert f"note: GLM5_FLASH_MEMORY=compact sets {setting}" in notes, setting
+    assert len(notes) == 19, notes
+    assert "--decode-rows" not in coordinator and "--fp8-head true" in coordinator and "--target-head" not in coordinator
+    assert "--embedding-placement gpu" in coordinator and "--kda-fp8 off" in coordinator
+    assert "--index-cache compact" in coordinator and "--kda-state bf16" in coordinator
+    # The command line's --embedding-placement is explicit too.
+    result = _glmf_launch(tmp_path / "flag", "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_PROFILE=rtx5090\n",
+                          extra_args=("--embedding-placement", "gpu"))
+    assert result.returncode == 0, result.stderr
+    assert "--embedding-placement gpu" in _glmf_lines(result)[0]
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_MEMORY=small\n", "GLM5_FLASH_MEMORY must be auto, compact or standard"),
+    ("GLM5_FLASH_PROFILE=rtx4090\n", "GLM5_FLASH_PROFILE must be rtx5090"),
+    ("GLM5_FLASH_PROFILE=rtx5090\nGLM5_FLASH_MEMORY=standard\n", "GLM5_FLASH_PROFILE=rtx5090 is GLM5_FLASH_MEMORY=compact"),
+    ("GLM5_FLASH_PROFILE=rtx5090\nGLM5_FLASH_MEMORY=auto\n", "GLM5_FLASH_PROFILE=rtx5090 is GLM5_FLASH_MEMORY=compact"),
+    ("GLM5_FLASH_MEMORY=compact\nSPARK_COUNT=0\n", "GLM5_FLASH_MEMORY=compact runs the routed experts on Sparks"),
+    ("GLM5_FLASH_MEMORY=compact\nEXPERT_BACKEND=local\n", "GLM5_FLASH_MEMORY=compact runs the routed experts on Sparks"),
+    ("GLM5_FLASH_MEMORY=compact\nRTX_GPUS=2\n", "GLM5_FLASH_MEMORY=compact serves from one GPU"),
+    ("GLM5_FLASH_MEMORY=compact\nRTX_GPUS=1\nPOOL_TOKENS=65536\n", "GLM5_FLASH_REPLAY_RECORDS=shared needs the step"),
+])
+def test_glmf_memory_switch_rejects_what_it_cannot_serve_before_launch(tmp_path, keys, message):
+    result = _glmf_launch(tmp_path, "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("family_config", [{"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+                                            "first_k_dense_replace": 3}, SPLIT_CONFIGS["qwen4"]])
+@pytest.mark.parametrize("key", ["GLM5_FLASH_MEMORY=auto\n", "GLM5_FLASH_PROFILE=rtx5090\n"])
+def test_glmf_memory_switch_applies_only_to_glm_flash(tmp_path, family_config, key):
+    result = _family_launch_result(tmp_path, family_config, "test/model", key)
+    assert result.returncode == 2 and "apply to GLM 5.3 Flash checkpoints" in result.stderr, result.stderr
+
+
+def test_glmf_shared_replay_records_take_a_fixed_pool_under_a_gpu_budget(tmp_path):
+    keys = "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_REPLAY_RECORDS=shared\nPOOL_TOKENS=65536\n"
+    assert _glmf_launch(tmp_path / "fixed", keys).returncode == 2
+    result = _glmf_launch(tmp_path / "budget", keys + "COORDINATOR_GPU_BUDGET_GIB=30\n")
+    assert result.returncode == 0, result.stderr
+    assert "--replay-records shared" in _glmf_lines(result)[0]
+
+
+def _glmf_plans(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line for line in result.stderr.splitlines() if line.startswith("docker run --rm") and " plan " in line]
+
+
+@pytest.mark.parametrize("pool,choice", [(1_114_112, "standard"), (1_114_111, "compact"), (2_097_152, "standard"),
+                                         (159_488, "compact")])
+def test_glmf_auto_takes_compact_when_standard_cannot_hold_one_request_and_64k_per_other_sequence(
+        tmp_path, pool, choice):
+    """16 sequences of 131,072 tokens: auto needs 131,072 + 15 x 65,536 = 1,114,112 tokens from the
+    standard settings' plan, keeps standard when the pool holds them, and otherwise runs the launch
+    again as compact (the plan runs once)."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\n", physical_gpus=(0,),
+                          gpu_memory=(32148, 32607), layout_plan=_glmf_plan_json(pool))
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    why = (f"the standard settings admit {pool} KV tokens on GPU 0 ({32148 / 1024} GiB free) for 16 sequences; "
+           "one 131072-token request and 65,536 tokens for each other sequence need 1114112")
+    assert notes[0] == f"note: GLM5_FLASH_MEMORY=auto {'keeps standard' if choice == 'standard' else 'takes compact'}: {why}"
+    assert len(_glmf_plans(result)) == 1
+    serve = coordinator.split()
+    if choice == "standard":
+        assert len(notes) == 1 and "--index-cache" not in coordinator
+    else:
+        assert notes[1] == "note: GLM5_FLASH_MEMORY=auto runs compact, as planned"
+        assert len([n for n in notes if " sets " in n]) == 16
+        assert serve[serve.index("serve-glmf") + 1:] == _GLMF_PROFILE_COMMAND
+
+
+def test_glmf_auto_plans_the_standard_launch_with_its_own_flags(tmp_path):
+    """The plan sizes what the standard launch would serve: the measured free memory of its GPU, its
+    Spark ranks, sequences and context, and every memory flag the launch passes, under the same names."""
+    keys = (_GLMF_BASE.replace("MAX_CONTEXT_TOKENS=131072", "MAX_CONTEXT_TOKENS=1048576")
+            .replace("CONCURRENCY=16", "CONCURRENCY=4") + "GLM5_FLASH_MEMORY=auto\nGLM5_FLASH_HEADROOM_GIB=1\n"
+            "GLM5_FLASH_DECODE_ROWS=128\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n"
+            "GLM5_FLASH_PREFILL_LANES=4\nDRAFT_CONTEXT_SLOTS=8\nGLM5_FLASH_DRAFT_LINEAR=wide\nEMBEDDING=host\n")
+    result = _glmf_launch(tmp_path, keys, physical_gpus=(0,), gpu_memory=(90000, 97887),
+                          layout_plan=_glmf_plan_json(1_441_792))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    argv = plan.split()
+    assert argv[argv.index("plan") + 1] == f"{_HUB}/models--test--glmf/snapshots/abc"
+    flags = " ".join(argv[argv.index("plan") + 2:])
+    for expected in ("--vision auto --audio off --json --layout --rtx 1", f"--rtx-gib {90000 / 1024}",
+                     f"--coordinator-budget-gib {90000 / 1024}", "--spark-ranks 1", "--spark-budget-gib 100.0",
+                     "--concurrency 4 --context-tokens 1048576", "--embedding-placement host", "--kda-fp8 off",
+                     "--pool-tokens 0", "--prefill-lanes 4", "--prefill-lane-rows 2048", "--headroom-gib 1",
+                     "--fp8-head false", "--decode-rows 128", "--decode-row-buckets", "--draft-linear wide",
+                     "--draft-context-slots 8", f"--draft {_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc"):
+        assert expected in flags, (expected, flags)
+    for absent in ("--index-cache", "--kda-state", "--prefix-marks", "--replay-records", "--graph-budget-mib"):
+        assert absent not in flags, absent
+    # 1,048,576 + 3 x 65,536 = 1,245,184 fit in 1,441,792.
+    assert _glmf_lines(result)[2] == [
+        f"note: GLM5_FLASH_MEMORY=auto keeps standard: the standard settings admit 1441792 KV tokens on GPU 0 "
+        f"({90000 / 1024} GiB free) for 4 sequences; one 1048576-token request and 65,536 tokens for each other "
+        "sequence need 1245184"]
+
+
+@pytest.mark.parametrize("restart,free_gib", [(False, 2000 / 1024), (True, 32148 / 1024)])
+def test_glmf_auto_restart_credits_only_its_own_coordinator(tmp_path, restart, free_gib):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nINSTANCE=own\n", physical_gpus=(0,),
+                          gpu_memory=(2000, 32607), restart=restart, container_pids=(123,),
+                          gpu_allocations=((123, 30148), (456, 1000)), layout_plan=_glmf_plan_json(2_097_152))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    assert f"--rtx-gib {free_gib} " in plan
+
+
+def test_glmf_auto_keeps_standard_where_compact_cannot_serve(tmp_path):
+    """Two GPUs split heads and local experts run on the GPU: compact applies to neither, so auto keeps
+    the standard launch without planning it."""
+    split = _glmf_launch(tmp_path / "split", "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_MEMORY=auto\nRTX_GPUS=2\n",
+                         gpu_memory=(32148, 32607), layout_plan=_glmf_plan_json(0))
+    assert split.returncode == 0, split.stderr
+    assert _glmf_lines(split)[2] == ["note: GLM5_FLASH_MEMORY=auto keeps standard: compact serves from one GPU, and this "
+                                     "launch splits heads over two"]
+    assert _glmf_plans(split) == [] and "--split-device" in _glmf_lines(split)[0]
+    local = _glmf_launch(tmp_path / "local", "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_MEMORY=auto\nRTX_GPUS=1\n"
+                         "SPARK_COUNT=0\n", gpu_memory=(97000, 98304), layout_plan=_glmf_plan_json(0))
+    assert local.returncode == 0, local.stderr
+    assert "compact runs the routed experts on Sparks" in _glmf_lines(local)[2][0]
+    assert _glmf_plans(local) == [] and "--local-experts" in _glmf_lines(local)[0]
+
+
+@pytest.mark.parametrize("plan,memory,message", [
+    ("not json", (32148, 32607), "GLM5_FLASH_MEMORY=auto could not lay out the standard settings"),
+    (_glmf_plan_json(0)[:-1], (32148, 32607), "GLM5_FLASH_MEMORY=auto could not lay out the standard settings"),
+    (_glmf_plan_json(2_097_152), None, "GLM5_FLASH_MEMORY=auto needs GPU 0's free memory from nvidia-smi (read: 0.0 GiB)"),
+])
+def test_glmf_auto_fails_before_launch_without_a_plan_or_a_free_memory_sample(tmp_path, plan, memory, message):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\n", physical_gpus=(0,), gpu_memory=memory,
+                          layout_plan=plan)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert "docker run -d" not in result.stderr and not any(line.startswith("ssh ") for line in result.stderr.splitlines())
+
+
+def test_glmf_auto_counts_a_plan_that_does_not_fit_as_no_pool(tmp_path):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\n", physical_gpus=(0,),
+                          gpu_memory=(32148, 32607), layout_plan=_glmf_plan_json(2_097_152, fits=False))
+    assert result.returncode == 0, result.stderr
+    assert _glmf_lines(result)[2][0].startswith("note: GLM5_FLASH_MEMORY=auto takes compact: the standard settings "
+                                                "admit 0 KV tokens")
+
+
+def test_glmf_auto_plans_a_wip_slot_with_its_own_planner_and_programs(tmp_path):
+    """A WIP slot's plan runs the slot's binary and PROGRAMS.json, copied out of the WIP container
+    apart from the staged layout, in the development image."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nCOORDINATOR_DOCKER_DEV=dev-image\n",
+                          physical_gpus=(0,), gpu_memory=(32148, 32607), layout_plan=_glmf_plan_json(2_097_152),
+                          extra_args=("--wip", "s1"))
+    lines = result.stderr.splitlines()
+    copies = [line for line in lines if line.startswith("docker cp cuteafd-coordinator-wip:/wip/slots/s1/coordinator/")]
+    assert [line.split()[2].rsplit("/", 1)[1] for line in copies[:2]] == ["cuteafd", "PROGRAMS.json"]
+    (plan,) = _glmf_plans(result)
+    assert ":/opt/cuteafd-plan:ro --entrypoint /opt/cuteafd-plan/cuteafd dev-image plan " in plan
+    assert "--workspace-manifest /opt/cuteafd-plan/PROGRAMS.json" in plan
+    assert "note: GLM5_FLASH_MEMORY=auto keeps standard" in result.stderr
+
+
+@pytest.mark.parametrize("kept", ["GLM5_FLASH_KDA_FP8=row128", "GLMF_KDA_FP8=channel", "GLM5_FLASH_KDA_FP8=auto"])
+def test_glmf_compact_leaves_the_bf16_state_to_bf16_kda_projections(tmp_path, kept):
+    """FP8 KDA projections the config keeps have no BF16-state programs: compact leaves the state FP32 (and
+    sets the rest, the tensor-core target head over its BF16 head included)."""
+    result = _glmf_launch(tmp_path, f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_MEMORY=compact\n{kept}\n")
+    assert result.returncode == 0, result.stderr
+    coordinator, _, notes = _glmf_lines(result)
+    assert (f"note: GLM5_FLASH_MEMORY=compact leaves GLM5_FLASH_KDA_STATE unset (compact: bf16): the BF16 state runs "
+            f"over the BF16 KDA projections, and the config keeps {kept}") in notes
+    assert "--kda-state" not in coordinator and "--target-head tensor" in coordinator
+    assert f"--kda-fp8 {'row128' if kept.endswith('auto') else kept.split('=')[1]}" in coordinator
+    assert len([n for n in notes if " sets " in n]) == 17
+
+
+@pytest.mark.parametrize("allocations,used,free_mib", [
+    # The coordinator alone on the GPU: the device's used memory, 142 MiB more than nvidia-smi's per-process
+    # figure (the GPU read 32,149 MiB free idle, total less reserved).
+    (((123, 30626),), 30768, 1383 + 30768),
+    # Another process on the GPU: only what nvidia-smi attributes to this launch's coordinator.
+    (((123, 30626), (456, 100)), 30868, 1383 + 30626),
+])
+def test_glmf_auto_restart_credits_its_coordinator_with_the_device_used_memory_when_alone(
+        tmp_path, allocations, used, free_mib):
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nINSTANCE=own\n", physical_gpus=(0,),
+                          gpu_memory=(1383, 32607), gpu_used_mib=used, restart=True, container_pids=(123,),
+                          gpu_allocations=allocations, layout_plan=_glmf_plan_json(2_097_152))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    assert f"--rtx-gib {free_mib / 1024} " in plan
+    assert f"on GPU 0 ({free_mib / 1024} GiB free)" in _glmf_lines(result)[2][0]
+
