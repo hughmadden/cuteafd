@@ -755,6 +755,30 @@ Policy decisions:
   cause or an engine-error exemption. Coordinator adjudication retains
   qualification and fidelity-side upload readiness with this note; upload
   still requires TJ's license decision and explicit approval.
+- **v2.0.0 payload (TJ, 2026-10-07):**
+  - Multimodal: vision by default for MiMo V2.6 Flash/Pro, GLM 5.3 Flash and
+    Qwen 3.8 (once its tower passes the WP-9 gates), with the encoder on an
+    expert Spark (D1); V4.1 vision unchanged.
+  - GLM 5.3 Flash beast mode: startup graphs, real-row MoE dispatch,
+    precreated workspaces, Hugh's Wave A, then his Waves B/C (1.6M-token
+    pool, 1M extent, C16 speed) as they land.
+  - Fixes: the MiMo V2.6 fused-QKV scale grid (cuteafd#3), Qwen
+    free-memory pools (C16 admitted 7 -> 16), and everything else merged
+    into work/p0 since v1.
+  - Quality on the dashboard: Quick (card), Standard and Full fidelity tiers
+    against the public dataset, with golden NLL for every family.
+  - Golden measurements: every served family qualified on the public
+    dataset, with MiMo Flash re-qualified and MiMo Pro added after the QKV fix.
+  - A full set of card updates in three columns: **5090** | **1× RTX** |
+    **2× RTX**. 1× RTX uses the fewest Sparks the model fits on (usually 4);
+    2× RTX uses 4 or 6, whichever divides it sensibly; any column whose GPUs
+    hold the whole model is a 0-Spark card (likely Qwen and GLM Flash on
+    some quants; `cuteafd plan --layout` decides). Supplementary cards where
+    useful, e.g. GLM Flash on 2× RTX with 0 Sparks.
+  - 5090 support, fully tested for the models Hugh runs: PLAT-1 (one SM120
+    image), PLAT-2 (the 32 GB plan) and PLAT-3 (GeForce defaults), with 5090
+    cards produced by Hugh's agent at release-candidate time
+    (hughmadden/cuteafd-collab item T-3).
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.
