@@ -35,6 +35,35 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
 
 
+def validate_media_input(config, entry):
+    relative = Path(entry['path'])
+    assert not relative.is_absolute() and relative.parts and all(part not in ('.', '..') for part in relative.parts), 'Unsafe media input path'
+    path = config / relative
+    assert path.resolve().is_relative_to(config.resolve()) and not path.is_symlink(), 'Unsafe media input path'
+    assert path.is_file() and path.stat().st_size == entry['bytes'] and digest(path) == entry['sha256'], 'Media input size/checksum differs'
+    if path.suffix == '.png':
+        import zlib
+        data = path.read_bytes()
+        assert data[:8] == b'\x89PNG\r\n\x1a\n', 'Invalid PNG signature'
+        offset, first = 8, True
+        while offset < len(data):
+            assert len(data) - offset >= 12, 'Truncated PNG chunk'
+            size = int.from_bytes(data[offset:offset + 4], 'big')
+            kind = data[offset + 4:offset + 8]
+            end = offset + 12 + size
+            assert end <= len(data), 'Truncated PNG chunk'
+            assert zlib.crc32(data[offset + 4:end - 4]) == int.from_bytes(data[end - 4:end], 'big'), 'PNG chunk checksum differs'
+            assert not first or (kind == b'IHDR' and size == 13), 'Invalid PNG header'
+            assert kind not in (b'tEXt', b'iTXt', b'zTXt', b'eXIf'), 'PNG privacy metadata chunks are not allowed'
+            offset, first = end, False
+            if kind == b'IEND':
+                assert size == 0 and offset == len(data), 'Invalid PNG end/trailing data'
+                return path
+        raise AssertionError('PNG lacks IEND')
+    assert path.suffix in ('.bf16', '.json'), 'Unsupported declared media input format'
+    return path
+
+
 def omit_checkpoint_license(config, manifest):
     """Remove only the optional checkpoint notice from a fresh output config."""
     (config / 'CHECKPOINT_LICENSE').unlink(missing_ok=True)
@@ -55,6 +84,8 @@ for shape in ('decode', 'prefill'):
         assert digest(path) == report['source_report_sha256'][f'{i}-{shape}']
 for entry in manifest['files']:
     assert digest(SOURCE / NAME / entry['path']) == entry['sha256']
+for entry in manifest.get('media_inputs', []):
+    validate_media_input(SOURCE / NAME, entry)
 assert not OUT.exists(), 'Preserve immutable output attempts'
 # Only the config is handed off; the coordinator owns the shared root index/card.
 OUT.mkdir()
@@ -155,7 +186,14 @@ def validate_output_file(path, config, manifest):
     elif path.name == 'README.md':
         validate_public_text(path.read_text(), scored_text=True)
     else:
-        validate_public_text(path.read_text())
+        media = [entry for entry in manifest.get('media_inputs', [])
+                 if path.resolve() == (config / entry['path']).resolve()]
+        if media:
+            assert len(media) == 1, 'Duplicate media input'
+            validate_media_input(config, media[0])
+            if path.suffix in ('.png', '.bf16'):
+                return
+        validate_public_text(path.read_text(encoding='utf-8'))
 
 
 for path in OUT.rglob('*'):

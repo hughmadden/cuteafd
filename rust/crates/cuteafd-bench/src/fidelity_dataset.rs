@@ -514,8 +514,12 @@ mod tests {
             return;
         }
         let reference = load(&root, &manifest).unwrap();
-        assert_eq!(reference.windows.len(), 64);
-        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
+        let panel: Value = serde_json::from_slice(&std::fs::read(root.join("windows.json")).unwrap()).unwrap();
+        let windows = panel["windows"].as_array().unwrap();
+        let scored_positions: usize = windows.iter().map(|w|
+            w["tokens"].as_array().unwrap().len() - w["score_from"].as_u64().unwrap() as usize).sum();
+        assert_eq!(reference.windows.len(), windows.len());
+        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), scored_positions);
         let validation = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_VALIDATION_DIR").unwrap());
         let arms = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_ARMS_DIR").unwrap());
         let expected: Value = serde_json::from_slice(&std::fs::read(validation.join("report.json")).unwrap()).unwrap();
