@@ -204,9 +204,12 @@ pub fn verdict(run: &Run) -> Verdict {
     if generated.groups("window").values().any(|w| w.top1 + 1e-12 < 0.80) {
         reasons.push("generated window top-1 below 80% floor".into());
     }
-    if run.dataset.as_ref().is_some_and(|d| crate::fidelity_dataset::ensure_valid_publication(
-        d["repository"].as_str().unwrap_or(""), d["revision"].as_str().unwrap_or(""), d["config"].as_str().unwrap_or("")).is_err()) {
-        reasons.push("reference under revision, scores not valid".into());
+    if let Some(dataset) = &run.dataset {
+        if let Err(error) = crate::fidelity_dataset::ensure_valid_publication(
+            dataset["repository"].as_str().unwrap_or(""), dataset["revision"].as_str().unwrap_or(""),
+            dataset["config"].as_str().unwrap_or("")) {
+            reasons.push(error.to_string());
+        }
     }
     generated.records.clear();
     Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons }
@@ -397,9 +400,27 @@ mod tests {
         assert!(!verdict(&bad).pass);
         bad = full.clone(); bad.score.missing = 1; assert!(!verdict(&bad).pass);
         bad = full; bad.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
-            "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
-        assert!(!verdict(&bad).pass);
+            "revision":crate::fidelity_dataset::RETIRED_FLASH_REVISION,"config":crate::fidelity_dataset::RETIRED_FLASH_CONFIG}));
+        let rejected = verdict(&bad);
+        assert!(!rejected.pass);
+        assert!(rejected.reasons.iter().any(|reason| reason.contains(crate::fidelity_dataset::FLASH_CONFIG)));
         assert!(compare(&bad, &bad, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn fixed_mimo_publication_uses_calibrated_bounds() {
+        let mut fixed = run(8, 512);
+        fixed.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
+            "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
+        fixed.floor_top1 = 0.93;
+        fixed.floor_kl = 0.04;
+        fixed.tripwire_expect = Some(crate::reference::TripwireExpect {
+            confident_top1_min:0.96,top3_min:0.97,confident_drop_margin:0.01,top3_drop_margin:0.005 });
+        let result = verdict(&fixed);
+        assert!(result.pass);
+        assert_eq!((result.top1_min,result.kl_max,result.confident_top1_min,result.top3_min),
+            (0.93,0.04,0.96,0.97));
+        assert!(compare(&fixed, &fixed, 0.005, 0.005, 100, 1).unwrap().pass);
     }
 
     #[test]

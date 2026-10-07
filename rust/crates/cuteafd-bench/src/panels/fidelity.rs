@@ -100,6 +100,9 @@ impl Panel for FidelityPanel {
         if self.full { decode + 380000.0 / rates.prefill_tok_s } else { decode }
     }
     fn unavailable(&self, info: &ServerInfo) -> Option<String> {
+        if info.checkpoint().is_empty() {
+            return Some("Discovering server configuration; run the basic card first".into());
+        }
         crate::fidelity_dataset::unavailable(&info.checkpoint())
             .or_else(|| if self.full { prefill_unavailable(info) } else { None })
     }
@@ -132,6 +135,9 @@ mod tests {
             value:Some("true".into()),default:Some("false".into()),source:"cli".into()});
         assert!(FULL.unavailable(&info).is_none());
         info.model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into();
-        assert!(STANDARD.unavailable(&info).unwrap().contains("under revision"));
+        assert!(STANDARD.unavailable(&info).is_none());
+        assert!(FULL.unavailable(&info).is_none());
+        info.configuration.settings.clear();
+        assert!(FULL.unavailable(&info).unwrap().contains("FULL_PREFILL_LOGITS=on"));
     }
 }

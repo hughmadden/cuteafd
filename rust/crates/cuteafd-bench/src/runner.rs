@@ -618,6 +618,21 @@ mod tests {
     fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
 
     #[test]
+    fn fidelity_catalog_defers_unknown_server_until_basic_card_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let bench = super::Bench::new(crate::store::Store::open(directory.path()).unwrap());
+        let catalog = bench.catalog();
+        for id in ["fidelity", "fidelity_full"] {
+            let panel = catalog["panels"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap();
+            let reason = panel["unavailable"].as_str().unwrap();
+            assert!(reason.contains("Discovering server configuration"));
+            assert!(!reason.contains("no verified"));
+        }
+        let baseline = catalog["panels"].as_array().unwrap().iter().find(|p| p["id"] == "baseline").unwrap();
+        assert!(baseline["unavailable"].is_null());
+    }
+
+    #[test]
     fn panel_eta_uses_the_estimate_before_a_pass_has_data() {
         // Three passes of 100 s, a fifth through the first: the estimate, and nothing measured yet.
         assert!(close(panel_eta_s(100.0, 1, 3, 0.2, 0.0), 80.0 + 200.0));

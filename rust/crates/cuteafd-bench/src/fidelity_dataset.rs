@@ -8,8 +8,11 @@ use std::path::{Component, Path, PathBuf};
 pub const REPOSITORY: &str = "wrldsuksgo2mars/cuteafd-fidelity";
 pub const REVISION: &str = "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0";
 pub const CONFIG: &str = "deepseek_v41-v2_20261005";
-pub const FLASH_REVISION: &str = "5db25a78dc2708df991df43b36636562e522a3b0";
-pub const FLASH_CONFIG: &str = "mimo_v2-v2_20261005_flash_mopd";
+pub const FLASH_REVISION: &str = "a8af5c3fecfa31bfbf4d0558362d9ab79451842f";
+pub const FLASH_CONFIG: &str = "mimo_v2-v2_20261007_flash_mopd_qkvfixed";
+pub const FLASH_MANIFEST_SHA256: &str = "ef94e9772f8fe227c6b8c12fe741906276920b2dae4518bc4aa02eed6f104758";
+pub const RETIRED_FLASH_REVISION: &str = "5db25a78dc2708df991df43b36636562e522a3b0";
+pub const RETIRED_FLASH_CONFIG: &str = "mimo_v2-v2_20261005_flash_mopd";
 pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
 pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
 pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
@@ -36,8 +39,8 @@ pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
 }
 
 pub fn ensure_valid_publication(repo: &str, commit: &str, config: &str) -> Result<()> {
-    ensure!(!(repo == REPOSITORY && commit == FLASH_REVISION && config == FLASH_CONFIG),
-        "MiMo Flash fidelity reference under revision, scores not valid (QKV scale bug); await replacement publication");
+    ensure!(!(repo == REPOSITORY && config == RETIRED_FLASH_CONFIG),
+        "superseded MiMo Flash fidelity reference at {commit}, scores not valid (QKV scale bug); use {FLASH_CONFIG} at {FLASH_REVISION}");
     Ok(())
 }
 
@@ -140,6 +143,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
     let bytes = fetch(agent, &root, repo, commit, path, Some(matches[0]["sha256"].as_str().context("manifest checksum")?))?;
     if repo == REPOSITORY {
         let expected = match (commit, config) {
+            (FLASH_REVISION, FLASH_CONFIG) => Some(FLASH_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
             _ => None,
@@ -250,7 +254,13 @@ mod tests {
     fn publications_and_retired_mimo_fail_closed() {
         assert_eq!(default_publication("wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"), Some((GLM_REVISION, GLM_CONFIG)));
         assert_eq!(default_publication("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), Some((V4PRO_REVISION, V4PRO_CONFIG)));
-        assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap().contains("under revision"));
+        assert_eq!(default_publication("XiaomiMiMo/MiMo-V2.6-Flash-MOPD"), Some((FLASH_REVISION, FLASH_CONFIG)));
+        assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_none());
+        assert!(ensure_valid_publication(REPOSITORY, FLASH_REVISION, FLASH_CONFIG).is_ok());
+        let retired = ensure_valid_publication(REPOSITORY, RETIRED_FLASH_REVISION, RETIRED_FLASH_CONFIG).unwrap_err();
+        assert!(retired.to_string().contains(FLASH_CONFIG));
+        // Later dataset commits can still contain the superseded config.
+        assert!(ensure_valid_publication(REPOSITORY, FLASH_REVISION, RETIRED_FLASH_CONFIG).is_err());
         assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Pro-RL").is_some());
         assert!(unavailable("zai-org/GLM-5.3-Flashlight").is_some());
     }
@@ -286,6 +296,12 @@ mod tests {
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
         assert_eq!(hash, expected_hash);
+        if commit == FLASH_REVISION && config == FLASH_CONFIG {
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.93, 0.04));
+            let tripwires = reference.expect.tripwires.as_ref().unwrap();
+            assert_eq!((tripwires.confident_top1_min, tripwires.top3_min), (0.96, 0.97));
+            assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+        }
         assert_eq!(identity, json!({"repository": REPOSITORY, "revision": commit, "config": config}));
         let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, &config).unwrap();
         assert_eq!(hash, again.1);
