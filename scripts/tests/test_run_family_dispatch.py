@@ -126,7 +126,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n' +
+                                    'case "$*" in *"docker logs"*) echo "worker ready"; '
+                                    'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
@@ -1048,6 +1049,32 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     else:
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])
+def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path, vision_kind, audio_kind):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
+              "vision_config": {"depth": 28}, "audio_token_id": 151669}
+    def placement(kind):
+        return {"kind": {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0} if kind == "rtx" else {})}, "replicas": []}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": placement(vision_kind), "audio_encoder": placement(audio_kind)}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={vision_kind}\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert f"--audio {audio_kind}:0" in launch
+    assert ("--audio-encoder-listen 0.0.0.0:19443" in worker) == (audio_kind == "spark")
+    assert ("--encoder-listen 0.0.0.0:19442" in worker) == (vision_kind == "spark")
+    assert ("--audio-peers 10.0.0.1:19443" in launch) == (audio_kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (vision_kind == "spark")
+    if audio_kind == "spark":
+        assert f"--audio-encoder-plan-hash {'ab' * 32}" in worker
+        assert f"--audio-encoder-plan-hash {'ab' * 32}" in launch
+        assert "--audio-encoder-revision abc" in launch
+        assert "--audio-encoder-backend mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32 in launch
+    else:
+        assert "--audio-encoder-backend" not in launch
 
 
 @pytest.mark.parametrize("mode,kind", [(None, "spark"), ("off", "off"), ("auto", "spark"),

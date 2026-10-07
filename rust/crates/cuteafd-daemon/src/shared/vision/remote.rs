@@ -562,8 +562,11 @@ impl EncoderServer {
         lut: Arc<[f32; 768]>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::start_shared(address, handshake, Arc::new(service), lut, timeout)
+    }
+    pub fn start_shared(address: SocketAddr, handshake: EncoderHandshake, service: Arc<EncoderService>,
+        lut: Arc<[f32; 768]>, timeout: Duration) -> Result<Self> {
         handshake.validate()?;
-        let service = Arc::new(service);
         let health = service.clone();
         Self::start_backend(
             address,
@@ -607,7 +610,10 @@ impl EncoderServer {
         service: EncoderService,
         timeout: Duration,
     ) -> Result<Self> {
-        let service = Arc::new(service);
+        Self::start_audio_shared(address, handshake, Arc::new(service), timeout)
+    }
+    pub fn start_audio_shared(address: SocketAddr, handshake: AudioHandshake, service: Arc<EncoderService>,
+        timeout: Duration) -> Result<Self> {
         let health = service.clone();
         Self::start_backend(
             address,

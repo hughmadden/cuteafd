@@ -87,6 +87,16 @@ pub(crate) struct ServeArgs {
     /// Snapshot revision used in the encoder handshake.
     #[arg(long, requires = "vision_peers")]
     pub encoder_revision: Option<String>,
+    /// Independently admitted audio tower endpoints.
+    #[arg(long)]
+    pub audio_peers: Option<String>,
+    #[arg(long, requires = "audio_peers")]
+    pub audio_encoder_plan_hash: Option<String>,
+    #[arg(long, requires = "audio_peers")]
+    pub audio_encoder_revision: Option<String>,
+    /// Exact SM121 backend/export identity reported by the reserved worker.
+    #[arg(long, requires = "audio_peers")]
+    pub audio_encoder_backend: Option<String>,
 }
 
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -118,16 +128,17 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let vision = args.vision;
     let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
+    let remote_audio = super::media::RemoteAudio::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote));
-    if let Some((preparer, audio_preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote, remote_audio));
+    if let Some((preparer, audio_preparer, health, audio_health)) = ready_rx.await.context("engine failed before it was ready")?? {
         if let Some(preparer) = preparer {
             profile = profile.with_loaded_vision(preparer);
             profile.vision_health = health.clone();
         }
         if let Some(preparer) = audio_preparer {
-            profile = profile.with_loaded_audio(preparer, health.context("audio owner health")?);
+            profile = profile.with_loaded_audio(preparer, audio_health.context("audio owner health")?);
         }
     }
     cuteafd_bench::context::phase("engine loaded");
@@ -195,11 +206,11 @@ const PRO_TP6_STEP_MS: [(usize, f64); 9] = [(1, 31.6), (2, 39.5), (4, 54.1), (8,
     (32, 197.8), (48, 258.3), (64, 304.4)];
 
 type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,
-    Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
+    Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
+    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -207,7 +218,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, audio, &prefix, media_cache_bytes, remote) {
+    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, audio, &prefix, media_cache_bytes, remote, remote_audio) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
@@ -215,7 +226,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let audio_preparer = vision.as_ref().and_then(|vision| vision.audio_preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
         (vision.encoder, vision.cache_bytes));
-    let health = encoder.health_handle();
+    let health = encoder.health_handle(false);
+    let audio_health = encoder.health_handle(true);
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
@@ -233,15 +245,16 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             tracing::info!(graphs, rows = DECODE_ROWS, elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo decode graphs captured");
         }
-        anyhow::ensure!((preparer.is_none() && audio_preparer.is_none()) || media.encoder().available(), "vision encoder unavailable before readiness");
+        anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
+        anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok((preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone()))));
+            let _ = ready.send(Ok((preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone()))));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
             args.token_io.token_select, host_config, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health))).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -499,7 +512,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
-                        if (!job.media.is_empty() || !job.audio.is_empty()) && !media.encoder().available() {
+                        if (!job.media.is_empty() && !media.encoder().available_for(false))
+                            || (!job.audio.is_empty() && !media.encoder().available_for(true)) {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
@@ -538,7 +552,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                 },
             };
-            if (!ready.job().job.media.is_empty() || !ready.job().job.audio.is_empty()) && !media.encoder().available() {
+            if (!ready.job().job.media.is_empty() && !media.encoder().available_for(false))
+                || (!ready.job().job.audio.is_empty() && !media.encoder().available_for(true)) {
                 let _ = ready.job().job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                 continue;
             }

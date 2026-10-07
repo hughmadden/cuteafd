@@ -282,6 +282,18 @@ pub(crate) struct NativeExpertDaemonArgs {
     pub(crate) encoder_revision: Option<String>,
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
     pub(crate) encoder_max_tokens: u32,
+    /// Load the checkpoint audio tower in this expert process.
+    #[arg(long, conflicts_with = "audio_encoder_only")]
+    pub(crate) audio_encoder: bool,
+    /// Serve only audio, without routed experts; may also host vision.
+    #[arg(long, conflicts_with = "encoder")]
+    pub(crate) audio_encoder_only: bool,
+    #[arg(long, default_value = "0.0.0.0:9300")]
+    pub(crate) audio_encoder_listen: String,
+    #[arg(long, required_if_eq_any = [("audio_encoder", "true"), ("audio_encoder_only", "true")])]
+    pub(crate) audio_encoder_plan_hash: Option<String>,
+    #[arg(long)]
+    pub(crate) audio_encoder_revision: Option<String>,
     /// First resident backbone layer; use 20 when both RTX GPUs host the encoder.
     /// Checked against the checkpoint's layer count at startup.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..256))]
