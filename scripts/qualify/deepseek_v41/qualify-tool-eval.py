@@ -10,18 +10,49 @@ output directory, including failed cases, commands, logs and raw tool traces.
 """
 import argparse
 import collections
+from datetime import date, timedelta
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 
 
-def collect(directory):
+# The pinned evaluator currently fixes TC-05/TC-08 to these March dates.
+REFERENCE_DATE = '2026-03-20'
+
+
+def validate_reference_date(value):
+    anchor = date.fromisoformat(value)
+    monday = anchor + timedelta(days=(7 - anchor.weekday()) % 7 or 7)
+    tomorrow = anchor + timedelta(days=1)
+    if (monday.isoformat(), tomorrow.isoformat()) != ('2026-03-23', '2026-03-21'):
+        raise ValueError('pinned TC-05/TC-08 evaluators require --reference-date 2026-03-20')
+    return value
+
+
+def tool_command(base_url, directory, *, reference_date=REFERENCE_DATE, parallel=16,
+                 timeout=900, max_turns=12, max_tokens=4096, short=False):
+    validate_reference_date(reference_date)
+    extra = dict(thinking=dict(type='enabled'), reasoning_effort='high', max_tokens=max_tokens)
+    return ['tool-eval-bench', '--model', 'deepseek-ai/DeepSeek-V4.1-Flash',
+            '--backend', 'vllm', '--base-url', base_url, '--api-key', 'local',
+            '--temperature', '0', '--backend-kwargs', json.dumps(extra),
+            '--short' if short else '--hardmode', '--parallel', str(parallel),
+            '--timeout', str(timeout), '--max-turns', str(max_turns),
+            '--reference-date', reference_date, '--no-live', '--no-probe-engine',
+            '--json-file', str(directory / 'tool-eval.json'),
+            '--output-dir', str(directory / 'report')]
+
+
+def collect(directory, *, short=False):
     result = json.loads((directory / 'tool-eval.json').read_text())
     assert result['status'] == 'completed', result['status']
     scenarios = result['scores']['scenario_results']
-    assert len(scenarios) == 88 and len({r['scenario_id'] for r in scenarios}) == 88
+    expected_count = 15 if short else 88
+    assert len(scenarios) == expected_count
+    assert len({r['scenario_id'] for r in scenarios}) == expected_count
     config = result['config']
+    validate_reference_date(config['reference_date'])
     assert config['extra_params']['thinking']['type'] == 'enabled'
     assert config['extra_params']['reasoning_effort'] == 'high'
     connection = sqlite3.connect(directory / 'data/benchmarks.sqlite')
@@ -29,7 +60,7 @@ def collect(directory):
         'select scenario_id,raw_log from scenario_traces where run_id=? order by scenario_id',
         (result['run_id'],))]
     connection.close()
-    assert len(traces) == 88
+    assert len(traces) == expected_count
     (directory / 'tool-eval-traces.json').write_text(json.dumps(traces, ensure_ascii=False, indent=2) + '\n')
     basic = [r for r in scenarios if int(r['scenario_id'][3:]) <= 69]
     hard = [r for r in scenarios if int(r['scenario_id'][3:]) > 69]
@@ -59,35 +90,30 @@ def main():
     parser.add_argument('--max-turns', type=int, default=12)
     parser.add_argument('--max-tokens', type=int, default=4096,
                         help='Per-response output cap including reasoning (benchmark default: 4096).')
-    parser.add_argument('--reference-date', required=True)
-    parser.add_argument('--label', default='ds41-native-thinking-high')
+    parser.add_argument('--reference-date', default=REFERENCE_DATE, type=validate_reference_date,
+                        help='Pinned evaluator anchor; other dates are rejected before inference.')
+    parser.add_argument('--short', action='store_true', help='Run the 15 core scenarios.')
     parser.add_argument('--collect-only', action='store_true',
                         help='Export an existing completed tool-eval.json and its SQLite traces.')
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.collect_only:
-        print(json.dumps(collect(args.output_dir), ensure_ascii=False))
+        print(json.dumps(collect(args.output_dir, short=args.short), ensure_ascii=False))
         return
     assert args.base_url and args.runs > 0 and 1 <= args.parallel <= 16
-    extra = dict(thinking=dict(type='enabled'), reasoning_effort='high')
-    if args.max_tokens is not None:
-        assert args.max_tokens > 0
-        extra['max_tokens'] = args.max_tokens
+    assert args.max_tokens > 0
     summaries = []
     for index in range(args.runs):
         directory = args.output_dir / f'run-{index + 1:02}'
         directory.mkdir(parents=True, exist_ok=False)
-        command = ['tool-eval-bench', '--model', 'deepseek-ai/DeepSeek-V4.1-Flash',
-                   '--backend', 'vllm', '--base-url', args.base_url, '--api-key', 'local',
-                   '--format', 'openai', '--temperature', '0', '--backend-kwargs', json.dumps(extra),
-                   '--hardmode', '--parallel', str(args.parallel), '--timeout', str(args.timeout),
-                   '--max-turns', str(args.max_turns), '--reference-date', args.reference_date,
-                   '--no-live', '--no-probe-engine', '--label', f'{args.label}-{index + 1}',
-                   '--json-file', str(directory / 'tool-eval.json'), '--output-dir', str(directory / 'report')]
+        command = tool_command(args.base_url, directory, reference_date=args.reference_date,
+                               parallel=args.parallel, timeout=args.timeout,
+                               max_turns=args.max_turns, max_tokens=args.max_tokens,
+                               short=args.short)
         (directory / 'tool-eval-command.json').write_text(json.dumps(command, indent=2) + '\n')
         with (directory / 'tool-eval.log').open('w') as log:
             subprocess.run(command, cwd=directory, stdout=log, stderr=subprocess.STDOUT, check=True)
-        summaries.append(collect(directory))
+        summaries.append(collect(directory, short=args.short))
         (args.output_dir / 'summaries.json').write_text(json.dumps(summaries, indent=2) + '\n')
         print(json.dumps(summaries[-1], ensure_ascii=False), flush=True)
 
