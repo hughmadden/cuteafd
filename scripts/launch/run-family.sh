@@ -1055,7 +1055,7 @@ if [[ "$glmf_memory" == auto ]]; then
         --decode-rows|--prefill-lanes|--prefill-lane-rows|--headroom-gib|--graph-budget-mib|--pool-tokens|--draft-fp8|\
         --draft-linear|--draft-context-slots|--draft-sequences)
           glmf_plan+=("${family_args[arg]}" "${family_args[arg + 1]}"); arg=$((arg + 1)) ;;
-        --decode-row-buckets) glmf_plan+=(--decode-row-buckets) ;;
+        --decode-row-buckets|--full-prefill-logits) glmf_plan+=("${family_args[arg]}") ;;
       esac
     done
     [[ "${draft_args[0]:-}" != --draft ]] || glmf_plan+=(--draft "${draft_args[1]}")

@@ -1837,6 +1837,17 @@ def test_glmf_auto_takes_compact_when_standard_cannot_hold_one_request_and_64k_p
         assert serve[serve.index("serve-glmf") + 1:] == _GLMF_PROFILE_COMMAND
 
 
+def test_glmf_auto_plans_the_all_row_logits_its_launch_admits(tmp_path):
+    """FULL_PREFILL_LOGITS=on admits every prefill row's logits at launch (probe scoring on the prefill
+    path): auto's plan of the standard settings charges them as the launch does."""
+    result = _glmf_launch(tmp_path, _GLMF_BASE + "GLM5_FLASH_MEMORY=auto\nFULL_PREFILL_LOGITS=on\n",
+                          physical_gpus=(0,), gpu_memory=(32148, 32607), layout_plan=_glmf_plan_json(2_097_152))
+    assert result.returncode == 0, result.stderr
+    (plan,) = _glmf_plans(result)
+    assert plan.split().count("--full-prefill-logits") == 1
+    assert _glmf_lines(result)[0].split().count("--full-prefill-logits") == 1
+
+
 def test_glmf_auto_plans_the_standard_launch_with_its_own_flags(tmp_path):
     """The plan sizes what the standard launch would serve: the measured free memory of its GPU, its
     Spark ranks, sequences and context, and every memory flag the launch passes, under the same names."""
@@ -1859,7 +1870,7 @@ def test_glmf_auto_plans_the_standard_launch_with_its_own_flags(tmp_path):
                      "--draft-context-slots 8", f"--draft {_HUB}/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/abc"):
         assert expected in flags, (expected, flags)
     for absent in ("--index-cache", "--kda-state", "--prefix-marks", "--replay-records", "--graph-budget-mib",
-                   "--startup-graphs"):
+                   "--startup-graphs", "--full-prefill-logits"):
         assert absent not in flags, absent
     # 1,048,576 + 3 x 65,536 = 1,245,184 fit in 1,441,792.
     assert _glmf_lines(result)[2] == [
