@@ -193,6 +193,69 @@ def load_tool(name, path):
     return module
 
 
+def test_audio_probe_geometry_markers_identity_and_unbound_pads():
+    span = {"start": 2, "len": 7, "samples": 24000, "key": "ab" * 32, "pcm_sha256": "cd" * 32}
+    tokens = [1, 7, *([8] * 7), 9, 2]
+    config = {"audio_start_token_id": 7, "audio_token_id": 8, "audio_end_token_id": 9}
+    assert audio.validate_probe_audio([span], tokens, config, 10) == [span]
+    for field, value in [("start", 0), ("len", 6), ("samples", 480), ("key", "AB" * 32),
+                         ("pcm_sha256", "bad"), ("samples", True), ("unknown", 1)]:
+        with pytest.raises(ValueError):
+            audio.validate_probe_audio([{**span, field: value}], tokens, config, 10)
+    for index in (0, 1, 2, 9):
+        bad = tokens.copy()
+        bad[index] = 8 if index == 0 else 1
+        with pytest.raises(ValueError):
+            audio.validate_probe_audio([span], bad, config, 10)
+    with pytest.raises(ValueError):
+        audio.validate_probe_audio([span, span], tokens, config)
+    with pytest.raises(ValueError):
+        audio.validate_probe_audio([span], tokens, config, 8)
+
+
+def test_audio_reference_features_immutable_attested_and_image_schema_separate(tmp_path, monkeypatch):
+    import json
+    import numpy as np
+    monkeypatch.syspath_prepend(str(ROOT / "python/reference"))
+    span = {"start": 2, "len": 7, "samples": 24000, "key": "ab" * 32, "pcm_sha256": "cd" * 32}
+    bits, codes = np.zeros((7, 2), dtype=np.uint16), np.zeros((26, 20), dtype=np.int64)
+    identity = {"snapshot_revision": "test"}
+    meta = audio.write_probe_features(tmp_path, span, bits, codes, identity)
+    assert meta["schema"] == "cuteafd.audio.features/1" and "grid" not in meta
+    actual, loaded = audio.read_probe_features(tmp_path, span, 2, identity)
+    assert np.array_equal(actual, bits) and loaded == meta
+    assert audio.write_probe_features(tmp_path, span, bits, codes, identity) == meta
+    with pytest.raises(ValueError, match="immutable"):
+        audio.write_probe_features(tmp_path, span, bits + 1, codes, identity)
+    for field in meta:
+        path = tmp_path / (span["key"] + ".json")
+        path.write_text(json.dumps({**meta, field: "wrong"}))
+        with pytest.raises(ValueError):
+            audio.read_probe_features(tmp_path, span, 2, identity)
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError):
+        audio.read_probe_features(tmp_path, {**span, "pcm_sha256": "ef" * 32}, 2, identity)
+    with pytest.raises(ValueError):
+        audio.write_probe_features(tmp_path, span, np.full((7, 2), 0x7f80, dtype=np.uint16), codes, identity)
+    with pytest.raises(ValueError):
+        audio.write_probe_features(tmp_path, span, bits, codes + 1024, identity)
+    (tmp_path / (span["key"] + ".codes.i64")).write_bytes(b"bad")
+    with pytest.raises(ValueError):
+        audio.read_probe_features(tmp_path, span, 2, identity)
+
+
+def test_native_projection_tolerance_is_architecture_scoped():
+    native = load_tool("audio_native_limits", PATH.with_name("audio_native_reference.py"))
+    assert native.projection_limit(120) == 1e-6
+    assert native.projection_limit(121) == 2e-6
+    for sm in (90, 122):
+        with pytest.raises(ValueError, match="requires SM120 or SM121"):
+            native.projection_limit(sm)
+    source = PATH.with_name("audio_native_reference.py").read_text()
+    assert 'result["rvq_agreement"] == 1.0' in source
+    assert 'all(row["byte_exact"]' in source
+
+
 def test_audio_native_abi_and_export_wrapper_fail_closed():
     import ctypes
     native = load_tool("audio_native_probe", PATH.with_name("audio_native_reference.py"))

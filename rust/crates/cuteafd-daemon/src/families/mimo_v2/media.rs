@@ -284,7 +284,30 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let expander = if config.get("vision_config").is_some() { SpanExpander::from_config(config, vocabulary as u32)? }
             else { SpanExpander::from_audio_config(config, vocabulary as u32)? };
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
-        if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
+        if job.probe.as_ref().is_some_and(|p| !p.spec.audio.is_empty()) {
+            let probe = job.probe.as_ref().unwrap();
+            probe.spec.validate_audio()?;
+            anyhow::ensure!(images.is_empty() && probe.spec.audio.len() == job.audio.len() && tokens.len() <= max_context,
+                "expanded audio probe count/context differs");
+            anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
+            let marker = |name| config.get(name).and_then(serde_json::Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok()).context("audio probe marker missing");
+            let (start, pad, finish) = (marker("audio_start_token_id")?, marker("audio_token_id")?, marker("audio_end_token_id")?);
+            let mut spans = Vec::with_capacity(job.audio.len());
+            for (span, clip) in probe.spec.audio.iter().zip(&job.audio) {
+                let end = span.start.checked_add(span.len).context("audio probe extent")?;
+                anyhow::ensure!(span.len == clip.geometry.tokens && span.samples == clip.pcm.len()
+                    && span.key == key_hex(clip.key) && span.pcm_sha256 == pcm_hash(&clip.pcm),
+                    "probe prepared audio identity differs");
+                anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == start
+                    && tokens[end] == finish && tokens[span.start..end].iter().all(|&id| id == pad),
+                    "probe audio rows/marker boundaries differ");
+                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: clip.key.into() });
+            }
+            anyhow::ensure!(tokens.iter().filter(|&&id| id == pad).count() == spans.iter().map(|s| s.len).sum::<usize>(),
+                "unbound probe audio placeholders");
+            (tokens, spans)
+        } else if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
             probe.spec.validate_media()?;
             anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
@@ -321,6 +344,12 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
         }).collect();
         probe.media(echo);
+        let audio_spans = spans.iter().filter(|span| span.key.is_audio()).collect::<Vec<_>>();
+        anyhow::ensure!(audio_spans.len() == job.audio.len(), "probe audio count differs");
+        probe.audio(audio_spans.into_iter().zip(&job.audio).map(|(span, clip)| {
+            cuteafd_api::openai::probe::ProbeAudio { start: span.start, len: span.len, key: key_hex(span.key),
+                samples: clip.pcm.len(), pcm_sha256: pcm_hash(&clip.pcm) }
+        }).collect());
     }
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
@@ -392,13 +421,18 @@ fn feature_payload(path: &std::path::Path, bytes: usize, sha256: &str, cached: O
 /// generation remains native. Separate cache identities cannot warm native images.
 pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
     cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &std::path::Path) -> Result<()> {
-    let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.media.is_empty()) else {
+    let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && (!p.spec.media.is_empty() || !p.spec.audio.is_empty())) else {
         return Ok(());
     };
-    let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
+    let audio = !probe.spec.audio.is_empty();
+    let variable = if audio { "CUTEAFD_AUDIO_FEATURES_DIR" } else { "CUTEAFD_MEDIA_FEATURES_DIR" };
+    let Some(root) = std::env::var_os(variable) else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
     probe.spec.validate_media()?;
-    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?)
+    let root = std::path::PathBuf::from(root);
+    let identity = snapshot_identity(snapshot)?;
+    if audio { apply_audio_probe_features(prompt, media, cache, &root, &identity) }
+    else { apply_probe_features(prompt, media, cache, &root, &identity) }
 }
 
 fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
@@ -438,6 +472,74 @@ fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
     probe.provenance(serde_json::json!({"mode": "reference_features", "probe_only": true,
         "encoder_bypassed": true, "features": provenance}));
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioFeatureMetadata {
+    schema: String,
+    key: String,
+    samples: usize,
+    pcm_sha256: String,
+    codes_sha256: String,
+    shape: [usize; 2],
+    dtype: String,
+    sha256: String,
+    tower_dtype: String,
+    snapshot_identity: serde_json::Value,
+}
+
+fn apply_audio_probe_features(prompt: &Prompt, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, root: &std::path::Path, identity: &serde_json::Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let probe = prompt.job.probe.as_ref().context("audio features require a probe")?;
+    anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation && probe.spec.score_from.is_some()
+        && !probe.spec.audio.is_empty() && probe.spec.media.is_empty(),
+        "audio features require a cold, speculation-free audio scoring probe");
+    probe.spec.validate_audio()?;
+    let root = root.canonicalize()?;
+    let mut provenance = Vec::new();
+    for span in &probe.spec.audio {
+        let metadata_path = root.join(format!("{}.json", span.key)).canonicalize()?;
+        let payload_path = root.join(format!("{}.bf16", span.key)).canonicalize()?;
+        let codes_path = root.join(format!("{}.codes.i64", span.key)).canonicalize()?;
+        anyhow::ensure!([&metadata_path, &payload_path, &codes_path].iter().all(|p| p.starts_with(&root)),
+            "audio feature path escapes root");
+        let raw = read_bounded(&metadata_path, 64 << 10)?;
+        let meta: AudioFeatureMetadata = serde_json::from_slice(&raw)?;
+        anyhow::ensure!(meta.schema == "cuteafd.audio.features/1" && meta.key == span.key && meta.samples == span.samples
+            && meta.pcm_sha256 == span.pcm_sha256 && meta.shape == [span.len, media.row_bytes() / 2]
+            && meta.dtype == "bf16-le" && meta.tower_dtype == "fp32"
+            && cuteafd_api::openai::probe::sha256_hex(&meta.sha256)
+            && cuteafd_api::openai::probe::sha256_hex(&meta.codes_sha256) && meta.snapshot_identity == *identity,
+            "audio reference feature metadata differs from prepared request/snapshot");
+        let clip = prompt.job.audio.iter().find(|c| key_hex(c.key) == span.key).context("feature span has no prepared audio")?;
+        anyhow::ensure!(span.samples == clip.pcm.len() && span.len == clip.geometry.tokens && pcm_hash(&clip.pcm) == span.pcm_sha256,
+            "audio reference PCM identity differs");
+        let codes = read_bounded(&codes_path, clip.geometry.codes.checked_mul(20 * 8).context("audio code extent")?)?;
+        anyhow::ensure!(codes.len() == clip.geometry.codes * 20 * 8 && format!("{:x}", Sha256::digest(&codes)) == meta.codes_sha256
+            && codes.chunks_exact(8).all(|b| (0..1024).contains(&i64::from_le_bytes(b.try_into().unwrap()))),
+            "audio reference codes differ");
+        let bytes = span.len.checked_mul(media.row_bytes()).context("audio feature extent")?;
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd.probe.audio_feature_override/1\0"); hash.update(span.key.as_bytes()); hash.update(&raw);
+        let override_key = cuteafd_core::AudioKey(hash.finalize().into());
+        let pin = cache.reserve(override_key, bytes)?;
+        let payload = feature_payload(&payload_path, bytes, &meta.sha256, pin.features())?;
+        let lease = cache.complete(override_key, payload)?;
+        media.attach_probe_override(clip.key, lease)?; drop(pin);
+        provenance.push(serde_json::from_slice::<serde_json::Value>(&raw)?);
+    }
+    probe.provenance(serde_json::json!({"mode": "audio_reference_features", "probe_only": true,
+        "encoder_bypassed": true, "features": provenance}));
+    Ok(())
+}
+
+fn pcm_hash(pcm: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for value in pcm { hash.update(value.to_le_bytes()); }
+    format!("{:x}", hash.finalize())
 }
 
 fn key_hex(key: impl Into<cuteafd_core::MediaKey>) -> String {
@@ -553,6 +655,115 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().any(|job| job.key == clip.key.into() && job.tokens == 7));
         assert!(jobs.iter().any(|job| job.key == image().key.into() && job.tokens == 4));
+    }
+    fn audio_feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeAudio};
+        let clip = Arc::new(cuteafd_loader::media::audio::prepare_pcm(vec![0.; 24000],
+            cuteafd_loader::media::EncoderId([2;32])).unwrap());
+        let tokens = vec![1,7,8,8,8,8,8,8,8,9,2];
+        let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(10),
+            audio: vec![ProbeAudio { start: 2, len: 7, key: key_hex(clip.key), samples: 24000, pcm_sha256: pcm_hash(&clip.pcm) }],
+            ..Default::default() };
+        let mut job = request(Vec::new()); job.audio = vec![clip]; job.probe = Some(Probe::new(spec));
+        let cfg = serde_json::json!({"audio_start_token_id":7,"audio_token_id":8,"audio_end_token_id":9});
+        let (prompt, media, _) = prepare(job, tokens, &cfg, 32, 2, 32).unwrap();
+        (prompt, media, serde_json::json!({"snapshot_revision":"test"}))
+    }
+    fn audio_feature_files(root: &std::path::Path, prompt: &Prompt, identity: &serde_json::Value, payload: &[u8]) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let span = &prompt.job.probe.as_ref().unwrap().spec.audio[0];
+        let codes = vec![0u8; 26 * 20 * 8];
+        let meta = serde_json::json!({"schema":"cuteafd.audio.features/1", "key":span.key,"samples":span.samples,
+            "pcm_sha256":span.pcm_sha256,"codes_sha256":format!("{:x}",Sha256::digest(&codes)),"shape":[7,2],
+            "dtype":"bf16-le","sha256":format!("{:x}",Sha256::digest(payload)),"tower_dtype":"fp32","snapshot_identity":identity});
+        for (suffix, bytes) in [("json", serde_json::to_vec(&meta).unwrap()), ("bf16", payload.to_vec()), ("codes.i64", codes)] {
+            std::fs::write(root.join(format!("{}.{suffix}", span.key)), bytes).unwrap();
+        }
+        meta
+    }
+    #[test]
+    fn audio_probe_binds_expanded_rows_pcm_markers_and_echo() {
+        use cuteafd_api::openai::probe::Probe;
+        let (prompt, _, _) = audio_feature_request();
+        assert_eq!(prompt.job.probe.as_ref().unwrap().record().audio, prompt.job.probe.as_ref().unwrap().spec.audio);
+        for mutation in ["key", "pcm", "samples", "length", "start_marker", "end_marker", "pad", "extra_pad", "vocabulary", "sources"] {
+            let (mut prompt, _, _) = audio_feature_request();
+            let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone();
+            match mutation {
+                "key" => spec.audio[0].key = "ab".repeat(32), "pcm" => spec.audio[0].pcm_sha256 = "ab".repeat(32),
+                "samples" => spec.audio[0].samples = 24001, "length" => spec.audio[0].len = 6,
+                "start_marker" => prompt.tokens[1] = 1, "end_marker" => prompt.tokens[9] = 1,
+                "pad" => prompt.tokens[2] = 1, "extra_pad" => prompt.tokens[0] = 8,
+                "vocabulary" => prompt.tokens[0] = 32, _ => prompt.job.audio.clear(),
+            }
+            spec.prompt_ids = Some(prompt.tokens.clone()); prompt.job.probe = Some(Probe::new(spec));
+            let cfg = serde_json::json!({"audio_start_token_id":7,"audio_token_id":8,"audio_end_token_id":9});
+            assert!(prepare(prompt.job, prompt.tokens, &cfg, 32, 2, 32).is_err(), "{mutation}");
+        }
+    }
+    #[test]
+    fn audio_override_is_budgeted_isolated_and_bypasses_native_owner() {
+        use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaWaiter, MediaPoll};
+        let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = audio_feature_request();
+        audio_feature_files(root.path(), &prompt, &identity, &[0;28]);
+        let key = prompt.job.audio[0].key;
+        let mut cache = EmbeddingCache::new(28);
+        apply_audio_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).unwrap();
+        assert!(media.ready(0, prompt.tokens.len())); assert!(!cache.contains(key)); assert_eq!(cache.bytes(), 28);
+        assert_eq!(media.spans()[0].key, key.into());
+        let clip = &prompt.job.audio[0];
+        let jobs = vec![EncodeJob::audio(clip.key, clip.pcm.clone(), 7, 2)];
+        let waiter = MediaWaiter::new(prompt, media, jobs, 0).unwrap();
+        let mut admission = MediaAdmission::new(cache, Encoder::Off, 1);
+        assert!(admission.enqueue(waiter).is_ok()); assert!(matches!(admission.poll(|_| false), MediaPoll::Ready(_)));
+        assert!(!admission.cache.contains(key)); assert_eq!(admission.stats(0,0).encodes,0);
+    }
+    #[test]
+    fn audio_override_rejects_bad_provenance_payloads_and_non_scoring_requests() {
+        use cuteafd_api::openai::probe::Probe;
+        for field in ["schema","key","samples","pcm_sha256","codes_sha256","shape","dtype","sha256","tower_dtype","snapshot_identity","unknown"] {
+            let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = audio_feature_request();
+            let mut meta = audio_feature_files(root.path(), &prompt, &identity, &[0;28]); meta[field] = "wrong".into();
+            let key = &prompt.job.probe.as_ref().unwrap().spec.audio[0].key;
+            std::fs::write(root.path().join(format!("{key}.json")), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(28);
+            assert!(apply_audio_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err(),"{field}");
+            assert_eq!(cache.bytes(),0);
+        }
+        for field in ["cold","speculation","score"] {
+            let root = tempfile::tempdir().unwrap(); let (mut prompt, mut media, identity) = audio_feature_request();
+            audio_feature_files(root.path(), &prompt, &identity, &[0;28]);
+            let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone();
+            match field { "cold" => spec.cold = false, "speculation" => spec.no_speculation = false, _ => spec.score_from = None }
+            prompt.job.probe = Some(Probe::new(spec)); let mut cache = cuteafd_engine::media::EmbeddingCache::new(28);
+            assert!(apply_audio_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+        }
+        for mode in ["missing", "escape", "codes", "payload"] {
+            let root = tempfile::tempdir().unwrap(); let outside = tempfile::tempdir().unwrap();
+            let (prompt, mut media, identity) = audio_feature_request();
+            audio_feature_files(root.path(), &prompt, &identity, &[0;28]);
+            let key = &prompt.job.probe.as_ref().unwrap().spec.audio[0].key;
+            match mode {
+                "missing" => std::fs::remove_file(root.path().join(format!("{key}.codes.i64"))).unwrap(),
+                "codes" => std::fs::write(root.path().join(format!("{key}.codes.i64")), [1;8]).unwrap(),
+                "payload" => std::fs::write(root.path().join(format!("{key}.bf16")), [1;28]).unwrap(),
+                _ => {
+                    let path = root.path().join(format!("{key}.bf16")); std::fs::remove_file(&path).unwrap();
+                    std::fs::write(outside.path().join("rows"), [0;28]).unwrap();
+                    #[cfg(unix)] std::os::unix::fs::symlink(outside.path().join("rows"), path).unwrap();
+                }
+            }
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(28);
+            assert!(apply_audio_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err(),"{mode}");
+            drop(media); cache.prune_reservations(); assert_eq!(cache.bytes(),0);
+        }
+        for (payload,budget) in [(vec![0;27],28),(vec![0;29],28),([0x80,0x7f].repeat(14),28),(vec![0;28],27)] {
+            let root = tempfile::tempdir().unwrap(); let (prompt, mut media, identity) = audio_feature_request();
+            audio_feature_files(root.path(), &prompt, &identity, &payload);
+            let mut cache = cuteafd_engine::media::EmbeddingCache::new(budget);
+            assert!(apply_audio_probe_features(&prompt, &mut media, &mut cache, root.path(), &identity).is_err());
+            drop(media); cache.prune_reservations(); assert_eq!(cache.bytes(),0);
+        }
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};

@@ -297,6 +297,94 @@ def pipeline(pcm, codec, patch, speech, ns, *, mel_fn=None) -> dict:
             handle.remove()
 
 
+def validate_probe_audio(spans, tokens, config, score_from=None):
+    """Separate audio probe contract; image descriptors are never reinterpreted."""
+    import re
+    if not isinstance(spans, list) or not 1 <= len(spans) <= 4:
+        raise ValueError("audio probe requires 1..4 clips")
+    previous, total, pads = 0, 0, 0
+    for span in spans:
+        if set(span) != {"start", "len", "key", "samples", "pcm_sha256"}:
+            raise ValueError("unexpected audio descriptor fields")
+        start, length, samples = (span[k] for k in ("start", "len", "samples"))
+        if any(type(x) is not int for x in (start, length, samples)):
+            raise ValueError("audio descriptor geometry must be integer")
+        geometry = token_geometry(samples)
+        end = start + length
+        if (length != geometry["tokens"] or start < max(1, previous) or end >= len(tokens)
+                or (score_from is not None and end > score_from)):
+            raise ValueError("audio spans must match geometry and precede scoring")
+        if any(not isinstance(span[k], str) or not re.fullmatch(r"[0-9a-f]{64}", span[k])
+               for k in ("key", "pcm_sha256")):
+            raise ValueError("invalid canonical audio identity")
+        if (tokens[start - 1] != config["audio_start_token_id"] or tokens[end] != config["audio_end_token_id"]
+                or any(t != config["audio_token_id"] for t in tokens[start:end])):
+            raise ValueError("audio rows/marker boundaries differ")
+        total += samples
+        if total > 600 * 24000:
+            raise ValueError("audio history exceeds sample bound")
+        previous, pads = end, pads + length
+    if tokens.count(config["audio_token_id"]) != pads:
+        raise ValueError("unbound audio placeholders")
+    return spans
+
+
+def write_probe_features(root, span, bits, codes, identity):
+    """Immutable official FP32 tower results with PCM and RVQ code attestations."""
+    import numpy as np
+    from fidelity_media import HEX, _feature_lock, _publish_locked
+    bits, codes = np.asarray(bits), np.asarray(codes)
+    geometry = token_geometry(span["samples"])
+    if (not HEX.fullmatch(span["key"]) or not HEX.fullmatch(span["pcm_sha256"])
+            or span["len"] != geometry["tokens"] or bits.dtype != np.uint16 or bits.ndim != 2
+            or bits.shape[0] != span["len"] or bits.shape[1] < 1
+            or not np.isfinite((bits.astype(np.uint32) << 16).view(np.float32)).all()):
+        raise ValueError("invalid audio BF16 rows/identity")
+    if codes.dtype != np.int64 or codes.shape != (geometry["codes"], 20) or (codes < 0).any() or (codes >= 1024).any():
+        raise ValueError("invalid audio RVQ codes")
+    data, code_data = bits.astype("<u2").tobytes(), codes.astype("<i8").tobytes()
+    meta = {"schema": "cuteafd.audio.features/1", "key": span["key"], "samples": span["samples"],
+            "pcm_sha256": span["pcm_sha256"], "codes_sha256": digest(code_data), "shape": list(bits.shape),
+            "dtype": "bf16-le", "sha256": digest(data), "tower_dtype": "fp32", "snapshot_identity": identity}
+    encoded = json.dumps(meta, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+    with _feature_lock(root):
+        _publish_locked([(root / (span["key"] + ".bf16"), data),
+                         (root / (span["key"] + ".codes.i64"), code_data),
+                         (root / (span["key"] + ".json"), encoded)])
+    return meta
+
+
+def read_probe_features(root, span, hidden, identity):
+    import numpy as np
+    from fidelity_media import HEX
+    if not HEX.fullmatch(span["key"]):
+        raise ValueError("unsafe audio feature key")
+    root = root.resolve()
+    def read(suffix, cap):
+        path = (root / (span["key"] + suffix)).resolve()
+        if not path.is_relative_to(root) or path.stat().st_size > cap:
+            raise ValueError("audio feature path/size exceeds bound")
+        with path.open("rb") as source:
+            data = source.read(cap + 1)
+        if len(data) > cap:
+            raise ValueError("audio feature exceeds bound")
+        return data
+    meta = json.loads(read(".json", 64 << 10))
+    data = read(".bf16", span["len"] * hidden * 2)
+    geometry = token_geometry(span["samples"])
+    code_data = read(".codes.i64", geometry["codes"] * 20 * 8)
+    expected = {"schema": "cuteafd.audio.features/1", "key": span["key"], "samples": span["samples"],
+                "pcm_sha256": span["pcm_sha256"], "codes_sha256": digest(code_data), "shape": [span["len"], hidden],
+                "dtype": "bf16-le", "sha256": digest(data), "tower_dtype": "fp32", "snapshot_identity": identity}
+    if meta != expected or len(data) != span["len"] * hidden * 2 or len(code_data) != geometry["codes"] * 20 * 8:
+        raise ValueError("audio reference metadata/payload differs")
+    codes = np.frombuffer(code_data, dtype="<i8")
+    bits = np.frombuffer(data, dtype="<u2").reshape(span["len"], hidden)
+    if (codes < 0).any() or (codes >= 1024).any() or not np.isfinite((bits.astype(np.uint32) << 16).view(np.float32)).all():
+        raise ValueError("nonfinite audio rows or invalid RVQ codes")
+    return bits.copy(), meta
+
+
 def main():
     import numpy as np
     import torch
@@ -307,7 +395,13 @@ def main():
     parser.add_argument("--pcm", type=Path, help="raw 24kHz mono float32 little-endian PCM")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--preprocess-only", action="store_true")
+    parser.add_argument("--probe-audio", type=Path, help="one echoed ProbeAudio descriptor JSON for --pcm")
+    parser.add_argument("--probe-features-out", type=Path, help="immutable audio-only feature directory")
     args = parser.parse_args()
+    if bool(args.probe_audio) != bool(args.probe_features_out) or (args.probe_audio and (not args.pcm or args.preprocess_only)):
+        parser.error("probe features require --probe-audio --probe-features-out --pcm and the full official tower")
+    if args.probe_audio:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     torch.set_num_threads(args.threads)
     root = Path(__file__).resolve().parents[5]
     runtime = verify_runtime(root)
@@ -344,6 +438,14 @@ def main():
             fixture["byte_deterministic"] = all(tensor_bytes(t) == tensor_bytes(repeated[k]) for k, t in stages.items())
             if not fixture["byte_deterministic"]:
                 raise ValueError(f"{name}: official CPU pipeline is not byte-deterministic")
+        if args.probe_audio:
+            from mimo_media import snapshot_identity
+            span = json.loads(args.probe_audio.read_text())
+            if (span["samples"] != pcm.numel() or span["len"] != token_geometry(pcm.numel())["tokens"]
+                    or span["pcm_sha256"] != digest(tensor_bytes(pcm))):
+                raise ValueError("echoed audio descriptor differs from canonical PCM")
+            fixture["probe_features"] = write_probe_features(args.probe_features_out, span,
+                stages["bf16_rows"].view(torch.uint16).numpy(), stages["codes"].numpy(), snapshot_identity(args.snapshot))
         for key, tensor in stages.items():
             data = tensor_bytes(tensor)
             filename = f"{name}.{key}.bin"

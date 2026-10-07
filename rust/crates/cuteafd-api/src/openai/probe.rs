@@ -33,6 +33,9 @@ pub struct ProbeSpec {
     /// Already-expanded native image spans, verified against prepared sources by the engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<ProbeMedia>,
+    /// Already-expanded audio spans bound to ordinary input_audio sources.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<ProbeAudio>,
     /// Teacher-forced scoring: run the prompt and record the logits row
     /// predicting every prompt token from this index on; the request then
     /// ends without generating.
@@ -107,6 +110,17 @@ pub struct ProbeMedia {
     pub image_url: Option<ProbeImageUrl>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeAudio {
+    pub start: usize,
+    pub len: usize,
+    pub key: String,
+    pub samples: usize,
+    /// SHA256 of canonical finite mono F32 LE PCM, independent of encoder identity.
+    pub pcm_sha256: String,
+}
+
 pub fn sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
@@ -146,7 +160,28 @@ impl ProbeSpec {
         Ok(())
     }
 
+    pub fn validate_audio(&self) -> anyhow::Result<()> {
+        if self.audio.is_empty() { return Ok(()); }
+        anyhow::ensure!(self.media.is_empty(), "mixed expanded image/audio probes are not supported");
+        let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe audio requires prompt_ids"))?;
+        anyhow::ensure!(self.audio.len() <= cuteafd_loader::media::audio::MAX_CLIPS, "too many probe audio clips");
+        let mut previous = 0;
+        let mut samples = 0usize;
+        for span in &self.audio {
+            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(span.samples)?;
+            let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe audio extent overflow"))?;
+            anyhow::ensure!(span.len == geometry.tokens && span.start >= previous && end <= tokens.len()
+                && self.score_from.is_none_or(|from| end <= from), "probe audio spans must match geometry and precede scoring");
+            anyhow::ensure!(sha256_hex(&span.key) && sha256_hex(&span.pcm_sha256), "invalid probe audio identity");
+            samples = samples.checked_add(span.samples).ok_or_else(|| anyhow::anyhow!("probe audio sample overflow"))?;
+            anyhow::ensure!(samples <= cuteafd_loader::media::audio::MAX_REQUEST_SAMPLES, "probe audio history exceeds sample bound");
+            previous = end;
+        }
+        Ok(())
+    }
+
     pub fn validate_media(&self) -> anyhow::Result<()> {
+        self.validate_audio()?;
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
         anyhow::ensure!(self.media.len() <= 128, "probe media exceeds history limit");
@@ -196,6 +231,8 @@ pub struct ProbeRecord {
     pub prompt_ids: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<ProbeMedia>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<ProbeAudio>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
     pub cached_tokens: usize,
@@ -250,6 +287,10 @@ impl Probe {
     pub fn media(&self, mut media: Vec<ProbeMedia>) {
         for span in &mut media { span.image_url = None; }
         self.with(|r| r.media = media);
+    }
+
+    pub fn audio(&self, audio: Vec<ProbeAudio>) {
+        self.with(|r| r.audio = audio);
     }
 
     pub fn provenance(&self, value: serde_json::Value) {
@@ -401,6 +442,39 @@ pub fn registry() -> &'static ProbeRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_probe_serialization_is_unchanged_when_audio_is_empty() {
+        use super::*;
+        let media = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "ab".repeat(32), grid: [1,4,4],
+            fixture: None, image_url: None };
+        assert_eq!(serde_json::to_string(&media).unwrap(), format!(
+            "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}", "ab".repeat(32)));
+        let spec = ProbeSpec { media: vec![media], ..Default::default() };
+        assert_eq!(serde_json::to_string(&spec).unwrap(), format!(concat!(
+            "{{\"cold\":false,\"no_speculation\":false,\"prompt_ids\":null,\"media\":[",
+            "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}],",
+            "\"score_from\":null,\"verify_rows\":null,\"score_path\":null,\"dump_rows\":null,",
+            "\"record_first\":false,\"record_rows\":0,\"top_k\":0,\"want\":{{}}}}"), "ab".repeat(32)));
+        assert!(serde_json::to_value(ProbeRecord::default()).unwrap().get("audio").is_none());
+    }
+    #[test]
+    fn audio_probe_geometry_identity_and_history_fail_closed() {
+        use super::*;
+        let span = ProbeAudio { start: 2, len: 7, key: "ab".repeat(32), samples: 24000, pcm_sha256: "cd".repeat(32) };
+        let spec = ProbeSpec { prompt_ids: Some(vec![0;12]), score_from: Some(10), audio: vec![span], ..Default::default() };
+        spec.validate_audio().unwrap();
+        for mutation in ["ids","len","short","huge","key","pcm","overlap","score","overflow","clips"] {
+            let mut bad = spec.clone();
+            match mutation {
+                "ids" => bad.prompt_ids = None, "len" => bad.audio[0].len = 6,
+                "short" => bad.audio[0].samples = 480, "huge" => bad.audio[0].samples = 7200001,
+                "key" => bad.audio[0].key = "AB".repeat(32), "pcm" => bad.audio[0].pcm_sha256 = "bad".into(),
+                "overlap" => bad.audio.push(bad.audio[0].clone()), "score" => bad.score_from = Some(8),
+                "overflow" => bad.audio[0].start = usize::MAX, _ => bad.audio = vec![bad.audio[0].clone();5],
+            }
+            assert!(bad.validate_audio().is_err(), "{mutation}");
+        }
+    }
     use super::*;
 
     fn dumped_row(path: &std::path::Path) -> Vec<f32> {

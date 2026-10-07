@@ -438,6 +438,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             p.fail("probe media requires a loaded encoder");
             return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
         }
+        if !p.spec.audio.is_empty() && (!state.profile.capabilities.audio || state.profile.audio_preparer.is_none()) {
+            p.fail("probe audio requires a loaded encoder");
+            return error(StatusCode::BAD_REQUEST, "probe audio requires a loaded encoder");
+        }
     }
     let audio_sources = if state.profile.capabilities.audio {
         if state.profile.audio_preparer.is_none() { return error(StatusCode::SERVICE_UNAVAILABLE, "audio processor unavailable"); }
@@ -446,6 +450,9 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             Err(message) => return error(StatusCode::BAD_REQUEST, message),
         }
     } else { Vec::new() };
+    if probe.as_ref().is_some_and(|p| !p.spec.audio.is_empty() && p.spec.audio.len() != audio_sources.len()) {
+        return error(StatusCode::BAD_REQUEST, "probe audio count differs from input_audio sources");
+    }
     if !audio_sources.is_empty() && state.profile.audio_health.as_ref().is_none_or(|h| !h.load(Ordering::Acquire)) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "audio encoder unavailable");
     }
@@ -616,7 +623,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
-    let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty());
+    let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
     let (prompt, image_sources, processor) = match glm_request {
         Some((Templated::Glm(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1300,6 +1307,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn expanded_audio_probe_binds_ordinary_sources_without_chat_rendering() {
+        use base64::Engine;
+        use cuteafd_loader::media::EncoderId;
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF"); wav.extend(48036u32.to_le_bytes()); wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes()); wav.extend(1u16.to_le_bytes()); wav.extend(1u16.to_le_bytes());
+        wav.extend(24000u32.to_le_bytes()); wav.extend(48000u32.to_le_bytes()); wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes()); wav.extend(b"data"); wav.extend(48000u32.to_le_bytes()); wav.resize(48044,0);
+        let source = base64::engine::general_purpose::STANDARD.encode(wav);
+        let preparer = Arc::new(media::audio::AudioPreparer::new(EncoderId([1;32]), Arc::new(tokio::sync::Semaphore::new(1))));
+        let clip = preparer.prepare(&[media::audio::AudioSource { data: &source, format: cuteafd_loader::media::audio::AudioFormat::Wav }]).unwrap().clips.remove(0);
+        let spec = probe::ProbeSpec { prompt_ids: Some(vec![1;11]), audio: vec![probe::ProbeAudio { start:2,len:7,samples:24000,
+            key: clip.key.0.iter().map(|v| format!("{v:02x}")).collect(), pcm_sha256:"ab".repeat(32) }], ..Default::default() };
+        for source_present in [false,true] {
+            let (id, _) = probe::registry().register(spec.clone());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let expected = clip.key;
+            let worker = source_present.then(|| tokio::spawn(async move {
+                let job = rx.recv().await.unwrap(); assert!(job.prompt.is_empty() && job.media.is_empty());
+                assert_eq!(job.audio.len(),1); assert_eq!(job.audio[0].key,expected);
+                job.events.send(Ok(InferenceChunk::Ready { system_fingerprint:None,
+                    prompt_usage:PromptUsage {prompt_tokens:11,prompt_cache_hit_tokens:0} })).unwrap();
+                job.events.send(Ok(InferenceChunk::Finish {finish_reason:InferenceFinishReason::Length})).unwrap();
+            }));
+            let profile = ModelProfile::new(MODEL,ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))
+                .with_loaded_audio(preparer.clone(),Arc::new(std::sync::atomic::AtomicBool::new(true)));
+            let app = router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(1),ConsoleHub::disabled(),profile);
+            let content = if source_present { json!([{"type":"input_audio","input_audio":{"data":source,"format":"wav"}}]) } else { json!("probe") };
+            let body = json!({"model":MODEL,"messages":[{"role":"user","content":content}],"max_tokens":1});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").header(probe::HEADER,id)
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),if source_present {StatusCode::OK} else {StatusCode::BAD_REQUEST});
+            if let Some(worker) = worker { worker.await.unwrap(); }
+        }
+    }
     #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;
