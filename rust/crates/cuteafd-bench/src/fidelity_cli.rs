@@ -213,6 +213,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             "prefill": crate::fidelity_dataset::STANDARD_PREFILL,
         });
     }
+    let standard_balance = standard.then(|| crate::fidelity_dataset::standard_balance(&reference));
     if let Some(limit) = model_record["max_context"].as_u64() {
         ensure!(windows.iter().all(|w| w.tokens.len() as u64 <= limit), "fidelity windows exceed server context ({limit})");
     }
@@ -247,7 +248,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
             kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
-            dataset: dataset_identity.clone(), verify_rows: args.verify_rows, engine, settings,
+            dataset: dataset_identity.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
             floor_kl: reference.expect.kl_max, tripwire_expect: reference.expect.tripwires.clone() }
     };
@@ -416,7 +417,7 @@ mod tests {
         let mut run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(),
             checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
             tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
-            verify_rows: None, dataset: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
+            verify_rows: None, dataset: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
             score, floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None };
         assert!(run_pass(&run));
         run.score.missing = 1; assert!(!run_pass(&run));
@@ -468,6 +469,31 @@ mod tests {
         assert!(dataset_source(&explicit, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_err());
         let explicit = parse(&["--tier", "full", "--dataset-config", "other-config"]);
         assert!(dataset_source(&explicit, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").is_err());
+    }
+
+    #[test]
+    fn mimo_pro_publication_is_checkpoint_specific_for_every_tier() {
+        let model = "XiaomiMiMo/MiMo-V2.6-Pro-MOPD";
+        for tier in ["quick", "standard", "full"] {
+            let args = parse(&["--tier", tier]);
+            assert_eq!(dataset_source(&args, model).unwrap(),
+                Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::MIMO_PRO_REVISION,
+                    crate::fidelity_dataset::MIMO_PRO_CONFIG)));
+            assert_ne!(dataset_source(&args, model).unwrap(),
+                dataset_source(&args, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").unwrap());
+            for other in ["mimo_v2", "XiaomiMiMo/MiMo-V2.6-Pro-RL", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD-speculator"] {
+                assert!(dataset_source(&args, other).is_err(), "{other}");
+            }
+        }
+        for local_flag in ["--reference", "--rows"] {
+            assert_eq!(dataset_source(&parse(&[local_flag, "local"]), model).unwrap(), None);
+        }
+        assert!(dataset_source(&parse(&["--dataset", "other/repo"]), model).is_err());
+        assert!(dataset_source(&parse(&["--dataset-config", "other-config"]), model).is_err());
+        let media = parse(&["--tier", "full", "--dataset-config", crate::fidelity_dataset::MIMO_PRO_MEDIA_CONFIG,
+            "--dataset-revision", crate::fidelity_dataset::MIMO_PRO_MEDIA_REVISION, "--media-root", "fixtures"]);
+        assert_eq!(dataset_source(&media, model).unwrap(), Some((crate::fidelity_dataset::REPOSITORY,
+            crate::fidelity_dataset::MIMO_PRO_MEDIA_REVISION, crate::fidelity_dataset::MIMO_PRO_MEDIA_CONFIG)));
     }
 
     #[test]

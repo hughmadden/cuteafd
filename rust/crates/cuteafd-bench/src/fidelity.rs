@@ -19,6 +19,9 @@ pub struct Run {
     pub verify_rows: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<serde_json::Value>,
+    /// Informational split balance, separate from the comparison-stable dataset identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_balance: Option<serde_json::Value>,
     pub engine: String,
     pub settings: serde_json::Value,
     pub seconds: f64,
@@ -390,7 +393,7 @@ mod tests {
         })).collect();
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
-            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None,
+            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, standard_balance: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
     }
@@ -436,6 +439,29 @@ mod tests {
         assert_eq!(report["verdict"]["label"],crate::fidelity_dataset::STANDARD_FALLBACK);
         split.path_shape = "decode-shaped".into();
         assert!(compare(&split,&fallback,0.005,0.005,100,1).is_err());
+    }
+
+    #[test]
+    fn standard_balance_is_optional_and_preserves_saved_run_comparability() {
+        let mut legacy = run(8,512);
+        for tier in ["quick", "standard", "full", crate::fidelity_dataset::STANDARD_TIER] {
+            legacy.tier = tier.into();
+            let saved = serde_json::to_value(&legacy).unwrap();
+            assert!(saved.get("standard_balance").is_none());
+            assert!(serde_json::from_value::<Run>(saved).unwrap().standard_balance.is_none());
+        }
+        legacy.dataset = Some(serde_json::json!({"standard_subset":{"mode":"32 decode / 32 prefill"}}));
+        let mut current = legacy.clone();
+        current.standard_balance = Some(serde_json::json!({
+            "decode":{"context_buckets":{"0-2K":13,"2-8K":10,"8-16K":9},"generated_positions":8786},
+            "prefill":{"context_buckets":{"0-2K":16,"2-8K":7,"8-16K":9},"generated_positions":7832}}));
+        let saved = serde_json::to_value(&current).unwrap();
+        assert_eq!(saved["standard_balance"], current.standard_balance.as_ref().unwrap().clone());
+        assert!(saved["dataset"]["standard_subset"].get("balance").is_none());
+        assert_eq!(serde_json::to_vec(&current.dataset).unwrap(), serde_json::to_vec(&legacy.dataset).unwrap());
+        let restored: Run = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.standard_balance, current.standard_balance);
+        assert!(compare(&legacy, &restored, 0.005, 0.005, 100, 1).unwrap().pass);
     }
 
     #[test]
