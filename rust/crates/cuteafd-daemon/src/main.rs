@@ -32,7 +32,7 @@ fn resolve_qwen_vision(
     family: Option<cuteafd_loader::plan::MediaMode>,
     initial: Option<cuteafd_loader::plan::MediaMode>,
 ) -> cuteafd_loader::plan::MediaMode {
-    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Off)
+    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Auto)
 }
 
 #[cfg(test)]
@@ -41,11 +41,25 @@ mod media_defaults_tests {
     use cuteafd_loader::plan::MediaMode;
 
     #[test]
-    fn qwen_vision_stays_off_until_explicitly_enabled() {
-        assert_eq!(resolve_qwen_vision(None, None), MediaMode::Off);
+    fn qualified_qwen_vision_defaults_auto_and_preserves_overrides() {
+        assert_eq!(resolve_qwen_vision(None, None), MediaMode::Auto);
+        assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Off)), MediaMode::Off);
         assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Auto)), MediaMode::Auto);
         assert_eq!(resolve_qwen_vision(Some(MediaMode::Off), Some(MediaMode::Auto)), MediaMode::Off);
         assert_eq!(resolve_qwen_vision(Some(MediaMode::Spark(Some(0))), None), MediaMode::Spark(Some(0)));
+    }
+
+    #[test]
+    fn qwen_direct_cli_defaults_auto_and_resolves_explicit_off() {
+        use clap::Parser;
+        use super::cli::{Cli, Commands};
+        let base = ["cuteafd", "serve-qwen4", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let defaults = Cli::try_parse_from(base).unwrap();
+        let Commands::ServeQwen4(args) = defaults.command else { panic!("expected Qwen serving"); };
+        assert_eq!(args.vision, MediaMode::Auto);
+        assert_eq!(resolve_qwen_vision(defaults.vision, None), MediaMode::Auto);
+        let off = Cli::try_parse_from(base.into_iter().chain(["--vision", "off"])).unwrap();
+        assert_eq!(resolve_qwen_vision(off.vision, None), MediaMode::Off);
     }
 
     #[test]

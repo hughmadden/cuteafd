@@ -78,7 +78,7 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub console: console::ConsoleArgs,
     /// Resolved global vision policy, assigned before dispatch.
-    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub vision: cuteafd_loader::plan::MediaMode,
     /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
