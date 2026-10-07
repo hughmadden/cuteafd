@@ -66,6 +66,14 @@ Extend (new families; kernels largely exist in b12x already):
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
 ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
+Qwen's launcher defaults to MTP3 only for local EXL3 (`ranks == 0`);
+TP4's shipped default uses copy-window drafts. Enabling native MTP on TP4
+with coordinator-local draft experts is a separate policy question, not a
+requirement of vision or decode-bucket qualification.
+Qwen TP4's former 32,768-token KV pool admitted only seven fresh requests
+at the qualified C16 output budget; scheduler and EXL3 slots were not the
+limit. Full-width distinct-prompt qualification and default auto admission
+are recorded under Qwen TP4 admission below.
 
 ## Architecture
 
@@ -99,6 +107,12 @@ build.sh wip.sh run.sh stop.sh   kept; config gains MODEL + family auto-detect
 ```
 
 Traits the engine programs against (keep them few and concrete):
+
+Decode buckets must not straddle registered projection arithmetic thresholds.
+Families use a named Rust threshold registry and a fail-closed startup check;
+CPU contracts compare it with the pinned fork's routing rules at each pin bump.
+Exporter-embedded, object-attested route registries are possible hardening if
+pin bumps ever bypass those tests; the current AOT manifest does not carry them.
 
 - `Family`: reads `config.json` + `quantization_config` + safetensors index
   into a `ModelSpec` (layer kinds, attention kind per layer, MoE geometry,
@@ -803,6 +817,66 @@ Work, in priority order:
    compatible bundled template still require explicit `CHAT_TEMPLATE_FROM`.
    The original failed v1 loss evidence stays intact; v3 closes the remaining
    gates. Shared code still requires the coordinator's batched V4.1 parity gate.
+   **Qwen image capacity:** 1024 merged tokens per image, `detail=low` 256,
+   BF16 residual; explicit `VISION=auto` still enables the tower (RTX on the
+   zero-Spark minimum). Qwen tower >1024 tokens: BF16 fails calibrated G2 at
+   2048/4096; FP32 residual fixes 4096 but regresses 256/1024 worst-row.
+   Bounded diagnostic: patch row 863 has dominant channel 514; block-27 cosine
+   0.99997 collapses at merger LayerNorm (0.588 versus BF16's 0.870).
+   Hypothesis: a massive-activation outlier and LN amplification, not a
+   demonstrated row-handling bug. Serving gates remain required before changing
+   the Qwen launcher default.
+   **WP-7 concurrency workload:** the Python concurrent benchmark defaults to
+   one identical prompt for every request (`scripts/bench/deepseek_v41/bench-concurrent-api.py:45`).
+   Qwen's retained C16 Copy comparison generated mostly lockstep lazy outputs
+   but diverse bucket outputs, so its ratio does not isolate matched expert
+   work. WP-7 task runners must pass `--distinct-prompts` for both Copy and
+   plain C16 arms, with the same deterministic nonce and per-request index;
+   qualify three interleaved pairs and their median before promotion. Preserve
+   the identical-prompt evidence as a separate workload, not a diverse-load
+   performance gate. The shared Rust `cuteafd-bench` concurrency panel already
+   uses a unique nonce per request and alternating code/summary prompts.
+   **Qwen TP4 admission:** published WP-7 C16 figures used the former
+   32,768-token default KV pool and were admission-limited to seven active
+   requests, not by EXL3 slots. The retained 104/105-token prompts plus a
+   4096-token output budget and 64-row verify slack reserve seventeen
+   256-token units per request; only seven fit in 128 units. Qwen's launcher
+   now selects `POOL_TOKENS=auto` (explicit fixed pools still override), using
+   existing free-memory admission after resident weights with workspace,
+   state, prefix, graph and headroom reserves. A fresh identical-config A/B
+   uses 73,728 tokens in both arms so all sixteen requests fit. The distinct
+   three-pair full-width medians pass the 0.98 floor for plain and Copy;
+   startup graphs now default on for serving, with `QWEN_STARTUP_GRAPHS=off`
+   restoring lazy capture. Golden/diagnostic engines keep exact-shape behavior.
+   Before KV allocation, admission solves the candidate pool's enumerated
+   graph count (actual context, layers, sequence count and speculative modes)
+   times the 2026-10-07 measured 149,712 bytes/graph, plus a margin of the
+   larger of 10% or 256 MiB; headroom remains a separate reserve. The prior
+   fixed 0.5 GiB serving estimate is not used for startup graphs. The
+   default-unset confirmation after V4 Pro calibration passes C1 Copy and
+   plain C16 single-pair floors, with zero capture deltas in both candidate
+   warmup/measurement intervals and byte-identical paired plain outputs.
+   Auto KV admits 2,097,152 tokens; enumerated and captured graph counts agree,
+   measured graph bytes fit the graph reserve, and post-startup CUDA free
+   exceeds the separate headroom. Readiness is measured at the first genuine
+   completion, not API-open. This confirms the promoted image, not a new
+   three-pair performance measurement; VISION stays off.
+   **Qwen multimodal maximum:** requested 2 RTX + 4 Sparks, effective 1 RTX
+   + 4 Sparks, correctness only; Qwen has no coordinator head split and the
+   second RTX is idle. Qualify Spark `VISION=auto` startup/readiness, image
+   QA, prefix a/e, one-image stall and proxy encoder loss on that layout.
+   Placing the encoder on the idle second RTX is a future planner option,
+   not part of this bring-up; do not claim two-RTX LM parity.
+   **Media-cache merge policy:** shared cache admission distinguishes a single
+   image larger than total capacity (permanent 400, `image needs N bytes > media
+   cache capacity M`) from capacity sufficient but pinned entries preventing
+   admission (transient 503 with `Retry-After: 1`). Qwen implements both; apply
+   the same pressure mapping to MiMo at integration (currently 400); GLM Flash
+   already maps pressure to 503. Qwen warns at startup when configured cache
+   bytes are below max admissible tokens times BF16 feature-row bytes, naming
+   both byte counts; add the warning to MiMo and GLM Flash at integration.
+   Do not reject/clamp deliberately tiny G7 eviction-test quotas. The shared
+   `ImageTooLarge` variant must stay in each family's permanent-400 fallback.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop

@@ -59,7 +59,7 @@ fn official_budgets_caps_and_patch_layout() {
         let image = config
             .prepare_rgb(rgb(6000, 4000), EncoderId([0; 32]))
             .unwrap();
-        assert!(image.tokens <= 4096);
+        assert!(image.tokens <= config.max_image_tokens);
         let low = config
             .with_detail(true)
             .prepare_rgb(rgb(1000, 600), EncoderId([0; 32]))
@@ -79,6 +79,23 @@ fn official_budgets_caps_and_patch_layout() {
     assert!(ProcessorConfig::for_family(ImageFamily::Mimo)
         .resize_shape(0, 1)
         .is_err());
+}
+#[test]
+fn qwen_snapshot_pixel_budget_cannot_raise_the_family_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("preprocessor_config.json"),
+        r#"{"min_pixels":65536,"max_pixels":16777216}"#).unwrap();
+    let config = ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Qwen).unwrap();
+    assert_eq!(config.max_image_tokens, QWEN_MAX_IMAGE_TOKENS);
+    assert_eq!(config.effective_max(), 1024 * 32 * 32);
+    let low = config.with_detail(true);
+    assert_eq!(low.max_image_tokens, 256);
+    assert_eq!(low.effective_max(), 256 * 32 * 32);
+    let mut old = config.clone();
+    old.max_image_tokens = 4096;
+    assert_ne!(old.id(), config.id());
+    assert_eq!(ProcessorConfig::for_family(ImageFamily::Mimo).max_image_tokens, 4096);
+    assert_eq!(ProcessorConfig::for_family(ImageFamily::GlmFlash).max_image_tokens, 4096);
 }
 #[test]
 fn snapshot_processor_overrides_defaults_and_rejects_bad_config() {

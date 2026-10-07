@@ -164,17 +164,27 @@ struct ProbeRequest {
     spec: cuteafd_api::openai::probe::ProbeSpec,
 }
 
+fn probe_error(error: anyhow::Error) -> Response {
+    let status = if error.downcast_ref::<StartError>().is_some_and(|e| matches!(e, StartError::Busy(_))) {
+        StatusCode::CONFLICT
+    } else if let Some(upstream) = error.downcast_ref::<crate::client::UpstreamHttpError>() {
+        let status = StatusCode::from_u16(upstream.code).unwrap_or(StatusCode::BAD_GATEWAY);
+        if serde_json::from_str::<serde_json::Value>(&upstream.body).is_ok() {
+            return (status, [(header::CONTENT_TYPE, "application/json")], upstream.body.clone()).into_response();
+        }
+        status
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(json!({"error": {"message": format!("{error:#}")}}))).into_response()
+}
+
 async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
     Json(request): Json<ProbeRequest>) -> Response {
     if !authorized(&bench, peer(connect), &headers) { return forbidden(); }
     match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
         Ok(Ok(chat)) => Json(chat).into_response(),
-        Ok(Err(error)) => {
-            let status = if error.downcast_ref::<StartError>().is_some_and(|e| matches!(e, StartError::Busy(_))) {
-                StatusCode::CONFLICT
-            } else { StatusCode::BAD_REQUEST };
-            (status, Json(json!({"error": {"message": format!("{error:#}")}}))).into_response()
-        }
+        Ok(Err(error)) => probe_error(error),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -313,6 +323,36 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_preserves_typed_upstream_status_and_message() {
+        for code in [400, 429, 503] {
+            let error = anyhow::Error::new(crate::client::UpstreamHttpError {
+                code, body: "vision encoder unavailable".into(),
+            }).context("probe chat");
+            let response = probe_error(error);
+            assert_eq!(response.status().as_u16(), code);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"]["message"].as_str().unwrap().contains("vision encoder unavailable"));
+        }
+        assert_eq!(probe_error(StartError::Busy("active".into()).into()).status(), StatusCode::CONFLICT);
+        assert_eq!(probe_error(anyhow::anyhow!("invalid probe")).status(), StatusCode::BAD_REQUEST);
+        // A string resembling an HTTP error is not an upstream status contract.
+        assert_eq!(probe_error(anyhow::anyhow!("HTTP 503: invalid input")).status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn probe_passes_upstream_json_body_through_verbatim() {
+        let body = format!("{{ \"error\": {{\"message\":\"vision encoder unavailable\",\"type\":\"native_v41_error\"}}, \"detail\":\"{}\" }}", "x".repeat(512));
+        let error = anyhow::Error::new(crate::client::UpstreamHttpError { code: 503, body: body.clone() })
+            .context("probe chat");
+        let response = probe_error(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(bytes.as_ref(), body.as_bytes());
+    }
 
     #[tokio::test]
     async fn probe_control_requires_authorization_before_execution() {

@@ -154,6 +154,17 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           env=env, capture_output=True, text=True, timeout=30)
 
 
+@pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
+def test_qwen_startup_graph_default_is_owned_by_engine(tmp_path, setting, expected):
+    keys = "" if not setting else f"QWEN_STARTUP_GRAPHS={setting}\n"
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", keys)
+    assert result.returncode == 0, result.stderr
+    if expected is None:
+        assert "CUTEAFD_QWEN4_STARTUP_GRAPHS=" not in result.stderr
+    else:
+        assert f"CUTEAFD_QWEN4_STARTUP_GRAPHS={expected}" in result.stderr
+
+
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
     result = _family_launch_result(tmp_path, config, "test/model",
@@ -507,17 +518,19 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
 
 
 @pytest.mark.parametrize("quota", [None, "4MiB", "0"])
-@pytest.mark.parametrize("family,serve", [("mimo_v2_flash", "serve-mimo"), ("glm5_next", "serve-glmf")])
-def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, family, serve):
-    config = {"model_type": family, "num_hidden_layers": 2}
-    config.update({"moe_layer_freq": [0, 1]} if family == "mimo_v2_flash" else
-                  {"mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]})
-    keys = "SPECULATOR=off\n" + ("" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n")
-    model = "test/mimo" if family == "mimo_v2_flash" else "zai-org/GLM-5.3-Flash"
+@pytest.mark.parametrize("vision", ["off", "auto"])
+@pytest.mark.parametrize("checkpoint,serve", [("mimo_flash", "serve-mimo"), ("qwen4", "serve-qwen4"),
+                                              ("glmf", "serve-glmf")])
+def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, vision, checkpoint, serve):
+    config = (SPLIT_CONFIGS[checkpoint] if checkpoint != "glmf" else
+              {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+               "layer_types": ["linear_attention", "deepseek_sparse_attention"]})
+    keys = f"VISION={vision}\nSPECULATOR=off\n" + ("" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n")
+    model = "zai-org/GLM-5.3-Flash" if checkpoint == "glmf" else f"test/{checkpoint}"
     result = _family_launch_result(tmp_path, config, model, keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
-    if quota is None:
+    if quota is None or vision == "off":
         assert "--media-cache-bytes" not in launch
     else:
         assert f"--media-cache-bytes {quota}" in launch
@@ -703,7 +716,18 @@ def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
     default = _family_launch_lines(tmp_path / "b", config, "Qwen/Qwen3.8-Flash-Next", "")
     launch = [l for l in default.splitlines() if "cuteafd serve-qwen4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
-    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens 0" in launch[0]
+
+
+@pytest.mark.parametrize("setting, expected", [("", "0"), ("auto", "0"), ("73728", "73728")])
+def test_qwen_pool_defaults_to_free_memory_admission(tmp_path: Path, setting: str, expected: str) -> None:
+    config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+                                                         "layer_types": ["linear_attention", "full_attention"]}}
+    result = _family_launch_result(tmp_path, config, "Qwen/Qwen3.8-Flash-Next",
+                                  "POOL_TOKENS=" + setting + "\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--pool-tokens " + expected in launch
 
 
 def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
@@ -1137,3 +1161,28 @@ def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
                                    "GLM5_FLASH_FP8_MODEL_ID=off\nRDMA_BOND_BALANCE=yes\n")
     assert result.returncode == 2 and "RDMA_BOND_BALANCE must be off, labels or probe" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+@pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"),
+                                        ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
+def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
+    config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+              "layer_types": ["linear_attention", "full_attention"]}, "vision_config": {"depth": 27}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    vision_key = f"VISION={mode}\n" if mode is not None else ""
+    result = _family_launch_result(tmp_path, config, "test/qwen", f"{vision_key}RTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert f"--vision {kind}" in launch
+    assert ("--encoder-listen" in worker) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in worker
+        assert f"--encoder-plan-hash {'ab' * 32}" in launch
+        assert "--encoder-max-tokens 1024" in worker
+        assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
+    if kind == "off":
+        assert "cuteafd plan" not in result.stderr

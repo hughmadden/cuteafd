@@ -892,6 +892,8 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
             }
             Err(_) => (0, 0),
         }
+    } else if report.family.as_deref() == Some("qwen4") && source_bytes > 0 {
+        (898_680_904, qwen_scratch_bytes(crate::media::QWEN_MAX_IMAGE_TOKENS as u64))
     } else { (source_bytes, 512 * MIB) };
     let hardware = EncoderHardware { v41: false,
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
@@ -932,4 +934,14 @@ fn mimo_scratch_bytes(width: u64) -> u64 {
     [n*1280*4,n*1280*4,n*1280*2,n*1536*2,n*2048*2,n*512*2,n*512*2,n*2048*2,4096*width*2,
      4096*3072*4,4096*1280*4,4096*2*4608*4,4096*4608*2,4096*5120*4,4096*5120*2,4096*width*4,
      n*16*16*3,3*256*4,n*2*4,n*2*4,4096*4,4096*4,4*MIB].into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+/// Mirrors scratch_qwen, including fixed staging, LSE and the BLAS workspace.
+fn qwen_scratch_bytes(tokens: u64) -> u64 {
+    let n = tokens * 4;
+    [n*1152*4, n*1152*4, n*1152*2, n*1536*2, n*1152*2, n*1152*2,
+     n*1152*2, n*1152*2, tokens*2560*2, 4096*3456*4, 4096*1152*4,
+     4096*4304*4, 4096*4304*2, 4096*4608*4, 4096*4608*2, 4096*2560*4,
+     n*16*16*3, 3*256*4, n*2*4, n*4*4, n*4*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }

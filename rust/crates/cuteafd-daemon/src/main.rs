@@ -28,10 +28,25 @@ fn resolve_vision(
     family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Auto)
 }
 
+fn resolve_qwen_vision(
+    family: Option<cuteafd_loader::plan::MediaMode>,
+    initial: Option<cuteafd_loader::plan::MediaMode>,
+) -> cuteafd_loader::plan::MediaMode {
+    family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Off)
+}
+
 #[cfg(test)]
 mod media_defaults_tests {
-    use super::resolve_vision;
+    use super::{resolve_qwen_vision, resolve_vision};
     use cuteafd_loader::plan::MediaMode;
+
+    #[test]
+    fn qwen_vision_stays_off_until_explicitly_enabled() {
+        assert_eq!(resolve_qwen_vision(None, None), MediaMode::Off);
+        assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Auto)), MediaMode::Auto);
+        assert_eq!(resolve_qwen_vision(Some(MediaMode::Off), Some(MediaMode::Auto)), MediaMode::Off);
+        assert_eq!(resolve_qwen_vision(Some(MediaMode::Spark(Some(0))), None), MediaMode::Spark(Some(0)));
+    }
 
     #[test]
     fn qualified_vision_defaults_auto_and_preserves_explicit_off() {
@@ -67,11 +82,18 @@ async fn main() -> Result<()> {
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
     };
-    let vision = resolve_vision(family_vision, initial_vision);
+    let vision = if matches!(&command, Commands::ServeQwen4(_)) {
+        resolve_qwen_vision(family_vision, initial_vision)
+    } else {
+        resolve_vision(family_vision, initial_vision)
+    };
     let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; }
     if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
+    if let Commands::ServeQwen4(args) = &mut command {
+        args.vision = vision;
+    }
     cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
         audio != cuteafd_loader::plan::MediaMode::Off);
     cuteafd_api::openai::media::set_preparation_policy(

@@ -35,7 +35,8 @@ use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -43,6 +44,43 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
+const PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];
+const SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
+// Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
+const GLM_BF16_SKINNY_ROWS: usize = 8;
+const QWEN_WIDE_SKINNY_ROWS: usize = 24;
+const QWEN_MEDIUM_SKINNY_ROWS: usize = 64;
+const QWEN_SMALL_SKINNY_ROWS: usize = 160;
+const FP8_PROJECTION_SKINNY_ROWS: usize = 16;
+const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
+    ProjectionThreshold { name: "gdn.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "gdn.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
+    ProjectionThreshold { name: "hc.down_inject", skinny_rows: QWEN_SMALL_SKINNY_ROWS },
+    ProjectionThreshold { name: "head.mixer_down", skinny_rows: QWEN_SMALL_SKINNY_ROWS },
+    ProjectionThreshold { name: "ple.kv", skinny_rows: QWEN_WIDE_SKINNY_ROWS },
+    ProjectionThreshold { name: "router.scores", skinny_rows: QWEN_MEDIUM_SKINNY_ROWS },
+    ProjectionThreshold { name: "shared.gate_up", skinny_rows: QWEN_MEDIUM_SKINNY_ROWS },
+    ProjectionThreshold { name: "mtp.feedback", skinny_rows: QWEN_WIDE_SKINNY_ROWS },
+    ProjectionThreshold { name: "gdn.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
+    ProjectionThreshold { name: "attention.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
+];
+
+pub(super) fn startup_graphs_enabled(graphs: Option<&str>, startup: Option<&str>) -> bool {
+    graphs != Some("0") && startup.map_or(true, |value| value == "1")
+}
+
+fn decode_bucket(rows: usize, spec: bool) -> usize {
+    let buckets = if spec { SPEC_BUCKETS } else { PLAIN_BUCKETS };
+    buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
+}
+
+pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
+    SPEC_BUCKETS.iter().copied().filter(|&bucket| bucket <= rows && bucket >= sequences)
+        .last().unwrap_or(sequences)
+}
+
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 K/V record of one token: K [2, 256] then V [2, 256].
@@ -223,6 +261,7 @@ pub(crate) struct Qwen4Placement {
     /// Request metadata from native ids/span grids, recomputed on prefix restore.
     /// Never radix keys; rotary coordinates never change logical cache rows.
     pub rope: cuteafd_loader::families::qwen4::RopePositions,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl Qwen4Placement {
@@ -231,7 +270,7 @@ impl Qwen4Placement {
         let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
             .collect();
         let pool_pages = units.iter().map(|&u| u as i32).collect();
-        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default() }
+        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default(), media: None }
     }
 
     pub fn record(&self, position: usize) -> Result<i64> {
@@ -247,6 +286,28 @@ impl Qwen4Placement {
         let page = *self.pool_pages.get(position / POOL_PAGE_TOKENS).context("position past the pool pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + ((position / BLOCK) % PAGE_ROWS) as i64)
     }
+}
+
+/// Pack media rows in the same order as native token gathers (MTP uses p+1).
+fn embedding_media(groups: &[(&Qwen4Placement, usize, usize)]) -> Result<cuteafd_engine::media::MediaChunk> {
+    let mut packed = cuteafd_engine::media::MediaChunk::default();
+    let mut offset = 0usize;
+    for &(placement, start, rows) in groups {
+        if let Some(media) = placement.media.as_ref().filter(|media| media.needed(start, start + rows).next().is_some()) {
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            media.write_chunk(start, start + rows, &mut chunk)?;
+            packed.indices.extend(chunk.indices.iter().map(|&index| index + offset as u32));
+            packed.features.extend(chunk.features);
+        }
+        offset += rows;
+    }
+    Ok(packed)
+}
+
+fn mtp_embedding_media(groups: &[MtpGroup<'_>]) -> Result<cuteafd_engine::media::MediaChunk> {
+    let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()
+        .map(move |row| (group.placement, row.position + 1, 1))).collect();
+    embedding_media(&rows)
 }
 
 /// The n-gram history after `tokens` (the PLE hash's context is a pure function of the token ids:
@@ -265,6 +326,123 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
+        use super::startup_graphs_enabled;
+        assert!(startup_graphs_enabled(None, None));
+        assert!(startup_graphs_enabled(None, Some("1")));
+        assert!(!startup_graphs_enabled(None, Some("0")));
+        assert!(!startup_graphs_enabled(Some("0"), None));
+        assert!(!startup_graphs_enabled(Some("0"), Some("1")));
+    }
+
+    #[test]
+    fn serving_graph_counts_and_modes_cover_the_qualified_layout() {
+        use super::*;
+        assert_eq!(graph_geometries(32768, 512, 2051).len(), 40);
+        let shapes = serving_graph_shapes(32768, 512, 2051, 16, true);
+        assert_eq!(shapes.len() * 49, 21560);
+        let modes: std::collections::HashSet<_> = shapes.iter().map(|&(rows, spec, _)| (rows, spec)).collect();
+        assert_eq!(modes, [(1, false), (4, false), (8, false), (16, false),
+            (2, true), (4, true), (8, true), (16, true), (24, true), (32, true), (64, true)].into());
+        assert_eq!(serving_graph_shapes(32768, 512, 2051, 16, false).len() * 49, 7840);
+        assert_eq!(graph_geometries(8192, 128, 2051).len(), 23);
+    }
+
+    #[test]
+    fn decode_buckets_preserve_registered_arithmetic_routes() {
+        use super::*;
+        check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
+        check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
+        for (real, spec, bucket) in [(5, false, 8), (9, false, 16), (3, true, 4),
+            (5, true, 8), (9, true, 16), (17, true, 24), (25, true, 32), (33, true, 64)] {
+            assert_eq!(decode_bucket(real, spec), bucket);
+            for projection in DECODE_PROJECTION_THRESHOLDS {
+                assert_eq!(real <= projection.skinny_rows, bucket <= projection.skinny_rows, "{}", projection.name);
+            }
+        }
+        assert_eq!(decode_bucket(2, true), 2);
+        assert_eq!(decode_bucket(24, true), 24);
+    }
+
+    #[test]
+    fn startup_geometries_cover_all_reachable_lengths_and_allocations() {
+        use super::*;
+        for (context, pages) in [(1, 4), (255, 4), (257, 8), (4096, 64), (8192, 128), (32768, 512), (8192, 100)] {
+            let geometries = graph_geometries(context, pages, 2051);
+            for units in 1..=context.div_ceil(UNIT_ROWS).min(pages / UNIT_PAGES) {
+                let pool_stride = units.next_power_of_two().min(pages / UNIT_PAGES);
+                let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+                for length in 1..=(units * UNIT_ROWS).min(context) {
+                    let geometry = GraphGeometry { pool_width: length.div_ceil(UNIT_ROWS).next_power_of_two().min(pool_stride),
+                        pool_stride, page_stride, long: length > 2051 };
+                    assert!(geometries.contains(&geometry), "context {context} units {units} length {length}: {geometry:?}");
+                }
+            }
+            let unique: std::collections::HashSet<_> = geometries.iter().collect();
+            assert_eq!(unique.len(), geometries.len());
+        }
+    }
+
+    #[test]
+    fn padding_masks_every_tail_and_preserves_native_real_rows() {
+        use super::*;
+        for real in 1..=64 {
+            for ple_rows in [0, 16] {
+                let mut tables = StepTables { page_stride: 4, pool_stride: 2,
+                    positions: vec![17; real], rope_positions: vec![[2, 3, 4]; real],
+                    block_rope_positions: vec![[1, 2, 3]; real], kv_slots: vec![29; real],
+                    pool_slots: vec![7; real], slots: vec![2; real], seq_first: vec![0; real],
+                    cache_lengths: vec![4; real], page_table: vec![3; real * 4], pool_table: vec![5; real * 2],
+                    ple_ids: vec![9; real * ple_rows], ..Default::default() };
+                let mut tokens = vec![248056; real];
+                let bucket = decode_bucket(real, true);
+                pad_decode_tables(&mut tables, &mut tokens, bucket, ple_rows);
+                assert_eq!(tokens.len(), bucket);
+                assert_eq!(&tokens[..real], vec![248056; real]);
+                assert_eq!(&tables.positions[..real], vec![17; real]);
+                assert_eq!(&tables.ple_ids[..real * ple_rows], vec![9; real * ple_rows]);
+                for row in real..bucket {
+                    assert_eq!((tokens[row], tables.positions[row], tables.kv_slots[row], tables.pool_slots[row],
+                        tables.slots[row], tables.seq_first[row], tables.cache_lengths[row]),
+                        (0, -1, -1, -1, -1, row as i32, 0));
+                    assert_eq!(tables.rope_positions[row], [0; 3]);
+                    assert_eq!(tables.block_rope_positions[row], [0; 3]);
+                }
+                assert!(tables.page_table[real * 4..].iter().all(|&p| p == 0));
+                assert!(tables.pool_table[real * 2..].iter().all(|&p| p == 0));
+                assert!(tables.ple_ids[real * ple_rows..].iter().all(|&p| p == 0));
+                assert_eq!(tables.page_table.len(), bucket * 4);
+                assert_eq!(tables.pool_table.len(), bucket * 2);
+                assert_eq!(tables.ple_ids.len(), bucket * ple_rows);
+            }
+        }
+    }
+
+    #[test]
+    fn media_gathers_pack_sequences_and_shift_mtp_by_one_native_row() {
+        use cuteafd_engine::media::{EmbeddingCache, ImageKey, MediaSpan, RequestMedia};
+        let key = ImageKey([7;32]);
+        let mut cache = EmbeddingCache::new(16);
+        let pin = cache.reserve(key, 16).unwrap();
+        let payload: Vec<u8> = (0..16).collect();
+        let lease = cache.complete(key, std::sync::Arc::from(payload.clone())).unwrap();
+        let mut media = RequestMedia::new(vec![MediaSpan { start: 2, len: 4, key }], 2, 8).unwrap();
+        media.attach(lease).unwrap(); drop(pin);
+        let mut image = super::Qwen4Placement::new(vec![0], 0, super::NgramHistory(vec![0]));
+        image.media = Some(media);
+        let text = super::Qwen4Placement::new(vec![1], 1, super::NgramHistory(vec![0]));
+        let packed = super::embedding_media(&[(&text, 0, 2), (&image, 1, 6)]).unwrap();
+        assert_eq!(packed.indices, [3,4,5,6]); assert_eq!(packed.features, payload);
+        // MTP row p embeds token p+1, including the first image row.
+        let shifted = super::mtp_embedding_media(&[super::MtpGroup { placement: &image, rows: vec![
+            super::MtpRow { position: 1, token: 248056, source: 0 },
+            super::MtpRow { position: 4, token: 248056, source: 1 },
+        ] }]).unwrap();
+        assert_eq!(shifted.indices, [0,1]); assert_eq!(shifted.features, [0,1,2,3,12,13,14,15]);
+        assert!(super::embedding_media(&[(&image, 8, 2)]).unwrap().indices.is_empty());
+    }
 
     #[test]
     fn fp8_head_spans_cover_every_logits_row_once() {
@@ -356,6 +534,7 @@ impl Allocator {
             Ok(fork) => {
                 let mut placement = Qwen4Placement::new(fork.pages, slot, history_of(&self.cfg, tokens));
                 placement.rope = source.rope.clone();
+                placement.media = source.media.clone();
                 Ok((placement, fork.copy))
             },
             Err(error) => {
@@ -531,6 +710,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub profile: RefCell<[f64; 2]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    startup_graphs: bool,
+    warming_graphs: Cell<bool>,
     /// Prefill programs over FP8-only projections quantize their activations
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
@@ -543,6 +724,73 @@ pub(crate) struct Qwen4Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, DECODE_ROWS].
     mtp_drafts: Dev<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphGeometry {
+    pool_width: usize,
+    page_stride: usize,
+    pool_stride: usize,
+    long: bool,
+}
+
+fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
+    let pools = pages / UNIT_PAGES;
+    let mut geometries = Vec::new();
+    for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
+        let pool_stride = units.next_power_of_two().min(pools);
+        let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+        let capacity = (units * UNIT_ROWS).min(context);
+        let mut width = 1;
+        while width / 2 * UNIT_ROWS < capacity {
+            let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
+            let high = (width * UNIT_ROWS).min(capacity);
+            for long in [false, true] {
+                if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                    let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                    if !geometries.contains(&geometry) { geometries.push(geometry); }
+                }
+            }
+            width *= 2;
+        }
+    }
+    geometries
+}
+
+pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usize,
+    sequences: usize, speculation: bool, layers: usize) -> Result<usize> {
+    let pages = pool_tokens.div_ceil(UNIT_ROWS).checked_mul(UNIT_PAGES)
+        .context("Qwen graph page count overflow")?;
+    serving_graph_shapes(context, pages, dense, sequences, speculation).len()
+        .checked_mul(layers.checked_add(1).context("Qwen graph segment count overflow")?)
+        .context("Qwen graph count overflow")
+}
+
+fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
+    -> Vec<(usize, bool, GraphGeometry)> {
+    let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
+    graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
+        PLAIN_BUCKETS.iter().copied().filter(move |&rows| rows <= plain).map(move |rows| (rows, false, geometry))
+            .chain(SPEC_BUCKETS.iter().copied().filter(move |_| speculation).map(move |rows| (rows, true, geometry)))
+    }).collect()
+}
+
+fn pad_decode_tables(tables: &mut StepTables, tokens: &mut Vec<u32>, bucket: usize, ple_rows: usize) {
+    while tables.kv_slots.len() < bucket {
+        let row = masked_row(tables.kv_slots.len());
+        tokens.push(0);
+        tables.positions.push(row.position);
+        tables.rope_positions.push([0; 3]);
+        tables.block_rope_positions.push([0; 3]);
+        tables.kv_slots.push(row.kv_slot);
+        tables.pool_slots.push(row.pool_slot);
+        tables.slots.push(row.state_slot);
+        tables.seq_first.push(row.seq_first);
+        tables.cache_lengths.push(row.cache_length);
+        tables.page_table.extend(std::iter::repeat_n(0, tables.page_stride));
+        tables.pool_table.extend(std::iter::repeat_n(0, tables.pool_stride));
+        tables.ple_ids.extend(std::iter::repeat_n(0, ple_rows));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -637,13 +885,181 @@ impl<'a> Qwen4Engine<'a> {
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"), w8a8_prefill: false,
+            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
+            startup_graphs: false,
+            warming_graphs: Cell::new(false), w8a8_prefill: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
 
+    pub(super) fn enable_startup_graphs(&mut self) {
+        self.startup_graphs = startup_graphs_enabled(
+            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
+            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
+    }
+
     pub fn set_experts(&mut self, experts: Experts<'a>) {
         self.experts = Some(experts);
+    }
+
+    /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
+    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
+        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        ensure!(sequences <= *PLAIN_BUCKETS.last().unwrap(),
+            "Qwen startup graphs support at most 16 concurrent sequences");
+        check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
+        check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
+        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
+        let segments = self.weights.layers.len() + 1;
+        let expected = shapes.len() * segments;
+        tracing::info!(graphs = expected, shapes = shapes.len(), plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS,
+            "Qwen startup decode graph admission");
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true, DECODE_ROWS)?);
+        }
+        // SAFETY: this engine owns the stream and all persistent graph buffers.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        let before = self.library.cuda_physical_memory_info()?.0;
+        let started = std::time::Instant::now();
+        self.warming_graphs.set(true);
+        let captured = (|| -> Result<()> {
+            for &(rows, spec, geometry) in &shapes {
+                let mut tables = StepTables { decode: true, spec, long: geometry.long,
+                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                    page_width: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
+                let mut tokens = Vec::new();
+                pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+                self.step(&tables, &tokens, rows, None, None, &Default::default(), true)?;
+            }
+            // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
+            unsafe { self.library.cuda_stream_synchronize(self.stream) }
+        })();
+        // SAFETY: even a failed sweep must drain work before its buffers can be released.
+        let drained = unsafe { self.library.cuda_stream_synchronize(self.stream) };
+        self.warming_graphs.set(false);
+        captured?;
+        drained?;
+        let graphs = self.captured_graphs();
+        ensure!(graphs == expected, "Qwen startup captured {graphs} graphs, expected {expected}");
+        for &(rows, spec, geometry) in &shapes {
+            for segment in 0..segments {
+                ensure!(self.graphs.borrow().contains_key(&GraphKey { segment, rows, spec,
+                    long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                    pool_stride: geometry.pool_stride }), "Qwen startup graph coverage missing");
+            }
+        }
+        let after = self.library.cuda_physical_memory_info()?.0;
+        tracing::info!(graphs, elapsed_ms = started.elapsed().as_millis() as u64,
+            graph_bytes = before as i64 - after as i64, "Qwen decode graphs captured at startup");
+        Ok(graphs)
+    }
+
+    /// Compare real logits and persistent cache/state bytes, including unused storage.
+    /// Run only before serving: this diagnostic owns its allocator and state slots.
+    pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(self.use_graphs && self.startup_graphs && self.weights.layers.len() == self.cfg.layers,
+            "Qwen padding check needs all layers and startup graphs");
+        ensure!(tokens.len() >= 69 && self.max_context >= 69 && self.slots >= 10 && self.pages >= 40,
+            "Qwen padding check needs 69 tokens, ten slots and forty pages");
+        let snapshot = |buffers: &[cuteafd_ffi::CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
+            // SAFETY: drain all writes before reading the live diagnostic regions.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            buffers.iter().map(|&buffer| {
+                let mut bytes = vec![0; buffer.bytes];
+                self.library.copy_d2h(&mut bytes, buffer)?;
+                Ok(bytes)
+            }).collect()
+        };
+        for (sequences, width, spec) in [(5, 1, false), (9, 1, false),
+            (1, 3, true), (1, 5, true), (1, 9, true), (1, 17, true), (1, 25, true), (1, 33, true)] {
+            let mut allocator = Allocator::new(self.pages, self.slots, &self.cfg);
+            let mut placements: Vec<_> = (0..sequences).map(|_| allocator.admit(65)).collect::<Result<_>>()?;
+            for placement in &mut placements {
+                self.prefill_device(placement, &tokens[..32], None, None, 1)?;
+            }
+            let original = placements.clone();
+            let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.ple_state]
+                .into_iter().filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+            for [kv, keys, pools] in self.paged_buffers() {
+                // Snapshot complete pools: any masked-row write, even outside the live sequences, fails.
+                buffers.extend([kv, keys, pools]);
+            }
+            let before = snapshot(&buffers)?;
+            let input = &tokens[32..32 + width];
+            let mut groups: Vec<_> = placements.iter_mut().map(|p| (p, input)).collect();
+            let plain = self.verify_device_ungraphed(&mut groups, spec)?
+                .context("Qwen padding check logits")?.to_host(self.library)?;
+            let plain_state = snapshot(&buffers)?;
+            for (&buffer, bytes) in buffers.iter().zip(&before) { self.library.copy_h2d(buffer, bytes)?; }
+            placements = original;
+            let mut groups: Vec<_> = placements.iter_mut().map(|p| (p, input)).collect();
+            let logits = self.verify_device(&mut groups, spec)?.context("Qwen padding check logits")?;
+            let padded = logits.to_host(self.library)?;
+            let rows = sequences * width;
+            let (ids, statuses) = logits.greedy.context("Qwen padded greedy selection missing")?;
+            let device = self.library.cuda_get_device()?;
+            let mut selected = vec![0u8; rows * 4];
+            let mut status = vec![0u8; rows * 4];
+            for (ptr, bytes) in [(ids, &mut selected), (statuses, &mut status)] {
+                self.library.copy_d2h(bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+                    ptr: ptr.cast_mut(), bytes: rows * 4, device_id: device, ..Default::default()
+                })?;
+            }
+            ensure!(status.iter().all(|&byte| byte == 0), "Qwen padded greedy selection/status failed");
+            for (row, id) in selected.chunks_exact(4).enumerate() {
+                let values = &padded[row * self.cfg.vocab_size..][..self.cfg.vocab_size];
+                let expected = (1..values.len()).fold(0, |best, i| if values[i] > values[best] { i } else { best });
+                ensure!(u32::from_le_bytes(id.try_into()?) as usize == expected, "Qwen padded greedy id differs");
+            }
+            ensure!(plain.len() == padded.len() && plain.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "Qwen decode padding {rows}->{} changed real-row logits", decode_bucket(rows, spec));
+            ensure!(snapshot(&buffers)? == plain_state,
+                "Qwen decode padding {rows}->{} changed persistent cache/state bytes", decode_bucket(rows, spec));
+            tracing::info!(rows, spec, bucket = decode_bucket(rows, spec), bytes = plain.len() * 4,
+                "Qwen padded decode logits and cache/state byte-exact");
+        }
+        // Exercise the serving trim helper before comparing exact-width arithmetic.
+        let mut sequences = vec![tokens[32..69].to_vec()];
+        let before_rows = sequences[0].len();
+        let limit = self.copy_verify_row_limit(before_rows, sequences.len(), false);
+        super::serve::trim_copy_rows(&mut sequences, limit);
+        let input = sequences[0].as_slice();
+        ensure!(before_rows == 37 && input.len() == 32 && input == &tokens[32..64],
+            "Qwen copy trim byte gate must preserve the 37->32 proposal prefix");
+        let mut allocator = Allocator::new(self.pages, self.slots, &self.cfg);
+        let mut placement = allocator.admit(69)?;
+        self.prefill_device(&mut placement, &tokens[..32], None, None, 1)?;
+        let original = placement.clone();
+        let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.ple_state]
+            .into_iter().filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+        for [kv, keys, pools] in self.paged_buffers() { buffers.extend([kv, keys, pools]); }
+        let before = snapshot(&buffers)?;
+        let exact = self.verify_device_ungraphed(&mut [(&mut placement, input)], true)?
+            .context("Qwen exact copy-trim logits")?.to_host(self.library)?;
+        let exact_state = snapshot(&buffers)?;
+        for (&buffer, bytes) in buffers.iter().zip(&before) { self.library.copy_h2d(buffer, bytes)?; }
+        placement = original;
+        let trimmed = self.verify_device(&mut [(&mut placement, input)], true)?
+            .context("Qwen bucketed copy-trim logits")?.to_host(self.library)?;
+        ensure!(exact.len() == trimmed.len() && exact.iter().zip(&trimmed).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "Qwen copy trim 37->32 changed exact-width real-row logits");
+        ensure!(snapshot(&buffers)? == exact_state, "Qwen copy trim 37->32 changed persistent cache/state bytes");
+        tracing::info!(before_rows, rows = input.len(), bucket = decode_bucket(input.len(), true),
+            bytes = exact.len() * 4, "Qwen copy trim logits and cache/state byte-exact");
+        // SAFETY: finish the diagnostic before releasing its persistent engine buffers.
+        unsafe { self.library.cuda_stream_synchronize(self.stream) }
+    }
+
+    /// Copy proposals may shrink to a lower spec bucket, never dropping a sequence.
+    pub(crate) fn copy_verify_row_limit(&self, rows: usize, sequences: usize, diagnostic: bool) -> usize {
+        if self.startup_graphs && self.use_graphs && !diagnostic {
+            copy_row_limit(rows, sequences)
+        } else { rows }
+    }
+
+    /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.
+    pub(crate) fn verify_bucket_rows(&self, rows: usize, spec: bool, diagnostic: bool) -> usize {
+        if self.startup_graphs && self.use_graphs && !diagnostic { decode_bucket(rows, spec) } else { rows }
     }
 
     pub fn captured_graphs(&self) -> usize {
@@ -1032,7 +1448,8 @@ impl<'a> Qwen4Engine<'a> {
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
             page_stride: 0, pool_stride: 0, page_width: placement.pages.len(), ..Default::default() };
         self.rows(placement, tokens, 0, &mut tables)?;
-        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced)?;
+        let media = embedding_media(&[(placement, start, t)])?;
+        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced, &media, true)?;
         placement.len += t;
         placement.state_len = placement.len;
         Ok(logits)
@@ -1047,7 +1464,7 @@ impl<'a> Qwen4Engine<'a> {
     /// GDN and PLE state advance in place: a caller rejecting a suffix must replay.
     pub fn verify(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>)
         -> Result<Option<Vec<f32>>> {
-        self.verify_step(sequences, on_layer, false)?.map(|logits| logits.to_host(self.library)).transpose()
+        self.verify_step(sequences, on_layer, false, true)?.map(|logits| logits.to_host(self.library)).transpose()
     }
 
     /// [`Self::verify`] as a speculative step: the GDN and PLE state stay as
@@ -1057,21 +1474,27 @@ impl<'a> Qwen4Engine<'a> {
     /// are overwritten when those positions come again.
     pub fn verify_spec(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>)
         -> Result<Option<Vec<f32>>> {
-        self.verify_step(sequences, on_layer, true)?.map(|logits| logits.to_host(self.library)).transpose()
+        self.verify_step(sequences, on_layer, true, true)?.map(|logits| logits.to_host(self.library)).transpose()
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
     /// logits on the device, with the decode graph's greedy selection of them.
     pub fn verify_device(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], spec: bool)
         -> Result<Option<DeviceLogits>> {
-        self.verify_step(sequences, None, spec)
+        self.verify_step(sequences, None, spec, true)
+    }
+
+    /// Diagnostic probes retain exact row geometry and never capture serving graphs.
+    pub fn verify_device_ungraphed(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], spec: bool)
+        -> Result<Option<DeviceLogits>> {
+        self.verify_step(sequences, None, spec, false)
     }
 
     fn verify_step(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>,
-        spec: bool) -> Result<Option<DeviceLogits>> {
+        spec: bool, graphs: bool) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS, "decode step of {rows} rows");
-        let tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        let mut tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
         let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
@@ -1094,7 +1517,21 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, &tokens, rows, on_layer, None)?;
+        let media = if sequences.iter().any(|(p, t)| p.media.as_ref()
+            .is_some_and(|media| media.needed(p.len, p.len + t.len()).next().is_some())) {
+            let media_rows: Vec<_> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
+            embedding_media(&media_rows)?
+        } else { Default::default() };
+        let bucketed = self.startup_graphs && self.use_graphs && graphs && on_layer.is_none() && media.indices.is_empty();
+        if bucketed {
+            pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+        }
+        let physical_rows = tokens.len();
+        let mut logits = self.step(&tables, &tokens, physical_rows, on_layer, None, &media, graphs)?;
+        if let Some(logits) = logits.as_mut() {
+            // Greedy statuses remain after the physical bucket's ids, not the real rows.
+            logits.rows = rows;
+        }
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
             if !spec {
@@ -1289,6 +1726,11 @@ impl<'a> Qwen4Engine<'a> {
                     None, w.x.buffer, self.stream)? };
             }
         }
+        if matches!(tokens, MtpTokens::Host(_)) && groups.iter().any(|group| group.placement.media.as_ref()
+            .is_some_and(|media| group.rows.iter().any(|row| media.needed(row.position + 1, row.position + 2).next().is_some()))) {
+            let media = mtp_embedding_media(groups)?;
+            self.inject_media(w, &media, &tables.seq_first, &w.x, t, 1)?;
+        }
         let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
@@ -1368,8 +1810,18 @@ impl<'a> Qwen4Engine<'a> {
         self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
     }
 
+    fn inject_media(&self, w: &Workspace<'_>, media: &cuteafd_engine::media::MediaChunk,
+        seq_first: &[i32], out: &Dev<'_>, rows: usize, copies: usize) -> Result<()> {
+        if media.indices.is_empty() { return Ok(()); }
+        // Scratch is consumed before norm/feedback; injection drains before the
+        // reused sequence table is restored. Graph storage stays unchanged.
+        self.library.embedding_injection()?.inject_host(&media.features, &media.indices,
+            w.delta.buffer, w.seq_first.buffer, out.buffer, rows, self.cfg.hidden, copies, self.stream)?;
+        self.put(&w.seq_first, seq_first)
+    }
+
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
-        forced: Forced<'_>) -> Result<Option<DeviceLogits>> {
+        forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows) {
@@ -1405,8 +1857,9 @@ impl<'a> Qwen4Engine<'a> {
         // Streams start as four copies of the embedding.
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none();
+        let graphed = graphs && self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
         self.stage_embedding(w, tokens, HC, &w.streams[0], graphed)?;
+        self.inject_media(w, media, &tables.seq_first, &w.streams[0], t, HC)?;
         let rows = Scalar::I32(t as i32);
         if graphed {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
@@ -1555,6 +2008,13 @@ impl<'a> Qwen4Engine<'a> {
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
+        // Bucket tails are a contiguous suffix; expert batches must retain native geometry.
+        let real_rows = if self.startup_graphs {
+            tables.positions.iter().take_while(|&&position| position >= 0).count()
+        } else { t };
+        ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0),
+            "Qwen decode mask is not a contiguous tail");
+        let expert_rows = Scalar::I32(real_rows as i32);
         let mut cur = 0usize;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
@@ -1592,12 +2052,31 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                self.moe_front(w, index, layer, t, rows)
+                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
-                self.moe_experts(w, index, t, rows, true)?;
-                crate::shared::console::layer_mark(index);
+                if self.startup_graphs {
+                    let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
+                        let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
+                            tail.len() * self.cfg.hidden * 2);
+                        // SAFETY: the masked suffix is inside persistent delta; the next graph
+                        // consumes it on this same stream after the zero and expert output.
+                        unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.stream) }
+                    };
+                    if self.warming_graphs.get() {
+                        ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked");
+                        clear_tail(0..t)?;
+                    } else {
+                        real_row_moe(real_rows, t, |real_rows| {
+                            self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
+                            self.moe_experts(w, index, real_rows, expert_rows, true)
+                        }, clear_tail)?;
+                    }
+                } else if !self.warming_graphs.get() {
+                    self.moe_experts(w, index, t, rows, true)?;
+                }
+                if !self.warming_graphs.get() { crate::shared::console::layer_mark(index); }
             }
         }
         self.last_streams.set((true, cur));
@@ -1617,6 +2096,8 @@ impl<'a> Qwen4Engine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers.
             return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
         }
+        ensure!(!self.startup_graphs || self.warming_graphs.get(),
+            "Qwen serving graph was not captured at startup: {key:?}");
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };

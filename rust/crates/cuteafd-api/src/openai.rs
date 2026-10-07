@@ -708,7 +708,11 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let first = match receive.recv().await {
         Some(Ok(chunk)) => chunk,
         Some(Err(NativeFailure::BadRequest(message))) => return error(StatusCode::BAD_REQUEST, message),
-        Some(Err(NativeFailure::Unavailable(message))) => return error(StatusCode::SERVICE_UNAVAILABLE, message),
+        Some(Err(NativeFailure::Unavailable(message))) => {
+            let mut response = error(StatusCode::SERVICE_UNAVAILABLE, message);
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            return response;
+        }
         Some(Err(message)) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
         None => return error(StatusCode::INTERNAL_SERVER_ERROR, "native worker ended without completion"),
     };
@@ -1080,6 +1084,32 @@ mod tests {
                 .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn media_admission_permanent_400_and_pressure_503_retry_after() {
+        for stream in [false, true] {
+            for permanent in [false, true] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let message = if permanent { "image needs 5 bytes > media cache capacity 4" }
+                    else { "embedding cache budget exhausted: need 4 bytes, 0 free of 8" };
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    let failure = if permanent { NativeFailure::BadRequest(message.into()) }
+                        else { NativeFailure::Unavailable(message.into()) };
+                    job.events.send(Err(failure)).unwrap();
+                });
+                let body = json!({"model": MODEL, "messages":[{"role":"user","content":"hello"}],"stream":stream});
+                let response = router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), if permanent { StatusCode::BAD_REQUEST } else { StatusCode::SERVICE_UNAVAILABLE });
+                if permanent { assert!(!response.headers().contains_key(axum::http::header::RETRY_AFTER)); }
+                else { assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1"); }
+                let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"], message);
+                worker.await.unwrap();
+            }
         }
     }
 

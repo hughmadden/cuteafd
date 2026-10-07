@@ -25,6 +25,8 @@ pub enum MediaError {
     Features,
     #[error("media features are not ready for {0:?}")]
     NotReady(ImageKey),
+    #[error("image needs {needed} bytes > media cache capacity {capacity}")]
+    ImageTooLarge { needed: usize, capacity: usize },
     #[error("embedding cache budget exhausted: need {needed} bytes, {free} free of {capacity}")]
     CacheFull {
         needed: usize,

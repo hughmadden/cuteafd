@@ -1,6 +1,7 @@
 //! Qwen 3.8 Flash Next (qwen4_exp) on the generic engine: weights, the PLE
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
+mod media;
 pub(crate) mod engine;
 mod admission;
 mod mtp_golden;
@@ -44,6 +45,9 @@ pub(crate) struct EngineArgs {
     /// Concrete serving prefix arena reservation; filled before engine loading.
     #[arg(skip)]
     pub planner_prefix_bytes: Option<u64>,
+    /// Serving graph modes, set before weight/KV admission; diagnostics stay lazy.
+    #[arg(skip)]
+    pub planner_graph_modes: Option<(usize, bool)>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -333,7 +337,10 @@ impl Opened {
         // Establish expert ownership before admission. EXL3 keeps its existing
         // lazy first-use load; reserve the exact loader plan before sizing KV.
         let mut future_expert_bytes = 0;
-        let budget_admission = args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some();
+        let startup_admission = args.planner_graph_modes.is_some() && engine::startup_graphs_enabled(
+            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
+            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
+        let budget_admission = args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() || startup_admission;
         let admitted_experts = if budget_admission {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
@@ -358,6 +365,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
             engine.set_experts(experts);

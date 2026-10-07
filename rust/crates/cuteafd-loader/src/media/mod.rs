@@ -98,6 +98,8 @@ pub struct ProcessorConfig {
     pub max_image_tokens: usize,
     pub decode: DecodePolicy,
 }
+/// Largest Qwen merged image admitted by the calibrated BF16 tower.
+pub const QWEN_MAX_IMAGE_TOKENS: usize = 1024;
 const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 impl ProcessorConfig {
@@ -116,7 +118,7 @@ impl ProcessorConfig {
             std,
             min_pixels,
             max_pixels,
-            max_image_tokens: 4096,
+            max_image_tokens: if family == ImageFamily::Qwen { QWEN_MAX_IMAGE_TOKENS } else { 4096 },
             decode: DecodePolicy::default(),
         }
     }

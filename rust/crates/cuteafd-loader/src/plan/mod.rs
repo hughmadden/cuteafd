@@ -142,6 +142,9 @@ pub struct PlanReport {
     pub disabled_media_bytes: u64,
     pub encoder: Option<encoder::EncoderPlacement>,
     pub encoder_plan_hash: String,
+    /// Qualified family ceiling in merged image rows, even when vision is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_image_tokens: Option<usize>,
     pub snapshot: String,
     pub family: Option<String>,
     pub architectures: Vec<String>,
@@ -273,6 +276,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         disabled_media_bytes: 0,
         encoder: None,
         encoder_plan_hash: String::new(),
+        max_image_tokens: None,
         snapshot: snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
@@ -328,6 +332,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    if family.id() == "qwen4" && checkpoint.config.get("vision_config").is_some() {
+        report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
+    }
     report.runtime = Some(family.runtime());
     let model = match family.open(&checkpoint) {
         Ok(model) => model,
@@ -504,7 +511,10 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision))
         .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
     let contract = serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement, report.vision, report.audio, &report.encoder)).expect("plan serializes");
-    report.encoder_plan_hash = format!("{:x}", Sha256::digest(contract));
+    let mut hash = Sha256::new();
+    hash.update(contract);
+    if let Some(cap) = report.max_image_tokens { hash.update((cap as u64).to_le_bytes()); }
+    report.encoder_plan_hash = format!("{:x}", hash.finalize());
     report.spec = Some(spec.clone());
     Ok(report)
 }
@@ -669,9 +679,17 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
+    if let Some(cap) = report.max_image_tokens {
+        let _ = writeln!(out, "image cap  {cap} merged tokens per image (detail=low 256); BF16 residual");
+    }
     if let Some(encoder) = &report.encoder {
         let arch = if matches!(encoder.kind, encoder::EncoderKind::Rtx { .. }) { "vision.sm120" } else { "vision.sm121" };
-        let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {}; shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
+        let attention = match report.family.as_deref() {
+            Some("qwen4") => "Qwen full-image head72 attention",
+            Some("glm5_flash") => "GLM Flash full-image head64 attention",
+            _ => "MiMo key-0 attention",
+        };
+        let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} ({attention}); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
         let _ = writeln!(out, "media hash {}", report.encoder_plan_hash);
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);

@@ -309,8 +309,8 @@ case $family in
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
-if [[ $family == mimo_v2 || $family == glm5_flash ]]; then
-  # Optional host embedding quota; unset retains the engine's admitted default.
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
+  # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
 if [[ $family == mimo_v2 ]]; then
@@ -358,9 +358,10 @@ if [[ $family == qwen4 ]]; then
 fi
 # POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4): the largest pool the GPUs hold after the
 # planner's remaining costs (up to 2M tokens).
-# GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
-# 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
-glm_default=""; [[ $family != glm5 ]] || glm_default=auto
+# GLM 5.3 and Qwen default to auto; Qwen's former 32768-token pool admitted
+# only seven 4096-output requests, below the default eight serving lanes.
+# DeepSeek V4 keeps its engine default.
+glm_default=""; [[ ! $family =~ ^(glm5|qwen4)$ ]] || glm_default=auto
 if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
   pool="$(get POOL_TOKENS "$glm_default")"
   if [[ "$pool" == auto ]]; then
@@ -456,6 +457,15 @@ if [[ -n "$trace" ]]; then
   mkdir -p "$(dirname "$trace")"
   trace_args=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
+fi
+# Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
+if [[ $family == qwen4 ]]; then
+  case "$(get QWEN_STARTUP_GRAPHS)" in
+    "") ;;
+    on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1) ;;
+    off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0) ;;
+    *) echo "QWEN_STARTUP_GRAPHS must be on or off" >&2; exit 2 ;;
+  esac
 fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
@@ -676,11 +686,12 @@ fi
 vision_peers=()
 encoder_ranks=()
 encoder_hash=""
+encoder_max_tokens=4096
 encoder_port=$((port + 1))
-if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
-  plan_pool="$(get POOL_TOKENS 32768)"; [[ "$plan_pool" != auto ]] || plan_pool=0
+  plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-95.5}"
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
@@ -691,16 +702,18 @@ import json,sys
 p=json.load(sys.stdin); e=p.get("encoder"); assert e is not None, "image checkpoint lacks encoder plan"
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
 k=e["kind"]; kind=k["kind"]; h=p["encoder_plan_hash"]
+cap=p.get("max_image_tokens") or (1024 if sys.argv[1]=="qwen4" else 4096)
+assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]
     assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
-    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
-elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
-elif kind=="off": print("off",h,"-")
+    print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)),cap)
+elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-",cap)
+elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
-' <<<"$plan_json")"
-  read -r vision encoder_hash rank_csv <<<"$selected"
+' "$family" <<<"$plan_json")"
+  read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
   if [[ "$vision" == spark:* ]]; then
     IFS=, read -r -a encoder_ranks <<<"$rank_csv"
     for encoder_rank in "${encoder_ranks[@]}"; do
@@ -709,7 +722,7 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
   fi
 elif [[ "$vision" == spark* || "$vision" == rtx* ]]; then
-  release_die "explicit encoder placement requires a supported MiMo or GLM Flash vision checkpoint"
+  release_die "explicit encoder placement requires a supported MiMo, Qwen or GLM Flash vision checkpoint"
 fi
 # Replace the original policy with the selected placement, without duplicated flags.
 for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
@@ -818,7 +831,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   encoder_args=""
   for encoder_rank in "${encoder_ranks[@]}"; do
     if [[ "$rank" == "$encoder_rank" ]]; then
-      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens 4096"
+      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens $encoder_max_tokens"
     fi
   done
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \

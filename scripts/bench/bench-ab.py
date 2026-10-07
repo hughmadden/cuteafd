@@ -4,7 +4,8 @@
 Each arm is a checkout with its own run.sh/stop.sh (for example ds41rt v15 and
 this repo). Sessions run in ABBA order per RTX layout; every session stops all
 arms, relaunches its arm with --restart, discards a warmup battery, then
-measures a greedy decode battery and the code concurrency sweep. Results land
+measures a greedy decode battery and the code concurrency sweep (distinct
+per-request nonces by default; --identical-prompts opts out). Results land
 under runs/ab/LABEL/ and the summary prints per-arm medians and B/A ratios.
 
   scripts/bench/bench-ab.py --label p0-parity \
@@ -69,6 +70,7 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     run([py, str(REPO / "scripts/bench/deepseek_v41/bench-concurrent-api.py"), "--base-url", args.base_url,
          "--case", "code", "--concurrency", *map(str, args.concurrency), "--repeats", "1",
          "--nonce", f"ab-{args.nonce_seed}", "--prompt-label", "ab", "--label", arm,
+         *([] if args.identical_prompts else ["--distinct-prompts"]),
          "--output", str(out / "concurrent.json")], log=log)
     decode_report = json.loads((out / "decode.json").read_text())
     concurrent_report = json.loads((out / "concurrent.json").read_text())
@@ -127,6 +129,8 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=4, help="per layout, ABBA order")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 16])
+    parser.add_argument("--identical-prompts", action="store_true",
+                        help="decode battery only: opt out of distinct per-request nonces in the concurrency sweep")
     parser.add_argument("--nonce-seed", type=int, default=20260929)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--tokenizer", default=TOKENIZER_DEFAULT)
