@@ -1,17 +1,20 @@
 //! GLM 5.3 Flash as a prefix-cache family (`cuteafd_engine::prefix`).
 //!
 //! Paged state, one 256-row allocation unit per page index: on each of the 11 MLA layers the
-//! unit's four 64-row MLA pages of FP8 latent records (528 B per row) and DSA token keys
-//! (512 B per row), and the pool-key page of the same index (64 pools of 4 tokens: 64 x 128
-//! E4M3 then 64 FP32 scales) = 3.02 MB per unit (11.8 KB per token). Units are refcounted:
-//! full units are shared, nobody writes them again (every sequence appends past its own
-//! length), and a partial tail unit is copied (its rows and its complete pools).
+//! unit's four 64-row MLA pages of FP8 latent records (528 B per row) and, with `--index-cache
+//! keys`, DSA token keys (512 B per row), and the pool-key page of the same index (64 pools of
+//! 4 tokens: 64 x 128 E4M3 then 64 FP32 scales) = 3.02 MB per unit (11.8 KB per token), or
+//! 1.58 MB (6.17 KB per token) with the compact index cache. Units are refcounted: full units
+//! are shared, nobody writes them again (every sequence appends past its own length), and a
+//! partial tail unit is copied (its rows and its complete pools).
 //!
 //! Mark: the KDA layers' recurrent state is per sequence and overwritten by every step, so a
 //! snapshot copies it whole: every KDA layer's FP32 state `[64, 128, 128]` and conv window
-//! (the last three q/k/v inputs), 34 layers = 140.8 MiB. The arena is sized by decoding lanes,
-//! with the host tier holding the rest. A restore copies the mark back into the new
-//! sequence's own KDA slot and maps its pool pages; nothing else of the state is positional.
+//! (the last three q/k/v inputs), 34 layers = 140.8 MiB, and with the compact index cache every
+//! MLA layer's index tail (the key | gate rows of the open pool, 11 x 1,552 B). The arena is
+//! sized by decoding lanes, with the host tier holding the rest. A restore copies the mark back
+//! into the new sequence's own KDA slot and maps its pool pages; nothing else of the state is
+//! positional.
 //! The capture point must be where the KDA state is: `kda_len` (a speculative verify leaves
 //! the state behind the placement until its kept rows are committed), so `capture_reach` is 0.
 //!
@@ -24,7 +27,8 @@
 //! replicated MLA projection and indexer write them) and each its own KDA heads' state: page
 //! copies run on each GPU's stream, a mark holds both GPUs' halves (an arena per GPU), and the
 //! host tier is off.
-use super::engine::{GlmfEngine, GlmfPlacement, KPOOL, PAGE_ROWS, RECORD_BYTES, UNIT_PAGES, UNIT_ROWS};
+use super::engine::{GlmfEngine, GlmfPlacement, PagedLayer, KEY_BYTES, KPOOL, PAGE_ROWS, RECORD_BYTES, UNIT_PAGES,
+    UNIT_ROWS};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
@@ -32,8 +36,6 @@ use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, PrefixFamily, Reu
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
-/// Token-key bytes per row (BF16 keys | gates, 256 wide).
-const KEY_BYTES: usize = 512;
 /// Pool-key page: 64 pools x 128 E4M3, then 64 FP32 scales.
 const POOL_KEY_BYTES: usize = 128;
 const POOL_SCALES: usize = PAGE_ROWS * POOL_KEY_BYTES;
@@ -41,8 +43,8 @@ const POOL_PAGE_BYTES: usize = PAGE_ROWS * (POOL_KEY_BYTES + 4);
 
 pub(crate) struct GlmfPrefix<'e, 'a> {
     engine: &'e GlmfEngine<'a>,
-    /// Per rank and MLA layer: records, token keys, pool keys.
-    paged: Vec<(usize, [CuteafdDeviceBuffer; 3])>,
+    /// Per rank and MLA layer: records, token keys (`--index-cache keys`), pool keys.
+    paged: Vec<(usize, PagedLayer)>,
     mark_bytes: usize,
     /// Per rank: its part of every mark (its KDA heads' state) and the arena of those parts.
     arenas: Vec<(usize, Option<DeviceAllocation<'a>>)>,
@@ -55,9 +57,10 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged: Vec<_> = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |buffers| (rank, buffers))).collect();
-        for (_, [records, keys, pools]) in &paged {
-            ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
-                && pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "MLA cache buffers smaller than the units");
+        for (_, layer) in &paged {
+            ensure!(layer.records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES
+                && layer.keys.is_none_or(|keys| keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES)
+                && layer.pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "MLA cache buffers smaller than the units");
         }
         let parts: Vec<usize> = (0..engine.ranks())
             .map(|rank| engine.slot_regions_on(rank, 0).iter().map(|r| r.bytes).sum()).collect();
@@ -76,7 +79,8 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.paged.len() * (UNIT_ROWS * (RECORD_BYTES + KEY_BYTES) + POOL_PAGE_BYTES)
+        self.paged.iter().map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES))
+            + POOL_PAGE_BYTES).sum()
     }
 
     pub fn slots(&self) -> usize {
@@ -94,17 +98,23 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         })
     }
 
-    /// The device ranges of one unit on rank `rank`, per MLA layer: records, token keys, pool keys.
-    fn unit_ranges_on(&self, rank: usize, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
+    /// One unit's views on rank `rank`, per MLA layer: records, token keys (`--index-cache keys`),
+    /// pool keys.
+    fn unit_layers_on(&self, rank: usize, unit: u32) -> Result<Vec<PagedLayer>> {
         let unit = unit as usize;
         let rows = UNIT_PAGES * PAGE_ROWS;
-        let mut out = Vec::with_capacity(3 * self.paged.len());
-        for &(_, [records, keys, pools]) in self.paged.iter().filter(|(r, _)| *r == rank) {
-            out.push(view(records, unit * rows * RECORD_BYTES, rows * RECORD_BYTES)?);
-            out.push(view(keys, unit * rows * KEY_BYTES, rows * KEY_BYTES)?);
-            out.push(view(pools, unit * POOL_PAGE_BYTES, POOL_PAGE_BYTES)?);
-        }
-        Ok(out)
+        self.paged.iter().filter(|(r, _)| *r == rank).map(|(_, layer)| Ok(PagedLayer {
+            records: view(layer.records, unit * rows * RECORD_BYTES, rows * RECORD_BYTES)?,
+            keys: layer.keys.map(|keys| view(keys, unit * rows * KEY_BYTES, rows * KEY_BYTES)).transpose()?,
+            pools: view(layer.pools, unit * POOL_PAGE_BYTES, POOL_PAGE_BYTES)?,
+        })).collect()
+    }
+
+    /// The device ranges of one unit on rank `rank`, per MLA layer: records, token keys
+    /// (`--index-cache keys`), pool keys.
+    fn unit_ranges_on(&self, rank: usize, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
+        Ok(self.unit_layers_on(rank, unit)?.into_iter()
+            .flat_map(|layer| std::iter::once(layer.records).chain(layer.keys).chain([layer.pools])).collect())
     }
 
     /// Mark `slot`'s part on each rank: (rank, its arena range).
@@ -191,8 +201,9 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let rows = UNIT_PAGES * PAGE_ROWS;
         let pools = copy.rows / KPOOL;
-        for &(rank, [records, keys, pool_keys]) in &self.paged {
-            for (buffer, row) in [(records, RECORD_BYTES), (keys, KEY_BYTES)] {
+        for &(rank, layer) in &self.paged {
+            let pool_keys = layer.pools;
+            for (buffer, row) in std::iter::once((layer.records, RECORD_BYTES)).chain(layer.keys.map(|k| (k, KEY_BYTES))) {
                 self.copy(rank, view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
                     view(buffer, copy.from as usize * rows * row, copy.rows * row)?)?;
             }
@@ -271,8 +282,9 @@ fn download(engine: &GlmfEngine<'_>, rank: usize, range: CuteafdDeviceBuffer) ->
     Ok(bytes)
 }
 
-/// Every paged byte of `placement`'s first `len` rows (records and token keys of each row,
-/// pool keys and scales of each complete pool), MLA layer by layer, in position order.
+/// Every paged byte of `placement`'s first `len` rows (records and, with `--index-cache keys`,
+/// token keys of each row, pool keys and scales of each complete pool), MLA layer by layer, in
+/// position order.
 pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let pools = len / KPOOL;
@@ -280,10 +292,12 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
         let rows = (len - u * UNIT_ROWS).min(UNIT_ROWS);
         let unit_pools = (pools.saturating_sub(u * PAGE_ROWS)).min(PAGE_ROWS);
         for rank in 0..family.engine.ranks() {
-            for ranges in family.unit_ranges_on(rank, unit)?.chunks_exact(3) {
-                out.extend_from_slice(&download(family.engine, rank, ranges[0])?[..rows * RECORD_BYTES]);
-                out.extend_from_slice(&download(family.engine, rank, ranges[1])?[..rows * KEY_BYTES]);
-                let page = download(family.engine, rank, ranges[2])?;
+            for layer in family.unit_layers_on(rank, unit)? {
+                out.extend_from_slice(&download(family.engine, rank, layer.records)?[..rows * RECORD_BYTES]);
+                if let Some(keys) = layer.keys {
+                    out.extend_from_slice(&download(family.engine, rank, keys)?[..rows * KEY_BYTES]);
+                }
+                let page = download(family.engine, rank, layer.pools)?;
                 out.extend_from_slice(&page[..unit_pools * POOL_KEY_BYTES]);
                 out.extend_from_slice(&page[POOL_SCALES..POOL_SCALES + unit_pools * 4]);
             }

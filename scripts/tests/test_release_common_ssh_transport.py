@@ -398,6 +398,8 @@ class TestRunShLifecycle:
             "true",
             "k34",
             "__none__",
+            "__none__",
+            "__none__",
         ], call
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
