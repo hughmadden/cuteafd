@@ -348,8 +348,10 @@ pub(crate) struct GlmDrafter<'a> {
     /// How the borrowed BF16 head runs past one draft block ([`super::DraftHead`]; GLM 5.3
     /// Flash's --draft-head). [`super::DraftHead::Exact`] unless the target sets it.
     head_mode: Cell<super::DraftHead>,
-    /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear; the FP8 scratch serves it).
+    /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear), and the latest mode the FP8
+    /// scratch was admitted for.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
+    fp8_admitted: fp8_linear::Fp8Rows,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -476,7 +478,8 @@ impl<'a> GlmDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the target embedding of
-    /// the mask token. `fp8_rows` is how the FP8 GEMMs run.
+    /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
+    /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
@@ -595,8 +598,18 @@ impl<'a> GlmDrafter<'a> {
             fp8_workspace,
             head_mode: Cell::new(super::DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
+            fp8_admitted: fp8_rows,
             cfg,
         })
+    }
+
+    /// How the FP8 GEMMs run from now on: the load's mode or one before it (whose scratch the
+    /// load's covers). A BF16 drafter ignores it.
+    pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
+        ensure!(mode <= self.fp8_admitted, "the DFlash2 FP8 scratch was admitted for {:?}, not {mode:?}",
+            self.fp8_admitted);
+        self.fp8_rows.set(mode);
+        Ok(())
     }
 
     /// How draft steps run the borrowed BF16 head from now on (a target's FP8 head launcher
@@ -623,7 +636,7 @@ impl<'a> GlmDrafter<'a> {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
                 // SAFETY: scratch covers every selected matrix and up to
                 // max(TAP_ROWS, max_batch_sequences*block) input rows in this
-                // mode (the load sized it for its mode).
+                // mode (set_draft_linear keeps it within the admitted one).
                 unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
                     self.fp8_rows.get()) }
             }

@@ -3,7 +3,7 @@
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use super::{bf16s, similarity, GoldenArgs, Opened};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use crate::families::glm5::dflash::{ContextRow, DraftSeq, RING, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -151,6 +151,94 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     crate::families::glm5::dflash::replay(drafter.replay(), &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
         engine.weights.head.bf16().context("--draft-replay borrows the target BF16 head; the FP8-only head \
             (--fp8-head) has no BF16 copy to replay against")?.buffer.ptr, start)
+}
+
+/// The settings [`draft_modes`] compares: both heads under every linear mode an FP8 drafter's
+/// scratch admits (`admitted`, its load's mode, and the modes before it), the head alone for a
+/// BF16 drafter. The first is the default (exact head, W8A16).
+fn draft_mode_settings(fp8: bool, admitted: crate::shared::fp8_linear::Fp8Rows)
+    -> Vec<(crate::families::glm5::DraftHead, crate::shared::fp8_linear::Fp8Rows)> {
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+    [Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].into_iter()
+        .filter(|&linear| linear == Fp8Rows::W8a16 || (fp8 && linear <= admitted))
+        .flat_map(|linear| [DraftHead::Exact, DraftHead::Tensor].map(|head| (head, linear)))
+        .collect()
+}
+
+/// Draft-kernel A/B (`--draft-modes N`): after the --prefill tokens (default 1024), the golden
+/// tokens go through the target in teacher-forced steps that tap the drafter's ring slot 0, and
+/// before each window of N anchors (positions p..p + N) the window drafts in one step of N
+/// sequences (8N rows; each anchor at its own position on the one ring) under every --draft-head
+/// and --draft-linear setting the drafter admits, and each anchor alone (8 rows, the same bits
+/// under every setting). A window's context ends at p + N - 2 and an anchor at q reads only
+/// positions before q; windows stop at the ring's length, so no entry an anchor reads has been
+/// overwritten. Prints, per setting, the drafts kept as a prefix of the text, the share of drafts
+/// identical to the first setting's and to the anchors' own, and the median step time.
+pub(super) fn draft_modes(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequences: usize) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-modes needs --draft")?;
+    ensure!((1..=drafter.max_batch_sequences()).contains(&sequences),
+        "--draft-modes takes 1 to {} sequences (--draft-sequences)", drafter.max_batch_sequences());
+    let tokens = tokens(args)?;
+    let drafts = drafter.drafts();
+    let prefill = args.prefill.unwrap_or(1024);
+    // The last window's context ends at the ring's last position; its drafts score `drafts` tokens.
+    let end = (RING + 1).min(tokens.len().saturating_sub(drafts));
+    ensure!(prefill >= 1 && prefill + sequences <= end, "--draft-modes needs --prefill + {sequences} <= {end} \
+        (the ring holds {RING} positions; tokens.bin has {} tokens)", tokens.len());
+    let fp8 = drafter.replay().resident_modes().iter().any(|mode| mode.name == "FP8");
+    let settings = draft_mode_settings(fp8, args.engine.draft_linear);
+    let mut placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
+    prefill_with_taps(engine, &mut placement, &tokens[..prefill], 0)?;
+    let kept = |draft: &[u32], position: usize| draft.iter().zip(&tokens[position + 1..]).take_while(|(d, t)| d == t).count();
+    // Per setting: drafts kept, identical to the first setting's, identical to the anchors' own; step seconds.
+    let mut totals = vec![(0usize, 0usize, 0usize, Vec::new()); settings.len()];
+    let (mut alone_kept, mut anchors, mut done, mut p) = (0usize, 0usize, prefill, prefill);
+    while p + sequences <= end {
+        while done + 1 < p + sequences {
+            let rows = (p + sequences - 1 - done).min(super::engine::DECODE_ROWS);
+            engine.verify(&mut [(&mut placement, rows)], &tokens[done..done + rows], None)?
+                .context("--draft-modes needs every layer")?;
+            drafter.update(&(0..rows).map(|r| ContextRow { tap_row: r, slot: 0, position: done + r }).collect::<Vec<_>>())?;
+            done += rows;
+        }
+        let seqs: Vec<DraftSeq> = (p..p + sequences)
+            .map(|q| DraftSeq { slot: 0, anchor: tokens[q], position: q, valid_from: 0 }).collect();
+        drafter.set_draft_head(settings[0].0);
+        drafter.set_draft_linear(settings[0].1)?;
+        let alone = seqs.iter().map(|seq| Ok(drafter.draft_device(std::slice::from_ref(seq), &engine.embedding,
+            engine.draft_head())?.remove(0).tokens)).collect::<Result<Vec<_>>>()?;
+        alone_kept += alone.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+        let mut first: Option<Vec<Vec<u32>>> = None;
+        for (&(head, linear), total) in settings.iter().zip(&mut totals) {
+            drafter.set_draft_head(head);
+            drafter.set_draft_linear(linear)?;
+            let timer = Instant::now();
+            let wide: Vec<Vec<u32>> = drafter.draft_device(&seqs, &engine.embedding, engine.draft_head())?
+                .into_iter().map(|d| d.tokens).collect();
+            total.3.push(timer.elapsed().as_secs_f64());
+            total.0 += wide.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+            total.1 += wide.iter().zip(first.get_or_insert_with(|| wide.clone()).iter()).filter(|(a, b)| a == b).count();
+            total.2 += wide.iter().zip(&alone).filter(|(a, b)| a == b).count();
+        }
+        anchors += sequences;
+        p += sequences;
+    }
+    drafter.set_draft_head(args.engine.draft_head);
+    drafter.set_draft_linear(args.engine.draft_linear)?;
+    let n = anchors.max(1) as f64;
+    println!("draft modes ({} drafter, {}): {anchors} anchors from {prefill} in steps of {sequences} sequences \
+        ({} rows); drafts kept as a prefix of the text, of {drafts}:", drafter.name(), if fp8 { "FP8" } else { "BF16" },
+        sequences * drafter.block());
+    println!("  each anchor alone ({} rows): kept {:.3}", drafter.block(), alone_kept as f64 / n);
+    for (&(head, linear), (kept, same, same_alone, times)) in settings.iter().zip(&mut totals) {
+        times.sort_by(f64::total_cmp);
+        println!("  head {head:?}, linear {linear:?}: kept {:.3}, identical to the first setting {:.2}%, to the \
+            anchors' own {:.2}%, step median {:.3} ms (p10 {:.3}, p90 {:.3})", *kept as f64 / n,
+            100.0 * *same as f64 / n, 100.0 * *same_alone as f64 / n, 1e3 * times[times.len() / 2],
+            1e3 * times[times.len() / 10], 1e3 * times[times.len() * 9 / 10]);
+    }
+    Ok(())
 }
 
 /// Prefills the golden prompt's first --prefill tokens, then decodes one row
@@ -506,4 +594,24 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
             1e3 * phases[1] / n, 1e3 * phases[2] / n);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod draft_mode_tests {
+    use super::*;
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+
+    #[test]
+    fn draft_modes_compare_both_heads_under_every_admitted_linear_mode() {
+        let all = draft_mode_settings(true, Fp8Rows::W8a8);
+        assert_eq!(all, [(DraftHead::Exact, Fp8Rows::W8a16), (DraftHead::Tensor, Fp8Rows::W8a16),
+            (DraftHead::Exact, Fp8Rows::Wide), (DraftHead::Tensor, Fp8Rows::Wide),
+            (DraftHead::Exact, Fp8Rows::W8a8), (DraftHead::Tensor, Fp8Rows::W8a8)]);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::Wide).len(), 4);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::W8a16), [(DraftHead::Exact, Fp8Rows::W8a16),
+            (DraftHead::Tensor, Fp8Rows::W8a16)]);
+        // A BF16 drafter has no FP8 GEMMs: the head alone.
+        assert_eq!(draft_mode_settings(false, Fp8Rows::W8a8), draft_mode_settings(true, Fp8Rows::W8a16));
+    }
 }

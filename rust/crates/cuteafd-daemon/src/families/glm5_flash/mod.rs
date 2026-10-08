@@ -770,6 +770,14 @@ pub(crate) struct GoldenArgs {
     /// reproduced (0: teacher-forced on tokens.bin, scoring against it).
     #[arg(long)]
     pub generate: Option<usize>,
+    /// With --draft: the draft-kernel A/B. After --prefill tokens (default 1024), windows of N
+    /// consecutive anchors draft in one step of N sequences (8N rows) under every --draft-head
+    /// and --draft-linear setting the drafter admits (load it with --draft-linear w8a8 for all
+    /// three linear modes), and each anchor alone, on the same teacher-forced contexts; prints the
+    /// drafts kept as a prefix of the text, identical drafts and step times per setting. Anchors
+    /// end at position 2048 (the ring's length).
+    #[arg(long)]
+    pub draft_modes: Option<usize>,
     /// Verify-by-replay check: after --prefill tokens, for every kept count k
     /// in 1..=N, require identical kept logits, KDA state, MLA rows and next
     /// decode when only the rejected suffix of the same N-row verify changes.
@@ -1550,6 +1558,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         anyhow::ensure!(bytes.len() % 4 == 0, "padding check token bytes must be u32-aligned");
         let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         return engine.check_decode_padding(&tokens);
+    }
+    if let Some(sequences) = args.draft_modes {
+        return speculate::draft_modes(args, engine, sequences);
     }
     if let Some(dir) = &args.draft_oracle {
         return speculate::draft_oracle(args, opened, engine, dir);
