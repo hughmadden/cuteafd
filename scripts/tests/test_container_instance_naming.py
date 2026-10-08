@@ -172,3 +172,107 @@ def test_candidate_launcher_refuses_every_namespaced_production_name():
         "refused cuteafd-spark-expert-ostrich-19441",
         "allowed cuteafd-tpep-dev",
     ]
+
+
+@pytest.mark.parametrize("instance", ["", "plat-robust", "agent.2_ab-cd"])
+def test_wip_instance_names_and_slot_lookup(tmp_path, instance):
+    home = tmp_path / "home"
+    home.mkdir()
+    script = f'''set -euo pipefail
+source "{COMMON}"
+WIP_INSTANCE="$1"
+release_record_wip_slot gate
+unset WIP_INSTANCE
+release_wip_slot_instance gate
+printf '%s\\n' "$(release_wip_container coordinator)" "$(release_wip_container spark-expert)" "$WIP_LAYOUT_SLOT"
+'''
+    result = subprocess.run(["bash", "-c", script, "_", instance],
+                            env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    suffix = f"-{instance}" if instance else ""
+    layout = f"{instance}/gate" if instance else "gate"
+    assert result.stdout.splitlines() == [f"cuteafd-coordinator-wip{suffix}",
+                                          f"cuteafd-spark-expert-wip{suffix}", layout]
+
+
+def test_wip_same_slot_in_two_instances_retains_explicit_lookup(tmp_path):
+    script = f'''set -euo pipefail
+source "{COMMON}"
+WIP_INSTANCE=first; release_record_wip_slot same
+WIP_INSTANCE=second; release_record_wip_slot same
+WIP_INSTANCE=first; release_wip_slot_instance same
+printf '%s\\n' "$WIP_INSTANCE" "$WIP_LAYOUT_SLOT"
+unset WIP_INSTANCE; release_wip_slot_instance same
+printf '%s\\n' "$WIP_INSTANCE" "$WIP_LAYOUT_SLOT"
+'''
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, HOME=str(tmp_path)),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["first", "first/same", "second", "second/same"]
+
+
+@pytest.mark.parametrize("value", ["../bad", "a/b", "-bad", "bad;cmd", "x" * 42])
+def test_wip_instance_refuses_unsafe_names(tmp_path, value):
+    result = subprocess.run(["bash", "-c", f'source "{COMMON}"; WIP_INSTANCE="$1"; release_wip_container coordinator', "_", value],
+                            env=dict(os.environ, HOME=str(tmp_path)), capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "WIP_INSTANCE must be" in result.stderr
+
+
+def test_wip_config_and_environment_precedence(tmp_path):
+    config = write_config(tmp_path / "cuteafd.config", None)
+    config.write_text(config.read_text() + "\nWIP_INSTANCE=configured\n")
+    script = f'set -euo pipefail; source "{COMMON}"; release_load_config "$1"; release_wip_container coordinator'
+    for override, expected in [(None, "configured"), ("environment", "environment")]:
+        env = dict(os.environ)
+        env.pop("WIP_INSTANCE", None)
+        if override is not None:
+            env["WIP_INSTANCE"] = override
+        result = subprocess.run(["bash", "-c", script, "_", str(config)], env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == f"cuteafd-coordinator-wip-{expected}"
+
+
+def test_wip_launchers_use_recorded_container_and_layout():
+    for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
+        text = path.read_text()
+        assert 'release_wip_slot_instance "$wip_slot"' in text
+        assert 'release_stage_wip_layout "$wip_coordinator_container"' in text
+        assert '"$(release_wip_container spark-expert)"' in text
+        assert 'docker cp "cuteafd-spark-expert-wip:' not in text
+        assert '$HOME/.cache/cuteafd/wip-run/$wip_slot' not in text
+    text = (ROOT / "wip.sh").read_text()
+    assert 'state_dir="$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}"' in text
+    assert 'release_record_wip_slot "$slot"' in text
+    assert '-v "$state_dir/container:/wip"' in text
+    assert '"wip_instance": ${wip_instance@Q}' in (ROOT / "scripts/build/finalize-wip-slot.sh").read_text()
+
+
+def test_wip_recreate_targets_only_resolved_instance(tmp_path):
+    text = (ROOT / "wip.sh").read_text()
+    body = text.split("remove_wip_containers() {", 1)[1].split("\n}", 1)[0]
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    log = tmp_path / "calls"
+    for name in ["docker", "ssh"]:
+        stub = binary / name
+        stub.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$LOG"\n')
+        stub.chmod(0o755)
+    script = f'''set -euo pipefail
+source "{COMMON}"
+WIP_INSTANCE=own
+coordinator_container="$(release_wip_container coordinator)"
+spark_container="$(release_wip_container spark-expert)"
+wip_hosts=(rhea moa)
+remove_wip_containers() {{{body}
+}}
+remove_wip_containers
+'''
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}", LOG=str(log)),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text().splitlines()
+    assert "rm -f cuteafd-coordinator-wip-own" in calls
+    assert all("cuteafd-spark-expert-wip-own" in call for call in calls if "rhea" in call or "moa" in call)
+    assert "rm -f cuteafd-coordinator-wip" not in calls
