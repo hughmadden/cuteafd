@@ -181,8 +181,10 @@ before → after tables with conditions.
 
 ## Engineering rules
 
-- Never slower than the engine being replaced: V4.1 Flash parity (C1 code
-  decode on 1 and 2 RTX, 8K prefill, tool eval) is checked at every phase.
+- cuteafd is measured against itself, not a replaced engine (TJ,
+  2026-10-08). Verify each change at the size it needs, as part of normal
+  work; the release card set catches the rest. A regression found at release
+  doesn't abort it: ship, and follow with a point release that fixes it.
 - Correctness first, then warm-up, then identical-config A/B, interleaved,
   three runs for a final number. Judge speculation by emitted tok/s, not
   acceptance. Profiling perturbs timing.
@@ -203,17 +205,16 @@ before → after tables with conditions.
 - Tiered gates. Merges and features: cargo/script tests (failing ids, not
   counts), golden NLL/byte-exactness on one GPU or loopback, and the
   feature's own measurement. Changes to shared hot paths (transport, expert
-  exchange, native lib, sampler) add a quick V4.1 parity: one launch of the
-  candidate (WIP images) vs a baseline measured the same day, C1 + C16 code
-  decode only (~10 min); escalate to 3 interleaved sessions per arm if a
-  metric is below 0.98 after warm-up, and to 6 sessions per arm only if that
-  escalation is still borderline (benches run one untimed batch per
-  concurrency level; DeepSeek engram tables and first-use workspaces make the
-  first wide batch after a launch ~10% slow — explain, don't re-run). Full
-  V4.1 parity (3 sessions per arm, all metrics) runs at release cuts only.
-  Release images are built for release cuts, not to verify branches;
-  agentic benches gate with 1–2 short sessions, the full bench runs at
-  release.
+  exchange, native lib, sampler, memory placement) add one quick A/B pair
+  on an affected model: candidate (WIP images) vs work/p0 measured the same
+  day, C1 + C16 code decode, tools and memory headroom (~20 min). Correctness
+  and memory safety gate; speed is reported, and only a clear drop (below
+  ~0.95) earns more sessions (benches run one untimed batch per concurrency
+  level; DeepSeek engram tables and first-use workspaces make the first wide
+  batch after a launch ~10% slow — explain, don't re-run). Releases run the
+  card set, not a multi-session parity campaign. Release images are built for
+  release cuts, not to verify branches; agentic benches gate with 1–2 short
+  sessions, the full bench runs at release.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.

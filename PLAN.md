@@ -915,7 +915,7 @@ Work, in priority order:
    checkpoints without a tower stay text-only. Quantized checkpoints lacking a
    compatible bundled template still require explicit `CHAT_TEMPLATE_FROM`.
    The original failed v1 loss evidence stays intact; v3 closes the remaining
-   gates. Shared code still requires the coordinator's batched V4.1 parity gate.
+   gates. Shared code gets the quick A/B pair on an affected model (AGENTS.md).
    **Qwen image capacity:** 1024 merged tokens per image, `detail=low` 256,
    BF16 residual; omitted `VISION` now defaults to `auto` in the launcher and
    direct CLI (RTX on the zero-Spark minimum); explicit `off` remains unchanged.
@@ -1070,7 +1070,7 @@ Work, in priority order:
    every pair and judge the median paired emitted-throughput ratio. This is a
    separate determinism task, not part of WP-9 vision/default promotion.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
-   and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
+   and run a quick A/B on an affected model for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
    and row-independent kernels for exact speculation (FR-G.2, G.6), the GB10
    EXL3 decode schedule (FR-G.7), 32 GB plan, API items, teacher gate.
