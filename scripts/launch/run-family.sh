@@ -112,6 +112,31 @@ case "$backend" in
   local) ranks=0 ;;
   *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
 esac
+coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
+# --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
+# the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
+# does for DeepSeek V4.1).
+wip_layout="" wip_mount_args=() wip_worker_args=""
+if [[ -n "$wip_slot" ]]; then
+  [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
+  WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
+  release_wip_slot_instance "$wip_slot"
+  wip_coordinator_container="$(release_wip_container coordinator)"
+  wip_spark_container="$(release_wip_container spark-expert)"
+  coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
+  wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
+  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
+  wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
+    -v "$wip_layout/share:/opt/cuteafd/share:ro"
+    -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
+    --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
+  wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/bin:/opt/cuteafd/bin:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
+    -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
+fi
 qwen_exl3=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
@@ -148,8 +173,8 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
     if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
       # CPU-only preflight reads checkpoint headers in the selected serving image.
       # Older images that do not qualify auto placement keep the Spark fallback.
-      preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
-        "$(get COORDINATOR_DOCKER_INFERENCE)" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
+      preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
+        "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
         --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
       if [[ "$preferred" == 0 ]]; then
@@ -437,30 +462,6 @@ fi
 served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
-coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
-# --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
-# the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
-# does for DeepSeek V4.1).
-wip_layout="" wip_mount_args=() wip_worker_args=""
-if [[ -n "$wip_slot" ]]; then
-  [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
-  WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
-  release_wip_slot_instance "$wip_slot"
-  wip_coordinator_container="$(release_wip_container coordinator)"
-  wip_spark_container="$(release_wip_container spark-expert)"
-  coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
-  wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
-  wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
-    -v "$wip_layout/share:/opt/cuteafd/share:ro"
-    -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
-    --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
-  wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/bin:/opt/cuteafd/bin:ro \
-    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
-    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
-    -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
-fi
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
 # (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
@@ -742,7 +743,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-95.5}"
-  plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
+  plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --rtx-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas")"
@@ -876,7 +877,6 @@ if [[ -n "$wip_slot" ]]; then
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
   release_require_dev_image_sparkinfer "$(hostname)" "$coordinator_image" \
     "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$coordinator_image")" "$pinned_sparkinfer"
-  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" <<'STAGE' ||
