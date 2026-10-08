@@ -50,6 +50,12 @@ Attention (KDA), a minority run MLA + DSA.
   (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
   recurrent state in BF16, rounded after every decode, verify and commit row
   and at each chunked-prefill window end: half the state and prefix-mark bytes.
+- KDA replay records: `GLM5_FLASH_REPLAY_RECORDS=shared` (`--replay-records
+  shared`, opt-in; one GPU whose pool is sized from measured memory) keeps the
+  speculative replay records (321,421,312 B) in the prefill lanes' scratch,
+  which no decode step reads, instead of an allocation of their own. A record
+  lives from a speculative verify to its commit, and a commit after a prefill
+  fails instead of reading records the prefill overwrote.
 - RTX/Spark layouts: scales from 1 RTX with local experts up through
   multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
   two-GPU head split when both coordinator GPUs are available;

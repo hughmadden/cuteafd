@@ -44,6 +44,10 @@ pub struct LayoutOptions {
     /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
     /// else in its place only when larger.
     pub graph_budget_bytes: Option<u64>,
+    /// GLM 5.3 Flash's KDA replay records in the prefill lanes' scratch (`--replay-records shared`):
+    /// out of the state, and the scratch holds at least them. The engine takes them only where it
+    /// sizes the pool from measured memory (one GPU, Spark experts, an automatic pool).
+    pub glmf_shared_replay: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -94,6 +98,7 @@ impl Default for LayoutOptions {
             full_prefill_logits: false,
             prefill_lanes: 0,
             graph_budget_bytes: None,
+            glmf_shared_replay: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
@@ -583,14 +588,25 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // GLM 5.3 Flash on one GPU: the step workspaces its engine allocates, from the program manifest.
     let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
         else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
-    let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
-        .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
-            context_tokens))).flatten();
-
     // A GLM 5.3 Flash graph budget, kept as the engine's KV admission keeps it: from measured free
     // memory (one GPU, Spark experts, an automatic pool) the budget itself, from the planner's costs
     // (a head split, local experts, a fixed pool) the budget or the graph allowance, whichever is larger.
     let glmf_measured = !split && automatic && matches!(report.placement, ExpertPlacement::Sparks { .. });
+    // Shared replay records (measured admission only): the KDA records, in the prefill scratch.
+    let glmf_shared_records = if family == "glm5_flash" && options.glmf_shared_replay {
+        if glmf_measured {
+            crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()
+                .and_then(|cfg| crate::serving_capacity::glm_flash_kda_replay_bytes(&cfg, cfg.layers, 1).ok())
+                .unwrap_or(0)
+        } else {
+            notes.push("GLM 5.3 Flash --replay-records shared needs one GPU, Spark experts and an automatic pool \
+                (the engine refuses it otherwise); planned with records of their own".into());
+            0
+        }
+    } else { 0 };
+    let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
+        .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
+            context_tokens, glmf_shared_records))).flatten();
 
     // Fixed runtime costs.
     let gpus_now = active_gpus;
@@ -789,7 +805,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency } else { concurrency + 2 });
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
                     + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
-                    + rank.speculative_replay_bytes + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
+                    + rank.speculative_replay_bytes.saturating_sub(glmf_shared_records)
+                    + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
@@ -888,7 +905,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 /// allocates for the decode workspace and `lanes` prefill lanes of `rows` rows
 /// (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
-    lanes: u64, rows: u64, context: u64) -> Option<u64> {
+    lanes: u64, rows: u64, context: u64, shared_records: u64) -> Option<u64> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
@@ -902,7 +919,9 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let shape = GlmfStepShape { lead: true, split: false, local_experts: !spark, spark, partial_bytes: 2,
         output_shard: false, full_prefill_logits: false, table_pages, table_pool_pages };
     let decode = glmf_step_scratch(&lookup, &cfg, options, 64, true).ok()?;
-    let prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
+    let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
+    // Shared replay records live in the prefill scratch.
+    prefill.programs = prefill.programs.max(shared_records);
     // A lane needs a Spark transport of its own: local experts prefill in one.
     let lanes = if spark { lanes } else { 1 };
     Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, &shape, decode, prefill).device_bytes())
