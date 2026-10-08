@@ -91,14 +91,15 @@ def test_build_takes_a_cpu_lock_and_only_guards_its_export_gpus():
     assert '--gpus "device=$export_gpu_uuid"' in build
     assert '-e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid"' in build
     assert 'release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &' in build
-    assert 'timeout "$export_timeout" docker run --rm --name "$coordinator_export_container"' in build
-    assert "trap 'release_stop_export_watchdog; release_export_cleanup; exit 143' TERM" in build
-    assert "trap 'release_export_cleanup; rm -rf \"$release_source_dir\"' EXIT" in build
+    assert 'timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container"' in build
+    assert "trap 'exit 143' TERM" in build
+    assert "trap 'release_stop_export_watchdog; release_export_cleanup; rm -rf \"$release_source_dir\"' EXIT" in build
     # The Spark export is guarded on the host: no serving worker, >=100 GiB
     # CUDA-free, an ssh-side EXIT/HUP cleanup and a contention watchdog.
     assert 'build_spark_release_leg export' in build
-    assert 'timeout "$export_timeout" ssh "${release_ssh_opts[@]}" "$seed_host"' in build
-    assert "trap 'cleanup_export_container' EXIT HUP INT TERM" in build
+    assert 'timeout "$export_timeout" --foreground ssh "${release_ssh_opts[@]}" "$seed_host"' in build
+    assert 'trap cleanup_spark_phase EXIT' in build
+    assert "trap 'exit 129' HUP" in build
     assert "name=^cuteafd-spark-expert-[a-z0-9_.-]+-[0-9]+$" in build
     assert 'CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB' in build
     helper = (ROOT / 'scripts/lib/release-export-locks.sh').read_text()
