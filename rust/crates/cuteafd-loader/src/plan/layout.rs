@@ -75,7 +75,8 @@ pub struct LayoutOptions {
     pub state_slots: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
-    /// MiMo retained snapshots per bank and device mark budget, matching serving.
+    /// MiMo's and GLM 5.3 Flash's retained snapshots per bank and device mark budget, matching
+    /// serving.
     pub mimo_prefix_entries: u64,
     pub mimo_prefix_mark_bytes: u64,
     /// Retain warm external MiMo drafter context with prefix marks (candidate opt-in).
@@ -847,14 +848,20 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                         .and_then(|draft| mimo_draft_prefix_bytes(&draft, 1, options.mimo_rings.max(concurrency))))
                 } else { None }
             } else { None };
-            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks;
+            // GLM 5.3 Flash takes no mark without entries, so pool marks then keep no unit back.
+            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks && options.mimo_prefix_entries > 0;
             let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                 if family == "mimo_v2" {
                     let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
                     cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
                         bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
-                } else if matches!(family, "deepseek_v4" | "qwen4" | "glm5_flash") {
+                } else if family == "glm5_flash" {
+                    // serve-glmf's arena with the same knobs, over one whole mark of the layout
+                    // planned here (token keys, which a head split keeps).
+                    cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries, bytes,
+                        options.mimo_prefix_mark_bytes)
+                } else if matches!(family, "deepseek_v4" | "qwen4") {
                     // The arena the family's server allocates at the default knobs (`MarkArena::slots_for`).
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
                 } else { costs.mark_slots }

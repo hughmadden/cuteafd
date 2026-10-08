@@ -1150,6 +1150,9 @@ pub(crate) struct GlmfEngine<'a> {
     mla_ordinal: Vec<Option<usize>>,
     /// The DSA index cache the caches were built for.
     pub index_cache: IndexCache,
+    /// Prefix mark arena slots the KV admission reserved on the layout above, which the prefix
+    /// cache allocates.
+    pub mark_slots: usize,
     /// Where the replay records live, and the check that no prefill overwrites shared ones
     /// between a verify and its commit.
     pub replay_records: ReplayRecords,
@@ -1635,7 +1638,7 @@ impl<'a> GlmfEngine<'a> {
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
-            kda_output_shard: false,
+            kda_output_shard: false, mark_slots: 0,
             kda_prefill_expanded: false, kda_state, l2: None, embedding, selector: RefCell::new(None) })
     }
 

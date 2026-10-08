@@ -1869,6 +1869,20 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);
     assert_eq!(marks(&plan(dir.path(), &none).unwrap().memory_layout.unwrap()), 0);
+    // `--prefix-cache-entries` and `--prefix-cache-mark-mib` size it as they size the server's:
+    // 1,971 MiB holds 14 marks at 5 sequences and 6 entries, one or two GPUs (each its half of
+    // every mark under a head split, which keeps the token keys planned here); no entries, none.
+    let knobs = |rtx: usize, entries: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30; rtx], concurrency: 5, pool_tokens: Some(0), mimo_prefix_entries: entries,
+        mimo_prefix_mark_bytes: 1971 << 20, ..Default::default() }), ..sparks(4) };
+    assert_eq!(cuteafd_core::prefix::mark_slots_for(5, 6, rank.retained_mark_bytes, 1971 << 20), 14);
+    let one = plan(dir.path(), &knobs(1, 6)).unwrap().memory_layout.unwrap();
+    assert_eq!(marks(&one), 14 * rank.retained_mark_bytes);
+    let split = plan(dir.path(), &knobs(2, 6)).unwrap().memory_layout.unwrap();
+    let half = crate::serving_capacity::glm_flash_rank_cache_geometry(&cfg, 45, 2,
+        crate::serving_capacity::GlmfIndexCache::Keys, 4).unwrap().ranks[0].retained_mark_bytes;
+    assert_eq!((marks(&split), 2 * half), (14 * half, rank.retained_mark_bytes));
+    assert_eq!(marks(&plan(dir.path(), &knobs(1, 0)).unwrap().memory_layout.unwrap()), 0);
 }
 
 /// `--prefix-marks pool` for GLM 5.3 Flash: no mark arena, and the units pool marks reserve
@@ -1892,6 +1906,11 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
         .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
     let (pool, none) = (layout(true, None), layout(false, Some(0)));
     assert_eq!((item(&pool, "marks"), item(&pool, "reserved units")), (0, GLMF_POOL_MARK_RESERVED_UNITS * unit));
+    // No entries, no marks: pool marks keep no unit back, as serve-glmf then keeps none.
+    let off = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![48 << 30],
+        concurrency: 16, pool_tokens: Some(0), glmf_pool_marks: true, mimo_prefix_entries: 0, ..Default::default() }),
+        ..sparks(4) }).unwrap().memory_layout.unwrap();
+    assert_eq!((item(&off, "marks"), item(&off, "reserved units")), (0, 0));
     assert_eq!((item(&none, "marks"), item(&none, "reserved units")), (0, 0));
     // Pool marks ignore an arena request; the reserved unit's bytes come out of the pool.
     assert_eq!(item(&layout(true, Some(34)), "marks"), 0);
