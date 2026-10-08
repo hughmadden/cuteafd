@@ -1747,6 +1747,34 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 ## Explore after v2
 
 Ideas TJ wants kept for later; not v2 work.
+- **First after v2: V4.1 onto the shared serving infrastructure (TJ, 2026-10-09).**
+  V4.1 came in as the ds41rt engine, the speed floor, and under the old "never
+  slower than the replaced engine" rule its hot path was left alone while the
+  shared layer grew beside it. It has ~60K lines of family code (the next
+  largest family has ~12.5K) and uses none of `shared/prefill_share` (decode
+  share), the generic prefix cache, shared decode graphs or the shared expert
+  service. Features and fixes land on it separately, or not at all.
+  1. Design first (one Astra/Fable session): map V4.1's scheduler, two-lane
+     encoder pipeline, HC-lagged replay, compressed KV, Engram tables and
+     expert path onto `PrefillQueue`, `PrefixFamily`/`RefPagePool`, shared
+     decode graphs and the expert service; name what the shared layer must grow.
+  2. Migrate in stages, each with the quick A/B at the 2M operating point:
+     decode share (supersedes `work/v41-decode-share`), prefix cache, decode
+     graphs, then the expert service.
+  3. Goal: V4.1 is one family among six; its model-specific code (attention,
+     Engram, HC) lives in a family module.
+  Input from `work/v41-decode-share` (2026-10-09):
+  - one 1024-row encoder wave is 400-700 ms, so wave-boundary interleaving
+    can't bring gaps to tens of ms;
+  - smaller prefill units need the fidelity gate;
+  - the shared queue should take time-sized chunks (generalise MiMo's
+    `--prefill-chunk-s`);
+  - share 0 on that branch measured C16 -25% vs pre0 (single run; repeat
+    pending).
+- Deterministic Spark expert reduction for prefill (ordered FP32 route planes;
+  an export option today): cold V4.1 prefill isn't bit-reproducible run to
+  run because of FP32 atomics, which blocks exact cache/golden/A-B checks.
+  Measure the cost; make it an opt-in, or the default if cheap.
 - Embedding in host RAM on the RTX PRO 6000: benchmark per model before any
   default change. It likely depends on vocabulary head and embedding size,
   and on whether the freed memory actually changes allocation enough to
