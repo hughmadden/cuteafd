@@ -116,7 +116,7 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
         ("head weights", TargetHeadWeights::device_bytes(catalog)?),
         ("engram weights", EngramLayerWeights::device_bytes(lib, catalog, 0)?
             + EngramLayerWeights::device_bytes(lib, catalog, 1)?),
-        ("vision", if cuteafd_api::openai::vision_input_enabled() {
+        ("vision", if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
             crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)?
         } else { 0 }),
     ];
@@ -179,12 +179,24 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
     Ok(())
 }
 
+// Remote vision reserves its tower on the Spark, never in the RTX startup bound.
+fn local_vision_owner(enabled: bool, remote: bool) -> bool {
+    enabled && !remote
+}
+
 fn startup_peak(fixed: usize, loading_phases: &[(&str, usize)]) -> Result<usize> {
     Ok(loading_phases.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0).max(fixed))
 }
 
 #[cfg(test)]
 mod startup_tests {
+    #[test]
+    fn startup_vision_bound_only_charges_enabled_rtx_fallback() {
+        assert!(super::local_vision_owner(true, false));
+        assert!(!super::local_vision_owner(true, true));
+        assert!(!super::local_vision_owner(false, false));
+        assert!(!super::local_vision_owner(false, true));
+    }
     #[test]
     fn embedding_profile_preserves_explicit_overrides_and_pro_default() {
         use crate::shared::memory::EmbedPlacement::{Gpu, Host};
