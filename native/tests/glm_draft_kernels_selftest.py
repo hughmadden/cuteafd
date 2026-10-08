@@ -16,7 +16,9 @@ Run with Python containing CUDA PyTorch, on one GPU.
    mode 0 bit for bit up to 8 rows; past them it must match mode 0 to accumulation rounding on
    activations that E4M3 holds exactly (every row and 128-wide K block scaled to an amax of 448
    times a power of two), and bit for bit on ternary operands, whose every partial sum is exact
-   in any accumulator (a fragment-layout slip misses by O(1) either way). Times each mode on the
+   in any accumulator (a fragment-layout slip misses by O(1) either way). The drafters take BF16
+   outputs: in every mode and at every row count the BF16 output must be the FP32 output rounded
+   to nearest even, bit for bit (the plain W8A16 entry point too). Times each mode on the
    drafter's GEMM shapes.
 """
 import argparse
@@ -197,9 +199,11 @@ def fp8_check(lib, args):
         workspace = torch.empty(sizes[2], device="cuda", dtype=torch.uint8)
 
         def run(mode, x, rows, out):
-            status = lib.cuteafd_fp8_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), out.data_ptr(), 1, rows,
-                                            k, n, mode, workspace.data_ptr(), workspace.numel(), stream)
-            assert status == 0, (k, n, mode, rows, status)
+            # FP32 output for an FP32 `out`, BF16 for a BF16 one.
+            out_f32 = int(out.dtype == torch.float32)
+            status = lib.cuteafd_fp8_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), out.data_ptr(), out_f32,
+                                            rows, k, n, mode, workspace.data_ptr(), workspace.numel(), stream)
+            assert status == 0, (k, n, mode, rows, out_f32, status)
 
         x = (torch.randn(rows_max, k, generator=generator) * torch.linspace(0.1, 3.0, rows_max)[:, None]).bfloat16()
         x = x.cuda()
@@ -223,8 +227,20 @@ def fp8_check(lib, args):
             legacy = torch.empty(rows, n, device="cuda")
             assert lib.cuteafd_fp8_w8a16_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), legacy.data_ptr(), 1,
                                                 rows, k, n, workspace.data_ptr(), workspace.numel(), stream) == 0
+            # BF16 outputs (the drafters' dtype): the FP32 ones rounded, in every mode.
+            outs16 = {}
+            for mode in (0, 1, 2):
+                outs16[mode] = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+                run(mode, x, rows, outs16[mode])
+            legacy16 = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+            assert lib.cuteafd_fp8_w8a16_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), legacy16.data_ptr(),
+                                                0, rows, k, n, workspace.data_ptr(), workspace.numel(), stream) == 0
             torch.cuda.synchronize()
             assert torch.equal(legacy, outs[0]), (k, n, rows)
+            assert torch.equal(legacy16, outs[0].bfloat16()), ("BF16 output of the W8A16 entry point", k, n, rows)
+            for mode in (0, 1, 2):
+                assert torch.equal(outs16[mode], outs[mode].bfloat16()), ("BF16 output is not the FP32 one rounded",
+                                                                          k, n, mode, rows)
             assert torch.equal(outs[1], outs[0]), ("wide is not bit-identical", k, n, rows)
             if rows <= 8:
                 assert torch.equal(outs[2], outs[0]), ("w8a8 changed one draft block", k, n, rows)
