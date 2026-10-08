@@ -108,7 +108,7 @@ PY
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"
   rmdir "$CUTEAFD_KACHE_WARNING_DIR" 2>/dev/null || true
   export RUSTC_WRAPPER="$launcher" CC_KNOWN_WRAPPER_CUSTOM=compiler-cache
-  export CC="$shim_dir/cc" CXX="$shim_dir/c++"
+  export CC="$shim_dir/cc" CXX="$shim_dir/c++" CUTEAFD_KACHE_SHIM_DIR="$shim_dir"
   export CMAKE_C_COMPILER_LAUNCHER="$launcher" CMAKE_CXX_COMPILER_LAUNCHER="$launcher"
   # Native CUDA remains opt-in with the rest of the build; not part of the CPU pilot.
   export CMAKE_CUDA_COMPILER_LAUNCHER="$launcher"
@@ -208,6 +208,12 @@ cuteafd_compiler_cache_docker_args() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # CMake also uses us as a launcher. Let the shim wrap its real compiler once;
+  # otherwise kache sees a shell script as the compiler, not cc/c++.
+  if [[ -n "${CUTEAFD_KACHE_SHIM_DIR:-}" ]] &&
+     [[ "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/cc" || "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/c++" ]]; then
+    exec "$@"
+  fi
   # One failing cache invocation disables it for the remainder of this build.
   if [[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]]; then
     exec "$@"

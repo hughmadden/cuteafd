@@ -157,6 +157,20 @@ def test_changed_toolchain_gets_new_shims_and_requires_fresh_configure(tmp_path)
     assert str(compiler) not in Path(original).read_text()
 
 
+def test_cmake_launcher_wraps_real_compiler_only_once(tmp_path):
+    binary = tmp_path / "kache"
+    log = tmp_path / "invocations"
+    binary.write_text('#!/bin/sh\nif [ "$1" = --version ]; then exit 0; fi\n'
+                      f'printf "%s\\n" "$1" >> "{log}"\nexec "$@"\n')
+    binary.chmod(0o755)
+    run_setup(tmp_path, {"CUTEAFD_KACHE": str(binary),
+                        "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
+              '"$CMAKE_C_COMPILER_LAUNCHER" "$CC" --version; '
+              '"$CMAKE_CXX_COMPILER_LAUNCHER" "$CXX" --version')
+    assert log.read_text().splitlines() == [str(Path(shutil.which(name)).resolve())
+                                           for name in ("cc", "c++")]
+
+
 def test_shim_setup_failure_preserves_compilers(tmp_path):
     result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
                                 "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache"),
