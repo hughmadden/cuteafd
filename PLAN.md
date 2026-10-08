@@ -758,7 +758,8 @@ Policy decisions:
 - **v2.0.0 payload (TJ, 2026-10-07):**
   - Multimodal: vision by default for MiMo V2.6 Flash/Pro, GLM 5.3 Flash and
     Qwen 3.8 (qualified WP-7 availability and single-image gates), with the
-    encoder on an expert Spark (D1); V4.1 vision unchanged.
+    encoder on an expert Spark (D1). V4.1 too: its vision tower moves to a
+    Spark by default like every other family (TJ, 2026-10-08).
   - GLM 5.3 Flash beast mode: startup graphs, real-row MoE dispatch,
     precreated workspaces, Hugh's Wave A, then his Waves B/C (1.6M-token
     pool, 1M extent, C16 speed) as they land.
@@ -862,7 +863,12 @@ Work, in priority order:
    encodes is a stress case, not a gate for this default. MiMo and GLM Flash
    launches now default to `VISION=auto`; Qwen joins them on the qualification
    below. Other generic families stay `off` until their towers are qualified.
-   Keep V4.1 vision unchanged.
+   **Placement policy (TJ, 2026-10-08):** every family, V4.1 included, moves
+   multimodal towers (vision, audio) to Sparks automatically by default;
+   KV, layers and graphs are the better use of RTX memory. Hot but
+   offloadable parts (the token embedding) stay on the GPU on an RTX PRO 6000
+   unless benchmarks show no decode/prefill regression; on 32 GB cards the
+   default is the embedding in host RAM (Hugh's tradeoff).
    **Merge note (Qwen WP-7 + GLM Flash WP-9):** the cold_steps echo allowlist in
    `cuteafd-api/src/openai/probe.rs` is `mimo_v2|qwen4` on WP-7 and
    `mimo_v2|glm5_flash` on WP-9. Each branch lists only families whose
@@ -1681,6 +1687,26 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
 12. **Housekeeping**: prune agent test images on raptor; delete
     `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root).
+
+## Explore after v2
+
+Ideas TJ wants kept for later; not v2 work.
+- Embedding in host RAM on the RTX PRO 6000: benchmark per model before any
+  default change. It likely depends on vocabulary head and embedding size,
+  and on whether the freed memory actually changes allocation enough to
+  onboard another layer. Until then it stays on the GPU (TJ, 2026-10-08).
+- On two RTX cards, keep the embedding (or other cold-ish parts) on only one
+  GPU where that helps, as DS41 did (TJ, 2026-10-08).
+- Segmented full-attention prefill packing for MiMo: pack many short prompts
+  into one ~1,024-row pass (Hugh's FR-M.8a). Needs a new exporter/engine
+  route; MiMo keeps two prefill lanes for v2.
+- MiMo RoPE computed on the fly instead of `max_context × 64` tables (FR-M.5b),
+  if 32 GB plans still need the memory; a SparkInfer export change.
+- MiMo host prefix tier on by default: needs `--host-cache-bytes` to become
+  `Option<u64>` in the shared PrefixArgs so the direct CLI can tell "unset"
+  from 0.
+- Whole-wave sparse-MLA blocks for the 5090 (FR-G.10) and per-SM-count
+  exports, only where measured to pay.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
