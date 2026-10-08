@@ -14,6 +14,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Device mark slots: two per active lane plus two, retaining both snapshot banks
+/// within the byte budget. Disabled retention takes no arena.
+pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u64) -> u64 {
+    if entries == 0 { return 0; }
+    let floor = lanes.max(1).saturating_mul(2).saturating_add(2);
+    let wanted = entries.saturating_mul(2).saturating_add(2);
+    wanted.min(budget_bytes / slot_bytes.max(1)).max(floor)
+}
+
 /// How much computation a retained frontier saves for a query that shares `common` tokens with
 /// it. An exact ancestor (`common == frontier`) always saves `common`. A partial match resumes at
 /// `common` rounded down to `align`, minus `replay` tokens replayed before it; `align == 0`

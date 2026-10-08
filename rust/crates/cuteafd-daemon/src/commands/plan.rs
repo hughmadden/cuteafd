@@ -36,6 +36,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
+                mimo_prefix_entries: args.prefix_cache_entries,
+                mimo_prefix_mark_bytes: args.prefix_cache_mark_mib.checked_mul(1 << 20)
+                    .ok_or_else(|| PlanError::InvalidOption { option: "--prefix-cache-mark-mib", reason: "byte budget overflows".into() })?,
                 mimo_prefix_draft: args.mimo_prefix_draft,
                 mimo_rings: args.mimo_rings,
                 draft_sequences: args.draft_sequences,
@@ -126,6 +129,8 @@ mod tests {
             graph_budget_mib: None,
             concurrency: 8,
             prefix_slots: None,
+            prefix_cache_entries: 20,
+            prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
             mimo_rings: 16,
             draft_sequences: 4,

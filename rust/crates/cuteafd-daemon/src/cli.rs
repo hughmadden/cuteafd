@@ -250,6 +250,12 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
+    /// MiMo retained snapshots per bank for --layout (matches serving).
+    #[arg(long, default_value_t = 20)]
+    pub(crate) prefix_cache_entries: u64,
+    /// MiMo device positional-mark budget for --layout, MiB.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) prefix_cache_mark_mib: u64,
     /// MiMo warm DFlash prefix context marks (off until qualified).
     #[arg(long)]
     pub(crate) mimo_prefix_draft: bool,

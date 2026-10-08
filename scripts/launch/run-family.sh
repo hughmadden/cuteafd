@@ -355,6 +355,7 @@ if [[ $family == mimo_v2 ]]; then
   # prefill unchanged); a number pins the pool.
   mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
   family_args+=(--pool-tokens "$mimo_pool")
+  [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
@@ -747,7 +748,9 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_gib="${coordinator_budget:-95.5}"
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
-    plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")")
+    plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
+      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
   fi

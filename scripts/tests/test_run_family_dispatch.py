@@ -599,6 +599,23 @@ def test_mimo_drafter_context_override_reaches_serving(tmp_path):
     assert "--draft-sequences 8" in launch
 
 
+def test_mimo_prefix_budget_matches_serving_and_encoder_plan(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "vision_config": {}}
+    config["vision_config"] = {"model_type": "test"}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "off"}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/mimo",
+                                  "SPECULATOR=off\nVISION=auto\nPREFIX_CACHE_ENTRIES=24\nPREFIX_CACHE_MARK_MIB=512\n",
+                                  encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    for command in [launch, planner]:
+        assert "--prefix-cache-entries 24" in command
+        assert "--prefix-cache-mark-mib 512" in command
+
+
 @pytest.mark.parametrize("policy, expected", [(None, None), ("auto", None), ("checkpoint", "checkpoint")])
 def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_forwarded(tmp_path, policy, expected):
     config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}

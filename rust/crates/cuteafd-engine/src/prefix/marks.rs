@@ -31,13 +31,9 @@ impl MarkArena {
     /// Recurrent families (hundred-MiB marks) stay near the lane floor and lean on the host tier;
     /// MiMo's 25-39 MB marks fit a full retention of both banks.
     pub fn slots_for(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize) -> usize {
-        let floor = 2 * lanes.max(1) + 2;
-        if entries == 0 {
-            return 0;
-        }
-        let wanted = 2 * entries + 2;
-        let affordable = budget_bytes / slot_bytes.max(1);
-        wanted.min(affordable).max(floor)
+        cuteafd_core::prefix::mark_slots_for(
+            lanes as u64, entries as u64, slot_bytes as u64, budget_bytes as u64,
+        ) as usize
     }
 
     pub fn slots(&self) -> usize {

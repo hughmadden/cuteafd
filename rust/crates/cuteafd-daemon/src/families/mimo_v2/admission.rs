@@ -35,6 +35,50 @@ mod draft_prefix_tests {
     use super::*;
 
     #[test]
+    fn planner_marks_equal_admission_at_c4_c16_warm_on_and_off() {
+        use clap::Parser;
+        use cuteafd_loader::plan::{plan, layout::LayoutOptions, testing::*, PlanOptions};
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            prefix: crate::shared::prefix::PrefixArgs,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = mimo_pro_config();
+        write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+        std::fs::create_dir(dir.path().join("dflash")).unwrap();
+        std::fs::write(dir.path().join("dflash/config.json"),
+            r#"{"num_hidden_layers":5,"num_key_value_heads":8,"head_dim":128}"#).unwrap();
+        let cfg = MimoV2Config::from_hf(&config).unwrap();
+        let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
+            &cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap();
+        let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+        let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024).unwrap();
+        for concurrency in [4, 16] {
+            for enabled in [false, true] {
+                // Include a budget-tight case to catch the concurrency floor and
+                // a warm mark changing the number of affordable retained slots.
+                for mib in [0, 1024, 2048] {
+                    let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
+                    let slots = mark_slots(&cli.prefix, concurrency,
+                        aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
+                    let layout = plan(dir.path(), &PlanOptions {
+                        layout: Some(LayoutOptions {
+                            concurrency: concurrency as u64, mimo_prefix_draft: enabled,
+                            mimo_prefix_mark_bytes: mib << 20, ..Default::default()
+                        }), ..Default::default()
+                    }).unwrap().memory_layout.unwrap();
+                    let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
+                    assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}");
+                    let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
+                    assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
+                    assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn disabled_warm_marks_preserve_target_slot_and_host_mark_geometry() {
         let target = 256u64 << 20;
         let draft = 20u64 << 20;
