@@ -59,6 +59,23 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_v41_accepts_explicit_vision_placement(self) -> None:
+        for vision in ("auto", "off", "rtx", "rtx:0", "spark", "spark:3"):
+            with self.subTest(vision=vision):
+                result = load(
+                    f"MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\nVISION={vision}\n",
+                    'printf "%s\\n" "$VISION"',
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), vision)
+
+    def test_v41_rejects_malformed_vision_placement(self) -> None:
+        for vision in ("auto:0", "off:0", "rtx:-1", "spark:rank", "cpu"):
+            with self.subTest(vision=vision):
+                result = load(f"MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\nVISION={vision}\n")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("VISION must be", result.stderr)
+
     def test_default_config_keeps_legacy_topology_and_is_not_mutated(self) -> None:
         before = CONFIG.read_bytes()
         result = load(
@@ -387,7 +404,8 @@ KV_POOL_SIZE=
 MEMORY_RESERVATION=
 DSPARK=on
 EMBEDDING=gpu
-VISION=auto
+# These topology tests exercise the text-only legacy startup contract.
+VISION=off
 AUDIO=off
 DSPARK_DRAFT_POLICY=adaptive
 dspark_draft_limit=
@@ -1524,8 +1542,8 @@ unset HF_HOME
         self.assertIn("./build.sh", release.stderr)
         wip = self.preflight(sparkinfer="old-revision", wip_slot='"slot"')
         self.assertNotEqual(wip.returncode, 0)
-        self.assertIn("scripts/build/build-dev-images.sh", wip.stderr)
-        self.assertIn("spark preflight on dodo", wip.stderr)
+        self.assertNotIn("carries SparkInfer", wip.stderr)
+        self.assertIn("Spark host preflight failed on dodo", wip.stderr)
 
     def test_exl3_family_tag_reaches_the_manifest_path(self) -> None:
         result = self.preflight(exl3="true", family='"k23"')

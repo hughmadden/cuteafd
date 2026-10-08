@@ -60,6 +60,9 @@ pub fn report(failed: bool) -> Report {
     let baseline = Baseline {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
+            concurrent: Some(ConcurrentRate { width: 8, aggregate_tok_s: 960.0, per_stream_median_tok_s: 120.0,
+                decode_s: 319.0 / 120.0, runs: (0..8).map(|_| ConcurrentTiming { sent_s: 0.0,
+                    timing: timing(320, 319.0 / 120.0) }).collect(), warmup_s: 3.0 }),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
             warmup_s: Some(14.2),
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
@@ -87,6 +90,45 @@ pub fn report(failed: bool) -> Report {
 #[cfg(test)]
 mod tests {
     use crate::render;
+
+    #[test]
+    fn old_reports_without_concurrent_rate_still_deserialize() {
+        let mut value = serde_json::to_value(super::report(false)).unwrap();
+        value["baseline"]["card"].as_object_mut().unwrap().remove("concurrent");
+        let report: crate::report::Report = serde_json::from_value(value).unwrap();
+        assert!(report.baseline.as_ref().unwrap().card.concurrent.is_none());
+        let card = render::card::card_svg(&report);
+        assert!(!card.contains("C8 CODE DECODE"));
+        assert!(card.contains(r#"x="610" y="246""#));
+        assert!(!render::report::panel_svg(&report, "baseline").contains("C8 CODE DECODE"));
+    }
+
+    #[test]
+    fn concurrent_rate_renders_at_the_measured_width_everywhere() {
+        let mut report = super::report(false);
+        for width in [8, 4] {
+            report.baseline.as_mut().unwrap().card.concurrent.as_mut().unwrap().width = width;
+            let label = format!("C{width} CODE DECODE");
+            let card = render::card::card_svg(&report);
+            let panel = render::report::panel_svg(&report, "baseline");
+            assert!(card.contains(&label) && card.contains(">960</text>"));
+            assert!(panel.contains(&label) && panel.contains(">960</text>"));
+            assert!(card.contains("aggregate · 120 tok/s per stream"));
+            let color = render::Theme::for_report(false).concurrent;
+            assert!(card.contains(&format!(r#"fill="{color}""#)));
+            assert!(panel.contains(&format!(r#"fill="{color}""#)));
+            assert!(!render::Theme::for_report(false).series[..4].contains(&color));
+            assert!(!card.contains("code, aggregate"));
+            assert!(card.find("C1 CODE DECODE").unwrap() < card.find(&label).unwrap());
+            assert!(card.find(&label).unwrap() < card.find("8K PREFILL").unwrap());
+            assert!(render::report::report_svg(&report).contains(&label));
+            let placed = crate::publish::Placed { dir: "benchmarks/sample/card".into(), report: report.clone() };
+            let readme = crate::publish::results(&[placed]);
+            assert!(readme.contains("Concurrent code (aggregate)"));
+            assert!(readme.contains(&format!("C{width}: 960")));
+            assert!(readme.contains("<th>Model · quant</th><th>Minimum hardware</th><th>Maximum hardware</th>"));
+        }
+    }
 
     #[test]
     fn publication_evidence_stays_in_full_report_not_card_options() {

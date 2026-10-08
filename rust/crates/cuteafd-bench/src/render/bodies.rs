@@ -266,29 +266,36 @@ impl<'a> View<'a> {
         let warn = if failed { "⚠ " } else { "" };
         let code = b.card.decode_of("code").map_or(0.0, |d| d.tok_s);
         let prefill = b.card.prefill.as_ref();
-        // Two headline numbers.
+        let concurrent = b.card.concurrent.as_ref();
+        let headline_width = if concurrent.is_some() { (w - 48.0) / 3.0 } else { 226.0 };
         let big = |doc: &mut Doc, x: f64, label: &str, value: &str, unit: &str, sub: &str, color: &str| {
             doc.text(x, 12.0, Font::new(10.0, t.muted).spacing(1.4), label);
             let value = format!("{warn}{value}");
-            doc.text(x, 58.0, Font::new(42.0, color).bold().opacity(dim), &value);
-            doc.text(x + text_width(&value, 42.0) + 8.0, 58.0, Font::new(13.0, t.ink2), unit);
-            doc.text(x, 80.0, Font::new(11.0, t.ink2), sub);
+            let size = 42.0f64.min((headline_width - text_width(unit, 13.0) - 8.0) / (0.6 * value.chars().count() as f64));
+            doc.text(x, 58.0, Font::new(size, color).bold().opacity(dim), &value);
+            doc.text(x + text_width(&value, size) + 8.0, 58.0, Font::new(13.0, t.ink2), unit);
+            doc.text(x, 80.0, Font::new(11.0, t.ink2), &fit(sub, 11.0, headline_width));
         };
         let code_tokens = b.card.decode_of("code").and_then(|d| d.runs.first()).map_or(0, |r| r.completion_tokens);
         big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tok/s", &format!("thinking off · {code_tokens} tokens"),
             t.series[0]);
-        match prefill {
-            Some(p) => big(doc, 250.0, "8K PREFILL", &rate(p.tok_s), "tok/s",
-                &format!("TTFT {} · {} tokens", seconds(p.ttft_s), super::grouped(p.prompt_tokens as f64)), t.series[3]),
-            None => big(doc, 250.0, "8K PREFILL", "—", "", "not measured", t.series[3]),
+        if let Some(c) = concurrent {
+            big(doc, headline_width + 24.0, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s), "tok/s",
+                &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
         }
-        // Content bars.
-        let bx = 520.0;
+        let prefill_x = if concurrent.is_some() { 2.0 * (headline_width + 24.0) } else { 250.0 };
+        match prefill {
+            Some(p) => big(doc, prefill_x, "8K PREFILL", &rate(p.tok_s), "tok/s",
+                &format!("TTFT {} · {} tokens", seconds(p.ttft_s), super::grouped(p.prompt_tokens as f64)), t.series[3]),
+            None => big(doc, prefill_x, "8K PREFILL", "—", "", "not measured", t.series[3]),
+        }
+        // Old reports keep their two headlines and bars alongside; new reports put bars below.
+        let (bx, by) = if concurrent.is_some() { (0.0, 100.0) } else { (520.0, 0.0) };
         let bw = w - bx;
-        doc.text(bx, 12.0, Font::new(10.0, t.muted).spacing(1.4), "C1 DECODE BY CONTENT");
+        doc.text(bx, by + 12.0, Font::new(10.0, t.muted).spacing(1.4), "C1 DECODE BY CONTENT");
         let max = b.card.decode.iter().map(|d| d.tok_s).fold(1.0f64, f64::max) * 1.12;
         for (i, d) in b.card.decode.iter().enumerate() {
-            let y = 26.0 + 20.0 * i as f64;
+            let y = by + 26.0 + 20.0 * i as f64;
             let color = content_color(t, &d.content);
             doc.text(bx, y + 11.0, Font::new(11.0, t.ink2), &d.content);
             let track = bw - 150.0;
@@ -298,9 +305,10 @@ impl<'a> View<'a> {
             doc.text(bx + bw, y + 12.0, Font::new(12.0, t.ink).anchor(Anchor::End).opacity(dim),
                 &format!("{warn}{}", rate(d.tok_s)));
         }
-        doc.text(0.0, 102.0, Font::new(11.0, t.ink2), &fit(&self.report.capacity().line(), 11.0, w));
+        let extra = by;
+        doc.text(0.0, 102.0 + extra, Font::new(11.0, t.ink2), &fit(&self.report.capacity().line(), 11.0, w));
         // Quick quality.
-        let mut y = 116.0;
+        let mut y = 116.0 + extra;
         doc.line(0.0, y, w, y, t.line, 1.0);
         y += 8.0;
         let q = &b.quality;
@@ -423,7 +431,7 @@ pub fn title(doc: &mut Doc, theme: &Theme, x: f64, y: f64, size: f64, text: &str
 /// Panel titles and hints by id (renderers outside the catalog: the baseline).
 pub fn panel_title(id: &str) -> (&'static str, &'static str) {
     match id {
-        "baseline" => ("Basic card", "C1 decode by content (thinking off), 8K prefill, quick quality"),
+        "baseline" => ("Basic card", "C1 decode by content (thinking off), C8 code aggregate, 8K prefill, quick quality"),
         _ => match crate::panels::find(id) {
             Some(panel) => (panel.title(), ""),
             None => ("Panel", ""),

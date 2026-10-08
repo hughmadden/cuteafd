@@ -181,6 +181,57 @@ impl From<KdaState> for GlmfKdaState {
     }
 }
 
+/// Where the KDA speculative replay records live (`--replay-records`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub(crate) enum ReplayRecords {
+    /// Their own allocation beside the KDA state.
+    #[default]
+    Own,
+    /// In the prefill lanes' shared scratch, which no decode step reads. A record lives only
+    /// from a speculative verify to its commit, and nothing prefills in between (the serving
+    /// loop verifies, selects, emits and commits before its next prefill round; `RecordGuard`
+    /// refuses a commit otherwise). One GPU, with the step workspaces allocated before the KV
+    /// pool (the measured admission).
+    Shared,
+}
+
+/// With the replay records in the prefill lanes' scratch, a prefill between a speculative verify
+/// and its commit would overwrite the records the commit reads. Every use of rank 0's prefill
+/// lanes and every speculative verify is counted, and a commit of records a prefill may have
+/// overwritten fails instead of applying them.
+#[derive(Debug, Default)]
+pub(crate) struct RecordGuard {
+    shared: bool,
+    /// Uses of the prefill lanes so far, and their count when a speculative verify last recorded.
+    prefills: std::cell::Cell<u64>,
+    recorded_at: std::cell::Cell<Option<u64>>,
+}
+
+impl RecordGuard {
+    fn new(records: ReplayRecords) -> Self {
+        Self { shared: records == ReplayRecords::Shared, ..Self::default() }
+    }
+
+    /// The prefill lanes (and their scratch) are in use.
+    fn prefilled(&self) {
+        self.prefills.set(self.prefills.get() + 1);
+    }
+
+    /// A speculative verify recorded its rows.
+    fn recorded(&self) {
+        self.recorded_at.set(Some(self.prefills.get()));
+    }
+
+    /// Whether a commit may read the records: always with records of their own; with shared ones,
+    /// only when no prefill has run since the last speculative verify.
+    fn check_commit(&self) -> Result<()> {
+        ensure!(!self.shared || self.recorded_at.get() == Some(self.prefills.get()),
+            "a prefill ran between a speculative verify and its commit, over the replay records the commit \
+            reads (--replay-records shared): commit every verify before the next prefill");
+        Ok(())
+    }
+}
+
 const MAX_RANKS: usize = 6;
 /// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
 /// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
@@ -610,6 +661,9 @@ pub(crate) struct StepPlan<'p, 'a> {
     scratch: GlmfScratchOptions,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
+    /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
+    /// scratch is at least this large. 0 with records of their own.
+    shared_records: u64,
 }
 
 /// The engine settings a step plan depends on besides its layers and experts.
@@ -626,6 +680,8 @@ pub(crate) struct StepSettings {
     pub index_cache: IndexCache,
     /// The KDA recurrent state's storage: which KDA programs the steps launch (`--kda-state`).
     pub kda_state: KdaState,
+    /// Where the KDA replay records live.
+    pub replay_records: ReplayRecords,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -637,6 +693,12 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
         let index_compact = settings.index_cache == IndexCache::Compact
             && layers.iter().any(|layer| layer.attention == GlmNextAttention::Mla);
+        // Every KDA layer's record, over this GPU's KDA heads (as `Caches::new`).
+        let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
+        let kda_layers = layers.iter().filter(|layer| layer.attention == GlmNextAttention::Kda).count();
+        let shared_records = if settings.replay_records == ReplayRecords::Shared {
+            (kda_layers * replay_bytes(kda_heads, 3 * kda_heads * cfg.kda_head_dim)) as u64
+        } else { 0 };
         Self {
             library,
             programs,
@@ -656,6 +718,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 table_pages,
                 table_pool_pages,
             },
+            shared_records,
         }
     }
 
@@ -674,24 +737,32 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
         let decode_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, DECODE_ROWS as u64, true)?;
-        let prefill_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false)?;
+        let mut prefill_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false)?;
+        if rank == 0 {
+            // The prefill scratch also holds the replay records (`--replay-records shared`).
+            prefill_scratch.programs = prefill_scratch.programs.max(self.shared_records);
+        }
         Ok(glmf_step_workspaces(self.cfg, lanes, prefill_rows as u64, &self.shape(rank), decode_scratch,
             prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape) {
-        (self.scratch, self.shape)
+    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, u64) {
+        (self.scratch, self.shape, self.shared_records)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape),
+    key: (GlmfScratchOptions, GlmfStepShape, u64),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
 }
+
+/// Rank 0's prefill lanes' shared temporaries, whose scratch holds the KDA replay records with
+/// `--replay-records shared` (the caches keep it alive with them).
+pub(crate) struct PrefillScratch<'a>(Rc<Temporaries<'a>>);
 
 impl<'a> StepWorkspaces<'a> {
     /// The decode workspace and `lanes` prefill lanes of `rows` rows of `plan`, on the current device.
@@ -700,6 +771,11 @@ impl<'a> StepWorkspaces<'a> {
         let temps = Rc::new(plan.temporaries(0, rows, false)?);
         let lanes = (0..lanes).map(|_| plan.lane(0, rows, false, temps.clone())).collect::<Result<_>>()?;
         Ok(Self { key: plan.key(), rows, decode, lanes })
+    }
+
+    /// The prefill lanes' shared temporaries (their scratch).
+    pub(crate) fn prefill_scratch(&self) -> Option<PrefillScratch<'a>> {
+        self.lanes.first().map(|lane| PrefillScratch(lane.temps.clone()))
     }
 }
 
@@ -724,7 +800,11 @@ impl<'a> StepPlan<'_, 'a> {
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        let mut scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        if rank == 0 && !decode {
+            // The prefill scratch also holds the replay records (`--replay-records shared`).
+            scratch.programs = scratch.programs.max(self.shared_records);
+        }
         let bytes = glmf_temporary_bytes(self.cfg, rows as u64, decode, &shape, scratch);
         let head_workspace = self.alloc(bytes.head_workspace)?;
         Ok(Temporaries {
@@ -852,7 +932,9 @@ struct Caches<'a> {
     index: Vec<Option<IndexLayer<'a>>>,
     kda_state: Dev<'a>,
     kda_conv: Dev<'a>,
-    kda_replay: Dev<'a>,
+    /// The replay records: their own allocation, or a region of rank 0's prefill scratch.
+    kda_replay: cuteafd_ffi::CuteafdDeviceBuffer,
+    _kda_replay_owner: RecordsOwner<'a>,
     /// Compact index cache: (tails, speculative key | gate records).
     index_tails: Option<(Dev<'a>, Dev<'a>)>,
     commit_tables: Dev<'a>,
@@ -861,11 +943,21 @@ struct Caches<'a> {
     kda_heads: usize,
 }
 
+/// What keeps the replay records' memory: their own allocation, or the prefill temporaries
+/// whose scratch holds them.
+enum RecordsOwner<'a> {
+    Own { _records: Dev<'a> },
+    Shared { _temporaries: Rc<Temporaries<'a>> },
+}
+
 impl<'a> Caches<'a> {
-    /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads.
+    /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads. The replay
+    /// records take their own allocation, or the start of `records`' scratch (written by every
+    /// speculative verify before its commit reads them, so they start unzeroed).
     #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
-        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState) -> Result<Self> {
+        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState,
+        records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -894,9 +986,23 @@ impl<'a> Caches<'a> {
         let index_tails = if keys || mla_layers == 0 { None } else {
             Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * REPLAY_ROWS * KEY_BYTES)?))
         };
+        let replay = kda_layers * replay;
+        let (kda_replay, owner) = match records {
+            Some(PrefillScratch(temps)) => {
+                let scratch = temps.scratch.buffer;
+                ensure!(scratch.bytes >= replay.max(256), "{replay} bytes of replay records do not fit the \
+                    {}-byte prefill scratch", scratch.bytes);
+                (cuteafd_ffi::CuteafdDeviceBuffer { bytes: replay.max(256), ..scratch },
+                    RecordsOwner::Shared { _temporaries: temps })
+            }
+            None => {
+                let own = zeroed(replay)?;
+                (own.buffer, RecordsOwner::Own { _records: own })
+            }
+        };
         Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
-            kda_replay: zeroed(kda_layers * replay)?, index_tails,
+            kda_replay, _kda_replay_owner: owner, index_tails,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }
 }
@@ -956,6 +1062,10 @@ pub(crate) struct GlmfEngine<'a> {
     mla_ordinal: Vec<Option<usize>>,
     /// The DSA index cache the caches were built for.
     pub index_cache: IndexCache,
+    /// Where the replay records live, and the check that no prefill overwrites shared ones
+    /// between a verify and its commit.
+    pub replay_records: ReplayRecords,
+    records: RecordGuard,
     /// This GPU's caches (rank 0 of a head split).
     caches: Caches<'a>,
     /// This engine's GPU (rank 0 of a head split).
@@ -1191,12 +1301,39 @@ struct GraphGeometry {
     long: bool,
 }
 
+impl GraphGeometry {
+    /// The table geometry a decode step's graphs are keyed by. The pool top-k (`index_topk`, which
+    /// runs only when a row is long) is the only launch that reads the pool table's width and
+    /// stride, so a short step keys neither: short steps that differ only there launch the same
+    /// programs with the same pointers and scalars, and share their graphs.
+    fn keyed(pool_width: usize, page_stride: usize, pool_stride: usize, long: bool) -> Self {
+        if long { Self { pool_width, page_stride, pool_stride, long } }
+        else { Self { pool_width: 0, page_stride, pool_stride: 0, long } }
+    }
+}
+
+/// The narrowest decode page-table stride, in MLA pages (4,096 tokens): sequences up to that size
+/// share one table shape, and so their decode graphs. The index expansion reads only a row's own
+/// pages, so a wider row changes nothing but its upload. A long step (a row past the 2,051-token
+/// dense context) already has at least 36 pages, so the floor never moves its stride.
+const MIN_PAGE_STRIDE: usize = 64;
+
+/// A decode step's (page-table, pool-table) strides for sequences of at most `pages` and
+/// `pool_pages` pages: powers of two (they bound the graphs a growing batch captures), the page
+/// stride from its floor, both at most the pool's pages and a table row's columns (a sequence
+/// holds at most `max_context` tokens' pages). Only a long step keys the pool stride.
+fn decode_strides(pages: usize, pool_pages: usize, pool: (usize, usize), table: (usize, usize)) -> (usize, usize) {
+    (pages.max(1).next_power_of_two().max(MIN_PAGE_STRIDE).min(pool.0).min(table.0),
+        pool_pages.max(1).next_power_of_two().min(pool.1).min(table.1))
+}
+
 fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
     let pools = pages / UNIT_PAGES;
+    let (table_pages, table_pools) = glmf_table_pages(context as u64);
+    let table = (table_pages as usize, table_pools as usize);
     let mut geometries = Vec::new();
     for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let pool_stride = units.next_power_of_two().min(pools);
-        let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+        let (page_stride, pool_stride) = decode_strides(units * UNIT_PAGES, units, (pages, pools), table);
         let capacity = (units * UNIT_ROWS).min(context);
         let mut width = 1;
         while width / 2 * UNIT_ROWS < capacity {
@@ -1204,7 +1341,7 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
             let high = (width * UNIT_ROWS).min(capacity);
             for long in [false, true] {
                 if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
-                    let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                    let geometry = GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
                     if !geometries.contains(&geometry) { geometries.push(geometry); }
                 }
             }
@@ -1223,6 +1360,14 @@ fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: u
             .chain(SPEC_DECODE_BUCKETS.into_iter().filter(move |_| speculation)
                 .map(move |rows| (rows, true, geometry)))
     }).collect()
+}
+
+/// A startup capture's tables: `rows` masked rows over `geometry`.
+fn startup_tables(rows: usize, spec: bool, geometry: GraphGeometry) -> StepTables {
+    let mut tables = StepTables { decode: true, spec, long: geometry.long, pool_width: geometry.pool_width,
+        page_stride: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
+    pad_decode_tables(&mut tables, rows);
+    tables
 }
 
 fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
@@ -1249,6 +1394,16 @@ struct GraphKey {
     pool_width: usize,
     page_stride: usize,
     pool_stride: usize,
+}
+
+impl GraphKey {
+    /// Segment `segment` of a decode step of `rows` rows over `tables`, keyed by its geometry
+    /// ([`GraphGeometry::keyed`]: a short step keys no pool-table width or stride).
+    fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
+        let geometry = GraphGeometry::keyed(tables.pool_width, tables.page_stride, tables.pool_stride, tables.long);
+        Self { segment, rows, spec: tables.spec, long: geometry.long, pool_width: geometry.pool_width,
+            page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
+    }
 }
 
 /// What the decode graph caches did and hold.
@@ -1294,7 +1449,8 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
-        slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState) -> Result<Self> {
+        slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState,
+        records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
@@ -1319,14 +1475,17 @@ impl<'a> GlmfEngine<'a> {
         let split = weights.layers.first().is_some_and(|l| l.split);
         ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
+        ensure!(records.is_none() || !split, "a head split keeps the replay records of its own (--replay-records own)");
+        let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache,
-            kda_state)?;
+            kda_state, records)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots,
-            kda_ordinal, mla_ordinal, index_cache, caches, device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
+            kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
+            device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphCache::new(None)),
@@ -1384,11 +1543,7 @@ impl<'a> GlmfEngine<'a> {
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
             for &(rows, spec, geometry) in &shapes {
-                let mut tables = StepTables { decode: true, spec, long: geometry.long,
-                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                    pool_stride: geometry.pool_stride, ..Default::default() };
-                pad_decode_tables(&mut tables, rows);
-                self.step(&tables, &vec![0; rows], rows, None, None, None, None)?;
+                self.step(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None, None)?;
             }
             self.synchronize()
         })();
@@ -1397,13 +1552,13 @@ impl<'a> GlmfEngine<'a> {
         let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
         for &(rows, spec, geometry) in &shapes {
+            let tables = startup_tables(rows, spec, geometry);
             for rank in 0..self.ranks() {
                 let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
                 let end = if rank == 0 { segments } else { segments - 1 };
                 for segment in 0..end {
-                    ensure!(graphs.borrow().contains(&GraphKey { segment, rows, spec, long: geometry.long,
-                        pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                        pool_stride: geometry.pool_stride }), "startup graph coverage missing");
+                    ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
+                        "startup graph coverage missing");
                 }
             }
         }
@@ -1423,7 +1578,7 @@ impl<'a> GlmfEngine<'a> {
         let caches = self.caches_of(0);
         // Every persistent byte a step can write: KDA state, conv state and replay records, the
         // compact index cache's tails and records, and the paged MLA records, keys and pools.
-        let mut buffers = vec![caches.kda_state.buffer, caches.kda_conv.buffer, caches.kda_replay.buffer];
+        let mut buffers = vec![caches.kda_state.buffer, caches.kda_conv.buffer, caches.kda_replay];
         if let Some((tails, records)) = &caches.index_tails {
             buffers.extend([tails.buffer, records.buffer]);
         }
@@ -1512,9 +1667,10 @@ impl<'a> GlmfEngine<'a> {
         // Both GPUs run the indexer; per-rank index tails are not built yet.
         ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
-            self.programs.load_all()?;
+            // Its own and the shares' programs.
+            self.programs.load_matching(|name| super::glmf_startup_program(name, true))?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads, self.index_cache, self.kda_state)?;
+                self.caches.kda_heads, self.index_cache, self.kda_state, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1734,6 +1890,7 @@ impl<'a> GlmfEngine<'a> {
         if sequences.is_empty() {
             return Ok(());
         }
+        self.records.check_commit()?;
         ensure!(sequences.len() <= DECODE_ROWS && sequences.iter().all(|&(slot, first, keep)|
             slot >= 0 && (slot as usize) < self.slots && first + keep <= REPLAY_ROWS), "commit of {sequences:?}");
         let n = sequences.len();
@@ -1753,7 +1910,7 @@ impl<'a> GlmfEngine<'a> {
             }
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
             let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
-                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.buffer.ptr),
+                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.ptr),
                 ("tables", caches.commit_tables.buffer.ptr)];
             let mut scalars = vec![Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)];
             // The state's commit; with the compact index cache, the one that also rebuilds the tails.
@@ -1872,7 +2029,8 @@ impl<'a> GlmfEngine<'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
-                max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state })
+                max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
+                replay_records: self.replay_records })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -1917,7 +2075,11 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_lanes_of(&self, rank: usize, count: usize) -> Result<std::cell::Ref<'_, Vec<Workspace<'a>>>> {
         let cell = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.lane_workspaces,
-            _ => &self.lane_workspaces,
+            _ => {
+                // Their scratch may hold the replay records: a commit after this sees it.
+                self.records.prefilled();
+                &self.lane_workspaces
+            }
         };
         if cell.borrow().len() < count {
             let mut lanes = cell.borrow_mut();
@@ -2253,11 +2415,10 @@ impl<'a> GlmfEngine<'a> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
-        // A sequence holds at most `max_context` tokens' pages: the tables' columns bound the strides.
-        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pages).min(self.table_pages);
-        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pool_pages).min(self.table_pool_pages);
+        let (page_stride, pool_stride) = decode_strides(
+            sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
+            sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1),
+            (self.pages, self.pool_pages), (self.table_pages, self.table_pool_pages));
         let mut tables = StepTables { decode: true, real_rows: rows, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
             page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
@@ -2276,6 +2437,10 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
+        if spec {
+            // The commit that follows reads this step's records.
+            self.records.recorded();
+        }
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
         let logits = if graphed {
@@ -2503,8 +2668,7 @@ impl<'a> GlmfEngine<'a> {
     /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
     /// streams), its attention half and FFN half.
     fn peer_segment(&self, index: usize, w1: &Workspace<'_>, t: usize, tables: &StepTables) -> Result<()> {
-        let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-            pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+        let key = GraphKey::new(index, t, tables);
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
                 self.peer_post(previous, 0, w1, t, "m64")?;
@@ -2669,8 +2833,7 @@ impl<'a> GlmfEngine<'a> {
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-                pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey::new(index, t, tables);
             self.replay(key, || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
@@ -2967,15 +3130,15 @@ impl<'a> GlmfEngine<'a> {
     fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         spec: bool) -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
-        let at = |pool: &Dev<'_>, per: usize| -> *mut c_void {
+        let at = |pool: cuteafd_ffi::CuteafdDeviceBuffer, per: usize| -> *mut c_void {
             // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
-            unsafe { pool.buffer.ptr.cast::<u8>().add(ordinal * per) }.cast()
+            unsafe { pool.ptr.cast::<u8>().add(ordinal * per) }.cast()
         };
         let caches = self.caches_of(rank);
         let d = caches.kda_heads * self.cfg.kda_head_dim;
-        let conv_state = at(&caches.kda_conv, self.slots * 3 * 3 * d * 2);
-        let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
-        let replay = at(&caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
+        let conv_state = at(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2);
+        let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
+        let replay = at(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
         let decode = cap == "m64";
         if layer.has("w_in_fp8") {
             return self.kda_w8(rank, w, layer, rows, cap, spec, [conv_state, state, replay]);
@@ -3705,7 +3868,7 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            ("integration/cuteafd/glmf.py", 0x1d5b_c227_1c04_0cca_u64),
+            ("integration/cuteafd/glmf.py", 0x4949_583b_7962_90f6_u64),
             ("integration/cuteafd/_glm_kernels.py", 0xabb3_5df9_3a4c_9796),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
@@ -3926,11 +4089,13 @@ mod prefill_lane_tests {
 
     #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
-        use super::{decode_bucket, serving_graph_shapes, GraphGeometry, UNIT_PAGES, UNIT_ROWS};
+        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, GraphGeometry, GraphKey, StepTables,
+            MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
             let shapes = serving_graph_shapes(context, pages, dense, 16, true);
             let set: std::collections::HashSet<_> = shapes.iter().copied().collect();
             assert_eq!(shapes.len(), set.len());
+            let (table_pages, table_pools) = glmf_table_pages(context as u64);
             for capacity in 1..=context.min(pages / UNIT_PAGES * UNIT_ROWS) {
                 let units = capacity.div_ceil(UNIT_ROWS);
                 let mut lengths = vec![1, capacity, dense.min(capacity), (dense + 1).min(capacity)];
@@ -3940,20 +4105,31 @@ mod prefill_lane_tests {
                     lengths.extend([boundary, boundary + 1]);
                 }
                 for len in lengths {
-                    let geometry = GraphGeometry {
-                        page_stride: (units * UNIT_PAGES).next_power_of_two().min(pages),
-                        pool_stride: units.next_power_of_two().min(pages / UNIT_PAGES),
-                        pool_width: len.div_ceil(UNIT_ROWS).next_power_of_two().min(units.next_power_of_two().min(pages / UNIT_PAGES)),
-                        long: len > dense,
-                    };
+                    // The decode step's tables: power-of-two strides (the page stride from its floor), within the
+                    // pool and a table row; the top-k width within the pool stride.
+                    let page_stride = (units * UNIT_PAGES).next_power_of_two().max(MIN_PAGE_STRIDE).min(pages)
+                        .min(table_pages as usize);
+                    let pool_stride = units.next_power_of_two().min(pages / UNIT_PAGES)
+                        .min(table_pools as usize);
+                    let pool_width = len.div_ceil(UNIT_ROWS).next_power_of_two().min(pool_stride);
+                    let long = len > dense;
                     for (rows, spec) in [(1, false), (3, false), (10, false), (16, false), (2, true), (10, true), (64, true)] {
-                        assert!(set.contains(&(decode_bucket(rows, spec), spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
+                        let tables = StepTables { decode: true, spec, long, pool_width, page_stride, pool_stride,
+                            ..Default::default() };
+                        let key = GraphKey::new(0, decode_bucket(rows, spec), &tables);
+                        let geometry = GraphGeometry { pool_width: key.pool_width, page_stride: key.page_stride,
+                            pool_stride: key.pool_stride, long: key.long };
+                        // A short step's key holds no pool-table width or stride.
+                        assert_eq!((key.pool_width, key.pool_stride), if long { (pool_width, pool_stride) } else { (0, 0) });
+                        assert!(set.contains(&(key.rows, spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
                     }
                 }
             }
         }
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 400);
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 160);
+        // 14 geometries of 32,768 tokens (four short ones, one per page stride, and ten long ones), each
+        // at 4 plain and 6 speculative buckets.
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 140);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 56);
     }
 
     #[test]
@@ -3970,13 +4146,13 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(17, false), 32);
         for sequences in [8, 16] {
             let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true);
-            assert_eq!(shapes.len() * 46, 18400);
+            assert_eq!(shapes.len() * 46, 6440);
             let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true);
-            assert_eq!(reserve, [3_300_923_584, super::graph_reserve_bytes(18000)]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 7360);
+            assert_eq!(reserve, [1_198_944_016, super::graph_reserve_bytes(6300)]);
+            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 2576);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 20240);
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 22080);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 7084);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 7728);
     }
 
     #[test]
@@ -4101,5 +4277,207 @@ mod prefill_lane_tests {
         assert_eq!(prefill_lane_capacity(DEFAULT_PREFILL_LANES, 4096), 8192);
         assert_eq!(prefill_lane_plan(511, 2, 4096).unwrap(), (1, 511));
         assert_eq!(prefill_lane_plan(512, 2, 4096).unwrap(), (2, 256));
+    }
+}
+
+#[cfg(test)]
+mod graph_key_tests {
+    use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
+        graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
+        GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
+        PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
+    use std::collections::HashSet;
+
+    fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
+        StepTables { decode: true, long, pool_width, page_stride, pool_stride, spec: true, ..Default::default() }
+    }
+
+    #[test]
+    fn short_steps_share_graphs_whatever_their_pool_top_k_shape() {
+        // The pool top-k (the only reader of the width and the pool table stride) runs only when a
+        // row sees past the dense context.
+        let key = |t: &StepTables| GraphKey::new(3, 40, t);
+        assert_eq!(key(&tables(false, 1, 64, 16)), key(&tables(false, 4, 64, 32)));
+        assert_eq!((key(&tables(false, 8, 64, 16)).pool_width, key(&tables(false, 8, 64, 16)).pool_stride), (0, 0));
+        assert_ne!(key(&tables(true, 1, 64, 16)), key(&tables(true, 4, 64, 16)));
+        assert_ne!(key(&tables(true, 4, 64, 16)), key(&tables(true, 4, 64, 32)));
+        // The page table stride reaches every step (the index expansion reads it).
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(false, 1, 128, 16)));
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(true, 1, 64, 16)));
+        assert_ne!(GraphKey::new(3, 40, &tables(false, 1, 64, 16)), GraphKey::new(4, 40, &tables(false, 1, 64, 16)));
+        assert_ne!(GraphKey::new(3, 40, &tables(false, 1, 64, 16)), GraphKey::new(3, 32, &tables(false, 1, 64, 16)));
+    }
+
+    #[test]
+    fn decode_strides_are_powers_of_two_from_a_floor_within_the_pool_and_the_table() {
+        let (pool, columns) = ((1 << 20, 1 << 18), (2048, 512));
+        // The page stride starts at the floor; the pool stride (keyed only by long steps) has none.
+        assert_eq!(decode_strides(5, 2, pool, columns), (MIN_PAGE_STRIDE, 2));
+        assert_eq!(decode_strides(64, 16, pool, columns), (64, 16));
+        assert_eq!(decode_strides(65, 17, pool, columns), (128, 32));
+        assert_eq!(decode_strides(132, 33, pool, columns), (256, 64));
+        // A row holds one sequence of the context: 131,072 tokens are 2,048 pages, 512 pool pages.
+        assert_eq!(decode_strides(4000, 1000, pool, columns), (2048, 512));
+        // A tiny pool, or a short context's table row, caps the strides below the floor.
+        assert_eq!(decode_strides(5, 2, (32, 8), columns), (32, 2));
+        assert_eq!(decode_strides(5, 2, pool, table(777)), (16, 2));
+        // A long step's sequence holds more than the 2,051-token dense context: at least 9 units (36
+        // pages), so its page stride is at least the floor already.
+        let units = 2052usize.div_ceil(UNIT_ROWS);
+        assert_eq!((units * UNIT_PAGES).next_power_of_two(), MIN_PAGE_STRIDE);
+        assert_eq!(decode_strides(units * UNIT_PAGES, units, pool, columns), (64, 16));
+    }
+
+    /// A table row's (page, pool page) columns for `context` tokens.
+    fn table(context: usize) -> (usize, usize) {
+        let (pages, pools) = glmf_table_pages(context as u64);
+        (pages as usize, pools as usize)
+    }
+
+    /// The startup geometries as `work/p0` enumerated them before the shorter keys: every key held
+    /// the pool top-k's width and stride, and strides started at one unit.
+    fn full_keys(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
+        let pools = pages / UNIT_PAGES;
+        let mut geometries = Vec::new();
+        for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
+            let pool_stride = units.next_power_of_two().min(pools);
+            let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+            let capacity = (units * UNIT_ROWS).min(context);
+            let mut width = 1;
+            while width / 2 * UNIT_ROWS < capacity {
+                let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
+                let high = (width * UNIT_ROWS).min(capacity);
+                for long in [false, true] {
+                    if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                        let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                        if !geometries.contains(&geometry) { geometries.push(geometry); }
+                    }
+                }
+                width *= 2;
+            }
+        }
+        geometries
+    }
+
+    /// The startup set before and after, 16 sequences with drafts: long steps (the only ones that run
+    /// the pool top-k) keep every key, short steps collapse onto page strides from 64 pages with no
+    /// pool-table width or stride, every shape keeps the row buckets the threshold registry passes,
+    /// and each capture's padded tables key it as its own shape.
+    #[test]
+    fn shorter_keys_shrink_the_startup_set_and_change_no_launch() {
+        let dense = 2051;
+        // The reserve's pool target (2,097,152 tokens: 32,768 pages) at three contexts, then smaller
+        // pools and short contexts, whose pool or table row caps the floors.
+        for (context, pages, before_shapes, after_shapes) in [(8192usize, 32768usize, 230usize, 50usize),
+            (32768, 32768, 400, 140), (131_072, 32768, 610, 270), (32768, 4096, 400, 140), (131_072, 2048, 610, 270),
+            (4096, 64, 160, 20), (3000, 36, 160, 20), (2048, 32768, 100, 10)] {
+            let (table_pages, _) = table(context);
+            let (before, after) = (full_keys(context, pages, dense), graph_geometries(context, pages, dense));
+            let long = |set: &[GraphGeometry]| set.iter().copied().filter(|g| g.long).collect::<Vec<_>>();
+            assert_eq!(long(&after), long(&before), "{context}/{pages}: long keys moved");
+            let short: HashSet<_> = after.iter().copied().filter(|g| !g.long).collect();
+            let collapsed: HashSet<_> = before.iter().filter(|g| !g.long).map(|g| GraphGeometry { pool_width: 0,
+                page_stride: g.page_stride.max(MIN_PAGE_STRIDE).min(pages).min(table_pages), pool_stride: 0,
+                long: false }).collect();
+            assert_eq!((short.len(), &short), (after.len() - long(&after).len(), &collapsed), "{context}/{pages}");
+            let shapes = serving_graph_shapes(context, pages, dense, 16, true);
+            assert_eq!((before.len() * 10, shapes.len()), (before_shapes, after_shapes), "{context}/{pages}");
+            // Rows: per geometry, exactly the buckets `check_decode_thresholds` passes for 16 sequences.
+            check_decode_thresholds(16, true).unwrap();
+            let plain: Vec<_> = PLAIN_DECODE_BUCKETS.into_iter()
+                .filter(|&rows| rows <= decode_bucket(16usize.clamp(16, DECODE_ROWS), false)).collect();
+            for geometry in &after {
+                for (spec, buckets) in [(false, &plain[..]), (true, &SPEC_DECODE_BUCKETS[..])] {
+                    let rows: Vec<_> = shapes.iter().filter(|s| s.2 == *geometry && s.1 == spec).map(|s| s.0).collect();
+                    assert_eq!(rows, buckets);
+                    check_bucket_thresholds(&rows, DECODE_PROJECTION_THRESHOLDS).unwrap();
+                }
+            }
+            // The capture's masked tables: `rows` rows of the geometry's strides, keyed as the shape.
+            for &(rows, spec, geometry) in &shapes {
+                let tables = startup_tables(rows, spec, geometry);
+                assert_eq!((tables.kv_slots.len(), tables.page_table.len(), tables.pool_table.len(), tables.real_rows),
+                    (rows, rows * geometry.page_stride, rows * geometry.pool_stride, 0));
+                assert!(tables.positions.iter().all(|&p| p == -1) && tables.kv_slots.iter().all(|&s| s == -1));
+                for segment in [0, 45] {
+                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec,
+                        long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                        pool_stride: geometry.pool_stride });
+                }
+            }
+        }
+        // The startup reserve on one GPU (46 segments a shape) at the engine's 146,459 B a graph.
+        for (context, before, after) in [(8192, 1_926_552_328, 471_335_704), (32768, 3_300_923_584, 1_198_944_016),
+            (131_072, 4_998_676_312u64, 2_249_933_800u64)] {
+            assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
+            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false), [after]);
+        }
+    }
+
+    /// A short step's key leaves out the pool table's width and stride, so the pool top-k, which runs
+    /// only when a row is long, must stay the one launch that reads them. Re-derive the key (and
+    /// this check) if another launch reads the pool table or those scalars.
+    #[test]
+    fn only_the_long_pool_top_k_reads_what_short_keys_leave_out() {
+        let source = include_str!("engine.rs");
+        let source = &source[..source.find("\n#[cfg(test)]\n").unwrap()];
+        let reads = ["pool_table.buffer", "Scalar::I32(tables.pool_width", "Scalar::I32(tables.pool_stride"];
+        let topk = source.find("&format!(\"index_topk_").unwrap();
+        let guard = source[..topk].rfind("if tables.long {").unwrap();
+        let end = topk + source[topk..].find("\"index_expand\"").unwrap();
+        // `if tables.long {` opens right before the launch and closes after its scalars.
+        assert!(!source[guard..topk].contains('}'));
+        for read in reads {
+            assert_eq!(source.matches(read).count(), 1, "{read}");
+            let at = source.find(read).unwrap();
+            assert!(topk < at && at < end, "{read} outside the long pool top-k launch");
+        }
+        let last = reads.iter().map(|read| source.find(read).unwrap()).max().unwrap();
+        assert!(source[last..end].lines().any(|line| line.trim() == "}"));
+    }
+}
+
+#[cfg(test)]
+mod replay_record_tests {
+    use super::{replay_bytes, RecordGuard, ReplayRecords};
+
+    #[test]
+    fn shared_records_commit_only_what_no_prefill_overwrote() {
+        let guard = RecordGuard::new(ReplayRecords::Shared);
+        // The serving loop: prefill rounds, then a verify and its commit.
+        guard.prefilled();
+        guard.recorded();
+        guard.check_commit().unwrap();
+        // A second commit of the same records (nothing ran in between) reads them intact.
+        guard.check_commit().unwrap();
+        // A prefill between a verify and its commit overwrote the records.
+        guard.recorded();
+        guard.prefilled();
+        let error = guard.check_commit().unwrap_err().to_string();
+        assert!(error.contains("between a speculative verify and its commit"), "{error}");
+        // The next verify records afresh.
+        guard.recorded();
+        guard.check_commit().unwrap();
+        // A commit with no verify at all reads nothing it could trust.
+        assert!(RecordGuard::new(ReplayRecords::Shared).check_commit().is_err());
+    }
+
+    #[test]
+    fn records_of_their_own_are_never_refused() {
+        let guard = RecordGuard::new(ReplayRecords::Own);
+        guard.recorded();
+        guard.prefilled();
+        guard.check_commit().unwrap();
+        assert!(RecordGuard::new(ReplayRecords::Own).check_commit().is_ok());
+    }
+
+    /// One KDA layer's records over a GPU's 64 KDA heads: 9,453,568 B; 34 layers 321,421,312 B,
+    /// the loader's `glm_flash_kda_replay_bytes`, which the 4,096-row KDA prefill programs'
+    /// 782,236,672-byte scratch holds.
+    #[test]
+    fn the_records_fit_the_prefill_scratch() {
+        assert_eq!(replay_bytes(64, 3 * 64 * 128), 9_453_568);
+        assert_eq!(34 * replay_bytes(64, 3 * 64 * 128), 321_421_312);
+        assert!(34 * replay_bytes(64, 3 * 64 * 128) < 782_236_672);
     }
 }

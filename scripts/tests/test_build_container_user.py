@@ -147,9 +147,16 @@ def test_dev_shell_execs_docker_with_the_group(tmp_path):
         ["-e", "CARGO_HOME=/tmp/cuteafd-dev-home/cargo"],
     ):
         assert any(tokens[i:i + 2] == pair for i in range(len(tokens) - 1)), pair
+    tokens = tokens[tokens.index("run"):]
     assert tokens[0] == "run"
     assert tokens[-1] == "true"
     assert tokens[-2] == "cuteafd-spark-expert-dev"
+    common_dir = subprocess.check_output(
+        ["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        text=True,
+    ).strip()
+    if common_dir != str(REPO / ".git"):
+        assert f"{common_dir}:{common_dir}:ro" in tokens
 
 
 def test_nvfp4_verifier_writes_the_reference_as_the_calling_user():
