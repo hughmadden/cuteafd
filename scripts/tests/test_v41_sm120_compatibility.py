@@ -1,5 +1,4 @@
 """Execute the real native bridges against stubbed CUDA/AOT launch entries."""
-import fcntl
 from pathlib import Path
 import shutil
 import subprocess
@@ -146,10 +145,10 @@ def test_capability_only_admission_and_live_launch_caps(family):
             source = ROOT / "native/shared/src/v41_experts.cc"
             main = EXPERT_MAIN
         (directory / "main.cc").write_text(main.replace("SOURCE", str(source)))
-        with (Path.home() / ".cache/cuteafd/build.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
-                            "-I", str(ROOT / "native/shared/include"),
-                            "-I", str(ROOT / "native/families/deepseek_v41/include"),
-                            str(directory / "main.cc"), "-o", str(directory / "test")], check=True)
-        subprocess.run([str(directory / "test")], check=True)
+        subprocess.run(["flock", "-w", "600", str(Path.home() / ".cache/cuteafd/build.lock"),
+                        compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        "-I", str(ROOT / "native/shared/include"),
+                        "-I", str(ROOT / "native/families/deepseek_v41/include"),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
