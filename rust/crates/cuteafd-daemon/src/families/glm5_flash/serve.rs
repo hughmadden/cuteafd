@@ -536,6 +536,10 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
+    if marks == PrefixMarks::Pool && host.is_none() && entries > 0 {
+        tracing::info!("GLM 5.3 Flash pool marks without the host tier: snapshots the pool evicts are dropped \
+            (--host-cache-bytes auto keeps them in RAM)");
+    }
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;

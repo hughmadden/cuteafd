@@ -76,7 +76,9 @@ Attention (KDA), a minority run MLA + DSA.
   (`--prefix-marks pool`, opt-in) in units of the KV pool itself (49 per FP32
   mark), taken at capture and evicted with the snapshot's rows. Unit 0 is then
   never handed out: the decode sparse MLA reads its first record for masked
-  candidates, and a mark's bytes there would turn decode rows into NaN.
+  candidates, and a mark's bytes there would turn decode rows into NaN. Pool
+  marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
+  keeps it off), so the snapshots the pool evicts move to RAM.
 
 ## Default precision (single residency)
 

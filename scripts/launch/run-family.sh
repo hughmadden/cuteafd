@@ -750,13 +750,16 @@ if [[ $family == glm5_flash ]]; then
   esac
   # GLM5_FLASH_PREFIX_MARKS: where prefix-cache snapshots keep their KDA state marks: unset or
   # arena (the engine default: a 2C + 2 device arena beside the KV pool) or pool (units of the
-  # KV pool itself, evicted like any snapshot's rows, unit 0 reserved; no arena to reserve).
+  # KV pool itself, evicted like any snapshot's rows, unit 0 reserved; no arena to reserve). Pool
+  # marks turn the pinned host tier on (HOST_CACHE_BYTES=auto) unless HOST_CACHE_BYTES is set (0
+  # keeps it off): snapshots the pool evicts move to RAM instead of being lost.
   prefix_marks="$(get GLM5_FLASH_PREFIX_MARKS)"
   case "$prefix_marks" in
     "") ;;
     arena|pool) family_args+=(--prefix-marks "$prefix_marks") ;;
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
+  [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

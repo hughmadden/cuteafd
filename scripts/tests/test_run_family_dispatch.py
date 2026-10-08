@@ -549,6 +549,23 @@ def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
         assert f"--prefix-marks {expected}" in launch and launch.count("--prefix-marks") == 1, launch
 
 
+@pytest.mark.parametrize("keys,expected", [
+    ("GLM5_FLASH_PREFIX_MARKS=pool\n", "auto"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", "64GiB"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=0\n", None),
+    ("GLM5_FLASH_PREFIX_MARKS=arena\n", None),
+    ("", None),
+])
+def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--host-cache-bytes" not in launch, launch
+    else:
+        assert launch.count("--host-cache-bytes") == 1 and f"--host-cache-bytes {expected}" in launch, launch
+
+
 def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
