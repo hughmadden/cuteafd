@@ -1244,6 +1244,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
     text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
     let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120]),
+        t("head.weight", "BF16", &[128, 5120]),
         t("vision.patch_embed.proj.weight", "BF16", &[16, 3, 14, 14])]);
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
@@ -1257,6 +1258,16 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     assert!(off.devices[0].items.iter().all(|i| i.group != "vision"));
     assert_eq!(auto.devices[0].used_bytes() - off.devices[0].used_bytes(), tower);
     assert_eq!(auto.pool_tokens, off.pool_tokens);
+    use cuteafd_core::memory_layout::Category;
+    assert!(!auto.devices[0].by_category().contains_key(&Category::Embedding));
+    options.layout.as_mut().unwrap().force_gpu_embedding = true;
+    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(gpu.devices[0].by_category()[&Category::Embedding] > 0);
+    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), 128 * 5120 * 2);
+    options.layout.as_mut().unwrap().force_gpu_embedding = false;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
+    let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(pro.devices[0].by_category()[&Category::Embedding] > 0);
 }
 
 #[test]

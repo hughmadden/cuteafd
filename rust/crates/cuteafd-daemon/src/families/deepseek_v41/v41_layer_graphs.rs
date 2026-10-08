@@ -6,6 +6,32 @@ use std::collections::BTreeMap;
 
 const MAX_DECODE_ROWS: u32 = 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1);
 
+static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Startup-only small-card policy. Exact shapes outside the set execute eagerly,
+/// never evicting or recapturing a graph, and never changing causal/cache rows.
+pub(super) fn set_fixed_shapes(shapes: Vec<u32>) -> Result<()> {
+    FIXED_SHAPES.set(validate_fixed_shapes(shapes)?)
+        .map_err(|_| anyhow::anyhow!("target graph policy already set"))
+}
+
+fn validate_fixed_shapes(mut shapes: Vec<u32>) -> Result<Vec<u32>> {
+    ensure!(shapes.contains(&1) && shapes.contains(&6)
+        && shapes.iter().all(|r| (1..=MAX_DECODE_ROWS).contains(r)),
+        "fixed target graph set must include rows 1 and 6 and use decode rows only");
+    shapes.sort_unstable();
+    shapes.dedup();
+    Ok(shapes)
+}
+
+pub(super) fn captures_shape(rows: u32) -> bool {
+    FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
+}
+
+pub(super) fn fixed_binding_limit() -> Option<usize> {
+    FIXED_SHAPES.get().map(|shapes| shapes.len() * 4)
+}
+
 struct Entry<'w, W> {
     weights: &'w W,
     graph: *mut c_void,
@@ -65,7 +91,7 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
                 unsafe { self.library.cuda_graph_exec_destroy(old.graph)?; }
             }
             if let Some(old) = self.entries[layer].take() {
-                if old.rows <= MAX_DECODE_ROWS && old.rows != rows {
+                if (old.rows <= MAX_DECODE_ROWS || FIXED_SHAPES.get().is_some()) && old.rows != rows {
                     if let Some(replaced) = self.retained[layer].insert(old.rows, old) {
                         unsafe { self.library.cuda_graph_exec_destroy(replaced.graph)?; }
                     }
@@ -165,6 +191,15 @@ impl<'a> RowGraphs<'a> {
 mod tests {
     use super::*;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn fixed_shapes_preserve_c1_and_refuse_replacing_large_prefill_slots() {
+        assert_eq!(validate_fixed_shapes(vec![48, 6, 1, 24, 32, 40, 6]).unwrap(),
+            vec![1, 6, 24, 32, 40, 48]);
+        for shapes in [vec![], vec![1], vec![6], vec![1, 6, 0], vec![1, 6, 80]] {
+            assert!(validate_fixed_shapes(shapes).is_err());
+        }
+    }
 
     #[test]
     fn cuda_row_bank_preserves_decode_handles_over_prefill() -> Result<()> {

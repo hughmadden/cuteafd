@@ -16,17 +16,28 @@ pub(super) const RUNTIME_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
 // CUDA allocation granularity and modules first used after this startup sample.
 const SMALL_CARD_SAMPLE_MARGIN: usize = 32 * 1024 * 1024;
 
+pub(super) fn embedding_placement(explicit: Option<crate::shared::memory::EmbedPlacement>, total: usize)
+    -> crate::shared::memory::EmbedPlacement {
+    explicit.unwrap_or(if total <= 32usize << 30 {
+        crate::shared::memory::EmbedPlacement::Host
+    } else { crate::shared::memory::EmbedPlacement::Gpu })
+}
+
 pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(usize, usize)> {
     let (free, total) = lib.cuda_memory_info()?;
     if total > 32usize << 30 { return Ok((free, total)); }
     let device = lib.cuda_get_device()?;
     let live = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let occupied = total - free;
+    let graph_budget = std::env::var("CUTEAFD_V41_GRAPH_BUDGET_MIB").ok()
+        .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(0)
+        .checked_mul(1 << 20).context("V4.1 graph budget overflow")?;
     let admitted_free = free.checked_sub(SMALL_CARD_SAMPLE_MARGIN)
-        .context("32 GB V4.1 startup leaves no room for the measured-pool margin")?;
+        .and_then(|bytes| bytes.checked_sub(graph_budget))
+        .context("32 GB V4.1 startup leaves no room for the measured-pool and graph margins")?;
     tracing::info!(occupied_bytes=occupied, tracked_owner_bytes=live,
         measured_context_module_allocator_bytes=occupied.saturating_sub(live),
-        sample_margin_bytes=SMALL_CARD_SAMPLE_MARGIN, admitted_free_bytes=admitted_free,
+        sample_margin_bytes=SMALL_CARD_SAMPLE_MARGIN, graph_budget_bytes=graph_budget, admitted_free_bytes=admitted_free,
         "V4.1 measured CUDA occupancy charged before pool sizing");
     Ok((admitted_free, total))
 }
@@ -91,7 +102,7 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
         ("backbone weights/load bound", BackboneLaneWeights::device_bytes(lib, catalog)?),
         ("cache producer weights", CacheProducerWeights::device_bytes(lib, catalog)?),
         ("index weights", IndexLaneWeights::device_bytes(lib, catalog)?),
-        ("embedding", if args.embedding_placement == crate::shared::memory::EmbedPlacement::Gpu {
+        ("embedding", if embedding_placement(args.embedding_placement, total) == crate::shared::memory::EmbedPlacement::Gpu {
             NativeRtxTensors::plan(catalog, &["embed.weight".into()])? } else { 0 }),
         ("vocabulary resident", VocabularyHead::resident_bytes(catalog)?),
         ("head weights", TargetHeadWeights::device_bytes(catalog)?),
@@ -166,6 +177,16 @@ fn startup_peak(fixed: usize, loading_phases: &[(&str, usize)]) -> Result<usize>
 
 #[cfg(test)]
 mod startup_tests {
+    #[test]
+    fn embedding_profile_preserves_explicit_overrides_and_pro_default() {
+        use crate::shared::memory::EmbedPlacement::{Gpu, Host};
+        for total in [31usize << 30, 32usize << 30, 96usize << 30] {
+            assert_eq!(super::embedding_placement(Some(Gpu), total), Gpu);
+            assert_eq!(super::embedding_placement(Some(Host), total), Host);
+            assert_eq!(super::embedding_placement(None, total),
+                if total <= 32usize << 30 { Host } else { Gpu });
+        }
+    }
     #[test]
     fn sequential_loading_peaks_do_not_shrink_the_serving_pool() {
         let fixed = 26usize << 30;

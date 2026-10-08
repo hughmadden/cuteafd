@@ -848,6 +848,15 @@ Work, in priority order:
    host-mapped embedding (like Engram) is a planner lever only when memory
    binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
    within ~0.5% (TJ, 2026-10-05).
+   **32 GB candidate issues (2026-10-08, work/plat2-32gb):** one heap abort
+   (`corrupted size vs. prev_size while consolidating`) in the initial C16
+   attempt; not reproduced in four corrected launches plus ten distinct C16
+   soak batches with MALLOC_CHECK_=3/GDB. No fix or memory-safety qualification
+   claimed. Independently, lazy target graph retention grew to ~12.6K counted
+   executables with unchanged device owners: untracked residency 3.24 ->
+   5.16 GB after batches 1 -> 5, leaving only 0.35 GiB of the logical 31.8 GiB
+   budget. A fixed small-card graph set and charged reserve, host embedding,
+   warmed margin and C1/C16 gates are pending; PRO policy remains unchanged.
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
    Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),

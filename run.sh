@@ -210,9 +210,10 @@ if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gi
   explicit_profile_key() { [[ -n "${overrides[$1]:-}" ]] || grep -qE "^${1}=.+" "$config"; }
   explicit_profile_key PREFILL_BATCH_TOKENS || PREFILL_BATCH_TOKENS=1024
   explicit_profile_key MEMORY_RESERVATION || MEMORY_RESERVATION=97%
+  explicit_profile_key EMBEDDING || EMBEDDING=host
   [[ "$RTX_EXPERT_LAYERS" != auto ]] || RTX_EXPERT_LAYERS=0
   ((PREFILL_BATCH_TOKENS <= 1024)) || release_die "32 GB V4.1 cannot admit capacity 4096 with vision/dSpark; set PREFILL_BATCH_TOKENS=1024 (256 for pool-first)"
-  echo "V4.1 32 GB profile: logical GPU ${profile_gib} GiB, prefill=$PREFILL_BATCH_TOKENS reservation=$MEMORY_RESERVATION RTX layers=$RTX_EXPERT_LAYERS (explicit overrides retained)" >&2
+  echo "V4.1 32 GB profile: logical GPU ${profile_gib} GiB, prefill=$PREFILL_BATCH_TOKENS reservation=$MEMORY_RESERVATION RTX layers=$RTX_EXPERT_LAYERS embedding=$EMBEDDING (explicit overrides retained)" >&2
 fi
 snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_REVISION"
 model_is_exl3="$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")"

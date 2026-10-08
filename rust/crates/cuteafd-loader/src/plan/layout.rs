@@ -516,7 +516,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             }
         }
     }
-    if options.host_embedding || (family == "mimo_v2" && small_card && !options.force_gpu_embedding) {
+    if options.host_embedding || (small_card && !options.force_gpu_embedding) {
         let embedding = report.components.iter().find(|c| c.component == Component::Embedding);
         let names: Vec<_> = checkpoint.tensors.iter().filter(|t|
             t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).collect();
