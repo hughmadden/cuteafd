@@ -332,60 +332,44 @@ impl Encoder {
             Self::Remote(e) => Some(e.health_handle()),
         }
     }
-    pub fn encode(&mut self, image: &V41Image, cancelled: impl Fn() -> bool) -> Result<Vec<u8>> {
+    pub fn image_job(image: &V41Image) -> EncodeJob {
         let grid = image.grid();
-        let job = EncodeJob::image(
+        EncodeJob::image(
             ImageKey(*image.identity()),
             [1, grid.vit_height as u32, grid.vit_width as u32],
             image.patches().to_vec().into(),
             grid.tokens(),
             5120,
-        );
-        let expected = job.feature_bytes().map_err(anyhow::Error::new)?;
-        let key = job.key;
-        let client: &mut dyn EncoderClient = match self {
-            Self::Off => anyhow::bail!(cuteafd_api::openai::NativeFailure::BadRequest(
-                "vision input disabled".into()
-            )),
-            Self::Local(e) => e,
-            Self::Remote(e) => e,
-            Self::Pending { .. } => anyhow::bail!("vision encoder has not connected"),
-        };
-        let started = Instant::now();
-        let ticket = client.submit(job).map_err(|e| {
-            anyhow::anyhow!(cuteafd_api::openai::NativeFailure::Unavailable(
-                e.to_string()
-            ))
-        })?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if cancelled() || Instant::now() >= deadline {
-                client.cancel(ticket);
-                anyhow::bail!(cuteafd_api::openai::NativeFailure::Unavailable(
-                    "vision encoding cancelled or timed out".into()
-                ));
+        )
+    }
+
+}
+
+impl EncoderClient for Encoder {
+    fn submit(&mut self, job: EncodeJob) -> std::result::Result<EncoderTicket, MediaError> {
+        match self {
+            Self::Local(owner) => owner.submit(job),
+            Self::Remote(remote) => remote.submit(job),
+            Self::Off | Self::Pending { .. } => Err(media_error("vision encoder unavailable")),
+        }
+    }
+    fn poll(
+        &mut self,
+        ticket: EncoderTicket,
+    ) -> Option<std::result::Result<EncodeOutput, MediaError>> {
+        match self {
+            Self::Local(owner) => owner.poll(ticket),
+            Self::Remote(remote) => remote.poll(ticket),
+            Self::Off | Self::Pending { .. } => {
+                Some(Err(media_error("vision encoder unavailable")))
             }
-            if let Some(result) = client.poll(ticket) {
-                let output = result.map_err(|e| {
-                    anyhow::anyhow!(cuteafd_api::openai::NativeFailure::Unavailable(
-                        e.to_string()
-                    ))
-                })?;
-                ensure!(
-                    output.key == key && output.features.len() == expected,
-                    "invalid V4.1 feature reply"
-                );
-                let roundtrip_ms = started.elapsed().as_secs_f64() * 1000.0;
-                tracing::info!(
-                    tokens = grid.tokens(),
-                    owner_ms = output.elapsed_ms,
-                    roundtrip_ms,
-                    edge_ms = roundtrip_ms - output.elapsed_ms,
-                    "V4.1 image encoder roundtrip"
-                );
-                return Ok(output.features.to_vec());
-            }
-            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn cancel(&mut self, ticket: EncoderTicket) {
+        match self {
+            Self::Local(owner) => owner.cancel(ticket),
+            Self::Remote(remote) => remote.cancel(ticket),
+            Self::Off | Self::Pending { .. } => (),
         }
     }
 }

@@ -461,7 +461,10 @@ impl EncoderClient for RemoteEncoder {
                 reply,
                 cancelled: cancelled.clone(),
             })
-            .map_err(|_| error("vision encoder queue unavailable"))?;
+            .map_err(|failure| match failure {
+                mpsc::TrySendError::Full(_) => MediaError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => error("vision encoder unavailable"),
+            })?;
         self.pending.insert(ticket, Pending { result, cancelled });
         Ok(ticket)
     }
@@ -1275,6 +1278,21 @@ mod tests {
             assert_eq!(result.is_err(), panic);
             assert!(!health.load(Ordering::Acquire));
         }
+    }
+    #[test]
+    fn saturated_owner_queue_is_transient_without_poisoning_health() {
+        let server = server();
+        let mut client = RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_secs(1)).unwrap();
+        // Detach a bounded queue from its worker so saturation is deterministic.
+        let (queue, receiver) = mpsc::sync_channel(1);
+        let original = client.replicas[0].queue.replace(queue);
+        let ticket = client.submit(job(0)).unwrap();
+        assert!(matches!(client.submit(job(1)), Err(MediaError::QueueFull)));
+        assert!(client.healthy());
+        client.cancel(ticket);
+        assert!(client.pending.is_empty());
+        drop(receiver);
+        client.replicas[0].queue = original;
     }
     #[test]
     fn invalid_geometry_rejected_before_queue_and_rank_failure_visible() {
