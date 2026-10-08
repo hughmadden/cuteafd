@@ -366,6 +366,9 @@ pub struct Baseline {
 pub struct BasicCard {
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
+    /// Code decode at up to C8, thinking off; aggregate over the batch's decode interval.
+    #[serde(default)]
+    pub concurrent: Option<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
@@ -495,6 +498,25 @@ pub struct ContentRate {
     /// Draft acceptance reported by the server for these runs, when it speculates.
     #[serde(default)]
     pub acceptance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConcurrentRate {
+    pub width: usize,
+    pub aggregate_tok_s: f64,
+    pub per_stream_median_tok_s: f64,
+    /// First emitted token to last emitted token across all streams.
+    pub decode_s: f64,
+    pub runs: Vec<ConcurrentTiming>,
+    /// Wall seconds of the untimed batch at the same width.
+    pub warmup_s: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConcurrentTiming {
+    /// Send offset on the batch's clock, needed to reproduce the aggregate rate.
+    pub sent_s: f64,
+    pub timing: StreamTiming,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
