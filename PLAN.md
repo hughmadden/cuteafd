@@ -1081,6 +1081,19 @@ Work, in priority order:
    item 4m), Engram counters / shard dir / table warm (FR-D.10), preflight,
    plan-only boot and ready probe (FR-D.11), whole-step graphs and
    device-side draft acceptance, W4A4 decode rows, deterministic prefill.
+9. **Open issue: one V4.1 heap abort on the 32 GB profile (2026-10-08).**
+   A candidate small-card launch (31.8 GiB logical budget, capacity 1024,
+   dSpark, C16, work/plat2-32gb) aborted once in C16 with glibc
+   `corrupted size vs. prev_size while consolidating` (host heap); C1 was fine.
+   Not reproduced since in 4 repeats (baseline 0143dcc4 and candidate,
+   fixed and automatic pools, under GDB and plain with `MALLOC_CHECK_=3`) nor
+   in a 10-batch C16 soak under GDB. No core was captured. The audit of new
+   host-to-native writes found no size mismatch. Treat as open: rerun
+   `MALLOC_CHECK_=3` soaks on small-card profiles before qualifying them.
+   The same runs showed lazily captured graph executables (≈12,600 at plateau,
+   ≈5.2 GB untracked) consuming the 32 GB card's margin; the small-card profile
+   moves to a fixed graph set reserved before KV.
+
 9. **Open issue: synchronized Spark response gaps.** GLM 5.3 Flash split
    (2 RTX + 4 Sparks, 2026-10-05 01:26 UTC): one BF16 launch had ~440 ms
    inter-wave response gaps on all four workers at once (normal 15–18 ms),
