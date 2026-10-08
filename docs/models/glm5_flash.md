@@ -37,6 +37,10 @@ Attention (KDA), a minority run MLA + DSA.
   | NVIDIA NVFP4 | 2 RTX + 4 Sparks | 117.3 / 415 / 131.1 | 118.2 / 347 / 91.3 | 74.8 / 232 / 79.1 |
   | tr3 4bpw | 1 RTX + 2 Sparks | 99.0 / 212 / 86.8 | 71.4 / 269 / 65.2 | 56.1 / 173 / 58.1 |
   | tr3 4bpw | 2 RTX + 4 Sparks | 149.6 / 435 / 131.0 | 132.0 / 407 / 87.2 | 78.3 / 280 / 81.5 |
+- Drafter context rings: one per sequence (`--max-sequences`), the draft
+  batch at most that many; `DRAFT_CONTEXT_SLOTS` overrides.
+  `draft_ring_misses` (`/v1/stats`, every request-complete line) counts
+  drafting admissions that found no ring, and must read 0.
 - Dense NVFP4 MLPs run natively on a ModelOpt release; its per-tensor FP8
   dense MLPs prefill as static W8A8 on their own scales; BF16 attention,
   indexer and shared experts quantize to FP8 blocks at load by default
