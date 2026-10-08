@@ -71,6 +71,9 @@ exl3_paired_tp4=OFF
 exl3_residency=""
 # Opt-in replicated-group Spark expert roles. Empty is the default and keeps
 # the historical Spark TP4 shard (and every release default) byte-identical.
+# Release images carry the audio tower: AUDIO=auto serves it for qualified checkpoints.
+audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
+case "$audio_aot" in ON|OFF) ;; *) echo "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" >&2; exit 2 ;; esac
 spark_tp_roles="${CUTEAFD_RELEASE_SPARK_TP_ROLES:-}"
 spark_tp_role_list=()
 if [[ -n "$spark_tp_roles" ]]; then
@@ -179,6 +182,13 @@ if [[ "$xgrammar" == ON ]]; then
     --lock "$build_root/source/third_party/xgrammar.lock.json"
 fi
 
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_EXTENSIONS_DIR="$build_root/cache/torch-extensions"
+export XDG_CACHE_HOME="$build_root/cache/xdg"
+export B12X_ROCE_CACHE_DIR="$build_root/cache/roce"
+export TRITON_CACHE_DIR="$build_root/cache/triton"
+mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
+export PYTHONPATH="$build_root/source/third_party/sparkinfer:$build_root/source/python/reference/cuteafd_reference:$build_root/source/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export PYO3_PYTHON=python3
 compiler_cache_cmake_args=()
 source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
@@ -201,6 +211,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \

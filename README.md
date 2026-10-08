@@ -217,3 +217,28 @@ controls support the release default.
 
 [`AGENTS.md`](AGENTS.md) is the standing guide for agents and collaborators
 working on CuteAFD. [`PLAN.md`](PLAN.md) is the roadmap.
+
+## Building from source
+
+Initialize the pinned submodules with `git submodule update --init --recursive`.
+The shared toolchain image is published as `ghcr.io/tpurtell/cuteafd-dev` for
+amd64 and arm64: choose an immutable `tc-<hash>` tag (or digest) for repeatable
+builds; `latest` follows dev toolchain updates. Set `COORDINATOR_DOCKER_DEV` and
+`SPARK_EXPERT_DOCKER_DEV` in your config to that reference. WIP and release builds
+pull registry references when absent; local image names remain the default.
+
+The image contains no SparkInfer: consumers verify the checkout's tree lock
+and import its mounted submodule. A kernel pin change does not require rebuilding
+the toolchain. Rebuild with `scripts/build/build-dev-images.sh --dry-run` first,
+then without `--dry-run`; `--publish --spark-hosts rhea` publishes only the dev
+package and preserves existing local campaign tags. Serialize actual builds
+with `~/.cache/cuteafd/build.lock` and the Spark build host's lock.
+
+Compiler caches are off by default. `CUTEAFD_KACHE=1` uses the image's kache for
+C/C++ and Rust; `CUTEAFD_KACHE_SPARK=1` enables it on Spark builds.
+`CUTEAFD_SCCACHE_CUDA=1` independently selects sccache for CUDA. Cache directories
+are host NVMe bind mounts under `~/.cache/cuteafd/builds/compiler-cache`, not
+image layers. Read-only source/JIT smoke: run
+`scripts/build/smoke-b12x-readonly.py --source /source --jit` inside a matching
+architecture's dev container with `/source:ro`, writable `HOME` and cache roots,
+and NVIDIA driver libraries (no GPU device is needed).

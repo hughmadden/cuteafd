@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Content identity for the development toolchain (independent of kernel pins)."""
+import hashlib
+from pathlib import Path
+
+BASE = 'nvcr.io/nvidia/pytorch:26.05-py3@sha256:'
+BASE_DIGESTS = {
+    'amd64': 'ca73b4795f0d3ae27e9cd81b1b1f1b7fc6c0a129f7d51a359d2326e95af48a3d',
+    'arm64': 'aa400d4373fa71f30e1714664beabcc64c2d198e72d65e9a3641440b07e7cc83',
+}
+
+
+def identity(source):
+    digest = hashlib.sha256()
+    for name in ('docker/Dockerfile.dev', 'docker/entrypoint.sh',
+                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/dev-toolchain.py'):
+        digest.update(name.encode() + b'\0' + (source / name).read_bytes() + b'\0')
+    return digest.hexdigest()[:16]
+
+
+if __name__ == '__main__':
+    import sys
+    print(BASE + BASE_DIGESTS[sys.argv[1]] if len(sys.argv) > 1
+          else identity(Path(__file__).resolve().parents[2]))

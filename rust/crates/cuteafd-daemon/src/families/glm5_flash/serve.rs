@@ -141,10 +141,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
-    if engine_args.draft_context_slots.is_none() {
-        engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
-            .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
-    }
+    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
+        engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let prefix = args.prefix.clone();
@@ -536,6 +534,37 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     Ok((family, cache))
 }
 
+/// The drafter's context rings and the most sequences of one draft step, for `max_sequences`
+/// sequences: the rings given, or one per sequence the scheduler can hold (it admits while
+/// fewer than `max_sequences` are active or prefilling, and every finished, failed or scoring
+/// sequence gives its ring back), with the draft batch at most the rings (it never holds more
+/// sequences than are active). Each ring is 2,048 rows x 5 layers x K and V x 1,024 BF16 values
+/// (41,943,040 B for DFlash2).
+pub(crate) fn draft_capacity(max_sequences: usize, draft_sequences: usize, context_slots: Option<usize>)
+    -> (Option<usize>, usize) {
+    match context_slots {
+        Some(slots) => (Some(slots), draft_sequences),
+        None => {
+            let slots = max_sequences.max(1);
+            (Some(slots), draft_sequences.min(slots))
+        }
+    }
+}
+
+/// A drafter ring for a newly admitted sequence that drafts (`wanted`), counting the admissions
+/// that found none (they decode without drafts until they finish).
+fn take_ring(free: &mut Vec<usize>, wanted: bool, misses: &mut u64) -> Option<usize> {
+    if !wanted {
+        return None;
+    }
+    let slot = free.pop();
+    if slot.is_none() {
+        *misses += 1;
+        tracing::warn!(misses = *misses, "a drafting request was admitted without a drafter ring: it decodes undrafted");
+    }
+    slot
+}
+
 /// Gives a finished or failed sequence's units, KDA slot and drafter slot back.
 fn release(family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, kda: &mut Vec<i32>,
     slots: &mut Vec<usize>, placement: &GlmfPlacement, slot: Option<usize>) {
@@ -631,12 +660,13 @@ fn prefill_memory_sample() -> serde_json::Value {
 
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
+    ring_misses: u64, cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
     memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
+            "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
+            "verify": verify.snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         crate::shared::probe::graph_capture_stats(&mut stats);
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
@@ -681,6 +711,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots()).rev().collect());
+    // Admissions that found no drafter ring (must stay 0: one ring per sequence the scheduler holds).
+    let mut ring_misses = 0u64;
     // The TP2 table also prices TP4 as served (its observed ratio settles the
     // level); TP6 scales the Spark share by its widest slice against TP4's.
     let table = match ranks {
@@ -703,7 +735,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
-    publish(stats, requests, generated_total, 0, 0, &cache, media, preparer, &verify_stats, &memory_boundaries);
+    publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &verify_stats,
+        &memory_boundaries);
     ready();
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -723,7 +756,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats, &memory_boundaries);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
+                            media, preparer, &verify_stats, &memory_boundaries);
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -801,9 +835,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = if probe::no_speculation(&ready.job().job.probe) || policy.fixed == Some(0) {
-                None
-            } else { free_slots.pop() };
+            let slot = take_ring(&mut free_slots, drafter.is_some() && !probe::no_speculation(&ready.job().job.probe)
+                && policy.fixed != Some(0), &mut ring_misses);
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
@@ -1305,7 +1338,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
                 graph_captures = graphs.stats.captures, graph_recaptures = graphs.stats.recaptures,
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
-                "request complete");
+                draft_ring_misses = ring_misses, "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
@@ -1319,7 +1352,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats, &memory_boundaries);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache, media, preparer,
+            &verify_stats, &memory_boundaries);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
@@ -1333,3 +1367,33 @@ const GLMF_TP2_GPU_MS: f64 = 6.7;
 /// rows extrapolated at the 12-16 slope (serving refits intercept and slope).
 const GLMF_TP2_STEP_MS: [(usize, f64); 15] = [(1, 19.1), (2, 26.0), (3, 30.2), (4, 35.2), (5, 40.1), (6, 43.5),
     (7, 48.7), (8, 53.8), (10, 60.7), (12, 67.4), (16, 80.2), (24, 106.0), (32, 132.0), (48, 183.0), (64, 234.0)];
+
+#[cfg(test)]
+mod ring_tests {
+    use super::{draft_capacity, take_ring};
+
+    #[test]
+    fn rings_default_to_one_per_sequence_with_the_draft_batch_within_them() {
+        // 16 sequences: 16 rings (4 x 41,943,040 B fewer than the 20 of max(20, 16, 5C/4)).
+        assert_eq!(draft_capacity(16, 16, None), (Some(16), 16));
+        assert_eq!(draft_capacity(8, 16, None), (Some(8), 8));
+        assert_eq!(draft_capacity(64, 16, None), (Some(64), 16));
+        assert_eq!(draft_capacity(0, 16, None), (Some(1), 1));
+        // Explicit rings stay as given.
+        assert_eq!(draft_capacity(16, 16, Some(20)), (Some(20), 16));
+        assert_eq!(draft_capacity(4, 16, Some(2)), (Some(2), 16));
+    }
+
+    #[test]
+    fn admissions_without_a_ring_are_counted() {
+        let (mut free, mut misses) = (vec![1usize, 0], 0u64);
+        assert_eq!(take_ring(&mut free, true, &mut misses), Some(0));
+        assert_eq!(take_ring(&mut free, false, &mut misses), None);
+        assert_eq!(take_ring(&mut free, true, &mut misses), Some(1));
+        assert_eq!(misses, 0);
+        assert_eq!(take_ring(&mut free, true, &mut misses), None);
+        assert_eq!(misses, 1);
+        assert_eq!(take_ring(&mut free, false, &mut misses), None);
+        assert_eq!(misses, 1);
+    }
+}

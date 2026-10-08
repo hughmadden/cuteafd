@@ -30,6 +30,8 @@ class DevImageReuseTest(unittest.TestCase):
         self.dockerfile = b'ARG RUST_TOOLCHAIN=1.98.1\n'
         (self.source / 'docker/Dockerfile.dev').write_bytes(self.dockerfile)
         (self.source / 'docker/entrypoint.sh').write_bytes(b'entrypoint')
+        for name in ('install-dev-cache-tools.sh', 'dev-toolchain.py'):
+            (self.source / 'scripts/build' / name).write_bytes(b'toolchain input')
         self.lock = {'revision': REVISION, 'source_tree_sha256': 'c' * 64}
         (self.source / 'third_party/transformers.lock.json').write_text(json.dumps(self.lock))
         (self.source / 'third_party/sparkinfer.lock.json').write_text(json.dumps(self.lock))
@@ -86,6 +88,44 @@ class DevImageReuseTest(unittest.TestCase):
         with self.assertRaisesRegex(MOD.VerificationError, 'architecture mismatch'):
             self.verify()
 
+    def toolchain_labels(self):
+        self.image['Config']['Env'] = []
+        self.image['Config']['Labels'] = {
+            'io.cuteafd.toolchain.hash': MOD._toolchain.identity(self.source),
+            'io.cuteafd.base.digest': MOD._toolchain.BASE + MOD._toolchain.BASE_DIGESTS['amd64'],
+            'org.opencontainers.image.revision': REVISION,
+        }
+        return self.image['Config']['Labels']
+
+    def test_toolchain_image_needs_no_sparkinfer_label_or_buildkit_history(self):
+        self.toolchain_labels()
+        absent = subprocess.CompletedProcess([], 1, '', 'No such object')
+        with patch.object(MOD, 'provenance', side_effect=AssertionError('legacy admission')), patch.object(MOD, 'run', self.fake_run), patch.object(MOD.subprocess, 'run', return_value=absent):
+            manifest = MOD.verify(self.source, IMAGE, self.output)
+        self.assertEqual(manifest['buildkit_ref'], 'toolchain-label')
+        self.assertEqual(manifest['dev_source_revision'], REVISION)
+        self.assertFalse(any(a[0] == 'git' for a in self.commands))
+        self.assertTrue(any('verify-sparkinfer-source.py' in a[1] for a in self.commands if a[0] == 'python3'))
+
+    def test_toolchain_hash_mismatch_refuses_before_probe(self):
+        self.toolchain_labels()['io.cuteafd.toolchain.hash'] = 'wrong'
+        with self.assertRaisesRegex(MOD.VerificationError, 'toolchain hash mismatch'):
+            self.verify()
+        self.assertFalse(any(a[:2] == ['docker', 'run'] for a in self.commands))
+
+    def test_toolchain_base_mismatch_refuses_before_probe(self):
+        self.toolchain_labels()['io.cuteafd.base.digest'] = 'wrong'
+        with self.assertRaisesRegex(MOD.VerificationError, 'base digest mismatch'):
+            self.verify()
+        self.assertFalse(any(a[:2] == ['docker', 'run'] for a in self.commands))
+
+    def test_toolchain_entrypoint_mismatch_refuses_before_probe(self):
+        self.toolchain_labels()
+        self.image['Config']['Entrypoint'] = ['/bin/bash']
+        with self.assertRaisesRegex(MOD.VerificationError, 'entrypoint mismatch'):
+            self.verify()
+        self.assertFalse(any(a[:2] == ['docker', 'run'] for a in self.commands))
+
     def test_missing_provenance_refuses(self):
         with patch.object(MOD, 'run', return_value=''):
             with self.assertRaisesRegex(MOD.VerificationError, 'no retained'):
@@ -133,6 +173,8 @@ class DevImageReuseTest(unittest.TestCase):
         installed.mkdir()
         (installed / 'entrypoint').write_bytes(b'entrypoint' if failure != 'entrypoint' else b'wrong')
         (installed / 'sparkinfer.lock.json').write_text(json.dumps(self.lock) if failure != 'lock' else '{}')
+        sparkinfer_verifier = checkout / 'scripts/build/verify-sparkinfer-source.py'
+        sparkinfer_verifier.write_text("def source_tree_sha256(source): return '" + ('d' if failure == 'source' else 'c') * 64 + "'\n")
         verifier = checkout / 'scripts/build/verify-transformers-source.py'
         verifier.write_text("def source_tree_sha256(source): return '" + 'c' * 64 + "'\n")
         expected = Path(self.temp.name) / 'expected.json'
@@ -159,17 +201,15 @@ class DevImageReuseTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'toolchain mismatch'):
             self.probe('toolchain')
 
-    def test_live_probe_sparkinfer_revision_mismatch(self):
-        with self.assertRaisesRegex(RuntimeError, 'SparkInfer revision mismatch'):
-            self.probe('revision')
+    def test_mounted_source_does_not_depend_on_baked_revision(self):
+        self.probe('revision')
 
     def test_live_probe_sparkinfer_source_mismatch(self):
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(RuntimeError, 'SparkInfer source-tree mismatch'):
             self.probe('source')
 
-    def test_live_probe_sparkinfer_lock_mismatch(self):
-        with self.assertRaisesRegex(RuntimeError, 'SparkInfer lock mismatch'):
-            self.probe('lock')
+    def test_mounted_source_does_not_depend_on_baked_lock(self):
+        self.probe('lock')
 
     def test_live_probe_entrypoint_mismatch(self):
         with self.assertRaisesRegex(RuntimeError, 'entrypoint mismatch'):
@@ -177,7 +217,7 @@ class DevImageReuseTest(unittest.TestCase):
 
     def test_build_branch_reuses_only_after_verification_and_unset_builds(self):
         text = (ROOT / 'build.sh').read_text()
-        branch = text[text.index('release_dev_reuse_manifest=""'):text.index('echo "== compiling coordinator')]
+        branch = text[text.index('release_dev_reuse_label_args=()'):text.index('echo "== compiling coordinator')]
         for image, refuses in (('', False), (IMAGE, False), (IMAGE, True)):
             commands = []
             script = 'release_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + branch + '\nprintf "%s\\n" "$COORDINATOR_DOCKER_DEV"\n'
@@ -191,7 +231,8 @@ class DevImageReuseTest(unittest.TestCase):
                 log = bin_dir / 'commands'
                 env = dict(os.environ, PATH=str(bin_dir) + ':' + os.environ['PATH'], COMMAND_LOG=str(log),
                            CUTEAFD_RELEASE_DEV_IMAGE=image, COORDINATOR_DOCKER_DEV='normal-dev', repo_root=str(ROOT),
-                           release_build_root=str(bin_dir), sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
+                           release_build_root=str(bin_dir), release_dev_reuse_manifest=str(bin_dir / 'DEV_IMAGE_REUSE.json'),
+                           sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
                 result = subprocess.run(['bash', '-ec', script], capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 2 if refuses else 0, result.stderr)
                 commands = log.read_text()

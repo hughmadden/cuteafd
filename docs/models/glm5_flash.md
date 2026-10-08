@@ -37,6 +37,10 @@ Attention (KDA), a minority run MLA + DSA.
   | NVIDIA NVFP4 | 2 RTX + 4 Sparks | 117.3 / 415 / 131.1 | 118.2 / 347 / 91.3 | 74.8 / 232 / 79.1 |
   | tr3 4bpw | 1 RTX + 2 Sparks | 99.0 / 212 / 86.8 | 71.4 / 269 / 65.2 | 56.1 / 173 / 58.1 |
   | tr3 4bpw | 2 RTX + 4 Sparks | 149.6 / 435 / 131.0 | 132.0 / 407 / 87.2 | 78.3 / 280 / 81.5 |
+- Drafter context rings: one per sequence (`--max-sequences`), the draft
+  batch at most that many; `DRAFT_CONTEXT_SLOTS` overrides.
+  `draft_ring_misses` (`/v1/stats`, every request-complete line) counts
+  drafting admissions that found no ring, and must read 0.
 - Dense NVFP4 MLPs run natively on a ModelOpt release; its per-tensor FP8
   dense MLPs prefill as static W8A8 on their own scales; BF16 attention,
   indexer and shared experts quantize to FP8 blocks at load by default
@@ -46,6 +50,12 @@ Attention (KDA), a minority run MLA + DSA.
   (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
   recurrent state in BF16, rounded after every decode, verify and commit row
   and at each chunked-prefill window end: half the state and prefix-mark bytes.
+- KDA replay records: `GLM5_FLASH_REPLAY_RECORDS=shared` (`--replay-records
+  shared`, opt-in; one GPU whose pool is sized from measured memory) keeps the
+  speculative replay records (321,421,312 B) in the prefill lanes' scratch,
+  which no decode step reads, instead of an allocation of their own. A record
+  lives from a speculative verify to its commit, and a commit after a prefill
+  fails instead of reading records the prefill overwrote.
 - RTX/Spark layouts: scales from 1 RTX with local experts up through
   multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
   two-GPU head split when both coordinator GPUs are available;
@@ -79,7 +89,10 @@ Attention (KDA), a minority run MLA + DSA.
   3; the speculative startup graph set ends at that budget. The decode
   workspace, token selector and replay records hold 128 rows (321 MB more
   records on one GPU, charged by every KV admission and `cuteafd plan
-  --layout --decode-rows 128`).
+  --layout --decode-rows 128`). With `GLM5_FLASH_REPLAY_RECORDS=shared` the
+  KDA records of 128 rows (642,842,624 B) still fit the 782,236,672-byte
+  prefill scratch, so they take no memory of their own. Start-up loads the
+  `*_m128` programs only with 128 rows.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 

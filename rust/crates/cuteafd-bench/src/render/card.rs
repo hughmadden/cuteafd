@@ -1,5 +1,5 @@
-//! The 1200×675 share card: model, two huge numbers (C1 code decode and 8K
-//! prefill), three content bars, one hardware line, the non-default option
+//! The 1200×675 share card: model, C1 and concurrent code decode beside 8K
+//! prefill (two headlines for old reports), three content bars, one hardware line, the non-default option
 //! chips, the build footer and the fidelity badge.
 use super::bodies::{self, chips, content_color, LOGO, LOGO_ASPECT};
 use super::svg::{fit, text_width, Anchor, Doc, Font};
@@ -40,20 +40,33 @@ pub fn card_svg(report: &Report) -> String {
     let baseline = r.baseline.as_ref();
     let code = baseline.and_then(|b| b.card.decode_of("code")).map_or(0.0, |d| d.tok_s);
     let prefill = baseline.and_then(|b| b.card.prefill.as_ref());
-    // The two huge numbers.
+    let concurrent = baseline.and_then(|b| b.card.concurrent.as_ref());
+    let columns = if concurrent.is_some() { 3.0 } else { 2.0 };
+    let gap = if concurrent.is_some() { 28.0 } else { 20.0 };
+    let column_width = (WIDTH - 2.0 * pad - gap * (columns - 1.0)) / columns;
+    let max_size: f64 = if concurrent.is_some() { 88.0 } else { 112.0 };
+    let sub_size = if concurrent.is_some() { 13.0 } else { 15.0 };
+    // Reserve the unit's width before sizing numerals, including commas and the failure badge.
     let huge = |doc: &mut Doc, x: f64, label: &str, value: &str, sub: &str, color: &str| {
         doc.text(x, 246.0, Font::new(15.0, t.muted).spacing(3.0).weight(600), label);
         let shown = format!("{warn}{value}");
-        doc.text(x, 352.0, Font::new(112.0, color).bold().opacity(dim).spacing(-3.0), &shown);
-        let width = text_width(&shown, 112.0) - 3.0 * shown.chars().count() as f64;
+        let count = shown.chars().count() as f64;
+        let size = max_size.min((column_width - text_width("tok/s", 24.0) - 14.0 + 3.0 * count) / (0.6 * count));
+        doc.text(x, 352.0, Font::new(size, color).bold().opacity(dim).spacing(-3.0), &shown);
+        let width = text_width(&shown, size) - 3.0 * count;
         doc.text(x + width + 14.0, 352.0, Font::new(24.0, t.ink2), "tok/s");
-        doc.text(x, 386.0, Font::new(15.0, t.ink2), sub);
+        doc.text(x, 386.0, Font::new(sub_size, t.ink2), &fit(sub, sub_size, column_width));
     };
     huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), "thinking off · one request", t.series[0]);
+    if let Some(c) = concurrent {
+        huge(&mut doc, pad + column_width + gap, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s),
+            &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
+    }
+    let prefill_x = if concurrent.is_some() { pad + 2.0 * (column_width + gap) } else { 610.0 };
     match prefill {
-        Some(p) => huge(&mut doc, 610.0, "8K PREFILL", &rate(p.tok_s),
+        Some(p) => huge(&mut doc, prefill_x, "8K PREFILL", &rate(p.tok_s),
             &format!("TTFT {} for {} tokens", seconds(p.ttft_s), grouped(p.prompt_tokens as f64)), t.series[3]),
-        None => huge(&mut doc, 610.0, "8K PREFILL", "—", "not measured", t.series[3]),
+        None => huge(&mut doc, prefill_x, "8K PREFILL", "—", "not measured", t.series[3]),
     }
     // Three content bars.
     let (bx, by, bw) = (pad, 424.0, WIDTH - 2.0 * pad);

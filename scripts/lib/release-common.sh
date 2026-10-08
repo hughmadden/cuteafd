@@ -353,6 +353,7 @@ release_known_key() {
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
     RDMA_BOND_BALANCE) return 0 ;;
     GLM5_FLASH_KDA_STATE) return 0 ;;
+    GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
     PROBE_DUMP_ROOT) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
@@ -582,9 +583,6 @@ release_load_config() {
 
   [[ "$VISION" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$VISION" != auto:* && "$VISION" != off:* ) ]] ||
     release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
-  if [[ "$MODEL_ID" == deepseek-ai/DeepSeek-V4.1-* ]]; then
-    case "$VISION" in auto|off) ;; *) release_die "V4.1 retains VISION=auto|off" ;; esac
-  fi
   case "$AUDIO" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
   case "$MODEL_VARIANT" in flash|pro) ;; *) release_die "MODEL_VARIANT must be flash or pro" ;; esac
   case "$EXPERT_FORMAT" in native|exl3) ;; *) release_die "EXPERT_FORMAT must be native or exl3" ;; esac
@@ -1457,19 +1455,27 @@ release_tp2_enabled() {
      "$TP2_OUTPUT_PROJECTION" == on || "$TP2_DSPARK_EXPERTS" == on ]]
 }
 
-# Copies a WIP slot's artifacts out of a persistent WIP container into a
-# release-shaped layout (bin/, lib/, share/) on this host for ./run.sh --wip.
-# Development images bake in the pinned SparkInfer, so a pin bump needs a
-# rebuild before WIP slots are built or launched from them.
-release_dev_image_rebuild_hint() {
-  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "$RELEASE_CONFIG"
+# Registry dev references are pulled only when absent; local campaign tags remain valid.
+release_ensure_dev_image() {
+  local image="$1" host="${2:-}"
+  if [[ -n "$host" ]]; then
+    release_ssh "$host" bash -s -- "$image" <<'REMOTE'
+set -euo pipefail
+image="$1"
+docker image inspect "$image" >/dev/null 2>&1 && exit 0
+registry="${image%%/*}"
+[[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || {
+  printf 'missing local development image %s; rebuild with scripts/build/build-dev-images.sh\n' "$image" >&2; exit 1;
 }
-
-# WHERE names the host, LABEL is the image's io.cuteafd.sparkinfer.revision.
-release_require_dev_image_sparkinfer() {
-  local where="$1" image="$2" label="$3" expected="$4"
-  [[ "$label" == "$expected" ]] ||
-    release_die "$where development image $image carries SparkInfer ${label:-<none>} but this checkout pins $expected; $(release_dev_image_rebuild_hint)"
+docker pull "$image"
+REMOTE
+  else
+    docker image inspect "$image" >/dev/null 2>&1 && return 0
+    local registry="${image%%/*}"
+    [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] ||
+      release_die "missing local development image $image; rebuild with scripts/build/build-dev-images.sh"
+    docker pull "$image"
+  fi
 }
 
 release_stage_wip_layout() {
@@ -1487,6 +1493,13 @@ release_stage_wip_layout() {
   [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
   [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
   mv "$raw/"* "$layout.tmp/share/"
+  mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
+  local slot_source="$container:/wip/slots/$slot/$role/workspace"
+  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
+    --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
   rm -rf "$raw" "$layout"
   mv "$layout.tmp" "$layout"
 }

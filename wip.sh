@@ -202,23 +202,12 @@ sparkinfer_revision="$(python3 "$staging_dir/scripts/build/verify-sparkinfer-sou
   --lock "$staging_dir/third_party/sparkinfer.lock.json" \
   --print-revision)"
 
-# Slots are built and launched inside the development images, which bake in
-# the pinned SparkInfer; run.sh --wip refuses a mismatch, so refuse it here,
-# before any container is recreated, and name the rebuild.
+# Kernels come from the verified frozen checkout, not the toolchain image.
 ensure_local_image() {
-  docker image inspect "$COORDINATOR_DOCKER_DEV" >/dev/null 2>&1 ||
-    release_die "missing coordinator development image $COORDINATOR_DOCKER_DEV; $(release_dev_image_rebuild_hint)"
-  release_require_dev_image_sparkinfer "$(hostname)" "$COORDINATOR_DOCKER_DEV" \
-    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_DEV")" \
-    "$sparkinfer_revision"
+  release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
 }
-
 ensure_seed_image() {
-  local label
-  label="$(ssh -o BatchMode=yes "$seed_host" \
-    "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.sparkinfer.revision\"}}' '$SPARK_EXPERT_DOCKER_DEV'")" ||
-    release_die "$seed_host lacks development image $SPARK_EXPERT_DOCKER_DEV; $(release_dev_image_rebuild_hint)"
-  release_require_dev_image_sparkinfer "$seed_host" "$SPARK_EXPERT_DOCKER_DEV" "$label" "$sparkinfer_revision"
+  release_ensure_dev_image "$SPARK_EXPERT_DOCKER_DEV" "$seed_host"
 }
 
 ensure_local_image
@@ -350,7 +339,7 @@ ensure_local_container() {
 
 ensure_remote_container() {
   local host="$1" cache_staging= cache_helper_dir
-  if [[ -n "${CUTEAFD_KACHE_SPARK:-}" ]]; then
+  if [[ -n "${CUTEAFD_KACHE_SPARK:-}" || "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if cache_staging="$(ssh -o BatchMode=yes "$host" 'printf "%s/.cache/cuteafd/kache-helper" "$HOME"')${WIP_INSTANCE:+-$WIP_INSTANCE}"; then
       printf -v cache_helper_dir '%q' "$cache_staging/scripts/build"
       if ! ssh -o BatchMode=yes "$host" "mkdir -p $cache_helper_dir" ||
@@ -369,7 +358,7 @@ ensure_remote_container() {
     "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__unset__}")" \
     "$(printf '%q' "${cache_staging:-__unset__}")" "${WIP_INSTANCE:-__none__}" "${WIP_ROOT:-__none__}" \
-    "$(base64 -w0 "$repo_root/scripts/build/assert-build-filesystem.py")" <<'REMOTE'
+    "$(base64 -w0 "$repo_root/scripts/build/assert-build-filesystem.py")" "${CUTEAFD_SCCACHE_CUDA:-0}" <<'REMOTE'
 set -euo pipefail
 container="$1"
 image="$2"
@@ -383,8 +372,9 @@ if [[ -n "$root" ]]; then
   mkdir -p "$root"
 fi
 cache_args=()
-if [[ "${3:-__unset__}" != __unset__ ]]; then
-  export CUTEAFD_KACHE="$3"
+if [[ "${3:-__unset__}" != __unset__ || "${10:-0}" == 1 ]]; then
+  export CUTEAFD_SCCACHE_CUDA="${10:-0}"
+  [[ "${3:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE="$3"
   [[ "${4:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_REMOTE="$4"
   [[ "${5:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_CACHE_DIR="$5"
   if [[ -f "$6/scripts/build/compiler-cache.sh" ]]; then
@@ -543,10 +533,17 @@ build_coordinator() {
   sync_local_source
   local image_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
-  local -a cache_env=(-e CUTEAFD_KACHE=)
+  local -a cache_env=(-e CUTEAFD_KACHE= -e CUTEAFD_SCCACHE_CUDA=0)
+  if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
+    if docker exec "$coordinator_container" test -d /opt/cuteafd-sccache-cache; then
+      cache_env+=(-e CUTEAFD_SCCACHE_CUDA=1)
+    else
+      cuteafd_compiler_cache_warn 'WIP sccache mount absent; --recreate to enable CUDA caching'
+    fi
+  fi
   if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
     if docker exec "$coordinator_container" test -x /opt/cuteafd-kache; then
-      cache_env=(-e CUTEAFD_KACHE=/opt/cuteafd-kache)
+      cache_env+=(-e CUTEAFD_KACHE=/opt/cuteafd-kache)
     else
       cuteafd_compiler_cache_warn 'WIP cache mounts absent; --recreate to enable caching'
     fi
@@ -579,7 +576,14 @@ build_expert() {
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
-  local cache_wrapper=
+  local cache_wrapper= cuda_cache=0
+  if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
+    if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -d /opt/cuteafd-sccache-cache; then
+      cuda_cache=1
+    else
+      cuteafd_compiler_cache_warn 'Spark WIP sccache mount absent; --recreate to enable CUDA caching'
+    fi
+  fi
   if [[ -n "${CUTEAFD_KACHE_SPARK:-}" ]]; then
     if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -x /opt/cuteafd-kache; then
       cache_wrapper=/opt/cuteafd-kache
@@ -590,7 +594,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

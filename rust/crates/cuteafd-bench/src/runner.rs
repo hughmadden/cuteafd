@@ -262,9 +262,9 @@ impl Bench {
         let rates = self.rates(fingerprint.as_deref());
         let has_baseline = fingerprint.as_ref().is_some_and(|f| self.baselines.lock().is_ok_and(|b| b.contains_key(f)));
         let mut panels = vec![json!({"id": "baseline", "title": "Basic card + quick quality", "mandatory": true,
-            "description": "C1 decode on code, prose and JSON (thinking off), 8K prefill and TTFT; logit fidelity, \
+            "description": "C1 decode on code, prose and JSON (thinking off), C8 code aggregate, 8K prefill and TTFT; logit fidelity, \
                 prefix-cache restore exactness, lossless speculation, template round trip, C1 vs C4.",
-            "estimate_s": if has_baseline { 0.0 } else { crate::baseline::estimate_s(&rates) },
+            "estimate_s": if has_baseline { 0.0 } else { crate::baseline::estimate_s(&rates, &info) },
             "done": has_baseline})];
         for panel in panels::catalog() {
             let (span, min_width) = crate::render::layout::span(panel.id());
@@ -469,12 +469,12 @@ impl Bench {
         let estimates: Vec<(String, f64, u32)> = plan.iter().filter_map(|p| panels::find(&p.id)
             .map(|panel| (p.id.clone(), panel.estimate_s(&rates, &info), p.passes))).collect();
         let mut remaining: f64 = estimates.iter().map(|(_, s, n)| s * f64::from(*n)).sum::<f64>()
-            + if baseline.is_none() { crate::baseline::estimate_s(&rates) } else { 0.0 };
+            + if baseline.is_none() { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
         let total = remaining.max(1.0);
         let baseline = match baseline {
             Some(b) => b,
             None => {
-                let estimate = crate::baseline::estimate_s(&rates);
+                let estimate = crate::baseline::estimate_s(&rates, &info);
                 self.begin(active, "baseline", estimate, remaining, total, 1, 1, progress);
                 let b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context,
                     max_output)?;

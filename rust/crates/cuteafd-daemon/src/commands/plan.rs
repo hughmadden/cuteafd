@@ -24,9 +24,11 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
+                spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
                 vision_replicas: args.vision_replicas as usize,
-                host_embedding: args.embedding_placement == crate::shared::token_io::EmbedPlacement::Host,
+                host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
+                force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 local_expert_layers: args.local_expert_layers,
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
@@ -35,6 +37,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_decode_rows: args.decode_rows,
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
+                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
                 mimo_prefix_entries: args.prefix_cache_entries,
@@ -108,7 +111,7 @@ mod tests {
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,
             model: model.display().to_string(),
-            embedding_placement: crate::shared::token_io::EmbedPlacement::Gpu,
+            embedding_placement: Some(crate::shared::token_io::EmbedPlacement::Gpu),
             revision: None,
             hf_home: None,
             spark_ranks: Some(spark_ranks),
@@ -129,6 +132,7 @@ mod tests {
             decode_rows: 64,
             headroom_gib: 2.0,
             graph_budget_mib: None,
+            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
             prefix_slots: None,
             prefix_cache_entries: 20,
@@ -215,6 +219,15 @@ mod tests {
             let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
         }
+    }
+
+    #[test]
+    fn spark_encoder_admission_honors_runtime_budget() {
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.spark_budget_gib = 82.0;
+        let options = options(&request).unwrap();
+        assert_eq!(options.spark_budget_bytes, 82 << 30);
+        assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
     }
 
     #[test]
