@@ -382,7 +382,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         else if family == "deepseek_v41" { if small_card { 1024 } else { 2048 } }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-    let concurrency = if options.concurrency > 0 { options.concurrency } else if matches!(family, "deepseek_v41" | "mimo_v2") { 16 } else { 8 };
+    let concurrency = if options.concurrency > 0 { options.concurrency }
+        else if family == "deepseek_v41" || (family == "mimo_v2" && small_card) { 16 }
+        else { 8 };
     let context_tokens = if options.context_tokens > 0 { options.context_tokens }
         else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
         else if matches!(family, "deepseek_v41" | "mimo_v2") { crate::serving_capacity::checkpoint_context_limit(&checkpoint.config).ok().flatten().unwrap_or(0) }

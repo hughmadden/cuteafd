@@ -888,6 +888,9 @@ Work, in priority order:
    generated code. Neither heap abort recurred in these gates. PRO-default
    parity/readiness on the rebased fcb6706d build remains the coordinator's
    merge gate; no full-1M prompt or real-5090 qualification is claimed.
+   MiMo's launcher/planner auto concurrency is 16 only for physical or logical
+   budgets at most 32 GiB; PRO retains 8 and explicit overrides are preserved.
+   The direct serve-mimo CLI's upstream default of 4 is unchanged.
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
    Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),

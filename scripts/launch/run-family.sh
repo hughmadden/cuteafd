@@ -267,11 +267,11 @@ default_context=8192
 default_concurrency=8
 if [[ "$family" == mimo_v2 ]]; then
   default_context=0
-  default_concurrency=16
   profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
   profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
   profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$coordinator_budget")"
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
+    default_concurrency=16
     [[ -n "${cfg[EMBEDDING]:-}" ]] || embedding=host
     echo "MiMo 32 GB profile: logical GPU ${profile_gib} GiB, embedding=$embedding (EMBEDDING overrides), int8 KV, checkpoint-full context unless MAX_CONTEXT_TOKENS overrides" >&2
   fi

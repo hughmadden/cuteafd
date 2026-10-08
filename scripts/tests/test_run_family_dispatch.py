@@ -210,7 +210,7 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--max-context 0" in launch
-    assert "--max-sequences 16" in launch
+    assert f"--max-sequences {16 if embedding == 'host' else 8}" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 0" in launch
 
@@ -1292,8 +1292,9 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
 
 
 @pytest.mark.parametrize("warm", [False, True])
-@pytest.mark.parametrize("concurrency", [None, 16])
-def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
+@pytest.mark.parametrize("concurrency", [None, 8, 16])
+@pytest.mark.parametrize("gpu_total_mib", [32768, 98304])
+def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_total_mib):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
@@ -1303,13 +1304,14 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
     if concurrency is not None:
         keys += f"CONCURRENCY={concurrency}\n"
     keys += f"MIMO_PREFIX_DRAFT={'on' if warm else 'off'}\n"
-    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan,
+                                   gpu_total_mib=gpu_total_mib)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--mimo-prefix-draft" in preflight) == warm
     assert ("--mimo-prefix-draft" in launch) == warm
-    effective = concurrency if concurrency is not None else 8
+    effective = concurrency if concurrency is not None else (16 if gpu_total_mib <= 32768 else 8)
     assert f"--concurrency {effective}" in preflight
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr

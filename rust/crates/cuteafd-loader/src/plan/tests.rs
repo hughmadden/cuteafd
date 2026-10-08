@@ -1158,6 +1158,27 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
+fn mimo_concurrency_default_is_small_card_only_and_overridable() {
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    for (gib, expected) in [(32, 16), (96, 8)] {
+        let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![gib << 30], ..Default::default()
+        }), ..sparks(4) };
+        let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        options.layout.as_mut().unwrap().concurrency = expected;
+        let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
+        assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
+        options.layout.as_mut().unwrap().concurrency = if expected == 16 { 8 } else { 16 };
+        let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+            .find(|item| item.group == "state").unwrap().bytes;
+        assert_ne!(state(&automatic), state(&overridden));
+    }
+}
+
+#[test]
 fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
