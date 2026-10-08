@@ -751,6 +751,19 @@ if [[ $family == glm5_flash ]]; then
       spark_worker_args+=" --exl3-schedule gb10" ;;
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_DECODE_ROWS: the most rows of one decode or verify step, 64 (default) or 128. With
+  # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
+  # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
+  # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  case "$decode_rows" in
+    ""|64) ;;
+    128)
+      [[ $head_split == 0 ]] ||
+        { echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; a head split takes 64" >&2; exit 2; }
+      family_args+=(--decode-rows 128) ;;
+    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

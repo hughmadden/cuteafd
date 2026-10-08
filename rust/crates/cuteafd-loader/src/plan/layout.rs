@@ -40,6 +40,10 @@ pub struct LayoutOptions {
     pub full_prefill_logits: bool,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+    /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
+    /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
+    /// replay records hold this many rows.
+    pub glmf_decode_rows: u64,
     /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance
     /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
     /// else in its place only when larger.
@@ -93,6 +97,7 @@ impl Default for LayoutOptions {
             prefill_rows: 0,
             full_prefill_logits: false,
             prefill_lanes: 0,
+            glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             graph_budget_bytes: None,
             spark_capacity_rows: 4096,
             pool_tokens: None,
@@ -583,9 +588,23 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // GLM 5.3 Flash on one GPU: the step workspaces its engine allocates, from the program manifest.
     let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
         else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
+    // `--decode-rows 128` runs the wide `_m128` programs on one GPU; the build must export them.
+    let glmf_decode_rows = if family == "glm5_flash" { options.glmf_decode_rows }
+        else { crate::serving_capacity::GLMF_DECODE_ROWS };
+    let glmf_wide = glmf_decode_rows > crate::serving_capacity::GLMF_DECODE_ROWS;
+    if glmf_wide && split {
+        report.placement_supported = false;
+        notes.push("GLM 5.3 Flash's 128-row decode programs run on one GPU: a head split takes --decode-rows 64".into());
+    }
+    if glmf_wide && workspace_manifest.as_ref().is_some_and(|manifest|
+        crate::serving_capacity::glmf_manifest_scratch(manifest)("glmf_mhc_post_pre_m128").is_none()) {
+        report.placement_supported = false;
+        notes.push("GLM 5.3 Flash --decode-rows 128 needs the 128-row decode programs, which this program manifest \
+            lacks (build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128)".into());
+    }
     let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
         .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
-            context_tokens))).flatten();
+            context_tokens, glmf_decode_rows))).flatten();
 
     // A GLM 5.3 Flash graph budget, kept as the engine's KV admission keeps it: from measured free
     // memory (one GPU, Spark experts, an automatic pool) the budget itself, from the planner's costs
@@ -634,6 +653,19 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some() && index == 0) { Basis::Formula }
             else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
+        if glmf_wide && !split && index == 0 {
+            // The token selector and GPU sampler of 128-row steps, beyond the 64-row ones the runtime
+            // allowance holds.
+            let vocab = model.spec().vocab as u64;
+            device.items.push(Item::new(Category::Workspace, "wide decode selector", "",
+                crate::serving_capacity::glmf_selector_bytes(glmf_decode_rows, vocab)
+                    - crate::serving_capacity::glmf_selector_bytes(crate::serving_capacity::GLMF_DECODE_ROWS, vocab),
+                Basis::Formula));
+            if glmf_steps.is_none() {
+                notes.push("GLM 5.3 Flash --decode-rows 128: without a program manifest the steps allowance \
+                    assumes 64-row decode workspaces (pass --workspace-manifest)".into());
+            }
+        }
         if options.full_prefill_logits && index == 0 {
             device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
                 full_prefill_logits_bytes_with_lanes(family, prefill_rows, model.spec().vocab as u64,
@@ -751,7 +783,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
-        prefill_rows: prefill_rows, ..Default::default() });
+        prefill_rows: prefill_rows, glmf_decode_rows, ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
         Ok(Some(mut geometry)) => {
@@ -885,10 +917,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 }
 
 /// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine
-/// allocates for the decode workspace and `lanes` prefill lanes of `rows` rows
+/// allocates for the decode workspace of `decode_rows` rows and `lanes` prefill lanes of `rows` rows
 /// (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
-    lanes: u64, rows: u64, context: u64) -> Option<u64> {
+    lanes: u64, rows: u64, context: u64, decode_rows: u64) -> Option<u64> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
@@ -901,11 +933,12 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
     let shape = GlmfStepShape { lead: true, split: false, local_experts: !spark, spark, partial_bytes: 2,
         output_shard: false, full_prefill_logits: false, table_pages, table_pool_pages };
-    let decode = glmf_step_scratch(&lookup, &cfg, options, 64, true).ok()?;
+    let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
     let prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // A lane needs a Spark transport of its own: local experts prefill in one.
     let lanes = if spark { lanes } else { 1 };
-    Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, &shape, decode, prefill).device_bytes())
+    Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, decode_rows, &shape, decode, prefill)
+        .device_bytes())
 }
 
 fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {
