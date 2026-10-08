@@ -1165,12 +1165,39 @@ struct GraphGeometry {
     long: bool,
 }
 
+impl GraphGeometry {
+    /// The table geometry a decode step's graphs are keyed by. The pool top-k (`index_topk`, which
+    /// runs only when a row is long) is the only launch that reads the pool table's width and
+    /// stride, so a short step keys neither: short steps that differ only there launch the same
+    /// programs with the same pointers and scalars, and share their graphs.
+    fn keyed(pool_width: usize, page_stride: usize, pool_stride: usize, long: bool) -> Self {
+        if long { Self { pool_width, page_stride, pool_stride, long } }
+        else { Self { pool_width: 0, page_stride, pool_stride: 0, long } }
+    }
+}
+
+/// The narrowest decode page-table stride, in MLA pages (4,096 tokens): sequences up to that size
+/// share one table shape, and so their decode graphs. The index expansion reads only a row's own
+/// pages, so a wider row changes nothing but its upload. A long step (a row past the 2,051-token
+/// dense context) already has at least 36 pages, so the floor never moves its stride.
+const MIN_PAGE_STRIDE: usize = 64;
+
+/// A decode step's (page-table, pool-table) strides for sequences of at most `pages` and
+/// `pool_pages` pages: powers of two (they bound the graphs a growing batch captures), the page
+/// stride from its floor, both at most the pool's pages and a table row's columns (a sequence
+/// holds at most `max_context` tokens' pages). Only a long step keys the pool stride.
+fn decode_strides(pages: usize, pool_pages: usize, pool: (usize, usize), table: (usize, usize)) -> (usize, usize) {
+    (pages.max(1).next_power_of_two().max(MIN_PAGE_STRIDE).min(pool.0).min(table.0),
+        pool_pages.max(1).next_power_of_two().min(pool.1).min(table.1))
+}
+
 fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
     let pools = pages / UNIT_PAGES;
+    let (table_pages, table_pools) = glmf_table_pages(context as u64);
+    let table = (table_pages as usize, table_pools as usize);
     let mut geometries = Vec::new();
     for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let pool_stride = units.next_power_of_two().min(pools);
-        let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+        let (page_stride, pool_stride) = decode_strides(units * UNIT_PAGES, units, (pages, pools), table);
         let capacity = (units * UNIT_ROWS).min(context);
         let mut width = 1;
         while width / 2 * UNIT_ROWS < capacity {
@@ -1178,7 +1205,7 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
             let high = (width * UNIT_ROWS).min(capacity);
             for long in [false, true] {
                 if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
-                    let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                    let geometry = GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
                     if !geometries.contains(&geometry) { geometries.push(geometry); }
                 }
             }
@@ -1197,6 +1224,14 @@ fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: u
             .chain(SPEC_DECODE_BUCKETS.into_iter().filter(move |_| speculation)
                 .map(move |rows| (rows, true, geometry)))
     }).collect()
+}
+
+/// A startup capture's tables: `rows` masked rows over `geometry`.
+fn startup_tables(rows: usize, spec: bool, geometry: GraphGeometry) -> StepTables {
+    let mut tables = StepTables { decode: true, spec, long: geometry.long, pool_width: geometry.pool_width,
+        page_stride: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
+    pad_decode_tables(&mut tables, rows);
+    tables
 }
 
 fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
@@ -1223,6 +1258,16 @@ struct GraphKey {
     pool_width: usize,
     page_stride: usize,
     pool_stride: usize,
+}
+
+impl GraphKey {
+    /// Segment `segment` of a decode step of `rows` rows over `tables`, keyed by its geometry
+    /// ([`GraphGeometry::keyed`]: a short step keys no pool-table width or stride).
+    fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
+        let geometry = GraphGeometry::keyed(tables.pool_width, tables.page_stride, tables.pool_stride, tables.long);
+        Self { segment, rows, spec: tables.spec, long: geometry.long, pool_width: geometry.pool_width,
+            page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
+    }
 }
 
 /// What the decode graph caches did and hold.
@@ -1358,11 +1403,7 @@ impl<'a> GlmfEngine<'a> {
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
             for &(rows, spec, geometry) in &shapes {
-                let mut tables = StepTables { decode: true, spec, long: geometry.long,
-                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                    pool_stride: geometry.pool_stride, ..Default::default() };
-                pad_decode_tables(&mut tables, rows);
-                self.step(&tables, &vec![0; rows], rows, None, None, None, None)?;
+                self.step(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None, None)?;
             }
             self.synchronize()
         })();
@@ -1371,13 +1412,13 @@ impl<'a> GlmfEngine<'a> {
         let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
         for &(rows, spec, geometry) in &shapes {
+            let tables = startup_tables(rows, spec, geometry);
             for rank in 0..self.ranks() {
                 let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
                 let end = if rank == 0 { segments } else { segments - 1 };
                 for segment in 0..end {
-                    ensure!(graphs.borrow().contains(&GraphKey { segment, rows, spec, long: geometry.long,
-                        pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                        pool_stride: geometry.pool_stride }), "startup graph coverage missing");
+                    ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
+                        "startup graph coverage missing");
                 }
             }
         }
@@ -2227,11 +2268,10 @@ impl<'a> GlmfEngine<'a> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
-        // A sequence holds at most `max_context` tokens' pages: the tables' columns bound the strides.
-        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pages).min(self.table_pages);
-        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pool_pages).min(self.table_pool_pages);
+        let (page_stride, pool_stride) = decode_strides(
+            sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
+            sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1),
+            (self.pages, self.pool_pages), (self.table_pages, self.table_pool_pages));
         let mut tables = StepTables { decode: true, real_rows: rows, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
             page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
@@ -2477,8 +2517,7 @@ impl<'a> GlmfEngine<'a> {
     /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
     /// streams), its attention half and FFN half.
     fn peer_segment(&self, index: usize, w1: &Workspace<'_>, t: usize, tables: &StepTables) -> Result<()> {
-        let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-            pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+        let key = GraphKey::new(index, t, tables);
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
                 self.peer_post(previous, 0, w1, t, "m64")?;
@@ -2643,8 +2682,7 @@ impl<'a> GlmfEngine<'a> {
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
-                pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey::new(index, t, tables);
             self.replay(key, || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
@@ -3900,11 +3938,13 @@ mod prefill_lane_tests {
 
     #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
-        use super::{decode_bucket, serving_graph_shapes, GraphGeometry, UNIT_PAGES, UNIT_ROWS};
+        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, GraphGeometry, GraphKey, StepTables,
+            MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
             let shapes = serving_graph_shapes(context, pages, dense, 16, true);
             let set: std::collections::HashSet<_> = shapes.iter().copied().collect();
             assert_eq!(shapes.len(), set.len());
+            let (table_pages, table_pools) = glmf_table_pages(context as u64);
             for capacity in 1..=context.min(pages / UNIT_PAGES * UNIT_ROWS) {
                 let units = capacity.div_ceil(UNIT_ROWS);
                 let mut lengths = vec![1, capacity, dense.min(capacity), (dense + 1).min(capacity)];
@@ -3914,20 +3954,31 @@ mod prefill_lane_tests {
                     lengths.extend([boundary, boundary + 1]);
                 }
                 for len in lengths {
-                    let geometry = GraphGeometry {
-                        page_stride: (units * UNIT_PAGES).next_power_of_two().min(pages),
-                        pool_stride: units.next_power_of_two().min(pages / UNIT_PAGES),
-                        pool_width: len.div_ceil(UNIT_ROWS).next_power_of_two().min(units.next_power_of_two().min(pages / UNIT_PAGES)),
-                        long: len > dense,
-                    };
+                    // The decode step's tables: power-of-two strides (the page stride from its floor), within the
+                    // pool and a table row; the top-k width within the pool stride.
+                    let page_stride = (units * UNIT_PAGES).next_power_of_two().max(MIN_PAGE_STRIDE).min(pages)
+                        .min(table_pages as usize);
+                    let pool_stride = units.next_power_of_two().min(pages / UNIT_PAGES)
+                        .min(table_pools as usize);
+                    let pool_width = len.div_ceil(UNIT_ROWS).next_power_of_two().min(pool_stride);
+                    let long = len > dense;
                     for (rows, spec) in [(1, false), (3, false), (10, false), (16, false), (2, true), (10, true), (64, true)] {
-                        assert!(set.contains(&(decode_bucket(rows, spec), spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
+                        let tables = StepTables { decode: true, spec, long, pool_width, page_stride, pool_stride,
+                            ..Default::default() };
+                        let key = GraphKey::new(0, decode_bucket(rows, spec), &tables);
+                        let geometry = GraphGeometry { pool_width: key.pool_width, page_stride: key.page_stride,
+                            pool_stride: key.pool_stride, long: key.long };
+                        // A short step's key holds no pool-table width or stride.
+                        assert_eq!((key.pool_width, key.pool_stride), if long { (pool_width, pool_stride) } else { (0, 0) });
+                        assert!(set.contains(&(key.rows, spec, geometry)), "missing {rows}/{spec}/{geometry:?}");
                     }
                 }
             }
         }
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 400);
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 160);
+        // 14 geometries of 32,768 tokens (four short ones, one per page stride, and ten long ones), each
+        // at 4 plain and 6 speculative buckets.
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 140);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 56);
     }
 
     #[test]
@@ -3944,13 +3995,13 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(17, false), 32);
         for sequences in [8, 16] {
             let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true);
-            assert_eq!(shapes.len() * 46, 18400);
+            assert_eq!(shapes.len() * 46, 6440);
             let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true);
-            assert_eq!(reserve, [3_300_923_584, super::graph_reserve_bytes(18000)]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 7360);
+            assert_eq!(reserve, [1_198_944_016, super::graph_reserve_bytes(6300)]);
+            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 2576);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 20240);
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 22080);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 7084);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 7728);
     }
 
     #[test]
@@ -4075,5 +4126,162 @@ mod prefill_lane_tests {
         assert_eq!(prefill_lane_capacity(DEFAULT_PREFILL_LANES, 4096), 8192);
         assert_eq!(prefill_lane_plan(511, 2, 4096).unwrap(), (1, 511));
         assert_eq!(prefill_lane_plan(512, 2, 4096).unwrap(), (2, 256));
+    }
+}
+
+#[cfg(test)]
+mod graph_key_tests {
+    use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
+        graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
+        GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
+        PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
+    use std::collections::HashSet;
+
+    fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
+        StepTables { decode: true, long, pool_width, page_stride, pool_stride, spec: true, ..Default::default() }
+    }
+
+    #[test]
+    fn short_steps_share_graphs_whatever_their_pool_top_k_shape() {
+        // The pool top-k (the only reader of the width and the pool table stride) runs only when a
+        // row sees past the dense context.
+        let key = |t: &StepTables| GraphKey::new(3, 40, t);
+        assert_eq!(key(&tables(false, 1, 64, 16)), key(&tables(false, 4, 64, 32)));
+        assert_eq!((key(&tables(false, 8, 64, 16)).pool_width, key(&tables(false, 8, 64, 16)).pool_stride), (0, 0));
+        assert_ne!(key(&tables(true, 1, 64, 16)), key(&tables(true, 4, 64, 16)));
+        assert_ne!(key(&tables(true, 4, 64, 16)), key(&tables(true, 4, 64, 32)));
+        // The page table stride reaches every step (the index expansion reads it).
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(false, 1, 128, 16)));
+        assert_ne!(key(&tables(false, 1, 64, 16)), key(&tables(true, 1, 64, 16)));
+        assert_ne!(GraphKey::new(3, 40, &tables(false, 1, 64, 16)), GraphKey::new(4, 40, &tables(false, 1, 64, 16)));
+        assert_ne!(GraphKey::new(3, 40, &tables(false, 1, 64, 16)), GraphKey::new(3, 32, &tables(false, 1, 64, 16)));
+    }
+
+    #[test]
+    fn decode_strides_are_powers_of_two_from_a_floor_within_the_pool_and_the_table() {
+        let (pool, columns) = ((1 << 20, 1 << 18), (2048, 512));
+        // The page stride starts at the floor; the pool stride (keyed only by long steps) has none.
+        assert_eq!(decode_strides(5, 2, pool, columns), (MIN_PAGE_STRIDE, 2));
+        assert_eq!(decode_strides(64, 16, pool, columns), (64, 16));
+        assert_eq!(decode_strides(65, 17, pool, columns), (128, 32));
+        assert_eq!(decode_strides(132, 33, pool, columns), (256, 64));
+        // A row holds one sequence of the context: 131,072 tokens are 2,048 pages, 512 pool pages.
+        assert_eq!(decode_strides(4000, 1000, pool, columns), (2048, 512));
+        // A tiny pool, or a short context's table row, caps the strides below the floor.
+        assert_eq!(decode_strides(5, 2, (32, 8), columns), (32, 2));
+        assert_eq!(decode_strides(5, 2, pool, table(777)), (16, 2));
+        // A long step's sequence holds more than the 2,051-token dense context: at least 9 units (36
+        // pages), so its page stride is at least the floor already.
+        let units = 2052usize.div_ceil(UNIT_ROWS);
+        assert_eq!((units * UNIT_PAGES).next_power_of_two(), MIN_PAGE_STRIDE);
+        assert_eq!(decode_strides(units * UNIT_PAGES, units, pool, columns), (64, 16));
+    }
+
+    /// A table row's (page, pool page) columns for `context` tokens.
+    fn table(context: usize) -> (usize, usize) {
+        let (pages, pools) = glmf_table_pages(context as u64);
+        (pages as usize, pools as usize)
+    }
+
+    /// The startup geometries as `work/p0` enumerated them before the shorter keys: every key held
+    /// the pool top-k's width and stride, and strides started at one unit.
+    fn full_keys(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
+        let pools = pages / UNIT_PAGES;
+        let mut geometries = Vec::new();
+        for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
+            let pool_stride = units.next_power_of_two().min(pools);
+            let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
+            let capacity = (units * UNIT_ROWS).min(context);
+            let mut width = 1;
+            while width / 2 * UNIT_ROWS < capacity {
+                let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
+                let high = (width * UNIT_ROWS).min(capacity);
+                for long in [false, true] {
+                    if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                        let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
+                        if !geometries.contains(&geometry) { geometries.push(geometry); }
+                    }
+                }
+                width *= 2;
+            }
+        }
+        geometries
+    }
+
+    /// The startup set before and after, 16 sequences with drafts: long steps (the only ones that run
+    /// the pool top-k) keep every key, short steps collapse onto page strides from 64 pages with no
+    /// pool-table width or stride, every shape keeps the row buckets the threshold registry passes,
+    /// and each capture's padded tables key it as its own shape.
+    #[test]
+    fn shorter_keys_shrink_the_startup_set_and_change_no_launch() {
+        let dense = 2051;
+        // The reserve's pool target (2,097,152 tokens: 32,768 pages) at three contexts, then smaller
+        // pools and short contexts, whose pool or table row caps the floors.
+        for (context, pages, before_shapes, after_shapes) in [(8192usize, 32768usize, 230usize, 50usize),
+            (32768, 32768, 400, 140), (131_072, 32768, 610, 270), (32768, 4096, 400, 140), (131_072, 2048, 610, 270),
+            (4096, 64, 160, 20), (3000, 36, 160, 20), (2048, 32768, 100, 10)] {
+            let (table_pages, _) = table(context);
+            let (before, after) = (full_keys(context, pages, dense), graph_geometries(context, pages, dense));
+            let long = |set: &[GraphGeometry]| set.iter().copied().filter(|g| g.long).collect::<Vec<_>>();
+            assert_eq!(long(&after), long(&before), "{context}/{pages}: long keys moved");
+            let short: HashSet<_> = after.iter().copied().filter(|g| !g.long).collect();
+            let collapsed: HashSet<_> = before.iter().filter(|g| !g.long).map(|g| GraphGeometry { pool_width: 0,
+                page_stride: g.page_stride.max(MIN_PAGE_STRIDE).min(pages).min(table_pages), pool_stride: 0,
+                long: false }).collect();
+            assert_eq!((short.len(), &short), (after.len() - long(&after).len(), &collapsed), "{context}/{pages}");
+            let shapes = serving_graph_shapes(context, pages, dense, 16, true);
+            assert_eq!((before.len() * 10, shapes.len()), (before_shapes, after_shapes), "{context}/{pages}");
+            // Rows: per geometry, exactly the buckets `check_decode_thresholds` passes for 16 sequences.
+            check_decode_thresholds(16, true).unwrap();
+            let plain: Vec<_> = PLAIN_DECODE_BUCKETS.into_iter()
+                .filter(|&rows| rows <= decode_bucket(16usize.clamp(16, DECODE_ROWS), false)).collect();
+            for geometry in &after {
+                for (spec, buckets) in [(false, &plain[..]), (true, &SPEC_DECODE_BUCKETS[..])] {
+                    let rows: Vec<_> = shapes.iter().filter(|s| s.2 == *geometry && s.1 == spec).map(|s| s.0).collect();
+                    assert_eq!(rows, buckets);
+                    check_bucket_thresholds(&rows, DECODE_PROJECTION_THRESHOLDS).unwrap();
+                }
+            }
+            // The capture's masked tables: `rows` rows of the geometry's strides, keyed as the shape.
+            for &(rows, spec, geometry) in &shapes {
+                let tables = startup_tables(rows, spec, geometry);
+                assert_eq!((tables.kv_slots.len(), tables.page_table.len(), tables.pool_table.len(), tables.real_rows),
+                    (rows, rows * geometry.page_stride, rows * geometry.pool_stride, 0));
+                assert!(tables.positions.iter().all(|&p| p == -1) && tables.kv_slots.iter().all(|&s| s == -1));
+                for segment in [0, 45] {
+                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec,
+                        long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                        pool_stride: geometry.pool_stride });
+                }
+            }
+        }
+        // The startup reserve on one GPU (46 segments a shape) at the engine's 146,459 B a graph.
+        for (context, before, after) in [(8192, 1_926_552_328, 471_335_704), (32768, 3_300_923_584, 1_198_944_016),
+            (131_072, 4_998_676_312u64, 2_249_933_800u64)] {
+            assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
+            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false), [after]);
+        }
+    }
+
+    /// A short step's key leaves out the pool table's width and stride, so the pool top-k, which runs
+    /// only when a row is long, must stay the one launch that reads them. Re-derive the key (and
+    /// this check) if another launch reads the pool table or those scalars.
+    #[test]
+    fn only_the_long_pool_top_k_reads_what_short_keys_leave_out() {
+        let source = include_str!("engine.rs");
+        let source = &source[..source.find("\n#[cfg(test)]\n").unwrap()];
+        let reads = ["pool_table.buffer", "Scalar::I32(tables.pool_width", "Scalar::I32(tables.pool_stride"];
+        let topk = source.find("&format!(\"index_topk_").unwrap();
+        let guard = source[..topk].rfind("if tables.long {").unwrap();
+        let end = topk + source[topk..].find("\"index_expand\"").unwrap();
+        // `if tables.long {` opens right before the launch and closes after its scalars.
+        assert!(!source[guard..topk].contains('}'));
+        for read in reads {
+            assert_eq!(source.matches(read).count(), 1, "{read}");
+            let at = source.find(read).unwrap();
+            assert!(topk < at && at < end, "{read} outside the long pool top-k launch");
+        }
+        let last = reads.iter().map(|read| source.find(read).unwrap()).max().unwrap();
+        assert!(source[last..end].lines().any(|line| line.trim() == "}"));
     }
 }
