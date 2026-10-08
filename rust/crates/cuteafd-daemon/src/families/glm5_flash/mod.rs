@@ -58,6 +58,12 @@ pub(crate) struct EngineArgs {
     /// planned admission and by the measured one alike.
     #[arg(skip)]
     pub planner_mark_slots: usize,
+    /// Where prefix-cache snapshots keep their KDA state marks: `arena`, a device arena of
+    /// 2C + 2 marks (147.6 MB each with FP32 state) beside the KV pool, or `pool`, units of
+    /// the KV pool itself (49 per mark), taken at capture and evicted (to the host tier when
+    /// it is on) like any snapshot's rows, with unit 0 reserved.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_PREFIX_MARKS", default_value = "arena")]
+    pub prefix_marks: prefix::PrefixMarks,
     /// The DSA index cache: `keys` keeps every token's BF16 key | gate row beside its latent
     /// record (11,804 B per token over the 11 MLA layers); `compact` keeps only the pooled keys
     /// and each sequence's open pool (at most three rows), 6,172 B per token, with the same
@@ -559,6 +565,14 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn prefix_marks_default_to_the_arena_and_take_the_pool() {
+        assert_eq!(parse(&[]).prefix_marks, prefix::PrefixMarks::Arena);
+        assert_eq!(parse(&["--prefix-marks", "pool"]).prefix_marks, prefix::PrefixMarks::Pool);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefix-marks", "host"]).is_err());
+    }
+
+    #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
         assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
@@ -1007,6 +1021,17 @@ impl Opened {
             Some(experts)
         } else { None };
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
+        // Pool marks keep `GLMF_POOL_MARK_RESERVED_UNITS` units beside the admitted pool, never
+        // handed out (see `prefix`): the admission reserves their bytes like any fixed cost and the
+        // engine allocates them past the pool's tokens, so the pool admitted is the pool usable.
+        let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
+            cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
+        let reserved_bytes = if reserved_units == 0 { 0 } else {
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
+                index_cache.into(), args.kda_state.bytes() as u64)?;
+            let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
+            reserved_units * (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
+        };
         // Startup decode graphs (`CUTEAFD_GLMF_STARTUP_GRAPHS`, the default): every graph a serving
         // loop launches is captured before readiness, so the pool leaves their reserve free (per rank).
         // A graph budget (`--graph-budget-mib`) asks for lazily captured graphs within it instead.
@@ -1068,7 +1093,7 @@ impl Opened {
                 mark_bytes = marks, "KV admission reserves recurrent state, replay records and prefix marks");
             // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
             // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
-            let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes);
+            let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes + reserved_bytes);
             let startup = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied());
             let admitted = measured_admission(args, startup, |graphs| {
                 let reserve = crate::shared::memory_report::MeasuredReserve { headroom, graphs, later };
@@ -1088,6 +1113,7 @@ impl Opened {
                 std::iter::once(args.device)
                     .chain(peer_stream.map(|(d, _)| d)).collect()
             };
+            // The head split's partials and the pool marks' reserved units (on every GPU).
             let extra = if args.kda_output_shard {
                 engine::output_shard_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden)
             } else if args.full_prefill_logits {
@@ -1096,7 +1122,7 @@ impl Opened {
             } else {
                 engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
                     if args.kda_fp32_partials { 4 } else { 2 })
-            };
+            } + reserved_bytes;
             // The step workspaces this engine makes before readiness (`workspace_reserve`, per rank: the
             // decode workspace, the prefill lanes over their shared temporaries, and the measured runtime
             // allowance per workspace), past the planner's workspace allowance; with all-row prefill
@@ -1143,14 +1169,14 @@ impl Opened {
         } else {
             (args.pool_tokens, startup_graphs)
         };
-        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
-        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, "GLM 5.3 Flash DSA index cache");
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, reserved_units, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
@@ -1321,8 +1347,9 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
-    // --resume-at captures into two arena marks (`prefix::resume_check`).
-    args.engine.planner_mark_slots = if args.resume_at.is_some() { 2 } else { 0 };
+    // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
+    args.engine.planner_mark_slots =
+        if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena { 2 } else { 0 };
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -1397,7 +1424,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat);
+            args.resume_repeat, args.engine.prefix_marks);
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);

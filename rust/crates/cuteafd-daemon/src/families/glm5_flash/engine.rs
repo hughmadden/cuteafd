@@ -427,7 +427,13 @@ pub(crate) struct Allocator {
 impl Allocator {
     /// Over an engine of `pages` MLA pages (a whole number of units) and `slots` KDA slots.
     pub fn new(pages: usize, slots: usize) -> Self {
-        Self { units: cuteafd_engine::prefix::RefPagePool::new(pages / UNIT_PAGES, UNIT_ROWS),
+        Self::with_reserved(pages, slots, 0)
+    }
+
+    /// [`Self::new`] that never hands out the first `reserved` units (pool-page prefix marks keep
+    /// unit 0 zeroed: see `GLMF_POOL_MARK_RESERVED_UNITS`).
+    pub fn with_reserved(pages: usize, slots: usize, reserved: usize) -> Self {
+        Self { units: cuteafd_engine::prefix::RefPagePool::with_reserved(pages / UNIT_PAGES, UNIT_ROWS, reserved),
             slots: (0..slots as i32).rev().collect() }
     }
 
@@ -456,6 +462,17 @@ impl Allocator {
                 Err(error).context("cache pages exhausted")
             }
         }
+    }
+
+    /// `n` units for a pool-page prefix mark, ascending as the prefix cache hands them out.
+    pub fn take_units(&mut self, n: usize) -> Result<Vec<u32>> {
+        let mut units = self.units.alloc(n).context("cache pages exhausted")?;
+        units.sort_unstable();
+        Ok(units)
+    }
+
+    pub fn release_units(&mut self, units: &[u32]) {
+        self.units.release(units);
     }
 
     /// A spare KDA state slot (a speculative verify's backup).
