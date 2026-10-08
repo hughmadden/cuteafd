@@ -444,16 +444,20 @@ coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 wip_layout="" wip_mount_args=() wip_worker_args=""
 if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
+  WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
+  release_wip_slot_instance "$wip_slot"
+  wip_coordinator_container="$(release_wip_container coordinator)"
+  wip_spark_container="$(release_wip_container spark-expert)"
   coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
-  wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
-  wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$wip_slot/bin:/opt/cuteafd/bin:ro \
-    -v \$HOME/.cache/cuteafd/wip-run/$wip_slot/lib:/opt/cuteafd/lib:ro \
-    -v \$HOME/.cache/cuteafd/wip-run/$wip_slot/share:/opt/cuteafd/share:ro \
+  wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/bin:/opt/cuteafd/bin:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
@@ -872,18 +876,19 @@ if [[ -n "$wip_slot" ]]; then
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
   release_require_dev_image_sparkinfer "$(hostname)" "$coordinator_image" \
     "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$coordinator_image")" "$pinned_sparkinfer"
-  release_stage_wip_layout cuteafd-coordinator-wip "$wip_slot" coordinator "$wip_layout"
+  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" <<'STAGE' ||
+    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" <<'STAGE' ||
 set -euo pipefail
 slot="$1" image="$2" pinned="$3"
+container="$4" layout_slot="$5"
 label="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image" 2>/dev/null || true)"
 [[ "$label" == "$pinned" ]] || { echo "$(hostname): $image carries SparkInfer ${label:-<none>}, this checkout pins $pinned" >&2; exit 1; }
-layout="$HOME/.cache/cuteafd/wip-run/$slot" raw="$HOME/.cache/cuteafd/wip-run/$slot.tmp/raw"
+layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
-docker cp "cuteafd-spark-expert-wip:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
-docker cp "cuteafd-spark-expert-wip:/wip/slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
+docker cp "$container:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
+docker cp "$container:/wip/slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
 mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
 mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
 [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"

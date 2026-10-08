@@ -11,6 +11,69 @@ release_die() {
   exit 2
 }
 
+release_validate_wip_instance() {
+  [[ -z "${WIP_INSTANCE:-}" || "$WIP_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
+    release_die "WIP_INSTANCE must be [A-Za-z0-9_.-], starting with a letter or digit (max 41 characters)"
+}
+
+release_validate_wip_root() {
+  [[ -n "${WIP_ROOT:-}" ]] || return 0
+  release_validate_path_setting WIP_ROOT "$WIP_ROOT"
+  local parent="$HOME/.cache/cuteafd/builds"
+  [[ "$WIP_ROOT" == "$parent/"* ]] || release_die "WIP_ROOT must be under $parent/"
+  [[ "$(realpath -m "$WIP_ROOT")" == "$(realpath -m "$parent")/"* ]] ||
+    release_die "WIP_ROOT resolves outside $parent/"
+}
+
+release_wip_container() {
+  release_validate_wip_instance
+  case "$1" in coordinator|spark-expert) ;; *) release_die "invalid WIP container role: $1" ;; esac
+  printf 'cuteafd-%s-wip%s' "$1" "${WIP_INSTANCE:+-$WIP_INSTANCE}"
+}
+
+# The host slot index finds the producing instance even when the launch config
+# omits it. Old slots without an index retain the legacy unnamed container.
+release_wip_slot_instance() {
+  local slot="$1" metadata="$HOME/.cache/cuteafd/wip-slots/$1.json" recorded
+  [[ "$slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid WIP slot: $slot"
+  release_validate_wip_instance
+  if [[ -n "${WIP_INSTANCE:-}" ]]; then
+    metadata="$HOME/.cache/cuteafd/wip-slots/$WIP_INSTANCE/$slot.json"
+  fi
+  if [[ -f "$metadata" ]]; then
+    recorded="$(python3 - "$metadata" "$slot" <<'PYMETA'
+import json, sys
+m = json.load(open(sys.argv[1]))
+assert m['slot'] == sys.argv[2] and isinstance(m['wip_instance'], str)
+print(m['wip_instance'])
+PYMETA
+)" || release_die "invalid WIP slot metadata: $metadata"
+    [[ -z "${WIP_INSTANCE:-}" || "$WIP_INSTANCE" == "$recorded" ]] ||
+      release_die "WIP slot $slot belongs to instance $recorded, not $WIP_INSTANCE"
+    WIP_INSTANCE="$recorded"
+    release_validate_wip_instance
+  fi
+  WIP_LAYOUT_SLOT="${WIP_INSTANCE:+$WIP_INSTANCE/}$slot"
+}
+
+release_record_wip_slot() {
+  release_validate_wip_instance
+  python3 - "$HOME/.cache/cuteafd/wip-slots" "$1" "${WIP_INSTANCE:-}" <<'PYMETA'
+import json, os, pathlib, sys, tempfile
+root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True, exist_ok=True)
+with tempfile.NamedTemporaryFile(mode='w', dir=root, delete=False) as f:
+    json.dump({'slot': sys.argv[2], 'wip_instance': sys.argv[3]}, f)
+    name = f.name
+os.replace(name, root / (sys.argv[2] + '.json'))
+if sys.argv[3]:
+    instance_root = root / sys.argv[3]; instance_root.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=instance_root, delete=False) as f:
+        json.dump({'slot': sys.argv[2], 'wip_instance': sys.argv[3]}, f)
+        name = f.name
+    os.replace(name, instance_root / (sys.argv[2] + '.json'))
+PYMETA
+}
+
 release_need() {
   command -v "$1" >/dev/null 2>&1 || release_die "required command not found: $1"
 }
@@ -221,7 +284,7 @@ release_known_key() {
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE|DRAFT_MODEL_ID|DRAFT_MODEL_REVISION|DRAFT_FP8|DFLASH|MTP|COORDINATOR_TRACE) return 0 ;;
     FULL_PREFILL_LOGITS|TABLE_BACKEND) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|COPY_DRAFTS|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|EXPERT_BACKEND) return 0 ;;
+    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|COPY_DRAFTS|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|EXPERT_BACKEND) return 0 ;;
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|EXL3_PAIRED_TP4|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     RDMA_BOND_BALANCE) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
@@ -393,6 +456,9 @@ release_load_config() {
   # so a second load in one process must not suffix an already-suffixed name.
   RELEASE_COORDINATOR_CONTAINER_NAME=cuteafd-coordinator
   INSTANCE=
+  local wip_env="${WIP_INSTANCE-}" wip_root_env="${WIP_ROOT-}"
+  WIP_ROOT=
+  WIP_INSTANCE=
   for release_i in 0 1 2 3 4 5; do
     printf -v "SPARK_${release_i}_HOST" '%s' ""
     printf -v "SPARK_${release_i}_LANE_A" '%s' ""
@@ -418,6 +484,11 @@ release_load_config() {
     [[ "$key" != MODEL_ID ]] || model_id_explicit=1
     [[ "$key" != MODEL_REVISION ]] || model_revision_explicit=1
   done <"$config"
+
+  WIP_INSTANCE="${wip_env:-$WIP_INSTANCE}"
+  WIP_ROOT="${wip_root_env:-$WIP_ROOT}"
+  release_validate_wip_root
+  release_validate_wip_instance
 
   if [[ -n "$SPARK_HOSTS" ]]; then
     local host_rows rank host lane_a lane_b
@@ -1045,8 +1116,8 @@ REMOTE
 }
 
 release_stop_wip_containers() {
-  local coordinator_container="${1:-cuteafd-coordinator-wip}"
-  local spark_container="${2:-cuteafd-spark-expert-wip}"
+  local coordinator_container="${1:-$(release_wip_container coordinator)}"
+  local spark_container="${2:-$(release_wip_container spark-expert)}"
   local failed=0
 
   release_stop_persistent_local_container "$coordinator_container" || failed=1
@@ -1102,7 +1173,7 @@ CONTAINER
 
 release_stop_wip_coordinator() {
   local coordinator_process="${1:-coordinator-${ADDR##*:}}"
-  local coordinator_container=cuteafd-coordinator-wip
+  local coordinator_container="$(release_wip_container coordinator)"
 
   if docker container inspect "$coordinator_container" >/dev/null 2>&1 &&
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]]; then
@@ -1115,8 +1186,8 @@ release_stop_wip_coordinator() {
 release_stop_wip_services() {
   local coordinator_process="${1:-coordinator-${ADDR##*:}}"
   local expert_process="${2:-expert-$EXPERT_PORT}"
-  local coordinator_container=cuteafd-coordinator-wip
-  local spark_container=cuteafd-spark-expert-wip
+  local coordinator_container="$(release_wip_container coordinator)"
+  local spark_container="$(release_wip_container spark-expert)"
   local failed=0
 
   release_stop_wip_coordinator "$coordinator_process" || failed=1

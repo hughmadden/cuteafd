@@ -328,11 +328,14 @@ fi
 sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
 wip_layout=""
 if [[ -n "$wip_slot" ]]; then
-  wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  release_wip_slot_instance "$wip_slot"
+  wip_coordinator_container="$(release_wip_container coordinator)"
+  wip_spark_container="$(release_wip_container spark-expert)"
+  wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
   release_require_dev_image_sparkinfer "$(hostname)" "$COORDINATOR_DOCKER_INFERENCE" \
     "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")" \
     "$sparkinfer_commit"
-  release_stage_wip_layout cuteafd-coordinator-wip "$wip_slot" coordinator "$wip_layout"
+  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
 else
   engine_commit="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
@@ -354,10 +357,12 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
+wip_spark_container="${9:-cuteafd-spark-expert-wip}"
+wip_layout_slot="${10:-$wip_slot}"
 [[ "$exl3_family" == __none__ ]] && exl3_family=
 # Every failure names the host and the check: this block runs over SSH, so a
 # bare nonzero exit would otherwise surface as an unexplained transport error.
@@ -382,11 +387,11 @@ if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
   die "model snapshot has dangling links: $snapshot_rel"
 fi
 if [[ "$wip_slot" != __none__ ]]; then
-  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
-  docker cp "cuteafd-spark-expert-wip:/wip/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
-    die "WIP slot $wip_slot has no spark-expert artifacts in cuteafd-spark-expert-wip"
-  docker cp "cuteafd-spark-expert-wip:/wip/slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
+  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
+    die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container"
+  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
   mkdir -p "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
   mv "$layout.tmp/raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
@@ -395,7 +400,7 @@ if [[ "$wip_slot" != __none__ ]]; then
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
 fi
 if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
-  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   if [ -f "$layout/lib/exl3/exl3-$exl3_family/manifest.json" ]; then cat "$layout/lib/exl3/exl3-$exl3_family/manifest.json"; else cat "$layout/lib/exl3/manifest.json"; fi
 elif [[ "$exl3" == true ]]; then
   docker run --rm --network none --entrypoint /bin/sh "$image" -c \
@@ -619,7 +624,7 @@ for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${wip_slot:-__none__}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
   release_ssh "$host" "bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
@@ -633,9 +638,10 @@ rdma_env="${14:-}"; ib_port="${15:-}"; execution_lanes="${16:-}"
 # see the caller's environment).
 rust_log="${17:-info}"
 wip_slot="${18:-__none__}"
+wip_layout_slot="$wip_slot"
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
-  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   wip_args=(-v "$layout/bin:/opt/cuteafd/bin:ro" -v "$layout/lib:/opt/cuteafd/lib:ro"
     -v "$layout/share:/opt/cuteafd/share:ro"
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
