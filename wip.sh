@@ -93,6 +93,7 @@ done
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
 
 release_load_config "$config"
+case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
 release_validate_wip_instance
 release_need docker
 release_need ssh
@@ -202,16 +203,95 @@ sparkinfer_revision="$(python3 "$staging_dir/scripts/build/verify-sparkinfer-sou
   --lock "$staging_dir/third_party/sparkinfer.lock.json" \
   --print-revision)"
 
-# Kernels come from the verified frozen checkout, not the toolchain image.
+# Explicit registry refs retain pull-if-missing behavior. Missing default local
+# tags prefer the checkout-matched published toolchain, then build on that host.
 ensure_local_image() {
-  release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
+  if [[ "$COORDINATOR_DOCKER_DEV" == */* ]] || docker image inspect "$COORDINATOR_DOCKER_DEV" >/dev/null 2>&1; then
+    release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
+  else
+    local admitted
+    admitted="$(python3 "$staging_dir/scripts/build/select-dev-image.py" select \
+      --source "$staging_dir" --arch amd64 --local-tag "$COORDINATOR_DOCKER_DEV" \
+      --engine-commit "$source_revision" --mode "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" \
+      --output "$dev_image_logs/coordinator.json")"
+    docker tag "$admitted" "$COORDINATOR_DOCKER_DEV"
+  fi
 }
-ensure_seed_image() {
-  release_ensure_dev_image "$SPARK_EXPERT_DOCKER_DEV" "$seed_host"
+ensure_seed_image() (
+  if [[ "$SPARK_EXPERT_DOCKER_DEV" == */* ]] || release_ssh "$seed_host" docker image inspect "$SPARK_EXPERT_DOCKER_DEV" >/dev/null 2>&1; then
+    release_ensure_dev_image "$SPARK_EXPERT_DOCKER_DEV" "$seed_host"
+  else
+    # Only these immutable toolchain inputs are needed for a fallback dev build.
+    local remote_source
+    remote_source="$(release_ssh "$seed_host" 'mkdir -p "$HOME/.cache/cuteafd/builds/wip-dev-image"; mktemp -d "$HOME/.cache/cuteafd/builds/wip-dev-image/source.XXXXXXXX"')"
+    release_validate_path_setting remote_source "$remote_source"
+    trap 'release_ssh "$seed_host" "rm -rf $remote_source" >/dev/null 2>&1 || true' EXIT
+    tar -C "$staging_dir" -cf - docker/Dockerfile.dev docker/entrypoint.sh \
+      scripts/build/install-dev-cache-tools.sh scripts/build/dev-toolchain.py \
+      scripts/build/select-dev-image.py scripts/build/assert-build-filesystem.py .dockerignore |
+      release_ssh "$seed_host" "tar -C $remote_source -xf -"
+    release_ssh "$seed_host" setsid --wait bash -s -- "$remote_source" "$SPARK_EXPERT_DOCKER_DEV" \
+      "$(printf '%q' "$source_revision")" "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" "$dev_image_run_id" <<'REMOTE'
+set -euo pipefail
+source_dir="$1"
+process_dir="$HOME/.cache/cuteafd/builds/wip-dev-image/processes"
+mkdir -p "$process_dir"
+process_file="$process_dir/$5.pid"
+cancel_file="$process_dir/$5.cancel"
+[[ ! -e "$cancel_file" ]] || exit 143
+printf '%s\n' "$$" >"$process_file"
+cleanup_dev_phase() {
+  trap '' HUP INT TERM
+  kill -TERM -- "-$$" 2>/dev/null || true
+  rm -f "$process_file"
+  rm -rf "$source_dir"
 }
+trap cleanup_dev_phase EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+[[ ! -e "$cancel_file" ]] || exit 143
+python3 "$source_dir/scripts/build/assert-build-filesystem.py" "$source_dir"
+admitted="$(python3 "$source_dir/scripts/build/select-dev-image.py" select \
+  --source "$source_dir" --arch arm64 --local-tag "$2" --engine-commit "$3" \
+  --mode "$4" --output "$source_dir/DEV_IMAGE_REUSE.json")"
+docker tag "$admitted" "$2"
+REMOTE
+  trap - EXIT
+  fi
+)
 
-ensure_local_image
-ensure_seed_image
+source "$repo_root/scripts/lib/build-supervision.sh"
+dev_image_log_root="$HOME/.cache/cuteafd/builds/wip-dev-image"
+python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$dev_image_log_root"
+mkdir -p "$dev_image_log_root"
+dev_image_logs="$(mktemp -d "$dev_image_log_root/legs.XXXXXXXX")"
+dev_image_run_id="wip-dev-$(basename "$dev_image_logs")"
+cancel_local_dev_image() { :; }
+cancel_seed_dev_image() {
+  timeout 30 ssh "${release_ssh_opts[@]}" -o ConnectTimeout=5 "$seed_host" bash -s -- "$dev_image_run_id" <<'CANCEL'
+set -euo pipefail
+process_dir="$HOME/.cache/cuteafd/builds/wip-dev-image/processes"
+mkdir -p "$process_dir"
+: >"$process_dir/$1.cancel"
+pid=""
+[[ ! -f "$process_dir/$1.pid" ]] || read -r pid <"$process_dir/$1.pid" || true
+if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/cmdline" ]] &&
+   grep -zFq -- "$1" "/proc/$pid/cmdline"; then
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  for ((i=0; i<5; i++)); do
+    kill -0 -- "-$pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+fi
+rm -f "$process_dir/$1.pid"
+CANCEL
+}
+release_configure_ssh_transport
+build_supervise 'WIP dev image' "$dev_image_logs" 0 \
+  coordinator ensure_local_image cancel_local_dev_image coordinator.log \
+  expert ensure_seed_image cancel_seed_dev_image expert.log
 
 # stream_between_hosts SRC SRC_CMD DST DST_CMD: SRC_CMD's stdout into DST_CMD's stdin, over
 # rdmapipe when both hosts have it, otherwise a plain ssh pipe relayed through this host (the

@@ -108,13 +108,18 @@ submodule verification; Docker image assembly still reads the live checkout. CUT
 supply an existing manifest. Source archives without .git must provide
 CUTEAFD_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
 
-CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID skips only the coordinator dev-image build.
-Requires retained image-ID-bound BuildKit provenance and Git history: matching
-Dockerfile.dev, entrypoint, Rust toolchain, installed SparkInfer source/lock,
-and the build revision's Transformers lock against the verified mounted source.
-Missing proof or mismatches refuse reuse. Unset retains the normal Docker build.
-The immutable reused ID and verification hashes ship in dist/DEV_IMAGE_REUSE.json
-(checksummed by dist/SHA256SUMS) and the coordinator image's reused-dev label.
+Development images default to ghcr.io/tpurtell/cuteafd-dev:tc-<hash>-<arch>,
+where dev-toolchain.py hashes the checkout's exact toolchain inputs. Both hosts
+use a cached matching image or pull it, verifying its hash, architecture and
+pinned base-digest label. Missing images, pull failures and mismatches fall back
+to Dockerfile.dev locally, with the reason logged. Set
+CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=build to force local dev builds on both hosts
+(default registry). Compilation uses the admitted immutable image ID.
+CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID overrides only the coordinator, keeping its
+existing live toolchain/source checks and image-ID-bound provenance proof.
+Missing proof or mismatches refuse this explicit override rather than falling back.
+Both legs' exact image IDs, registry references/digests and toolchain hashes ship
+in dist/DEV_IMAGE_REUSE.json (checksummed by dist/SHA256SUMS) and image labels.
 EOF
 }
 
@@ -331,11 +336,27 @@ release_leg_plan="coordinator and Spark legs build concurrently; shared export/d
 [[ "$release_sequential" == 0 ]] ||
   release_leg_plan="sequential: coordinator then Spark (CUTEAFD_RELEASE_SEQUENTIAL=1)"
 
+release_dev_image_source="${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}"
+case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
+
 if ((dry_run)); then
+  release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
   echo "  build hosts (${#RELEASE_BUILD_HOSTS[@]}): $(IFS=,; echo "${RELEASE_BUILD_HOSTS[*]}")"
   echo "  seed host: ${RELEASE_BUILD_HOSTS[0]:-}"
+  if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
+    echo "  coordinator dev image: verify explicit override $CUTEAFD_RELEASE_DEV_IMAGE"
+  elif [[ "$release_dev_image_source" == registry ]]; then
+    echo "  coordinator dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-amd64 on $(hostname) if missing; verify or build locally"
+  else
+    echo "  coordinator dev image: build Dockerfile.dev locally on $(hostname)"
+  fi
+  if [[ "$release_dev_image_source" == registry ]]; then
+    echo "  Spark dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-arm64 on ${RELEASE_BUILD_HOSTS[0]:-} if missing; verify or build locally"
+  else
+    echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
+  fi
   echo "  build legs: $release_leg_plan"
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
@@ -668,9 +689,7 @@ release_log_root="${release_build_root:-$HOME/.cache/cuteafd/builds/release-sour
 python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_log_root"
 mkdir -p "$release_log_root"
 release_leg_log_dir="$(mktemp -d "$release_log_root/build-legs.XXXXXXXX")"
-release_dev_reuse_manifest=""
-[[ -z "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]] ||
-  release_dev_reuse_manifest="$release_leg_log_dir/DEV_IMAGE_REUSE.json"
+release_dev_reuse_manifest="$release_leg_log_dir/coordinator-dev-image.json"
 
 build_coordinator_release() (
 release_source_dir=""
@@ -687,19 +706,16 @@ if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
   COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/verify-release-dev-image.py" \
     --source "$repo_root" --image "$CUTEAFD_RELEASE_DEV_IMAGE" \
     --output "$release_dev_reuse_manifest")" || release_die "coordinator dev image reuse verification failed"
-  release_dev_reuse_label_args=(--label "io.cuteafd.dev-image.reused=$COORDINATOR_DOCKER_DEV")
-elif [[ "$COORDINATOR_DOCKER_DEV" == */* ]]; then
-  release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
+  python3 "$repo_root/scripts/build/select-dev-image.py" record-override \
+    --source "$repo_root" --manifest "$release_dev_reuse_manifest"
 else
-  echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
-  docker build \
-    --build-arg BASE_IMAGE="$(python3 "$repo_root/scripts/build/dev-toolchain.py" amd64)" \
-    --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 "$repo_root/scripts/build/dev-toolchain.py")" \
-    --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
-    -f "$repo_root/docker/Dockerfile.dev" \
-    -t "$COORDINATOR_DOCKER_DEV" \
-    "$repo_root"
+  COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/select-dev-image.py" select \
+    --source "$repo_root" --arch amd64 --local-tag "$COORDINATOR_DOCKER_DEV" \
+    --engine-commit "$engine_commit" --mode "$release_dev_image_source" \
+    --output "$release_dev_reuse_manifest")"
 fi
+python3 "$repo_root/scripts/build/select-dev-image.py" labels --manifest "$release_dev_reuse_manifest" >"$release_leg_log_dir/coordinator-dev-labels"
+mapfile -t release_dev_reuse_label_args <"$release_leg_log_dir/coordinator-dev-labels"
 
 echo "== compiling coordinator release artifacts in GPU-enabled development container =="
 mkdir -p "$artifact_dir"
@@ -830,7 +846,7 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -912,20 +928,17 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 [[ ! -e "$cancel_file" ]] || exit 143
 # release-spark-process-group:end
-if [[ "$phase" == dev && "$dev_image" == */* ]]; then
-  source scripts/lib/release-common.sh
-  release_ensure_dev_image "$dev_image"
-elif [[ "$phase" == dev ]]; then
+dev_manifest="$process_dir/$export_container.dev-image.json"
+if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
-docker build \
-  --build-arg BASE_IMAGE="$(python3 scripts/build/dev-toolchain.py arm64)" \
-  --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 scripts/build/dev-toolchain.py)" \
-  --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
-  -f docker/Dockerfile.dev \
-  -t "$dev_image" .
+python3 scripts/build/select-dev-image.py select \
+  --source "$remote_dir" --arch arm64 --local-tag "$dev_image" \
+  --engine-commit "$engine_commit" --mode "${20:-registry}" --output "$dev_manifest"
+else
+dev_image="$(python3 scripts/build/select-dev-image.py image --manifest "$dev_manifest")"
 fi
 if [[ "$phase" == export ]]; then
 # AOT export outside the hardware locks (USING_AGENTS.md): it needs a GPU to
@@ -1027,8 +1040,11 @@ wait "$spark_export_watchdog_pid" 2>/dev/null || true
   { echo "$(hostname): the Spark AOT export failed (exit $spark_export_status) at $(date -Is)" >&2; exit "$spark_export_status"; }
 fi
 if [[ "$phase" == image ]]; then
+python3 scripts/build/select-dev-image.py labels --manifest "$dev_manifest" >"$dev_manifest.labels"
+mapfile -t release_dev_reuse_label_args <"$dev_manifest.labels"
 docker build \
   "${release_source_label_args[@]}" \
+  "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -1174,10 +1190,12 @@ release_sync --delete \
   "$seed_host:$remote_dir/dist/spark-expert/" \
   "$repo_root/dist/spark-expert/"
 dist_source_manifest=()
-if [[ -n "$release_dev_reuse_manifest" ]]; then
-  install -m 0644 "$release_dev_reuse_manifest" "$repo_root/dist/DEV_IMAGE_REUSE.json"
-  dist_source_manifest+=(DEV_IMAGE_REUSE.json)
-fi
+release_sync "$seed_host:$remote_dir/.cuteafd-release/$export_container-expert.dev-image.json" \
+  "$release_leg_log_dir/spark-dev-image.json"
+python3 "$repo_root/scripts/build/select-dev-image.py" merge \
+  --coordinator "$release_dev_reuse_manifest" --spark "$release_leg_log_dir/spark-dev-image.json" \
+  --output "$repo_root/dist/DEV_IMAGE_REUSE.json"
+dist_source_manifest+=(DEV_IMAGE_REUSE.json)
 if [[ -n "$source_manifest" ]]; then
   install -m 0644 "$source_manifest" "$repo_root/dist/SOURCE_SHA256SUMS"
   dist_source_manifest+=(SOURCE_SHA256SUMS)
