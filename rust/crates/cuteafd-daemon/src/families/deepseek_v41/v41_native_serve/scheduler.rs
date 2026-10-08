@@ -211,7 +211,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     first: &mut P, second: &mut P,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
     second_transport: &mut P::Transport, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
-    vision: &mut Option<crate::families::deepseek_v41::v41_vision::VisionRuntime<'a>>,
+    vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
@@ -371,10 +371,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     let started = Instant::now();
                     for &index in &needed {
                         ensure!(!job.events.is_closed(), "client disconnected");
-                        let features = vision.as_mut().context("vision input disabled; no vision tower is loaded")?
-                            .encode(&images[index].image)?;
-                        let mut bytes = vec![0; features.bytes];
-                        lib.copy_d2h(&mut bytes, features)?;
+                        let bytes = vision.encode(&images[index].image, || job.events.is_closed())?;
                         requests.install_image_features(lease, index, bytes)?;
                     }
                     tracing::info!(request_id=id, images=images.len(), encoded_images=needed.len(),

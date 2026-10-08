@@ -660,6 +660,13 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Checked Spark vision replicas; omitted for local RTX fallback.
+    #[arg(long)]
+    pub vision_peers: Option<String>,
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_plan_hash: Option<String>,
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_revision: Option<String>,
     /// Embedding placement: pinned mapped RAM on <=32 GiB, GPU otherwise; explicit overrides win.
     #[arg(long, alias = "embed-placement", value_enum)]
     pub embedding_placement: Option<crate::shared::token_io::EmbedPlacement>,

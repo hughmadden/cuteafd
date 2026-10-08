@@ -101,7 +101,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
                 tracing::error!(%error,"native target worker stopped");
             }
         })?;
-    readiness
+    let vision_health = readiness
         .await
         .context("native target startup stopped")?
         .map_err(anyhow::Error::msg)?;
@@ -109,7 +109,9 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
-    let router = cuteafd_api::openai::router_with_console(send, limits, stats, http_queue_wait, console_hub.clone());
+    let mut profile = cuteafd_api::openai::ModelProfile::default();
+    profile.vision_health = vision_health;
+    let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(), profile);
     axum::serve(listener, cuteafd_bench::app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let mut term =
@@ -282,7 +284,7 @@ fn spark_transport(
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
     // Auto placement must publish its live boundary even when no local layer
@@ -517,9 +519,7 @@ fn worker(
     if small_card { memory::startup_phase(&lib, "v41/drafter", device_total)?; }
     let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
-    let mut vision = cuteafd_api::openai::vision_input_enabled().then(||
-        crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)).transpose()?;
+    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
     let vision_bytes = if small_card { vision_free_before.saturating_sub(lib.cuda_memory_info()?.0) } else { 0 };
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
@@ -666,10 +666,11 @@ fn worker(
         .build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
     scheduler::publish_capacity(&requests, &prefixes);
+    vision.connect()?;
     ready
         .take()
         .context("startup readiness missing")?
-        .send(Ok(()))
+        .send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut prefill_pass,
         &mut requests, &mut transport, &mut prefill_transport, draft.as_mut(), &mut vision, stats, prefixes)

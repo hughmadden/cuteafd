@@ -516,9 +516,6 @@ release_load_config() {
 
   [[ "$VISION" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$VISION" != auto:* && "$VISION" != off:* ) ]] ||
     release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
-  if [[ "$MODEL_ID" == deepseek-ai/DeepSeek-V4.1-* ]]; then
-    case "$VISION" in auto|off) ;; *) release_die "V4.1 retains VISION=auto|off" ;; esac
-  fi
   case "$AUDIO" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
   case "$MODEL_VARIANT" in flash|pro) ;; *) release_die "MODEL_VARIANT must be flash or pro" ;; esac
   case "$EXPERT_FORMAT" in native|exl3) ;; *) release_die "EXPERT_FORMAT must be native or exl3" ;; esac

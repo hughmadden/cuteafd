@@ -1459,6 +1459,41 @@ fn media_off_is_disabled_and_saves_checkpoint_bytes() {
 }
 
 #[test]
+fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
+    use super::encoder::EncoderKind;
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = snapshot(v41_config(), &[
+        t("embed.weight", "BF16", &[128, 5120]),
+        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+        t("vision.embeddings.patch_embedding.weight", "BF16", &[1152, 3, 14, 14]),
+    ]);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), target_pool_tokens: 32768,
+        spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
+    }), ..Default::default() };
+    let auto = plan(dir.path(), &options).unwrap();
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
+    assert_eq!(auto.encoder.as_ref().unwrap().scratch,
+        617_439_296 + super::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES);
+    let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
+    let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().scratch, 617_439_296);
+    let experts = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark).map(|d| d.items.iter()
+        .filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
+    assert_eq!(experts(&auto), experts(&off));
+    assert_eq!(experts(&local), experts(&off));
+    let mut limited = options;
+    limited.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(1);
+    let fallback = plan(dir.path(), &limited).unwrap();
+    assert_eq!(fallback.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
+    assert_eq!(experts(&fallback), experts(&off));
+    assert_ne!(auto.encoder_plan_hash, local.encoder_plan_hash);
+    assert_ne!(auto.encoder_plan_hash, off.encoder_plan_hash);
+}
+
+#[test]
 fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     use super::encoder::EncoderKind;
     let mut cfg = mimo_flash_config();

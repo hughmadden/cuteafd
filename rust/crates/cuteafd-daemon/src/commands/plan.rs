@@ -24,6 +24,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
+                spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
                 vision_replicas: args.vision_replicas as usize,
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
@@ -214,6 +215,15 @@ mod tests {
             let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
         }
+    }
+
+    #[test]
+    fn spark_encoder_admission_honors_runtime_budget() {
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.spark_budget_gib = 82.0;
+        let options = options(&request).unwrap();
+        assert_eq!(options.spark_budget_bytes, 82 << 30);
+        assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
     }
 
     #[test]

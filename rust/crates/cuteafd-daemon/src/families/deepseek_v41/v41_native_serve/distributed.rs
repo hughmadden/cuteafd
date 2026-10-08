@@ -11,7 +11,7 @@ use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, Targ
 use std::rc::Rc;
 
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     if let Some(directory)=args.placement_directory.as_deref() {
         if let Some(layers)=super::placement::StartupPlacement::resumed_layers(directory)? {
@@ -299,9 +299,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     memory_checkpoint("draft runtime")?;
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
-    let mut vision = cuteafd_api::openai::vision_input_enabled().then(||
-        crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)).transpose()?;
+    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
     memory_checkpoint("vision")?;
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
@@ -418,7 +416,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
-    ready.take().context("startup readiness missing")?.send(Ok(()))
+    vision.connect()?;
+    ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
         &mut transport, &mut second_transport, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)

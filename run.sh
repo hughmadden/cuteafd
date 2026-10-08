@@ -562,12 +562,41 @@ if [[ -n "$wip_layout" ]]; then
   )
 fi
 
+# Resolve the cold tower against the full Spark expert reservation. Never trade
+# expert capacity for vision; auto falls back to RTX when no Spark has room.
+encoder_rank=-1
+encoder_hash=
+encoder_port=$((EXPERT_PORT + 100))
+vision_args=()
+if [[ "$VISION" != off ]]; then
+  encoder_plan="$(docker run --rm --network host "${wip_mount_args[@]}" \
+    -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" \
+    "$COORDINATOR_DOCKER_INFERENCE" cuteafd --vision "$VISION" --audio off plan \
+    "/root/.cache/huggingface/$snapshot_rel" --json --layout --rtx "$RELEASE_RTX_GPUS" \
+    --spark-ranks "$SPARK_COUNT" --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")" \
+    --local-expert-layers 0 --prefill-rows "$expert_capacity" --concurrency "$CONCURRENCY")"
+  encoder_kind="$(jq -r '.encoder.kind.kind // "off"' <<<"$encoder_plan")"
+  encoder_hash="$(jq -r '.encoder_plan_hash' <<<"$encoder_plan")"
+  case "$encoder_kind" in
+    spark)
+      encoder_rank="$(jq -er '.encoder.kind.rank' <<<"$encoder_plan")"
+      encoder_host="${hosts[$encoder_rank]}"
+      encoder_peer="${lanes[$encoder_rank]}:$encoder_port"
+      vision_args=(--vision-peers "$encoder_peer" --encoder-plan-hash "$encoder_hash" --encoder-revision "$RELEASE_MODEL_REVISION") ;;
+    rtx)
+      [[ "$(jq -er '.encoder.kind.gpu' <<<"$encoder_plan")" == 0 ]] ||
+        release_die "V4.1 local vision currently requires RTX0; use VISION=rtx:0 or auto" ;;
+    *) release_die "vision placement unavailable; use VISION=off or provide tower headroom" ;;
+  esac
+  echo "  vision placement: $encoder_kind rank=$encoder_rank hash=$encoder_hash"
+fi
+
 # The in-server benchmark keeps its history (SQLite) on the host.
 bench_dir="$HOME/.cache/cuteafd/bench"
 mkdir -p "$bench_dir"
 start_coordinator() {
 echo "== starting native RTX coordinator =="
-local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
+local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 args+=(--table-backend "$TABLE_BACKEND")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
@@ -639,6 +668,9 @@ for i in "${!hosts[@]}"; do
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
   remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  if ((encoder_rank >= 0)); then
+    remote_args+=("$encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
+  fi
   release_ssh "$host" "bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
@@ -653,6 +685,10 @@ rdma_env="${14:-}"; ib_port="${15:-}"; execution_lanes="${16:-}"
 rust_log="${17:-info}"
 wip_slot="${18:-__none__}"
 wip_layout_slot="$wip_slot"
+encoder_args=()
+if [[ "$rank" == "${19:--1}" ]]; then
+  encoder_args=(--encoder --encoder-listen "0.0.0.0:${20}" --encoder-plan-hash "${21}" --encoder-revision "${22}" --encoder-max-tokens 1024)
+fi
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
@@ -671,7 +707,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
-docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" >/dev/null
+docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done

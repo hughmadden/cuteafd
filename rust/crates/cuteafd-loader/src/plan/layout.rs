@@ -33,6 +33,8 @@ pub struct LayoutOptions {
     pub force_gpu_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
     pub spark_bytes: u64,
+    /// Runtime allocation ceiling, distinct from unified physical memory.
+    pub spark_allocation_budget_bytes: Option<u64>,
     /// Two coordinator GPUs split attention heads (generic families) rather
     /// than V4.1's layer ranges.
     pub head_split: bool,
@@ -92,6 +94,7 @@ impl Default for LayoutOptions {
             force_gpu_embedding: false,
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
+            spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,
             full_prefill_logits: false,
@@ -481,7 +484,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         .filter(|c| (c.owner == Owner::Rtx
             || (c.owner == Owner::SparkSliced && report.placement == ExpertPlacement::Local))
             && c.status != Status::Unused && c.status != Status::Disabled
-            && !(family != "deepseek_v41" && matches!(c.component, Component::Vision | Component::Audio)) && !covered(c.component)) {
+            && !matches!(c.component, Component::Vision | Component::Audio) && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -845,11 +848,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));
                 }
             }
-            if family != "deepseek_v41" {
+            {
                 let target = options.pool_tokens.filter(|&tokens| tokens != 0)
                     .unwrap_or_else(|| if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens });
                 let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
-                resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
+                resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
@@ -902,8 +905,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
-    if family != "deepseek_v41" && report.encoder.is_none() {
-        resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options.vision_replicas, &mut notes);
+    if report.encoder.is_none() {
+        resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options, &mut notes);
     }
     devices.extend(spark_devices);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -1097,13 +1100,24 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
     }).collect())
 }
 
-fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], replicas: usize, notes: &mut Vec<String>) {
+// The host footprint belongs to physical capacity, not expertd's allocation
+// budget. Neither the tower nor its admission guard may displace experts.
+fn spark_encoder_headroom(device: &DeviceLayout, budget: Option<u64>) -> u64 {
+    let physical = device.free_bytes().max(0) as u64;
+    let allocated: u64 = device.items.iter().filter(|i| i.category != Category::Reserved)
+        .map(|i| i.bytes).sum();
+    budget.map_or(physical, |bytes| physical.min(bytes.saturating_sub(allocated)))
+}
+
+fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], options: &LayoutOptions, notes: &mut Vec<String>) {
     use super::encoder::*;
     let source = report.components.iter().find(|c| c.component == Component::Vision);
     let source_bytes = source.map_or(0, |c| c.bytes);
     // MiMo resident vectors are FP32. The measured 4096-token native ledger
     // includes the fixed 4096-row GEMM staging and 4 MiB BLAS workspace.
-    let (weights, scratch) = if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
+    let (weights, scratch) = if report.family.as_deref() == Some("deepseek_v41") && source_bytes > 0 {
+        (source_bytes, v41::vision_scratch_bytes())
+    } else if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
         let width = model.spec().hidden as u64;
         (1_458_170_944 + width.saturating_sub(4096) * 5120 * 2, mimo_scratch_bytes(width))
     } else if report.family.as_deref() == Some("glm5_flash") && source_bytes > 0 {
@@ -1126,14 +1140,20 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
     } else if report.family.as_deref() == Some("qwen4") && source_bytes > 0 {
         (898_680_904, qwen_scratch_bytes(crate::media::QWEN_MAX_IMAGE_TOKENS as u64))
     } else { (source_bytes, 512 * MIB) };
-    let hardware = EncoderHardware { v41: false,
+    let hardware = EncoderHardware { v41: report.family.as_deref() == Some("deepseek_v41"),
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
-            expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: d.free_bytes().max(0) as u64 }).collect() };
-    let placement = encoder_placement(report.vision, &hardware, weights, scratch, replicas);
+            expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
+    let placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
-        d.items.push(Item::new(Category::Workspace, "vision scratch", "resident", placement.scratch, Basis::Formula));
+        let spark_overhead = if hardware.v41 && d.kind == DeviceKind::Spark {
+            super::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES
+        } else { 0 };
+        d.items.push(Item::new(Category::Workspace, "vision scratch", "resident", placement.scratch.saturating_sub(spark_overhead), Basis::Formula));
+        if spark_overhead > 0 {
+            d.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "SM121 measured delta + margin", spark_overhead, Basis::Formula));
+        }
     };
     match placement.kind {
         EncoderKind::Rtx { gpu } => add(&mut rtx[gpu]),
@@ -1182,7 +1202,7 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
             kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
             idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
-            free_bytes: d.free_bytes().max(0) as u64 }).collect() };
+            free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
     let placement = encoder_placement(report.audio, &hardware, weights, scratch, 1);
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "audio tower", "FP32 native", placement.weights, Basis::Formula));

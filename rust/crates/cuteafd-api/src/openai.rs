@@ -695,6 +695,9 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     // Rendered sources own the image payloads needed by preprocessing. Do not
     // retain another copy of their data URLs throughout the generated response.
     drop(converted.conversation);
+    if !image_sources.is_empty() && state.profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "vision encoder unavailable");
+    }
     if image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
         return error(StatusCode::BAD_REQUEST, "at most 16 images are supported");
     }
@@ -1268,6 +1271,25 @@ mod tests {
             .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v41_vision_failure_without_generic_preparer_rejects_images() {
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut profile = ModelProfile::default();
+        assert!(profile.media_preparer.is_none());
+        profile.vision_health = Some(healthy);
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        for stream in [false, true] {
+            let body = json!({"model": MODEL, "messages":[{"role":"user","content":[{"type":"image_url",
+                "image_url":{"url":"data:image/png;base64,not-decoded"}}]}],"stream":stream});
+            let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
