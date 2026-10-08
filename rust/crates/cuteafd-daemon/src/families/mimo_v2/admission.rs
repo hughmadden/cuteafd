@@ -373,6 +373,7 @@ pub(super) fn preflight(
             checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?,
             native_mtp_layers: args.mtp,
             gpu_embedding: args.token_io.embed_placement
+                .context("MiMo embedding placement must resolve before admission")?
                 == crate::shared::token_io::EmbedPlacement::Gpu,
             head_format: opened.weight_formats.head,
             output_formats: opened.weight_formats.output.clone(),
@@ -389,6 +390,8 @@ pub(super) fn preflight(
     )?;
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
+        target_pool_tokens: (if memory.iter().any(|m| m.total_bytes <= 32u64 << 30) { 1u64 << 20 }
+            else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS }).max(args.max_context as u64),
         max_context_tokens: Some(args.max_context as u64),
         // 0: the largest pool every GPU admits after all fixed costs, up to the target.
         pool_tokens: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
@@ -403,6 +406,13 @@ pub(super) fn preflight(
     let capacity = resolve_capacity(policy, &profiles.steady, &memory).with_context(|| {
         format!("MiMo steady admission; complete per-GPU reservation contract {report}")
     })?;
+    let pool_tokens = capacity.allocated_gpu_kv_tokens;
+    let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
+    tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
+        slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
+    if shortfall_tokens > 0 {
+        tracing::warn!(shortfall_tokens, "MiMo full context does not fit; lower context/concurrency or use host embedding/add coordinator memory");
+    }
     if !draft_packing.is_empty() {
         let units = capacity.allocated_gpu_kv_tokens / profiles.steady.pool_unit_rows;
         for (rank, phase) in profiles.post_target_kv.iter().enumerate() {

@@ -1107,7 +1107,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     config["tie_word_embeddings"] = json!(false);
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
     let mut options = PlanOptions {
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], ..Default::default() }),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true, ..Default::default() }),
         ..sparks(6)
     };
     let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -1133,6 +1133,25 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     assert!(!tied.fits);
     assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
     assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Embedding], bytes);
+}
+
+#[test]
+fn mimo_small_card_auto_embedding_and_full_context() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mimo_pro_config();
+    config["max_position_embeddings"] = json!(1_048_576);
+    config["tie_word_embeddings"] = json!(false);
+    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], ..Default::default()
+    }), ..sparks(4) };
+    let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
+    assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
+    assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+    options.layout.as_mut().unwrap().force_gpu_embedding = true;
+    assert!(plan(dir.path(), &options).unwrap().memory_layout.unwrap().devices[0].by_category().contains_key(&Category::Embedding));
 }
 
 #[test]

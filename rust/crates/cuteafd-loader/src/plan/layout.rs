@@ -29,6 +29,8 @@ pub struct LayoutOptions {
     pub vision_replicas: usize,
     /// One mapped pinned token embedding instead of a device allocation.
     pub host_embedding: bool,
+    /// Explicit device placement disables the memory-constrained auto profile.
+    pub force_gpu_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
     pub spark_bytes: u64,
     /// Two coordinator GPUs split attention heads (generic families) rather
@@ -87,6 +89,7 @@ impl Default for LayoutOptions {
             rtx_bytes: vec![95 * GIB + 512 * MIB],
             vision_replicas: 1,
             host_embedding: false,
+            force_gpu_embedding: false,
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
             head_split: true,
@@ -373,14 +376,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)
     }).and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let small_card = matches!(family, "deepseek_v41" | "mimo_v2")
+        && options.rtx_bytes.first().is_some_and(|&bytes| bytes <= 32 * GIB);
     let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
-        else if family == "deepseek_v41" { 2048 }
+        else if family == "deepseek_v41" { if small_card { 1024 } else { 2048 } }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-    let concurrency = if options.concurrency > 0 { options.concurrency } else if family == "deepseek_v41" { 16 } else { 8 };
+    let concurrency = if options.concurrency > 0 { options.concurrency } else if matches!(family, "deepseek_v41" | "mimo_v2") { 16 } else { 8 };
     let context_tokens = if options.context_tokens > 0 { options.context_tokens }
         else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
+        else if matches!(family, "deepseek_v41" | "mimo_v2") { crate::serving_capacity::checkpoint_context_limit(&checkpoint.config).ok().flatten().unwrap_or(0) }
         else { 0 };
+    let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
@@ -506,7 +513,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             }
         }
     }
-    if options.host_embedding {
+    if options.host_embedding || (family == "mimo_v2" && small_card && !options.force_gpu_embedding) {
         let embedding = report.components.iter().find(|c| c.component == Component::Embedding);
         let names: Vec<_> = checkpoint.tensors.iter().filter(|t|
             t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).collect();
@@ -827,13 +834,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             }
             if family != "deepseek_v41" {
                 let target = options.pool_tokens.filter(|&tokens| tokens != 0)
-                    .unwrap_or_else(|| if options.rtx_bytes[0] <= 32 * GIB { 1_000_000 } else { options.target_pool_tokens });
+                    .unwrap_or_else(|| if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens });
                 let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
                 resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
-                .unwrap_or_else(|| size_pool(&free, &per_token, unit, if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS } else { options.target_pool_tokens }));
+                .unwrap_or_else(|| size_pool(&free, &per_token, unit,
+                    if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS }
+                    else if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
+            if pool_tokens < context_tokens {
+                notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
+            }
             for (device, &cost) in devices.iter_mut().zip(&per_token) {
                 if cost > 0 {
                     let units = pool_tokens.div_ceil(unit);
