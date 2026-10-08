@@ -42,6 +42,7 @@ def test_dry_run_reports_concurrent_legs_or_sequential_opt_out(tmp_path, sequent
 def run_legs(tmp_path: Path, bodies: str, sequential: int = 0, tail: str = ""):
     script = f"""set -euo pipefail
 source {shlex.quote(str(ROOT / 'scripts/lib/release-common.sh'))}
+repo_root={shlex.quote(str(ROOT))}
 release_leg_log_dir={shlex.quote(str(tmp_path))}
 release_sequential={sequential}
 release_leg_plan=fixture
@@ -161,6 +162,25 @@ build_spark_release() (
     for leg in ("coord", "spark"):
         assert not process_running(int((tmp_path / f"{leg}.pid").read_text()))
     assert not (tmp_path / "tail").exists()
+
+
+@pytest.mark.parametrize('failing', ['coord', 'spark'])
+def test_killed_wrapper_without_fifo_completion_cancels_peer(tmp_path, failing):
+    bodies = f'''
+build_coordinator_release() {{
+  {'kill -KILL "$BASHPID"' if failing == 'coord' else 'sleep 30'}
+}}
+build_spark_release() {{
+  {'kill -KILL "$BASHPID"' if failing == 'spark' else 'sleep 30'}
+}}
+'''
+    result = run_legs(tmp_path, bodies)
+    assert result.returncode != 0
+    assert f'[{failing}] release build leg failed (exit 137)' in result.stderr
+    assert 'killed without exit status' in result.stderr
+    assert (tmp_path / 'cleanup').exists()
+    assert not (tmp_path / 'tail').exists()
+    assert not (tmp_path / 'completions').exists()
 
 
 def test_split_state_and_tail_wiring():

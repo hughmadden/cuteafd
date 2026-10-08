@@ -1082,96 +1082,12 @@ CANCEL
 # release-build-cancellation:end
 
 # release-build-supervision:start
-release_run_leg() (
-  leg="$1"
-  command="$2"
-  # A FIFO retains even immediate completions; wait -n can miss an already-exited
-  # job. The wrapper trap is separate from each leg's private cleanup traps.
-  trap 'status=$?; printf "%s %s\n" "$leg" "$status" >&8' EXIT
-  "$command"
-)
-
-release_build_legs_cleanup() {
-  local pid
-  trap - EXIT INT TERM
-  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
-    kill -TERM -- "-$pid" 2>/dev/null || true
-  done
-  release_cancel_coordinator_build
-  if ((release_spark_started)); then
-    release_cancel_remote_build || echo "[spark] WARNING: remote cleanup failed on $seed_host; inspect $export_container-expert" >&2
-  fi
-  # Give leg EXIT traps a bounded chance to remove containers and source copies,
-  # then kill whole groups, not just shell leaders (docker/ssh/sleep children).
-  sleep 2
-  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
-    kill -KILL -- "-$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-  done
-  exec 8>&-
-  rm -f "$release_leg_log_dir/completions"
-}
-
+source "$repo_root/scripts/lib/build-supervision.sh"
 release_build_legs() {
-  local completed status pid active_pid remaining=0
-  local -a release_leg_pids=() active_pids=()
-  local release_spark_started=0 coordinator_pid="" spark_pid=""
   echo "== $release_leg_plan =="
-  echo "[coord] log: $release_leg_log_dir/coordinator.log"
-  echo "[spark] log: $release_leg_log_dir/spark.log"
-  mkfifo "$release_leg_log_dir/completions"
-  exec 8<>"$release_leg_log_dir/completions"
-  trap release_build_legs_cleanup EXIT
-  trap 'echo "release build interrupted (INT); stopping both legs" >&2; exit 130' INT
-  trap 'echo "release build interrupted (TERM); stopping both legs" >&2; exit 143' TERM
-  # Job control gives each worker its own process group without exporting shell
-  # functions/settings to a new bash. The foreground supervisor handles failures
-  # from either leg while the coordinator compiles, instead of waiting blindly.
-  set -m
-  if [[ "$release_sequential" == 0 ]]; then
-    release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
-    spark_pid=$!
-    release_leg_pids+=("$spark_pid")
-    release_spark_started=1
-    remaining=1
-  fi
-  release_run_leg coord build_coordinator_release >"$release_leg_log_dir/coordinator.log" 2>&1 &
-  coordinator_pid=$!
-  release_leg_pids+=("$coordinator_pid")
-  remaining=$((remaining + 1))
-  set +m
-  while ((remaining)); do
-    read -r completed status <&8
-    case "$completed" in
-      coord) pid="$coordinator_pid" ;;
-      spark) pid="$spark_pid" ;;
-      *) release_die "invalid build leg completion: $completed" ;;
-    esac
-    wait "$pid" || true
-    [[ "$status" == 0 ]] ||
-      release_die "[$completed] release build leg failed (exit $status); stopping the other leg; see $release_leg_log_dir"
-    # Never retain a completed group ID throughout the other leg's long build:
-    # after the group disappears, its numeric ID could be reused by another job.
-    active_pids=()
-    for active_pid in "${release_leg_pids[@]}"; do
-      [[ "$active_pid" == "$pid" ]] || active_pids+=("$active_pid")
-    done
-    release_leg_pids=("${active_pids[@]}")
-    echo "[$completed] release build leg complete"
-    remaining=$((remaining - 1))
-    if [[ "$release_sequential" == 1 && "$completed" == coord ]]; then
-      set -m
-      release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
-      spark_pid=$!
-      release_leg_pids+=("$spark_pid")
-      release_spark_started=1
-      remaining=$((remaining + 1))
-      set +m
-    fi
-  done
-  trap - EXIT INT TERM
-  exec 8>&-
-  rm -f "$release_leg_log_dir/completions"
+  build_supervise 'release build' "$release_leg_log_dir" "$release_sequential" \
+    coord build_coordinator_release release_cancel_coordinator_build coordinator.log \
+    spark build_spark_release release_cancel_remote_build spark.log
 }
 # release-build-supervision:end
 
