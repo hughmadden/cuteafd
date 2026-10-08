@@ -22,17 +22,20 @@
 //!
 //! A call is held until its closing `</tool_call>` (the SSE keepalive covers
 //! the wait), so a client never sees part of a call that turns out malformed.
-//! The hold-and-return-as-content contract is ported from glm53f-api's
-//! `dialect/glm.rs` (Hugh Madden), which FR-G.14 adopts for every dialect:
+//! FR-G.14's hold-until-close contract is adopted from glm53f-api's
+//! `dialect/glm.rs` (Hugh Madden, MIT); the code here reads the tag format
+//! above (vLLM's `qwen3_coder` dialect):
 //!
 //! - a call that cannot be read (closing tag missing, `<function=...>` absent,
-//!   markup in the name, or arguments without a name) is returned as content
-//!   from its opening tag;
+//!   markup in the name, arguments without a name, or an empty/markup
+//!   parameter key) is returned as content from its opening tag;
 //! - `finish_reason: tool_calls` counts only calls that parsed, so an
 //!   unreadable call never fails the request and never claims a tool call;
-//! - an argument that cannot be read, or stray text between arguments, is
-//!   dropped from its call (its bytes still return as content if the call is
-//!   later lost);
+//! - an unreadable parameter key loses the whole call: the argument cannot be
+//!   named, and the call that would be released (with that argument silently
+//!   missing, or with a `""` key) is not the one the model meant. Stray text
+//!   between arguments is still dropped from its call (its bytes still return
+//!   as content if the call is later lost);
 //! - each lost call is logged.
 //!
 //! Results are independent of how the text is chunked.
@@ -316,13 +319,15 @@ impl QwenOutputParser {
         true
     }
 
-    /// Read the parameter key up to `>`; an unreadable key drops the argument.
+    /// Read the parameter key up to `>`; an unreadable key loses the whole
+    /// call — the argument it introduces cannot be named, and the call that
+    /// would be released is not the one the model meant.
     fn step_key(&mut self) -> bool {
         let Some(end) = self.pending.find('>') else { return false; };
         let key = self.pending[..end].trim().to_owned();
         self.take(end + 1);
         if key.is_empty() || key.contains(['<', '\n']) {
-            self.skip("unreadable argument key");
+            self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
         self.call.as_mut().expect("a call is open").key = Some(key);
@@ -373,7 +378,7 @@ impl QwenOutputParser {
         true
     }
 
-    /// Drop stray text or an unreadable argument up to the call's next tag.
+    /// Drop stray text between arguments up to the call's next tag.
     fn skip(&mut self, reason: &'static str) {
         let call = self.call.as_mut().expect("a call is open");
         call.key = None;

@@ -15,11 +15,16 @@
 //!   opening tag;
 //! - a name followed by stray closing tags (`bash</arg_key>`) is recovered
 //!   when what is left is a declared tool;
-//! - an argument that cannot be read (markup in its key, no value) and
-//!   stray text between arguments are dropped from their call, and a
+//! - an argument that cannot be read (markup in its key, or no `<arg_value>`)
+//!   loses its whole call: the argument cannot be named or has no value, and
+//!   the call that would be released with it silently missing is not the one
+//!   the model meant. Stray text between arguments is still dropped, and a
 //!   repeated key keeps its last value, in the place of its first.
 //!
 //! Each case is logged. Results are independent of how the text is chunked.
+//!
+//! FR-G.14's hold-until-close contract is adopted from glm53f-api's
+//! `dialect/glm.rs` (Hugh Madden, MIT); the code here follows glmrt's filter.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
@@ -290,7 +295,7 @@ impl GlmOutputParser {
         let key = self.pending[..end].trim().to_owned();
         self.take(end + ARG_KEY_END.len());
         if key.is_empty() || key.contains(['<', '>']) {
-            self.skip("unreadable argument key", excerpt(&key));
+            self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
         self.call.as_mut().expect("a call is open").key = Some(key);
@@ -312,8 +317,9 @@ impl GlmOutputParser {
             return true;
         }
         if ARG_VALUE.starts_with(self.pending.as_str()) { return false; }
-        let key = self.call.as_ref().and_then(|call| call.key.as_deref()).map(excerpt).unwrap_or_default();
-        self.skip("argument without a value", key);
+        // The key was readable but its value never opens: the argument cannot
+        // be delivered, and the call is not the one the model meant.
+        self.mode = Mode::Lost("argument without a value");
         true
     }
 
@@ -388,7 +394,7 @@ impl GlmOutputParser {
         self.mode = Mode::Content;
     }
 
-    /// Drop an unreadable argument, or stray text, up to the call's next tag.
+    /// Drop stray text between arguments up to the call's next tag.
     fn skip(&mut self, reason: &'static str, text: String) {
         let call = self.call.as_mut().expect("a call is open");
         call.key = None;

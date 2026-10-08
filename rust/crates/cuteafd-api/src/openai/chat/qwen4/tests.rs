@@ -274,19 +274,33 @@ fn unreadable_calls_return_as_content() {
 }
 
 
-/// An argument that cannot be read, or stray text between arguments, is
-/// dropped from its call; the call and its other arguments survive.
+/// Stray text between arguments is dropped from its call; the call and its
+/// other arguments survive.
 #[test]
-fn unreadable_arguments_are_dropped_from_their_call() {
+fn stray_text_is_dropped_from_its_call() {
+    let query = "<parameter=query>\ncats\n</parameter>";
+    let text = format!("<tool_call>\n<function=search>\n{query}\nstray\n</function>\n</tool_call>");
+    let projection = parse_everywhere(&options(false, Some(tools())), &text);
+    assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("search".into(), json!({"query": "cats"}))]));
+}
+
+/// A parameter key that cannot be read loses its whole call: the call comes
+/// back as content, nothing of it is a tool call, and it is not counted. The
+/// call would otherwise be released with the argument silently missing (or
+/// with a `""` key), which is not the call the model meant.
+#[test]
+fn an_unreadable_argument_key_returns_its_whole_call_as_content() {
     let query = "<parameter=query>\ncats\n</parameter>";
     for (shape, text) in [
-        ("markup in the key", format!("<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n{query}\n</function>\n</tool_call>")),
-        ("markup in the key up to >", format!("<tool_call>\n<function=search>\n<parameter=a<b>\n1\n</parameter>\n{query}\n</function>\n</tool_call>")),
-        ("stray text", format!("<tool_call>\n<function=search>\n{query}\nstray\n</function>\n</tool_call>")),
+        ("markup in the key",
+            format!("<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n{query}\n</function>\n</tool_call>")),
+        ("markup in the key up to >",
+            format!("<tool_call>\n<function=search>\n<parameter=a<b>\n1\n</parameter>\n{query}\n</function>\n</tool_call>")),
+        ("empty key",
+            format!("<tool_call>\n<function=search>\n<parameter=>\n1\n</parameter>\n{query}\n</function>\n</tool_call>")),
     ] {
         let projection = parse_everywhere(&options(false, Some(tools())), &text);
-        assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("search".into(), json!({"query": "cats"}))]),
-            "{shape}");
+        assert_eq!((projection.content.as_str(), projection.calls), (text.as_str(), vec![]), "{shape}");
     }
 }
 
@@ -384,6 +398,11 @@ mod router {
             (format!("Plan.\n{parsed}"), "Plan.".to_owned(), 1, "tool_calls"),
             ("Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned(),
                 "Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned(), 0, "stop"),
+            // An unreadable parameter key loses the whole call: content, stop,
+            // never a tool call.
+            ("Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned(),
+                "Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned(),
+                0, "stop"),
         ] {
             for streaming in [false, true] {
                 let body = json!({"model": MODEL, "stream": streaming, "enable_thinking": false, "tools": tools,

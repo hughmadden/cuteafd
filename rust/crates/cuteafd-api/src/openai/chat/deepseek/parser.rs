@@ -37,8 +37,11 @@
 //!   grammar's own delimiters ([`skip_is_structural`]), never per segment,
 //!   because the machine splits a run wherever a partial match fails.
 //!
-//! The hold-and-return-as-content contract is ported from glm53f-api's
-//! `dialect/glm.rs` (Hugh Madden), which FR-G.14 adopts for every dialect.
+//! The hold-and-return-as-content contract is adopted from glm53f-api's
+//! `dialect/glm.rs` (Hugh Madden, MIT), which FR-G.14 applies to every
+//! dialect. No donor source is reproduced: the code here is written against
+//! `deepseek_recipe`'s own state machine, and the crate's processor is the
+//! differential reference in the tests below.
 use std::collections::VecDeque;
 
 use deepseek_recipe::stream::OutputChunk;

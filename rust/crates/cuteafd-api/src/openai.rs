@@ -604,6 +604,11 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Some(thinking) = enable_thinking {
         converted.conversation.thinking_mode = thinking;
     }
+    // `convert` derives the stream parser's starting stage from the thinking
+    // mode before the overrides above can change it; a stale stage delivers the
+    // answer's leading text as reasoning_content.
+    converted.parsing_options.reasoning_initial_stage = converted.conversation.thinking_mode
+        .then_some(deepseek_recipe::stream::state_machine::ReasoningStage::Start);
     let model = state.profile.id.clone();
     if converted.model.as_deref() != Some(model.as_str()) {
         return error(StatusCode::BAD_REQUEST, format!("model must be {model}"));
