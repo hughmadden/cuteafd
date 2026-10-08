@@ -73,8 +73,12 @@ if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
                 -e CARGO_TARGET_DIR=/opt/cuteafd-target)
 fi
 source "$repo_root/scripts/build/compiler-cache.sh"
+source "$repo_root/scripts/build/build-caches.sh"
+export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"
+cuteafd_build_cache_defaults
 compiler_cache_args=()
-mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
+cache_plan="$(cuteafd_build_cache_docker_args "${CUTEAFD_DEV_TARGET_DIR:-$HOME/.cache/cuteafd/builds/dev-cache-fallback}" "$container_home" "$(python3 "$repo_root/scripts/build/dev-toolchain.py")")" || exit 2
+mapfile -t compiler_cache_args <<<"$cache_plan"
 docker_args+=("${compiler_cache_args[@]}")
 
 if [[ "$role" == "expert" || "$role" == "spark" ]]; then

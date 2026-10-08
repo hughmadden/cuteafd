@@ -4,6 +4,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
+source "$repo_root/scripts/build/build-caches.sh"
+cuteafd_build_cache_defaults
+wip_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
@@ -138,13 +141,16 @@ if ((dry_run)); then
   echo "  config: $RELEASE_CONFIG"
   echo "  slot: $slot (role $role)"
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
-  echo "  WIP root: ${WIP_ROOT:-<container-private>}"
+  echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host"
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
   echo "  Audio AOT: $audio_aot"
+  cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry >/dev/null
+  echo "  Spark cache plan (host HOME template; states/admission and uid rechecked on each Spark, no SSH):"
+  cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry aarch64 >/dev/null
   exit 0
 fi
 
@@ -154,7 +160,9 @@ release_resolve_coordinator_gpu_identity
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
 seed_host="$SPARK_0_HOST"
-state_dir="${WIP_ROOT:-$repo_root/.cuteafd-wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+state_dir="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+wip_mount_root="$state_dir"
+python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$state_dir"
 if [[ -n "${WIP_ROOT:-}" ]]; then
   python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$WIP_ROOT"
 fi
@@ -339,18 +347,44 @@ remove_wip_containers() {
   wait
 }
 
+# Refuse root-owned trees before removing containers: normal builds never repair
+# permissions, and legacy slots remain runnable via run.sh --wip unchanged.
+if [[ ! -w "$state_dir" ]] || find "$state_dir" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; then
+  release_die "WIP root $state_dir has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)"
+fi
 if ((recreate)); then
+  # Refuse before removing any container or payload, including remote uid-1001
+  # trees. Legacy root slots stay available until an operator chooses a new root.
+  for host in "${wip_hosts[@]}"; do
+    ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'CHECK_ROOT'
+set -euo pipefail
+root="$1"
+instance="$2"
+[[ "$instance" != __none__ ]] || instance=
+[[ "$root" != __default__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
+if [[ -e "$root" ]] && { [[ ! -w "$root" ]] || find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; }; then
+  echo "WIP root $root has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)" >&2
+  exit 2
+fi
+CHECK_ROOT
+  done
   echo "== discarding persistent WIP containers and build caches =="
   remove_wip_containers
-  if [[ -n "${WIP_ROOT:-}" ]]; then
-    # The frozen source survives; remove only this instance's build payloads.
-    for part in build output slots incoming run cache; do
-      rm -rf "$WIP_ROOT/$part"
-      for host in "${wip_hosts[@]}"; do
-        ssh -o BatchMode=yes "$host" "rm -rf '$WIP_ROOT/$part'"
-      done
+  # The frozen source and global stores survive. --recreate clears this
+  # instance's build payloads even when its host-backed root was implicit.
+  for part in build output slots incoming run cache; do
+    rm -rf "$state_dir/$part"
+    for host in "${wip_hosts[@]}"; do
+      ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$part" <<'CLEAR_ROOT'
+set -euo pipefail
+root="$1"
+instance="$2"
+[[ "$instance" != __none__ ]] || instance=
+[[ "$root" != __default__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
+rm -rf "$root/$3"
+CLEAR_ROOT
     done
-  fi
+  done
 fi
 
 preflight_existing_container_images() {
@@ -383,13 +417,18 @@ ensure_local_container() {
   local image_id container_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
   if docker container inspect "$coordinator_container" >/dev/null 2>&1; then
+    [[ "$(docker inspect -f '{{.Config.User}}' "$coordinator_container")" == "$(id -u):$(id -g)" ]] ||
+      release_die "$coordinator_container is a legacy root WIP container; run.sh --wip still works, but rebuilding requires --recreate with a fresh writable WIP_ROOT"
+    [[ "$(docker inspect -f '{{index .Config.Labels "io.cuteafd.build-caches"}}' "$coordinator_container")" == "${CUTEAFD_BUILD_CACHES:-on}:$wip_toolchain_hash" ]] ||
+      release_die "$coordinator_container cache plan changed; rerun ./wip.sh --recreate"
     container_id="$(docker inspect -f '{{.Image}}' "$coordinator_container")"
     [[ "$container_id" == "$image_id" ]] ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
-    if [[ -n "${WIP_ROOT:-}" ]]; then
-      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$WIP_ROOT")" ]] ||
+    if [[ -n "$wip_mount_root" ]]; then
+      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$wip_mount_root")" ]] ||
         release_die "$coordinator_container has a different /wip build mount; rerun ./wip.sh --recreate"
     fi
+    cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
       docker start "$coordinator_container" >/dev/null
     docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
@@ -397,6 +436,9 @@ ensure_local_container() {
   fi
   local -a args=(
     run -d --name "$coordinator_container" --restart no
+    --label "io.cuteafd.build-caches=${CUTEAFD_BUILD_CACHES:-on}:$wip_toolchain_hash"
+    --user "$(id -u):$(id -g)"
+    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)"
     --gpus device="$RELEASE_COORDINATOR_GPU_UUID"
     --net=host --ipc=host --security-opt seccomp=unconfined
     --ulimit memlock=-1:-1 --cap-add IPC_LOCK
@@ -407,9 +449,12 @@ ensure_local_container() {
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )
   local -a cache_args=()
-  mapfile -t cache_args < <(cuteafd_compiler_cache_docker_args)
+  local cache_plan
+  cache_plan="$(cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash")" || release_die "WIP cache plan failed"
+  mapfile -t cache_args <<<"$cache_plan"
   args+=("${cache_args[@]}")
-  [[ -z "${WIP_ROOT:-}" ]] || args+=(-v "$WIP_ROOT:/wip")
+  mkdir -p "$wip_mount_root/home"
+  args+=(-v "$wip_mount_root:/wip")
   [[ ! -e /dev/infiniband ]] || args+=(--device=/dev/infiniband)
   # sparknest keeps hub/ as a symlink into its mount; expose it at the same path.
   [[ ! -d /mnt/sparknest ]] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
@@ -419,11 +464,11 @@ ensure_local_container() {
 
 ensure_remote_container() {
   local host="$1" cache_staging= cache_helper_dir
-  if [[ -n "${CUTEAFD_KACHE_SPARK:-}" || "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
+  {
     if cache_staging="$(ssh -o BatchMode=yes "$host" 'printf "%s/.cache/cuteafd/kache-helper" "$HOME"')${WIP_INSTANCE:+-$WIP_INSTANCE}"; then
       printf -v cache_helper_dir '%q' "$cache_staging/scripts/build"
       if ! ssh -o BatchMode=yes "$host" "mkdir -p $cache_helper_dir" ||
-         ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$host:$cache_staging/scripts/build/"; then
+         ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$repo_root/scripts/build/build-caches.sh" "$repo_root/scripts/build/build-cache-plan.py" "$host:$cache_staging/scripts/build/"; then
         cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
         cache_staging=
       fi
@@ -431,41 +476,41 @@ ensure_remote_container() {
       cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
       cache_staging=
     fi
-  fi
+  }
   ssh -o BatchMode=yes "$host" bash -s -- \
     "$spark_container" "$SPARK_EXPERT_DOCKER_DEV" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__unset__}")" \
     "$(printf '%q' "${cache_staging:-__unset__}")" "${WIP_INSTANCE:-__none__}" "${WIP_ROOT:-__none__}" \
-    "$(base64 -w0 "$repo_root/scripts/build/assert-build-filesystem.py")" "${CUTEAFD_SCCACHE_CUDA:-0}" <<'REMOTE'
+    "$(base64 -w0 "$repo_root/scripts/build/assert-build-filesystem.py")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${CUTEAFD_BUILD_CACHES:-on}" "$wip_toolchain_hash" <<'REMOTE'
 set -euo pipefail
 container="$1"
 image="$2"
 instance="${7:-__none__}"
 [[ "$instance" != __none__ ]] || instance=
 root="${8:-__none__}"
-[[ "$root" != __none__ ]] || root=
+[[ "$root" != __none__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
 if [[ -n "$root" ]]; then
   [[ "$root" == "$HOME/.cache/cuteafd/builds/"* ]] || { echo "WIP_ROOT outside host build root" >&2; exit 2; }
   printf '%s' "$9" | base64 -d | python3 - "$root"
   mkdir -p "$root"
 fi
 cache_args=()
-if [[ "${3:-__unset__}" != __unset__ || "${10:-0}" == 1 ]]; then
-  export CUTEAFD_SCCACHE_CUDA="${10:-0}"
-  [[ "${3:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE="$3"
-  [[ "${4:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_REMOTE="$4"
-  [[ "${5:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_CACHE_DIR="$5"
-  if [[ -f "$6/scripts/build/compiler-cache.sh" ]]; then
-    source "$6/scripts/build/compiler-cache.sh"
-    mapfile -t cache_args < <(cuteafd_compiler_cache_docker_args)
-  else
-    printf 'warning: Spark kache helper not staged; using plain compilers\n' >&2
-  fi
-fi
+export CUTEAFD_BUILD_CACHES="${11:-on}" CUTEAFD_SCCACHE_CUDA="${10:-1}"
+[[ "${3:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE="$3"
+[[ "${5:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_CACHE_DIR="$5"
+[[ -f "$6/scripts/build/build-caches.sh" ]] || { echo "Spark cache helper not staged" >&2; exit 2; }
+source "$6/scripts/build/build-caches.sh"
+cuteafd_build_cache_defaults
+cache_plan="$(cuteafd_build_cache_docker_args "$root" /wip/home "${12:?}")" || exit 2
+mapfile -t cache_args <<<"$cache_plan"
 image_id="$(docker image inspect -f '{{.Id}}' "$image")"
 if docker container inspect "$container" >/dev/null 2>&1; then
+  [[ "$(docker inspect -f '{{.Config.User}}' "$container")" == "$(id -u):$(id -g)" ]] ||
+    { echo "$container is a legacy root WIP container; run.sh --wip still works, but rebuilding requires --recreate with a fresh writable WIP_ROOT" >&2; exit 2; }
+  [[ "$(docker inspect -f '{{index .Config.Labels "io.cuteafd.build-caches"}}' "$container")" == "${CUTEAFD_BUILD_CACHES:-on}:${12:?}" ]] ||
+    { echo "$container cache plan changed; rerun ./wip.sh --recreate" >&2; exit 2; }
   container_id="$(docker inspect -f '{{.Image}}' "$container")"
   if [ "$container_id" != "$image_id" ]; then
     echo "$container uses an old development image; rerun ./wip.sh --recreate" >&2
@@ -479,9 +524,17 @@ if docker container inspect "$container" >/dev/null 2>&1; then
   docker exec "$container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
   exit 0
 fi
+if [[ ! -w "$root" ]] || find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; then
+  echo "WIP root $root has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)" >&2
+  exit 2
+fi
+mkdir -p "$root/home"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 args=(
   run -d --name "$container" --restart no
+  --label "io.cuteafd.build-caches=${CUTEAFD_BUILD_CACHES:-on}:${12:?}"
+  --user "$(id -u):$(id -g)"
+  -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)"
   --gpus all --net=host --ipc=host --security-opt seccomp=unconfined
   --ulimit memlock=-1:-1 --cap-add IPC_LOCK
   -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
@@ -583,7 +636,7 @@ fi
 
 sync_local_source() {
   docker exec "$coordinator_container" rm -rf /wip/source.next
-  docker cp "$staging_dir/." "$coordinator_container:/wip/source.next"
+  docker cp -a "$staging_dir/." "$coordinator_container:/wip/source.next"
   docker exec "$coordinator_container" bash -lc 'rm -rf /wip/source && mv /wip/source.next /wip/source'
 }
 
@@ -605,7 +658,7 @@ sync_seed_source() {
     rsync -a --delete "$staging_dir/" "$seed_host:$remote_staging/"
   fi
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec '$spark_container' rm -rf /wip/source.next && docker cp '$remote_staging/.' '$spark_container:/wip/source.next' && docker exec '$spark_container' bash -lc 'rm -rf /wip/source && mv /wip/source.next /wip/source'"
+    "docker exec '$spark_container' rm -rf /wip/source.next && docker cp -a '$remote_staging/.' '$spark_container:/wip/source.next' && docker exec '$spark_container' bash -lc 'rm -rf /wip/source && mv /wip/source.next /wip/source'"
 }
 
 build_coordinator() {
@@ -613,7 +666,7 @@ build_coordinator() {
   sync_local_source
   local image_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
-  local -a cache_env=(-e CUTEAFD_KACHE= -e CUTEAFD_SCCACHE_CUDA=0)
+  local -a cache_env=(-e CUTEAFD_KACHE= -e CUTEAFD_SCCACHE_CUDA=0 -e "CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}")
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if docker exec "$coordinator_container" test -d /opt/cuteafd-sccache-cache; then
       cache_env+=(-e CUTEAFD_SCCACHE_CUDA=1)
@@ -673,7 +726,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
+source "$repo_root/scripts/build/build-caches.sh"
+cuteafd_build_cache_defaults
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
@@ -369,8 +371,13 @@ if ((dry_run)); then
   echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
   echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB"
   echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB free CUDA memory, same wait"
+  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
+  echo "  Spark cache plan (host HOME shown as template; states/admission rechecked on Spark, no SSH):"
+  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry aarch64 >/dev/null
   exit 0
 fi
+
+release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 
 prepare_pinned_source_dependencies() {
   local git_root=""
@@ -740,7 +747,8 @@ release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
 export_watchdog_pid=$!
 coordinator_export_status=0
 compiler_cache_args=()
-mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
+cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
+mapfile -t compiler_cache_args <<<"$cache_plan"
 timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container" \
   --gpus "device=$export_gpu_uuid" \
   --ipc=host \
@@ -846,7 +854,7 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -893,14 +901,12 @@ if [[ -n "$source_manifest_sha256" ]]; then
 fi
 cd "$remote_dir"
 compiler_cache_args=()
-if [[ "${16:-__legacy__}" != __legacy__ || "${19:-0}" == 1 ]]; then
-  export CUTEAFD_SCCACHE_CUDA="${19:-0}"
-  [[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
-  [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_REMOTE="${17}"
-  [[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
-  source scripts/build/compiler-cache.sh
-  mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
-fi
+export CUTEAFD_BUILD_CACHES="${22:-on}"
+[[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
+[[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
+export CUTEAFD_SCCACHE_CUDA="${19:-1}"
+source scripts/build/build-caches.sh
+cuteafd_build_cache_defaults
 phase="${13:?}"
 # The audio tower switch reaches the remote leg as its own argument (ON/OFF).
 audio_aot="${21:-ON}"
@@ -997,6 +1003,8 @@ mkdir -p .cuteafd-release-image
 # passed explicitly; the artifact compiler creates them before Cargo runs.
 container_home=/tmp/cuteafd-home
 [[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
+cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$container_home" "$(python3 scripts/build/dev-toolchain.py)")" || exit 2
+mapfile -t compiler_cache_args <<<"$cache_plan"
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
