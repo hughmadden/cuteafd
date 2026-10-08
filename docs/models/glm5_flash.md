@@ -96,7 +96,8 @@ Attention (KDA), a minority run MLA + DSA.
   dense NVFP4 package, local FP8 or EXL3 experts, the Spark transports and
   their intake planes) holds the widest step, `max(--prefill-rows,
   --decode-rows)`, so prefill lanes narrower than 128 rows still take a
-  127-row verify step through the experts.
+  127-row verify step through the experts. The launcher passes the decode
+  rows to the encoder placement plan as well as to serving.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 

@@ -1438,6 +1438,28 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
         assert f"--vision {mode or 'auto'}" in preflight
 
 
+@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, keys, forwarded):
+    """The encoder placement plan charges what serving admits: GLM5_FLASH_DECODE_ROWS=128 reaches
+    `cuteafd plan --layout` as --decode-rows 128 beside the coordinator's, with a fixed near-fit pool
+    and the vision tower on the RTX; 64, the default, passes it to neither."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nPOOL_TOKENS=262144\n" + keys,
+                                   encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert "--vision rtx" in planner and "--pool-tokens 262144" in planner, planner
+    for command in [planner, launch]:
+        assert ("--decode-rows 128" in command) == forwarded and command.count("--decode-rows") == int(forwarded), command
+
+
 @pytest.mark.parametrize("family_config,serve", [
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
