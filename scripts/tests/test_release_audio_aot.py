@@ -31,6 +31,6 @@ def test_spark_remote_leg_receives_the_audio_switch():
     block = BUILD.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
     invocation, remote = block.split("<<'REMOTE'", 1)
     remote = remote.split("\nREMOTE\n", 1)[0]
-    assert invocation.rstrip().endswith('"$audio_aot"'), "the Spark leg must pass the audio switch"
+    assert invocation.rstrip().endswith('"$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}"'), "the Spark leg must pass the audio switch"
     assert 'audio_aot="${21:-ON}"' in remote
     assert remote.index('audio_aot="${21:-ON}"') < remote.index('CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot')

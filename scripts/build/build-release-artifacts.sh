@@ -182,11 +182,22 @@ if [[ "$xgrammar" == ON ]]; then
     --lock "$build_root/source/third_party/xgrammar.lock.json"
 fi
 
+if [[ "${CUTEAFD_BUILD_CACHES:-on}" == off ]]; then
+  cold_cache="$(mktemp -d "$build_root/cold-cache.XXXXXXXX")"
+  export CARGO_HOME="$cold_cache/cargo"
+  export CUTEAFD_KACHE= CUTEAFD_SCCACHE_CUDA=0
+  export TORCH_EXTENSIONS_DIR="$cold_cache/torch-extensions" XDG_CACHE_HOME="$cold_cache/xdg"
+  export B12X_ROCE_CACHE_DIR="$cold_cache/roce" TRITON_CACHE_DIR="$cold_cache/triton"
+  export TORCHINDUCTOR_CACHE_DIR="$cold_cache/torchinductor"
+fi
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$build_root/cache/torchinductor}"
+mkdir -p "${CARGO_HOME:-$HOME/.cargo}" "$TORCHINDUCTOR_CACHE_DIR"
+source "$(dirname "${BASH_SOURCE[0]}")/build-caches.sh"
 export PYTHONDONTWRITEBYTECODE=1
-export TORCH_EXTENSIONS_DIR="$build_root/cache/torch-extensions"
-export XDG_CACHE_HOME="$build_root/cache/xdg"
-export B12X_ROCE_CACHE_DIR="$build_root/cache/roce"
-export TRITON_CACHE_DIR="$build_root/cache/triton"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$build_root/cache/torch-extensions}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$build_root/cache/xdg}"
+export B12X_ROCE_CACHE_DIR="${B12X_ROCE_CACHE_DIR:-$build_root/cache/roce}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$build_root/cache/triton}"
 mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
 export PYTHONPATH="$build_root/source/third_party/sparkinfer:$build_root/source/python/reference/cuteafd_reference:$build_root/source/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export PYO3_PYTHON=python3
@@ -195,7 +206,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_root"
 cuteafd_compiler_cache_check_cmake_compilers "$build_root/native"
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build \
+cargo_target_dir+="$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
+export CARGO_TARGET_DIR="$cargo_target_dir"
+cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
+cargo build \
+  --locked \
   --manifest-path "$build_root/source/rust/Cargo.toml" \
   -p cuteafd-daemon \
   --release

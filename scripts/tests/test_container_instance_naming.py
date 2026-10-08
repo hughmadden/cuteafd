@@ -243,9 +243,9 @@ def test_wip_launchers_use_recorded_container_and_layout():
         assert 'docker cp "cuteafd-spark-expert-wip:' not in text
         assert '$HOME/.cache/cuteafd/wip-run/$wip_slot' not in text
     text = (ROOT / "wip.sh").read_text()
-    assert 'state_dir="${WIP_ROOT:-$repo_root/.cuteafd-wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"' in text
+    assert 'state_dir="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"' in text
     assert 'release_record_wip_slot "$slot"' in text
-    assert 'args+=(-v "$WIP_ROOT:/wip")' in text
+    assert 'args+=(-v "$wip_mount_root:/wip")' in text
     assert '"wip_instance": ${wip_instance@Q}' in (ROOT / "scripts/build/finalize-wip-slot.sh").read_text()
 
 
@@ -300,7 +300,7 @@ def test_wip_root_config_env_and_legacy_default(tmp_path):
         assert result.stdout == (override or str(tmp_path / ".cache/cuteafd/builds/configured/wip"))
     text = (ROOT / "wip.sh").read_text()
     assert 'python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$WIP_ROOT"' in text
-    assert 'args+=(-v "$WIP_ROOT:/wip")' in text
+    assert 'args+=(-v "$wip_mount_root:/wip")' in text
     assert 'args+=(-v "$root:/wip")' in text
     assert 'remote_staging="$WIP_ROOT/source-staging"' in text
     assert 'WIP_ROOT (environment or config)' in text

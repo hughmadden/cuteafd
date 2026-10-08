@@ -93,7 +93,7 @@ def test_guard_still_probes_the_writable_output_and_target():
 
 def test_cargo_build_and_daemon_install_share_one_target_dir():
     text = script_text()
-    assert 'CARGO_TARGET_DIR="$cargo_target_dir" cargo build' in text, (
+    assert 'export CARGO_TARGET_DIR="$cargo_target_dir"' in text, (
         "cargo must build into the selected target directory"
     )
     assert 'install -m 0755 "$cargo_target_dir/release/cuteafd"' in text, (
