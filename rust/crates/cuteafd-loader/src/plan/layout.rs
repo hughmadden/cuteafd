@@ -60,6 +60,17 @@ pub struct LayoutOptions {
     pub state_slots: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
+    /// MiMo retained snapshots per bank and device mark budget, matching serving.
+    pub mimo_prefix_entries: u64,
+    pub mimo_prefix_mark_bytes: u64,
+    /// Retain warm external MiMo drafter context with prefix marks (candidate opt-in).
+    pub mimo_prefix_draft: bool,
+    /// MiMo target rings (serving default: 16, at least concurrency).
+    pub mimo_rings: u64,
+    /// MiMo drafter batch limit (serving raises it to concurrency).
+    pub draft_sequences: u64,
+    /// Explicit MiMo DFlash context arena; does not widen its draft batch.
+    pub draft_context_slots: Option<u64>,
     /// Compiled context extent (RoPE and index workspaces).
     pub context_tokens: u64,
     /// Resident native drafter stages (zero disables optional native MTP).
@@ -91,6 +102,12 @@ impl Default for LayoutOptions {
             concurrency: 0,
             state_slots: None,
             prefix_slots: None,
+            mimo_prefix_entries: 20,
+            mimo_prefix_mark_bytes: 2 * GIB,
+            mimo_prefix_draft: false,
+            mimo_rings: 16,
+            draft_sequences: 4,
+            draft_context_slots: None,
             context_tokens: 0,
             native_mtp_layers: 3,
             local_expert_layers: None,
@@ -308,6 +325,31 @@ fn share_of(family: &str, component: Component) -> Share {
         Component::Attention | Component::DenseFfn | Component::SharedExpert | Component::Indexer
         | Component::Compressor => Share::Sharded { replicated: 0.0 },
         _ => Share::Lead,
+    }
+}
+
+fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64) -> Result<(u64, u64), String> {
+    let field = |name| config[name].as_u64().filter(|&n| n > 0)
+        .ok_or_else(|| format!("missing or zero {name}"));
+    let width = field("num_key_value_heads")?.checked_mul(field("head_dim")?)
+        .ok_or("DFlash KV width overflow")?;
+    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, width)
+        .map_err(|e| e.to_string())?;
+    Ok((mark.checked_mul(marks).ok_or("DFlash marks overflow")?,
+        rings.checked_mul(8).ok_or("DFlash floors overflow")?))
+}
+
+#[cfg(test)]
+mod draft_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn draft_prefix_reserves_marks_and_all_ring_floors() {
+        let config = serde_json::json!({"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128});
+        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18).unwrap(), ((20 * MIB + 8) * 42, 144));
+        assert!(mimo_draft_prefix_bytes(&config, u64::MAX, 18).is_err());
+        assert!(mimo_draft_prefix_bytes(&config, 42, u64::MAX).is_err());
+        assert!(mimo_draft_prefix_bytes(&serde_json::json!({}), 42, 18).is_err());
     }
 }
 
@@ -720,9 +762,21 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     _ => 0,
                 };
             }
+            let warm_draft = if family == "mimo_v2" && drafter > 0 && options.mimo_prefix_draft {
+                let draft_config = checkpoint.snapshot.join("dflash/config.json");
+                if draft_config.is_file() {
+                    Some(std::fs::read(&draft_config).map_err(|e| e.to_string())
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string()))
+                        .and_then(|draft| mimo_draft_prefix_bytes(&draft, 1, options.mimo_rings.max(concurrency))))
+                } else { None }
+            } else { None };
             let marks = options.prefix_slots.unwrap_or_else(|| {
-                if matches!(family, "deepseek_v4" | "qwen4") {
-                    let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+                let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+                if family == "mimo_v2" {
+                    let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
+                    cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
+                        bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
+                } else if matches!(family, "deepseek_v4" | "qwen4") {
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
                 } else { costs.mark_slots }
             });
@@ -739,6 +793,25 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
+                }
+            }
+            if let Some(reservation) = warm_draft {
+                let rings = options.mimo_rings.max(concurrency);
+                let context_slots = crate::families::mimo_v2::draft_representation::mimo_draft_context_slots(
+                    options.draft_sequences.max(concurrency), rings, options.draft_context_slots);
+                notes.push(format!("MiMo DFlash context slots {context_slots}; valid-floor transfer uses {rings} target rings"));
+                match reservation.and_then(|(bytes, floors)| bytes.checked_mul(marks)
+                    .map(|bytes| (bytes, floors)).ok_or_else(|| "DFlash prefix marks overflow".into())) {
+                    Ok((bytes, floors)) => {
+                        devices[0].items.push(Item::new(Category::Prefix, "DFlash context marks", "BF16", bytes, Basis::Formula));
+                        devices[0].items.push(Item::new(Category::Prefix, "DFlash valid-floor transfer", "i64", floors, Basis::Formula));
+                    }
+                    Err(reason) => {
+                        report.placement_supported = false;
+                        notes.push(format!("DFlash prefix reservation unsupported: {reason}"));
+                        report.hints.push(super::Hint { what: format!("invalid dflash/config.json: {reason}"),
+                            how: "Provide the loaded DFlash geometry before admitting its prefix marks.".into() });
+                    }
                 }
             }
             if family == "deepseek_v41" {

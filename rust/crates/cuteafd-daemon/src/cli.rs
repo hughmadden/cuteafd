@@ -250,6 +250,24 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
+    /// MiMo retained snapshots per bank for --layout (matches serving).
+    #[arg(long, default_value_t = 20)]
+    pub(crate) prefix_cache_entries: u64,
+    /// MiMo device positional-mark budget for --layout, MiB.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) prefix_cache_mark_mib: u64,
+    /// MiMo warm DFlash prefix context marks (off until qualified).
+    #[arg(long)]
+    pub(crate) mimo_prefix_draft: bool,
+    /// MiMo target ring count for --layout (at least concurrency).
+    #[arg(long = "rings", default_value_t = 16)]
+    pub(crate) mimo_rings: u64,
+    /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
+    #[arg(long, default_value_t = 4)]
+    pub(crate) draft_sequences: u64,
+    /// Explicit MiMo drafter context arena for --layout.
+    #[arg(long)]
+    pub(crate) draft_context_slots: Option<u64>,
     /// Native drafter stages, 0 disables the native drafter.
     #[arg(long, default_value_t = 3)]
     pub(crate) native_mtp_layers: usize,

@@ -675,6 +675,33 @@ def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(
         assert f"--draft-fp8 {expected}" in launch
 
 
+def test_mimo_drafter_context_override_reaches_serving(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo",
+                                  "SPECULATOR=dflash2\nDRAFT_CONTEXT_SLOTS=25\nDRAFT_SEQUENCES=8\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert "--draft-context-slots 25" in launch
+    assert "--draft-sequences 8" in launch
+
+
+def test_mimo_prefix_budget_matches_serving_and_encoder_plan(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "vision_config": {}}
+    config["vision_config"] = {"model_type": "test"}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "off"}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/mimo",
+                                  "SPECULATOR=off\nVISION=auto\nPREFIX_CACHE_ENTRIES=24\nPREFIX_CACHE_MARK_MIB=512\n",
+                                  encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    for command in [launch, planner]:
+        assert "--prefix-cache-entries 24" in command
+        assert "--prefix-cache-mark-mib 512" in command
+
+
 @pytest.mark.parametrize("policy, expected", [(None, None), ("auto", None), ("checkpoint", "checkpoint")])
 def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_forwarded(tmp_path, policy, expected):
     config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
@@ -896,6 +923,24 @@ def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> N
     assert "deprecated" in old and "deprecated" not in new
     bad = _family_launch_lines(tmp_path / "c", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=dspark\n")
     assert "does not apply to mimo_v2" in bad
+
+
+@pytest.mark.parametrize("host, expected", [("", "auto"), ("HOST_CACHE_BYTES=0\n", None),
+                                           ("HOST_CACHE_BYTES=16GiB\n", "16GiB")])
+def test_mimo_port_flags_preserve_explicit_host_budget(tmp_path: Path, host: str, expected: str | None) -> None:
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
+    keys = ("MIMO_HOST_CACHE=on\nMIMO_PREFIX_DRAFT=on\nMIMO_COPY_WINDOWS=on\n"
+            "MIMO_SNAPSHOT_WAIT=on\nMIMO_PREFILL_CHUNK_S=4\nHTTP_QUEUE_DEPTH=32\nHTTP_QUEUE_WAIT_MS=1234\n") + host
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    for flag in ("--mimo-host-cache", "--mimo-prefix-draft", "--mimo-copy-windows",
+                 "--mimo-snapshot-wait", "--prefill-chunk-s 4", "--http-queue-depth 32", "--http-queue-wait-ms 1234"):
+        assert flag in launch
+    if expected is None:
+        assert "--host-cache-bytes" not in launch
+    else:
+        assert "--host-cache-bytes " + expected in launch
 
 
 def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
@@ -1216,6 +1261,32 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     else:
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("concurrency", [None, 16])
+def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    keys = "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nMAX_CONTEXT_TOKENS=131072\n"
+    if concurrency is not None:
+        keys += f"CONCURRENCY={concurrency}\n"
+    keys += f"MIMO_PREFIX_DRAFT={'on' if warm else 'off'}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert ("--mimo-prefix-draft" in preflight) == warm
+    assert ("--mimo-prefix-draft" in launch) == warm
+    effective = concurrency if concurrency is not None else 8
+    assert f"--concurrency {effective}" in preflight
+    assert f"--max-sequences {effective}" in launch
+    assert "unbound variable" not in result.stderr
+    if warm:
+        assert "--context-tokens 131072" in preflight
 
 
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])

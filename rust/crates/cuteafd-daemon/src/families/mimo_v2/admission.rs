@@ -18,6 +18,84 @@ pub(super) struct Preflight {
     pub local_expert_budget: usize,
 }
 
+fn aggregate_mark_bytes(target: u64, draft: u64, enabled: bool) -> Result<u64> {
+    target.checked_add(if enabled { draft } else { 0 }).context("MiMo mark size overflow")
+}
+
+fn draft_prefix_reservations(enabled: bool, mark: u64, slots: u64, rings: u64) -> Result<Vec<MemoryReservation>> {
+    if !enabled { return Ok(Vec::new()); }
+    Ok(vec![MemoryReservation { name: "prefix.dflash_context_marks".into(),
+        bytes: mark.checked_mul(slots).context("DFlash prefix marks overflow")? },
+        MemoryReservation { name: "prefix.dflash_valid_floor_transfer".into(),
+            bytes: rings.checked_mul(8).context("DFlash ring metadata overflow")? }])
+}
+
+#[cfg(test)]
+mod draft_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn planner_marks_equal_admission_at_c4_c16_warm_on_and_off() {
+        use clap::Parser;
+        use cuteafd_loader::plan::{plan, layout::LayoutOptions, testing::*, PlanOptions};
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            prefix: crate::shared::prefix::PrefixArgs,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = mimo_pro_config();
+        write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+        std::fs::create_dir(dir.path().join("dflash")).unwrap();
+        std::fs::write(dir.path().join("dflash/config.json"),
+            r#"{"num_hidden_layers":5,"num_key_value_heads":8,"head_dim":128}"#).unwrap();
+        let cfg = MimoV2Config::from_hf(&config).unwrap();
+        let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
+            &cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap();
+        let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+        let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024).unwrap();
+        for concurrency in [4, 16] {
+            for enabled in [false, true] {
+                // Include a budget-tight case to catch the concurrency floor and
+                // a warm mark changing the number of affordable retained slots.
+                for mib in [0, 1024, 2048] {
+                    let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
+                    let slots = mark_slots(&cli.prefix, concurrency,
+                        aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
+                    let layout = plan(dir.path(), &PlanOptions {
+                        layout: Some(LayoutOptions {
+                            concurrency: concurrency as u64, mimo_prefix_draft: enabled,
+                            mimo_prefix_mark_bytes: mib << 20, ..Default::default()
+                        }), ..Default::default()
+                    }).unwrap().memory_layout.unwrap();
+                    let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
+                    assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}");
+                    let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
+                    assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
+                    assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_warm_marks_preserve_target_slot_and_host_mark_geometry() {
+        let target = 256u64 << 20;
+        let draft = 20u64 << 20;
+        let bytes = |enabled| aggregate_mark_bytes(target, draft + 8, enabled).unwrap();
+        let slots = |enabled| cuteafd_engine::prefix::MarkArena::slots_for(16, 24, bytes(enabled) as usize, 12usize << 30);
+        assert_eq!(slots(false), cuteafd_engine::prefix::MarkArena::slots_for(16, 24, target as usize, 12usize << 30));
+        assert!(slots(true) <= slots(false));
+        assert_eq!(bytes(false), target);
+        assert!(draft_prefix_reservations(false, draft + 8, 42, 18).unwrap().is_empty());
+        let enabled = draft_prefix_reservations(true, draft + 8, 42, 18).unwrap();
+        assert_eq!(enabled[0].bytes, (draft + 8) * 42);
+        assert_eq!(enabled[1].bytes, 18 * 8);
+        assert_eq!(bytes(true), target + draft + 8);
+        assert!(draft_prefix_reservations(true, draft + 8, u64::MAX, 18).is_err());
+    }
+}
+
 /// Resolve physical reservations before modules, weights, KV or workspaces.
 /// The same profile can be serialized by a planner; explicit benchmark pool
 /// and context arguments are always preserved.
@@ -28,6 +106,7 @@ pub(super) fn preflight(
     split_device: Option<i32>,
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
+    prefix_draft: bool,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
         admit_device_reservations, resolve_capacity, CapacityPolicy, DeviceMemory,
@@ -61,11 +140,19 @@ pub(super) fn preflight(
         .context("MiMo checkpoint has no max_position_embeddings; specify its context capability in config.json")?;
     let kv = args.kv_cache.into();
     let cache = mimo_cache_geometry(cfg, layers, ranks, kv, args.mtp)?;
-    let mark_bytes = cache
+    let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
+        .map(|dir| -> Result<u64> {
+            let draft = super::dflash::DflashConfig::read(&dir)?;
+            let width = (draft.kv_heads as u64).checked_mul(draft.head_dim as u64)
+                .context("DFlash KV width overflow")?;
+            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, width)?)
+        }).transpose()?.unwrap_or(0);
+    let target_mark_bytes = cache
         .ranks
         .iter()
         .try_fold(0u64, |sum, r| sum.checked_add(r.retained_mark_bytes))
         .context("MiMo mark size overflow")?;
+    let mark_bytes = aggregate_mark_bytes(target_mark_bytes, draft_mark_bytes, prefix_draft)?;
     let mark_slots = match serving {
         Some((prefix, _)) => mark_slots(prefix, concurrency, usize::try_from(mark_bytes)?)? as u64,
         None => 0,
@@ -239,6 +326,8 @@ pub(super) fn preflight(
                     args.draft_capacity(draft.block)?,
                 )?;
                 additional.extend(reservations.steady);
+                additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
+                    args.rings as u64)?);
                 if transport_lanes >= 2 && args.prefill_rows >= 2048 && args.mtp == 0
                     && prefill_output == MimoPrefillOutput::LastRow {
                     additional.push(MemoryReservation {

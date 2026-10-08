@@ -9,6 +9,11 @@ pub enum MimoDraftRepresentation {
 
 }
 
+/// Serving contexts cover every target ring; a larger explicit arena does not widen the draft batch.
+pub fn mimo_draft_context_slots(draft_sequences: u64, target_rings: u64, explicit: Option<u64>) -> u64 {
+    explicit.unwrap_or(draft_sequences).max(draft_sequences).max(target_rings)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MimoDraftCapacity {
     pub context_slots: usize,
@@ -58,6 +63,12 @@ pub struct MimoDraftGeometry {
     pub taps: u64,
     pub vocab: u64,
     pub sinks: bool,
+}
+
+/// One byte-exact retained DFlash context mark (BF16 K/V and valid floor).
+pub fn mimo_draft_mark_bytes(layers: u64, kv_width: u64) -> Result<u64, MimoDraftStorageError> {
+    mul(mul(mul(layers, 1024)?, kv_width)?, 4)?.checked_add(8)
+        .ok_or(MimoDraftStorageError::Overflow)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +281,20 @@ impl MimoDraftWeightLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn serving_context_slots_cover_rings_batch_and_explicit_arena() {
+        assert_eq!(mimo_draft_context_slots(4, 16, None), 16);
+        assert_eq!(mimo_draft_context_slots(24, 16, None), 24);
+        assert_eq!(mimo_draft_context_slots(16, 16, Some(25)), 25);
+        assert_eq!(mimo_draft_context_slots(16, 16, Some(1)), 16);
+    }
+
+    #[test]
+    fn retained_draft_context_mark_counts_both_bf16_planes_and_floor() {
+        assert_eq!(mimo_draft_mark_bytes(5, 8 * 128).unwrap(), 20 * 1024 * 1024 + 8);
+        assert!(mimo_draft_mark_bytes(u64::MAX, 1024).is_err());
+    }
+
     fn pro() -> MimoDraftGeometry {
         MimoDraftGeometry {
             hidden: 6144,
