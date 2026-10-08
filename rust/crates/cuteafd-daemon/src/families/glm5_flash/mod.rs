@@ -50,7 +50,7 @@ pub(crate) struct EngineArgs {
     /// Tokens the MLA record pools hold across sequences.
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
-    /// Sequences with KDA state (136 MiB each).
+    /// Sequences with KDA state (136 MiB each; 68 MiB with --kda-state bf16).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
     /// The DSA index cache: `keys` keeps every token's BF16 key | gate row beside its latent
@@ -124,6 +124,14 @@ pub(crate) struct EngineArgs {
     /// output under speculation; opt-in.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
+    /// KDA recurrent state storage: `f32` (default), or `bf16`: computed in FP32 and rounded to
+    /// nearest even after every decode, verify and commit row (after the row's read-out, so a
+    /// verify committed at k rows stores the bits of k serial steps) and where each chunked-prefill
+    /// window stores it; `bf16-tile` rounds the chunked prefill after every 16-row tile instead.
+    /// Half the state and prefix-mark bytes (34 layers: 136 -> 68 MiB per sequence). Runs the
+    /// BF16-projection KDA programs on one GPU (with --kda-fp8 off, no --split-device).
+    #[arg(long, value_enum, default_value = "f32")]
+    pub kda_state: engine::KdaState,
     /// Keep FP8 KDA output partials in FP32 until the two-GPU sum.
     #[arg(long, env = "CUTEAFD_GLMF_KDA_FP32_PARTIALS", default_value_t = false)]
     pub kda_fp32_partials: bool,
@@ -197,6 +205,18 @@ pub(crate) struct EngineArgs {
     pub serving_graph_policy: Option<(usize, bool)>,
 }
 
+/// Bytes a planned admission reserves beyond the planner's flat GLM Flash mark count
+/// (`family_costs`) for a mark arena of `arena` bytes (what `with_engine_admitting`'s `after_pool`
+/// gives) holding marks of `mark` bytes: a BF16 KDA state halves each prefix mark, so the mark budget
+/// holds up to twice as many as with an FP32 state, and the arena the prefix cache allocates can
+/// exceed that count. FP32 states keep the flat reserve.
+pub(crate) fn bf16_mark_reserve(kda_state: engine::KdaState, arena: u64, mark: u64) -> u64 {
+    if kda_state == engine::KdaState::F32 {
+        return 0;
+    }
+    arena.saturating_sub(cuteafd_loader::plan::layout::family_costs("glm5_flash").mark_slots * mark)
+}
+
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
@@ -265,6 +285,58 @@ mod draft_cli_tests {
         }
         assert!(check_options(&parse(&["--fp8-prefill", "none,mla"])).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
+    }
+
+    #[test]
+    fn bf16_kda_state_runs_the_bf16_projection_programs_on_one_gpu() {
+        assert_eq!(parse(&[]).kda_state, engine::KdaState::F32);
+        for (value, state) in [("f32", engine::KdaState::F32), ("bf16", engine::KdaState::Bf16),
+            ("bf16-tile", engine::KdaState::Bf16Tile)] {
+            let args = parse(&["--kda-state", value]);
+            assert_eq!((args.kda_state, args.kda_state.name()), (state, value));
+            check_options(&args).unwrap();
+        }
+        for extra in [&["--kda-state", "bf16", "--kda-fp8", "row128"][..],
+            &["--kda-state", "bf16-tile", "--kda-fp8", "channel"][..], &["--kda-state", "bf16", "--split-device", "1"][..]] {
+            let error = check_options(&parse(extra)).unwrap_err().to_string();
+            assert!(error.contains("--kda-state bf16"), "{error}");
+        }
+        check_options(&parse(&["--kda-state", "f32", "--kda-fp8", "row128", "--split-device", "1"])).unwrap();
+        // With the compact index cache too: its commit then rebuilds the index tails over the BF16 state.
+        check_options(&parse(&["--kda-state", "bf16", "--index-cache", "compact"])).unwrap();
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--kda-state", "fp16"]).is_err());
+    }
+
+    #[test]
+    fn bf16_marks_reserve_the_arena_beyond_the_planned_mark_count() {
+        use cuteafd_loader::families::glm5_flash::GlmNextAttention;
+        // GLM 5.3 Flash: 34 KDA and 11 MLA layers; a BF16 mark is 76,316,672 B (147,619,840 B in FP32).
+        let cfg = GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
+            attention: (0..45).map(|i| if i % 4 == 3 { GlmNextAttention::Mla } else { GlmNextAttention::Kda }).collect(),
+            dense: vec![false; 45], dense_intermediate: 12288, experts: 288, topk: 8, moe_intermediate: 2048,
+            routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4, kda_heads: 64, kda_head_dim: 128,
+            heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048,
+            index_kpool: 4, eos: vec![] };
+        let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&cfg, 45, 1,
+            cuteafd_loader::serving_capacity::GlmfIndexCache::Keys, 2).unwrap();
+        let mark = geometry.ranks[0].retained_mark_bytes;
+        assert_eq!(mark, 76_316_672);
+        // The arena serve's `after_pool` gives: `MarkArena::slots_for` marks of the decoding lanes.
+        let arena = |lanes: usize, entries: usize, budget: usize|
+            cuteafd_engine::prefix::MarkArena::slots_for(lanes, entries, mark as usize, budget) as u64 * mark;
+        let budget = 2048usize << 20;
+        // An FP32 state keeps the planner's flat 18 marks, and no arena reserves nothing.
+        assert_eq!(bf16_mark_reserve(engine::KdaState::F32, arena(8, 20, budget), mark), 0);
+        assert_eq!(bf16_mark_reserve(engine::KdaState::Bf16, 0, mark), 0);
+        // 2 GiB holds 28 BF16 marks (14 FP32): 10 beyond the planned 18 at 8 lanes, and the floor of
+        // 2 x 16 + 2 = 34 at 16 lanes is 16 beyond.
+        for state in [engine::KdaState::Bf16, engine::KdaState::Bf16Tile] {
+            assert_eq!(bf16_mark_reserve(state, arena(8, 20, budget), mark), 10 * mark);
+            assert_eq!(bf16_mark_reserve(state, arena(16, 20, budget), mark), 16 * mark);
+        }
+        // An arena within the planned count (1 GiB holds 14 BF16 marks) adds nothing.
+        assert_eq!(bf16_mark_reserve(engine::KdaState::Bf16, arena(4, 20, 1024 << 20), mark), 0);
     }
 
     #[test]
@@ -685,6 +757,9 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         "--fp8-prefill none takes no other group");
     ensure!(args.kda_nvfp4_gate.is_none() || args.kda_fp8 == fp8::KdaFp8::Off,
         "--kda-nvfp4-gate rounds the BF16 KDA projections; it takes --kda-fp8 off");
+    ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
+        "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
+        --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
     Ok(())
 }
 
@@ -707,7 +782,7 @@ impl EngineArgs {
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state }
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -856,8 +931,22 @@ impl Opened {
         if args.fp8_head {
             needed.push("glmf_head_fp8");
         }
-        if args.index_cache == engine::IndexCache::Compact {
-            needed.extend(["glmf_index_producer_c_m64", "glmf_index_producer_c_m4096", "glmf_kda_commit_c"]);
+        let compact = args.index_cache == engine::IndexCache::Compact;
+        if compact {
+            needed.extend(["glmf_index_producer_c_m64", "glmf_index_producer_c_m4096"]);
+        }
+        if args.kda_state != engine::KdaState::F32 || compact {
+            // The state's KDA programs and the commit a speculative verify runs: the state's, or with
+            // the compact index cache the one that also rebuilds the tails (`kda_commit_c[_s16]`).
+            let kda: Vec<String> = if args.kda_state == engine::KdaState::F32 { Vec::new() }
+                else { ["m64", "m4096"].iter().map(|cap| args.kda_state.program(cap)).collect() };
+            let commit = if compact { args.kda_state.compact_commit_program() }
+                else { args.kda_state.commit_program() };
+            for name in kda.into_iter().chain([commit.to_string()]) {
+                programs.spec(&format!("glmf_{name}")).with_context(|| format!("--kda-state {} with --index-cache {} \
+                    needs program glmf_{name}; this native library predates it", args.kda_state.name(),
+                    if compact { "compact" } else { "keys" }))?;
+            }
         }
         if args.kda_fp32_partials {
             needed.extend(["glmf2_kda_w8_f32_m64", "glmf2_kda_w8_f32_m4096"]);
@@ -1011,9 +1100,10 @@ impl Opened {
             let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
                 &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
             // The caches this engine builds: records per token, the sequences' state and marks, and
-            // the speculative records follow the index cache.
+            // the speculative records follow the index cache, and a BF16 KDA state halves the state
+            // per sequence and each mark the arena holds.
             let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
-                index_cache.into())?;
+                index_cache.into(), args.kda_state.bytes() as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
@@ -1076,25 +1166,38 @@ impl Opened {
             let lazy_extra = planned_graph_extra(args, None, allowance);
             let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
                 reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
+            // A BF16 KDA state's mark arena can hold more marks than the planner's flat count; the
+            // lead GPU keeps the rest free too (`bf16_mark_reserve`).
+            let marks = match args.kda_state {
+                engine::KdaState::F32 => 0,
+                state => {
+                    let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers,
+                        1, index_cache.into(), state.bytes() as u64)?;
+                    let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
+                    bf16_mark_reserve(state, after_pool(rank), rank.retained_mark_bytes)
+                }
+            };
             engine::admit_beside_decode_graphs(startup, |graphs| {
                 // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
                 let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
-                let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
+                let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
                     crate::shared::memory_report::RankReserve {
-                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
+                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }
+                            + if rank == 0 { marks } else { 0 },
                         workspace_bytes: args.full_prefill_logits.then_some(workspace),
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                     args.draft.as_deref(), args.prefill_rows, args.slots,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
-                    index_cache.into())
+                    index_cache.into(), args.kda_state.bytes() as u64)
             })?
         } else {
             (args.pool_tokens, startup_graphs)
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache)?;
+            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
+            args.kda_state)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }

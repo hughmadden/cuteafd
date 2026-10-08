@@ -482,6 +482,49 @@ def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
+                                             ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
+                                             ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
+def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, forwarded):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if forwarded is None:
+        assert "--kda-state" not in launch
+    else:
+        assert f"--kda-state {forwarded}" in launch and launch.count("--kda-state") == 1
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_STATE=bf16\n", "GLM5_FLASH_KDA_FP8=off"),
+    ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
+])
+def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
+    root = tmp_path / "dumps"
+    root.mkdir()
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"-v {root}:{root} -e CUTEAFD_PROBE_DUMP_ROOT={root}" in launch
+    result = _family_launch_result(tmp_path / "unset", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n")
+    assert result.returncode == 0 and "CUTEAFD_PROBE_DUMP_ROOT" not in result.stderr
+    result = _family_launch_result(tmp_path / "missing", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nPROBE_DUMP_ROOT={tmp_path}/absent\n")
+    assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
