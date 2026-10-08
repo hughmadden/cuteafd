@@ -225,6 +225,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let copy_windows = draft.is_some() && copy_drafts::enabled();
     tracing::info!(copy_drafts=copy_windows, window=copy_drafts::WINDOW, "copy-window drafting");
     loop {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
         prefixes.tick();
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();

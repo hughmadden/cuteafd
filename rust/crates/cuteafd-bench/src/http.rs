@@ -1,6 +1,5 @@
 //! `/bench` and `/v1/bench/*`, the lockout of other inference while a run is
-//! active, and the access rule for controls: local network, or the server's
-//! API key when one is set.
+//! active. Controls require the server's API key, including on private networks.
 use crate::client::BENCH_HEADER;
 use crate::profiles::Profile;
 use crate::render;
@@ -60,18 +59,13 @@ pub fn local_network(ip: IpAddr) -> bool {
 }
 
 fn authorized(bench: &Bench, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
-    if peer.is_some_and(|p| local_network(p.ip())) {
-        return true;
-    }
-    let Some(key) = &bench.api_key else { return false };
-    let bearer = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
-    bearer == Some(key.as_str())
+    let _ = peer;
+    bench.api_key.get().is_some_and(|key| key.accepts(headers))
 }
 
 fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": {"message":
-        "benchmark controls are accepted from the local network or with the server's API key",
+        "benchmark controls require the server's API key",
         "type": "forbidden"}}))).into_response()
 }
 
@@ -326,6 +320,12 @@ async fn events(State(bench): State<Arc<Bench>>) -> Response {
         .into_response()
 }
 
+async fn require_control_key(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
+    if request.uri().path().starts_with("/v1/bench/") && !authorized(&bench, None, request.headers()) {
+        return forbidden();
+    }
+    next.run(request).await
+}
 /// The benchmark routes.
 pub fn routes(bench: Arc<Bench>) -> Router {
     Router::new()
@@ -343,7 +343,8 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/v1/bench/import", post(import))
         .route("/v1/bench/events", get(events))
         .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
-        .with_state(bench)
+        .with_state(bench.clone())
+        .layer(axum::middleware::from_fn_with_state(bench, require_control_key))
 }
 
 /// `router` with the benchmark mounted and the lockout in front of it.
@@ -395,6 +396,24 @@ mod tests {
         let response = routes(bench.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(bench.active().is_none());
+    }
+
+    #[tokio::test]
+    async fn private_network_does_not_bypass_key_and_auth_precedes_json() {
+        use tower::ServiceExt;
+        let bench = Bench::new(crate::store::Store::memory().unwrap());
+        bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("bench-secret").unwrap());
+        for key in [None, Some("Bearer wrong")] {
+            let mut request = axum::http::Request::builder().method("POST").uri("/v1/bench/probe")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo("10.55.0.1:8000".parse::<SocketAddr>().unwrap()));
+            if let Some(key) = key { request = request.header("Authorization", key); }
+            assert_eq!(routes(bench.clone()).oneshot(request.body(Body::from("malformed")).unwrap())
+                .await.unwrap().status(), StatusCode::FORBIDDEN);
+        }
+        let response = routes(bench).oneshot(axum::http::Request::get("/v1/bench/status")
+            .header("Authorization", "bearer bench-secret").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

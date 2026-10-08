@@ -73,6 +73,8 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
+    #[command(flatten)]
+    pub api: crate::shared::api::ApiArgs,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -84,6 +86,7 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+    let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
@@ -109,14 +112,14 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     ready_rx.await.context("engine failed before it was ready")??;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub.clone(), profile.clone());
+        hub.clone(), crate::shared::api::profile(profile.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM API is ready");
     tokio::select! {
-        served = axum::serve(listener, cuteafd_bench::app(router, hub)
+        served = axum::serve(listener, api.app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        finished = worker => finished??,
+        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
     }
     Ok(())
 }
@@ -459,6 +462,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {

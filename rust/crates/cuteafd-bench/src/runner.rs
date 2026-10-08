@@ -81,7 +81,7 @@ fn panel_eta_s(estimate: f64, pass: u32, passes: u32, fraction: f64, elapsed: f6
 }
 
 /// The run holding the lock.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ActiveRun {
     pub id: String,
     pub token: String,
@@ -90,6 +90,12 @@ pub struct ActiveRun {
     pub eta_s: f64,
     pub panel: String,
     pub fraction: f64,
+}
+
+impl std::fmt::Debug for ActiveRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveRun").field("id", &self.id).field("token", &"<redacted>").finish_non_exhaustive()
+    }
 }
 
 /// Allows console token text while a run holds the server; clearing on drop
@@ -122,9 +128,8 @@ pub struct Bench {
     /// allows token text on it: the lockout makes the run's own prompts the
     /// only requests in.
     console: OnceLock<Arc<ConsoleHub>>,
-    /// `CUTEAFD_API_KEY`: when set, bench controls from outside the local
-    /// network need it as a bearer token.
-    pub api_key: Option<String>,
+    /// Benchmark controls always require the configured API key.
+    pub api_key: OnceLock<cuteafd_api::openai::auth::ApiKey>,
 }
 
 impl Bench {
@@ -138,8 +143,17 @@ impl Bench {
             info: Mutex::new(None),
             events,
             console: OnceLock::new(),
-            api_key: std::env::var("CUTEAFD_API_KEY").ok().filter(|k| !k.is_empty()),
+            api_key: OnceLock::new(),
         })
+    }
+
+    pub fn set_api_key(&self, key: cuteafd_api::openai::auth::ApiKey) {
+        let _ = self.api_key.set(key);
+    }
+
+    pub fn accepts_internal(&self, token: &str) -> bool {
+        self.active().is_some_and(|active|
+            cuteafd_api::openai::auth::constant_time_eq(active.token.as_bytes(), token.as_bytes()))
     }
 
     /// The server's live console; called once when the bench is mounted.
@@ -176,7 +190,7 @@ impl Bench {
     /// and `token` is not its token.
     pub fn locked(&self, token: Option<&str>) -> Option<u64> {
         let active = self.active()?;
-        if token == Some(active.token.as_str()) {
+        if token.is_some_and(|token| cuteafd_api::openai::auth::constant_time_eq(active.token.as_bytes(), token.as_bytes())) {
             return None;
         }
         Some((active.eta_s.ceil() as u64).clamp(5, 3600))
@@ -279,7 +293,7 @@ impl Bench {
             "baseline": baseline.as_ref().map(|b| json!({"run": b.run_id, "quality": b.quality.status,
                 "badge": b.quality.badge()})),
             "quality_failed": baseline.as_ref().is_some_and(|b| b.quality.status == crate::report::CheckStatus::Fail),
-            "auth": if self.api_key.is_some() { "local network or API key" } else { "local network" },
+            "auth": "API key",
         })
     }
 
@@ -320,7 +334,7 @@ impl Bench {
             }
         }
         let _release = Release(self.clone(), active.id.clone());
-        let mut client = Client::new(&base, Some(active.token), active.cancel);
+        let mut client = Client::new(&base, Some(active.token), active.cancel).with_api_key(self.api_key.get().cloned());
         client.discover()?;
         let model = client.model.clone();
         let chat = client.chat(body, Some(spec))?;
@@ -437,7 +451,7 @@ impl Bench {
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
         plan: &[PlannedPanel]) -> anyhow::Result<()> {
-        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone());
+        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
@@ -557,7 +571,7 @@ impl Bench {
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
     fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str) {
-        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false)));
+        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
         let mut last: Option<(Instant, f64)> = None;
         let mut revision = u64::MAX;
         while !done.load(Ordering::Relaxed) {
@@ -624,6 +638,24 @@ mod tests {
     use super::panel_eta_s;
 
     fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
+
+    #[test]
+    fn internal_token_is_private_full_length_and_only_active() {
+        let bench = super::Bench::new(crate::store::Store::memory().unwrap());
+        assert!(!bench.accepts_internal("private-run-token"));
+        let active = super::ActiveRun { id: "run".into(), token: "private-run-token".into(),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: std::time::Instant::now(), eta_s: 10.0, panel: "basic".into(), fraction: 0.0 };
+        assert!(!format!("{active:?}").contains("private-run-token"));
+        *bench.active.lock().unwrap() = Some(active);
+        assert!(bench.accepts_internal("private-run-token"));
+        assert_eq!(bench.locked(Some("private-run-token")), None);
+        for wrong in ["", "private-run-toke", "private-run-token-tail"] {
+            assert!(!bench.accepts_internal(wrong));
+            assert!(bench.locked(Some(wrong)).is_some());
+        }
+        assert!(!bench.status().to_string().contains("private-run-token"));
+    }
 
     #[test]
     fn fidelity_catalog_defers_unknown_server_until_basic_card_discovery() {

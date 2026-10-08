@@ -76,6 +76,7 @@ pub fn set_media_input_policy(vision: bool, audio: bool) {
 
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
+    pub engine_health: Option<health::HealthWitness>,
 pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -96,7 +97,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None,
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None }
     }
 
@@ -138,6 +139,8 @@ impl Default for ModelProfile {
     fn default() -> Self {
         Self::new(MODEL, ModelEncoding::DeepseekV41)
     }
+pub mod auth;
+pub mod health;
 }
 mod limits;
 mod admission;
@@ -233,12 +236,21 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     if let Some(&(vision, audio)) = MEDIA_INPUT_POLICY.get() {
         profile.capabilities.vision &= vision;
         profile.capabilities.audio &= audio;
+    let health_queue = queue.clone();
+    let engine_health = profile.engine_health.clone();
+    let middleware_health = engine_health.clone().unwrap_or_else(|| health::HealthWitness(Arc::new(|| None)));
+    let witness = health::HealthWitness(Arc::new(move || {
+        engine_health.as_ref().and_then(health::HealthWitness::reason)
+            .or_else(|| health_queue.is_closed().then(|| "scheduler stopped".into()))
+    }));
+    profile.engine_health = Some(witness.clone());
     }
     let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
         .route("/", get(console::page))
+        .route("/v1/console/events", get(console::events))
         .route("/v1/console", get(console::socket))
         .route("/v1/console/snapshot", get(console::snapshot))
         .route("/assets/cuteafd-ui.css", get(console::ui_css))
@@ -253,6 +265,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/chat/completions", post(chat))
         .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
         .with_state(NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) })
+        .layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
         .merge(console_routes)
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
@@ -293,13 +306,17 @@ async fn models(State(state): State<NativeState>) -> Json<Value> {
     }
     Json(json!({"object":"list","data":[model]}))
 }
+    if let Some(reason) = state.profile.engine_health.as_ref().and_then(health::HealthWitness::reason) {
+        return health::unavailable(reason);
+    }
 async fn health(State(state): State<NativeState>) -> Response {
     let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));
     let audio = state.profile.audio_health.as_ref().map(|h| h.load(Ordering::Acquire));
     let status = if state.queue.is_closed() || vision == Some(false) || audio == Some(false) {
         StatusCode::SERVICE_UNAVAILABLE
     } else { StatusCode::OK };
-    if vision.is_none() && audio.is_none() { return status.into_response(); }
+    readiness.insert("status".into(), json!(if status == StatusCode::OK { "ok" } else { "unavailable" }));
+    if status != StatusCode::OK { readiness.insert("reason".into(), json!("media encoder failed")); }
     let mut readiness = serde_json::Map::new();
     if let Some(healthy) = vision { readiness.insert("vision".into(), json!(if healthy { "ready" } else { "failed" })); }
     if let Some(healthy) = audio { readiness.insert("audio".into(), json!(if healthy { "ready" } else { "failed" })); }
@@ -1097,6 +1114,7 @@ mod tests {
     }
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
+            ModelProfile::new("test-dsv4", ModelEncoding::DeepseekV4),
         let profiles = [ModelProfile::default(),
             ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
             ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))];

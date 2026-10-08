@@ -70,7 +70,7 @@ pub(crate) struct RunArgs {
     pub(crate) out: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     pub(crate) root: PathBuf,
-    /// Bearer key for servers outside the local network.
+    /// Bearer key for the server's benchmark controls.
     #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
     pub(crate) api_key: Option<String>,
 }

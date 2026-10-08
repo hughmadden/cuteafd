@@ -54,6 +54,8 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
+    #[command(flatten)]
+    pub api: crate::shared::api::ApiArgs,
 }
 
 /// "…/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/<rev>" -> "deepseek-ai/DeepSeek-V4-Flash-0731".
@@ -71,6 +73,7 @@ fn eos_token(snapshot: &Path) -> Result<u32> {
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+    let api = args.api.load()?;
     let limits = NativeLimits::new(args.max_context, args.max_output)?;
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
@@ -89,14 +92,14 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     ready_rx.await.context("engine failed before it was ready")??;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub.clone(), profile.clone());
+        hub.clone(), crate::shared::api::profile(profile.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
     tokio::select! {
-        served = axum::serve(listener, cuteafd_bench::app(router, hub)
+        served = axum::serve(listener, api.app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        finished = worker => finished??,
+        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
     }
     Ok(())
 }
@@ -505,6 +508,9 @@ fn schedule(
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
         // Admit while sequence slots and decode rows remain.
         while !states.is_empty() && active.len() + prefills.len() < engine.decode_rows {
             let busy = !active.is_empty() || !prefills.is_empty();

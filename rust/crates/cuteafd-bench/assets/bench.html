@@ -170,8 +170,24 @@ const secs = (s) => {
   if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
   return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`;
 };
+let apiKey = '';
+const authenticatedFetch = async (path, init = {}) => {
+  const headers = new Headers(init.headers);
+  if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
+  let response = await fetch(path, { ...init, headers });
+  if (response.status === 401) {
+    const key = window.prompt('API key for this server (kept in memory for this tab only)');
+    if (key) {
+      apiKey = key;
+      headers.set('Authorization', `Bearer ${apiKey}`);
+      response = await fetch(path, { ...init, headers });
+    }
+  }
+  return response;
+};
+window.cuteafdAuthenticatedFetch = authenticatedFetch;
 const api = async (path, init) => {
-  const response = await fetch(path, init);
+  const response = await authenticatedFetch(path, init);
   const text = await response.text();
   let body = null; try { body = JSON.parse(text); } catch (_) {}
   if (!response.ok) throw new Error(body?.error?.message || text || response.statusText);
@@ -330,7 +346,7 @@ function renderPanels() {
         // the new version arrived, so a filling chart never flickers.
         if (chart.dataset.src !== src) {
           chart.dataset.src = src;
-          fetch(src).then((r) => r.ok ? r.text() : null).then((text) => {
+          authenticatedFetch(src).then((r) => r.ok ? r.text() : null).then((text) => {
             if (text && chart.dataset.src === src) chart.innerHTML = text;
           }).catch(() => {});
         }
@@ -339,7 +355,7 @@ function renderPanels() {
         if (paired) {
           const src = `/v1/bench/runs/${report.id}/report.json?${paired}&rev=${revs[id] || 0}`;
           table.dataset.src = src;
-          fetch(src).then((r) => r.ok ? r.json() : null).then((saved) => {
+          authenticatedFetch(src).then((r) => r.ok ? r.json() : null).then((saved) => {
             const compared = saved?.panels?.find((p) => p.id === id);
             if (compared && table.dataset.src === src) table.innerHTML = tableFor(id, compared);
           }).catch(() => {});
@@ -563,9 +579,8 @@ $('dialog-save').onclick = async () => {
 };
 
 // ---------------------------------------------------------------- events
-function connect() {
-  const source = new EventSource('/v1/bench/events');
-  source.onmessage = (message) => {
+async function connect() {
+  const onmessage = (message) => {
     let event; try { event = JSON.parse(message.data); } catch (_) { return; }
     if (event.type === 'status') {
       const was = status.active?.id;
@@ -593,8 +608,39 @@ function connect() {
       }
     }
   };
-  source.onerror = () => { source.close(); setTimeout(connect, 3000); };
+  try {
+    const response = await authenticatedFetch('/v1/bench/events');
+    if (!response.ok) throw new Error(response.statusText);
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let pending = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = pending.indexOf('\n\n')) >= 0) {
+        const frame = pending.slice(0, boundary); pending = pending.slice(boundary + 2);
+        const data = frame.split('\n').filter((line) => line.startsWith('data: ')).map((line) => line.slice(6)).join('\n');
+        if (data) onmessage({ data });
+      }
+    }
+  } catch (_) {}
+  setTimeout(connect, 3000);
 }
+// Downloads cannot attach headers through ordinary links. Fetch to a blob instead.
+document.addEventListener('click', async (event) => {
+  const anchor = event.target.closest('a[href]');
+  if (!anchor || !new URL(anchor.href).pathname.startsWith('/v1/bench/')) return;
+  event.preventDefault();
+  try {
+    const response = await authenticatedFetch(anchor.href);
+    if (!response.ok) throw new Error(response.statusText);
+    const url = URL.createObjectURL(await response.blob());
+    const download = document.createElement('a'); download.href = url;
+    download.download = anchor.download || new URL(anchor.href).pathname.split('/').pop();
+    download.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (error) { alert(error.message); }
+});
 
 let resizeTimer;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderPanels, 200); });

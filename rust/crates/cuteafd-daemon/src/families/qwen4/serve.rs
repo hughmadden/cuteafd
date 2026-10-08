@@ -77,6 +77,8 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
+    #[command(flatten)]
+    pub api: crate::shared::api::ApiArgs,
     /// Resolved global vision policy, assigned before dispatch.
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub vision: cuteafd_loader::plan::MediaMode,
@@ -103,6 +105,7 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+    let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = Arc::new(QwenEncoding::from_snapshot(&snapshot)?);
@@ -137,14 +140,14 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     }
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub.clone(), profile.clone());
+        hub.clone(), crate::shared::api::profile(profile.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
     tokio::select! {
-        served = axum::serve(listener, cuteafd_bench::app(router, hub)
+        served = axum::serve(listener, api.app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        finished = worker => finished??,
+        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
     }
     Ok(())
 }
@@ -592,6 +595,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let config = &opened.checkpoint.config;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     loop {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
             let ready = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy,

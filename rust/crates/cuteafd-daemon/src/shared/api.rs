@@ -1,0 +1,117 @@
+//! Common API policy for every serving family.
+use cuteafd_api::openai::{auth::{ApiKey, Auth}, health::HealthWitness, ModelProfile};
+use std::{path::PathBuf, sync::Arc};
+
+#[derive(Debug, Clone, Default, clap::Args)]
+pub(crate) struct ApiArgs {
+    /// Require a bearer key from this file on /v1/* (health stays open).
+    #[arg(long, env = "API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+    /// Mount benchmark controls and lockout; requires --api-key-file.
+    #[arg(long, env = "CUTEAFD_ENABLE_BENCH")]
+    pub enable_bench: bool,
+}
+pub(crate) struct ApiPolicy {
+    key: Option<ApiKey>,
+    bench: bool,
+}
+impl ApiArgs {
+    pub fn load(&self) -> anyhow::Result<ApiPolicy> {
+        let key = self.api_key_file.as_deref().map(ApiKey::from_file).transpose()?;
+        anyhow::ensure!(!self.enable_bench || key.is_some(), "--enable-bench requires --api-key-file");
+        Ok(ApiPolicy { key, bench: self.enable_bench })
+    }
+}
+impl ApiPolicy {
+    pub fn app(self, router: axum::Router, hub: Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
+        let (router, internal) = if self.bench {
+            let bench = cuteafd_bench::Bench::global();
+            bench.set_console(hub);
+            bench.set_api_key(self.key.clone().expect("validated benchmark key"));
+            let witness = bench.clone();
+            let internal: Arc<dyn Fn(&str, &axum::http::HeaderMap) -> bool + Send + Sync> = Arc::new(move |path, headers| {
+                matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/models" | "/v1/stats")
+                    && cuteafd_api::openai::auth::bearer(headers).is_some_and(|token| witness.accepts_internal(token))
+            });
+            (cuteafd_bench::http::mount(router, bench), Some(internal))
+        } else { (router, None) };
+        router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
+            cuteafd_api::openai::auth::require_key))
+    }
+}
+pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    // The worker's state is discarded after unwind; no partially mutated engine is reused.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("scheduler panicked")))
+}
+pub(crate) async fn watch_scheduler(worker: tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let reason = match worker.await {
+        Ok(Ok(())) => "scheduler stopped".into(),
+        Ok(Err(error)) => format!("scheduler stopped: {error:#}"),
+        Err(error) => format!("scheduler stopped: {error}"),
+    };
+    tracing::error!(%reason);
+    cuteafd_transport::health::record_failure(reason);
+    // Stay pending so select keeps polling the HTTP server after worker death.
+    std::future::pending::<()>().await;
+}
+pub(crate) fn profile(mut profile: ModelProfile) -> ModelProfile {
+    profile.engine_health = Some(HealthWitness(Arc::new(cuteafd_transport::health::failure_reason)));
+    profile
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn default_has_no_benchmark_routes_and_keyed_auth_is_outermost() {
+        use axum::{body::Body, http::StatusCode};
+        use tower::ServiceExt;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let app = ApiArgs::default().load().unwrap().app(cuteafd_api::openai::router(tx),
+            cuteafd_api::openai::ConsoleHub::disabled());
+        assert_eq!(app.oneshot(axum::http::Request::get("/v1/bench/status").body(Body::empty()).unwrap())
+            .await.unwrap().status(), StatusCode::NOT_FOUND);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false }.app(
+            cuteafd_api::openai::router(tx), cuteafd_api::openai::ConsoleHub::disabled());
+        assert_eq!(app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+            .body(Body::from("malformed")).unwrap()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(app.oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap())
+            .await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    #[test]
+    fn every_family_accepts_api_policy_options() {
+        use clap::Parser;
+        use crate::cli::{Cli, Commands};
+        for serve in ["serve-glm", "serve-glmf", "serve-mimo", "serve-qwen4", "serve-dsv4", "serve-native"] {
+            let mut argv = vec!["cuteafd", serve, "--snapshot", "/model", "--native-lib", "/native.so",
+                "--api-key-file", "/key", "--enable-bench"];
+            if serve == "serve-native" { argv.extend(["--peers", "127.0.0.1:9000"]); }
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let api = match cli.command {
+                Commands::ServeGlm(args) => args.api,
+                Commands::ServeGlmf(args) => args.api,
+                Commands::ServeMimo(args) => args.api,
+                Commands::ServeQwen4(args) => args.api,
+                Commands::ServeDsv4(args) => args.api,
+                Commands::ServeNative(args) => args.api,
+                _ => panic!("expected serving"),
+            };
+            assert_eq!(api.api_key_file, Some(PathBuf::from("/key")));
+            assert!(api.enable_bench);
+        }
+    }
+    #[test]
+    fn scheduler_panic_becomes_terminal_error() {
+        let stopped = catch_scheduler_panic(|| panic!("private scheduler payload"));
+        assert_eq!(stopped.unwrap_err().to_string(), "scheduler panicked");
+        assert!(catch_scheduler_panic(|| Ok(())).is_ok());
+        assert_eq!(catch_scheduler_panic(|| anyhow::bail!("worker failed")).unwrap_err().to_string(), "worker failed");
+    }
+    #[test]
+    fn benchmark_controls_require_a_key() {
+        assert!(ApiArgs { enable_bench: true, api_key_file: None }.load().is_err());
+        assert!(ApiArgs::default().load().is_ok());
+    }
+}

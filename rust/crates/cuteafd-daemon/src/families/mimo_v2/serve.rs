@@ -70,6 +70,8 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
+    #[command(flatten)]
+    pub api: crate::shared::api::ApiArgs,
     /// Resolved global vision policy, assigned before dispatch.
     #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
     pub vision: cuteafd_loader::plan::MediaMode,
@@ -103,6 +105,7 @@ pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+    let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
@@ -143,14 +146,14 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     }
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub.clone(), profile.clone());
+        hub.clone(), crate::shared::api::profile(profile.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
     tokio::select! {
-        served = axum::serve(listener, cuteafd_bench::app(router, hub)
+        served = axum::serve(listener, api.app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        finished = worker => finished??,
+        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
     }
     Ok(())
 }
@@ -484,6 +487,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
     let result = (|| -> Result<()> { loop {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
             let ready = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy,

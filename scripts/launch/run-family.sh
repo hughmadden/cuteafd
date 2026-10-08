@@ -867,14 +867,14 @@ spark_hosts=()
 spark_host_names=()
 for ((rank = 0; rank < ranks; rank++)); do
   spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")")
-  if [[ "${CUTEAFD_GLOBAL_PAGE_CACHE_DROP:-0}" != 1 ]]; then
-    echo "SparkNest absent: workers use checkpoint fadvise(DONTNEED); no global cache drop."
-    return 0
-  fi
   spark_host_names+=("$(get "SPARK_${rank}_HOST")")
 done
 drop_spark_caches() {
   if command -v nest >/dev/null; then nest drop-caches "${spark_hosts[@]}" >/dev/null; return; fi
+  if [[ "${CUTEAFD_GLOBAL_PAGE_CACHE_DROP:-0}" != 1 ]]; then
+    echo "SparkNest absent: workers use checkpoint fadvise(DONTNEED); no global cache drop."
+    return 0
+  fi
   local host failed=0
   for host in "${spark_host_names[@]}"; do
     ssh -n "$host" 'sync; echo 1 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null' || failed=1
@@ -983,6 +983,21 @@ case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, g
 family_args+=(--table-backend "$table_backend")
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
+api_mount_args=()
+API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
+ENABLE_BENCH="$(get ENABLE_BENCH off)"
+release_prepare_api_key "$ENABLE_BENCH" "${instance:-default}"
+if [[ -n "$API_KEY_FILE" ]]; then
+  [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }
+  API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
+  api_mount_args=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
+  family_args+=(--api-key-file /run/cuteafd-api-key)
+fi
+case "$ENABLE_BENCH" in
+  on) family_args+=(--enable-bench) ;;
+  off) ;;
+  *) echo "ENABLE_BENCH must be on or off" >&2; exit 2 ;;
+esac
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
@@ -991,7 +1006,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  "${chat_template_mounts[@]}" "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
@@ -1008,4 +1023,4 @@ until curl --max-time 5 -sf "$url/health" >/dev/null; do
     { echo "coordinator exited:" >&2; docker logs --tail 30 "$coordinator_name" >&2; exit 1; }
   sleep 2
 done
-echo "API ready at $url/v1/ ($(curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
+echo "API ready at $url/v1/ ($(release_api_curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
