@@ -124,7 +124,25 @@ impl IntakeChoice {
 
 /// Probes dma-buf GPU landing (64 MiB loopback sends) on the current device.
 pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingProbe> {
+    ensure!(!std::env::var("CUTEAFD_GPU_LANDING_PROBE").is_ok_and(|v| v == "unavailable"),
+        "GPU landing probe forced unavailable");
     cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)
+}
+
+fn device_choice_available(choice: &IntakeChoice) -> bool {
+    choice.mode == IntakeMode::Gpu || (choice.setting == "auto"
+        && choice.probe.as_ref().is_some_and(|probe| probe.usable()))
+}
+
+/// Optional device-driven exchange must not turn a failed landing probe into
+/// a startup error. The existing pinned transport remains the fallback.
+pub(crate) fn device_exchange_available(library: &NativeLibrary) -> Result<bool> {
+    let choice = choose_mode(library)?;
+    let available = device_choice_available(&choice);
+    if !available {
+        tracing::warn!(reason = %choice.reason, "GPU exchange unavailable; retaining pinned-host Spark intake");
+    }
+    Ok(available)
 }
 
 /// Pinned host to device copy rate on the current device, GB/s: eight
@@ -158,6 +176,21 @@ pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
     timed
 }
 
+fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Option<f64>) -> (IntakeMode, String) {
+    match probe {
+        Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}")),
+        Ok(p) if !p.usable() => (IntakeMode::Pinned, format!("GPU landing unusable: {}{}",
+            p.error.as_deref().unwrap_or(&p.status),
+            if p.registered && p.writes_ordering < 100 { " (GPUDirect writes not ordered for kernels)" } else { "" })),
+        Ok(p) if setting == "auto" => match gpu_wins(p, h2d) {
+            (true, rates) => (IntakeMode::Gpu, format!("dma-buf landing verified, {rates}")),
+            (false, rates) => (IntakeMode::Pinned, format!("dma-buf landing verified but slow, {rates}")),
+        },
+        Ok(p) => (IntakeMode::Gpu, format!("dma-buf landing verified, {:.1} GB/s into GPU vs {:.1} GB/s into host",
+            p.gpu_gbps, p.host_gbps)),
+    }
+}
+
 /// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing for `auto` and
 /// `gpu`) once per process.
 pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
@@ -176,18 +209,7 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
                     .map_err(|error| tracing::warn!("H2D copy probe failed: {error:#}")).ok(),
                 _ => None,
             };
-            let (mode, reason) = match &probe {
-                Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}")),
-                Ok(p) if !p.usable() => (IntakeMode::Pinned, format!("GPU landing unusable: {}{}",
-                    p.error.as_deref().unwrap_or(&p.status),
-                    if p.registered && p.writes_ordering < 100 { " (GPUDirect writes not ordered for kernels)" } else { "" })),
-                Ok(p) if setting == "auto" => match gpu_wins(p, h2d) {
-                    (true, rates) => (IntakeMode::Gpu, format!("dma-buf landing verified, {rates}")),
-                    (false, rates) => (IntakeMode::Pinned, format!("dma-buf landing verified but slow, {rates}")),
-                },
-                Ok(p) => (IntakeMode::Gpu, format!("dma-buf landing verified, {:.1} GB/s into GPU vs {:.1} GB/s into host",
-                    p.gpu_gbps, p.host_gbps)),
-            };
+            let (mode, reason) = resolve_landing_probe(&setting, &probe, h2d);
             (mode, reason, probe.ok(), h2d)
         }
         other => anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not one of auto, gpu, pinned, host"),
@@ -1128,6 +1150,18 @@ mod tests {
         assert!(!gpu_wins(&probe(pinned / 3.0), Some(57.6)).0);
         // Without the H2D probe, a verified landing path is used.
         assert!(gpu_wins(&probe(19.6), None).0);
+    }
+
+    #[test]
+    fn unavailable_landing_keeps_pinned_intake_and_disables_device_exchange() {
+        for setting in ["auto", "gpu"] {
+            let (mode, reason) = resolve_landing_probe(setting, &Err(anyhow::anyhow!("forced unavailable")), None);
+            assert!(reason.contains("forced unavailable"));
+            let choice = IntakeChoice { setting: setting.into(), mode,
+                reason, probe: None, h2d_gbps: None };
+            assert!(!device_choice_available(&choice));
+            assert_eq!(choice.mode_for(4096 * 10240).0, IntakeMode::Pinned);
+        }
     }
 
     #[test]

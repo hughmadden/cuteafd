@@ -692,6 +692,15 @@ impl Opened {
     pub fn with_engine_admitting<T>(&self, args: &EngineArgs,
         after_pool: &dyn Fn(&cuteafd_loader::serving_capacity::RankCacheGeometry) -> u64,
         body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
+        let mut resolved = args.clone();
+        if args.split_device.is_some()
+            && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
+            resolved.split_device = None;
+            resolved.kda_fp32_partials = false;
+            resolved.kda_output_shard = false;
+            resolved.kda_prefill_expanded = false;
+        }
+        let args = &resolved;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.

@@ -284,7 +284,20 @@ fn worker(
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
-    if args.rtx_gpus == 2 { return distributed::worker(args, receive, ready, stats); }
+    if args.rtx_gpus == 2 {
+        // Probe before the distributed loader reserves either device's weights.
+        // SAFETY: the configured native library is trusted and remains live for the probe.
+        let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+        if crate::shared::peer_split::probed_device(&library, 0, Some(1))?.is_none() {
+            args.rtx_gpus = 1;
+            args.tp2_dspark_experts = false;
+            args.tp2_output_projection = false;
+            args.tp2_query_projection = false;
+            args.tp2_attention = false;
+        } else {
+            return distributed::worker(args, receive, ready, stats);
+        }
+    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.

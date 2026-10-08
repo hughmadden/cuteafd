@@ -911,7 +911,8 @@ class BuildScopeTest(unittest.TestCase):
     def test_run_sh_accepts_actual_placement_gpus_and_opens_single_rtx_handoff(self) -> None:
         release = (ROOT / "run.sh").read_text()
         self.assertIn('--argjson gpus "$RELEASE_RTX_GPUS"', release)
-        self.assertIn(".rtx_gpus == $gpus", release)
+        self.assertIn("(.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus", release)
+        self.assertIn(".rtx_expert_layers > 0 or .rtx_gpus == 1", release)
         self.assertIn("handoff", release)
         # The boundary acknowledgement must not be gated on the RTX count alone.
         self.assertIn('if [[ -n "$placement_directory" ]]; then', release)

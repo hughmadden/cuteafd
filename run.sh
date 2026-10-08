@@ -597,15 +597,15 @@ if [[ -n "$placement_directory" ]]; then
     ((SECONDS < deadline)) || release_die "timed out waiting for coordinator placement"
     sleep 1
   done
-  # Accept the coordinator's actual RTX count (1 or 2) and require it to match
-  # the layout this launch selected.
+  # A failed P2P startup probe may reduce a selected two-GPU layout to one.
+  # Never accept an expansion beyond the GPUs admitted by this launch.
   spark_first_layer="$(jq -er --argjson gpus "$RELEASE_RTX_GPUS" --arg requested "$RTX_EXPERT_LAYERS" '
     select(.version == 1)
-    | select((.rtx_gpus | type) == "number" and .rtx_gpus == $gpus)
+    | select((.rtx_gpus | type) == "number" and (.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus)
     | select((.nonce | type) == "string" and (.nonce | length) > 0)
     | select((.rtx_expert_layers | type) == "number")
     | select(.rtx_expert_layers == (.rtx_expert_layers | floor) and .rtx_expert_layers >= 0 and .rtx_expert_layers <= 40)
-    | select(.rtx_expert_layers > 0 or $gpus == 1)
+    | select(.rtx_expert_layers > 0 or .rtx_gpus == 1)
     | select($requested == "auto" or .rtx_expert_layers == ($requested | tonumber))
     | select(.spark_first_layer == ([.rtx_expert_layers, 39] | min))
     | .spark_first_layer' <<<"$placement_plan")" || release_die "invalid coordinator placement plan"
