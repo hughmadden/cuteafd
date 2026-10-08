@@ -875,8 +875,19 @@ Work, in priority order:
    missing reservation. Both small-card families now use an absolute 2.9 GiB
    floor with the 97% ceiling; MiMo's measured contract predicts 962,560
    aggregate tokens across 16 slots, an 86,016-token full-context shortfall.
-   New-pin hardware confirmation and paired larger-output code checks remain
-   pending; no full-1M prompt or real-5090 qualification is claimed.
+   Matching pin 682f5ad confirmation passed: V4.1 production-default auto
+   pool 3,342,848 tokens, C1/C16 code smoke and ten distinct C16 batches,
+   minimum observed logical free 3.9863 GiB, no observed selection recaptures
+   or capture failures. MiMo retained Int8 KV and the predicted 962,560-token
+   aggregate pool; its 64 MiB startup probe shares the floor slack only while
+   the probe is live (max(probe, floor), not their sum). Steady headroom stays
+   2.9 GiB. A 262,048 API-token request returned the exact requested secret
+   with 3.5976 GiB minimum observed logical free. The completed 640-token
+   host/GPU code outputs are byte-identical and pass structural checks, but
+   share an incorrect interval-merging assert; the checker does not execute
+   generated code. Neither heap abort recurred in these gates. PRO-default
+   parity/readiness on the rebased fcb6706d build remains the coordinator's
+   merge gate; no full-1M prompt or real-5090 qualification is claimed.
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
    Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),
