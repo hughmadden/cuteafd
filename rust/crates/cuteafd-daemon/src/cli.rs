@@ -175,8 +175,8 @@ pub(crate) struct PlanArgs {
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub(crate) vision: cuteafd_loader::plan::MediaMode,
-    /// Audio is off until its correctness gates pass.
-    #[arg(skip = cuteafd_loader::plan::MediaMode::Off)]
+    /// Auto enables qualified bundled audio towers, otherwise off.
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub(crate) audio: cuteafd_loader::plan::MediaMode,
     /// Place the untied token embedding in pinned mapped RAM instead of the lead GPU.
     #[arg(long, alias = "embed-placement", value_enum, default_value_t = crate::shared::token_io::EmbedPlacement::Gpu)]

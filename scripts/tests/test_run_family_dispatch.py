@@ -32,6 +32,11 @@ def _snapshot(hf: Path, model: str, config: dict) -> None:
     (root / "refs" / "main").write_text("abc")
     (root / "snapshots" / "abc").mkdir(parents=True)
     (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
+    if config.get("audio_config"):
+        audio = root / "snapshots" / "abc" / "audio_tokenizer"
+        audio.mkdir()
+        (audio / "config.json").write_text("{}")
+        (audio / "model.safetensors").write_bytes(b"stub")
 
 
 def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -118,6 +123,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    wip = "--wip" in extra_args
+    if wip:
+        (repo / "scripts" / "build").mkdir()
+        (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
     bin_dir = tmp_path / "bin"
@@ -128,8 +137,12 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "worker ready"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
+                                    ('case "$*" in image\\ inspect*) echo test-pin ;; '
+                                     'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
+                                     'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh" ;; esac\n'
+                                     if tool == "docker" and wip else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
-                                     if tool == "docker" and preferred_ranks is not None else '') +
+                                     if tool == "docker" and preferred_ranks is not None and encoder_plan is None else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
                                      if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
@@ -151,12 +164,40 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}", **(extra_env or {})}
+    if wip:
+        env["HOME"] = str(tmp_path / "home")
     if not with_nest:
         # Hide any nest the host has, keeping only the stub directory and the system tools.
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                            *(["--restart"] if restart else []), *extra_args],
                           env=env, capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("qwen", [False, True])
+def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen):
+    config = ({**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"},
+               "vision_config": {"depth": 24}}
+              if qwen else {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                            "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}})
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nWIP_INSTANCE=plan-test\n",
+                                  preferred_ranks=1 if qwen else None, encoder_plan=plan,
+                                  extra_args=("--wip", "slot-test"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    assert len(plans) == (2 if qwen else 1)
+    staging = next(i for i, line in enumerate(lines) if "docker cp" in line and ".cuteafd-wip" in line)
+    for preflight in plans:
+        assert staging < lines.index(preflight)
+        assert "cuteafd-coordinator-dev cuteafd plan" in preflight
+        for part in ("bin", "lib", "share"):
+            assert f"wip-run/plan-test/slot-test/{part}:/opt/cuteafd/{part}:ro" in preflight
+        assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
 
 
 @pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
@@ -1136,8 +1177,8 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
 
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])
 def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path, vision_kind, audio_kind):
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
-              "vision_config": {"depth": 28}, "audio_token_id": 151669}
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
+              "vision_config": {"depth": 28}, "audio_token_id": 151669, "audio_config": {"audio_channels": 20}}
     def placement(kind):
         return {"kind": {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0} if kind == "rtx" else {})}, "replicas": []}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
@@ -1322,3 +1363,67 @@ def test_qwen_encoder_explicit_placement_and_default_auto(tmp_path, mode, kind):
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off":
         assert "cuteafd plan" not in result.stderr
+
+
+@pytest.mark.parametrize("width", [4096, 6144])
+@pytest.mark.parametrize("mode,kind", [(None, "spark"), ("off", "off"), ("auto", "spark")])
+def test_qualified_mimo_audio_default_and_explicit_off(tmp_path, width, mode, kind):
+    config = {"model_type": "mimo_v2", "hidden_size": width, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "audio_config": {"audio_channels": 20}}
+    placement = {"kind": {"kind": "spark", "rank": 0}, "replicas": []}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": None, "audio_encoder": placement}
+    keys = "VISION=off\nRTX_GPUS=1\nSPECULATOR=off\n" + (f"AUDIO={mode}\n" if mode else "")
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    expected = "spark:0" if kind == "spark" else "off"
+    assert f"--audio {expected}" in launch
+    assert ("--audio-peers" in launch) == (kind == "spark")
+
+
+@pytest.mark.parametrize("tower,reason", [(False, "no tower"), (True, "no device headroom")])
+def test_mimo_audio_auto_without_admitted_owner_serves_text(tmp_path, tower, reason):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    if tower:
+        config["audio_config"] = {"audio_channels": 20}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": None,
+            "audio_encoder": {"kind": {"kind": "off"}, "replicas": [], "reason": reason, "shortfall": 1}}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=off\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--audio off" in launch and "--audio-peers" not in launch
+    assert ("audio auto disabled" in result.stderr) == tower
+
+
+@pytest.mark.parametrize("model_type,width,tower,want", [
+    ("mimo_v2", 4096, True, "auto"), ("mimo_v2", 6144, True, "auto"),
+    ("mimo_v2", 4096, False, "off"), ("mimo_v2", 128, True, "off"),
+    ("deepseek_v41", 4096, True, "off"), ("qwen4_exp", 4096, True, "off"),
+    ("glm5_next", 4096, True, "off"), ("deepseek_v4", 4096, True, "off"),
+])
+def test_release_audio_default_resolves_per_snapshot(tmp_path, model_type, width, tower, want):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(json.dumps({"model_type": model_type, "hidden_size": width, "audio_config": {"audio_channels": 20}}))
+    if tower:
+        (snapshot / "audio_tokenizer").mkdir()
+        (snapshot / "audio_tokenizer/config.json").write_text("{}")
+        (snapshot / "audio_tokenizer/model.safetensors").write_bytes(b"stub")
+    config = tmp_path / "release.config"
+    config.write_text("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i+1}\nSPARK_{i}_LANE_B=10.0.1.{i+1}\n" for i in range(4)))
+    script = f'source "{ROOT}/scripts/lib/release-common.sh"; release_load_config "$1"; test "$AUDIO" = auto; release_resolve_audio_mode "$AUDIO" "$2"'
+    result = subprocess.run(["bash", "-c", script, "bash", str(config), str(snapshot)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == want
+    result = subprocess.run(["bash", "-c", f'source "{ROOT}/scripts/lib/release-common.sh"; release_resolve_audio_mode off "$1"', "bash", str(snapshot)], capture_output=True, text=True)
+    assert result.stdout.strip() == "off"
+
+
+@pytest.mark.parametrize("mode", ["spark:0", "rtx"])
+def test_explicit_audio_without_tower_refuses(tmp_path, mode):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION=off\nAUDIO={mode}\nRTX_GPUS=1\nSPECULATOR=off\n")
+    assert result.returncode != 0
+    assert "cuteafd serve-mimo" not in result.stderr

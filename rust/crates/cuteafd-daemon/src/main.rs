@@ -41,6 +41,16 @@ mod media_defaults_tests {
     use cuteafd_loader::plan::MediaMode;
 
     #[test]
+    fn planner_audio_defaults_auto_and_preserves_global_off() {
+        use clap::Parser;
+        let cli = super::cli::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap();
+        let super::cli::Commands::Plan(args) = cli.command else { panic!("expected planner"); };
+        assert_eq!(args.audio, MediaMode::Auto);
+        let cli = super::cli::Cli::try_parse_from(["cuteafd", "plan", "/model", "--audio", "off"]).unwrap();
+        assert_eq!(cli.audio, Some(MediaMode::Off));
+    }
+
+    #[test]
     fn qualified_qwen_vision_defaults_auto_and_preserves_overrides() {
         assert_eq!(resolve_qwen_vision(None, None), MediaMode::Auto);
         assert_eq!(resolve_qwen_vision(None, Some(MediaMode::Off)), MediaMode::Off);
@@ -105,7 +115,15 @@ async fn main() -> Result<()> {
     } else {
         resolve_vision(family_vision, initial_vision)
     };
-    let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
+    let requested_audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
+    let audio = match &command {
+        Commands::Plan(_) => requested_audio,
+        Commands::ServeMimo(args) => cuteafd_loader::plan::resolve_audio(requested_audio, &args.engine.snapshot)?,
+        _ => match requested_audio {
+            cuteafd_loader::plan::MediaMode::Auto | cuteafd_loader::plan::MediaMode::Off => cuteafd_loader::plan::MediaMode::Off,
+            _ => anyhow::bail!("explicit audio placement requires a qualified MiMo audio checkpoint"),
+        },
+    };
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
