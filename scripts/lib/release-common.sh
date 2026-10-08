@@ -1065,6 +1065,20 @@ done
 REMOTE
 }
 
+# Explicit --all cleanup only: never sweep worker ports during normal restart.
+release_stop_all_worker_containers() {
+  local host failed=0
+  local -a pids=()
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    release_ssh "$host" 'ids=$(docker ps -a --format "{{.Names}}" --filter "name=^cuteafd-spark-expert-.+-[0-9]+$" | grep -vE "^cuteafd-spark-expert-wip($|-)"); [ -z "$ids" ] || docker rm -f $ids >/dev/null' &
+    pids+=("$!")
+  done < <(release_stop_hosts)
+  local pid
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  ((failed == 0))
+}
+
 release_stop_services() {
   local coordinator_container="$1"
   local spark_container_prefix="$2"

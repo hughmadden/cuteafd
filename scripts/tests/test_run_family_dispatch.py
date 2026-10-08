@@ -54,6 +54,11 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--restart")
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart\n"
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--restart", "--all")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --all\n"
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--all")
+    assert result.returncode != 0 and "--all requires --restart" in result.stderr
     # DeepSeek V4.1 options do not apply to other families.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--concurrency", "4")
     assert result.returncode != 0 and "take --config, --restart, --wip and --embedding-placement" in result.stderr
@@ -1225,14 +1230,28 @@ def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-def test_restart_removes_workers_and_keeps_the_wip_container(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", restart=True)
+def test_restart_removes_only_own_worker_port(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf",
+                                   "GLM5_FLASH_FP8_MODEL_ID=off\nEXPERT_PORT=19555\nINSTANCE=own\n", restart=True)
+    assert result.returncode == 0, result.stderr
+    assert "docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr
+    assert "docker ps -aq --filter" not in result.stderr
+    assert "docker rm -f cuteafd-spark-expert-h0-19441" not in result.stderr
+    assert "docker rm -f cuteafd-spark-expert-wip" not in result.stderr
+
+
+def test_restart_all_sweeps_workers_and_keeps_the_wip_container(tmp_path):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   restart=True, extra_args=("--all",))
     assert result.returncode == 0, result.stderr
     cleanup = next(line for line in result.stderr.splitlines()
-                   if line.startswith("ssh h0 ") and "docker ps -aq --filter" in line)
+                   if line.startswith("ssh h0 ") and 'docker ps -a --format' in line)
     pattern = re.search(r'--filter "?name=([^")\s]+)', cleanup).group(1)
     assert re.search(pattern, "cuteafd-spark-expert-h0-19441")
     assert not re.search(pattern, "cuteafd-spark-expert-wip")
+    # Numeric WIP_INSTANCE suffixes can match the worker regex: exclude the
+    # entire persistent WIP namespace explicitly before deleting names.
+    assert 'grep -vE "^cuteafd-spark-expert-wip($|-)"' in cleanup
 
 
 def test_rdma_device_map_reaches_the_workers_and_the_coordinator(tmp_path):

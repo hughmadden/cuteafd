@@ -55,7 +55,8 @@ container-name characters, [A-Za-z0-9_.-], as scripts/launch/run-family.sh does.
   --tp2-dspark-experts          split native draft routed experts (default off)
   --no-tp2-<option>             disable the corresponding configured TP2 option
   --wip SLOT                     serve a ./wip.sh slot's artifacts in the dev images
-  --restart                     replace the current release deployment
+  --restart                     replace this instance's release deployment
+  --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate without changing services
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
@@ -75,6 +76,7 @@ EOF
 
 config="$repo_root/cuteafd.config"
 restart=0
+restart_all=0
 dry_run=0
 dspark_draft_limit=""
 wip_slot=""
@@ -111,11 +113,14 @@ while [[ $# -gt 0 ]]; do
     --no-tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=off; shift ;;
     --wip) wip_slot="${2:?$1 requires SLOT}"; shift 2 ;;
     --restart) restart=1; shift ;;
+    --all) restart_all=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) release_die "unknown run argument: $1" ;;
   esac
 done
+
+((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
 
 # Every family but DeepSeek V4.1 launches through scripts/launch/run-family.sh
 # (same config file, same container names, so ./stop.sh stops it); the family
@@ -131,6 +136,7 @@ if [[ "$family" != deepseek_v41 ]]; then
   [[ -z "$table_override" ]] || family_args+=(--table-backend "$table_override")
   [[ -z "$embedding_override" ]] || family_args+=(--embedding-placement "$embedding_override")
   ((restart == 0)) || family_args+=(--restart)
+  ((restart_all == 0)) || family_args+=(--all)
   [[ -z "$wip_slot" ]] || family_args+=(--wip "$wip_slot")
   exec "$repo_root/scripts/launch/run-family.sh" "${family_args[@]}"
 fi
@@ -484,6 +490,7 @@ if ((dry_run)); then
 fi
 if ((restart)); then
   release_stop_services "$coordinator" "$spark_prefix"
+  ((restart_all == 0)) || release_stop_all_worker_containers
 else
   docker inspect "$coordinator" >/dev/null 2>&1 && release_die "$coordinator already exists; use --restart"
   for i in "${!hosts[@]}"; do

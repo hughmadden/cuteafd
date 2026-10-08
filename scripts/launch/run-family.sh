@@ -10,6 +10,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 config="$repo_root/cuteafd.config"
 restart=0
+restart_all=0
 family=""
 embedding_override=""
 table_override=""
@@ -21,10 +22,12 @@ while [[ $# -gt 0 ]]; do
     --table-backend) table_override="${2:?--table-backend requires uring, mmap or mincore-routed}"; shift 2 ;;
     --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
+    --all) restart_all=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--table-backend uring|mmap|mincore-routed] [--restart] [--wip SLOT]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--table-backend uring|mmap|mincore-routed] [--restart [--all]] [--wip SLOT]" >&2; exit 2 ;;
   esac
 done
+((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
 # Plain KEY=VALUE lines; the launch reads only the keys below.
 declare -A cfg
 while IFS='=' read -r key value; do
@@ -805,9 +808,8 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
   [[ "${family_args[arg]}" != --audio ]] || family_args[arg+1]="$audio"
 done
 peers=()
-# --restart removes this launcher's containers; stop.sh accepts the same keys.
-# One model is served at a time: every expert worker on these hosts goes, whatever
-# its port (a leftover worker of another model holds Spark memory and OOMs the next).
+# --restart removes only this coordinator and its host-port workers. Broad
+# cleanup is opt-in (--all); shared hosts may hold another instance's workers.
 if [[ "$restart" == 1 ]]; then
   previous_csv=""
   if [[ "$ranks" == 0 && "$configured_ranks" != 0 ]]; then
@@ -829,11 +831,15 @@ if [[ "$restart" == 1 ]]; then
       done
     done
   fi
-  for ((rank = 0; rank < ranks; rank++)); do
+  cleanup_ranks="$ranks"
+  ((restart_all == 0)) || cleanup_ranks="$configured_ranks"
+  for ((rank = 0; rank < cleanup_ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    # Workers are cuteafd-spark-expert-HOST-PORT; the persistent ./wip.sh container
-    # (cuteafd-spark-expert-wip) and its build cache stay.
-    ssh "$host" 'ids=$(docker ps -aq --filter "name=^cuteafd-spark-expert-.+-[0-9]+$"); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
+    if ((restart_all)); then
+      ssh "$host" 'ids=$(docker ps -a --format "{{.Names}}" --filter "name=^cuteafd-spark-expert-.+-[0-9]+$" | grep -vE "^cuteafd-spark-expert-wip($|-)"); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
+    else
+      ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$port >/dev/null 2>&1 || true"
+    fi
   done
 fi
 # FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
