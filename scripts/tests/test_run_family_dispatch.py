@@ -504,6 +504,10 @@ def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, f
 def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,schedule", [("", None), ("GLM5_FLASH_EXL3_SCHEDULE=default\n", None),
                                             ("GLM5_FLASH_EXL3_SCHEDULE=gb10\n", "gb10")])
 def test_glmf_exl3_schedule_reaches_only_the_spark_workers(tmp_path, keys, schedule):
