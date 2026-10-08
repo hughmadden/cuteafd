@@ -123,6 +123,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    wip = "--wip" in extra_args
+    if wip:
+        (repo / "scripts" / "build").mkdir()
+        (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
     bin_dir = tmp_path / "bin"
@@ -133,8 +137,12 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "worker ready"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
+                                    ('case "$*" in image\\ inspect*) echo test-pin ;; '
+                                     'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
+                                     'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh" ;; esac\n'
+                                     if tool == "docker" and wip else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
-                                     if tool == "docker" and preferred_ranks is not None else '') +
+                                     if tool == "docker" and preferred_ranks is not None and encoder_plan is None else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
                                      if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
@@ -156,12 +164,40 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}", **(extra_env or {})}
+    if wip:
+        env["HOME"] = str(tmp_path / "home")
     if not with_nest:
         # Hide any nest the host has, keeping only the stub directory and the system tools.
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                            *(["--restart"] if restart else []), *extra_args],
                           env=env, capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("qwen", [False, True])
+def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen):
+    config = ({**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"},
+               "vision_config": {"depth": 24}}
+              if qwen else {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                            "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}})
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nWIP_INSTANCE=plan-test\n",
+                                  preferred_ranks=1 if qwen else None, encoder_plan=plan,
+                                  extra_args=("--wip", "slot-test"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    assert len(plans) == (2 if qwen else 1)
+    staging = next(i for i, line in enumerate(lines) if "docker cp" in line and ".cuteafd-wip" in line)
+    for preflight in plans:
+        assert staging < lines.index(preflight)
+        assert "cuteafd-coordinator-dev cuteafd plan" in preflight
+        for part in ("bin", "lib", "share"):
+            assert f"wip-run/plan-test/slot-test/{part}:/opt/cuteafd/{part}:ro" in preflight
+        assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
 
 
 @pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
