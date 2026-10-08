@@ -575,6 +575,25 @@ def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
         assert launch.count("--host-cache-bytes") == 1 and f"--host-cache-bytes {expected}" in launch, launch
 
 
+@pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
+                                           ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
+def test_glmf_prefix_marks_reach_the_encoder_plan(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=1\nSPECULATOR=off\nVISION=auto\n{keys}", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    for command in [launch, planner]:
+        if expected is None:
+            assert "--prefix-marks" not in command, command
+        else:
+            assert command.count("--prefix-marks") == 1 and f"--prefix-marks {expected}" in command, command
+
+
 def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
