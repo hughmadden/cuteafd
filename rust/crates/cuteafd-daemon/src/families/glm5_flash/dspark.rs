@@ -313,6 +313,8 @@ pub(crate) struct DsparkDrafter<'a> {
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block (--draft-head).
     head_mode: Cell<DraftHead>,
+    /// How the FP8 GEMMs run (--draft-linear; the FP8 scratch serves it).
+    fp8_rows: Cell<fp8_linear::Fp8Rows>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -328,11 +330,12 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 impl<'a> DsparkDrafter<'a> {
     /// Uploads the drafter's tensors (see [`prefetch`]) and allocates `slots`
     /// ring contexts; draft steps take up to `max_sequences` sequences.
-    /// `mask_row` is the target embedding of the mask token.
+    /// `mask_row` is the target embedding of the mask token; `fp8_rows` how the
+    /// FP8 GEMMs run.
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
         slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
-        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
@@ -409,7 +412,7 @@ impl<'a> DsparkDrafter<'a> {
             GlmDraftRepresentation::Fp8Only => {
                 let shapes = [(taps, h), (h, cfg.qkv_width()), (h, 2 * kv), (cfg.q_width(), h), (h, 2 * inter),
                     (inter, h)];
-                Some(fp8_linear::scratch(library, TAP_ROWS.max(max_sequences * cfg.block), &shapes)?)
+                Some(fp8_linear::scratch_rows(library, TAP_ROWS.max(max_sequences * cfg.block), &shapes, fp8_rows)?)
             }
         };
         let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
@@ -442,6 +445,7 @@ impl<'a> DsparkDrafter<'a> {
             representation,
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
+            fp8_rows: Cell::new(fp8_rows),
             cfg,
         })
     }
@@ -463,8 +467,10 @@ impl<'a> DsparkDrafter<'a> {
             Weight::Bf16(w) => unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) },
             Weight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
-                // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows.
-                unsafe { w.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) }
+                // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows
+                // in this mode (the load sized it for its mode).
+                unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
+                    self.fp8_rows.get()) }
             }
         }
     }
@@ -757,7 +763,8 @@ impl<'a> Drafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
-        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows)
+        -> Result<Self> {
         if is_dspark(snapshot) {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
@@ -765,7 +772,7 @@ impl<'a> Drafter<'a> {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let tensors = prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
-                sequences.min(MAX_SEQUENCES), mask, representation, scales)?));
+                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows)?));
         }
         let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
@@ -774,7 +781,7 @@ impl<'a> Drafter<'a> {
         let file = crate::families::glm5::dflash::prefetch(snapshot).join()
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
         Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, slots,
-            sequences, mask, true, representation, scales)?))
+            sequences, mask, true, representation, scales, fp8_rows)?))
     }
 
     pub fn prepare_workspace(&self) -> Result<()> {
