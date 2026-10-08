@@ -33,6 +33,43 @@ const PLACEMENT_BUDGET: Duration = Duration::from_secs(10);
 /// Bytes each bond member received on the wire (`ethtool -S`), RDMA included.
 const RX_COUNTER: &str = "rx_bytes_phy";
 
+/// Sample physical member counters away from the request polling hot path.
+/// Physical counters include competing traffic, which is named in the log.
+pub(super) fn monitor_bond(selection: &crate::fabric::RdmaSelection, address: IpAddr) {
+    static MONITORS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let IpAddr::V4(address) = address else { return };
+    let gid = format!("00000000000000000000ffff{:08x}", u32::from(address));
+    let Ok(Some(bond)) = bond::discover_bond(std::path::Path::new("/sys"),
+        &selection.device, selection.port, &gid) else { return };
+    let Ok(mut monitored) = MONITORS.get_or_init(|| Mutex::new(BTreeSet::new())).lock() else { return };
+    if monitored.contains(&bond.bond) { return; }
+    let mut counters = match EthtoolCounters::open(&bond.slaves, RX_COUNTER) {
+        Ok(counters) => counters,
+        Err(error) => { tracing::warn!(%error, bond = %bond.bond, "cannot monitor RoCE bond traffic"); return; }
+    };
+    monitored.insert(bond.bond.clone());
+    thread::spawn(move || {
+        let Ok(mut before) = counters.read() else { return };
+        loop {
+            thread::sleep(Duration::from_secs(5));
+            let Ok(after) = counters.read() else { return };
+            let deltas: Vec<_> = after.iter().zip(&before).map(|(a, b)| a.saturating_sub(*b)).collect();
+            before = after;
+            let total: u64 = deltas.iter().sum();
+            if total < 64 * 1024 * 1024 { continue; }
+            for (member, bytes) in bond.slaves.iter().zip(deltas) {
+                let share = bytes as f64 / total as f64;
+                tracing::info!(bond = %bond.bond, %member, bytes, share_percent = share * 100.0,
+                    "expert fabric bond traffic share (physical counters include competing traffic)");
+                if bond.slaves.len() == 2 && !(0.42..=0.58).contains(&share) {
+                    tracing::warn!(bond = %bond.bond, %member, share_percent = share * 100.0,
+                        "RoCE bond traffic outside 42-58 percent balance");
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct VerbsHostFlowProbeStart {
     pub(super) message: String,
@@ -114,7 +151,7 @@ fn serve_flow_probe(
         PROBE_CONTROL_BYTES,
         start.probe_bytes,
         next_local_psn("server"),
-        rdma_device.as_deref(),
+        rdma_device.as_ref(),
     )?;
     endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
     let (read_addr, read_rkey) =
@@ -152,17 +189,13 @@ fn probe_once(
     probe_bytes: usize,
     counters: &mut dyn PortCounters,
 ) -> Result<ProbeResult> {
-    let endpoint = NativeRdmaEndpoint::create_from_wire_bytes(
-        Arc::clone(library),
-        "client",
-        PROBE_CONTROL_BYTES,
-        probe_bytes,
-        PROBE_CONTROL_BYTES,
-        probe_bytes,
-        next_local_psn("client"),
-    )?;
     let mut stream = connect_control_stream(&peer.to_string(), PROBE_CONTROL_TIMEOUT)?;
     configure_control_stream(&stream, PROBE_CONTROL_TIMEOUT)?;
+    let selection = verbs_host_rdma_device_for_stream(&stream)?;
+    let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_on_device(
+        Arc::clone(library), "client", PROBE_CONTROL_BYTES, probe_bytes,
+        PROBE_CONTROL_BYTES, probe_bytes, next_local_psn("client"), selection.as_ref(),
+    )?;
     let mut reader = BufReader::new(stream.try_clone()?);
     write_control(
         &mut stream,
@@ -263,12 +296,12 @@ impl Balancer {
 
     /// Probe mode's first use: find the bond behind the RDMA device this
     /// process's QPs open (as a probe endpoint reports it) and its counters.
-    fn initialize(&mut self) {
+    fn initialize(&mut self, peer: SocketAddr) {
         self.initialized = true;
         if self.mode != BondBalance::Probe {
             return;
         }
-        match Self::find_measure(self.probe_bytes) {
+        match Self::find_measure(peer, self.probe_bytes) {
             Ok(Some(measure)) => {
                 tracing::info!(bond = %measure.bond.bond, members = ?measure.bond.slaves, counter = RX_COUNTER,
                     max_probes = self.max_probes, probe_bytes = self.probe_bytes,
@@ -282,16 +315,13 @@ impl Balancer {
         }
     }
 
-    fn find_measure(probe_bytes: usize) -> Result<Option<Measure>> {
+    fn find_measure(peer: SocketAddr, probe_bytes: usize) -> Result<Option<Measure>> {
         let library = load_verbs_host_native_library()?;
-        let endpoint = NativeRdmaEndpoint::create_from_wire_bytes(
-            Arc::clone(&library),
-            "client",
-            PROBE_CONTROL_BYTES,
-            probe_bytes,
-            PROBE_CONTROL_BYTES,
-            probe_bytes,
-            next_local_psn("client"),
+        let stream = connect_control_stream(&peer.to_string(), PROBE_CONTROL_TIMEOUT)?;
+        let selection = verbs_host_rdma_device_for_stream(&stream)?;
+        let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_on_device(
+            Arc::clone(&library), "client", PROBE_CONTROL_BYTES, probe_bytes,
+            PROBE_CONTROL_BYTES, probe_bytes, next_local_psn("client"), selection.as_ref(),
         )?;
         let device = c_char_array_to_string(&endpoint.info.device_name);
         let gid = c_char_array_to_string(&endpoint.info.gid_hex);
@@ -306,7 +336,7 @@ impl Balancer {
 
     fn acquire(&mut self, peer: SocketAddr, transport: u64) -> Result<Assignment> {
         if !self.initialized {
-            self.initialize();
+            self.initialize(peer);
         }
         let ip = peer.ip();
         let Some(measure) = self.measure.as_mut().filter(|_| !self.unsupported.contains(&ip)) else {

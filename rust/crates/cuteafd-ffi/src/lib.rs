@@ -1059,6 +1059,21 @@ type RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn = unsafe extern "C" fn(
     host_buffer_flags: u64,
     out: *mut CuteafdRdmaRcEndpointInfo,
 ) -> CuteafdStatus;
+type RdmaRcEndpointCreateOnGidWithBufferFlagsFn = unsafe extern "C" fn(
+    device_name: *const c_char,
+    port_num: u32,
+    gid_index: u32,
+    local_psn: u32,
+    send_frame_bytes: usize,
+    recv_frame_bytes: usize,
+    send_registered_span_bytes: usize,
+    recv_registered_span_bytes: usize,
+    max_send_wr: u32,
+    max_recv_wr: u32,
+    max_sge: u32,
+    host_buffer_flags: u64,
+    out: *mut CuteafdRdmaRcEndpointInfo,
+) -> CuteafdStatus;
 type RdmaRcEndpointBufferViewFn = unsafe extern "C" fn(
     handle: *mut c_void,
     receive_buffer: c_int,
@@ -3667,6 +3682,55 @@ impl NativeLibrary {
         };
         self.status_to_result(
             "cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags",
+            status,
+        )?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
+        Ok(info)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+        &self,
+        device_name: &str,
+        port_num: u32,
+        gid_index: u32,
+        local_psn: u32,
+        send_frame_bytes: usize,
+        recv_frame_bytes: usize,
+        send_registered_span_bytes: usize,
+        recv_registered_span_bytes: usize,
+        max_send_wr: u32,
+        max_recv_wr: u32,
+        max_sge: u32,
+        host_buffer_flags: u64,
+    ) -> Result<CuteafdRdmaRcEndpointInfo> {
+        // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
+        let create_fn: Symbol<RdmaRcEndpointCreateOnGidWithBufferFlagsFn> = unsafe {
+            self.lib
+                .get(b"cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags")?
+        };
+        let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
+        let mut info = CuteafdRdmaRcEndpointInfo::default();
+        // SAFETY: device_name and info remain valid for the synchronous native call.
+        let status = unsafe {
+            create_fn(
+                device_name.as_ptr(),
+                port_num,
+                gid_index,
+                local_psn,
+                send_frame_bytes,
+                recv_frame_bytes,
+                send_registered_span_bytes,
+                recv_registered_span_bytes,
+                max_send_wr,
+                max_recv_wr,
+                max_sge,
+                host_buffer_flags,
+                &mut info,
+            )
+        };
+        self.status_to_result(
+            "cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags",
             status,
         )?;
         record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);

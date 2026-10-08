@@ -293,7 +293,7 @@ impl LocalVerbsExpertConnection {
             start.request_registered_span_bytes,
             start.response_registered_span_bytes,
             next_local_psn("server"),
-            rdma_device.as_deref(),
+            rdma_device.as_ref(),
         )?;
         let request_recv_view = endpoint.recv_buffer_view()?;
         let response_send_view = endpoint.send_buffer_view()?;
