@@ -109,7 +109,8 @@ pub(super) fn preflight(
     prefix_draft: bool,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
-        admit_device_reservations, resolve_capacity, CapacityPolicy, DeviceMemory,
+        admit_device_reservations_with_headroom, resolve_capacity, CapacityPolicy, DeviceMemory,
+        small_card_headroom_bytes,
     };
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
     use cuteafd_loader::families::mimo_v2::capacity::{
@@ -390,6 +391,7 @@ pub(super) fn preflight(
     )?;
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
+        small_card_headroom: true,
         target_pool_tokens: (if memory.iter().any(|m| m.total_bytes <= 32u64 << 30) { 1u64 << 20 }
             else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS }).max(args.max_context as u64),
         max_context_tokens: Some(args.max_context as u64),
@@ -400,7 +402,8 @@ pub(super) fn preflight(
     let report = reservation_report(&profiles.steady, &memory, policy)?;
     tracing::info!(reservations = %report, "MiMo steady allocation contract before module/weight loads");
     for (loading, &sample) in profiles.loading.iter().zip(&memory) {
-        admit_device_reservations(policy.gpu_occupancy_percent, sample, &loading.reservations)
+        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, sample,
+            &loading.reservations, small_card_headroom_bytes(sample.total_bytes))
             .with_context(|| format!("MiMo target-loading admission; steady contract {report}"))?;
     }
     let capacity = resolve_capacity(policy, &profiles.steady, &memory).with_context(|| {
@@ -427,7 +430,8 @@ pub(super) fn preflight(
             if rank == 0 {
                 costs.extend(draft_packing.iter().cloned());
             }
-            admit_device_reservations(policy.gpu_occupancy_percent, memory[rank], &costs)
+            admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, memory[rank],
+                &costs, small_card_headroom_bytes(memory[rank].total_bytes))
                 .context("MiMo selected drafter packing admission after target KV allocation")?;
             tracing::info!(rank, reservations = %serde_json::to_string(&costs)?,
                 "MiMo selected drafter packing phase before any model allocation");
@@ -466,7 +470,8 @@ pub(super) fn preflight(
             name: "startup.spark_intake_probe_temporary".into(),
             bytes: intake_probe_bytes,
         });
-        admit_device_reservations(policy.gpu_occupancy_percent, memory[0], &costs)?;
+        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, memory[0],
+            &costs, small_card_headroom_bytes(memory[0].total_bytes))?;
     }
     tracing::info!(checkpoint_max_context = capacity.checkpoint_max_context_tokens,
         max_context = capacity.effective_max_context_tokens, requested_pool = args.pool_tokens,
@@ -507,9 +512,12 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let budget = (u128::from(sample.total_bytes) * u128::from(policy.gpu_occupancy_percent)
-            / 100)
-            .saturating_sub(u128::from(non_engine));
+        let minimum_free = if policy.small_card_headroom {
+            cuteafd_core::serving_capacity::small_card_headroom_bytes(sample.total_bytes)
+        } else { 0 };
+        let budget = cuteafd_core::serving_capacity::admission_ceiling(
+            sample.total_bytes, policy.gpu_occupancy_percent, minimum_free)?
+            .saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {
             let category = cost
@@ -532,6 +540,7 @@ fn reservation_report(
         devices.push(serde_json::json!({
             "device": costs.device, "total_bytes": sample.total_bytes,
             "non_engine_bytes": non_engine, "engine_budget_bytes": budget,
+            "minimum_free_bytes": minimum_free,
             "fixed_categories": fixed, "fixed_bytes": fixed_bytes,
             "requested_pool_bytes": pool_bytes,
             "complete_requested_bytes": fixed_bytes.checked_add(pool_bytes).context("MiMo complete requested bytes overflow")?,

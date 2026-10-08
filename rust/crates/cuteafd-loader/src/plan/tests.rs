@@ -1117,7 +1117,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + options.layout.as_ref().unwrap().headroom_bytes;
+            + bytes + options.layout.as_ref().unwrap().headroom_bytes
+                .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(gpu.devices[1].by_category().get(&Category::Embedding), None);
     options.layout.as_mut().unwrap().host_embedding = true;
@@ -1148,6 +1149,8 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     }), ..sparks(4) };
     let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
+    assert_eq!(base.devices[0].capacity_bytes,
+        (32u64 << 30) - cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;

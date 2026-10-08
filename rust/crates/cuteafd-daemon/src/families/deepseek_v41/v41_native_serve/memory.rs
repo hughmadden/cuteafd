@@ -30,9 +30,10 @@ pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(
     let live = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let occupied = total - free;
     // Opt-in empirical reserve, not a per-executable model: official V4.1 Flash,
-    // 31.8 GiB/C16/six fixed shapes grew 1,107,296,256 bytes ready -> plateau.
-    // The measured 2 GiB envelope also covers untracked driver/allocator growth;
-    // enlarged shape sets still require their own warmed margin gate.
+    // 31.8 GiB/C16 grew 1,107,296,256 bytes with six shapes, and 838,860,800
+    // with eight shapes plus bounded index selection, ready -> ten-batch plateau.
+    // The 2 GiB envelope also covers untracked driver/allocator growth;
+    // other shape sets still require their own warmed margin gate.
     let graph_budget = std::env::var("CUTEAFD_V41_GRAPH_BUDGET_MIB").ok()
         .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(0)
         .checked_mul(1 << 20).context("V4.1 graph budget overflow")?;
@@ -59,12 +60,15 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
     let available: Vec<u64> = memory.iter().enumerate().map(|(gpu, &(free, total))| {
         ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory information");
         let policy_ceiling = args.memory_reservation.map(|r| r.bytes(total)).transpose()?.unwrap_or(total);
-        let ceiling = if automatic { policy_ceiling.min((total as u128 * 97 / 100) as usize) }
+        let small_card = total <= 32usize << 30;
+        let ceiling = if small_card {
+            policy_ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(total as u64,
+                97, cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64))? as usize)
+        } else if automatic { policy_ceiling.min((total as u128 * 97 / 100) as usize) }
             else { policy_ceiling };
-        // Keep >=3 GiB even after deferred local expert placement consumes
-        // its allowed budget. Existing explicit/non-planner paths are intact.
-        let runtime = if automatic { 3usize << 30 } else if memory.len() == 1 { RUNTIME_HEADROOM }
-            else { distributed::RUNTIME_HEADROOM };
+        // The small-card ceiling already includes its absolute runtime slack.
+        let runtime = if small_card { 0 } else if automatic { 3usize << 30 }
+            else if memory.len() == 1 { RUNTIME_HEADROOM } else { distributed::RUNTIME_HEADROOM };
         Ok(ceiling.checked_sub(total - free).and_then(|n| n.checked_sub(runtime))
             .with_context(|| format!("GPU {gpu} planner leaves no room after fixed owners and runtime reserve"))? as u64)
     }).collect::<Result<_>>()?;
@@ -358,9 +362,12 @@ impl PoolPlan {
             .map(|r| r.bytes(total))
             .transpose()?
             .unwrap_or(total);
-        let runtime_headroom = if total <= 32usize << 30 && !matches!(reservation, Some(Reservation::Bytes(_))) {
-            RUNTIME_HEADROOM.max((3usize << 30).saturating_sub(total - ceiling))
-        } else { RUNTIME_HEADROOM };
+        let small_card = total <= 32usize << 30;
+        let ceiling = if small_card { ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(
+            total as u64, 97, cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64))? as usize)
+        } else { ceiling };
+        // The absolute runtime floor is already charged in the ceiling.
+        let runtime_headroom = if small_card { 0 } else { RUNTIME_HEADROOM };
         let available = ceiling.checked_sub(occupied).and_then(|v| v.checked_sub(runtime_headroom))
             .context("memory reservation leaves no space after existing allocations and runtime headroom")?;
         ensure!(retained_turns <= 128, "invalid retained-turn limit");
@@ -513,9 +520,16 @@ mod tests {
         let total = 32usize << 30;
         let free = 5usize << 30;
         let plan = PoolPlan::new(16, 1_048_576, 24, 0, None, None, free, total).unwrap();
-        assert!(plan.cache_bytes + (3usize << 30) <= free);
+        let floor = cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES as usize;
+        assert!(plan.cache_bytes + floor <= free);
         let reserved = PoolPlan::new(16, 1_048_576, 24, 0, None, Some("97%".parse().unwrap()), free, total).unwrap();
-        assert!(free - reserved.cache_bytes >= 3usize << 30);
+        assert!(free - reserved.cache_bytes >= floor);
+        let explicit = PoolPlan::new(16, 1_048_576, 24, 0, None,
+            Some(Reservation::Bytes(ByteSize(total))), free, total).unwrap();
+        assert!(free - explicit.cache_bytes >= floor);
+        let overflow = explicit.global_bytes + GROUP_BYTES;
+        assert!(PoolPlan::new(16, 1_048_576, 24, 0, Some(ByteSize(overflow)),
+            Some(Reservation::Bytes(ByteSize(total))), free, total).is_err());
         assert!(plan.pages[0] >= 2048 + 64);
         assert!(PoolPlan::new(16, 1_048_576, 24, 0, Some(ByteSize(16 << 30)), None, free, total).is_err());
     }

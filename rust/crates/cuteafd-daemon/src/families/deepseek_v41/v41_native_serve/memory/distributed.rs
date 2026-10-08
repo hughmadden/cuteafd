@@ -124,8 +124,15 @@ impl PoolPlan {
             ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory information");
             occupied_before[gpu] = total - free;
             reservation_bytes[gpu] = reservation.map(|r| r.bytes(total)).transpose()?.unwrap_or(total);
+            let small_card = total <= 32usize << 30;
+            if small_card {
+                reservation_bytes[gpu] = reservation_bytes[gpu].min(
+                    cuteafd_core::serving_capacity::admission_ceiling(total as u64, 97,
+                        cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64))? as usize);
+            }
+            let runtime = if small_card { 0 } else { RUNTIME_HEADROOM };
             available[gpu] = reservation_bytes[gpu].checked_sub(occupied_before[gpu])
-                .and_then(|n| n.checked_sub(RUNTIME_HEADROOM))
+                .and_then(|n| n.checked_sub(runtime))
                 .with_context(|| format!("GPU {gpu} reservation leaves no cache space after fixed owners and runtime headroom"))?;
         }
         let cache_bytes = |groups| if replicated {
@@ -171,6 +178,21 @@ impl PoolPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_card_pool_leaves_absolute_floor_on_each_rank() -> anyhow::Result<()> {
+        let placement = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let total = 32usize << 30;
+        let free = 8usize << 30;
+        let plan = PoolPlan::new(placement, 16, 1_048_576, 20, 0, None,
+            Some("97%".parse()?), [(free, total); 2])?;
+        let floor = cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES as usize;
+        for gpu in 0..2 {
+            assert!(free - plan.cache_bytes[gpu] >= floor);
+            assert_eq!(plan.reservation_bytes[gpu], total - floor);
+        }
+        Ok(())
+    }
+
     #[test]
     fn replicated_pool_charges_both_cards_without_inflating_tokens()->anyhow::Result<()> {
         let placement=crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
