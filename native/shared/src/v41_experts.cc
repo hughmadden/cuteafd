@@ -149,9 +149,7 @@ extern "C" int32_t cuteafd_expert_output_kind(int32_t capacity, uint32_t* out) {
 }
 
 namespace {
-// Same contract as v41_fp8.cc: the AOT export pins compute capability and SM count of the
-// GPU that ran export_b12x_v41_experts_aot.py. Name the mismatch instead of returning a
-// bare cudaErrorInvalidDevice (101).
+// Cubins require the exported architecture, not the export host's SM count.
 int32_t reject_expert_device(const char* what, int device, int major, int minor, int sms) {
   std::fprintf(stderr,
                "cuteafd: %s AOT kernels were exported for compute 12.%d with %d SMs, but device "
@@ -177,11 +175,6 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   if (status != cudaSuccess) return status;
   if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
     return reject_expert_device("v41 expert", device, major, minor, sms);
-  if (sms != CUTEAFD_V41_SMS)
-    std::fprintf(stderr,
-                 "cuteafd: v41 expert AOT was exported on a %d-SM part but device %d has %d SMs; "
-                 "using the same kernels with the launch cluster cap clamped to %d\n",
-                 int(CUTEAFD_V41_SMS), device, sms, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   if (variant->device >= 0) {
     if (variant->device != device) return cudaErrorInvalidDevice;
@@ -217,6 +210,11 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
     return status;
   }
   variant->device = device;
+  if (sms != CUTEAFD_V41_SMS)
+    std::fprintf(stderr,
+                 "cuteafd: v41 expert AOT was exported on a %d-SM part but device %d has %d SMs; "
+                 "using the same kernels with the launch cluster cap clamped to %d\n",
+                 int(CUTEAFD_V41_SMS), device, sms, sms);
   *out = variant;
   return cudaSuccess;
 }
@@ -284,7 +282,7 @@ extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR || sms != CUTEAFD_V41_SMS)
+  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
     return reject_expert_device("v41 expert input-quant", device, major, minor, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   auto* owner = input_quant.device == device ? &input_quant :
@@ -305,7 +303,13 @@ extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
     if (!existing) { if (input_quant.library) cudaLibraryUnload(input_quant.library); input_quant.library = nullptr; }
     return status;
   }
+  owner->device_sms = sms;
   owner->device = device;
+  if (sms != CUTEAFD_V41_SMS)
+    std::fprintf(stderr,
+                 "cuteafd: v41 input-quant AOT exported on %d SMs; device %d has %d SMs; "
+                 "using the same kernel with grid capped at %d CTAs\n",
+                 int(CUTEAFD_V41_SMS), device, sms, 4 * sms);
   *out = owner;
   return cudaSuccess;
 }
@@ -325,7 +329,8 @@ extern "C" int32_t cuteafd_v41_expert_input_quantize_async(void* kernel,
   void* values = output;
   void* scales = output + 5120;
   void* unused_mma = output; // wire specialization does not write MMA scales
-  int32_t m = rows, grid = cuteafd_v41_input_quant_grids[rows-1];
+  // The quantizer covers every task with a grid-stride loop.
+  int32_t m = rows, grid = std::min<int>(cuteafd_v41_input_quant_grids[rows-1], 4 * owner->device_sms);
   int32_t result = 0;
   void* args[] = {&source, &values, &scales, &unused_mma, &m, &grid, &stream, &result};
   CUTEAFD_V41_INPUT_QUANT_ENTRY(args, 8);
