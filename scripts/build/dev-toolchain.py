@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Content identity for the development toolchain (independent of kernel pins)."""
+"""Byte-exact toolchain identity (independent of kernel pins).
+
+Dockerfile frontend/cache syntax changes intentionally require a new tc- tag:
+keep this conservative rather than risk normalizing away content-affecting edits.
+"""
 import hashlib
 from pathlib import Path
 

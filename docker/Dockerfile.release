@@ -1,5 +1,8 @@
+# syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 FROM ${BASE_IMAGE} AS inference
+ARG TARGETARCH
+# Cache mounts stay out of layers. Reset with: docker buildx prune --filter type=exec.cachemount
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HF_HUB_OFFLINE=1
@@ -18,8 +21,10 @@ RUN apt-get update && \
       iproute2 pciutils netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir uv && \
-    uv pip install --system --break-system-packages --no-cache \
+RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+    python3 -m pip install uv && \
+    uv pip install --system --break-system-packages \
       safetensors \
       huggingface-hub \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
@@ -32,14 +37,15 @@ RUN python3 -m pip install --no-cache-dir uv && \
       "tabulate==0.10.0" \
       "transformers==5.13.0" \
       "rich==15.0.0" && \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
+    uv pip install --system --break-system-packages --no-deps \
       "flashinfer-python==0.6.14" && \
     python3 -c 'import torch; print(torch.__version__)'
 
 # The NGC 26.05 base declares pytest as a runtime requirement of its bundled
 # triton-kernels distribution. Keep the release environment dependency-complete
 # so the source-pinned SparkInfer installation can be checked globally below.
-RUN uv pip install --system --break-system-packages --no-cache pytest
+RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+    uv pip install --system --break-system-packages pytest
 
 # Keep source/revision metadata after the expensive immutable dependency
 # layers. Rapid SparkInfer iteration should invalidate only the pinned-source
@@ -80,7 +86,8 @@ COPY scripts/build/sparkinfer-release-provenance.py /opt/cuteafd/scripts/build/s
 COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
 COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
 
-RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
+RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+    python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
     locked_revision="$(python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
@@ -89,7 +96,7 @@ RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --print-revision)" && \
     [ "${CUTEAFD_SPARKINFER_COMMIT}" != unknown ] && \
     [ "${CUTEAFD_SPARKINFER_COMMIT}" = "$locked_revision" ] && \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
+    uv pip install --system --break-system-packages --no-deps \
       --editable /opt/cuteafd/third_party/sparkinfer && \
     uv pip check && \
     python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
@@ -103,7 +110,8 @@ RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
 COPY scripts/build/verify-tool-eval-source.py /opt/cuteafd/scripts/build/verify-tool-eval-source.py
 COPY third_party/tool-eval-bench.lock.json /opt/cuteafd/third_party/tool-eval-bench.lock.json
 COPY third_party/tool-eval-bench /opt/cuteafd/third_party/tool-eval-bench
-RUN if [ "$CUTEAFD_ROLE" = coordinator ]; then \
+RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+    if [ "$CUTEAFD_ROLE" = coordinator ]; then \
       python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py \
         --source /opt/cuteafd/third_party/tool-eval-bench \
         --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json && \
@@ -111,7 +119,7 @@ RUN if [ "$CUTEAFD_ROLE" = coordinator ]; then \
         --source /opt/cuteafd/third_party/tool-eval-bench \
         --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json --print-revision)" && \
       SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+g${revision%"${revision#???????}"}" \
-        uv pip install --system --break-system-packages --no-cache /opt/cuteafd/third_party/tool-eval-bench && \
+        uv pip install --system --break-system-packages /opt/cuteafd/third_party/tool-eval-bench && \
       uv pip check && tool-eval-bench --help >/dev/null; \
     else rm -rf /opt/cuteafd/third_party/tool-eval-bench; fi
 
