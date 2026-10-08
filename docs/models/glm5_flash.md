@@ -99,7 +99,15 @@ Attention (KDA), a minority run MLA + DSA.
   127-row verify step through the experts. The launcher passes the decode
   rows to the encoder placement plan as well as to serving.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
-  a KDA recurrent-state mark at the commit point (`kda_len`).
+  a KDA recurrent-state mark at the commit point (`kda_len`). Marks live in a
+  device arena of 2C + 2 marks (147.6 MB each with an FP32 state), which both
+  KV admissions reserve, or with `GLM5_FLASH_PREFIX_MARKS=pool`
+  (`--prefix-marks pool`, opt-in) in units of the KV pool itself (49 per FP32
+  mark), taken at capture and evicted with the snapshot's rows. Unit 0 is then
+  never handed out: the decode sparse MLA reads its first record for masked
+  candidates, and a mark's bytes there would turn decode rows into NaN. Pool
+  marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
+  keeps it off), so the snapshots the pool evicts move to RAM.
 
 ## Default precision (single residency)
 

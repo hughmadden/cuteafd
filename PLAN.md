@@ -1747,6 +1747,54 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 ## Explore after v2
 
 Ideas TJ wants kept for later; not v2 work.
+- **First after v2: retire ds41rt; V4.1 becomes an ordinary family (TJ, 2026-10-09).**
+  The goal is to remove ds41rt as a separate engine, not only to move its
+  scheduler: V4.1 should be a model the shared engine runs, as GLM Flash and
+  MiMo are. It came in as the ds41rt speed floor. Under the old "never slower
+  than the replaced engine" rule its hot path was left alone while `shared/`
+  grew beside it. Today:
+  - ~60K lines in 141 files in `families/deepseek_v41/` (the next largest
+    family has ~12.5K);
+  - 42 native files (~4.2K lines);
+  - 228 ds41-named references;
+  - none of `shared/prefill_share`, the generic prefix cache, shared decode
+    graphs or the expert service is used.
+  Features and fixes land on it separately, or not at all.
+  1. **Inventory (Fable design session).** Classify every V4.1-specific
+     mechanism as (a) truly model-specific, (b) a generic capability
+     `shared/` lacks, or (c) a ds41rt vestige.
+     - Model-specific: compressed/sparse KV and indexer attention, HC/mHC,
+       Engram tables, weight formats.
+     - Likely generic: two-lane encoder pipelining, HC-lagged replay as a
+       "lagged state" concept, independent decode lanes, memory placement.
+  2. **Grow `shared/`** for the (b) items, so any family can use them.
+  3. **Migrate in stages,** each gated by the quick A/B at the 2M operating
+     point: serve loop and decode share (`PrefillQueue`, with time-sized
+     chunks), prefix cache (`PrefixFamily`/`RefPagePool`), decode graphs, the
+     expert exchange and service, memory planning. Delete the (c) vestiges
+     as each stage lands.
+  4. **End state:** `families/deepseek_v41/` holds only model code, roughly
+     a GLM Flash-sized module; no ds41/ds41rt names remain in configs,
+     scripts or docs.
+  Input from `work/v41-decode-share` (2026-10-09; the branch is closed, not
+  merged; the unification supersedes it):
+  - a 2048-row text encoder wave costs 480-680 ms and the 128-row replay
+    ~250 ms, so wave-boundary interleaving can't bring decode gaps to tens of
+    ms;
+  - smaller prefill units need the fidelity gate;
+  - the shared queue should take time-sized chunks (generalise MiMo's
+    `--prefill-chunk-s`);
+  - share-0 C16 recheck (1 RTX + 4, 3 interleaved pairs, pre0 vs the branch at
+    share 0): the first single-run -25% did not reproduce (the earlier arm had
+    run an extra probe panel first). Paired ratios 0.931 / 1.003 / 0.947,
+    median -5.3%; arm medians 734.6 -> 714.5 (-2.7%). The CPU audit found no
+    hot-path cause: the share-0 queue stays empty and lane moves are
+    identical. The unification must keep the share-0 path free of per-round
+    overhead and re-measure C16.
+- Deterministic Spark expert reduction for prefill (ordered FP32 route planes;
+  an export option today): cold V4.1 prefill isn't bit-reproducible run to
+  run because of FP32 atomics, which blocks exact cache/golden/A-B checks.
+  Measure the cost; make it an opt-in, or the default if cheap.
 - Embedding in host RAM on the RTX PRO 6000: benchmark per model before any
   default change. It likely depends on vocabulary head and embedding size,
   and on whether the freed memory actually changes allocation enough to

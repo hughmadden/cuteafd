@@ -91,17 +91,30 @@ if [[ "$xgrammar" == ON ]]; then
 fi
 
 mkdir -p "$build_dir" "$output_dir"
+if [[ "${CUTEAFD_BUILD_CACHES:-on}" == off ]]; then
+  cold_cache="$(mktemp -d "$build_dir/cold-cache.XXXXXXXX")"
+  export CARGO_HOME="$cold_cache/cargo"
+  export CUTEAFD_KACHE= CUTEAFD_SCCACHE_CUDA=0
+  export TORCH_EXTENSIONS_DIR="$cold_cache/torch-extensions" XDG_CACHE_HOME="$cold_cache/xdg"
+  export B12X_ROCE_CACHE_DIR="$cold_cache/roce" TRITON_CACHE_DIR="$cold_cache/triton"
+  export TORCHINDUCTOR_CACHE_DIR="$cold_cache/torchinductor"
+fi
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$build_dir/cache/torchinductor}"
+mkdir -p "${CARGO_HOME:-$HOME/.cargo}" "$TORCHINDUCTOR_CACHE_DIR"
+source "$(dirname "${BASH_SOURCE[0]}")/build-caches.sh"
 export PYTHONDONTWRITEBYTECODE=1
-export TORCH_EXTENSIONS_DIR="$build_dir/cache/torch-extensions"
-export XDG_CACHE_HOME="$build_dir/cache/xdg"
-export B12X_ROCE_CACHE_DIR="$build_dir/cache/roce"
-export TRITON_CACHE_DIR="$build_dir/cache/triton"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$build_dir/cache/torch-extensions}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$build_dir/cache/xdg}"
+export B12X_ROCE_CACHE_DIR="${B12X_ROCE_CACHE_DIR:-$build_dir/cache/roce}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$build_dir/cache/triton}"
 mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
 export PYO3_PYTHON=python3
 export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/cuteafd_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
-export CARGO_TARGET_DIR="$build_dir/cargo-target"
 source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_dir"
+# kache restores hardlinks; plain and cached Cargo must not share outputs.
+export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
+cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
 cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"
 compiler_cache_cmake_args=()
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_dir/native")
@@ -131,6 +144,7 @@ fi
 wip_current_fingerprint="$wip_rust_fingerprint $wip_native_fingerprint"
 
 cargo build \
+  --locked \
   --quiet \
   --manifest-path "$source_dir/rust/Cargo.toml" \
   -p cuteafd-daemon \

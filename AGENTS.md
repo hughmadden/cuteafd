@@ -133,9 +133,21 @@ before → after tables with conditions.
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   no failing ids since the codex/v1 merge (808 pass); add none.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
-- Optional compiler cache: set `CUTEAFD_KACHE=/absolute/path/to/kache` (v1.0.0)
-  and optionally `CUTEAFD_KACHE_REMOTE=/shared/cache/directory`. Unset means
-  unchanged plain builds; missing kache or inaccessible remote warns and falls
+- Release and WIP builds persist Cargo registry/git under
+  `~/.cache/cuteafd/cargo-home/<arch>`, toolchain-keyed JIT caches under
+  `~/.cache/cuteafd/jit/<dev-toolchain-hash>/<arch>`, and local compiler caches
+  under `~/.cache/cuteafd/{kache,sccache}/<arch>`. Unsafe/non-NVMe paths warn
+  and fall back to per-build storage. `CUTEAFD_BUILD_CACHES=off` bypasses all
+  these stores; Cargo stays `--locked`, using offline resolution when the
+  locked dependencies are already cached and populating missing inputs online.
+  Release/WIP enable kache and CUDA sccache by default; dev shells share input
+  caches but compiler wrapping stays opt-in. New WIP containers run as each
+  host's uid with a writable NVMe `/wip` and home. Legacy root slots still run;
+  rebuilding needs `--recreate` and a fresh writable `WIP_ROOT` when the old
+  root is not owned by that uid. Normal builds never chown or remove old slots.
+- Optional compiler cache override: set `CUTEAFD_KACHE=/absolute/path/to/kache` (v1.0.0)
+  and optionally `CUTEAFD_KACHE_REMOTE=/shared/cache/directory` for host gates.
+  Build containers use local stores only; missing kache or inaccessible remote warns and falls
   back. Cache invocations time out after 300 seconds (`CUTEAFD_KACHE_TIMEOUT_SECONDS`
   overrides for very slow compilers), then retry plain and disable caching for the
   rest of that build. Never make kache a gate prerequisite. Never run plain and

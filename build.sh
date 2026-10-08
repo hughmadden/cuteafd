@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
+source "$repo_root/scripts/build/build-caches.sh"
+cuteafd_build_cache_defaults
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
@@ -108,13 +110,18 @@ submodule verification; Docker image assembly still reads the live checkout. CUT
 supply an existing manifest. Source archives without .git must provide
 CUTEAFD_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
 
-CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID skips only the coordinator dev-image build.
-Requires retained image-ID-bound BuildKit provenance and Git history: matching
-Dockerfile.dev, entrypoint, Rust toolchain, installed SparkInfer source/lock,
-and the build revision's Transformers lock against the verified mounted source.
-Missing proof or mismatches refuse reuse. Unset retains the normal Docker build.
-The immutable reused ID and verification hashes ship in dist/DEV_IMAGE_REUSE.json
-(checksummed by dist/SHA256SUMS) and the coordinator image's reused-dev label.
+Development images default to ghcr.io/tpurtell/cuteafd-dev:tc-<hash>-<arch>,
+where dev-toolchain.py hashes the checkout's exact toolchain inputs. Both hosts
+use a cached matching image or pull it, verifying its hash, architecture and
+pinned base-digest label. Missing images, pull failures and mismatches fall back
+to Dockerfile.dev locally, with the reason logged. Set
+CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=build to force local dev builds on both hosts
+(default registry). Compilation uses the admitted immutable image ID.
+CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID overrides only the coordinator, keeping its
+existing live toolchain/source checks and image-ID-bound provenance proof.
+Missing proof or mismatches refuse this explicit override rather than falling back.
+Both legs' exact image IDs, registry references/digests and toolchain hashes ship
+in dist/DEV_IMAGE_REUSE.json (checksummed by dist/SHA256SUMS) and image labels.
 EOF
 }
 
@@ -331,11 +338,27 @@ release_leg_plan="coordinator and Spark legs build concurrently; shared export/d
 [[ "$release_sequential" == 0 ]] ||
   release_leg_plan="sequential: coordinator then Spark (CUTEAFD_RELEASE_SEQUENTIAL=1)"
 
+release_dev_image_source="${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}"
+case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
+
 if ((dry_run)); then
+  release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
   echo "  build hosts (${#RELEASE_BUILD_HOSTS[@]}): $(IFS=,; echo "${RELEASE_BUILD_HOSTS[*]}")"
   echo "  seed host: ${RELEASE_BUILD_HOSTS[0]:-}"
+  if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
+    echo "  coordinator dev image: verify explicit override $CUTEAFD_RELEASE_DEV_IMAGE"
+  elif [[ "$release_dev_image_source" == registry ]]; then
+    echo "  coordinator dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-amd64 on $(hostname) if missing; verify or build locally"
+  else
+    echo "  coordinator dev image: build Dockerfile.dev locally on $(hostname)"
+  fi
+  if [[ "$release_dev_image_source" == registry ]]; then
+    echo "  Spark dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-arm64 on ${RELEASE_BUILD_HOSTS[0]:-} if missing; verify or build locally"
+  else
+    echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
+  fi
   echo "  build legs: $release_leg_plan"
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
@@ -348,8 +371,13 @@ if ((dry_run)); then
   echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
   echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB"
   echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB free CUDA memory, same wait"
+  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
+  echo "  Spark cache plan (host HOME shown as template; states/admission rechecked on Spark, no SSH):"
+  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry aarch64 >/dev/null
   exit 0
 fi
+
+release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 
 prepare_pinned_source_dependencies() {
   local git_root=""
@@ -668,9 +696,7 @@ release_log_root="${release_build_root:-$HOME/.cache/cuteafd/builds/release-sour
 python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_log_root"
 mkdir -p "$release_log_root"
 release_leg_log_dir="$(mktemp -d "$release_log_root/build-legs.XXXXXXXX")"
-release_dev_reuse_manifest=""
-[[ -z "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]] ||
-  release_dev_reuse_manifest="$release_leg_log_dir/DEV_IMAGE_REUSE.json"
+release_dev_reuse_manifest="$release_leg_log_dir/coordinator-dev-image.json"
 
 build_coordinator_release() (
 release_source_dir=""
@@ -687,19 +713,16 @@ if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
   COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/verify-release-dev-image.py" \
     --source "$repo_root" --image "$CUTEAFD_RELEASE_DEV_IMAGE" \
     --output "$release_dev_reuse_manifest")" || release_die "coordinator dev image reuse verification failed"
-  release_dev_reuse_label_args=(--label "io.cuteafd.dev-image.reused=$COORDINATOR_DOCKER_DEV")
-elif [[ "$COORDINATOR_DOCKER_DEV" == */* ]]; then
-  release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
+  python3 "$repo_root/scripts/build/select-dev-image.py" record-override \
+    --source "$repo_root" --manifest "$release_dev_reuse_manifest"
 else
-  echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
-  docker build \
-    --build-arg BASE_IMAGE="$(python3 "$repo_root/scripts/build/dev-toolchain.py" amd64)" \
-    --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 "$repo_root/scripts/build/dev-toolchain.py")" \
-    --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
-    -f "$repo_root/docker/Dockerfile.dev" \
-    -t "$COORDINATOR_DOCKER_DEV" \
-    "$repo_root"
+  COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/select-dev-image.py" select \
+    --source "$repo_root" --arch amd64 --local-tag "$COORDINATOR_DOCKER_DEV" \
+    --engine-commit "$engine_commit" --mode "$release_dev_image_source" \
+    --output "$release_dev_reuse_manifest")"
 fi
+python3 "$repo_root/scripts/build/select-dev-image.py" labels --manifest "$release_dev_reuse_manifest" >"$release_leg_log_dir/coordinator-dev-labels"
+mapfile -t release_dev_reuse_label_args <"$release_leg_log_dir/coordinator-dev-labels"
 
 echo "== compiling coordinator release artifacts in GPU-enabled development container =="
 mkdir -p "$artifact_dir"
@@ -724,7 +747,8 @@ release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
 export_watchdog_pid=$!
 coordinator_export_status=0
 compiler_cache_args=()
-mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
+cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
+mapfile -t compiler_cache_args <<<"$cache_plan"
 timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container" \
   --gpus "device=$export_gpu_uuid" \
   --ipc=host \
@@ -755,7 +779,7 @@ rm -rf "$release_source_dir"
 release_source_dir=""
 
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=coordinator \
@@ -830,7 +854,7 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -877,15 +901,15 @@ if [[ -n "$source_manifest_sha256" ]]; then
 fi
 cd "$remote_dir"
 compiler_cache_args=()
-if [[ "${16:-__legacy__}" != __legacy__ || "${19:-0}" == 1 ]]; then
-  export CUTEAFD_SCCACHE_CUDA="${19:-0}"
-  [[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
-  [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_REMOTE="${17}"
-  [[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
-  source scripts/build/compiler-cache.sh
-  mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
-fi
+export CUTEAFD_BUILD_CACHES="${22:-on}"
+[[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
+[[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
+export CUTEAFD_SCCACHE_CUDA="${19:-1}"
+source scripts/build/build-caches.sh
+cuteafd_build_cache_defaults
 phase="${13:?}"
+# The audio tower switch reaches the remote leg as its own argument (ON/OFF).
+audio_aot="${21:-ON}"
 export_container="${14:?}"
 native_build_jobs="${15-__legacy__}"
 [[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
@@ -912,20 +936,17 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 [[ ! -e "$cancel_file" ]] || exit 143
 # release-spark-process-group:end
-if [[ "$phase" == dev && "$dev_image" == */* ]]; then
-  source scripts/lib/release-common.sh
-  release_ensure_dev_image "$dev_image"
-elif [[ "$phase" == dev ]]; then
+dev_manifest="$process_dir/$export_container.dev-image.json"
+if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
-docker build \
-  --build-arg BASE_IMAGE="$(python3 scripts/build/dev-toolchain.py arm64)" \
-  --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 scripts/build/dev-toolchain.py)" \
-  --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
-  -f docker/Dockerfile.dev \
-  -t "$dev_image" .
+python3 scripts/build/select-dev-image.py select \
+  --source "$remote_dir" --arch arm64 --local-tag "$dev_image" \
+  --engine-commit "$engine_commit" --mode "${20:-registry}" --output "$dev_manifest"
+else
+dev_image="$(python3 scripts/build/select-dev-image.py image --manifest "$dev_manifest")"
 fi
 if [[ "$phase" == export ]]; then
 # AOT export outside the hardware locks (USING_AGENTS.md): it needs a GPU to
@@ -982,6 +1003,8 @@ mkdir -p .cuteafd-release-image
 # passed explicitly; the artifact compiler creates them before Cargo runs.
 container_home=/tmp/cuteafd-home
 [[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
+cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$container_home" "$(python3 scripts/build/dev-toolchain.py)")" || exit 2
+mapfile -t compiler_cache_args <<<"$cache_plan"
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
@@ -1027,8 +1050,11 @@ wait "$spark_export_watchdog_pid" 2>/dev/null || true
   { echo "$(hostname): the Spark AOT export failed (exit $spark_export_status) at $(date -Is)" >&2; exit "$spark_export_status"; }
 fi
 if [[ "$phase" == image ]]; then
-docker build \
+python3 scripts/build/select-dev-image.py labels --manifest "$dev_manifest" >"$dev_manifest.labels"
+mapfile -t release_dev_reuse_label_args <"$dev_manifest.labels"
+DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
+  "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -1082,96 +1108,12 @@ CANCEL
 # release-build-cancellation:end
 
 # release-build-supervision:start
-release_run_leg() (
-  leg="$1"
-  command="$2"
-  # A FIFO retains even immediate completions; wait -n can miss an already-exited
-  # job. The wrapper trap is separate from each leg's private cleanup traps.
-  trap 'status=$?; printf "%s %s\n" "$leg" "$status" >&8' EXIT
-  "$command"
-)
-
-release_build_legs_cleanup() {
-  local pid
-  trap - EXIT INT TERM
-  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
-    kill -TERM -- "-$pid" 2>/dev/null || true
-  done
-  release_cancel_coordinator_build
-  if ((release_spark_started)); then
-    release_cancel_remote_build || echo "[spark] WARNING: remote cleanup failed on $seed_host; inspect $export_container-expert" >&2
-  fi
-  # Give leg EXIT traps a bounded chance to remove containers and source copies,
-  # then kill whole groups, not just shell leaders (docker/ssh/sleep children).
-  sleep 2
-  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
-    kill -KILL -- "-$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-  done
-  exec 8>&-
-  rm -f "$release_leg_log_dir/completions"
-}
-
+source "$repo_root/scripts/lib/build-supervision.sh"
 release_build_legs() {
-  local completed status pid active_pid remaining=0
-  local -a release_leg_pids=() active_pids=()
-  local release_spark_started=0 coordinator_pid="" spark_pid=""
   echo "== $release_leg_plan =="
-  echo "[coord] log: $release_leg_log_dir/coordinator.log"
-  echo "[spark] log: $release_leg_log_dir/spark.log"
-  mkfifo "$release_leg_log_dir/completions"
-  exec 8<>"$release_leg_log_dir/completions"
-  trap release_build_legs_cleanup EXIT
-  trap 'echo "release build interrupted (INT); stopping both legs" >&2; exit 130' INT
-  trap 'echo "release build interrupted (TERM); stopping both legs" >&2; exit 143' TERM
-  # Job control gives each worker its own process group without exporting shell
-  # functions/settings to a new bash. The foreground supervisor handles failures
-  # from either leg while the coordinator compiles, instead of waiting blindly.
-  set -m
-  if [[ "$release_sequential" == 0 ]]; then
-    release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
-    spark_pid=$!
-    release_leg_pids+=("$spark_pid")
-    release_spark_started=1
-    remaining=1
-  fi
-  release_run_leg coord build_coordinator_release >"$release_leg_log_dir/coordinator.log" 2>&1 &
-  coordinator_pid=$!
-  release_leg_pids+=("$coordinator_pid")
-  remaining=$((remaining + 1))
-  set +m
-  while ((remaining)); do
-    read -r completed status <&8
-    case "$completed" in
-      coord) pid="$coordinator_pid" ;;
-      spark) pid="$spark_pid" ;;
-      *) release_die "invalid build leg completion: $completed" ;;
-    esac
-    wait "$pid" || true
-    [[ "$status" == 0 ]] ||
-      release_die "[$completed] release build leg failed (exit $status); stopping the other leg; see $release_leg_log_dir"
-    # Never retain a completed group ID throughout the other leg's long build:
-    # after the group disappears, its numeric ID could be reused by another job.
-    active_pids=()
-    for active_pid in "${release_leg_pids[@]}"; do
-      [[ "$active_pid" == "$pid" ]] || active_pids+=("$active_pid")
-    done
-    release_leg_pids=("${active_pids[@]}")
-    echo "[$completed] release build leg complete"
-    remaining=$((remaining - 1))
-    if [[ "$release_sequential" == 1 && "$completed" == coord ]]; then
-      set -m
-      release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
-      spark_pid=$!
-      release_leg_pids+=("$spark_pid")
-      release_spark_started=1
-      remaining=$((remaining + 1))
-      set +m
-    fi
-  done
-  trap - EXIT INT TERM
-  exec 8>&-
-  rm -f "$release_leg_log_dir/completions"
+  build_supervise 'release build' "$release_leg_log_dir" "$release_sequential" \
+    coord build_coordinator_release release_cancel_coordinator_build coordinator.log \
+    spark build_spark_release release_cancel_remote_build spark.log
 }
 # release-build-supervision:end
 
@@ -1258,10 +1200,12 @@ release_sync --delete \
   "$seed_host:$remote_dir/dist/spark-expert/" \
   "$repo_root/dist/spark-expert/"
 dist_source_manifest=()
-if [[ -n "$release_dev_reuse_manifest" ]]; then
-  install -m 0644 "$release_dev_reuse_manifest" "$repo_root/dist/DEV_IMAGE_REUSE.json"
-  dist_source_manifest+=(DEV_IMAGE_REUSE.json)
-fi
+release_sync "$seed_host:$remote_dir/.cuteafd-release/$export_container-expert.dev-image.json" \
+  "$release_leg_log_dir/spark-dev-image.json"
+python3 "$repo_root/scripts/build/select-dev-image.py" merge \
+  --coordinator "$release_dev_reuse_manifest" --spark "$release_leg_log_dir/spark-dev-image.json" \
+  --output "$repo_root/dist/DEV_IMAGE_REUSE.json"
+dist_source_manifest+=(DEV_IMAGE_REUSE.json)
 if [[ -n "$source_manifest" ]]; then
   install -m 0644 "$source_manifest" "$repo_root/dist/SOURCE_SHA256SUMS"
   dist_source_manifest+=(SOURCE_SHA256SUMS)

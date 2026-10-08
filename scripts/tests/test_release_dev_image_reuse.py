@@ -215,7 +215,7 @@ class DevImageReuseTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'entrypoint mismatch'):
             self.probe('entrypoint')
 
-    def test_build_branch_reuses_only_after_verification_and_unset_builds(self):
+    def test_build_branch_reuses_only_after_verification_and_forced_build(self):
         text = (ROOT / 'build.sh').read_text()
         branch = text[text.index('release_dev_reuse_label_args=()'):text.index('echo "== compiling coordinator')]
         for image, refuses in (('', False), (IMAGE, False), (IMAGE, True)):
@@ -226,18 +226,19 @@ class DevImageReuseTest(unittest.TestCase):
                 for command in ('python3', 'docker'):
                     fake = bin_dir / command
                     fake.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$COMMAND_LOG"\n' +
-                                    ('if [[ "$1" == *verify-release-dev-image.py ]]; then [[ "$REFUSE" == 0 ]] || exit 1; printf "%s\\n" "$CUTEAFD_RELEASE_DEV_IMAGE"; fi\nexit 0\n' if command == 'python3' else 'exit 0\n'))
+                                    ('if [[ "$1" == *verify-release-dev-image.py ]]; then [[ "$REFUSE" == 0 ]] || exit 1; printf "%s\\n" "$CUTEAFD_RELEASE_DEV_IMAGE"; elif [[ "$2" == select ]]; then printf "%s\\n" normal-dev; fi\nexit 0\n' if command == 'python3' else 'exit 0\n'))
                     fake.chmod(0o755)
                 log = bin_dir / 'commands'
                 env = dict(os.environ, PATH=str(bin_dir) + ':' + os.environ['PATH'], COMMAND_LOG=str(log),
                            CUTEAFD_RELEASE_DEV_IMAGE=image, COORDINATOR_DOCKER_DEV='normal-dev', repo_root=str(ROOT),
                            release_build_root=str(bin_dir), release_dev_reuse_manifest=str(bin_dir / 'DEV_IMAGE_REUSE.json'),
-                           sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
+                           release_leg_log_dir=str(bin_dir), engine_commit=REVISION,
+                           release_dev_image_source='build', sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
                 result = subprocess.run(['bash', '-ec', script], capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 2 if refuses else 0, result.stderr)
                 commands = log.read_text()
                 self.assertEqual('verify-release-dev-image.py' in commands, bool(image))
-                self.assertEqual('--build-arg' in commands, not bool(image))
+                self.assertEqual('select --source' in commands, not bool(image))
                 if refuses:
                     self.assertIn('reuse verification failed', result.stderr)
                 else:
