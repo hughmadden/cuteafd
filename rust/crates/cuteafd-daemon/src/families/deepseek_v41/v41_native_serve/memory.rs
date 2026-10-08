@@ -13,6 +13,23 @@ const GROUP_BYTES: usize = 5 * 256 * (68 + cuteafd_ffi::V41Kv::COMPRESSED_ROW_BY
 // Request scratch and graph/runtime allocations. Snapshot arenas are already live.
 // Kept outside the eagerly allocated cache; this is not a CUDA process quota.
 pub(super) const RUNTIME_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
+// CUDA allocation granularity and modules first used after this startup sample.
+const SMALL_CARD_SAMPLE_MARGIN: usize = 32 * 1024 * 1024;
+
+pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(usize, usize)> {
+    let (free, total) = lib.cuda_memory_info()?;
+    if total > 32usize << 30 { return Ok((free, total)); }
+    let device = lib.cuda_get_device()?;
+    let live = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
+    let occupied = total - free;
+    let admitted_free = free.checked_sub(SMALL_CARD_SAMPLE_MARGIN)
+        .context("32 GB V4.1 startup leaves no room for the measured-pool margin")?;
+    tracing::info!(occupied_bytes=occupied, tracked_owner_bytes=live,
+        measured_context_module_allocator_bytes=occupied.saturating_sub(live),
+        sample_margin_bytes=SMALL_CARD_SAMPLE_MARGIN, admitted_free_bytes=admitted_free,
+        "V4.1 measured CUDA occupancy charged before pool sizing");
+    Ok((admitted_free, total))
+}
 
 /// Resolve the planner's token budget after fixed owners are live (or charged
 /// to a synthetic free-memory sample for deferred TP2 experts). The byte plan
@@ -63,7 +80,7 @@ pub(super) fn startup_phase(lib: &cuteafd_ffi::NativeLibrary, phase: &str, devic
 pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog, args: &crate::cli::NativeServeArgs) -> Result<()> {
     use super::*;
-    let (free, total) = lib.cuda_memory_info()?;
+    let (_, total) = lib.cuda_memory_info()?;
     if total > 32usize << 30 { return Ok(()); }
     ensure!(args.rtx_expert_layers == LocalLayers::Count(0),
         "32 GB V4.1 startup admission requires --rtx-expert-layers 0; use a larger coordinator for local experts");
@@ -80,7 +97,9 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
         ("head weights", TargetHeadWeights::device_bytes(catalog)?),
         ("engram weights", EngramLayerWeights::device_bytes(lib, catalog, 0)?
             + EngramLayerWeights::device_bytes(lib, catalog, 1)?),
-        ("vision", crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)?),
+        ("vision", if cuteafd_api::openai::vision_input_enabled() {
+            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)?
+        } else { 0 }),
     ];
     let weight_bytes = owners.iter().take(4).try_fold(0usize, |n, (_, b)|
         n.checked_add(*b).context("startup weights overflow"))?;
@@ -127,6 +146,9 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
     owners.push(("snapshot arenas", snapshots));
     let fixed = owners.iter().try_fold(0usize, |n, (_, b)| n.checked_add(*b).context("startup fixed-owner overflow"))?;
     let peak = startup_peak(fixed, &loading_peaks)?;
+    // Geometry queries initialize native modules; sample their real CUDA cost
+    // now, before reading weights, rather than using a card/driver constant.
+    let (free, total) = measured_pool_memory(lib)?;
     ensure!(peak <= free, "32 GB V4.1 startup refused before weights: peak {peak} bytes, free {free}, phases {loading_peaks:?}, owners {owners:?}; use --prefill-batch-tokens 256 or a larger coordinator");
     let after = free.checked_sub(fixed).with_context(|| format!("32 GB V4.1 fixed startup owners need {fixed} bytes, free {free}; set --prefill-batch-tokens 256, --rtx-expert-layers 0 or use a larger coordinator; owners {owners:?}"))?;
     let exact = planned_pool_size(args, &[(after, total)])?;

@@ -1234,6 +1234,32 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
 }
 
 #[test]
+fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
+    let mut config = v41_config();
+    let text = &mut config["text_config"];
+    text["num_hidden_layers"] = json!(40);
+    text["head_dim"] = json!(512);
+    text["qk_rope_head_dim"] = json!(64);
+    text["sliding_window"] = json!(128);
+    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
+    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
+    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120]),
+        t("vision.patch_embed.proj.weight", "BF16", &[16, 3, 14, 14])]);
+    let mut options = sparks(4);
+    options.vision = MediaMode::Auto;
+    options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30], pool_tokens: Some(512),
+        local_expert_layers: Some(0), native_mtp_layers: 0, ..Default::default() });
+    let auto = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let tower: u64 = auto.devices[0].items.iter().filter(|i| i.group == "vision").map(|i| i.bytes).sum();
+    assert!(tower > 0);
+    options.vision = MediaMode::Off;
+    let off = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(off.devices[0].items.iter().all(|i| i.group != "vision"));
+    assert_eq!(auto.devices[0].used_bytes() - off.devices[0].used_bytes(), tower);
+    assert_eq!(auto.pool_tokens, off.pool_tokens);
+}
+
+#[test]
 fn layout_charges_admitted_probe_outputs_before_sizing_kv() {
     let dir = qwen_snapshot(4);
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {

@@ -295,8 +295,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     memory_checkpoint("draft runtime")?;
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
-    let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-        crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    let mut vision = cuteafd_api::openai::vision_input_enabled().then(||
+        crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
+            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)).transpose()?;
     memory_checkpoint("vision")?;
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };

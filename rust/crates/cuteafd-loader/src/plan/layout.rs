@@ -444,7 +444,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         qwen_exl3_arenas(checkpoint, native_layers > 0)
     } else { None };
     if let Some(ranks) = &v41_weights {
-        for (device, items) in devices.iter_mut().zip(ranks) { device.items.extend(items.iter().cloned()); }
+        for (device, items) in devices.iter_mut().zip(ranks) {
+            device.items.extend(items.iter().filter(|item|
+                report.vision != super::MediaMode::Off || item.group != "vision").cloned());
+        }
     }
     let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0);
     if let Some(ranks) = &exact {

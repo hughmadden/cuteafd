@@ -186,7 +186,13 @@ mod prefill_capacity_tests {
     #[test]
     fn small_card_refuses_large_capacity_before_allocation() {
         for batch in [80, 256, 1024] { assert!(super::admit_small_card_capacity(32usize << 30, batch).is_ok()); }
-        for batch in [1025, 2048, 4096] { assert!(super::admit_small_card_capacity(32usize << 30, batch).unwrap_err().to_string().contains("capacity 4096")); }
+        for total in [32usize << 30, (31.8 * (1u64 << 30) as f64) as usize] {
+            for batch in [1025, 2048, 4096] {
+                let reason = super::admit_small_card_capacity(total, batch).unwrap_err().to_string();
+                assert!(reason.contains("capacity 4096"), "{reason}");
+                assert!(reason.contains("--prefill-batch-tokens 1024 (256 for pool-first)"), "{reason}");
+            }
+        }
         assert!(super::admit_small_card_capacity(96usize << 30, 4096).is_ok());
     }
 
@@ -502,8 +508,9 @@ fn worker(
     memory::startup_phase(&lib, "v41/drafter", device_total)?;
     let vision_free_before = lib.cuda_memory_info()?.0;
     let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
-    let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-        crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    let mut vision = cuteafd_api::openai::vision_input_enabled().then(||
+        crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
+            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)).transpose()?;
     let vision_bytes = vision_free_before.saturating_sub(lib.cuda_memory_info()?.0);
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
@@ -522,7 +529,7 @@ fn worker(
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
     memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?;
     // Size after vision, both lanes, transports and optional draft allocations are live.
-    let (free, total) = lib.cuda_memory_info()?;
+    let (free, total) = memory::measured_pool_memory(&lib)?;
     // A nominal 32 GiB card can expose slightly less memory to CUDA. The
     // compact ceiling may become smaller, never larger, on that hardware.
     // This cap belongs to the legacy two- or three-peer EXL3 compact profile

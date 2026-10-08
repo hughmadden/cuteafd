@@ -74,6 +74,11 @@ pub fn set_media_input_policy(vision: bool, audio: bool) {
     let _ = MEDIA_INPUT_POLICY.set((vision, audio));
 }
 
+/// Startup owners follow the same explicit input policy as request validation.
+pub fn vision_input_enabled() -> bool {
+    MEDIA_INPUT_POLICY.get().map_or(true, |policy| policy.0)
+}
+
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
