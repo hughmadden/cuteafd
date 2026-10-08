@@ -35,7 +35,7 @@ use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use cuteafd_loader::families::glm5::draft_representation::{
     GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -345,6 +345,9 @@ pub(crate) struct GlmDrafter<'a> {
     workspace: RefCell<Option<Workspace<'a>>>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
+    /// How the borrowed BF16 head runs past one draft block ([`super::DraftHead`]; GLM 5.3
+    /// Flash's --draft-head). [`super::DraftHead::Exact`] unless the target sets it.
+    head_mode: Cell<super::DraftHead>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -588,8 +591,15 @@ impl<'a> GlmDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             fp8_workspace,
+            head_mode: Cell::new(super::DraftHead::Exact),
             cfg,
         })
+    }
+
+    /// How draft steps run the borrowed BF16 head from now on (a target's FP8 head launcher
+    /// ignores it).
+    pub fn set_draft_head(&self, mode: super::DraftHead) {
+        self.head_mode.set(mode);
     }
 
     /// `out` [rows,n] = `x` [rows,k] @ selected weight rows. This loaded
@@ -866,8 +876,8 @@ impl<'a> GlmDrafter<'a> {
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
             }
             match &head {
-                HeadCall::Bf16(weight) => super::launch_head(l, &w.head, w.n.buffer.ptr, *weight,
-                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadCall::Bf16(weight) => super::launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
+                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,

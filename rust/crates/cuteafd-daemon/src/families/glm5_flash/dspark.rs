@@ -28,6 +28,7 @@
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, HeadLaunch, ReplayDrafter, ReplayMode, TargetHead, RING,
     TAP_ROWS};
+use crate::families::glm5::DraftHead;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
@@ -36,7 +37,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::read_safetensors_metadata;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -310,6 +311,8 @@ pub(crate) struct DsparkDrafter<'a> {
     representation: GlmDraftRepresentation,
     /// GEMV scratch of the FP8 representation (every context/draft row count).
     fp8_workspace: Option<Dev<'a>>,
+    /// How the borrowed BF16 head runs past one draft block (--draft-head).
+    head_mode: Cell<DraftHead>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -438,8 +441,14 @@ impl<'a> DsparkDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             fp8_workspace,
+            head_mode: Cell::new(DraftHead::Exact),
             cfg,
         })
+    }
+
+    /// How draft steps run the borrowed BF16 head from now on (the FP8 head launcher ignores it).
+    pub fn set_draft_head(&self, mode: DraftHead) {
+        self.head_mode.set(mode);
     }
 
     /// `out` [rows, n] = `x` [rows, k] @ rows `first..first + n` of `weight`^T.
@@ -654,8 +663,8 @@ impl<'a> DsparkDrafter<'a> {
                     rows, h, eps, s)?;
             }
             match head {
-                HeadRef::Bf16(weight) => crate::families::glm5::launch_head(l, &w.head, w.n.buffer.ptr,
-                    weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadRef::Bf16(weight) => crate::families::glm5::launch_draft_head(l, &w.head, w.n.buffer.ptr,
+                    weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
@@ -787,6 +796,14 @@ impl<'a> Drafter<'a> {
         match self {
             Self::Dflash2(d) => d.max_batch_sequences(),
             Self::Dspark(d) => d.max_sequences,
+        }
+    }
+
+    /// How draft steps run the target's BF16 head past one draft block (--draft-head).
+    pub fn set_draft_head(&self, mode: DraftHead) {
+        match self {
+            Self::Dflash2(d) => d.set_draft_head(mode),
+            Self::Dspark(d) => d.set_draft_head(mode),
         }
     }
 
