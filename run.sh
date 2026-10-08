@@ -204,6 +204,16 @@ docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
+profile_mib="$(nvidia-smi --id="$RELEASE_COORDINATOR_GPU_UUID" --query-gpu=memory.total --format=csv,noheader,nounits)"
+profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$COORDINATOR_GPU_BUDGET_GIB")"
+if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib" && ! release_spark_compact_active; then
+  explicit_profile_key() { [[ -n "${overrides[$1]:-}" ]] || grep -qE "^${1}=.+" "$config"; }
+  explicit_profile_key PREFILL_BATCH_TOKENS || PREFILL_BATCH_TOKENS=1024
+  explicit_profile_key MEMORY_RESERVATION || MEMORY_RESERVATION=97%
+  [[ "$RTX_EXPERT_LAYERS" != auto ]] || RTX_EXPERT_LAYERS=0
+  ((PREFILL_BATCH_TOKENS <= 1024)) || release_die "32 GB V4.1 cannot admit capacity 4096 with vision/dSpark; set PREFILL_BATCH_TOKENS=1024 (256 for pool-first)"
+  echo "V4.1 32 GB profile: logical GPU ${profile_gib} GiB, prefill=$PREFILL_BATCH_TOKENS reservation=$MEMORY_RESERVATION RTX layers=$RTX_EXPERT_LAYERS (explicit overrides retained)" >&2
+fi
 snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_REVISION"
 model_is_exl3="$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")"
 if release_spark_compact_active; then
@@ -266,6 +276,9 @@ if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
   ((minimum_expert_layers >= topology_min_layers)) || minimum_expert_layers="$topology_min_layers"
 fi
 gpu_selection_mode="$RTX_GPUS"
+if [[ "$gpu_selection_mode" == auto ]] && python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
+  gpu_selection_mode=1
+fi
 # Auto must not turn the compact topology into a two-RTX launch.
 # The Spark TP/EP degree does NOT select the RTX layout: RTX_GPUS (auto or an
 # explicit 1/2) decides, and an infeasible combination is rejected below by the
