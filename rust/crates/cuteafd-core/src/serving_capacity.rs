@@ -479,6 +479,30 @@ mod tests {
     }
 
     #[test]
+    fn startup_intake_probe_uses_floor_slack_without_shrinking_the_pool() {
+        let memory = DeviceMemory { device: 0, total_bytes: 34_144_990_003,
+            baseline_free_bytes: 34_144_990_003 - 586_416_128 };
+        let floor = small_card_headroom_bytes(memory.total_bytes);
+        let probe = 64 << 20;
+        let costs = vec![
+            MemoryReservation { name: "steady.fixed".into(), bytes: 17_965_280_768 },
+            MemoryReservation { name: "kv.logical_pool".into(), bytes: 962_560 / 64 * 829_704 },
+            MemoryReservation { name: "startup.spark_intake_probe_temporary".into(), bytes: probe },
+        ];
+        let stacked = admit_device_reservations_with_headroom(97, memory, &costs, floor);
+        assert!(matches!(stacked, Err(CapacityError::ReservationsExceeded { .. })));
+        let admitted = admit_device_reservations_with_headroom(97, memory, &costs,
+            floor.saturating_sub(probe)).unwrap();
+        assert_eq!(admitted.reserved_bytes, 30_511_137_792);
+        assert_eq!(admitted.engine_budget_bytes - admitted.reserved_bytes, 693_657);
+        let steady = admit_device_reservations_with_headroom(97, memory, &costs[..2], floor).unwrap();
+        assert_eq!(steady.engine_budget_bytes - steady.reserved_bytes, 693_657);
+        // A temporary larger than the floor still has to fit the physical ceiling.
+        let oversized = vec![MemoryReservation { name: "startup".into(), bytes: memory.total_bytes }];
+        assert!(admit_device_reservations_with_headroom(97, memory, &oversized, 0).is_err());
+    }
+
+    #[test]
     fn logical_budget_charges_existing_usage_and_never_enlarges_a_gpu() {
         let cap = GpuMemoryBudget::from_gib(32.0).unwrap();
         let sample = cap.apply(hardware(7, 5 * GIB)).unwrap();

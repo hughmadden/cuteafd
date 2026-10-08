@@ -460,6 +460,8 @@ pub(super) fn preflight(
         // The GPU-landing and H2D probes each release their 64 MiB before
         // transport storage is created. Admit their maximum, not their sum,
         // as a startup peak without reducing permanent KV/expert capacity.
+        // On small cards the probe uses floor slack released before serving:
+        // charge max(probe, floor), not probe + floor, only for this phase.
         let lead = &capacity.devices[0];
         let mut costs = lead.reservations.clone();
         costs.push(MemoryReservation {
@@ -471,7 +473,7 @@ pub(super) fn preflight(
             bytes: intake_probe_bytes,
         });
         admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, memory[0],
-            &costs, small_card_headroom_bytes(memory[0].total_bytes))?;
+            &costs, small_card_headroom_bytes(memory[0].total_bytes).saturating_sub(intake_probe_bytes))?;
     }
     tracing::info!(checkpoint_max_context = capacity.checkpoint_max_context_tokens,
         max_context = capacity.effective_max_context_tokens, requested_pool = args.pool_tokens,

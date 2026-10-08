@@ -1369,7 +1369,7 @@ release_tp2_enabled() {
 # Development images bake in the pinned SparkInfer, so a pin bump needs a
 # rebuild before WIP slots are built or launched from them.
 release_dev_image_rebuild_hint() {
-  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "$RELEASE_CONFIG"
+  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "${RELEASE_CONFIG:-cuteafd.config}"
 }
 
 # WHERE names the host, LABEL is the image's io.cuteafd.sparkinfer.revision.
