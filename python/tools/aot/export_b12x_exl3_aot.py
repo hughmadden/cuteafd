@@ -124,7 +124,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
-           ws_dynamic_tiles: bool = False) -> dict:
+           ws_dynamic_tiles: bool = False, compile_only: bool = False) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -252,14 +252,17 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             "parameters": [p.strip() for p in wrapper[2].split(',')],
             "object_sha256": hashlib.sha256((output / (label + '.o')).read_bytes()).hexdigest(),
             "header_sha256": hashlib.sha256(header.encode()).hexdigest()})
-    buffers = make_mixed_trellis_buffers(launch, device=torch.device("cuda", 0), sms=props.multi_processor_count)
+    # Compile-only qualification needs the same shapes/aliasing, not CUDA storage.
+    buffers = make_mixed_trellis_buffers(launch,
+        device=torch.device("meta") if compile_only else torch.device("cuda", 0),
+        sms=props.multi_processor_count)
     lut_bytes = launch.trellis_lut.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     (output / 'trellis_lut.bin').write_bytes(lut_bytes)
     layouts = {}
     owners = {}
     for field in fields(buffers):
         value = getattr(buffers, field.name)
-        address = value.untyped_storage().data_ptr()
+        address = id(value) if compile_only else value.untyped_storage().data_ptr()
         owner = owners.setdefault(address, field.name)
         layouts[field.name] = {"shape": list(value.shape), "dtype": str(value.dtype),
             "bytes": value.numel() * value.element_size(), "allocation": owner,

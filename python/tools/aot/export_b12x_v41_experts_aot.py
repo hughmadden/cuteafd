@@ -272,7 +272,6 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
     import torch
     from b12x.moe.fused_moe import _impl as moe
 
-    torch.empty(1, dtype=torch.uint8, device="cuda")
     device = torch.device("cuda", torch.cuda.current_device())
     properties = torch.cuda.get_device_properties(device)
     capability = (properties.major, properties.minor)

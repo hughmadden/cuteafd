@@ -132,6 +132,7 @@ before → after tables with conditions.
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   no failing ids since the codex/v1 merge (808 pass); add none.
+- Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
 - Optional compiler cache: set `CUTEAFD_KACHE=/absolute/path/to/kache` (v1.0.0)
   and optionally `CUTEAFD_KACHE_REMOTE=/shared/cache/directory`. Unset means
   unchanged plain builds; missing kache or inaccessible remote warns and falls
