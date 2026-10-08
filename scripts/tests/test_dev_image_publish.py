@@ -17,7 +17,7 @@ def fixture_repo(tmp_path):
     repo = tmp_path / 'repo'
     for name in ('scripts/build/build-dev-images.sh', 'scripts/build/dev-toolchain.py',
                  'scripts/build/install-dev-cache-tools.sh', 'scripts/build/assert-build-filesystem.py',
-                 'scripts/lib/release-common.sh', 'docker/Dockerfile.dev', 'docker/entrypoint.sh', '.dockerignore'):
+                 'scripts/lib/release-common.sh', 'scripts/lib/build-supervision.sh', 'docker/Dockerfile.dev', 'docker/entrypoint.sh', '.dockerignore'):
         dest = repo / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / name, dest)
@@ -63,9 +63,139 @@ esac
     return repo, env, log
 
 
+def parallel_fixture(tmp_path):
+    repo, env, log = fixture_repo(tmp_path)
+    bin_dir = Path(env['PATH'].split(':')[0])
+    events = tmp_path / 'events'
+    events.mkdir()
+    (bin_dir / 'docker').write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "docker $*" >>"$LOG"
+leg="${STUB_LEG:-coordinator}"
+if [[ "$1" == build ]]; then
+  printf '%s\\n' "$BASHPID" >"$EVENTS/$leg.pid"
+  : >"$EVENTS/$leg.start"
+  other=coordinator; [[ "$leg" != coordinator ]] || other=expert
+  if [[ "$MODE" == parallel ]]; then
+    while [[ ! -e "$EVENTS/$other.start" ]]; do sleep 0.01; done
+  elif [[ "$MODE" == sequential && "$leg" == expert ]]; then
+    [[ -e "$EVENTS/coordinator.done" ]]
+  fi
+  if [[ "${FAIL_LEG:-}" == "$leg" ]]; then
+    if [[ "$MODE" != sequential ]]; then
+      while [[ ! -e "$EVENTS/$other.start" ]]; do sleep 0.01; done
+    fi
+    exit 17
+  elif [[ -n "${FAIL_LEG:-}" ]]; then
+    trap '' TERM
+    exec sleep 30
+  fi
+  : >"$EVENTS/$leg.done"
+elif [[ "$1" == tag || "$1" == push ]]; then
+  if [[ "$MODE" != single ]]; then
+    [[ -e "$EVENTS/coordinator.done" && -e "$EVENTS/expert.done" ]]
+  fi
+elif [[ "$1 $2" == 'image inspect' ]]; then
+  case "$*" in
+    *toolchain.hash*) [[ "${BAD_CHECK:-}" != "$leg" ]] && echo "$HASH" || echo wrong ;;
+    *Architecture*) [[ "$leg" == coordinator ]] && echo amd64 || echo arm64 ;;
+    *) exit 1 ;;
+  esac
+fi
+''')
+    (bin_dir / 'ssh').write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "ssh $*" >>"$LOG"
+while [[ "$1" == -o ]]; do shift 2; done
+shift # host
+export HOME="$REMOTE_HOME" STUB_LEG=expert
+case "$1" in
+  uname) echo aarch64 ;;
+  python3) : ;; # filesystem probe's input need not run remotely
+  setsid) shift; exec setsid "$@" ;;
+  bash)
+    code="$(</dev/stdin)"
+    if [[ "$code" == *'.cancel'* ]]; then : >"$EVENTS/remote-cancel"; fi
+    shift; exec bash "$@" <<<"$code" ;;
+  *) : ;;
+esac
+''')
+    remote_dir = tmp_path / 'remote'
+    remote_dir.mkdir()
+    env.update(EVENTS=str(events), MODE='parallel', REMOTE_HOME=str(tmp_path / 'remote-home'))
+    return repo, env, log, events
+
+
 def launch(repo, env, *args):
     return subprocess.run(['bash', str(repo / 'scripts/build/build-dev-images.sh'), '--spark-hosts', 'rhea', *args],
-                          env=env, capture_output=True, text=True)
+                          env=env, capture_output=True, text=True, timeout=20)
+
+
+@pytest.mark.parametrize('sequential', [False, True])
+def test_dev_legs_overlap_or_respect_sequential_opt_out(tmp_path, sequential):
+    repo, env, log, events = parallel_fixture(tmp_path)
+    env.update(MODE='sequential' if sequential else 'parallel',
+               CUTEAFD_DEV_IMAGE_SEQUENTIAL=str(int(sequential)))
+    result = launch(repo, env)
+    assert result.returncode == 0, result.stderr
+    assert (events / 'coordinator.done').exists() and (events / 'expert.done').exists()
+    assert not (events / 'remote-cancel').exists()
+    assert 'docker tag' in log.read_text()
+
+
+@pytest.mark.parametrize('failing', ['coordinator', 'expert'])
+def test_dev_failure_names_leg_cancels_other_and_skips_publish(tmp_path, failing):
+    repo, env, log, events = parallel_fixture(tmp_path)
+    result = launch(repo, {**env, 'FAIL_LEG': failing}, '--publish')
+    assert result.returncode != 0
+    assert f'[{failing}] dev image build leg failed (exit 17)' in result.stderr
+    assert (events / 'remote-cancel').exists()
+    for leg in ('coordinator', 'expert'):
+        from test_release_build_parallel import process_running
+        assert not process_running(int((events / f'{leg}.pid').read_text()))
+    assert 'docker push' not in log.read_text()
+    assert 'imagetools create' not in log.read_text()
+    assert 'docker tag' not in log.read_text()
+
+
+def test_sequential_coordinator_failure_never_starts_or_cancels_expert(tmp_path):
+    repo, env, log, events = parallel_fixture(tmp_path)
+    result = launch(repo, {**env, 'MODE': 'sequential', 'FAIL_LEG': 'coordinator',
+                          'CUTEAFD_DEV_IMAGE_SEQUENTIAL': '1'})
+    assert result.returncode != 0
+    assert '[coordinator] dev image build leg failed (exit 17)' in result.stderr
+    assert not (events / 'expert.start').exists()
+    assert not (events / 'remote-cancel').exists()
+    assert 'docker tag' not in log.read_text()
+
+
+@pytest.mark.parametrize('bad_check', ['coordinator', 'expert', ''])
+def test_publish_waits_for_both_checks(tmp_path, bad_check):
+    repo, env, log, events = parallel_fixture(tmp_path)
+    result = launch(repo, {**env, 'BAD_CHECK': bad_check}, '--publish')
+    assert (result.returncode == 0) == (not bad_check), result.stderr
+    assert ('docker push' in log.read_text()) == (not bad_check)
+    if not bad_check:
+        assert (events / 'coordinator.done').exists() and (events / 'expert.done').exists()
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'expert'])
+def test_single_role_builds_only_selected_leg(tmp_path, role):
+    repo, env, log, events = parallel_fixture(tmp_path)
+    result = launch(repo, {**env, 'MODE': 'single'}, '--role', role)
+    assert result.returncode == 0, result.stderr
+    other = 'expert' if role == 'coordinator' else 'coordinator'
+    assert (events / f'{role}.done').exists()
+    assert not (events / f'{other}.start').exists()
+
+
+@pytest.mark.parametrize('sequential', ['0', '1'])
+def test_dev_dry_run_reports_plan_without_external_calls(tmp_path, sequential):
+    repo, env, log = fixture_repo(tmp_path)
+    result = launch(repo, {**env, 'CUTEAFD_DEV_IMAGE_SEQUENTIAL': sequential}, '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert ('legs build concurrently' if sequential == '0' else 'sequential: coordinator then expert') in result.stdout
+    assert not log.exists()
 
 
 def test_dirty_publish_refuses_before_build(tmp_path):
