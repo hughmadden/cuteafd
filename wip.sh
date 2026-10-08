@@ -36,7 +36,9 @@ role. This is useful for coordinator-only or expert-only A/B candidates.
 For a coordinator-only clone, wip.sh stops only the coordinator process and
 keeps resident Spark experts available for fingerprint-checked reuse.
 WIP_INSTANCE (environment or config key) isolates containers and caches; unset
-keeps the legacy names. --recreate discards only this instance before
+keeps the legacy names. WIP_ROOT (environment or config) optionally puts /wip
+and source-staging under ~/.cache/cuteafd/builds/ on each host.
+--recreate discards only this instance before
 creating them again from the configured development images.
 EOF
 }
@@ -135,6 +137,7 @@ if ((dry_run)); then
   echo "  config: $RELEASE_CONFIG"
   echo "  slot: $slot (role $role)"
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
+  echo "  WIP root: ${WIP_ROOT:-<container-private>}"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host"
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
@@ -150,11 +153,13 @@ release_resolve_coordinator_gpu_identity
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
 seed_host="$SPARK_0_HOST"
-state_dir="$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}"
-python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$state_dir"
+state_dir="${WIP_ROOT:-$repo_root/.cuteafd-wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+if [[ -n "${WIP_ROOT:-}" ]]; then
+  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$WIP_ROOT"
+fi
 staging_dir="$state_dir/source-staging"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
-mkdir -p "$state_dir/container" "$hf_home"
+mkdir -p "$state_dir" "$hf_home"
 
 snapshot_args=(
   -a --delete --delete-excluded
@@ -162,7 +167,7 @@ snapshot_args=(
   --exclude .pytest_cache/ --exclude .ruff_cache/ --exclude __pycache__/
   --exclude '*.pyc' --exclude '*.pyo' --exclude .cuteafd-cache/
   --exclude .cuteafd-release/ --exclude .cuteafd-release-image/
-  --exclude .cuteafd-wip --exclude dist/ --exclude rust/target/
+  --exclude '.cuteafd-wip*' --exclude dist/ --exclude rust/target/
   --exclude 'native/build*/'
   --filter 'P .cuteafd-source-revision'
 )
@@ -268,11 +273,15 @@ remove_wip_containers() {
 if ((recreate)); then
   echo "== discarding persistent WIP containers and build caches =="
   remove_wip_containers
-  rm -rf "$state_dir/container"
-  mkdir -p "$state_dir/container"
-  for host in "${wip_hosts[@]}"; do
-    ssh -o BatchMode=yes "$host" "rm -rf \"\$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}/container\""
-  done
+  if [[ -n "${WIP_ROOT:-}" ]]; then
+    # The frozen source survives; remove only this instance's build payloads.
+    for part in build output slots incoming run cache; do
+      rm -rf "$WIP_ROOT/$part"
+      for host in "${wip_hosts[@]}"; do
+        ssh -o BatchMode=yes "$host" "rm -rf '$WIP_ROOT/$part'"
+      done
+    done
+  fi
 fi
 
 preflight_existing_container_images() {
@@ -308,8 +317,8 @@ ensure_local_container() {
     container_id="$(docker inspect -f '{{.Image}}' "$coordinator_container")"
     [[ "$container_id" == "$image_id" ]] ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
-    if [[ -n "${WIP_INSTANCE:-}" ]]; then
-      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$state_dir/container")" ]] ||
+    if [[ -n "${WIP_ROOT:-}" ]]; then
+      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$WIP_ROOT")" ]] ||
         release_die "$coordinator_container has a different /wip build mount; rerun ./wip.sh --recreate"
     fi
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
@@ -323,8 +332,7 @@ ensure_local_container() {
     --net=host --ipc=host --security-opt seccomp=unconfined
     --ulimit memlock=-1:-1 --cap-add IPC_LOCK
     -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
-    -v "$state_dir/container:/wip"
-    -e "WIP_INSTANCE=${WIP_INSTANCE:-}"
+    -e "WIP_INSTANCE=${WIP_INSTANCE:-}" -e "WIP_ROOT=${WIP_ROOT:-}"
     -e HF_HOME="$hf_home"
     -e CUDA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
@@ -332,6 +340,7 @@ ensure_local_container() {
   local -a cache_args=()
   mapfile -t cache_args < <(cuteafd_compiler_cache_docker_args)
   args+=("${cache_args[@]}")
+  [[ -z "${WIP_ROOT:-}" ]] || args+=(-v "$WIP_ROOT:/wip")
   [[ ! -e /dev/infiniband ]] || args+=(--device=/dev/infiniband)
   # sparknest keeps hub/ as a symlink into its mount; expose it at the same path.
   [[ ! -d /mnt/sparknest ]] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
@@ -359,16 +368,20 @@ ensure_remote_container() {
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__unset__}")" \
-    "$(printf '%q' "${cache_staging:-__unset__}")" "${WIP_INSTANCE:-__none__}" \
+    "$(printf '%q' "${cache_staging:-__unset__}")" "${WIP_INSTANCE:-__none__}" "${WIP_ROOT:-__none__}" \
     "$(base64 -w0 "$repo_root/scripts/build/assert-build-filesystem.py")" <<'REMOTE'
 set -euo pipefail
 container="$1"
 image="$2"
 instance="${7:-__none__}"
 [[ "$instance" != __none__ ]] || instance=
-state_dir="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
-printf '%s' "$8" | base64 -d | python3 - "$state_dir"
-mkdir -p "$state_dir/container"
+root="${8:-__none__}"
+[[ "$root" != __none__ ]] || root=
+if [[ -n "$root" ]]; then
+  [[ "$root" == "$HOME/.cache/cuteafd/builds/"* ]] || { echo "WIP_ROOT outside host build root" >&2; exit 2; }
+  printf '%s' "$9" | base64 -d | python3 - "$root"
+  mkdir -p "$root"
+fi
 cache_args=()
 if [[ "${3:-__unset__}" != __unset__ ]]; then
   export CUTEAFD_KACHE="$3"
@@ -388,8 +401,8 @@ if docker container inspect "$container" >/dev/null 2>&1; then
     echo "$container uses an old development image; rerun ./wip.sh --recreate" >&2
     exit 2
   fi
-  if [[ -n "$instance" ]]; then
-    [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$container")" == "$(realpath "$state_dir/container")" ]] ||
+  if [[ -n "$root" ]]; then
+    [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$container")" == "$(realpath "$root")" ]] ||
       { echo "$container has a different /wip build mount; rerun ./wip.sh --recreate" >&2; exit 2; }
   fi
   [ "$(docker inspect -f '{{.State.Running}}' "$container")" = true ] || docker start "$container" >/dev/null
@@ -402,10 +415,11 @@ args=(
   --gpus all --net=host --ipc=host --security-opt seccomp=unconfined
   --ulimit memlock=-1:-1 --cap-add IPC_LOCK
   -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
-  -v "$state_dir/container:/wip" -e "WIP_INSTANCE=$instance"
+  -e "WIP_INSTANCE=$instance" -e "WIP_ROOT=$root"
   -e HF_HOME="$hf_home"
 )
 args+=("${cache_args[@]}")
+[[ -z "$root" ]] || args+=(-v "$root:/wip")
 [ ! -e /dev/infiniband ] || args+=(--device=/dev/infiniband)
 [ ! -d /mnt/sparknest ] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
 docker "${args[@]}" "$image" sleep infinity >/dev/null
@@ -505,7 +519,11 @@ sync_local_source() {
 
 sync_seed_source() {
   local remote_staging
-  remote_staging="$(ssh -o BatchMode=yes "$seed_host" 'printf "%s/.cache/cuteafd/builds" "$HOME"')/wip${WIP_INSTANCE:+-$WIP_INSTANCE}/source-staging"
+  if [[ -n "${WIP_ROOT:-}" ]]; then
+    remote_staging="$WIP_ROOT/source-staging"
+  else
+    remote_staging="$(ssh -o BatchMode=yes "$seed_host" 'printf "%s/.cuteafd-wip-source-staging" "$HOME"')${WIP_INSTANCE:+-$WIP_INSTANCE}"
+  fi
   local sync=rsync
   if command -v rdmasync >/dev/null 2>&1 && ssh -o BatchMode=yes "$seed_host" 'command -v rdmasync >/dev/null'; then
     sync=rdmasync

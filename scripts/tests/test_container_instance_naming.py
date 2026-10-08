@@ -243,9 +243,9 @@ def test_wip_launchers_use_recorded_container_and_layout():
         assert 'docker cp "cuteafd-spark-expert-wip:' not in text
         assert '$HOME/.cache/cuteafd/wip-run/$wip_slot' not in text
     text = (ROOT / "wip.sh").read_text()
-    assert 'state_dir="$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}"' in text
+    assert 'state_dir="${WIP_ROOT:-$repo_root/.cuteafd-wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"' in text
     assert 'release_record_wip_slot "$slot"' in text
-    assert '-v "$state_dir/container:/wip"' in text
+    assert 'args+=(-v "$WIP_ROOT:/wip")' in text
     assert '"wip_instance": ${wip_instance@Q}' in (ROOT / "scripts/build/finalize-wip-slot.sh").read_text()
 
 
@@ -276,3 +276,31 @@ remove_wip_containers
     assert "rm -f cuteafd-coordinator-wip-own" in calls
     assert all("cuteafd-spark-expert-wip-own" in call for call in calls if "rhea" in call or "moa" in call)
     assert "rm -f cuteafd-coordinator-wip" not in calls
+
+
+@pytest.mark.parametrize("root", ["/tmp/build", "/mnt/scratch/wip", "/home/tj/.cache/cuteafd/builds/../wrong", "/home/tj/.cache/cuteafd/builds"])
+def test_wip_root_rejects_paths_outside_build_cache(root):
+    result = subprocess.run(["bash", "-c", f'source "{COMMON}"; WIP_ROOT="$1"; release_validate_wip_root', "_", root],
+                            env=dict(os.environ, HOME="/home/tj"), capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "WIP_ROOT" in result.stderr
+
+
+def test_wip_root_config_env_and_legacy_default(tmp_path):
+    config = write_config(tmp_path / "cuteafd.config", None)
+    config.write_text(config.read_text() + "\nWIP_ROOT=" + str(tmp_path / ".cache/cuteafd/builds/configured/wip") + "\n")
+    script = f'source "{COMMON}"; release_load_config "$1"; printf "%s" "$WIP_ROOT"'
+    for override in [None, str(tmp_path / ".cache/cuteafd/builds/environment/wip")]:
+        env = dict(os.environ, HOME=str(tmp_path))
+        env.pop("WIP_ROOT", None)
+        if override is not None:
+            env["WIP_ROOT"] = override
+        result = subprocess.run(["bash", "-c", script, "_", str(config)], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == (override or str(tmp_path / ".cache/cuteafd/builds/configured/wip"))
+    text = (ROOT / "wip.sh").read_text()
+    assert 'python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$WIP_ROOT"' in text
+    assert 'args+=(-v "$WIP_ROOT:/wip")' in text
+    assert 'args+=(-v "$root:/wip")' in text
+    assert 'remote_staging="$WIP_ROOT/source-staging"' in text
+    assert 'WIP_ROOT (environment or config)' in text

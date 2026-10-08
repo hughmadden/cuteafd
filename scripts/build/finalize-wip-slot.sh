@@ -13,6 +13,7 @@ build_output="$(realpath "$4")"
 image="$5"
 image_id="$6"
 wip_instance="${WIP_INSTANCE:-}"
+wip_root="${WIP_ROOT:-}"
 [[ "$role" == coordinator || "$role" == spark-expert ]] || {
   echo "invalid WIP role: $role" >&2
   exit 2
@@ -99,6 +100,7 @@ assert isinstance(roles, list) and all(isinstance(role, str) for role in roles),
 metadata = {
     "schema": 1,
     "wip_instance": ${wip_instance@Q},
+    "wip_root": ${wip_root@Q},
     "slot": ${slot@Q},
     "role": ${role@Q},
     "base_image": ${image@Q},
