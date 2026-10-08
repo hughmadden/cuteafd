@@ -103,7 +103,6 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
     from b12x.gemm.wo_projection._quant_cute import compile_wo_grouped_quant_aot
     from b12x.gemm._shared.block_fp8 import _block_fp8_linear_scratch_layout
 
-    torch.cuda.init()
     device = torch.device('cuda', torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     if (props.major, props.minor) != (12, 0):

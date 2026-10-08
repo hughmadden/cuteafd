@@ -6,16 +6,17 @@ source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./stop.sh [--config FILE]
+Usage: ./stop.sh [--config FILE] [--all]
 
-Gracefully stops release and WIP CUTEAFD processes on the coordinator and every
-configured Spark rank, regardless of SPARK_COUNT. Cleanup is a superset of the
-active ranks: a previous six-rank run can leave release or WIP containers on the
-fifth/sixth hosts even when the configuration currently selects a smaller
-serving set, and the default configuration names those hosts.
-Release containers are removed; persistent WIP development containers are
-stopped but retained. WIP slots, build caches, images, model caches, and
-unrelated containers are left untouched.
+Gracefully stops this instance's coordinator and EXPERT_PORT workers on every
+configured Spark rank, regardless of SPARK_COUNT. Host scope is a superset of the
+active ranks, but worker cleanup remains port-scoped. Release containers are removed;
+only the port-tracked WIP processes are stopped. Shared persistent WIP containers,
+other worker ports, slots, build caches, images and model caches remain untouched.
+
+--all also removes every release expert worker on the configured hosts and stops
+(but retains) their persistent WIP containers. Use only when those hosts are not
+shared with another deployment.
 
 Every configured host and every cleanup phase is attempted even if one host or
 phase fails; the script exits nonzero if anything could not be stopped.
@@ -30,6 +31,7 @@ EOF
 }
 
 config="$repo_root/cuteafd.config"
+stop_all=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
       config="$2"
       shift 2
       ;;
+    --all) stop_all=1; shift ;;
     -h|--help)
       usage
       exit 0
@@ -67,7 +70,10 @@ echo "== stopping CUTEAFD release services =="
 echo "  Spark cleanup hosts: $(release_stop_hosts | paste -sd, -)"
 failed=0
 release_stop_wip_services || failed=1
-release_stop_wip_containers || failed=1
+if ((stop_all)); then
+  release_stop_wip_containers || failed=1
+  release_stop_all_worker_containers || failed=1
+fi
 release_stop_services \
   "$RELEASE_COORDINATOR_CONTAINER_NAME" \
   "$RELEASE_SPARK_CONTAINER_PREFIX" || failed=1

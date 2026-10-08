@@ -193,6 +193,14 @@ void test_rdma_abi() {
     assert(qp.status[0] != '\0');
   }
 
+  cuteafd_rdma_rc_endpoint_info_t selected = {};
+  assert(cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+      nullptr, 1, 3, 1, 4096, 4096, 4096, 4096, 8, 8, 1, 0, &selected) ==
+      CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+      "missing-device", 1, 256, 1, 4096, 4096, 4096, 4096, 8, 8, 1, 0, &selected) ==
+      CUTEAFD_STATUS_INVALID_ARGUMENT);
+
   cuteafd_rdma_rc_send_recv_probe_t loopback = {};
   const cuteafd_status_t loopback_status =
       cuteafd_rdma_rc_send_recv_loopback_probe(1, 12288, &loopback);

@@ -240,10 +240,73 @@ release_model_list_matches() {
     >/dev/null 2>&1
 }
 
+# Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
+release_prepare_api_key() {
+  local enabled="${1:-off}" instance="${2:-default}"
+  case "$enabled" in
+    on|off) ;;
+    *) release_die "ENABLE_BENCH must be on or off" ;;
+  esac
+  if [[ "$enabled" == on && -z "${API_KEY_FILE:-}" ]]; then
+    [[ "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || release_die "invalid API key instance"
+    API_KEY_FILE="$(python3 - "$HOME/.cache/cuteafd/$instance" <<'PYKEY'
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+import tempfile
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o022:
+    raise SystemExit('API key directory must be owned by this user and not writable by others')
+path = root / 'api-key'
+fd, temporary = tempfile.mkstemp(prefix='.api-key-', dir=root)
+try:
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(secrets.token_hex(32) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    # Publish without replacing a key another concurrent launcher installed.
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        pass
+finally:
+    os.unlink(temporary)
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(fd, 'r') as stream:
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit('generated API key must be an owned regular file with mode 0600')
+    key = stream.read().rstrip('\r\n')
+    if not key or any(not 33 <= ord(c) <= 126 for c in key):
+        raise SystemExit('generated API key file is invalid')
+print(path)
+PYKEY
+)" || release_die "could not provision benchmark API key"
+    printf 'Benchmark API key file: %s\n' "$API_KEY_FILE" >&2
+  fi
+  if [[ -n "${API_KEY_FILE:-}" ]]; then
+    [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
+  fi
+}
+
+release_api_curl() {
+  if [[ -n "${API_KEY_FILE:-}" ]]; then
+    # Keep the key out of argv/process listings. Health probes do not need it.
+    printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' <"$API_KEY_FILE")" |
+      curl --header @- "$@"
+  else
+    curl "$@"
+  fi
+}
+
 release_api_advertises_model() {
   local url="$1"
   local model_id="$2"
-  curl -fsS "$url/v1/models" 2>/dev/null |
+  release_api_curl -fsS "$url/v1/models" 2>/dev/null |
     release_model_list_matches "$model_id"
 }
 
@@ -260,7 +323,7 @@ release_native_model_list_matches() {
 release_api_advertises_native_model() {
   local url="$1"
   local model_id="$2"
-  curl -fsS "$url/v1/models" 2>/dev/null |
+  release_api_curl -fsS "$url/v1/models" 2>/dev/null |
     release_native_model_list_matches "$model_id"
 }
 
@@ -282,7 +345,7 @@ release_trim() {
 release_known_key() {
   case "$1" in
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE|DRAFT_MODEL_ID|DRAFT_MODEL_REVISION|DRAFT_FP8|DFLASH|MTP|COORDINATOR_TRACE) return 0 ;;
-    FULL_PREFILL_LOGITS|TABLE_BACKEND|PREFIX_CACHE_MARK_MIB) return 0 ;;
+    FULL_PREFILL_LOGITS|TABLE_BACKEND|PREFIX_CACHE_MARK_MIB|API_KEY_FILE|ENABLE_BENCH) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_COPY_WINDOWS|MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|COPY_DRAFTS|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|EXPERT_BACKEND) return 0 ;;
@@ -431,6 +494,8 @@ release_load_config() {
   KV_POOL_SIZE=
   HOST_CACHE_BYTES=auto
   TABLE_BACKEND="${CUTEAFD_TABLE_BACKEND:-mmap}"
+  API_KEY_FILE="${API_KEY_FILE:-}"
+  ENABLE_BENCH=off
   MEMORY_RESERVATION=
   MAX_CONTEXT_TOKENS=1048576
   MAX_OUTPUT_TOKENS=393216
@@ -542,8 +607,13 @@ release_load_config() {
     [[ "$SPARKINFER_EXL3" != force || "$EXPERT_FORMAT" == exl3 ]] ||
       release_die "SPARKINFER_EXL3=force requires EXPERT_FORMAT=exl3"
   fi
-  [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] ||
-    release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
+  if [[ "$mode" == stop ]]; then
+    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
+      release_die "RTX_EXPERT_LAYERS must be auto or a non-negative integer"
+  else
+    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] ||
+      release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
+  fi
   case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
   [[ "$COORDINATOR_GPU" =~ ^[0-9]+$ ]] || release_die "COORDINATOR_GPU must be a non-negative host GPU index"
   [[ -z "$COORDINATOR_GPU_UUID" || "$COORDINATOR_GPU_UUID" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
@@ -553,12 +623,18 @@ release_load_config() {
   [[ -z "$COORDINATOR_GPU_UUID" && -z "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
     [[ -n "$COORDINATOR_GPU_UUID" && -n "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
     release_die "COORDINATOR_GPU_UUID and COORDINATOR_GPU_PCI_BUS_ID must be set together"
-  [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+  if [[ "$mode" == stop ]]; then
+    [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
+  else
+    [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+  fi
   [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] ||
     release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
-  [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] &&
+  [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] || release_die "PREFILL_BATCH_TOKENS must be non-negative"
+  if [[ "$mode" == launch ]]; then
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
-    release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
+      release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
+  fi
   [[ "$SPARK_DEVICE_BUDGET_BYTES" =~ ^[1-9][0-9]*$ ]] ||
     release_die "SPARK_DEVICE_BUDGET_BYTES must be a positive integer"
   [[ "$SPARK_REDUCTION_MIN_ROWS" =~ ^[1-9][0-9]*$ ]] ||
@@ -577,11 +653,13 @@ release_load_config() {
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"
   done
-  [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
-    release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
-  [[ -z "$MAX_OUTPUT_TOKENS" ]] || ((MAX_OUTPUT_TOKENS <= 393216)) ||
-    release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
-  if [[ -n "$KV_POOL_TOKENS" ]]; then
+  if [[ "$mode" == launch ]]; then
+    [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
+      release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
+    [[ -z "$MAX_OUTPUT_TOKENS" ]] || ((MAX_OUTPUT_TOKENS <= 393216)) ||
+      release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
+  fi
+  if [[ "$mode" == launch && -n "$KV_POOL_TOKENS" ]]; then
     ((KV_POOL_TOKENS % 64 == 0)) || release_die "KV_POOL_TOKENS must be a multiple of 64"
   fi
   [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
@@ -1054,6 +1132,20 @@ for container in "$@"; do
   docker rm -f "$container" >/dev/null
 done
 REMOTE
+}
+
+# Explicit --all cleanup only: never sweep worker ports during normal restart.
+release_stop_all_worker_containers() {
+  local host failed=0
+  local -a pids=()
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    release_ssh "$host" 'ids=$(docker ps -a --format "{{.Names}}" --filter "name=^cuteafd-spark-expert-.+-[0-9]+$" | grep -vE "^cuteafd-spark-expert-wip($|-)"); [ -z "$ids" ] || docker rm -f $ids >/dev/null' &
+    pids+=("$!")
+  done < <(release_stop_hosts)
+  local pid
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  ((failed == 0))
 }
 
 release_stop_services() {

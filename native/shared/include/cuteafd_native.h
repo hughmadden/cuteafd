@@ -479,6 +479,11 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags(
     size_t send_registered_span_bytes, size_t recv_registered_span_bytes,
     uint32_t max_send_wr, uint32_t max_recv_wr, uint32_t max_sge,
     uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+    const char* device_name, uint32_t port_num, uint32_t gid_index, uint32_t local_psn,
+    size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
+    size_t recv_registered_span_bytes, uint32_t max_send_wr, uint32_t max_recv_wr,
+    uint32_t max_sge, uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_buffer_view(
     void* handle, int receive_buffer, cuteafd_rdma_rc_endpoint_buffer_view_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint32_t remote_qp_num,

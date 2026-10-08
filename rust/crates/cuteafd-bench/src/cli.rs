@@ -129,14 +129,14 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if !options.quiet {
         eprintln!("run {id} on {base}");
     }
-    let followed = follow(&base, &id, options.quiet, options.deadline);
+    let followed = follow(&base, &id, options.quiet, options.deadline, &options.api_key);
     if let Err(error) = &followed {
         if error.downcast_ref::<Overdue>().is_some() {
             let _ = authorize(agent.post(&format!("{base}/v1/bench/runs/{id}/cancel")), &options.api_key).call();
             return Err(followed.unwrap_err()).with_context(|| format!("run {id} on {base}"));
         }
     }
-    let served = followed.as_ref().ok().and_then(|_| agent.get(&format!("{base}/v1/bench/runs/{id}")).call().ok())
+    let served = followed.as_ref().ok().and_then(|_| authorize(agent.get(&format!("{base}/v1/bench/runs/{id}")), &options.api_key).call().ok())
         .map(|response| response.into_json::<Report>().context("the finished report"));
     let report = match served {
         Some(report) => report?,
@@ -176,7 +176,7 @@ struct Overdue(u64);
 const UNREACHABLE: Duration = Duration::from_secs(60);
 
 /// Prints progress lines from the event stream until run `id` finishes.
-fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>) -> Result<()> {
+fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>, api_key: &Option<String>) -> Result<()> {
     let started = std::time::Instant::now();
     let overdue = || deadline.filter(|d| started.elapsed() > *d).map(|d| Overdue(d.as_secs()));
     let events = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
@@ -184,7 +184,7 @@ fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>) -> Resu
     let mut last_line = String::new();
     let mut unreachable: Option<std::time::Instant> = None;
     loop {
-        let response = match events.get(&format!("{base}/v1/bench/events")).call() {
+        let response = match authorize(events.get(&format!("{base}/v1/bench/events")), api_key).call() {
             Ok(response) => {
                 unreachable = None;
                 response
@@ -192,7 +192,7 @@ fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>) -> Resu
             Err(error) => {
                 // A dropped stream: check whether the run ended meanwhile, else reconnect,
                 // giving up once the server has refused connections for a while.
-                if finished(base, id)? {
+                if finished(base, id, api_key)? {
                     return Ok(());
                 }
                 if let Some(overdue) = overdue() {
@@ -239,14 +239,14 @@ fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>) -> Resu
                 _ => {}
             }
         }
-        if finished(base, id)? {
+        if finished(base, id, api_key)? {
             return Ok(());
         }
     }
 }
 
-fn finished(base: &str, id: &str) -> Result<bool> {
-    let report: Value = match agent().get(&format!("{base}/v1/bench/runs/{id}")).call() {
+fn finished(base: &str, id: &str, api_key: &Option<String>) -> Result<bool> {
+    let report: Value = match authorize(agent().get(&format!("{base}/v1/bench/runs/{id}")), api_key).call() {
         Ok(response) => response.into_json()?,
         Err(_) => return Ok(false),
     };
@@ -256,7 +256,7 @@ fn finished(base: &str, id: &str) -> Result<bool> {
 /// Cancels the server's active run.
 pub fn cancel(url: &str, api_key: &Option<String>) -> Result<()> {
     let base = url.trim_end_matches('/');
-    let status: Value = agent().get(&format!("{base}/v1/bench/status")).call()?.into_json()?;
+    let status: Value = authorize(agent().get(&format!("{base}/v1/bench/status")), api_key).call()?.into_json()?;
     let Some(id) = status["active"]["id"].as_str() else { bail!("no run is active") };
     authorize(agent().post(&format!("{base}/v1/bench/runs/{id}/cancel")), api_key).call()?;
     eprintln!("cancelled {id}");

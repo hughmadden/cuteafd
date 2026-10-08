@@ -294,19 +294,39 @@ function rate(key, windowMs) {
 }
 
 // ---------------------------------------------------------------- socket
-let retry = 500;
-function connect() {
-  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/v1/console`;
-  let ws;
-  try { ws = new WebSocket(url); } catch (_) { return setTimeout(connect, retry); }
-  S.socket = ws;
-  ws.onopen = () => { S.connected = true; retry = 500; };
-  ws.onmessage = (ev) => {
-    let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
-    if (m.type === 'snapshot') onSnapshot(m); else if (m.type === 'frame') onFrame(m);
-  };
-  ws.onclose = () => { S.connected = false; retry = Math.min(retry * 2, 5000); setTimeout(connect, retry); };
-  ws.onerror = () => ws.close();
+let retry = 500, apiKey = '';
+window.cuteafdAuthenticatedFetch = (path, init = {}) => {
+  const headers = new Headers(init.headers);
+  if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
+  return fetch(path, { ...init, headers });
+};
+async function connect() {
+  try {
+    const headers = new Headers();
+    if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
+    let response = await fetch('/v1/console/events', { headers });
+    if (response.status === 401) {
+      const key = window.prompt('API key for this server (kept in memory for this tab only)');
+      if (key) { apiKey = key; headers.set('Authorization', `Bearer ${apiKey}`); response = await fetch('/v1/console/events', { headers }); }
+    }
+    if (!response.ok) throw new Error(response.statusText);
+    S.connected = true; retry = 500;
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let pending = '';
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = pending.indexOf('\n\n')) >= 0) {
+        const frame = pending.slice(0, boundary); pending = pending.slice(boundary + 2);
+        const data = frame.split('\n').filter((line) => line.startsWith('data: ')).map((line) => line.slice(6)).join('\n');
+        if (!data) continue;
+        let m; try { m = JSON.parse(data); } catch (_) { continue; }
+        if (m.type === 'snapshot') onSnapshot(m); else if (m.type === 'frame') onFrame(m);
+      }
+    }
+  } catch (_) {}
+  S.connected = false; retry = Math.min(retry * 2, 5000); setTimeout(connect, retry);
 }
 
 // ---------------------------------------------------------------- header, status

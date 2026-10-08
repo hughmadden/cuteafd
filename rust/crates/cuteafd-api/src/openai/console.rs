@@ -159,6 +159,29 @@ pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>) -> Response {
         .into_response()
 }
 
+/// Browsers cannot send bearer headers on WebSocket handshakes; offer the same
+/// authenticated feed over fetch/SSE without putting credentials in a URL.
+pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>) -> Response {
+    let mut frames = hub.frames.subscribe();
+    let viewer = hub.enabled.then(|| {
+        hub.viewers.fetch_add(1, Ordering::Relaxed);
+        Viewer(hub.clone())
+    });
+    let stream = async_stream::stream! {
+        let _viewer = viewer;
+        yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", hub.snapshot()));
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), frames.recv()).await {
+                Ok(Ok(frame)) => yield Ok(format!("data: {frame}\n\n")),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => yield Ok(format!("data: {}\n\n", hub.snapshot())),
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => yield Ok(": keepalive\n\n".to_string()),
+            }
+        }
+    };
+    ([(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")],
+        axum::body::Body::from_stream(stream)).into_response()
+}
 pub(super) async fn socket(State(hub): State<Arc<ConsoleHub>>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| serve(hub, socket))
 }

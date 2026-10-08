@@ -85,14 +85,17 @@ fn parse_verbs_host_rdma_device_map(raw: &str, local_ip: IpAddr) -> Result<Optio
     Ok(selected)
 }
 
-fn verbs_host_rdma_device_for_stream(stream: &TcpStream) -> Result<Option<String>> {
-    let Ok(raw) = env::var(VERBS_HOST_RDMA_DEVICE_MAP_ENV) else {
-        return Ok(None);
-    };
-    let local_addr = stream
-        .local_addr()
-        .context("reading verbs-host control connection local address")?;
-    parse_verbs_host_rdma_device_map(&raw, local_addr.ip())
+fn verbs_host_rdma_device_for_stream(stream: &TcpStream) -> Result<Option<crate::fabric::RdmaSelection>> {
+    let local_addr = stream.local_addr().context("reading verbs-host control connection local address")?;
+    let device_override = env::var(VERBS_HOST_RDMA_DEVICE_MAP_ENV).ok()
+        .map(|raw| parse_verbs_host_rdma_device_map(&raw, local_addr.ip())).transpose()?.flatten();
+    let selection = crate::fabric::select_rdma_address(&crate::fabric::discover()?.ports,
+        local_addr.ip(), device_override.as_deref())?;
+    tracing::info!(peer = %stream.peer_addr()?, local = %local_addr.ip(),
+        device = %selection.device, port = selection.port, gid_index = selection.gid_index,
+        "expert RoCE endpoint selected from control address");
+    flows::monitor_bond(&selection, local_addr.ip());
+    Ok(Some(selection))
 }
 
 struct VerbsHostCudaStream {
@@ -2080,28 +2083,29 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let response_capacity_wire_bytes = response_ring.slot_capacity_bytes;
         let request_registered_span_bytes = request_ring.registered_span_bytes;
         let response_registered_span_bytes = response_ring.registered_span_bytes;
+        let peer = addr.to_string();
+        let mut stream = connect_control_stream(&peer, config.timeout)?;
+        configure_control_stream(&stream, config.timeout)?;
+        let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
         let mut endpoint = if retain_final_response {
-            NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring(
+            NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring_on_device(
                 Arc::clone(&library), "client", request_capacity_wire_bytes,
                 response_capacity_wire_bytes, request_registered_span_bytes,
-                response_registered_span_bytes, next_local_psn("client"), response_ring.depth,
+                response_registered_span_bytes, next_local_psn("client"), response_ring.depth, rdma_device.as_ref(),
                 // A landing receive scatters header and payload, a gathered
                 // send gathers them (two entries each).
                 if landing.is_some() || gathered_sends { 2 } else { 1 },
             )?
         } else {
-            NativeRdmaEndpoint::create_from_wire_bytes(
+            NativeRdmaEndpoint::create_from_wire_bytes_on_device(
                 Arc::clone(&library), "client", request_capacity_wire_bytes,
                 response_capacity_wire_bytes, request_registered_span_bytes,
-                response_registered_span_bytes, next_local_psn("client"),
+                response_registered_span_bytes, next_local_psn("client"), rdma_device.as_ref(),
             )?
         };
         // Publish the external-owner witness before landing registration or
         // any fallible bootstrap work can drop this temporary endpoint.
         endpoint.terminal_owner = terminal_owner;
-        let peer = addr.to_string();
-        let mut stream = connect_control_stream(&peer, config.timeout)?;
-        configure_control_stream(&stream, config.timeout)?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let (client_host, _server_host) =
             distinct_endpoint_hosts(local_control_host("client"), peer.clone());
@@ -2911,15 +2915,15 @@ fn verbs_host_protocol_v2_roundtrip_blocking(
         &expected_response_frame,
         crate::verbs_host_capabilities().preferred_alignment,
     )?;
-    let endpoint = NativeRdmaEndpoint::create(
-        Arc::clone(&library),
-        "client",
-        &endpoint_plan,
-        next_local_psn("client"),
-    )?;
     let peer = addr.to_string();
     let mut stream = connect_control_stream(&peer, config.timeout)?;
     configure_control_stream(&stream, config.timeout)?;
+    let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
+    let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_on_device(
+        Arc::clone(&library), "client", endpoint_plan.request_frame_bytes,
+        endpoint_plan.response_frame_bytes, endpoint_plan.request_registered_span_bytes,
+        endpoint_plan.response_registered_span_bytes, next_local_psn("client"), rdma_device.as_ref(),
+    )?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let (client_host, _server_host) =
         distinct_endpoint_hosts(local_control_host("client"), peer.clone());
@@ -3056,7 +3060,7 @@ fn handle_verbs_host_protocol_v2_connection(
             start.request_registered_span_bytes,
             start.response_registered_span_bytes,
             next_local_psn("server"),
-            rdma_device.as_deref(),
+            rdma_device.as_ref(),
         )?;
         let (_client_host, server_host) = distinct_endpoint_hosts(
             start.client_endpoint.host.clone(),
@@ -3397,44 +3401,6 @@ struct NativeRdmaEndpoint {
 }
 
 impl NativeRdmaEndpoint {
-    fn create(
-        library: Arc<NativeLibrary>,
-        role: &str,
-        endpoint_plan: &VerbsHostProtocolV2EndpointPlan,
-        local_psn: u32,
-    ) -> Result<Self> {
-        Self::create_from_wire_bytes(
-            library,
-            role,
-            endpoint_plan.request_frame_bytes,
-            endpoint_plan.response_frame_bytes,
-            endpoint_plan.request_registered_span_bytes,
-            endpoint_plan.response_registered_span_bytes,
-            local_psn,
-        )
-    }
-
-    fn create_from_wire_bytes(
-        library: Arc<NativeLibrary>,
-        role: &str,
-        request_frame_bytes: usize,
-        response_frame_bytes: usize,
-        request_registered_span_bytes: usize,
-        response_registered_span_bytes: usize,
-        local_psn: u32,
-    ) -> Result<Self> {
-        Self::create_from_wire_bytes_on_device(
-            library,
-            role,
-            request_frame_bytes,
-            response_frame_bytes,
-            request_registered_span_bytes,
-            response_registered_span_bytes,
-            local_psn,
-            None,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn create_from_wire_bytes_on_device(
         library: Arc<NativeLibrary>,
@@ -3444,7 +3410,7 @@ impl NativeRdmaEndpoint {
         request_registered_span_bytes: usize,
         response_registered_span_bytes: usize,
         local_psn: u32,
-        rdma_device: Option<&str>,
+        rdma_device: Option<&crate::fabric::RdmaSelection>,
     ) -> Result<Self> {
         Self::create_from_wire_bytes_with_buffer_flags(
             library,
@@ -3470,7 +3436,7 @@ impl NativeRdmaEndpoint {
         request_registered_span_bytes: usize,
         response_registered_span_bytes: usize,
         local_psn: u32,
-        rdma_device: Option<&str>,
+        rdma_device: Option<&crate::fabric::RdmaSelection>,
     ) -> Result<Self> {
         Self::create_from_wire_bytes_with_buffer_flags(
             library,
@@ -3488,35 +3454,6 @@ impl NativeRdmaEndpoint {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_from_wire_bytes_mapped_for_ring(
-        library: Arc<NativeLibrary>,
-        role: &str,
-        request_frame_bytes: usize,
-        response_frame_bytes: usize,
-        request_registered_span_bytes: usize,
-        response_registered_span_bytes: usize,
-        local_psn: u32,
-        ring_depth: usize,
-        max_sge: u32,
-    ) -> Result<Self> {
-        let queue_depth = u32::try_from(ring_depth.max(VERBS_HOST_RDMA_RING_DEPTH))
-            .context("mapped RDMA ring depth exceeds u32")?;
-        Self::create_from_wire_bytes_with_buffer_flags(
-            library,
-            role,
-            request_frame_bytes,
-            response_frame_bytes,
-            request_registered_span_bytes,
-            response_registered_span_bytes,
-            local_psn,
-            CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
-            queue_depth,
-            None,
-            max_sge,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn create_from_wire_bytes_mapped_for_ring_on_device(
         library: Arc<NativeLibrary>,
         role: &str,
@@ -3526,7 +3463,8 @@ impl NativeRdmaEndpoint {
         response_registered_span_bytes: usize,
         local_psn: u32,
         ring_depth: usize,
-        rdma_device: Option<&str>,
+        rdma_device: Option<&crate::fabric::RdmaSelection>,
+        max_sge: u32,
     ) -> Result<Self> {
         let queue_depth = u32::try_from(ring_depth.max(VERBS_HOST_RDMA_RING_DEPTH))
             .context("mapped RDMA ring depth exceeds u32")?;
@@ -3541,7 +3479,7 @@ impl NativeRdmaEndpoint {
             CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
             queue_depth,
             rdma_device,
-            1,
+            max_sge,
         )
     }
 
@@ -3556,10 +3494,9 @@ impl NativeRdmaEndpoint {
         local_psn: u32,
         host_buffer_flags: u64,
         queue_depth: u32,
-        rdma_device: Option<&str>,
+        rdma_device: Option<&crate::fabric::RdmaSelection>,
         max_sge: u32,
     ) -> Result<Self> {
-        let port_num = verbs_host_ib_port_num()?;
         let (send_frame_bytes, recv_frame_bytes, send_span, recv_span) = match role {
             "client" => (
                 request_frame_bytes,
@@ -3575,46 +3512,12 @@ impl NativeRdmaEndpoint {
             ),
             other => bail!("unsupported verbs-host RDMA endpoint role: {other}"),
         };
-        let info = if let Some(rdma_device) = rdma_device {
-            library.rdma_rc_endpoint_create_on_device_with_buffer_flags(
-                rdma_device,
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_span,
-                recv_span,
-                queue_depth,
-                queue_depth,
-                max_sge,
-                host_buffer_flags,
-            )?
-        } else if host_buffer_flags == 0 {
-            library.rdma_rc_endpoint_create(
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_span,
-                recv_span,
-                queue_depth,
-                queue_depth,
-                max_sge,
-            )?
-        } else {
-            library.rdma_rc_endpoint_create_with_buffer_flags(
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_span,
-                recv_span,
-                queue_depth,
-                queue_depth,
-                max_sge,
-                host_buffer_flags,
-            )?
-        };
+        let rdma_device = rdma_device.context("RDMA endpoint requires an address-selected device/port/GID")?;
+        let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+            &rdma_device.device, rdma_device.port, rdma_device.gid_index, local_psn,
+            send_frame_bytes, recv_frame_bytes, send_span, recv_span,
+            queue_depth, queue_depth, max_sge, host_buffer_flags,
+        )?;
         Ok(Self { library, info, terminal_owner: None })
     }
 
@@ -3920,7 +3823,7 @@ impl VerbsHostMappedRdmaRing {
         peer: &str,
         transport: &TcpTransportConfig,
         config: VerbsHostMappedRdmaRingConfig,
-        rdma_device: Option<&str>,
+        rdma_device: Option<&crate::fabric::RdmaSelection>,
     ) -> Result<Self> {
         verbs_host_preflight()?;
         anyhow::ensure!(
@@ -3931,34 +3834,15 @@ impl VerbsHostMappedRdmaRing {
         );
         let layout = config.layout()?;
         let library = load_verbs_host_native_library()?;
-        let endpoint = match rdma_device {
-            Some(rdma_device) => {
-                NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring_on_device(
-                    Arc::clone(&library),
-                    "client",
-                    layout.slot_capacity_bytes,
-                    layout.slot_capacity_bytes,
-                    layout.registered_span_bytes,
-                    layout.registered_span_bytes,
-                    next_local_psn("client"),
-                    layout.depth,
-                    Some(rdma_device),
-                )?
-            }
-            None => NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring(
-                Arc::clone(&library),
-                "client",
-                layout.slot_capacity_bytes,
-                layout.slot_capacity_bytes,
-                layout.registered_span_bytes,
-                layout.registered_span_bytes,
-                next_local_psn("client"),
-                layout.depth,
-                1,
-            )?,
-        };
         let mut stream = connect_control_stream(peer, transport.timeout)?;
         configure_control_stream(&stream, transport.timeout)?;
+        let selected = verbs_host_rdma_device_for_stream(&stream)?;
+        let rdma_device = rdma_device.or(selected.as_ref());
+        let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring_on_device(
+            Arc::clone(&library), "client", layout.slot_capacity_bytes, layout.slot_capacity_bytes,
+            layout.registered_span_bytes, layout.registered_span_bytes, next_local_psn("client"),
+            layout.depth, rdma_device, 1,
+        )?;
         let mut reader = BufReader::new(stream.try_clone()?);
         write_control(
             &mut stream,
@@ -4026,7 +3910,7 @@ impl VerbsHostMappedRdmaRing {
             layout.registered_span_bytes,
             next_local_psn("server"),
             layout.depth,
-            rdma_device.as_deref(),
+            rdma_device.as_ref(), 1,
         )?;
         endpoint.connect(&start.client_native_endpoint)?;
         for slot in 0..layout.depth {
@@ -4555,10 +4439,22 @@ fn next_local_psn(role: &str) -> u32 {
     base + offset
 }
 
+static VERBS_NATIVE_LIBRARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Install the resolved CLI native library before any expert transports start.
+pub fn set_verbs_host_native_library_path(path: PathBuf) -> Result<()> {
+    if let Some(existing) = VERBS_NATIVE_LIBRARY.get() {
+        anyhow::ensure!(existing == &path, "verbs native library already configured as {}", existing.display());
+        return Ok(());
+    }
+    VERBS_NATIVE_LIBRARY.set(path).map_err(|_| anyhow::anyhow!("verbs native library configuration raced"))
+}
+
 fn verbs_host_native_library_path() -> Option<PathBuf> {
     if let Ok(path) = env::var("CUTEAFD_NATIVE_LIB") {
         return Some(PathBuf::from(path));
     }
+    if let Some(path) = VERBS_NATIVE_LIBRARY.get() { return Some(path.clone()); }
     for candidate in [
         "native/build-cuda-sm120/libcuteafd_native.so",
         "native/build-cuda/libcuteafd_native.so",

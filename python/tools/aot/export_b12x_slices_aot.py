@@ -95,7 +95,6 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline, V41DraftSlicePipeline
     from export_b12x_v41_experts_aot import export_input_quantizer
 
-    torch.cuda.init()
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError("native Blackwell device required")

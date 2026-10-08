@@ -374,22 +374,14 @@ fn echo_request(
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires a live RoCE HCA on the coordinator fabric IP, CUTEAFD_NATIVE_LIB, and the per-host device map; host-memory echo, no GPU"]
+#[ignore = "requires a live RoCE HCA on the coordinator fabric IP and CUTEAFD_NATIVE_LIB; host-memory echo, no GPU"]
 async fn native_group_large_frame_wire_loopback_ep1() -> Result<()> {
-    // 127.0.0.1 has no RoCE GID; bind the coordinator's real fabric address and
-    // require an explicit device-map entry so native selects that HCA.
+    // 127.0.0.1 has no RoCE GID; bind the coordinator's real fabric address.
+    // Device, port and GID are discovered from that address without a map.
     let loopback_ip: IpAddr = std::env::var("CUTEAFD_LOOPBACK_IP")
         .unwrap_or_else(|_| "10.55.0.22".to_owned())
         .parse()
         .context("CUTEAFD_LOOPBACK_IP is not an IP address")?;
-    let map = std::env::var("CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP").context(
-        "set CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=<loopback-ip>=<hca>, e.g. 10.55.0.22=mlx5_0",
-    )?;
-    let entry = format!("{loopback_ip}=");
-    ensure!(
-        map.split(',').any(|value| value.trim().starts_with(&entry)),
-        "device map must contain {entry}<hca> for the loopback control IP"
-    );
 
     let ranks: usize = std::env::var("CUTEAFD_LARGE_FRAME_RANKS")
         .ok()

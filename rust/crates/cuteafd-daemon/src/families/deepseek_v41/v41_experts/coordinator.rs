@@ -332,6 +332,10 @@ impl<'a> NativeTp4Wave<'a> {
     ) -> Result<Self> {
         let capacity = transport.capacity();
         let world_size = transport.world_size();
+        // V4.1's receive uploader already supports pinned-host intake.
+        let choice = crate::shared::spark_intake::choose_v41_mode(library)?;
+        tracing::info!(mode = choice.mode.name(), reason = %choice.reason,
+            "V4.1 Spark intake probe (host lane uses pinned uploads)");
         ensure!(
             matches!(world_size, 2 | 3 | 4 | 6),
             "native TP wave requires two, three, four or six ranks"
@@ -380,6 +384,9 @@ impl<'a> NativeTp4Wave<'a> {
     /// legacy TP4 FP8 transports; `layer` is a Spark layer for the warm-up.
     pub(crate) fn install_device_link(&mut self, peers: &[std::net::SocketAddr], capacity: usize, layer: u32,
         config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
+        if !crate::shared::spark_intake::v41_device_exchange_available(self.library)? {
+            return Ok(());
+        }
         ensure!(self.native.is_none() && self.paired.is_none(),
             "the device exchange serves the legacy TP contract only");
         let world = peers.len();

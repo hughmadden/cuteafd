@@ -753,6 +753,7 @@ impl Opened {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
+        let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
         self.cfg.validate_program_manifest(&manifest, if split_device.is_some() { 2 } else { 1 })?;
         if split_device.is_some() {
