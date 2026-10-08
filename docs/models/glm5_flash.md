@@ -108,6 +108,12 @@ Attention (KDA), a minority run MLA + DSA.
   candidates, and a mark's bytes there would turn decode rows into NaN. Pool
   marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
   keeps it off), so the snapshots the pool evicts move to RAM.
+- Packed admission prefill (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
+  (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
+  prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head
+  run over its own rows as its own pass would, the rest over all rows, with one Spark wave per
+  MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
+  pass).
 
 ## Default precision (single residency)
 

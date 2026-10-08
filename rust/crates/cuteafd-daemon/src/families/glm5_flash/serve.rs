@@ -25,6 +25,7 @@
 //! the cache's counters.
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
+use super::packing;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -76,6 +77,12 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
+    /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
+    /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
+    /// layer for all of them. Off: one pass per prompt.
+    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = false, num_args = 0..=1,
+        default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub prefill_batch: bool,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -104,12 +111,13 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Speculation settings: copy-window draft cap (0 disables) and a fixed
-/// DFlash2 draft count replacing the adaptive policy.
+/// Speculation and admission settings: copy-window draft cap (0 disables), a fixed DFlash2 draft
+/// count replacing the adaptive policy, and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     copy: usize,
     fixed: Option<usize>,
+    batch: bool,
 }
 
 pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -144,7 +152,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
-    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
+    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
+        batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
@@ -294,9 +303,12 @@ struct Prefill<'a> {
     first: Option<u32>,
     prompt_row: Option<Vec<f32>>,
     started: Instant,
-    /// Seconds in this prompt's chunks, and their engine phases.
+    /// Seconds in this prompt's chunks, and their engine phases (a packed pass's split evenly among
+    /// its prompts: bookkeeping, not attribution).
     busy: f64,
     phases: [f64; 3],
+    /// Chunks prefilled in packed passes (`--prefill-batch`).
+    packed: usize,
     ticket: console::Ticket,
 }
 
@@ -930,79 +942,25 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let plan = cold_replay_plan(&job.probe, plan, logits.is_some());
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, prompt_row: None,
-                started: Instant::now(), busy: 0.0, phases: [0.0; 3], ticket });
+                started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
-            // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
-                if p.done == p.tokens.len() {
-                    return Ok(Chunk::Done);
-                }
-                if p.job.events.is_closed() {
-                    p.cancelled = true;
-                    anyhow::bail!("client went away");
-                }
-                let timer = Instant::now();
-                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
-                let chunk = &p.tokens[p.done..end];
-                // One sample around the first text and first media prefill only;
-                // no extra synchronization and no steady-state decode sampling.
-                let media_index = usize::from(!p.media.spans().is_empty());
-                let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
-                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
-                    let start = p.placement.len;
-                    let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
-                        engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
+            // --prefill-batch, adjacent prompts whose chunks fit one pass prefill together.
+            let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
+                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
+            let finished = if policy.batch && engine.packs_prefill() {
+                let limits = engine.packed_limits();
+                prefills.round_groups(DECODE_ROWS, |group, next| packable(group, next, &limits),
+                    |group| if group.len() == 1 {
+                        vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
                     } else {
-                        engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
-                    };
-                    if end == p.tokens.len() {
-                        // The first token, while this prompt's logits are the workspace's.
-                        let logits = logits.context("prefill produced no logits")?;
-                        if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
-                            p.prompt_row = Some(logits.row_host(&opened.library, 0)?);
-                        }
-                        if probe::wants_first(&p.job.probe) {
-                            probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
-                        }
-                        let mut batch = SelectBatch::default();
-                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
-                        let selected = selector.select(&logits, &batch)?;
-                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                    }
-                    // The chunk's tapped tail becomes drafter context before the next step.
-                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
-                        let n = chunk.len().min(TAP_ROWS);
-                        let first = start + chunk.len() - n;
-                        drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
-                            .collect::<Vec<_>>())?;
-                    }
-                    Ok(())
-                });
-                if let Some(before) = memory_before {
-                    let boundary = serde_json::json!({"kind": if media_index == 0 { "first-text-prefill" } else { "first-media-prefill" },
-                        "rows": chunk.len(), "success": result.is_ok(), "before": before,
-                        "after": prefill_memory_sample(),
-                        "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
-                    tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
-                    memory_boundaries.borrow_mut().push(boundary);
-                }
-                p.done += chunk.len();
-                add_phases(&mut p.phases, phases);
-                p.busy += timer.elapsed().as_secs_f64();
-                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
-                result?;
-                // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-                    if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, &p.keys.tokens()[..point], p.keys.spans(), &p.placement,
-                        After::default()) {
-                        tracing::warn!("snapshot point {point} not retained: {error:#}");
-                    }
-                }
-                p.chunks += 1;
-                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+                        prefill_group(&cx, &mut selector, &mut cache, group)
+                    })
+            } else {
+                prefills.round(|p| prefill_chunk(&cx, &mut selector, &mut cache, p))
+            };
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1045,7 +1003,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
                         tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
-                        experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64, "prefill");
+                        experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64,
+                        packed_chunks = p.packed, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
@@ -1373,6 +1332,207 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     }
 }
 
+/// What a prefill round's chunks share: the engine, the prefix family, whether the cache retains
+/// snapshots, and the first-prefill memory boundaries.
+#[derive(Clone, Copy)]
+struct PrefillCx<'r, 'e, 'a> {
+    engine: &'e GlmfEngine<'a>,
+    library: &'r cuteafd_ffi::NativeLibrary,
+    family: &'r GlmfPrefix<'e, 'a>,
+    caching: bool,
+    first_prefill_seen: &'r std::cell::Cell<[bool; 2]>,
+    memory_boundaries: &'r std::cell::RefCell<Vec<serde_json::Value>>,
+}
+
+/// One chunk of prompt `p` through its own pass (a lane wave where Spark prefill runs in lanes):
+/// the first token after its last chunk, the chunk's drafter context, its snapshot points.
+fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &mut Prefill<'_>) -> Result<Chunk> {
+    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries } = *cx;
+    let drafter = engine.drafter.as_ref();
+    if p.done == p.tokens.len() {
+        return Ok(Chunk::Done);
+    }
+    if p.job.events.is_closed() {
+        p.cancelled = true;
+        anyhow::bail!("client went away");
+    }
+    let timer = Instant::now();
+    let end = chunk_end(p);
+    let chunk = &p.tokens[p.done..end];
+    // One sample around the first text and first media prefill only;
+    // no extra synchronization and no steady-state decode sampling.
+    let media_index = usize::from(!p.media.spans().is_empty());
+    let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
+    let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+        let start = p.placement.len;
+        let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
+            engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+        } else {
+            engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
+        };
+        if end == p.tokens.len() {
+            // The first token, while this prompt's logits are the workspace's.
+            let logits = logits.context("prefill produced no logits")?;
+            if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
+                p.prompt_row = Some(logits.row_host(library, 0)?);
+            }
+            if probe::wants_first(&p.job.probe) {
+                probe::device_rows(library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+            }
+            let mut batch = SelectBatch::default();
+            batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+            let selected = selector.select(&logits, &batch)?;
+            p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+        }
+        // The chunk's tapped tail becomes drafter context before the next step.
+        if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
+            let n = chunk.len().min(TAP_ROWS);
+            let first = start + chunk.len() - n;
+            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
+                .collect::<Vec<_>>())?;
+        }
+        Ok(())
+    });
+    if let Some(before) = memory_before {
+        let boundary = serde_json::json!({"kind": if media_index == 0 { "first-text-prefill" } else { "first-media-prefill" },
+            "rows": chunk.len(), "success": result.is_ok(), "before": before,
+            "after": prefill_memory_sample(),
+            "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
+        tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
+        memory_boundaries.borrow_mut().push(boundary);
+    }
+    p.done += chunk.len();
+    add_phases(&mut p.phases, phases);
+    p.busy += timer.elapsed().as_secs_f64();
+    p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
+    result?;
+    capture_points(family, cache, p);
+    p.chunks += 1;
+    Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+}
+
+/// Intermediate snapshot points prompt `p`'s current chunk ends at (off unless configured).
+fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &Prefill<'_>) {
+    for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
+            p.keys.spans(), &p.placement, After::default()) {
+            tracing::warn!("snapshot point {point} not retained: {error:#}");
+        }
+    }
+}
+
+/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-batch`): still prefilling
+/// with its client there, no media (its rows' embeddings are injected by its own pass), and not a
+/// cold probe's replayed decode step.
+fn packs(p: &Prefill<'_>) -> bool {
+    packs_chunk(!p.job.events.is_closed(), p.tokens.len() - p.done, p.logits.is_some(), !p.media.spans().is_empty(),
+        cold_replay_decode(&p.job.probe, p.chunks))
+}
+
+/// [`packs`] from a prompt's state: its client is there, rows are left, no whole-prompt hit's
+/// retained logits, no media, and its next chunk is not a cold probe's replayed decode step.
+fn packs_chunk(client: bool, left: usize, retained: bool, media: bool, replay_decode: bool) -> bool {
+    client && left > 0 && !retained && !media && !replay_decode
+}
+
+/// Whether prompt `next` may join `group` in one packed pass (`--prefill-batch`): every member
+/// [`packs`], and every member's next chunk fits the pass.
+fn packable(group: &[Prefill<'_>], next: &Prefill<'_>, limits: &packing::Limits) -> bool {
+    let chunk = |p: &Prefill<'_>| (p.placement.len, chunk_end(p) - p.done);
+    packs(next) && group.iter().all(packs)
+        && packing::fits(&group.iter().chain([next]).map(chunk).collect::<Vec<_>>(), limits)
+}
+
+/// One past the last token of prompt `p`'s next chunk.
+fn chunk_end(p: &Prefill<'_>) -> usize {
+    p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())
+}
+
+/// The next chunk of every prompt of `group` in one packed pass (`--prefill-batch`,
+/// `GlmfEngine::prefill_packed`): each prompt's first token, prompt row, drafter context and
+/// snapshot points as its own chunk takes them. A group that no longer packs (a client left, a
+/// prompt is done) goes through the one-prompt path, so cleanup stays per prompt.
+fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, group: &mut [Prefill<'_>]) -> Vec<Result<Chunk>> {
+    if !group.iter().all(packs) {
+        return group.iter_mut().map(|p| prefill_chunk(cx, selector, cache, p)).collect();
+    }
+    let engine = cx.engine;
+    let timer = Instant::now();
+    let ends: Vec<usize> = group.iter().map(chunk_end).collect();
+    let rows: usize = group.iter().zip(&ends).map(|(p, &end)| end - p.done).sum();
+    let memory_before = first_prefill_sample(cx.first_prefill_seen, false, prefill_memory_sample);
+    let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+        let mut sequences = Vec::with_capacity(group.len());
+        let mut firsts = Vec::with_capacity(group.len());
+        for (p, &end) in group.iter_mut().zip(&ends) {
+            let Prefill { job, constraint, tokens, done, resume, placement, first, prompt_row, .. } = p;
+            let len = tokens.len();
+            sequences.push((placement, &tokens[*done..end]));
+            firsts.push((&*job, constraint, first, prompt_row, *resume, len, end));
+        }
+        let segments = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+            let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
+            if *end < *len {
+                return Ok(());
+            }
+            // The first token, while this prompt's logits are the workspace's.
+            if cx.caching && !probe::cold(&job.probe) && *resume < *len {
+                **prompt_row = Some(logits.row_host(cx.library, 0)?);
+            }
+            if probe::wants_first(&job.probe) {
+                probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len)?;
+            }
+            let mut batch = SelectBatch::default();
+            batch.push_next(job.sampling, constraint.as_mut(), *end as u64)?;
+            let selected = selector.select(&logits, &batch)?;
+            **first = Some(take(constraint.as_mut(), &selected[0])?);
+            Ok(())
+        })?;
+        drop((sequences, firsts));
+        // Each prompt's tapped tail becomes its drafter context before the next step.
+        if let Some(drafter) = engine.drafter.as_ref() {
+            for ((p, segment), &end) in group.iter().zip(&segments).zip(&ends) {
+                if let Some(slot) = p.slot {
+                    let n = segment.tap_rows;
+                    drafter.update(&(0..n).map(|r| ContextRow { tap_row: segment.tap_offset + r, slot,
+                        position: end - n + r }).collect::<Vec<_>>())?;
+                }
+            }
+        }
+        Ok(())
+    });
+    if let Some(before) = memory_before {
+        // The first text prefill's boundary, around the packed pass.
+        let boundary = serde_json::json!({"kind": "first-text-prefill", "rows": rows, "packed_prompts": group.len(),
+            "success": result.is_ok(), "before": before, "after": prefill_memory_sample(),
+            "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
+        tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
+        cx.memory_boundaries.borrow_mut().push(boundary);
+    }
+    // One pass for the group: its time and phases split evenly among the prompts.
+    let share = 1.0 / group.len() as f64;
+    let busy = timer.elapsed().as_secs_f64() * share;
+    for (p, &end) in group.iter_mut().zip(&ends) {
+        let rows = end - p.done;
+        p.done = end;
+        add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
+        p.busy += busy;
+        p.packed += 1;
+        p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
+    }
+    if let Err(error) = result {
+        let message = format!("packed prefill of {} prompts: {error:#}", group.len());
+        return group.iter().map(|_| Err(anyhow::anyhow!("{message}"))).collect();
+    }
+    group.iter_mut().map(|p| {
+        capture_points(cx.family, cache, p);
+        p.chunks += 1;
+        Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+    }).collect()
+}
+
 /// Coordinator share of `GLMF_TP2_STEP_MS` at one row (GPU 6.7 ms of 18.8).
 const GLMF_TP2_GPU_MS: f64 = 6.7;
 /// GLM 5.3 Flash, 1 RTX PRO 6000 (325 W) + Spark TP2 (rhea, moa), recommended
@@ -1409,5 +1569,43 @@ mod ring_tests {
         assert_eq!(misses, 1);
         assert_eq!(take_ring(&mut free, false, &mut misses), None);
         assert_eq!(misses, 1);
+    }
+}
+
+#[cfg(test)]
+mod serve_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    fn parse(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
+        Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
+            .chain(extra.iter().copied())).map(|p| p.serve)
+    }
+
+    #[test]
+    fn only_plain_prompt_chunks_join_a_packed_pass() {
+        assert!(packs_chunk(true, 1, false, false, false));
+        // A client that left, nothing left, a whole-prompt hit, media rows (their embeddings are
+        // injected by the prompt's own pass) or a cold probe's replayed decode step: its own path.
+        assert!(!packs_chunk(false, 1, false, false, false));
+        assert!(!packs_chunk(true, 0, false, false, false));
+        assert!(!packs_chunk(true, 1, true, false, false));
+        assert!(!packs_chunk(true, 1, false, true, false));
+        assert!(!packs_chunk(true, 1, false, false, true));
+    }
+
+    #[test]
+    fn packed_admission_prefill_is_off_by_default() {
+        assert!(!parse(&[]).unwrap().prefill_batch);
+        assert!(parse(&["--prefill-batch"]).unwrap().prefill_batch);
+        assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
+        assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
+        assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
     }
 }

@@ -516,6 +516,43 @@ def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+def test_glmf_default_launch_passes_no_admission_option(tmp_path):
+    """Packed admission prefill is opt-in: a launch without its key passes no option for it (one
+    prefill pass per prompt)."""
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in ("--prefill-batch",):
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("GLM5_FLASH_PREFILL_BATCH=off\n", (), ("--prefill-batch",)),
+    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
+])
+def test_glmf_admission_keys_are_forwarded(tmp_path, keys, expected, absent):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, (option, launch)
+    for option in absent:
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
+])
+def test_glmf_admission_keys_reject_bad_values_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
