@@ -755,7 +755,7 @@ mod tests {
     /// are the `prefix` ledger scopes a 32 GB card measured at 8 and 16 sequences.
     #[test]
     fn the_planner_reserves_the_marks_and_replay_records_the_engine_allocates() {
-        use super::super::engine::{kda_layer_bytes, IndexCache, KdaState, KEY_BYTES, TAIL_BYTES};
+        use super::super::engine::{kda_layer_bytes, IndexCache, KdaState, DECODE_ROWS, KEY_BYTES, TAIL_BYTES};
         use crate::shared::prefix::PrefixArgs;
         use clap::Parser;
         use cuteafd_loader::families::glm5_flash::GlmNextAttention;
@@ -771,7 +771,7 @@ mod tests {
         for (ranks, state) in [(1, KdaState::F32), (2, KdaState::F32), (1, KdaState::Bf16)] {
             let geometry = glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks, GlmfIndexCache::Keys,
                 state.bytes() as u64).unwrap();
-            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks, state);
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks, state, DECODE_ROWS);
             let rank = &geometry.ranks[0];
             assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes),
                 ((kda * (state + conv)) as u64, (kda * (state + conv)) as u64));
@@ -782,15 +782,15 @@ mod tests {
         for state in [KdaState::F32, KdaState::Bf16] {
             let compact = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, GlmfIndexCache::Compact,
                 state.bytes() as u64).unwrap();
-            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, state);
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, state, DECODE_ROWS);
             let rank = &compact.ranks[0];
             let slot = kda * (state + conv) + mla * TAIL_BYTES;
             assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes), (slot as u64, slot as u64));
             assert_eq!(rank.speculative_replay_bytes, (kda * replay + mla * 64 * KEY_BYTES) as u64);
         }
-        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::F32);
+        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::F32, DECODE_ROWS);
         let mark = kda * (state + conv);
-        let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16).0 + conv);
+        let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16, DECODE_ROWS).0 + conv);
         assert_eq!((mark, bf16, kda * replay, mla * 64 * KEY_BYTES), (147_619_840, 76_316_672, 321_421_312, 360_448));
         let prefix = Cli::parse_from(["serve"]).prefix;
         for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 18, 28), (16, 34, 34), (64, 130, 130)] {

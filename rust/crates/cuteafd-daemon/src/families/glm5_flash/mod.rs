@@ -73,6 +73,15 @@ pub(crate) struct EngineArgs {
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
     #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// The most rows of one decode or verify step: 64 (the `_m64` programs), or 128, where a step of
+    /// more than 64 rows runs the wide `_m128` programs (a build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128;
+    /// one GPU) and fewer rows keep the `_m64` ones, their bits and speed. A verify step then schedules
+    /// up to the GPU's whole sparse MLA waves (127 rows on an RTX 5090, 128 on 188 SMs): at 16 sequences
+    /// each verifies 6 or 7 drafts instead of 3. The decode workspace, the token selector and the
+    /// speculative replay records grow with it, and every expert resource holds at least its rows.
+    #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROWS", default_value_t = engine::DECODE_ROWS,
+        value_parser = parse_decode_rows)]
+    pub decode_rows: usize,
     /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
     /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
     /// --prefill-rows rows. The lanes share one set of attention temporaries.
@@ -226,6 +235,47 @@ pub(crate) struct EngineArgs {
     pub serving_graph_policy: Option<(usize, bool)>,
 }
 
+/// `--decode-rows`: the decode programs' 64 rows, or the wide programs' 128.
+fn parse_decode_rows(value: &str) -> std::result::Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(rows) if rows == engine::DECODE_ROWS || rows == engine::WIDE_DECODE_ROWS => Ok(rows),
+        _ => Err(format!("{} or {}", engine::DECODE_ROWS, engine::WIDE_DECODE_ROWS)),
+    }
+}
+
+/// The wide `_m128` programs a launch with `--decode-rows 128` runs (none with 64): every decode
+/// program its steps launch, at 128 rows, for its KDA state, KDA projections and index cache, and the
+/// replay commit over 128-row records. Start-up names the first one the build lacks.
+pub(crate) fn wide_decode_programs(args: &EngineArgs, cfg: &GlmNextConfig) -> Vec<String> {
+    if args.decode_rows <= engine::DECODE_ROWS {
+        return Vec::new();
+    }
+    let cap = format!("m{}", engine::WIDE_DECODE_ROWS);
+    let compact = args.index_cache == engine::IndexCache::Compact;
+    let mut names: Vec<String> = ["mhc_post_pre".to_string(), "mla_producer".into(), "o".into(),
+        "sparse_mla_decode".into(), "index_producer".into(), "index_topk_decode".into(),
+        format!("ffn_i{}", cfg.moe_intermediate), format!("ffn_i{}", cfg.dense_intermediate)]
+        .into_iter().map(|name| format!("glmf_{name}_{cap}")).collect();
+    names.push(format!("glmf_{}", args.kda_state.program(&cap)));
+    if args.kda_fp8 != fp8::KdaFp8::Off {
+        names.push(format!("glmf_kda_w8_{cap}"));
+    }
+    if compact {
+        names.push(format!("glmf_index_producer_c_{cap}"));
+    }
+    let commit = if compact { args.kda_state.compact_commit_program() } else { args.kda_state.commit_program() };
+    names.push(format!("glmf_{commit}_{cap}"));
+    names
+}
+
+/// The token selector and GPU sampler of `decode_rows`-row steps beyond the 64-row ones (none at 64):
+/// what `--decode-rows 128` adds where the serving loop makes the selector after the pool.
+fn wide_selector_bytes(decode_rows: usize, vocab: usize) -> u64 {
+    use cuteafd_loader::serving_capacity::glmf_selector_bytes;
+    glmf_selector_bytes(decode_rows as u64, vocab as u64)
+        .saturating_sub(glmf_selector_bytes(engine::DECODE_ROWS as u64, vocab as u64))
+}
+
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
@@ -247,19 +297,25 @@ mod draft_cli_tests {
         assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
-    /// Start-up loads GLM Flash's own programs, the head split's shares with a second GPU, nothing
-    /// of another family: the engine resolves programs only as `glmf_`/`glmf2_` (`run_on`) and the
-    /// FP8 head's `glmf_head_fp8`.
+    /// Start-up loads GLM Flash's own programs, the head split's shares with a second GPU, the wide
+    /// `_m128` decode programs only with `--decode-rows 128`, nothing of another family: the engine
+    /// resolves programs only as `glmf_`/`glmf2_` (`run_on`) and the FP8 head's `glmf_head_fp8`.
     #[test]
     fn startup_loads_only_the_programs_a_glm_flash_engine_launches() {
         let names = ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
             "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows", "dsv4f_attention_m64", "dsv4p_compressor_m4096",
-            "glm_mla_m64", "mimo_attention_m64", "qwen4_gdn_m64"];
-        let kept = |split: bool| -> Vec<&str> { names.iter().copied().filter(|n| glmf_startup_program(n, split)).collect() };
-        assert_eq!(kept(false), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
-            "glmf_head_fp8"]);
-        assert_eq!(kept(true), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
-            "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows"]);
+            "glm_mla_m64", "mimo_attention_m64", "qwen4_gdn_m64", "glmf_kda_m128", "glmf_kda_commit_c_s16_m128"];
+        let kept = |split: bool, wide: bool| -> Vec<&str> {
+            names.iter().copied().filter(|n| glmf_startup_program(n, split, wide)).collect()
+        };
+        assert_eq!(kept(false, false), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16",
+            "glmf_index_producer_c_m64", "glmf_head_fp8"]);
+        assert_eq!(kept(true, false), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16",
+            "glmf_index_producer_c_m64", "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows"]);
+        // `--decode-rows 128` (one GPU) adds the wide programs, which no step of up to 64 rows launches.
+        assert_eq!(kept(false, true), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16",
+            "glmf_index_producer_c_m64", "glmf_head_fp8", "glmf_kda_m128", "glmf_kda_commit_c_s16_m128"]);
+        assert_eq!(format!("_m{}", engine::WIDE_DECODE_ROWS), "_m128");
         // Every program lookup the engine makes: `run_on`'s prefix and the FP8 head (re-check the
         // predicate if another appears).
         let engine = include_str!("engine.rs");
@@ -353,6 +409,138 @@ mod draft_cli_tests {
         check_options(&parse(&["--kda-state", "bf16", "--index-cache", "compact"])).unwrap();
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--kda-state", "fp16"]).is_err());
+    }
+
+    /// `--decode-rows`: 64 by default (the `_m64` programs, nothing changes), 128 with the wide programs
+    /// on one GPU; a head split is refused before any checkpoint or native work.
+    #[test]
+    fn decode_rows_default_to_64_and_take_128_on_one_gpu() {
+        assert_eq!(parse(&[]).decode_rows, engine::DECODE_ROWS);
+        let wide = parse(&["--decode-rows", "128"]);
+        assert_eq!(wide.decode_rows, engine::WIDE_DECODE_ROWS);
+        check_options(&wide).unwrap();
+        check_options(&parse(&["--decode-rows", "128", "--index-cache", "compact", "--kda-state", "bf16"])).unwrap();
+        for rows in ["0", "32", "65", "127", "256", "wide"] {
+            assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--decode-rows", rows]).is_err(), "{rows}");
+        }
+        let error = check_options(&parse(&["--decode-rows", "128", "--split-device", "1"])).unwrap_err().to_string();
+        assert!(error.contains("--decode-rows 64"), "{error}");
+        check_options(&parse(&["--decode-rows", "64", "--split-device", "1"])).unwrap();
+    }
+
+    /// The wide programs a launch needs follow its KDA state, KDA projections and index cache; 64 rows
+    /// need none.
+    #[test]
+    fn wide_launches_name_the_wide_programs_of_their_configuration() {
+        let cfg = GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
+            attention: vec![cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda; 45], dense: vec![false; 45],
+            dense_intermediate: 12288, experts: 288, topk: 8, moe_intermediate: 2048, routed_scale: 2.5,
+            swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4, kda_heads: 64, kda_head_dim: 128, heads: 64,
+            q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048,
+            index_kpool: 4, eos: vec![] };
+        assert!(wide_decode_programs(&parse(&[]), &cfg).is_empty());
+        let base = ["glmf_mhc_post_pre_m128", "glmf_mla_producer_m128", "glmf_o_m128", "glmf_sparse_mla_decode_m128",
+            "glmf_index_producer_m128", "glmf_index_topk_decode_m128", "glmf_ffn_i2048_m128", "glmf_ffn_i12288_m128"];
+        let with = |extra: &[&str]| base.iter().chain(extra).map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128"]), &cfg),
+            with(&["glmf_kda_m128", "glmf_kda_commit_m128"]));
+        assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128", "--kda-fp8", "row128"]), &cfg),
+            with(&["glmf_kda_m128", "glmf_kda_w8_m128", "glmf_kda_commit_m128"]));
+        assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128", "--kda-state", "bf16", "--index-cache",
+            "compact"]), &cfg), with(&["glmf_kda_s16_m128", "glmf_index_producer_c_m128", "glmf_kda_commit_c_s16_m128"]));
+        // Every name is one of the exporter's 16 wide stems.
+        let stems = ["index_producer", "index_producer_c", "index_topk_decode", "mhc_post_pre", "kda", "kda_w8",
+            "kda_s16", "mla_producer", "o", "sparse_mla_decode", "ffn_i2048", "ffn_i12288", "kda_commit",
+            "kda_commit_s16", "kda_commit_c", "kda_commit_c_s16"].map(|stem| format!("glmf_{stem}_m128"));
+        for flags in [&["--kda-fp8", "row128", "--index-cache", "compact"][..], &["--kda-state", "bf16-tile"][..]] {
+            let args = parse(&[&["--decode-rows", "128"][..], flags].concat());
+            assert!(wide_decode_programs(&args, &cfg).iter().all(|name| stems.contains(name)), "{flags:?}");
+        }
+        // Start-up loads all 16 with 128 rows and none with 64 (`glmf_startup_program`).
+        for name in &stems {
+            assert!(glmf_startup_program(name, false, true) && !glmf_startup_program(name, false, false), "{name}");
+        }
+    }
+
+    /// The selector and sampler `--decode-rows 128` adds where the serving loop makes them after the pool:
+    /// the loader's formula (which the planner charges) is the daemon's allocation, 3,209,984 B over 64 rows.
+    #[test]
+    fn the_wide_selector_reserve_is_what_the_selector_allocates() {
+        use crate::shared::sampler::TargetSamplingWave;
+        for rows in [engine::DECODE_ROWS, engine::WIDE_DECODE_ROWS] {
+            assert_eq!(cuteafd_loader::serving_capacity::glmf_selector_bytes(rows as u64, 154_880),
+                (rows * 12 + TargetSamplingWave::device_bytes(rows.min(128), 154_880)) as u64);
+        }
+        assert_eq!(wide_selector_bytes(engine::DECODE_ROWS, 154_880), 0);
+        assert_eq!(wide_selector_bytes(engine::WIDE_DECODE_ROWS, 154_880), 3_209_984);
+    }
+
+    /// `--prefill-rows 64 --decode-rows 128`: a 16-stream verify wave of long drafts fills the GPU's
+    /// verify budget (127 rows on 170 SMs, 128 on 188) and runs every real row, more than the prefill
+    /// lane's 64, through the experts; every expert resource holds the widest step's rows, and a
+    /// planned admission charges the Spark intake planes' rows past the lane's.
+    #[test]
+    fn experts_hold_a_verify_wave_wider_than_the_prefill_lane() {
+        for (flags, rows) in [(&[][..], 4096), (&["--decode-rows", "128"][..], 4096),
+            (&["--prefill-rows", "64"][..], 64), (&["--prefill-rows", "64", "--decode-rows", "128"][..], 128),
+            (&["--prefill-rows", "2048", "--decode-rows", "128"][..], 2048), (&["--prefill-rows", "32"][..], 64)] {
+            assert_eq!(parse(flags).expert_rows(), rows, "{flags:?}");
+        }
+        let args = parse(&["--prefill-rows", "64", "--decode-rows", "128"]);
+        check_options(&args).unwrap();
+        for (sms, budget) in [(170, 127), (188, 128)] {
+            let verify_rows = engine::verify_budget(args.decode_rows, sms);
+            assert_eq!(verify_rows, budget);
+            // The serving loop's limits at 16 sequences that can all draft past the even share.
+            let sequences = 16;
+            let room = (verify_rows / sequences).max(1) - 1;
+            let mut limits = vec![room; sequences];
+            engine::hand_out_remainder(&mut limits, room, verify_rows, |_| true);
+            let real: usize = limits.iter().map(|limit| limit + 1).sum();
+            assert_eq!(real, verify_rows);
+            // Padded into its bucket, the step's real rows run the router, the expert wire and the
+            // routed experts.
+            let bucket = engine::DecodeBuckets::new(verify_rows).bucket(real, true);
+            let mut experts = None;
+            crate::shared::decode_graph::real_row_moe(real, bucket, |rows| { experts = Some(rows); Ok(()) },
+                |_| Ok(())).unwrap();
+            let rows = experts.unwrap();
+            assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
+        }
+        // Two lanes' transports, each with a plane per Spark (4 ranks) of 64 more rows of 4,096 BF16.
+        assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
+        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-lanes", "4"]),
+            4, 4096), 4 * 4 * 64 * 4096 * 2);
+        for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
+            &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
+            assert_eq!(wide_intake_bytes(&parse(flags), 4, 4096), 0, "{flags:?}");
+        }
+    }
+
+    /// The dense NVFP4 package, local FP8 and EXL3 experts and every Spark transport are sized by
+    /// `expert_rows`, never by the prefill lane's rows alone.
+    #[test]
+    fn every_expert_resource_takes_the_expert_rows() {
+        let source = include_str!("mod.rs");
+        // The needles are joined here, so that this test's own text does not match them.
+        let body = |name: &str| {
+            let start = source.find(&["    fn ", name, "<'s>(&'s self, args: &EngineArgs"].concat()).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        let (dense, experts) = (body("load_dense"), body("experts"));
+        let sized = ["args.expert", "_rows()"].concat();
+        assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
+        // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
+        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new("] {
+            let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
+            let arguments: String = experts[at..].chars().take(200).collect();
+            assert!(arguments.contains(&sized), "{site}");
+        }
+        assert_eq!(experts.matches(&sized).count(), 3);
+        let lane = ["args.prefill", "_rows"].concat();
+        assert!(!dense.contains(&lane) && !experts.contains(&lane));
     }
 
     #[test]
@@ -792,6 +980,9 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
     ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
         "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
+    ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
+        "--decode-rows {} runs the wide decode programs on one GPU: a head split (--split-device) takes \
+        --decode-rows {}", args.decode_rows, engine::DECODE_ROWS);
     Ok(())
 }
 
@@ -807,6 +998,24 @@ impl EngineArgs {
         ensure!(self.headroom_gib.is_finite() && self.headroom_gib >= 0.0, "--headroom-gib must be a size in GiB");
         Ok((self.headroom_gib * (1u64 << 30) as f64) as u64)
     }
+
+    /// The rows every routed-expert resource holds (the dense NVFP4 package, local FP8 or EXL3
+    /// experts, the Spark transports and their intake planes): the widest step, a prefill lane of
+    /// `--prefill-rows` or a decode or verify step of `--decode-rows` (with `--prefill-rows 64
+    /// --decode-rows 128`, a verify step's 127 rows).
+    pub(crate) fn expert_rows(&self) -> usize {
+        cuteafd_loader::serving_capacity::glmf_expert_rows(self.prefill_rows as u64, self.decode_rows as u64) as usize
+    }
+}
+
+/// Device bytes of the Spark intake planes that experts sized for the decode rows hold beyond a
+/// narrower prefill lane's (none when a lane is at least as wide as a decode step): what a planned
+/// admission charges on the lead GPU, as it charges the wide selector, beyond the allowances it
+/// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
+fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
+    use cuteafd_loader::serving_capacity::glmf_spark_intake_bytes;
+    let at = |rows: usize| glmf_spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
+    at(args.expert_rows()) - at(args.prefill_rows)
 }
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
@@ -814,15 +1023,17 @@ impl EngineArgs {
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
+        decode_rows: args.decode_rows }
 }
 
-/// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`), and
-/// the head split's `glmf2_` shares with a second GPU (rank 0 runs shares too). Every program a
-/// step can launch inside a decode graph capture is loaded; the engine launches no other family's
-/// program.
-pub(crate) fn glmf_startup_program(name: &str, split: bool) -> bool {
-    name.starts_with("glmf_") || (split && name.starts_with("glmf2_"))
+/// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`), the
+/// head split's `glmf2_` shares with a second GPU (rank 0 runs shares too), and the wide `_m128`
+/// decode programs only with `--decode-rows 128` (`wide`: steps of up to 64 rows never launch them).
+/// Every program a step can launch inside a decode graph capture is loaded; the engine launches no
+/// other family's program.
+pub(crate) fn glmf_startup_program(name: &str, split: bool, wide: bool) -> bool {
+    (name.starts_with("glmf_") && (wide || !name.ends_with("_m128"))) || (split && name.starts_with("glmf2_"))
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -1014,9 +1225,16 @@ impl Opened {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
+        // `--decode-rows 128`: every wide program this configuration's steps and commits launch.
+        for name in wide_decode_programs(args, &self.cfg) {
+            programs.spec(&name).with_context(|| format!("--decode-rows {} needs program {name}; this build \
+                exports no 128-row decode programs (build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128)", args.decode_rows))?;
+        }
         // GLM Flash's programs only (a release library carries every family's): the head split's
-        // `glmf2_` share programs only with a second GPU.
-        let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name, args.split_device.is_some()))?;
+        // `glmf2_` share programs only with a second GPU, the wide `_m128` ones only with
+        // `--decode-rows 128`.
+        let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name, args.split_device.is_some(),
+            args.decode_rows > engine::DECODE_ROWS))?;
         tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
@@ -1124,8 +1342,10 @@ impl Opened {
             // An automatic pool can only shrink this geometry, never exceed the 2M cap.
             let pool = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
                 else { args.pool_tokens };
+            // The engine's bucket sets: with the wide programs its verify budget, from this GPU's SMs.
+            let buckets = engine::DecodeBuckets::new(engine::verify_budget(args.decode_rows, self.library.sm_count()?));
             Some(engine::serving_graph_reserve(args.max_context, pool, self.cfg.dense_context(),
-                sequences, speculation, layers, peer_stream.is_some()))
+                sequences, speculation, layers, peer_stream.is_some(), &buckets))
         } else { None };
         // Eager admission (an automatic or budgeted pool on one GPU, its experts on Sparks or
         // admitted under the budget): the drafter, the Spark transports and intake, the dense
@@ -1154,7 +1374,7 @@ impl Opened {
             }
             let dense = self.load_dense(args, &model.layers)?;
             let mut selector = crate::shared::token_io::TokenSelector::new(&self.library, args.token_io.token_select,
-                self.cfg.vocab_size, engine::DECODE_ROWS)?;
+                self.cfg.vocab_size, args.decode_rows)?;
             selector.reserve_sampler()?;
             let lanes = if engine::prefill_pipelines(layers, self.cfg.layers, experts.as_ref(), args.prefill_lanes) {
                 args.prefill_lanes
@@ -1163,14 +1383,17 @@ impl Opened {
                 &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
             // The caches this engine builds: records per token, the sequences' state and marks, and
             // the speculative records follow the index cache, and a BF16 KDA state halves the state
-            // per sequence and each mark the arena holds.
-            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
-                index_cache.into(), args.kda_state.bytes() as u64)?;
+            // per sequence and each mark the arena holds. The replay records and commit tables hold the
+            // decode rows (`later` charges them: they are allocated with the pool).
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry_rows(&self.cfg, layers, 1,
+                index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
-            // Shared replay records sit in the prefill scratch the workspaces already hold.
+            // Shared replay records (of the decode rows) sit in the prefill scratch the workspaces already
+            // hold.
             let shared_records = if args.replay_records == engine::ReplayRecords::Shared {
-                cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes(&self.cfg, layers, 1)?
+                cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes_rows(&self.cfg, layers, 1,
+                    args.decode_rows as u64)?
             } else { 0 };
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes - shared_records;
@@ -1245,18 +1468,29 @@ impl Opened {
             // Every GPU keeps the prefix mark arena the caller allocates (its part of `planner_mark_slots`
             // marks, whatever the KDA state) and the speculative replay records free, as the runtime
             // allocates them.
+            // The token selector and GPU sampler of `--decode-rows 128` beyond the 64-row ones the
+            // runtime allowance holds: the serving loop makes them after the pool, on the lead GPU.
+            let selector = wide_selector_bytes(args.decode_rows, self.cfg.vocab_size);
+            // The Spark intake planes of experts sized for decode steps wider than a prefill lane
+            // (`--prefill-rows 64 --decode-rows 128`), past the lane's rows, also on the lead GPU.
+            let intake = match args.peers.as_deref() {
+                Some(peers) if moe && !args.skip_experts => wide_intake_bytes(args, peers.split(',').count(),
+                    self.cfg.hidden),
+                _ => 0,
+            };
             engine::admit_beside_decode_graphs(startup, |graphs| {
                 // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
                 let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
-                let reserves: Vec<_> = workspace_reserve.iter().map(|&workspace|
+                let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
                     crate::shared::memory_report::RankReserve {
-                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra },
+                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }
+                            + if rank == 0 { selector + intake } else { 0 },
                         workspace_bytes: args.full_prefill_logits.then_some(workspace),
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                     args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
-                    index_cache.into(), args.kda_state.bytes() as u64)
+                    index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)
             })?
         } else {
             (args.pool_tokens, startup_graphs)
@@ -1264,7 +1498,7 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, records)?;
+            args.kda_state, args.decode_rows, records)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
@@ -1353,7 +1587,7 @@ impl Opened {
             return Ok(None);
         }
         let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
-        let dense = engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?;
+        let dense = engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.expert_rows())?;
         tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
         Ok(Some(dense))
     }
@@ -1372,7 +1606,7 @@ impl Opened {
             let resident = if args.expert_window.is_some() { 0..0 } else { first..layers };
             let started = Instant::now();
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
-                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                args.expert_rows(), free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();
@@ -1388,7 +1622,7 @@ impl Opened {
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
                 resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1),
-                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.prefill_rows,
+                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.expert_rows(),
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
                 budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
             })));
@@ -1398,9 +1632,10 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
+        // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
+        // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
         let transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
-            &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+            &peers, &executors, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
         crate::shared::memory_report::release_load_staging(&self.library);

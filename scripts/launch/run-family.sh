@@ -787,8 +787,9 @@ if [[ $family == glm5_flash ]]; then
   esac
   [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
-  # own 321 MB) or shared (the prefill lanes' scratch, which no decode step reads). One GPU whose
-  # pool is sized from measured memory (an automatic pool with Spark experts).
+  # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
+  # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
+  # Spark experts).
   replay_records="$(get GLM5_FLASH_REPLAY_RECORDS own)"
   case "$replay_records" in
     ""|own) ;;
@@ -799,6 +800,19 @@ if [[ $family == glm5_flash ]]; then
       fi
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_DECODE_ROWS: the most rows of one decode or verify step, 64 (default) or 128. With
+  # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
+  # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
+  # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  case "$decode_rows" in
+    ""|64) ;;
+    128)
+      [[ $head_split == 0 ]] ||
+        { echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; a head split takes 64" >&2; exit 2; }
+      family_args+=(--decode-rows 128) ;;
+    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
   esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
@@ -869,6 +883,12 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   fi
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
+  # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
+  # charge their wider decode workspace, selector, replay records and expert intake, as serving
+  # admits them, before an encoder placement is chosen.
+  if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
+    plan_draft_args+=(--decode-rows 128)
+  fi
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
