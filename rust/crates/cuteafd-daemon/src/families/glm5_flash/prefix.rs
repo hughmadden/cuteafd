@@ -69,6 +69,15 @@ pub(crate) enum PrefixMarks {
     Pool,
 }
 
+impl PrefixMarks {
+    /// Where marks live with `entries` retained snapshots per bank. Without entries no mark is
+    /// ever taken, so there is no store: pool marks keep no unit back and need no room in the
+    /// pool, as an arena of no entries holds no mark.
+    pub fn with_entries(self, entries: usize) -> Self {
+        if entries == 0 { Self::Arena } else { self }
+    }
+}
+
 /// The prefix mark arena a command allocates on every GPU (a head split's GPUs each their part
 /// of every mark), which either KV admission reserves before the pool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -959,6 +968,18 @@ mod tests {
         assert_eq!(super::ArenaMarks::Slots(2).slots_on(&cfg, cfg.layers, IndexCache::Compact, KdaState::F32)
             .unwrap(), 2);
         assert_eq!(super::ArenaMarks::None.slots_on(&cfg, cfg.layers, IndexCache::Keys, KdaState::F32).unwrap(), 0);
+    }
+
+    /// Without entries no mark is taken: pool marks need no room in the pool and keep no unit
+    /// back, and the arena rule sizes no arena.
+    #[test]
+    fn no_entries_take_no_prefix_marks() {
+        use super::PrefixMarks;
+        assert_eq!(PrefixMarks::Pool.with_entries(0), PrefixMarks::Arena);
+        assert_eq!(PrefixMarks::Pool.with_entries(1), PrefixMarks::Pool);
+        assert_eq!(PrefixMarks::Arena.with_entries(0), PrefixMarks::Arena);
+        let rule = crate::shared::prefix::MarkRule { lanes: 16, entries: 0, budget_bytes: 2 << 30 };
+        assert_eq!(super::ArenaMarks::Rule(rule).slots(147_619_840), 0);
     }
 
     /// Pool marks off the GPU: a mark laid out buffer by buffer over its units round trips

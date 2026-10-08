@@ -813,7 +813,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                         .and_then(|draft| mimo_draft_prefix_bytes(&draft, 1, options.mimo_rings.max(concurrency))))
                 } else { None }
             } else { None };
-            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks;
+            // GLM 5.3 Flash takes no mark without entries, so pool marks then keep no unit back.
+            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks && options.mimo_prefix_entries > 0;
             let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                 if family == "mimo_v2" {

@@ -213,6 +213,12 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some() || policy.copy > 0));
     let lanes = max_sequences.min(DECODE_ROWS);
+    // Without entries no mark is taken: pool marks keep no unit back and need no room in the pool.
+    let marks = args.prefix_marks.with_entries(prefix.prefix_cache_entries);
+    if marks != args.prefix_marks {
+        tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
+        args.prefix_marks = marks;
+    }
     // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
     // counted once the engine's layout is known (`with_engine`).
     args.mark_arena = match args.prefix_marks {

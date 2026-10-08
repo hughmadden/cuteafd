@@ -1786,6 +1786,11 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
         .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
     let (pool, none) = (layout(true, None), layout(false, Some(0)));
     assert_eq!((item(&pool, "marks"), item(&pool, "reserved units")), (0, GLMF_POOL_MARK_RESERVED_UNITS * unit));
+    // No entries, no marks: pool marks keep no unit back, as serve-glmf then keeps none.
+    let off = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![48 << 30],
+        concurrency: 16, pool_tokens: Some(0), glmf_pool_marks: true, mimo_prefix_entries: 0, ..Default::default() }),
+        ..sparks(4) }).unwrap().memory_layout.unwrap();
+    assert_eq!((item(&off, "marks"), item(&off, "reserved units")), (0, 0));
     assert_eq!((item(&none, "marks"), item(&none, "reserved units")), (0, 0));
     // Pool marks ignore an arena request; the reserved unit's bytes come out of the pool.
     assert_eq!(item(&layout(true, Some(34)), "marks"), 0);
