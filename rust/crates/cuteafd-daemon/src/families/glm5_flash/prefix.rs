@@ -233,6 +233,21 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         Ok(out)
     }
 
+    /// Diagnostic (`--resume-poison-unit0`): fills record slot 0 (unit 0's first MLA record) of
+    /// every MLA layer on every rank with `byte`, after the streams drained. With pool marks unit 0
+    /// is reserved and nothing else reads or writes it, so whatever reaches the logits through it
+    /// came from a kernel's stand-in for masked candidates.
+    fn fill_stand_in(&self, byte: u8) -> Result<()> {
+        ensure!(self.mark_units > 0, "the stand-in poison needs pool marks (unit 0 reserved)");
+        self.engine.synchronize()?;
+        let bytes = vec![byte; RECORD_BYTES];
+        for &(rank, layer) in &self.paged {
+            let slot0 = view(layer.records, 0, RECORD_BYTES)?;
+            self.engine.on(rank, || self.engine.library.copy_h2d(slot0, &bytes))?;
+        }
+        Ok(())
+    }
+
     /// Mark `slot`'s part on each rank: (rank, its arena range).
     fn mark_parts(&self, slot: MarkSlot) -> Result<Vec<(usize, CuteafdDeviceBuffer)>> {
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
@@ -469,12 +484,18 @@ fn gather_scatter(from: &[Span], to: &[Span]) -> Vec<SpanCopy> {
 }
 
 /// One continued prefill: every layer's output digest, every row's logits digest and argmax,
-/// and the last row.
+/// the last row, and how many logits were not finite (NaN or infinite: never in a sound run).
 pub(crate) struct SuffixRun {
     pub layers: Vec<u64>,
     pub logits: u64,
     pub argmax: Vec<usize>,
     pub last: Vec<f32>,
+    pub nonfinite: usize,
+}
+
+/// Logits that are NaN or infinite.
+fn nonfinite(values: &[f32]) -> usize {
+    values.iter().filter(|v| !v.is_finite()).count()
 }
 
 /// Prefill `tokens` into `placement` in chunks of `chunk` rows, digesting each layer's streams
@@ -485,7 +506,7 @@ pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacem
     let vocab = engine.cfg.vocab_size;
     let mut hashers: Vec<std::collections::hash_map::DefaultHasher> = Vec::new();
     let mut logit_hash = std::collections::hash_map::DefaultHasher::new();
-    let (mut argmax, mut last) = (Vec::new(), Vec::new());
+    let (mut argmax, mut last, mut bad) = (Vec::new(), Vec::new(), 0);
     for part in tokens.chunks(chunk) {
         let mut on_layer = |layer: usize, rows: &[u8]| -> Result<()> {
             if hashers.len() <= layer {
@@ -501,10 +522,12 @@ pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacem
                 values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
                 argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
             }
+            bad += nonfinite(&out);
             last = out[out.len() - vocab..].to_vec();
         }
     }
-    Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })
+    Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last,
+        nonfinite: bad })
 }
 
 /// `range` of rank `rank`'s GPU, after every stream drained (retiring every write to it).
@@ -543,21 +566,29 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
 /// units, the copied tail unit, the KDA mark), restore it into sequence B (its own KDA slot and
 /// pool-page mapping), continue both with the same chunks and `decode` greedy single-row steps,
 /// and compare every layer's rows, every logit, every paged row, the KDA state and the mark
-/// round trip byte for byte (a restore must be exact). A straight prefill without the boundary
-/// at P is reported too (informational: chunking changes may round differently).
+/// round trip byte for byte (a restore must be exact). Every logit must also be finite: equal NaNs
+/// in A and B compare identical. A straight prefill without the boundary at P is reported too
+/// (informational: chunking changes may round differently).
 /// With `cold`, B is prefilled from scratch on its own units instead (no restore): the floor of
 /// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
 /// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
 /// `marks` picks where the two marks live: arena slots, or pool units taken beside the
 /// sequences' own units (so their rows must come through the mark's units untouched too), with
 /// unit 0 reserved as in serving.
+/// `poison` (diagnostic, pool marks): before the continuations, fill the reserved unit's record
+/// slot 0 with 0xFF (NaN as E4M3 and as FP32) in every MLA layer, and report the non-finite
+/// logits instead of failing on them. Nothing but a kernel's stand-in for masked candidates reads
+/// that record: non-finite decode logits show the decode sparse MLA reads it (and multiplies it
+/// by zero) for masked candidates.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n: usize, chunk: usize, decode: usize,
-    cold: bool, repeat: usize, marks: PrefixMarks) -> Result<()> {
+    cold: bool, repeat: usize, marks: PrefixMarks, poison: bool) -> Result<()> {
     use super::engine::Allocator;
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
     ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
+    ensure!(!poison || marks == PrefixMarks::Pool,
+        "--resume-poison-unit0 needs --prefix-marks pool (unit 0 reserved, so nothing else reads or writes it)");
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let embed = &tokens[..n];
     let family = GlmfPrefix::new(engine, marks, |_| 2)?;
@@ -582,40 +613,47 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
         Some(pages) => family.mark_pages_host(&pages[mark]),
         None => family.mark_host(MarkSlot(mark as u32)),
     };
-    let (mut identical, mut marks_identical, mut last) = (0, 0, None);
-    for _ in 0..repeat.max(1) {
+    let (mut identical, mut marks_identical, mut last, mut bad_total) = (0, 0, None, 0);
+    for attempt in 1..=repeat.max(1) {
+    // Every step names where it failed (an expert exchange refusing NaN routes, a missing unit).
+    let phase = |what: &str| format!("--resume-at {at}, attempt {attempt}: {what}");
     // A: prefill [0, P), capture, continue in place.
-    let mut a = allocator.admit(n + decode)?;
-    prefill_digest(engine, &mut a, &embed[..at], chunk, false)?;
+    let mut a = allocator.admit(n + decode).with_context(|| phase("admitting A"))?;
+    prefill_digest(engine, &mut a, &embed[..at], chunk, false).with_context(|| phase("A's prefill to P"))?;
     family.drain().map_err(err)?;
     let started = std::time::Instant::now();
-    capture(0, &a)?;
+    capture(0, &a).with_context(|| phase("capturing A's mark"))?;
     // B: a second sequence restored from the snapshot (shared full units, its own tail and KDA slot).
     let mut b = if cold {
         // The floor: B prefilled cold on its own units (what placement alone changes).
-        let mut b = allocator.admit(n + decode)?;
-        prefill_digest(engine, &mut b, &embed[..at], chunk, false)?;
-        capture(1, &b)?;
-        restore(1, &mut b)?;
+        let mut b = allocator.admit(n + decode).with_context(|| phase("admitting B"))?;
+        prefill_digest(engine, &mut b, &embed[..at], chunk, false).with_context(|| phase("B's cold prefill to P"))?;
+        capture(1, &b).with_context(|| phase("capturing B's mark"))?;
+        restore(1, &mut b).with_context(|| phase("restoring B from its own mark"))?;
         b
     } else {
-        let (mut b, copy) = allocator.fork(&a, at, n + decode)?;
+        let (mut b, copy) = allocator.fork(&a, at, n + decode).with_context(|| phase("forking B from A"))?;
         if let Some(copy) = copy {
-            family.copy_rows(copy).map_err(err)?;
+            family.copy_rows(copy).map_err(err).with_context(|| phase("copying B's tail unit"))?;
         }
-        restore(0, &mut b)?;
+        restore(0, &mut b).with_context(|| phase("restoring B from A's mark"))?;
         b
     };
     family.drain().map_err(err)?;
     let restore_ms = started.elapsed().as_secs_f64() * 1e3;
     // The restored KDA state reads back exactly as the captured one.
-    capture(1, &b)?;
+    capture(1, &b).with_context(|| phase("capturing B's restored state"))?;
     let mark_equal = mark_host(0)? == mark_host(1)?;
     // The state at P (every paged row and the KDA state): what a restore must reproduce.
     let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?
         && engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
-    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
-    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
+    if poison {
+        family.fill_stand_in(0xFF).with_context(|| phase("poisoning the reserved record slot 0"))?;
+    }
+    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)
+        .with_context(|| phase("A's continuation"))?;
+    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)
+        .with_context(|| phase("B's continuation"))?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
     let logits_equal = straight.logits == restored.logits;
     let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -623,48 +661,66 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i as u32);
     let (mut next_a, mut next_b) = (argmax(&straight.last), argmax(&restored.last));
     let mut decode_equal = next_a == next_b;
-    for _ in 0..decode {
-        let la = engine.verify(&mut [(&mut a, 1)], &[next_a], None)?.context("decode logits")?;
-        let lb = engine.verify(&mut [(&mut b, 1)], &[next_b], None)?.context("decode logits")?;
+    let (mut decode_bad_a, mut decode_bad_b) = (0, 0);
+    for step in 1..=decode {
+        let la = engine.verify(&mut [(&mut a, 1)], &[next_a], None)
+            .with_context(|| phase(&format!("A's decode step {step}")))?.context("decode logits")?;
+        let lb = engine.verify(&mut [(&mut b, 1)], &[next_b], None)
+            .with_context(|| phase(&format!("B's decode step {step}")))?.context("decode logits")?;
         decode_equal &= la.iter().zip(&lb).all(|(x, y)| x.to_bits() == y.to_bits());
+        (decode_bad_a, decode_bad_b) = (decode_bad_a + nonfinite(&la), decode_bad_b + nonfinite(&lb));
         (next_a, next_b) = (argmax(&la), argmax(&lb));
+    }
+    if poison {
+        family.fill_stand_in(0).with_context(|| phase("clearing the reserved record slot 0"))?;
     }
     let len = a.len;
     let paged_equal = paged_rows(&family, &a, len)? == paged_rows(&family, &b, len)?;
     let state_equal = engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
+    let bad = straight.nonfinite + restored.nonfinite + decode_bad_a + decode_bad_b;
     let store = if pool_marks.is_some() { format!("in {} pool units, unit 0 reserved", family.mark_units()) }
         else { "in an arena slot".into() };
     println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): state at {at} {} | layers {} | logits \
         {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | KDA state {} | mark round trip \
-        {} ({} B {store}), capture+restore {restore_ms:.1} ms", if state_at { "identical" } else { "DIFFERS" },
+        {} ({} B {store}), capture+restore {restore_ms:.1} ms | non-finite logits: prefill {} + {}, decode {} + {}{}",
+        if state_at { "identical" } else { "DIFFERS" },
         first_layer.map_or("identical".to_string(), |l| format!("differ from layer {l}")),
         if logits_equal { "identical" } else { "DIFFER" }, if decode_equal { "identical" } else { "DIFFERS" },
         if paged_equal { "identical" } else { "DIFFER" }, if state_equal { "identical" } else { "DIFFERS" },
-        if mark_equal { "identical" } else { "DIFFERS" }, family.mark_bytes());
+        if mark_equal { "identical" } else { "DIFFERS" }, family.mark_bytes(), straight.nonfinite, restored.nonfinite,
+        decode_bad_a, decode_bad_b, if poison { " [record slot 0 poisoned]" } else { "" });
     allocator.release(b);
     allocator.release(a);
     identical += usize::from(first_layer.is_none() && logits_equal && decode_equal && paged_equal && state_equal
-        && mark_equal);
+        && mark_equal && (poison || bad == 0));
     marks_identical += usize::from(mark_equal && state_at);
+    bad_total += bad;
     last = Some(restored);
     }
     let restored = last.context("no attempt")?;
     let repeat = repeat.max(1);
     // C: one prefill with no boundary at P (chunking changes may round differently; informational).
     let mut c = allocator.admit(n)?;
-    let whole = prefill_digest(engine, &mut c, embed, chunk, true)?;
+    let whole = prefill_digest(engine, &mut c, embed, chunk, true)
+        .with_context(|| format!("--resume-at {at}: the straight prefill without the boundary"))?;
     let x = &whole.argmax[at..];
     let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
     let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());
-    println!("vs one straight prefill without the boundary at {at}: suffix top-1 agreement {agree}/{}, last row logits {}",
-        x.len(), if last_equal { "identical" } else { "differ" });
+    println!("vs one straight prefill without the boundary at {at}: suffix top-1 agreement {agree}/{}, last row \
+        logits {}, non-finite logits {}", x.len(), if last_equal { "identical" } else { "differ" }, whole.nonfinite);
     allocator.release(c);
     for pages in pool_marks.iter().flatten() {
         allocator.release_units(pages);
     }
     println!("resume at {at} of {n} (chunks of {chunk}): {identical}/{repeat} attempts byte-identical, mark round trip \
         and state at {at} identical in {marks_identical}/{repeat}{}", if cold { " [cold floor: B prefilled, not restored]" } else { "" });
+    if poison {
+        println!("record slot 0 poisoned with 0xFF in every MLA layer: {bad_total} non-finite logits across the \
+            attempts (non-zero: a kernel reads it for masked candidates; the prefill path should stay finite)");
+    }
     ensure!(marks_identical == repeat, "the restored state differs from the captured one");
+    ensure!(poison || (bad_total == 0 && whole.nonfinite == 0), "{} non-finite logits (A, B and the straight prefill)",
+        bad_total + whole.nonfinite);
     ensure!(identical == repeat, "the restored sequence's continuation differs from the straight one");
     Ok(())
 }
