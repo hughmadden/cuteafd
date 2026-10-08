@@ -1486,7 +1486,8 @@ impl<'a> GlmfEngine<'a> {
         // Both GPUs run the indexer; per-rank index tails are not built yet.
         ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
-            self.programs.load_all()?;
+            // Its own and the shares' programs.
+            self.programs.load_matching(|name| super::glmf_startup_program(name, true))?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
                 self.caches.kda_heads, self.index_cache, self.kda_state)?;
             Ok(GlmfPeer { device, stream, layers, caches,

@@ -240,6 +240,30 @@ mod draft_cli_tests {
         assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
+    /// Start-up loads GLM Flash's own programs, the head split's shares with a second GPU, nothing
+    /// of another family: the engine resolves programs only as `glmf_`/`glmf2_` (`run_on`) and the
+    /// FP8 head's `glmf_head_fp8`.
+    #[test]
+    fn startup_loads_only_the_programs_a_glm_flash_engine_launches() {
+        let names = ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows", "dsv4f_attention_m64", "dsv4p_compressor_m4096",
+            "glm_mla_m64", "mimo_attention_m64", "qwen4_gdn_m64"];
+        let kept = |split: bool| -> Vec<&str> { names.iter().copied().filter(|n| glmf_startup_program(n, split)).collect() };
+        assert_eq!(kept(false), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8"]);
+        assert_eq!(kept(true), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows"]);
+        // Every program lookup the engine makes: `run_on`'s prefix and the FP8 head (re-check the
+        // predicate if another appears).
+        let engine = include_str!("engine.rs");
+        let engine = &engine[..engine.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(engine.matches("programs.program(").count(), 1);
+        assert!(engine.contains("let name = format!(\"{}_{name}\", if split { \"glmf2\" } else { \"glmf\" });"));
+        let head = include_str!("head.rs");
+        assert_eq!((head.matches("programs.program(").count(), head.matches("programs.program(\"glmf_head_fp8\"").count()),
+            (1, 1));
+    }
+
     #[test]
     fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
         let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
@@ -787,6 +811,14 @@ fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::
         max_context: args.max_context, index_cache, kda_state: args.kda_state }
 }
 
+/// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`), and
+/// the head split's `glmf2_` shares with a second GPU (rank 0 runs shares too). Every program a
+/// step can launch inside a decode graph capture is loaded; the engine launches no other family's
+/// program.
+pub(crate) fn glmf_startup_program(name: &str, split: bool) -> bool {
+    name.starts_with("glmf_") || (split && name.starts_with("glmf2_"))
+}
+
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
 /// planner's allowance.
 fn graph_reserve(args: &EngineArgs) -> u64 {
@@ -972,7 +1004,10 @@ impl Opened {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
-        programs.load_all()?;
+        // GLM Flash's programs only (a release library carries every family's): the head split's
+        // `glmf2_` share programs only with a second GPU.
+        let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name, args.split_device.is_some()))?;
+        tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
         // (`glmf2`) in this build.
