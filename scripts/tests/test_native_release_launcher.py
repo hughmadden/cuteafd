@@ -80,7 +80,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
         invocation, remote = block.split("<<'REMOTE'", 1)
         invocation = invocation.split('  local phase="$1"\n', 1)[1]
-        preamble = remote.split('if [[ "$phase" == dev ]]', 1)[0].replace('cd "$remote_dir"', ':')
+        preamble = remote.split('# release-spark-process-group:start', 1)[0].replace('cd "$remote_dir"', ':')
         # The optional source manifest and the optional V41 expert roles are
         # both carried behind non-empty sentinels. An empty earlier value must
         # not shift a later one, because OpenSSH joins argv into one command
@@ -95,7 +95,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 harness = f'''set -euo pipefail
 # The timed SSH leg joins arguments just as OpenSSH does. Preserve the
 # empty-argument elision regression while testing the new export phase fields.
-timeout() {{ shift 1; "$@"; }}
+timeout() {{ shift 1; [[ $1 != --foreground ]] || shift; "$@"; }}
 ssh() {{ shift 1; bash -c "$*"; }}
 release_ssh_opts=()
 export_timeout=60
@@ -189,7 +189,7 @@ spark_tp_roles=
                 records[kind].append(token)
             self.assertEqual(records['O'], ['-o', 'BatchMode=yes', '-F', str(config)])
             self.assertEqual(records['H'], ['fixture'])
-            self.assertEqual(records['C'][:3], ['bash', '-s', '--'],
+            self.assertEqual(records['C'][:5], ['setsid', '--wait', 'bash', '-s', '--'],
                              'the remote command is what OpenSSH joins into one string')
             self.assertFalse([t for t in records['C'] if str(config) in t],
                              'the config path must not appear in the remote command line')

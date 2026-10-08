@@ -177,7 +177,7 @@ class DevImageReuseTest(unittest.TestCase):
 
     def test_build_branch_reuses_only_after_verification_and_unset_builds(self):
         text = (ROOT / 'build.sh').read_text()
-        branch = text[text.index('release_dev_reuse_manifest=""'):text.index('echo "== compiling coordinator')]
+        branch = text[text.index('release_dev_reuse_label_args=()'):text.index('echo "== compiling coordinator')]
         for image, refuses in (('', False), (IMAGE, False), (IMAGE, True)):
             commands = []
             script = 'release_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + branch + '\nprintf "%s\\n" "$COORDINATOR_DOCKER_DEV"\n'
@@ -191,7 +191,8 @@ class DevImageReuseTest(unittest.TestCase):
                 log = bin_dir / 'commands'
                 env = dict(os.environ, PATH=str(bin_dir) + ':' + os.environ['PATH'], COMMAND_LOG=str(log),
                            CUTEAFD_RELEASE_DEV_IMAGE=image, COORDINATOR_DOCKER_DEV='normal-dev', repo_root=str(ROOT),
-                           release_build_root=str(bin_dir), sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
+                           release_build_root=str(bin_dir), release_dev_reuse_manifest=str(bin_dir / 'DEV_IMAGE_REUSE.json'),
+                           sparkinfer_commit=REVISION, REFUSE=str(int(refuses)))
                 result = subprocess.run(['bash', '-ec', script], capture_output=True, text=True, env=env)
                 self.assertEqual(result.returncode, 2 if refuses else 0, result.stderr)
                 commands = log.read_text()

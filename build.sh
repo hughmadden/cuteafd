@@ -18,8 +18,11 @@ usage() {
   cat <<'EOF'
 Usage: ./build.sh [--config FILE] [--spark-hosts HOST,...] [--dry-run]
 
-Builds the coordinator image locally and the Spark image natively over SSH on
-the first configured Spark. It exports both release artifact sets to dist/
+The coordinator and Spark legs build concurrently: the coordinator image locally
+and the Spark image natively over SSH on the first configured Spark. Set
+CUTEAFD_RELEASE_SEQUENTIAL=1 to build coordinator then Spark for debugging.
+Each leg has its own log file; both must finish before artifacts are exported.
+It exports both release artifact sets to dist/
 and distributes the Spark inference image to all configured Spark hosts.
 Use --spark-hosts ostrich,dodo to build and distribute only on available hosts;
 this does not change the serving topology.
@@ -317,11 +320,19 @@ spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
   release_die "CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB must be positive GiB"
 # release-build-budget:end
 
+release_sequential="${CUTEAFD_RELEASE_SEQUENTIAL:-0}"
+[[ "$release_sequential" == 0 || "$release_sequential" == 1 ]] ||
+  release_die "CUTEAFD_RELEASE_SEQUENTIAL must be 0 or 1"
+release_leg_plan="coordinator and Spark legs build concurrently; shared export/distribution waits for both"
+[[ "$release_sequential" == 0 ]] ||
+  release_leg_plan="sequential: coordinator then Spark (CUTEAFD_RELEASE_SEQUENTIAL=1)"
+
 if ((dry_run)); then
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
   echo "  build hosts (${#RELEASE_BUILD_HOSTS[@]}): $(IFS=,; echo "${RELEASE_BUILD_HOSTS[*]}")"
   echo "  seed host: ${RELEASE_BUILD_HOSTS[0]:-}"
+  echo "  build legs: $release_leg_plan"
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
   echo "  coordinator image: $COORDINATOR_DOCKER_INFERENCE"
@@ -365,6 +376,7 @@ prepare_pinned_source_dependencies() {
 
 release_need flock
 release_need timeout
+release_need mkfifo
 
 # One build at a time, and never a hardware lock: a build is CPU work plus two
 # short AOT exports that merely need *a* GPU (see the guard below). Holding
@@ -568,6 +580,7 @@ for host in "${RELEASE_BUILD_HOSTS[@]}"; do
   release_ssh -o ConnectTimeout=10 "$host" bash -s <<'REMOTE'
 set -euo pipefail
 command -v docker >/dev/null
+command -v setsid >/dev/null
 docker info >/dev/null
 test "$(uname -m)" = "aarch64"
 REMOTE
@@ -645,15 +658,28 @@ if [[ -n "$release_build_root" ]]; then
     release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
 fi
 
+# Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
+# before forking so the shared tail can read it without importing worker variables.
+release_log_root="${release_build_root:-$HOME/.cache/cuteafd/builds/release-source}"
+python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_log_root"
+mkdir -p "$release_log_root"
+release_leg_log_dir="$(mktemp -d "$release_log_root/build-legs.XXXXXXXX")"
 release_dev_reuse_manifest=""
+[[ -z "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]] ||
+  release_dev_reuse_manifest="$release_leg_log_dir/DEV_IMAGE_REUSE.json"
+
+build_coordinator_release() (
+release_source_dir=""
+coordinator_export_container="$export_container-coordinator"
+release_export_cleanup() {
+  docker rm -f "$coordinator_export_container" >/dev/null 2>&1 || true
+}
+trap 'release_stop_export_watchdog; release_export_cleanup; rm -rf "$release_source_dir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 release_dev_reuse_label_args=()
 if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
   echo "== verifying reused coordinator development image: $CUTEAFD_RELEASE_DEV_IMAGE =="
-  dev_verification_root="${release_build_root:-$HOME/.cache/cuteafd/builds/release-source}"
-  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$dev_verification_root"
-  mkdir -p "$dev_verification_root"
-  dev_verification_dir="$(mktemp -d "$dev_verification_root/dev-image-verification.XXXXXXXX")"
-  release_dev_reuse_manifest="$dev_verification_dir/DEV_IMAGE_REUSE.json"
   COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/verify-release-dev-image.py" \
     --source "$repo_root" --image "$CUTEAFD_RELEASE_DEV_IMAGE" \
     --output "$release_dev_reuse_manifest")" || release_die "coordinator dev image reuse verification failed"
@@ -679,7 +705,6 @@ release_source_parent="${release_build_root:-$HOME/.cache/cuteafd/builds/release
 python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_source_parent"
 mkdir -p "$release_source_parent"
 release_source_dir="$(mktemp -d "$release_source_parent/coordinator-source.XXXXXXXX")"
-trap 'rm -rf "$release_source_dir"' EXIT
 "$repo_root/scripts/build/stage-release-source.sh" "$repo_root" "$release_source_dir"
 coordinator_export_container="$export_container-coordinator"
 export_gpu_pick="$(release_select_idle_export_gpu)" || exit 2
@@ -687,21 +712,15 @@ read -r export_gpu_index export_gpu_uuid export_gpu_used <<<"$export_gpu_pick"
 echo "== coordinator AOT export on $(hostname) GPU $export_gpu_index ($export_gpu_uuid) at $(date -Is): ${export_gpu_used} MiB in use, no hardware lock =="
 release_build_user_args=()
 mapfile -t release_build_user_args < <(release_build_container_user_args_render "$release_build_root")
-# Cleanup has to be inline now that no hardware-lock helper wraps the export:
-# killing the docker client does not stop the container, and a TIMEOUT of the
-# client must not leave an export compiling on a device a measurement wants.
-release_export_cleanup() {
-  docker rm -f "$coordinator_export_container" >/dev/null 2>&1 || true
-}
-trap 'release_stop_export_watchdog; release_export_cleanup; exit 130' INT
-trap 'release_stop_export_watchdog; release_export_cleanup; exit 143' TERM
-trap 'release_export_cleanup; rm -rf "$release_source_dir"' EXIT
+# Killing a docker client does not stop its container; the leg's EXIT trap owns
+# both the named export and its watchdog, including failures before docker run.
+# --foreground keeps timeout and its client inside the cancellable leg group.
 release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
 export_watchdog_pid=$!
 coordinator_export_status=0
 compiler_cache_args=()
 mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
-timeout "$export_timeout" docker run --rm --name "$coordinator_export_container" \
+timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container" \
   --gpus "device=$export_gpu_uuid" \
   --ipc=host \
   --ulimit memlock=-1:-1 \
@@ -724,11 +743,10 @@ timeout "$export_timeout" docker run --rm --name "$coordinator_export_container"
   /source/scripts/build/build-release-artifacts.sh /source coordinator 120 /output ||
   coordinator_export_status=$?
 release_stop_export_watchdog
-trap - INT TERM
 (( coordinator_export_status == 0 )) ||
   release_die "coordinator AOT export failed (exit $coordinator_export_status); it ran on $(hostname) GPU $export_gpu_index ($export_gpu_uuid) at $(date -Is)"
 rm -rf "$release_source_dir"
-trap - EXIT
+release_source_dir=""
 
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 docker build \
@@ -743,7 +761,9 @@ docker build \
   -f "$repo_root/docker/Dockerfile.release" \
   -t "$COORDINATOR_DOCKER_INFERENCE" \
   "$repo_root"
+)
 
+build_spark_release() (
 echo "== staging native Spark build on $seed_host:$remote_dir =="
 printf -v remote_dir_quoted '%q' "$remote_dir"
 release_ssh "$seed_host" "mkdir -p $remote_dir_quoted"
@@ -794,7 +814,7 @@ release_prepare_build_root "$seed_host" "$remote_dir"
 echo "== building Spark development and inference images natively on $seed_host =="
 build_spark_release_leg() {
   local phase="$1"
-  timeout "$export_timeout" ssh "${release_ssh_opts[@]}" "$seed_host" bash -s -- \
+  timeout "$export_timeout" --foreground ssh "${release_ssh_opts[@]}" "$seed_host" setsid --wait bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
   "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
@@ -864,6 +884,27 @@ native_build_jobs="${15-__legacy__}"
 [[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
+# release-spark-process-group:start
+# Each SSH phase has its own session. A separate cancellation SSH can stop its
+# docker clients/children even when closing the original SSH did not deliver HUP.
+process_dir="$remote_dir/.cuteafd-release"
+process_file="$process_dir/$export_container.pid"
+cancel_file="$process_dir/$export_container.cancel"
+mkdir -p "$process_dir"
+[[ ! -e "$cancel_file" ]] || exit 143
+printf '%s\n' "$$" >"$process_file"
+cleanup_spark_phase() {
+  trap '' HUP INT TERM
+  kill -TERM -- "-$$" 2>/dev/null || true
+  docker rm -f "$export_container" "$export_container-probe" >/dev/null 2>&1 || true
+  rm -f "$process_file"
+}
+trap cleanup_spark_phase EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+[[ ! -e "$cancel_file" ]] || exit 143
+# release-spark-process-group:end
 if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
@@ -907,7 +948,10 @@ while :; do
   if [[ -n "$spark_serving" ]]; then
     spark_wait_reason="serving container(s) running: $(tr '\n' ' ' <<<"$spark_serving")"
   else
-    spark_cuda_free="$(docker run --rm --gpus all --entrypoint python3 "$dev_image" \
+    spark_cuda_free="$(docker run --rm --name "$export_container-probe" --gpus all \
+      -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e HOME=/tmp/home \
+      -e TORCHINDUCTOR_CACHE_DIR=/tmp/home/torchinductor -e TRITON_CACHE_DIR=/tmp/home/triton \
+      --entrypoint python3 "$dev_image" \
       -c 'import torch; print(torch.cuda.mem_get_info()[0])' 2>/dev/null || true)"
     if [[ "$spark_cuda_free" =~ ^[0-9]+$ ]] && (( spark_cuda_free >= spark_export_min_free_bytes )); then
       echo "== Spark AOT export on $(hostname) at $(date -Is): ${spark_cuda_free} bytes CUDA memory free, no serving container, no hardware lock =="
@@ -932,8 +976,6 @@ container_home=/tmp/cuteafd-home
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
-cleanup_export_container() { docker rm -f "$export_container" >/dev/null 2>&1 || true; }
-trap 'cleanup_export_container' EXIT HUP INT TERM
 docker run --rm --name "$export_container" \
   "${compiler_cache_args[@]}" \
   --user "$(id -u):$(id -g)" \
@@ -992,6 +1034,138 @@ build_spark_release_leg dev
 build_spark_release_leg export
 build_spark_release_leg image
 verify_remote_source_manifest
+)
+
+# release-build-cancellation:start
+release_cancel_coordinator_build() {
+  # Also clean from the supervisor, outside the killed group: a worker trap may
+  # itself have been terminated or a Docker client may have hung during cleanup.
+  timeout 20 docker rm -f "$export_container-coordinator" >/dev/null 2>&1 || true
+}
+
+release_cancel_remote_build() {
+  # A new bounded SSH owns cancellation; killing an SSH client alone is not a
+  # reliable remote process/container cleanup. Only this build's names are used.
+  timeout 30 ssh "${release_ssh_opts[@]}" -o ConnectTimeout=5 "$seed_host" bash -s -- \
+    "$remote_dir" "$export_container-expert" <<'CANCEL'
+set -euo pipefail
+process_dir="$1/.cuteafd-release"
+container="$2"
+mkdir -p "$process_dir"
+# Close the race with a phase whose SSH arrived just as cancellation began.
+: >"$process_dir/$container.cancel"
+pid=""
+[[ ! -f "$process_dir/$container.pid" ]] || read -r pid <"$process_dir/$container.pid" || true
+if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/cmdline" ]] &&
+   grep -zFq -- "$container" "/proc/$pid/cmdline"; then
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  for ((i=0; i<5; i++)); do
+    kill -0 -- "-$pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+fi
+docker rm -f "$container" "$container-probe" >/dev/null 2>&1 || true
+rm -f "$process_dir/$container.pid"
+CANCEL
+}
+# release-build-cancellation:end
+
+# release-build-supervision:start
+release_run_leg() (
+  leg="$1"
+  command="$2"
+  # A FIFO retains even immediate completions; wait -n can miss an already-exited
+  # job. The wrapper trap is separate from each leg's private cleanup traps.
+  trap 'status=$?; printf "%s %s\n" "$leg" "$status" >&8' EXIT
+  "$command"
+)
+
+release_build_legs_cleanup() {
+  local pid
+  trap - EXIT INT TERM
+  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  done
+  release_cancel_coordinator_build
+  if ((release_spark_started)); then
+    release_cancel_remote_build || echo "[spark] WARNING: remote cleanup failed on $seed_host; inspect $export_container-expert" >&2
+  fi
+  # Give leg EXIT traps a bounded chance to remove containers and source copies,
+  # then kill whole groups, not just shell leaders (docker/ssh/sleep children).
+  sleep 2
+  for pid in ${release_leg_pids[@]+"${release_leg_pids[@]}"}; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  exec 8>&-
+  rm -f "$release_leg_log_dir/completions"
+}
+
+release_build_legs() {
+  local completed status pid active_pid remaining=0
+  local -a release_leg_pids=() active_pids=()
+  local release_spark_started=0 coordinator_pid="" spark_pid=""
+  echo "== $release_leg_plan =="
+  echo "[coord] log: $release_leg_log_dir/coordinator.log"
+  echo "[spark] log: $release_leg_log_dir/spark.log"
+  mkfifo "$release_leg_log_dir/completions"
+  exec 8<>"$release_leg_log_dir/completions"
+  trap release_build_legs_cleanup EXIT
+  trap 'echo "release build interrupted (INT); stopping both legs" >&2; exit 130' INT
+  trap 'echo "release build interrupted (TERM); stopping both legs" >&2; exit 143' TERM
+  # Job control gives each worker its own process group without exporting shell
+  # functions/settings to a new bash. The foreground supervisor handles failures
+  # from either leg while the coordinator compiles, instead of waiting blindly.
+  set -m
+  if [[ "$release_sequential" == 0 ]]; then
+    release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
+    spark_pid=$!
+    release_leg_pids+=("$spark_pid")
+    release_spark_started=1
+    remaining=1
+  fi
+  release_run_leg coord build_coordinator_release >"$release_leg_log_dir/coordinator.log" 2>&1 &
+  coordinator_pid=$!
+  release_leg_pids+=("$coordinator_pid")
+  remaining=$((remaining + 1))
+  set +m
+  while ((remaining)); do
+    read -r completed status <&8
+    case "$completed" in
+      coord) pid="$coordinator_pid" ;;
+      spark) pid="$spark_pid" ;;
+      *) release_die "invalid build leg completion: $completed" ;;
+    esac
+    wait "$pid" || true
+    [[ "$status" == 0 ]] ||
+      release_die "[$completed] release build leg failed (exit $status); stopping the other leg; see $release_leg_log_dir"
+    # Never retain a completed group ID throughout the other leg's long build:
+    # after the group disappears, its numeric ID could be reused by another job.
+    active_pids=()
+    for active_pid in "${release_leg_pids[@]}"; do
+      [[ "$active_pid" == "$pid" ]] || active_pids+=("$active_pid")
+    done
+    release_leg_pids=("${active_pids[@]}")
+    echo "[$completed] release build leg complete"
+    remaining=$((remaining - 1))
+    if [[ "$release_sequential" == 1 && "$completed" == coord ]]; then
+      set -m
+      release_run_leg spark build_spark_release >"$release_leg_log_dir/spark.log" 2>&1 &
+      spark_pid=$!
+      release_leg_pids+=("$spark_pid")
+      release_spark_started=1
+      remaining=$((remaining + 1))
+      set +m
+    fi
+  done
+  trap - EXIT INT TERM
+  exec 8>&-
+  rm -f "$release_leg_log_dir/completions"
+}
+# release-build-supervision:end
+
+release_build_legs
 
 echo "== exporting release binaries =="
 mkdir -p "$repo_root/dist/coordinator" "$repo_root/dist/spark-expert"
