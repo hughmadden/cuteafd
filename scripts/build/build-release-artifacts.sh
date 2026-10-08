@@ -179,6 +179,13 @@ if [[ "$xgrammar" == ON ]]; then
     --lock "$build_root/source/third_party/xgrammar.lock.json"
 fi
 
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_EXTENSIONS_DIR="$build_root/cache/torch-extensions"
+export XDG_CACHE_HOME="$build_root/cache/xdg"
+export B12X_ROCE_CACHE_DIR="$build_root/cache/roce"
+export TRITON_CACHE_DIR="$build_root/cache/triton"
+mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
+export PYTHONPATH="$build_root/source/third_party/sparkinfer:$build_root/source/python/reference/cuteafd_reference:$build_root/source/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export PYO3_PYTHON=python3
 compiler_cache_cmake_args=()
 source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"

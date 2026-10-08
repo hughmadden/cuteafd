@@ -27,6 +27,10 @@ esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+source "$repo_root/scripts/lib/release-common.sh"
+release_ensure_dev_image "$image"
+python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" \
+  --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json"
 
 docker_args=(
   run --rm
@@ -54,6 +58,11 @@ docker_args+=(
   -e "USER=$(id -un)"
   -e "LOGNAME=$(id -un)"
   -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"
+  -e "TRITON_CACHE_DIR=$container_home/triton"
+  -e "TORCH_EXTENSIONS_DIR=$container_home/torch-extensions"
+  -e "XDG_CACHE_HOME=$container_home/.cache"
+  -e "B12X_ROCE_CACHE_DIR=$container_home/roce"
+  -e "PYTHONPATH=/workspace/cuteafd/third_party/sparkinfer:/workspace/cuteafd/python/reference/cuteafd_reference:/workspace/cuteafd/python/reference"
   -e "CARGO_HOME=$container_home/cargo"
 )
 
@@ -85,6 +94,11 @@ fi
 if [[ "$repo_root" != "/workspace/cuteafd" ]]; then
   docker_args+=(-v "$repo_root:$repo_root")
 fi
+# Worktree and submodule gitfiles resolve through the original checkout's metadata.
+git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
+if [[ "$git_common_dir" != "$repo_root/.git" ]]; then
+  docker_args+=(-v "$git_common_dir:$git_common_dir:ro")
+fi
 
 if [[ -t 0 && -t 1 ]]; then
   docker_args+=(-it)
@@ -110,7 +124,7 @@ if [[ $# -eq 0 ]]; then
   set -- bash
 fi
 
-if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
+if [[ -n "${CUTEAFD_KACHE:-}" || "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
   # Apply inside the matching toolchain, then preserve the caller's argv exactly.
   set -- bash -c 'source /workspace/cuteafd/scripts/build/compiler-cache.sh;
     cuteafd_compiler_cache_setup "${CARGO_TARGET_DIR:-$HOME/compiler-cache-build}";

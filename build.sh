@@ -658,13 +658,14 @@ if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
     --source "$repo_root" --image "$CUTEAFD_RELEASE_DEV_IMAGE" \
     --output "$release_dev_reuse_manifest")" || release_die "coordinator dev image reuse verification failed"
   release_dev_reuse_label_args=(--label "io.cuteafd.dev-image.reused=$COORDINATOR_DOCKER_DEV")
+elif [[ "$COORDINATOR_DOCKER_DEV" == */* ]]; then
+  release_ensure_dev_image "$COORDINATOR_DOCKER_DEV"
 else
   echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
   docker build \
-    --build-arg CUTEAFD_ROLE=coordinator \
-    --build-arg CUDA_ARCH=120 \
-    --build-arg TARGET_PLATFORM=linux/amd64 \
-    --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
+    --build-arg BASE_IMAGE="$(python3 "$repo_root/scripts/build/dev-toolchain.py" amd64)" \
+    --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 "$repo_root/scripts/build/dev-toolchain.py")" \
+    --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
     -f "$repo_root/docker/Dockerfile.dev" \
     -t "$COORDINATOR_DOCKER_DEV" \
     "$repo_root"
@@ -804,7 +805,7 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -851,8 +852,9 @@ if [[ -n "$source_manifest_sha256" ]]; then
 fi
 cd "$remote_dir"
 compiler_cache_args=()
-if [[ "${16:-__legacy__}" != __legacy__ ]]; then
-  export CUTEAFD_KACHE="${16}"
+if [[ "${16:-__legacy__}" != __legacy__ || "${19:-0}" == 1 ]]; then
+  export CUTEAFD_SCCACHE_CUDA="${19:-0}"
+  [[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
   [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_REMOTE="${17}"
   [[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
   source scripts/build/compiler-cache.sh
@@ -864,16 +866,18 @@ native_build_jobs="${15-__legacy__}"
 [[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
-if [[ "$phase" == dev ]]; then
+if [[ "$phase" == dev && "$dev_image" == */* ]]; then
+  source scripts/lib/release-common.sh
+  release_ensure_dev_image "$dev_image"
+elif [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
 docker build \
-  --build-arg CUTEAFD_ROLE=expert \
-  --build-arg CUDA_ARCH=121 \
-  --build-arg TARGET_PLATFORM=linux/arm64 \
-  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
+  --build-arg BASE_IMAGE="$(python3 scripts/build/dev-toolchain.py arm64)" \
+  --build-arg CUTEAFD_TOOLCHAIN_HASH="$(python3 scripts/build/dev-toolchain.py)" \
+  --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
   -f docker/Dockerfile.dev \
   -t "$dev_image" .
 fi

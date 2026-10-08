@@ -80,7 +80,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
         invocation, remote = block.split("<<'REMOTE'", 1)
         invocation = invocation.split('  local phase="$1"\n', 1)[1]
-        preamble = remote.split('if [[ "$phase" == dev ]]', 1)[0].replace('cd "$remote_dir"', ':')
+        preamble = remote.split('if [[ "$phase" == dev', 1)[0].replace('cd "$remote_dir"', ':')
         # The optional source manifest and the optional V41 expert roles are
         # both carried behind non-empty sentinels. An empty earlier value must
         # not shift a later one, because OpenSSH joins argv into one command

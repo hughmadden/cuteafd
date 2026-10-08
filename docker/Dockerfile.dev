@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -15,6 +15,7 @@ RUN apt-get update && \
       build-essential clang cmake ninja-build nasm python3-venv \
       rdma-core ibverbs-providers libibverbs-dev perftest \
       openssh-client netcat-openbsd iproute2 pciutils && \
+    mkdir -p /opt/cuteafd && dpkg -l > /opt/cuteafd/dpkg-packages.txt && \
     rm -rf /var/lib/apt/lists/*
 
 # Pinned toolchain: a release at least two weeks old, so builds do not move under us.
@@ -22,13 +23,18 @@ ARG RUST_TOOLCHAIN=1.98.1
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} && \
     rustup component add rustfmt
 
+ARG KACHE_VERSION=1.0.0
+ARG SCCACHE_VERSION=0.18.0
+COPY scripts/build/install-dev-cache-tools.sh /opt/cuteafd/install-dev-cache-tools.sh
+RUN KACHE_VERSION=${KACHE_VERSION} SCCACHE_VERSION=${SCCACHE_VERSION} bash /opt/cuteafd/install-dev-cache-tools.sh
+
 ENV UV_SYSTEM_PYTHON=1
 
-RUN python3 -m pip install --no-cache-dir uv && \
+RUN python3 -m pip install --no-cache-dir "uv==0.12.23" && \
     uv pip install --system --break-system-packages --no-cache \
-      pytest \
-      safetensors \
-      huggingface-hub && \
+      "pytest==9.1.1" \
+      "safetensors==0.8.0" \
+      "huggingface-hub==1.14.0" && \
     uv pip install --system --break-system-packages --no-cache \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
@@ -37,51 +43,30 @@ RUN python3 -m pip install --no-cache-dir uv && \
       "einops==0.8.2" \
       "ninja==1.13.0" \
       "nvidia-ml-py==13.610.43" \
-      "pillow>=11,<13" \
+      "pillow==12.2.0" \
       "tabulate==0.10.0" \
       "transformers==5.13.0" \
       "rich==15.0.0" && \
     uv pip install --system --break-system-packages --no-cache --no-deps \
       "flashinfer-python==0.6.14"
 
-# Source/revision arguments deliberately follow the reusable toolchain and
-# Python dependency layers so a new pinned fork commit does not reinstall them.
-ARG CUTEAFD_ROLE=dev
-ARG CUDA_ARCH=120
-ARG TARGET_PLATFORM=linux/amd64
-ARG CUTEAFD_SPARKINFER_COMMIT=unknown
-
-ENV CUTEAFD_ROLE=${CUTEAFD_ROLE}
-ENV CUTEAFD_CUDA_ARCH=${CUDA_ARCH}
-ENV CUTEAFD_TARGET_PLATFORM=${TARGET_PLATFORM}
-ENV CUTEAFD_SPARKINFER_COMMIT=${CUTEAFD_SPARKINFER_COMMIT}
-
-LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}
-
-COPY scripts/build/verify-sparkinfer-source.py /opt/cuteafd/scripts/build/verify-sparkinfer-source.py
-COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
-COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
-
-RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
-      --source /opt/cuteafd/third_party/sparkinfer \
-      --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
-    locked_revision="$(python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
-      --source /opt/cuteafd/third_party/sparkinfer \
-      --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
-      --print-revision)" && \
-    { [ "${CUTEAFD_SPARKINFER_COMMIT}" = unknown ] || \
-      [ "${CUTEAFD_SPARKINFER_COMMIT}" = "$locked_revision" ]; } && \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
-      --editable /opt/cuteafd/third_party/sparkinfer && \
-    uv pip check && \
-    python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
-    python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
-      --source /opt/cuteafd/third_party/sparkinfer \
-      --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
-      --require-no-python-cache
+# Toolchain only: kernels and their lock come from the mounted checkout.
+RUN uv pip check
+ARG BASE_IMAGE
+ARG CUTEAFD_ENGINE_COMMIT=unknown
+ARG CUTEAFD_TOOLCHAIN_HASH=unknown
+LABEL org.opencontainers.image.source="https://github.com/tpurtell/cuteafd" \
+      org.opencontainers.image.revision=${CUTEAFD_ENGINE_COMMIT} \
+      org.opencontainers.image.description="CuteAFD build toolchain; mount the checkout for SparkInfer kernels" \
+      io.cuteafd.base.digest=${BASE_IMAGE} \
+      io.cuteafd.rust.version=${RUST_TOOLCHAIN} \
+      io.cuteafd.cutlass-dsl.version="4.6.2" \
+      io.cuteafd.kache.version=${KACHE_VERSION} \
+      io.cuteafd.sccache.version=${SCCACHE_VERSION} \
+      io.cuteafd.toolchain.hash=${CUTEAFD_TOOLCHAIN_HASH}
 
 WORKDIR /workspace/cuteafd
-ENV PYTHONPATH=/workspace/cuteafd/third_party/sparkinfer:/opt/cuteafd/third_party/sparkinfer:/workspace/cuteafd/python/reference/cuteafd_reference:/workspace/cuteafd/python/reference
+ENV PYTHONPATH=/workspace/cuteafd/third_party/sparkinfer:/workspace/cuteafd/python/reference/cuteafd_reference:/workspace/cuteafd/python/reference
 COPY docker/entrypoint.sh /usr/local/bin/cuteafd-entrypoint
 RUN chmod +x /usr/local/bin/cuteafd-entrypoint
 

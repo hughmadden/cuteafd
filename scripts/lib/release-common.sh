@@ -1456,19 +1456,27 @@ release_tp2_enabled() {
      "$TP2_OUTPUT_PROJECTION" == on || "$TP2_DSPARK_EXPERTS" == on ]]
 }
 
-# Copies a WIP slot's artifacts out of a persistent WIP container into a
-# release-shaped layout (bin/, lib/, share/) on this host for ./run.sh --wip.
-# Development images bake in the pinned SparkInfer, so a pin bump needs a
-# rebuild before WIP slots are built or launched from them.
-release_dev_image_rebuild_hint() {
-  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "$RELEASE_CONFIG"
+# Registry dev references are pulled only when absent; local campaign tags remain valid.
+release_ensure_dev_image() {
+  local image="$1" host="${2:-}"
+  if [[ -n "$host" ]]; then
+    release_ssh "$host" bash -s -- "$image" <<'REMOTE'
+set -euo pipefail
+image="$1"
+docker image inspect "$image" >/dev/null 2>&1 && exit 0
+registry="${image%%/*}"
+[[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || {
+  printf 'missing local development image %s; rebuild with scripts/build/build-dev-images.sh\n' "$image" >&2; exit 1;
 }
-
-# WHERE names the host, LABEL is the image's io.cuteafd.sparkinfer.revision.
-release_require_dev_image_sparkinfer() {
-  local where="$1" image="$2" label="$3" expected="$4"
-  [[ "$label" == "$expected" ]] ||
-    release_die "$where development image $image carries SparkInfer ${label:-<none>} but this checkout pins $expected; $(release_dev_image_rebuild_hint)"
+docker pull "$image"
+REMOTE
+  else
+    docker image inspect "$image" >/dev/null 2>&1 && return 0
+    local registry="${image%%/*}"
+    [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] ||
+      release_die "missing local development image $image; rebuild with scripts/build/build-dev-images.sh"
+    docker pull "$image"
+  fi
 }
 
 release_stage_wip_layout() {
@@ -1486,6 +1494,13 @@ release_stage_wip_layout() {
   [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
   [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
   mv "$raw/"* "$layout.tmp/share/"
+  mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
+  local slot_source="$container:/wip/slots/$slot/$role/workspace"
+  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
+    --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
   rm -rf "$raw" "$layout"
   mv "$layout.tmp" "$layout"
 }
