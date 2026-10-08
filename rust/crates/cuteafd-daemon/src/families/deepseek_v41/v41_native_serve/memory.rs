@@ -154,6 +154,7 @@ pub(super) struct PoolPlan {
     pub cache_bytes: usize,
     pub occupied_before: usize,
     pub reservation_bytes: usize,
+    pub runtime_headroom_bytes: usize,
 }
 impl PoolPlan {
     fn from_groups(
@@ -173,6 +174,7 @@ impl PoolPlan {
             cache_bytes: BackboneCache::device_bytes(slots, pages)?,
             occupied_before,
             reservation_bytes,
+            runtime_headroom_bytes: RUNTIME_HEADROOM,
         })
     }
     pub fn new(
@@ -199,7 +201,10 @@ impl PoolPlan {
             .map(|r| r.bytes(total))
             .transpose()?
             .unwrap_or(total);
-        let available = ceiling.checked_sub(occupied).and_then(|v| v.checked_sub(RUNTIME_HEADROOM))
+        let runtime_headroom = if total <= 32usize << 30 && !matches!(reservation, Some(Reservation::Bytes(_))) {
+            RUNTIME_HEADROOM.max((3usize << 30).saturating_sub(total - ceiling))
+        } else { RUNTIME_HEADROOM };
+        let available = ceiling.checked_sub(occupied).and_then(|v| v.checked_sub(runtime_headroom))
             .context("memory reservation leaves no space after existing allocations and runtime headroom")?;
         ensure!(retained_turns <= 128, "invalid retained-turn limit");
         // At most two retained frontiers per turn, plus one active tail per slot.
@@ -214,7 +219,7 @@ impl PoolPlan {
                 "exact KV pool exceeds physical page capacity"
             );
             exact.0 / GROUP_BYTES
-        } else if reservation.is_some() {
+        } else if reservation.is_some() || total <= 32usize << 30 {
             // Tables saturate at the maximum logical per-request context. Find
             // the largest whole page group whose entire cache fits the budget.
             let (mut low, mut high) = (0, MAX_GROUPS);
@@ -237,10 +242,11 @@ impl PoolPlan {
         ensure!(groups >= minimum,
             "KV pool needs at least {} global bytes for {slots} active owners plus copy-on-write headroom; increase the memory budget",
             minimum * GROUP_BYTES);
-        let plan = Self::from_groups(slots, groups, occupied, ceiling)?;
+        let mut plan = Self::from_groups(slots, groups, occupied, ceiling)?;
+        plan.runtime_headroom_bytes = runtime_headroom;
         ensure!(plan.cache_bytes <= available,
             "KV cache needs {} bytes but reservation leaves {available} after existing allocations and {} bytes of runtime headroom",
-            plan.cache_bytes, RUNTIME_HEADROOM);
+            plan.cache_bytes, runtime_headroom);
         Ok(plan)
     }
 }
@@ -345,6 +351,18 @@ mod tests {
         assert!(PoolPlan::new(16, 1_048_576, 24, 0, None, None, 32 << 30, 96 << 30).is_ok());
         assert!(PoolPlan::new(16, 1_048_576, 24, 0, None, None, 16 << 30, 96 << 30).is_err());
     }
+    #[test]
+    fn small_card_without_reservation_sizes_from_free_memory() {
+        let total = 32usize << 30;
+        let free = 5usize << 30;
+        let plan = PoolPlan::new(16, 1_048_576, 24, 0, None, None, free, total).unwrap();
+        assert!(plan.cache_bytes + (3usize << 30) <= free);
+        let reserved = PoolPlan::new(16, 1_048_576, 24, 0, None, Some("97%".parse().unwrap()), free, total).unwrap();
+        assert!(free - reserved.cache_bytes >= 3usize << 30);
+        assert!(plan.pages[0] >= 2048 + 64);
+        assert!(PoolPlan::new(16, 1_048_576, 24, 0, Some(ByteSize(16 << 30)), None, free, total).is_err());
+    }
+
     #[test]
     fn snapshot_arenas_trade_default_pool_bytes_without_changing_overrides() {
         let tail = crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256;

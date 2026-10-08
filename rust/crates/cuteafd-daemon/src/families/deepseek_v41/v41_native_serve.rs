@@ -136,6 +136,12 @@ fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
         .context("no prefill capacity covers the requested batch")
 }
 
+fn admit_small_card_capacity(total: usize, batch: u32) -> Result<()> {
+    ensure!(total > 32usize << 30 || prefill_capacity(batch)? <= 1024,
+        "32 GB V4.1 capacity 4096 cannot fit with vision/dSpark; set --prefill-batch-tokens 1024 (256 for pool-first)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod prefill_capacity_tests {
     use super::{legacy_compact, prefill_capacity, compact_budget, memory};
@@ -175,6 +181,13 @@ mod prefill_capacity_tests {
         let mut kv = Some(memory::ByteSize(1usize << 30));
         compact_budget(&mut Some("31GiB".parse().unwrap()), &mut kv).unwrap();
         assert_eq!(kv.unwrap().0, 1usize << 30);
+    }
+
+    #[test]
+    fn small_card_refuses_large_capacity_before_allocation() {
+        for batch in [80, 256, 1024] { assert!(super::admit_small_card_capacity(32usize << 30, batch).is_ok()); }
+        for batch in [1025, 2048, 4096] { assert!(super::admit_small_card_capacity(32usize << 30, batch).unwrap_err().to_string().contains("capacity 4096")); }
+        assert!(super::admit_small_card_capacity(96usize << 30, 4096).is_ok());
     }
 
     #[test]
@@ -285,13 +298,21 @@ fn worker(
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
     if args.rtx_gpus == 2 { return distributed::worker(args, receive, ready, stats); }
+    // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
+    let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
+    let (_, device_total) = lib.cuda_memory_info()?;
+    if device_total <= 32usize << 30 && !legacy_compact(None, args.peers.len()) {
+        admit_small_card_capacity(device_total, args.prefill_batch_tokens)?;
+        if args.memory_reservation.is_none() { args.memory_reservation = Some("97%".parse()?); }
+        if args.rtx_expert_layers == memory::LocalLayers::Auto { args.rtx_expert_layers = memory::LocalLayers::Count(0); }
+        tracing::info!(device_total, prefill=args.prefill_batch_tokens, "selected V4.1 32 GB all-remote profile; explicit pool/reservation overrides retained");
+    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
     let aot_capacity = prefill_capacity(args.prefill_batch_tokens)?;
     let capacity = args.prefill_batch_tokens.max(256);
     let rows = capacity as usize;
-    let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let catalog = cuteafd_loader::read_official_v41_catalog(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         &args.snapshot,
@@ -442,6 +463,7 @@ fn worker(
     if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
+    let draft_free_before = lib.cuda_memory_info()?.0;
     let draft_weights = if args.dspark {
         Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(
             &lib,
@@ -465,8 +487,11 @@ fn worker(
         draft.set_fixed(args.dspark_fixed);
     }
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
+    let vision_free_before = lib.cuda_memory_info()?.0;
+    let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
     let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
         crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    let vision_bytes = vision_free_before.saturating_sub(lib.cuda_memory_info()?.0);
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
@@ -500,7 +525,10 @@ fn worker(
         args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
     tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
         cache_bytes=pool.cache_bytes, device_occupied_bytes=pool.occupied_before,
-        reservation_bytes=pool.reservation_bytes, runtime_headroom_bytes=memory::RUNTIME_HEADROOM,
+        dspark_bytes, vision_bytes, snapshot_bytes,
+        pool_tokens=pool.pages[0].saturating_sub(args.concurrency as usize + 2 * args.prefix_cache_entries as usize) * 512,
+        projected_free_bytes=free.saturating_sub(pool.cache_bytes),
+        reservation_bytes=pool.reservation_bytes, runtime_headroom_bytes=pool.runtime_headroom_bytes,
         "native KV pool reservation");
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
@@ -597,7 +625,7 @@ fn worker(
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
         spark_topology=?topology.map(|t| (t.tp(), t.ep())),
         device_occupied_bytes=occupied, device_budget_bytes=pool.reservation_bytes,
-        runtime_headroom_bytes=memory::RUNTIME_HEADROOM, "native serving residency ready");
+        runtime_headroom_bytes=pool.runtime_headroom_bytes, "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
