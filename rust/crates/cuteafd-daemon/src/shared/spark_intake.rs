@@ -130,8 +130,26 @@ pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingPro
 }
 
 fn device_choice_available(choice: &IntakeChoice) -> bool {
-    choice.mode == IntakeMode::Gpu || (choice.setting == "auto"
-        && choice.probe.as_ref().is_some_and(|probe| probe.usable()))
+    choice.mode == IntakeMode::Gpu
+}
+
+fn v41_choice(mut choice: IntakeChoice) -> IntakeChoice {
+    // V4.1's exchange loop lacks the overlap that justifies generic auto landing.
+    if choice.setting == "auto" {
+        choice.mode = IntakeMode::Pinned;
+        choice.reason = format!("V4.1 auto retains pinned uploads; {}", choice.reason);
+    }
+    choice
+}
+
+/// Preserve V4.1's pinned default while retaining capability checks for explicit GPU intake.
+pub(crate) fn choose_v41_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
+    choose_mode(library).map(v41_choice)
+}
+
+pub(crate) fn v41_device_exchange_available(library: &NativeLibrary) -> Result<bool> {
+    let choice = choose_v41_mode(library)?;
+    Ok(device_choice_available(&choice))
 }
 
 /// Optional device-driven exchange must not turn a failed landing probe into
@@ -948,11 +966,7 @@ impl<'a> SparkDeviceLink<'a> {
         build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
         use cuteafd_transport::expert::device_mailbox;
         let choice = choose_mode(library)?;
-        // The exchange's verify waves are small: dma-buf landing that works is
-        // enough even where the probe judged it slower than the pinned path
-        // for prefill-sized waves (that choice still holds for the host path).
-        let usable = choice.probe.as_ref().is_some_and(|probe| probe.usable());
-        ensure!(choice.mode == IntakeMode::Gpu || (usable && choice.setting == "auto"),
+        ensure!(device_choice_available(&choice),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
             row_bytes)?;
@@ -1150,6 +1164,48 @@ mod tests {
         assert!(!gpu_wins(&probe(pinned / 3.0), Some(57.6)).0);
         // Without the H2D probe, a verified landing path is used.
         assert!(gpu_wins(&probe(19.6), None).0);
+    }
+
+    #[test]
+    fn v41_auto_keeps_pinned_at_parity_rates_without_changing_generic_auto() {
+        let mut measured = probe(19.2);
+        measured.host_gbps = 55.0;
+        let h2d = Some(55.0);
+        assert_eq!(pinned_path_gbps(measured.host_gbps, h2d.unwrap()), 27.5);
+        let (mode, reason) = resolve_landing_probe("auto", &Ok(measured.clone()), h2d);
+        assert_eq!(mode, IntakeMode::Gpu);
+        let generic = IntakeChoice { setting: "auto".into(), mode, reason,
+            probe: Some(measured), h2d_gbps: h2d };
+        assert!(device_choice_available(&generic));
+        let v41 = v41_choice(generic);
+        assert_eq!(v41.mode, IntakeMode::Pinned);
+        assert!(!device_choice_available(&v41));
+        assert_eq!(v41.mode_for(4096 * 10240).0, IntakeMode::Pinned);
+    }
+
+    #[test]
+    fn v41_explicit_gpu_preserves_the_capability_fallback() {
+        let measured = probe(19.2);
+        for supported in [true, false] {
+            let result = if supported { Ok(measured.clone()) }
+                else { Err(anyhow::anyhow!("forced unavailable")) };
+            let (mode, reason) = resolve_landing_probe("gpu", &result, None);
+            let choice = v41_choice(IntakeChoice { setting: "gpu".into(), mode, reason,
+                probe: result.ok(), h2d_gbps: None });
+            assert_eq!(device_choice_available(&choice), supported);
+            assert_eq!(choice.mode, if supported { IntakeMode::Gpu } else { IntakeMode::Pinned });
+        }
+    }
+
+    #[test]
+    fn resolved_pinned_intake_cannot_be_upgraded_by_a_usable_probe() {
+        let measured = probe(1.0);
+        let (mode, reason) = resolve_landing_probe("auto", &Ok(measured.clone()), Some(57.6));
+        assert_eq!(mode, IntakeMode::Pinned);
+        let choice = IntakeChoice { setting: "auto".into(), mode, reason,
+            probe: Some(measured), h2d_gbps: Some(57.6) };
+        assert!(choice.probe.as_ref().unwrap().usable());
+        assert!(!device_choice_available(&choice));
     }
 
     #[test]
