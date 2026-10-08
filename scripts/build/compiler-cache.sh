@@ -78,14 +78,16 @@ PY
   # Some AOT exporters exec CC/CXX as a single path, not a shell command.
   # Keep shims build-local so concurrent toolchains cannot overwrite each other.
   local shim_dir
-  shim_dir="$(realpath -m "$build_dir/compiler-cache/bin")"
-  if ! python3 - "$shim_dir" "$launcher" "${CC:-cc}" "${CXX:-c++}" <<'PY'
-import os, shlex, shutil, sys
+  if ! shim_dir="$(python3 - "$build_dir/compiler-cache/bin" "$launcher" "${CC:-cc}" "${CXX:-c++}" <<'PY'
+import hashlib, os, shlex, shutil, sys
 from pathlib import Path
-root = Path(sys.argv[1])
 compilers = [shutil.which(name) for name in sys.argv[3:]]
 if not all(compilers):
     raise SystemExit('cannot resolve C/C++ compilers')
+compilers = [str(Path(compiler).resolve()) for compiler in compilers]
+# A new toolchain needs a new shim path so CMake's compiler-change check sees it.
+identity = hashlib.sha256('\n'.join(compilers).encode()).hexdigest()[:16]
+root = Path(sys.argv[1]).resolve() / identity
 root.mkdir(parents=True, exist_ok=True)
 for name, compiler in zip(('cc', 'c++'), compilers):
     path = root / name
@@ -95,8 +97,9 @@ for name, compiler in zip(('cc', 'c++'), compilers):
         stage.write_text(text)
         stage.chmod(0o755)
         os.replace(stage, path)
+print(root)
 PY
-  then
+)"; then
     cuteafd_compiler_cache_warn 'cannot create compiler shims'; return 0
   fi
   export CUTEAFD_KACHE_ACTIVE="$wrapper" KACHE_CONFIG="$config" KACHE_HOST_CONFIG=
