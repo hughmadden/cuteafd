@@ -256,17 +256,20 @@ pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot
     drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
     requested: Option<u64>, future_expert_bytes: u64) -> anyhow::Result<usize> {
     planned_pool_tokens_with_extra(library, snapshot, devices, drafter, prefill_rows, slots, requested,
-        future_expert_bytes, 0)
+        future_expert_bytes, 0, Default::default())
 }
 
 /// As `planned_pool_tokens`, also reserving a family's optional per-GPU
-/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool.
+/// buffers (e.g. GLM Flash split KDA partials) before admitting the pool,
+/// with GLM Flash's DSA index cache layout `glmf_index`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
     devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
-    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64) -> anyhow::Result<usize> {
+    requested: Option<u64>, future_expert_bytes: u64, extra_reserve_bytes: u64,
+    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache) -> anyhow::Result<usize> {
     let reserves = vec![RankReserve { extra_bytes: extra_reserve_bytes, workspace_bytes: None }; devices.len()];
     planned_pool_tokens_with_reserves(library, snapshot, devices, drafter, prefill_rows, slots,
-        requested, future_expert_bytes, &reserves, 4)
+        requested, future_expert_bytes, &reserves, glmf_index, 4)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -287,7 +290,8 @@ pub(crate) fn lead_reserves(ranks: usize, lead_bytes: u64) -> Vec<RankReserve> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
     devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
-    requested: Option<u64>, future_expert_bytes: u64, reserves: &[RankReserve], kda_state_bytes: u64)
+    requested: Option<u64>, future_expert_bytes: u64, reserves: &[RankReserve],
+    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache, kda_state_bytes: u64)
     -> anyhow::Result<usize> {
     use anyhow::Context;
     anyhow::ensure!(reserves.len() == devices.len(), "reserve must cover every admitted GPU");
@@ -299,7 +303,7 @@ pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLib
     let glmf = family.id() == "glm5_flash";
     let cache_ranks = if glmf { 1 } else { devices.len() };
     let geometry = model.cache_geometry(cuteafd_loader::serving_capacity::CacheOptions {
-        coordinator_ranks: cache_ranks, kda_state_bytes, ..Default::default() })?
+        coordinator_ranks: cache_ranks, glmf_index, kda_state_bytes, ..Default::default() })?
         .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
     let costs = cuteafd_loader::plan::layout::family_costs(family.id());
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;

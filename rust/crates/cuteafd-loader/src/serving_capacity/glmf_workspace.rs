@@ -61,6 +61,9 @@ pub struct GlmfScratchOptions {
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
+    /// The compact DSA index cache (`--index-cache compact`): the `glmf_index_producer_c_*`
+    /// producers, whose scratch also holds the step's key | gate rows.
+    pub index_compact: bool,
     /// The KDA recurrent state (`--kda-state`): which KDA programs the steps launch.
     pub kda_state: GlmfKdaState,
 }
@@ -126,6 +129,10 @@ pub fn glmf_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConf
         format!("sparse_mla_{mode}_{cap}"), format!("o_{cap}"), format!("ffn_i2048_{cap}"),
         format!("ffn_i12288_{cap}"), format!("index_producer_{cap}"), "mhc_pre".into()] {
         scratch = scratch.max(required(format!("glmf_{name}"))?);
+    }
+    if options.index_compact {
+        // The step's key | gate rows follow the compact producer's query and projection scratch.
+        scratch = scratch.max(required(format!("glmf_index_producer_c_{cap}"))?);
     }
     if options.split {
         // The head split's share programs (those this build has).
@@ -451,6 +458,29 @@ mod tests {
         assert_eq!(glmf_step_scratch(lookup, &cfg, tile, 4096, false).unwrap_err(),
             GlmfMissingProgram("glmf_kda_s16t_m4096".into()));
         assert_eq!([GlmfKdaState::F32, GlmfKdaState::Bf16, GlmfKdaState::Bf16Tile].map(GlmfKdaState::bytes), [4, 2, 2]);
+    }
+
+    #[test]
+    fn the_compact_index_cache_charges_its_producers_and_needs_them() {
+        let cfg = glm53_flash();
+        let compact = GlmfScratchOptions { index_compact: true, ..Default::default() };
+        // `index_producer_c_scratch_bytes`: the producer's scratch, then the step's key | gate rows.
+        let with = |name: &str| match name {
+            "glmf_index_producer_c_m64" => Some(561_152 + 64 * 512),
+            "glmf_index_producer_c_m4096" => Some(35_913_728 + 4096 * 512),
+            _ => lookup(name),
+        };
+        // Below the largest program's scratch at either capacity: the workspace bytes do not move.
+        assert_eq!(glmf_step_scratch(with, &cfg, compact, 64, true).unwrap(), scratch(&cfg, 64, true));
+        assert_eq!(glmf_step_scratch(with, &cfg, compact, 4096, false).unwrap(), scratch(&cfg, 4096, false));
+        // A larger producer scratch is the step's: the lanes' shared temporaries hold it.
+        let larger = |name: &str| if name == "glmf_index_producer_c_m4096" { Some(900_000_000) } else { with(name) };
+        assert_eq!(glmf_step_scratch(larger, &cfg, compact, 4096, false).unwrap().programs, 900_000_000);
+        assert_eq!(glmf_step_scratch(larger, &cfg, GlmfScratchOptions::default(), 4096, false).unwrap(),
+            scratch(&cfg, 4096, false));
+        // A build without the compact producers cannot run the compact cache.
+        assert_eq!(glmf_step_scratch(lookup, &cfg, compact, 64, true).unwrap_err(),
+            GlmfMissingProgram("glmf_index_producer_c_m64".into()));
     }
 
     #[test]

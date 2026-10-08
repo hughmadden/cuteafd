@@ -251,6 +251,9 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
         ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
+        # The compact index cache (--index-cache compact): the commit that also rebuilds the
+        # sequences' index tails, and below the producers without per-token keys.
+        ("kda_commit_c", "kda_commit", {"index_cache": "compact"}, lambda: glmf.compile_glmf_kda_commit_c_aot(g)),
     ]
     # MLA, dense and shared-expert projections take only E4M3 weights with 128x128 scales
     # (the official FP8 release's): decode rows up to ``fp8_rows`` on the GEMV, W8A16
@@ -266,6 +269,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out += [
             (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
              lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
+            (f"index_producer_c_m{rows}", "index_producer", {"max_rows": rows, "index_cache": "compact"},
+             lambda r=rows: glmf.compile_glmf_index_producer_c_aot(g, max_rows=r)),
             (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": pool_pages},
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
@@ -298,6 +303,9 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                         g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr)))
     out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
                 lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
+    # Both: the compact index cache's commit (state and index tails in one launch) over a BF16 state.
+    out.append(("kda_commit_c_s16", "kda_commit", {"index_cache": "compact", "state_dtype": "bfloat16"},
+                lambda: glmf.compile_glmf_kda_commit_c_aot(g, state_dtype="bfloat16")))
     return out
 
 
@@ -312,9 +320,10 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     keep = ("kda_m", "kda_w8_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
     from b12x.integration.cuteafd import glmf
 
-    # The head split keeps an FP32 KDA state (no BF16-state ``_s16`` programs yet).
+    # The head split keeps the per-token index keys and an FP32 KDA state (no compact index cache
+    # or BF16-state ``_s16`` programs on two GPUs yet).
     programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context)
-                if item[0].startswith(keep) and "_s16" not in item[0]]
+                if item[0].startswith(keep) and not item[0].startswith("kda_commit_c") and "_s16" not in item[0]]
     programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
     programs.append(("join_heads", "join", {"half_width": g.kda_width},
                      lambda: glmf.compile_glmf_join_aot(g.kda_width)))

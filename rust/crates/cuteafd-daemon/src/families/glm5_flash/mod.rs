@@ -53,6 +53,12 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each; 68 MiB with --kda-state bf16).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
+    /// The DSA index cache: `keys` keeps every token's BF16 key | gate row beside its latent
+    /// record (11,804 B per token over the 11 MLA layers); `compact` keeps only the pooled keys
+    /// and each sequence's open pool (at most three rows), 6,172 B per token, with the same
+    /// pooled keys bit for bit. A two-GPU head split keeps `keys`.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
+    pub index_cache: engine::IndexCache,
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
     #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
@@ -223,6 +229,16 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn index_cache_defaults_to_keys_and_takes_compact() {
+        let parse_cache = |extra: &[&str]| Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib",
+            "/native"].into_iter().chain(extra.iter().copied())).map(|p| p.engine.index_cache);
+        assert_eq!(parse_cache(&[]).unwrap(), engine::IndexCache::Keys);
+        assert_eq!(parse_cache(&["--index-cache", "compact"]).unwrap(), engine::IndexCache::Compact);
+        assert_eq!(parse_cache(&["--index-cache", "keys"]).unwrap(), engine::IndexCache::Keys);
+        assert!(parse_cache(&["--index-cache", "tails"]).is_err());
+    }
+
+    #[test]
     fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
         let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
             .unwrap().engine;
@@ -286,6 +302,8 @@ mod draft_cli_tests {
             assert!(error.contains("--kda-state bf16"), "{error}");
         }
         check_options(&parse(&["--kda-state", "f32", "--kda-fp8", "row128", "--split-device", "1"])).unwrap();
+        // With the compact index cache too: its commit then rebuilds the index tails over the BF16 state.
+        check_options(&parse(&["--kda-state", "bf16", "--index-cache", "compact"])).unwrap();
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--kda-state", "fp16"]).is_err());
     }
@@ -300,7 +318,8 @@ mod draft_cli_tests {
             routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4, kda_heads: 64, kda_head_dim: 128,
             heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048,
             index_kpool: 4, eos: vec![] };
-        let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&cfg, 45, 1, 2).unwrap();
+        let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&cfg, 45, 1,
+            cuteafd_loader::serving_capacity::GlmfIndexCache::Keys, 2).unwrap();
         let mark = geometry.ranks[0].retained_mark_bytes;
         assert_eq!(mark, 76_316_672);
         // The arena serve's `after_pool` gives: `MarkArena::slots_for` marks of the decoding lanes.
@@ -453,6 +472,128 @@ mod draft_cli_tests {
             5_000_000_000 - allowance);
         assert_eq!(planned_graph_extra(&lazy, Some(&[1_000_000_000]), allowance), 0);
         assert_eq!(planned_graph_extra(&lazy, None, allowance), 0);
+    }
+
+    /// `measured_pool_tokens` modelled on a 5090 (33,711,521,792 B) at default flags with Spark experts,
+    /// an automatic pool and 16 sequences, from what its launches measured once start-up had allocated
+    /// everything but the pool: `free` bytes free (11,876,761,600 at 8,192 and at 131,072 tokens), and
+    /// 2 GiB of headroom and 7,702,414,080 B of state and marks kept beside the graphs, at 11,804 B a
+    /// token in 256-token units. The GPU's one-unit check, then the pool in what the reserve leaves
+    /// (`admitted_pool_tokens`). Records each measurement's graph bytes in `calls`.
+    fn measured_on_a_5090(free: u64, calls: &std::cell::RefCell<Vec<u64>>)
+        -> impl FnMut(u64) -> anyhow::Result<usize> + '_ {
+        use cuteafd_core::serving_capacity::{DeviceMemory, GpuMemoryBudget, DEFAULT_GPU_KV_TOKENS};
+        const TOTAL: u64 = 33_711_521_792;
+        move |graphs| {
+            calls.borrow_mut().push(graphs);
+            let reserve = (2u64 << 30) + graphs + 7_702_414_080;
+            GpuMemoryBudget(TOTAL).admit(DeviceMemory { device: 0, total_bytes: TOTAL, baseline_free_bytes: free },
+                reserve + 256 * 11_804)?;
+            let room = free as i64 - reserve as i64;
+            let tokens = cuteafd_core::memory_layout::size_pool(&[room], &[11_804], 256, DEFAULT_GPU_KV_TOKENS);
+            anyhow::ensure!(tokens >= 256, crate::shared::memory_report::NoKvRoom { free_after_reserve: vec![room] });
+            Ok(tokens as usize)
+        }
+    }
+
+    /// The 5090's measured refusal (its one-unit check): `required` bytes against 33,711,521,792. At default
+    /// flags, 131,072 tokens and 16 sequences the launch beside the startup set (28,060 graphs,
+    /// 4,998,676,312 B) was refused needing 36,686,356,056 B, short 2,974,834,264 B.
+    fn the_5090_refusal(required: u64, shortfall: u64) -> cuteafd_core::serving_capacity::CapacityError {
+        cuteafd_core::serving_capacity::CapacityError::GpuBudgetExceeded { device: 0, required,
+            budget: 33_711_521_792, shortfall }
+    }
+
+    /// The launch the measured admission refused falls back to lazily captured graphs, which keep the
+    /// 1.5 GiB allowance: 3,388,063,576 B more room, 35,072 tokens. With less free memory, short either
+    /// way, the startup refusal stands.
+    #[test]
+    fn a_measured_admission_falls_back_to_lazy_capture_on_a_real_shortfall() {
+        use cuteafd_core::serving_capacity::CapacityError;
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        assert_eq!(kv_admission(&args, false, false), KvAdmission::Measured);
+        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
+        assert_eq!(allowance, 1_610_612_736);
+        let calls = std::cell::RefCell::new(Vec::new());
+        // The model refuses the startup set as the launch did.
+        let refused = measured_on_a_5090(11_876_761_600, &calls)(set).unwrap_err();
+        assert_eq!(refused.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(36_686_356_056, 2_974_834_264)));
+        assert_eq!(calls.take(), [set]);
+        // Measured again keeping the allowance: lazy capture, 35,072 tokens.
+        let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
+        assert_eq!(admitted, (35_072, false));
+        assert_eq!(calls.take(), [set, allowance]);
+        // 876,761,600 B less free: short by 463,532,288 B with the allowance too, so the startup refusal stands.
+        let error = measured_admission(&args, Some(set), measured_on_a_5090(11_000_000_000, &calls)).unwrap_err();
+        assert_eq!(error.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(37_563_117_656, 3_851_595_864)));
+        assert_eq!(calls.take(), [set, allowance]);
+    }
+
+    /// A startup set that fits is kept as before: measured once, captured at startup. At 8,192 tokens the
+    /// launch's set (10,580 graphs, 1,926,552,328 B) left the 8,448 tokens it admitted. A set within the
+    /// allowance (1,474,297,856 B, what that launch captured) is kept exactly, not as the allowance, and
+    /// refused, has no room to gain from lazy capture: its refusal stands, measured once.
+    #[test]
+    fn a_measured_admission_keeps_a_startup_set_that_fits_unchanged() {
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        let calls = std::cell::RefCell::new(Vec::new());
+        for (set, tokens) in [(1_926_552_328, 8_448), (1_474_297_856, 46_592)] {
+            let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
+            assert_eq!(admitted, (tokens, true));
+            assert_eq!(calls.take(), [set]);
+        }
+        let error = measured_admission(&args, Some(1_474_297_856), measured_on_a_5090(11_000_000_000, &calls))
+            .unwrap_err();
+        assert!(crate::shared::memory_report::kv_shortfall(&error), "{error:#}");
+        assert_eq!(calls.take(), [1_474_297_856]);
+    }
+
+    /// A lazy retry that fails for another reason (its memory sample, an overflow, a CUDA query) returns
+    /// its own error, whole, beneath the startup refusal; a first measurement that fails so is not retried.
+    #[test]
+    fn a_measured_retry_that_fails_for_another_reason_keeps_its_own_error() {
+        use crate::shared::memory_report::kv_shortfall;
+        use cuteafd_core::serving_capacity::CapacityError;
+        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
+        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
+        let refusal = || anyhow::Error::from(the_5090_refusal(36_686_356_056, 2_974_834_264));
+        let others: [fn() -> anyhow::Error; 3] = [
+            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
+            || anyhow::anyhow!("KV admission reserve overflows"),
+            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
+        ];
+        let calls = std::cell::RefCell::new(Vec::new());
+        // Measurements answering `answers` in turn.
+        let scripted = |mut answers: Vec<anyhow::Result<usize>>| { answers.reverse(); let calls = &calls;
+            move |graphs: u64| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two measurements") } };
+        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
+        for other in others {
+            let error = measured_admission(&args, Some(set), scripted(vec![Err(refusal()), Err(other())])).unwrap_err();
+            assert!(!kv_shortfall(&error), "{error:#}");
+            assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
+            assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
+            assert_eq!(calls.take(), [set, allowance]);
+            let error = measured_admission(&args, Some(set), scripted(vec![Err(other())])).unwrap_err();
+            assert_eq!(chain(&error), chain(&other()));
+            assert_eq!(calls.take(), [set]);
+        }
+    }
+
+    /// Without a startup set (a graph budget turns startup capture off, as `CUTEAFD_GLMF_STARTUP_GRAPHS=0`
+    /// does) the measured admission measures once, keeping the budget, else the allowance, and captures
+    /// lazily, with nothing to fall back to: at 512 MiB the 126,208 tokens the budgeted launch admitted;
+    /// at 4096 MiB its refusal stands.
+    #[test]
+    fn a_measured_admission_without_a_startup_set_measures_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        for (budget, kept, admitted) in [(None, 1_610_612_736, Some(35_072)), (Some("512"), 536_870_912, Some(126_208)),
+            (Some("4096"), 4_294_967_296, None)] {
+            let args = with_budget(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat(), budget);
+            assert!(budget.is_none() || !args.startup_graphs());
+            let result = measured_admission(&args, None, measured_on_a_5090(11_876_761_600, &calls));
+            assert_eq!(result.ok(), admitted.map(|tokens| (tokens, false)), "{budget:?}");
+            assert_eq!(calls.take(), [kept], "{budget:?}");
+        }
     }
 
     #[test]
@@ -636,11 +777,12 @@ impl EngineArgs {
     }
 }
 
-/// The step settings these arguments give the engine (its step plan's inputs besides layers and experts).
-fn step_settings(args: &EngineArgs) -> engine::StepSettings {
+/// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
+/// with the DSA index cache `with_engine_admitting` resolved (a head split keeps `keys`).
+fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, kda_state: args.kda_state }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state }
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -654,7 +796,7 @@ fn graph_reserve(args: &EngineArgs) -> u64 {
 enum KvAdmission {
     /// From the free memory measured once everything else is allocated: one GPU with Spark experts
     /// and an automatic pool, or any one-GPU launch under a coordinator GPU budget. It keeps the
-    /// startup set's reserve free for decode graphs, else `graph_reserve`.
+    /// startup set's reserve free for decode graphs, else `graph_reserve` (`measured_admission`).
     Measured,
     /// From the planner's per-GPU costs before the engine allocates: a head split, local experts
     /// without a GPU budget, a fixed pool. Every GPU keeps the planner's graph allowance and
@@ -687,6 +829,21 @@ fn kv_admission(args: &EngineArgs, gpu_budget: bool, split: bool) -> KvAdmission
 fn planned_graph_extra(args: &EngineArgs, startup_reserve: Option<&[u64]>, allowance: u64) -> u64 {
     let startup = startup_reserve.and_then(|reserve| reserve.iter().copied().max()).unwrap_or(0);
     startup.max(args.graph_budget_mib.map_or(0, |mib| mib << 20)).saturating_sub(allowance)
+}
+
+/// The measured admission beside the startup decode graphs (`startup`, the set's reserve on its one
+/// GPU; None when graphs are captured lazily). `measure(graphs)` sizes the pool from the free memory
+/// measured now, keeping `graphs` bytes free for decode graphs. It keeps the startup set's reserve
+/// exactly, below the allowance or above it. When that leaves no room for a pool, it measures again
+/// keeping `graph_reserve` (with a startup set, the planner's allowance), and decode graphs are
+/// captured lazily: the planned admission's rule (`engine::admit_beside_decode_graphs`). Everything
+/// else precedes the pool, so only the graph reserve differs between the two measurements. Returns the
+/// pool and whether decode graphs are captured at startup.
+fn measured_admission(args: &EngineArgs, startup: Option<u64>, mut measure: impl FnMut(u64) -> Result<usize>)
+    -> Result<(usize, bool)> {
+    let lazy = graph_reserve(args);
+    engine::admit_beside_decode_graphs(startup.map(|reserve| engine::StartupGraphReserve { reserve, allowance: lazy }),
+        |graphs| measure(graphs.unwrap_or(lazy)))
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -774,11 +931,21 @@ impl Opened {
         if args.fp8_head {
             needed.push("glmf_head_fp8");
         }
-        if args.kda_state != engine::KdaState::F32 {
-            for name in ["m64", "m4096"].iter().map(|cap| args.kda_state.program(cap))
-                .chain([args.kda_state.commit_program().to_string()]) {
-                programs.spec(&format!("glmf_{name}")).with_context(|| format!("--kda-state {} needs program \
-                    glmf_{name}; this native library predates it", args.kda_state.name()))?;
+        let compact = args.index_cache == engine::IndexCache::Compact;
+        if compact {
+            needed.extend(["glmf_index_producer_c_m64", "glmf_index_producer_c_m4096"]);
+        }
+        if args.kda_state != engine::KdaState::F32 || compact {
+            // The state's KDA programs and the commit a speculative verify runs: the state's, or with
+            // the compact index cache the one that also rebuilds the tails (`kda_commit_c[_s16]`).
+            let kda: Vec<String> = if args.kda_state == engine::KdaState::F32 { Vec::new() }
+                else { ["m64", "m4096"].iter().map(|cap| args.kda_state.program(cap)).collect() };
+            let commit = if compact { args.kda_state.compact_commit_program() }
+                else { args.kda_state.commit_program() };
+            for name in kda.into_iter().chain([commit.to_string()]) {
+                programs.spec(&format!("glmf_{name}")).with_context(|| format!("--kda-state {} with --index-cache {} \
+                    needs program glmf_{name}; this native library predates it", args.kda_state.name(),
+                    if compact { "compact" } else { "keys" }))?;
             }
         }
         if args.kda_fp32_partials {
@@ -800,7 +967,7 @@ impl Opened {
             if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
         }
         for name in needed {
-            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
+            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
         programs.load_all()?;
@@ -818,6 +985,14 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
+        // Both GPUs of a head split run the indexer; their index tails are not built yet.
+        let index_cache = match (args.index_cache, split_device) {
+            (engine::IndexCache::Compact, Some(device)) => {
+                tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
+                engine::IndexCache::Keys
+            }
+            (cache, _) => cache,
+        };
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -923,24 +1098,28 @@ impl Opened {
                 args.prefill_lanes
             } else { 1 };
             let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
-                &model.layers, experts.as_ref(), step_settings(args)), args.prefill_rows, lanes)?;
-            // A BF16 KDA state halves the state per sequence and each mark the arena holds.
+                &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
+            // The caches this engine builds: records per token, the sequences' state and marks, and
+            // the speculative records follow the index cache, and a BF16 KDA state halves the state
+            // per sequence and each mark the arena holds.
             let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
-                args.kda_state.bytes() as u64)?;
+                index_cache.into(), args.kda_state.bytes() as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes;
-            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance).
-            let graphs = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied())
-                .unwrap_or_else(|| graph_reserve(args));
-            let reserve = crate::shared::memory_report::MeasuredReserve { headroom: args.headroom_bytes()?,
-                graphs, later: state + after_pool(rank) + future_expert_bytes };
-            let tokens = crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
-                (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
+            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
+            // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
+            let (headroom, later) = (args.headroom_bytes()?, state + after_pool(rank) + future_expert_bytes);
+            let startup = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied());
+            let admitted = measured_admission(args, startup, |graphs| {
+                let reserve = crate::shared::memory_report::MeasuredReserve { headroom, graphs, later };
+                crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
+                    (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
+                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64))
+            })?;
             early = Some((experts, drafter, dense, selector, workspaces));
-            (tokens, startup_graphs)
+            admitted
         } else if admission == KvAdmission::Planned {
             // 0: automatic; fixed pools (budgeted, served, or beside decode graphs) retain their
             // requested size and refuse before allocation if the future storage would not fit.
@@ -966,7 +1145,7 @@ impl Opened {
             // logits, their exact union replaces the allowance.
             let spark = args.peers.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-                step_settings(args)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
+                step_settings(args, index_cache)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
             let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
             let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
                 args.draft.is_some())?;
@@ -993,13 +1172,14 @@ impl Opened {
                 engine::KdaState::F32 => 0,
                 state => {
                     let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers,
-                        1, state.bytes() as u64)?;
+                        1, index_cache.into(), state.bytes() as u64)?;
                     let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
                     bf16_mark_reserve(state, after_pool(rank), rank.retained_mark_bytes)
                 }
             };
-            engine::admit_beside_decode_graphs(startup, |graph_extra| {
-                let graph_extra = graph_extra.max(lazy_extra);
+            engine::admit_beside_decode_graphs(startup, |graphs| {
+                // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
+                let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
                 let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
                     crate::shared::memory_report::RankReserve {
                         extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }
@@ -1009,17 +1189,19 @@ impl Opened {
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                     args.draft.as_deref(), args.prefill_rows, args.slots,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
-                    args.kda_state.bytes() as u64)
+                    index_cache.into(), args.kda_state.bytes() as u64)
             })?
         } else {
             (args.pool_tokens, startup_graphs)
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, args.kda_state)?;
+            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
+            args.kda_state)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
