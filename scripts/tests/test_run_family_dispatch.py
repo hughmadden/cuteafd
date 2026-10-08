@@ -1515,6 +1515,37 @@ def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, ke
         assert ("--decode-rows 128" in command) == forwarded and command.count("--decode-rows") == int(forwarded), command
 
 
+@pytest.mark.parametrize("keys,sequences,entries,budget,shared", [
+    ("", 8, 20, None, False),
+    ("CONCURRENCY=8\nPREFIX_CACHE_ENTRIES=20\nPREFIX_CACHE_MARK_MIB=2048\nGLM5_FLASH_REPLAY_RECORDS=own\n",
+     8, 20, 2048, False),
+    ("CONCURRENCY=16\nPREFIX_CACHE_ENTRIES=6\nPREFIX_CACHE_MARK_MIB=1971\nGLM5_FLASH_REPLAY_RECORDS=shared\n",
+     16, 6, 1971, True),
+])
+def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, keys, sequences, entries, budget,
+                                                                      shared):
+    """The encoder placement plan sizes GLM 5.3 Flash's mark arena as serve-glmf does: the sequences
+    (CONCURRENCY), PREFIX_CACHE_ENTRIES, PREFIX_CACHE_MARK_MIB and shared replay records reach
+    `cuteafd plan --layout` exactly as they reach the coordinator; unset, both take the defaults."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\n" + keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " "
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line) + " "
+    assert f" --max-sequences {sequences} " in launch and launch.count("--max-sequences") == 1, launch
+    assert f" --concurrency {sequences} " in planner and planner.count("--concurrency") == 1, planner
+    for command in [planner, launch]:
+        assert f" --prefix-cache-entries {entries} " in command and command.count("--prefix-cache-entries") == 1, command
+        assert command.count("--prefix-cache-mark-mib") == (budget is not None), command
+        assert budget is None or f" --prefix-cache-mark-mib {budget} " in command, command
+        assert ("--replay-records shared" in command) == shared and command.count("--replay-records") == shared, command
+
+
 @pytest.mark.parametrize("family_config,serve", [
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),

@@ -245,6 +245,42 @@ mod tests {
         assert!(parse(&["--prefix-marks", "host"]).is_err());
     }
 
+    /// The flags the launcher's encoder placement plan passes for GLM 5.3 Flash (the sequences,
+    /// prefix knobs and replay records serve-glmf gets) size its layout: the mark arena follows
+    /// the sequences, entries and mark budget, as serve-glmf's does.
+    #[test]
+    fn glm_flash_serving_knobs_reach_the_layout() {
+        use clap::Parser;
+        let mut config = cuteafd_loader::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45)
+            .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &config, &[], None);
+        let model = snapshot.path().display().to_string();
+        let layout = |extra: &[&str]| {
+            let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
+                "--rtx-gib", "96", "--pool-tokens", "0"];
+            let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            options(&args).unwrap()
+        };
+        let marks = |options: &PlanOptions| plan(std::path::Path::new(&model), options).unwrap().memory_layout
+            .unwrap().devices[0].items.iter().filter(|i| i.group == "marks").map(|i| i.bytes).sum::<u64>();
+        let custom = layout(&["--concurrency", "16", "--prefix-cache-entries", "6", "--prefix-cache-mark-mib",
+            "1971", "--replay-records", "shared"]);
+        let knobs = custom.layout.as_ref().unwrap();
+        assert_eq!((knobs.concurrency, knobs.mimo_prefix_entries, knobs.mimo_prefix_mark_bytes,
+            knobs.glmf_shared_replay), (16, 6, 1971 << 20, true));
+        // 147,619,840 B marks and the 2C + 2 floor: 18 at 8 sequences (the default of both the
+        // launcher and the planner) and 34 at 16; at 5 sequences and 6 entries 1,971 MiB holds 14.
+        let mark = 147_619_840;
+        assert_eq!(marks(&layout(&[])), 18 * mark);
+        assert_eq!(marks(&layout(&["--concurrency", "8", "--prefix-cache-entries", "20"])), 18 * mark);
+        assert_eq!(marks(&custom), 34 * mark);
+        assert_eq!(marks(&layout(&["--concurrency", "5", "--prefix-cache-entries", "6",
+            "--prefix-cache-mark-mib", "1971"])), 14 * mark);
+    }
+
     #[test]
     fn diagnostic_prefill_flag_is_forwarded_to_layout() {
         use clap::Parser;
