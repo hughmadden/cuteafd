@@ -547,7 +547,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
-        if graph.is_none() {
+        if graph.is_none() && super::v41_layer_graphs::captures_shape(rows) {
             unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };
             let captured=unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
