@@ -53,6 +53,12 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
+    /// The DSA index cache: `keys` keeps every token's BF16 key | gate row beside its latent
+    /// record (11,804 B per token over the 11 MLA layers); `compact` keeps only the pooled keys
+    /// and each sequence's open pool (at most three rows), 6,172 B per token, with the same
+    /// pooled keys bit for bit. A two-GPU head split keeps `keys`.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
+    pub index_cache: engine::IndexCache,
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
     #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
     pub prefill_rows: usize,
@@ -200,6 +206,16 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn index_cache_defaults_to_keys_and_takes_compact() {
+        let parse_cache = |extra: &[&str]| Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib",
+            "/native"].into_iter().chain(extra.iter().copied())).map(|p| p.engine.index_cache);
+        assert_eq!(parse_cache(&[]).unwrap(), engine::IndexCache::Keys);
+        assert_eq!(parse_cache(&["--index-cache", "compact"]).unwrap(), engine::IndexCache::Compact);
+        assert_eq!(parse_cache(&["--index-cache", "keys"]).unwrap(), engine::IndexCache::Keys);
+        assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
     #[test]
@@ -564,11 +580,12 @@ impl EngineArgs {
     }
 }
 
-/// The step settings these arguments give the engine (its step plan's inputs besides layers and experts).
-fn step_settings(args: &EngineArgs) -> engine::StepSettings {
+/// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
+/// with the DSA index cache `with_engine_admitting` resolved (a head split keeps `keys`).
+fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context }
+        max_context: args.max_context, index_cache }
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -702,6 +719,9 @@ impl Opened {
         if args.fp8_head {
             needed.push("glmf_head_fp8");
         }
+        if args.index_cache == engine::IndexCache::Compact {
+            needed.extend(["glmf_index_producer_c_m64", "glmf_index_producer_c_m4096", "glmf_kda_commit_c"]);
+        }
         if args.kda_fp32_partials {
             needed.extend(["glmf2_kda_w8_f32_m64", "glmf2_kda_w8_f32_m4096"]);
             needed.push("glmf2_add_fp32");
@@ -721,7 +741,7 @@ impl Opened {
             if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
         }
         for name in needed {
-            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
+            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
         programs.load_all()?;
@@ -739,6 +759,14 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
+        // Both GPUs of a head split run the indexer; their index tails are not built yet.
+        let index_cache = match (args.index_cache, split_device) {
+            (engine::IndexCache::Compact, Some(device)) => {
+                tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
+                engine::IndexCache::Keys
+            }
+            (cache, _) => cache,
+        };
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -844,8 +872,11 @@ impl Opened {
                 args.prefill_lanes
             } else { 1 };
             let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
-                &model.layers, experts.as_ref(), step_settings(args)), args.prefill_rows, lanes)?;
-            let geometry = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(&self.cfg, layers)?;
+                &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
+            // The caches this engine builds: records per token, the sequences' state and marks, and
+            // the speculative records follow the index cache.
+            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
+                index_cache.into())?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
@@ -885,7 +916,7 @@ impl Opened {
             // logits, their exact union replaces the allowance.
             let spark = args.peers.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-                step_settings(args)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
+                step_settings(args, index_cache)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
             let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
             let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
                 args.draft.is_some())?;
@@ -915,17 +946,19 @@ impl Opened {
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                     args.draft.as_deref(), args.prefill_rows, args.slots,
-                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves)
+                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
+                    index_cache.into())
             })?
         } else {
             (args.pool_tokens, startup_graphs)
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding)?;
+            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
+        tracing::info!(index_cache = ?engine.index_cache, pool_tokens, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;

@@ -1,8 +1,9 @@
 //! glmf-golden --lane-check: N prefill lanes give the bits of N passes. One chunk prefills through
 //! the pipelined lanes into sequence A and, over the same cuts, through serial passes into
-//! sequence B; every row's logits, the KDA state (with everything `slot_state` carries) and every
-//! paged byte of both sequences' units must agree bit for bit. Both sequences take fresh units of
-//! a fresh engine, which the caches zero, so whole units compare exactly whatever their layout.
+//! sequence B; every row's logits, the KDA state (with everything `slot_state` carries, the compact
+//! index cache's tails included) and every paged byte of both sequences' units must agree bit for
+//! bit. Both sequences take fresh units of a fresh engine, which the caches zero, so whole units
+//! compare exactly whatever their layout (with or without the per-token index keys).
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use anyhow::{ensure, Context, Result};
 
@@ -11,8 +12,9 @@ use anyhow::{ensure, Context, Result};
 fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
     engine.synchronize()?;
     let mut out = Vec::new();
-    for buffers in engine.paged_buffers() {
-        for buffer in buffers {
+    for layer in engine.paged_buffers() {
+        // Records, token keys (`--index-cache keys` only) and pool keys.
+        for buffer in std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]) {
             ensure!(buffer.bytes % engine.pool_pages == 0, "a paged buffer that is not whole units");
             let per_unit = buffer.bytes / engine.pool_pages;
             for &unit in &placement.units {
