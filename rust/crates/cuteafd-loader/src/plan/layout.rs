@@ -674,13 +674,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 |rank| rank.fixed_device_bytes),
         };
         // V4 keeps one 4096-row intake plane per Spark and prefill lane; GLM 5.3 Flash one plane
-        // of a lane's rows per Spark and lane. Decode reuses lane zero; every plane belongs to the
-        // lead GPU.
+        // per Spark and lane of its widest step's rows (a lane's, or 128 decode rows past a
+        // narrower lane). Decode reuses lane zero; every plane belongs to the lead GPU.
         let intake = match (family, report.placement) {
             ("deepseek_v4", ExpertPlacement::Sparks { ranks }) if index == 0 =>
                 2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2,
             ("glm5_flash", ExpertPlacement::Sparks { ranks }) if index == 0 && !split =>
-                glmf_lanes * ranks as u64 * prefill_rows * model.spec().hidden as u64 * 2,
+                crate::serving_capacity::glmf_spark_intake_bytes(glmf_lanes, ranks as u64,
+                    crate::serving_capacity::glmf_expert_rows(prefill_rows, glmf_decode_rows), model.spec().hidden as u64),
             _ => 0,
         };
         let workspace = workspace + intake;

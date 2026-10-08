@@ -351,6 +351,19 @@ pub fn glmf_selector_bytes(rows: u64, vocab: u64) -> u64 {
     rows * 12 + capacity * (64 + 64 + 2048 * 4 + 256 * (4 + 8) + 32) + 2 * mask
 }
 
+/// The rows every routed-expert resource of a GLM 5.3 Flash engine holds: the widest step it runs,
+/// a prefill lane of `prefill_rows` rows or a decode or verify step of `decode_rows` rows. The dense
+/// NVFP4 package, local FP8 or EXL3 experts and the Spark transports and intake planes take them.
+pub fn glmf_expert_rows(prefill_rows: u64, decode_rows: u64) -> u64 {
+    prefill_rows.max(decode_rows)
+}
+
+/// Device bytes of GLM 5.3 Flash's Spark intake planes: one transport per prefill lane (decode
+/// reuses lane zero's), each with a plane of `rows` BF16 partial rows of `hidden` per Spark rank.
+pub fn glmf_spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
+    lanes * ranks * rows * hidden * 2
+}
+
 /// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the decode workspace of
 /// `decode_rows` rows (the engine's `--decode-rows`), over the scratch of each step shape.
 pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, decode_rows: u64,

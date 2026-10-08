@@ -1010,8 +1010,9 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
 /// `--decode-rows 128` in the planner charges what the engine allocates for it: the decode workspace of
 /// 128 rows over both program sets' scratch (planned = allocated, from the same arithmetic and
 /// manifest), the wide token selector and sampler, and the speculative replay records and commit tables
-/// of 128 rows (with `--replay-records shared`, the KDA records of 128 rows in the prefill scratch). A
-/// manifest without the wide programs, or a head split, is refused.
+/// of 128 rows (with `--replay-records shared`, the KDA records of 128 rows in the prefill scratch), and
+/// past a narrower prefill lane the Spark intake planes of 128 rows. A manifest without the wide
+/// programs, or a head split, is refused.
 #[test]
 fn glm5_flash_layout_charges_the_wide_decode_rows() {
     use crate::families::glm5_flash::GlmNextConfig;
@@ -1105,6 +1106,25 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         assert_eq!(state(report) - state(shared), records, "{rows} rows");
         assert_eq!(steps(shared), steps(report), "{rows} rows");
     }
+    // A prefill lane narrower than a verify step (`--prefill-rows 64 --decode-rows 128`): every lane's
+    // intake planes hold the widest step's rows, as the engine's Spark transports do; lanes of 4,096
+    // rows keep theirs.
+    let lane = |prefill_rows: u64, decode_rows: u64| {
+        let mut options = options(decode_rows, &wide_path, 1);
+        options.layout.as_mut().unwrap().prefill_rows = prefill_rows;
+        plan(dir.path(), &options).unwrap()
+    };
+    for (rows, decode_rows, intake_rows) in [(64u64, 64u64, 64u64), (64, 128, 128), (4096, 128, 4096)] {
+        let engine = glmf_step_workspaces(&cfg, 2, rows, decode_rows, &shape,
+            glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
+            glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
+        let intake = crate::serving_capacity::glmf_spark_intake_bytes(2, 4, intake_rows, 4096);
+        assert_eq!(intake, 2 * 4 * intake_rows * 4096 * 2);
+        assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine + intake, Basis::Formula)),
+            "{rows} prefill rows, {decode_rows} decode rows");
+    }
+    // 128 rows past a 64-row lane: the wide decode workspace and 64 more intake rows per lane and Spark.
+    assert_eq!(steps(&lane(64, 128)) - steps(&lane(64, 64)), 64_606_464 + 2 * 4 * 64 * 4096 * 2);
 }
 
 #[test]

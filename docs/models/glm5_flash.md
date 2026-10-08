@@ -92,7 +92,11 @@ Attention (KDA), a minority run MLA + DSA.
   --layout --decode-rows 128`). With `GLM5_FLASH_REPLAY_RECORDS=shared` the
   KDA records of 128 rows (642,842,624 B) still fit the 782,236,672-byte
   prefill scratch, so they take no memory of their own. Start-up loads the
-  `*_m128` programs only with 128 rows.
+  `*_m128` programs only with 128 rows. Every routed-expert resource (the
+  dense NVFP4 package, local FP8 or EXL3 experts, the Spark transports and
+  their intake planes) holds the widest step, `max(--prefill-rows,
+  --decode-rows)`, so prefill lanes narrower than 128 rows still take a
+  127-row verify step through the experts.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 

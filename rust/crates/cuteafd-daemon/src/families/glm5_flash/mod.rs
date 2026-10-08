@@ -67,7 +67,7 @@ pub(crate) struct EngineArgs {
     /// one GPU) and fewer rows keep the `_m64` ones, their bits and speed. A verify step then schedules
     /// up to the GPU's whole sparse MLA waves (127 rows on an RTX 5090, 128 on 188 SMs): at 16 sequences
     /// each verifies 6 or 7 drafts instead of 3. The decode workspace, the token selector and the
-    /// speculative replay records grow with it.
+    /// speculative replay records grow with it, and every expert resource holds at least its rows.
     #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROWS", default_value_t = engine::DECODE_ROWS,
         value_parser = parse_decode_rows)]
     pub decode_rows: usize,
@@ -506,6 +506,73 @@ mod draft_cli_tests {
         }
         assert_eq!(wide_selector_bytes(engine::DECODE_ROWS, 154_880), 0);
         assert_eq!(wide_selector_bytes(engine::WIDE_DECODE_ROWS, 154_880), 3_209_984);
+    }
+
+    /// `--prefill-rows 64 --decode-rows 128`: a 16-stream verify wave of long drafts fills the GPU's
+    /// verify budget (127 rows on 170 SMs, 128 on 188) and runs every real row, more than the prefill
+    /// lane's 64, through the experts; every expert resource holds the widest step's rows, and a
+    /// planned admission charges the Spark intake planes' rows past the lane's.
+    #[test]
+    fn experts_hold_a_verify_wave_wider_than_the_prefill_lane() {
+        for (flags, rows) in [(&[][..], 4096), (&["--decode-rows", "128"][..], 4096),
+            (&["--prefill-rows", "64"][..], 64), (&["--prefill-rows", "64", "--decode-rows", "128"][..], 128),
+            (&["--prefill-rows", "2048", "--decode-rows", "128"][..], 2048), (&["--prefill-rows", "32"][..], 64)] {
+            assert_eq!(parse(flags).expert_rows(), rows, "{flags:?}");
+        }
+        let args = parse(&["--prefill-rows", "64", "--decode-rows", "128"]);
+        check_options(&args).unwrap();
+        for (sms, budget) in [(170, 127), (188, 128)] {
+            let verify_rows = engine::verify_budget(args.decode_rows, sms);
+            assert_eq!(verify_rows, budget);
+            // The serving loop's limits at 16 sequences that can all draft past the even share.
+            let sequences = 16;
+            let room = (verify_rows / sequences).max(1) - 1;
+            let mut limits = vec![room; sequences];
+            engine::hand_out_remainder(&mut limits, room, verify_rows, |_| true);
+            let real: usize = limits.iter().map(|limit| limit + 1).sum();
+            assert_eq!(real, verify_rows);
+            // Padded into its bucket, the step's real rows run the router, the expert wire and the
+            // routed experts.
+            let bucket = engine::DecodeBuckets::new(verify_rows).bucket(real, true);
+            let mut experts = None;
+            crate::shared::decode_graph::real_row_moe(real, bucket, |rows| { experts = Some(rows); Ok(()) },
+                |_| Ok(())).unwrap();
+            let rows = experts.unwrap();
+            assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
+        }
+        // Two lanes' transports, each with a plane per Spark (4 ranks) of 64 more rows of 4,096 BF16.
+        assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
+        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-lanes", "4"]),
+            4, 4096), 4 * 4 * 64 * 4096 * 2);
+        for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
+            &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
+            assert_eq!(wide_intake_bytes(&parse(flags), 4, 4096), 0, "{flags:?}");
+        }
+    }
+
+    /// The dense NVFP4 package, local FP8 and EXL3 experts and every Spark transport are sized by
+    /// `expert_rows`, never by the prefill lane's rows alone.
+    #[test]
+    fn every_expert_resource_takes_the_expert_rows() {
+        let source = include_str!("mod.rs");
+        // The needles are joined here, so that this test's own text does not match them.
+        let body = |name: &str| {
+            let start = source.find(&["    fn ", name, "<'s>(&'s self, args: &EngineArgs"].concat()).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        let (dense, experts) = (body("load_dense"), body("experts"));
+        let sized = ["args.expert", "_rows()"].concat();
+        assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
+        // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
+        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new("] {
+            let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
+            let arguments: String = experts[at..].chars().take(200).collect();
+            assert!(arguments.contains(&sized), "{site}");
+        }
+        assert_eq!(experts.matches(&sized).count(), 3);
+        let lane = ["args.prefill", "_rows"].concat();
+        assert!(!dense.contains(&lane) && !experts.contains(&lane));
     }
 
     #[test]
@@ -949,6 +1016,24 @@ impl EngineArgs {
         ensure!(self.headroom_gib.is_finite() && self.headroom_gib >= 0.0, "--headroom-gib must be a size in GiB");
         Ok((self.headroom_gib * (1u64 << 30) as f64) as u64)
     }
+
+    /// The rows every routed-expert resource holds (the dense NVFP4 package, local FP8 or EXL3
+    /// experts, the Spark transports and their intake planes): the widest step, a prefill lane of
+    /// `--prefill-rows` or a decode or verify step of `--decode-rows` (with `--prefill-rows 64
+    /// --decode-rows 128`, a verify step's 127 rows).
+    pub(crate) fn expert_rows(&self) -> usize {
+        cuteafd_loader::serving_capacity::glmf_expert_rows(self.prefill_rows as u64, self.decode_rows as u64) as usize
+    }
+}
+
+/// Device bytes of the Spark intake planes that experts sized for the decode rows hold beyond a
+/// narrower prefill lane's (none when a lane is at least as wide as a decode step): what a planned
+/// admission charges on the lead GPU, as it charges the wide selector, beyond the allowances it
+/// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
+fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
+    use cuteafd_loader::serving_capacity::glmf_spark_intake_bytes;
+    let at = |rows: usize| glmf_spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
+    at(args.expert_rows()) - at(args.prefill_rows)
 }
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
@@ -1390,6 +1475,13 @@ impl Opened {
             // The token selector and GPU sampler of `--decode-rows 128` beyond the 64-row ones the
             // runtime allowance holds: the serving loop makes them after the pool, on the lead GPU.
             let selector = wide_selector_bytes(args.decode_rows, self.cfg.vocab_size);
+            // The Spark intake planes of experts sized for decode steps wider than a prefill lane
+            // (`--prefill-rows 64 --decode-rows 128`), past the lane's rows, also on the lead GPU.
+            let intake = match args.peers.as_deref() {
+                Some(peers) if moe && !args.skip_experts => wide_intake_bytes(args, peers.split(',').count(),
+                    self.cfg.hidden),
+                _ => 0,
+            };
             // A BF16 KDA state's mark arena can hold more marks than the planner's flat count; the
             // lead GPU keeps the rest free too (`bf16_mark_reserve`).
             let marks = match args.kda_state {
@@ -1407,7 +1499,7 @@ impl Opened {
                 let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
                     crate::shared::memory_report::RankReserve {
                         extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }
-                            + if rank == 0 { marks + selector } else { 0 },
+                            + if rank == 0 { marks + selector + intake } else { 0 },
                         workspace_bytes: args.full_prefill_logits.then_some(workspace),
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
@@ -1510,7 +1602,7 @@ impl Opened {
             return Ok(None);
         }
         let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
-        let dense = engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?;
+        let dense = engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.expert_rows())?;
         tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
         Ok(Some(dense))
     }
@@ -1529,7 +1621,7 @@ impl Opened {
             let resident = if args.expert_window.is_some() { 0..0 } else { first..layers };
             let started = Instant::now();
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
-                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                args.expert_rows(), free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();
@@ -1545,7 +1637,7 @@ impl Opened {
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
                 resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1),
-                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.prefill_rows,
+                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.expert_rows(),
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
                 budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
             })));
@@ -1555,9 +1647,10 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
+        // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
+        // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
         let transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
-            &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+            &peers, &executors, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
         crate::shared::memory_report::release_load_staging(&self.library);

@@ -3371,8 +3371,8 @@ impl<'a> GlmfEngine<'a> {
                 layer.ptr("nvfp4_s1")?, layer.ptr("nvfp4_w3")?, layer.ptr("nvfp4_s3")?, layer.ptr("nvfp4_w2")?,
                 layer.ptr("nvfp4_s2")?, out, dense.scratch.buffer.ptr];
             // SAFETY: the input rows, the layer's NVFP4 operands, the constant ids/weights
-            // (prefill capacity rows), the output and the scratch are live device buffers
-            // used on the engine stream.
+            // (the expert rows: the widest prefill lane or decode step), the output and the
+            // scratch are live device buffers used on the engine stream.
             return self.timed("ffn (NVFP4 dense)", || unsafe {
                 dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
             });
