@@ -6,18 +6,18 @@ use std::{fmt, str::FromStr};
 pub(crate) mod distributed;
 
 // Aggregate source capacity is independent of the retained snapshot count.
-const RETAINED_CONTEXTS: usize = 2;
+const DEFAULT_POOL_TOKENS: usize = 2 * 1_048_576;
 // Extra pages cover retained partial tails and active copy-on-write frontiers.
 const MAX_GROUPS: usize = 131_072;
 const GROUP_BYTES: usize = 5 * 256 * (68 + cuteafd_ffi::V41Kv::COMPRESSED_ROW_BYTES);
 // Request scratch and graph/runtime allocations. Snapshot arenas are already live.
 // Kept outside the eagerly allocated cache; this is not a CUDA process quota.
 pub(super) const RUNTIME_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
-// Post-ready untracked growth in official-native C1/C16 (plus single-RTX tools),
+// Post-ready untracked growth in official-native C1/C16 and tools,
 // plus 25%, rounded up to 64 MiB. Separate from transient runtime scratch.
 pub(super) const SINGLE_GRAPH_RESERVE: usize = 3264 * 1024 * 1024;
-pub(super) const DUAL_GPU0_GRAPH_RESERVE: usize = 320 * 1024 * 1024;
-pub(super) const DUAL_GPU1_GRAPH_RESERVE: usize = 384 * 1024 * 1024;
+pub(super) const DUAL_GPU0_GRAPH_RESERVE: usize = 1472 * 1024 * 1024;
+pub(super) const DUAL_GPU1_GRAPH_RESERVE: usize = 1472 * 1024 * 1024;
 
 pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
     // Plat2 already charges its measured fixed-shape graph envelope.
@@ -70,8 +70,10 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
     memory: &[(usize, usize)]) -> Result<Option<ByteSize>> {
     let Some(requested) = args.pool_tokens else { return Ok(args.kv_pool_size); };
     let automatic = requested == 0;
-    let target = if automatic { 14 * 1_048_576 }
-        else { requested };
+    let target = if automatic {
+        let default = if memory.iter().any(|&(_, total)| total <= 32usize << 30) { 1_048_576 } else { DEFAULT_POOL_TOKENS as u64 };
+        default.max((args.max_context_tokens as u64).div_ceil(512) * 512 + args.concurrency as u64 * 512)
+    } else { requested };
     let config: serde_json::Value = serde_json::from_reader(std::fs::File::open(args.snapshot.join("config.json"))?)?;
     let available: Vec<u64> = memory.iter().enumerate().map(|(gpu, &(free, total))| {
         ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory information");
@@ -91,6 +93,11 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
     }).collect::<Result<_>>()?;
     let groups = cuteafd_loader::serving_capacity::deepseek_v41_pool_groups(&config,
         args.concurrency as u64, args.prefix_cache_entries as u64, &available, target, automatic, args.tp2_attention)?;
+    if automatic {
+        ensure!(groups >= (args.max_context_tokens as u64).div_ceil(512)
+            + 2 * (args.concurrency as u64 + args.prefix_cache_entries as u64),
+            "automatic KV pool cannot fit one full-context request and private tails");
+    }
     let bytes = usize::try_from(groups)?.checked_mul(GROUP_BYTES).context("planner KV byte overflow")?;
     tracing::info!(requested_pool_tokens=requested, admitted_pool_tokens=groups.saturating_sub(
         args.concurrency as u64 + 2 * args.prefix_cache_entries as u64) * 512,
@@ -371,7 +378,7 @@ impl PoolPlan {
         slots: usize,
         context: usize,
         retained_turns: usize,
-        snapshot_bytes: usize,
+        _snapshot_bytes: usize,
         exact: Option<ByteSize>,
         reservation: Option<Reservation>,
         free: usize,
@@ -405,14 +412,14 @@ impl PoolPlan {
         let per_context = context.div_ceil(512);
         // Explicit budgets may trade aggregate context capacity for memory.
         // Provision at least one page per active owner plus private tail space.
-        let minimum = slots + spare_groups;
+        let minimum = if exact.is_none() && reservation.is_none() { per_context + 2 * (slots + retained_turns) } else { slots + spare_groups };
         let groups = if let Some(exact) = exact {
             ensure!(
                 exact.0 / GROUP_BYTES <= MAX_GROUPS,
                 "exact KV pool exceeds physical page capacity"
             );
             exact.0 / GROUP_BYTES
-        } else if reservation.is_some() || total <= 32usize << 30 {
+        } else if reservation.is_some() || small_card {
             // Tables saturate at the maximum logical per-request context. Find
             // the largest whole page group whose entire cache fits the budget.
             let (mut low, mut high) = (0, MAX_GROUPS);
@@ -424,13 +431,12 @@ impl PoolPlan {
                     high = mid - 1;
                 }
             }
-            low
+            if reservation.is_some() { low } else { low.min((1_048_576usize / 512 + spare_groups).max(minimum)) }
         } else {
-            // Keep the default total footprint stable when snapshot tails move
-            // from demand allocation into startup arenas. Explicit KV/total
-            // reservations above retain their own sizing policy.
-            (per_context * (slots + RETAINED_CONTEXTS) + spare_groups)
-                .saturating_sub(snapshot_bytes.div_ceil(GROUP_BYTES)).max(minimum)
+            // Snapshot arenas are already live and charged to fixed occupancy.
+            // Explicit KV/total reservations retain their own sizing policy.
+            (DEFAULT_POOL_TOKENS / 512 + spare_groups)
+                .max(minimum)
         };
         ensure!(groups >= minimum,
             "KV pool needs at least {} global bytes for {slots} active owners plus copy-on-write headroom; increase the memory budget",
@@ -470,11 +476,17 @@ mod tests {
         let mut auto = parse(&["--pool-tokens", "0"])?;
         auto.snapshot = directory.path().to_owned();
         let full = planned_pool_size(&auto, &[(96 << 30, 96 << 30)])?.unwrap();
-        assert_eq!(full.0 / GROUP_BYTES, 14 * 2048 + 16 + 40);
-        let limited = planned_pool_size(&auto, &[((6 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30)])?.unwrap();
+        assert_eq!(full.0 / GROUP_BYTES, 2 * 2048 + 16 + 40);
+        let small = planned_pool_size(&auto, &[(16 << 30, 32 << 30)])?.unwrap();
+        assert_eq!(small.0 / GROUP_BYTES, 2048 + 2 * (16 + 20));
+        auto.max_context_tokens = 32768;
+        let small = planned_pool_size(&auto, &[(16 << 30, 32 << 30)])?.unwrap();
+        assert_eq!(small.0 / GROUP_BYTES, 2048 + 16 + 40);
+        auto.max_context_tokens = 1_048_576;
+        let limited = planned_pool_size(&auto, &[((15usize << 29) + SINGLE_GRAPH_RESERVE, 96 << 30)])?.unwrap();
         assert!(limited.0 < full.0);
         auto.pool_tokens = Some(14 * 1_048_576);
-        assert!(planned_pool_size(&auto, &[((6 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30)]).is_err());
+        assert!(planned_pool_size(&auto, &[((15usize << 29) + SINGLE_GRAPH_RESERVE, 96 << 30)]).is_err());
         Ok(())
     }
     #[test]
@@ -534,15 +546,15 @@ mod tests {
         }
     }
     #[test]
-    fn default_pool_covers_eighteen_contexts_and_twenty_four_snapshot_tails() {
+    fn default_pool_covers_two_million_tokens_and_snapshot_tails() {
         let p = PoolPlan::new(16, 1_048_576, 24, 0, None, None, 96 << 30, 96 << 30).unwrap();
-        assert_eq!(p.pages, [36_928, 36_928, 36_928, 73_856]);
-        assert_eq!(p.global_bytes, 16_827_351_040);
+        assert_eq!(p.pages, [4160, 4160, 4160, 8320]);
+        assert_eq!(p.global_bytes, 4160 * GROUP_BYTES);
         assert!(p.cache_bytes > p.global_bytes);
         let small = PoolPlan::new(16, 32768, 24, 0, None, None, 8 << 30, 96 << 30).unwrap();
-        assert_eq!(small.pages, [1216, 1216, 1216, 2432]);
+        assert_eq!(small.pages, [4160, 4160, 4160, 8320]);
         assert!(PoolPlan::new(16, 1_048_576, 24, 0, None, None, 32 << 30, 96 << 30).is_ok());
-        assert!(PoolPlan::new(16, 1_048_576, 24, 0, None, None, 16 << 30, 96 << 30).is_err());
+        assert!(PoolPlan::new(16, 1_048_576, 24, 0, None, None, 6 << 30, 96 << 30).is_err());
     }
     #[test]
     fn small_card_without_reservation_sizes_from_free_memory() {
@@ -551,6 +563,9 @@ mod tests {
         let plan = PoolPlan::new(16, 1_048_576, 24, 0, None, None, free, total).unwrap();
         let floor = cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES as usize;
         assert!(plan.cache_bytes + floor <= free);
+        assert_eq!(plan.pages[0], 2048 + 2 * (16 + 24));
+        let roomy = PoolPlan::new(16, 32768, 24, 0, None, None, 20 << 30, total).unwrap();
+        assert_eq!(roomy.pages[0], 2048 + 16 + 2 * 24);
         let reserved = PoolPlan::new(16, 1_048_576, 24, 0, None, Some("97%".parse().unwrap()), free, total).unwrap();
         assert!(free - reserved.cache_bytes >= floor);
         let explicit = PoolPlan::new(16, 1_048_576, 24, 0, None,
@@ -564,15 +579,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_arenas_trade_default_pool_bytes_without_changing_overrides() {
+    fn snapshot_arenas_are_fixed_occupancy_without_changing_pool_tokens() {
         let tail = crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256;
         let bytes = 50 * (tail + 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES);
         let free = 56 << 30;
         let total = 96 << 30;
         let old = PoolPlan::new(16, 1_048_576, 24, 0, None, None, free, total).unwrap();
         let pooled = PoolPlan::new(16, 1_048_576, 24, bytes, None, None, free-bytes, total).unwrap();
-        let returned = old.global_bytes - pooled.global_bytes;
-        assert!(returned >= bytes && returned - bytes < GROUP_BYTES);
+        assert_eq!(old.pages, pooled.pages);
         let explicit = PoolPlan::new(16, 1_048_576, 24, bytes,
             Some(ByteSize(old.global_bytes)), None, free-bytes, total).unwrap();
         assert_eq!(explicit.pages, old.pages);
@@ -599,7 +613,7 @@ mod tests {
             PoolPlan::new(2, 1_048_576, 24, 0, Some(ByteSize(1 << 30)), None, free, total).unwrap();
         assert!(small.global_bytes <= 1 << 30);
         let c2 = PoolPlan::new(2, 1_048_576, 24, 0, None, None, free, total).unwrap();
-        assert_eq!(c2.pages[0], 2048 * 4 + 50);
+        assert_eq!(c2.pages[0], 4096 + 50);
         let reservation = Some("80GiB".parse().unwrap());
         let p = PoolPlan::new(16, 1_048_576, 24, 0, None, reservation, free, total).unwrap();
         assert!(p.cache_bytes + p.occupied_before + p.runtime_headroom_bytes <= 80 << 30);
@@ -622,7 +636,7 @@ mod tests {
             1_048_576,
             24, 0,
             Some(ByteSize(default.global_bytes)),
-            Some("50GiB".parse().unwrap()),
+            Some("41GiB".parse().unwrap()),
             free,
             total
         )
@@ -709,6 +723,17 @@ mod local_tests {
         }
         assert_eq!(graph_reserve_bytes(96 << 30, Some(0)), DUAL_GPU0_GRAPH_RESERVE);
         assert_eq!(graph_reserve_bytes(96 << 30, Some(1)), DUAL_GPU1_GRAPH_RESERVE);
+    }
+
+    #[test]
+    fn dual_graph_reserves_cover_measured_tools_growth() {
+        // parity-v2c RTX2 s1, qualification plus separate stress, 2026-10-08.
+        let growth = [1_184_529_440usize, 1_220_203_808];
+        let quantum = 64usize << 20;
+        for gpu in 0..2 {
+            let measured_reserve = (growth[gpu] * 5).div_ceil(4).div_ceil(quantum) * quantum;
+            assert_eq!(graph_reserve_bytes(96 << 30, Some(gpu)), measured_reserve);
+        }
     }
 
     #[test]

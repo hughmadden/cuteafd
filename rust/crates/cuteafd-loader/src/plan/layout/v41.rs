@@ -4,7 +4,7 @@ use crate::plan::Checkpoint;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use std::collections::BTreeMap;
 
-pub const DEFAULT_POOL_TOKENS: u64 = 14 * 1_048_576;
+pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
 /// Native MXFP4 packer storage, including the padding of each intermediate
 /// slice. This applies to full RTX experts and each independently packed TP

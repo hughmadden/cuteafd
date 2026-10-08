@@ -857,7 +857,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
                 .unwrap_or_else(|| size_pool(&free, &per_token, unit,
-                    if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS }
+                    if family == "deepseek_v41" { if small_card { 1 << 20 } else { v41::DEFAULT_POOL_TOKENS } }
                     else if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
             if pool_tokens < context_tokens {
                 notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
