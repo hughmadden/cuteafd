@@ -29,13 +29,13 @@ pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(
     let device = lib.cuda_get_device()?;
     let live = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let occupied = total - free;
-    // Opt-in empirical reserve, not a per-executable model: official V4.1 Flash,
+    // Empirical small-card reserve, not a per-executable model: official V4.1 Flash,
     // 31.8 GiB/C16 grew 1,107,296,256 bytes with six shapes, and 838,860,800
     // with eight shapes plus bounded index selection, ready -> ten-batch plateau.
     // The 2 GiB envelope also covers untracked driver/allocator growth;
     // other shape sets still require their own warmed margin gate.
     let graph_budget = std::env::var("CUTEAFD_V41_GRAPH_BUDGET_MIB").ok()
-        .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(0)
+        .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(2048)
         .checked_mul(1 << 20).context("V4.1 graph budget overflow")?;
     let admitted_free = free.checked_sub(SMALL_CARD_SAMPLE_MARGIN)
         .and_then(|bytes| bytes.checked_sub(graph_budget))

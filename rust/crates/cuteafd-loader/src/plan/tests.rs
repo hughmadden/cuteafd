@@ -1210,6 +1210,20 @@ fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() 
 }
 
 #[test]
+fn v41_small_card_graph_envelope_preserves_pro_allowance() {
+    let dir = snapshot(v41_config(), &[]);
+    for (gib, expected) in [(32, 2u64 << 30), (96, (1u64 << 30) * 150 / 100)] {
+        let options = PlanOptions {
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], ..Default::default() }),
+            ..sparks(4)
+        };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let graph = memory.devices[0].items.iter().find(|item| item.group == "graph allowance").unwrap();
+        assert_eq!(graph.bytes, expected);
+    }
+}
+
+#[test]
 fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
     let mut config = v41_config();

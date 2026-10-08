@@ -612,10 +612,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
+        let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
+            // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
+            2 * GIB
+        } else { costs.graph_bytes[role] };
         match options.graph_budget_bytes.filter(|&budget| family == "glm5_flash"
-            && (glmf_measured || budget > costs.graph_bytes[role])) {
+            && (glmf_measured || budget > graph_allowance)) {
             Some(budget) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget, Basis::Formula)),
-            None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role],
+            None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance,
                 allowance_basis)),
         }
         let workspace = match glmf_steps {

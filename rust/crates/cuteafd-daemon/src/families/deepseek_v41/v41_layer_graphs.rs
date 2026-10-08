@@ -6,7 +6,16 @@ use std::collections::BTreeMap;
 
 const MAX_DECODE_ROWS: u32 = 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1);
 
+pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,6,16,24,32,40,43,48";
 static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+pub(super) fn profile_fixed_shapes(total_bytes: usize, explicit: Option<&str>) -> Result<Option<Vec<u32>>> {
+    if total_bytes > 32usize << 30 { return Ok(None); }
+    let value = explicit.unwrap_or(SMALL_CARD_FIXED_ROWS);
+    if value.is_empty() { return Ok(None); }
+    Ok(Some(validate_fixed_shapes(value.split(',').map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()?)?))
+}
 
 /// Startup-only small-card policy. Exact shapes outside the set execute eagerly,
 /// never evicting or recapturing a graph, and never changing causal/cache rows.
@@ -191,6 +200,17 @@ impl<'a> RowGraphs<'a> {
 mod tests {
     use super::*;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn small_card_profile_defaults_to_qualified_bank_and_preserves_overrides() {
+        assert_eq!(profile_fixed_shapes(32usize << 30, None).unwrap(),
+            Some(vec![1, 6, 16, 24, 32, 40, 43, 48]));
+        assert_eq!(profile_fixed_shapes(32usize << 30, Some("")).unwrap(), None);
+        assert_eq!(profile_fixed_shapes(32usize << 30, Some("1,6")).unwrap(), Some(vec![1, 6]));
+        assert_eq!(profile_fixed_shapes(96usize << 30, None).unwrap(), None);
+        assert_eq!(profile_fixed_shapes(96usize << 30, Some("1,6")).unwrap(), None);
+        assert!(profile_fixed_shapes(32usize << 30, Some("1,80")).is_err());
+    }
 
     #[test]
     fn fixed_shapes_preserve_c1_and_refuse_replacing_large_prefill_slots() {

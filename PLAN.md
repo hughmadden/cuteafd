@@ -861,8 +861,22 @@ Work, in priority order:
    soaks remain required; no memory-safety qualification is claimed. Independently, lazy target graph retention grew to ~12.6K counted
    executables with unchanged device owners: untracked residency 3.24 ->
    5.16 GB after batches 1 -> 5, leaving only 0.35 GiB of the logical 31.8 GiB
-   budget. A fixed small-card graph set and charged reserve, host embedding,
-   warmed margin and C1/C16 gates are pending; PRO policy remains unchanged.
+   budget. The small-card fixed eight-shape bank (`1,6,16,24,32,40,43,48`),
+   exact index-selection retention/eager overflow and measured 2 GiB graph
+   envelope passed three interleaved C1/C16 comparisons and ten distinct
+   MALLOC_CHECK_=3 C16 batches on pin c595ba7: C1 +0.56%, C16 ratio 0.98194 (pair ratios
+   1.01965/1.02588/0.95888), minimum warmed logical free 4.084 GiB;
+   all four selection owners captured 256 exact fingerprints without recapture.
+   Accepted for the small-card profile; finite lazy warm-up remains, not a
+   startup freeze. PRO policy remains unchanged. MiMo host/GPU timing was
+   byte-identical with no measured host penalty (+0.51% median); its 256K
+   retrieval passed, but long-prompt free 2.5605 GiB failed the margin.
+   Growth was already-admitted shared KV shadow/lane/drafter storage, not a
+   missing reservation. Both small-card families now use an absolute 2.9 GiB
+   floor with the 97% ceiling; MiMo's measured contract predicts 962,560
+   aggregate tokens across 16 slots, an 86,016-token full-context shortfall.
+   New-pin hardware confirmation and paired larger-output code checks remain
+   pending; no full-1M prompt or real-5090 qualification is claimed.
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
    Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),

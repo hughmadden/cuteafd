@@ -309,8 +309,8 @@ fn worker(
     let (_, device_total) = lib.cuda_memory_info()?;
     let small_card = device_total <= 32usize << 30;
     if small_card {
-        if let Some(value) = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok().filter(|value| !value.is_empty()) {
-            let shapes = value.split(',').map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>()?;
+        let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
+        if let Some(shapes) = super::v41_layer_graphs::profile_fixed_shapes(device_total, explicit.as_deref())? {
             tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
             super::v41_layer_graphs::set_fixed_shapes(shapes)?;
         }
