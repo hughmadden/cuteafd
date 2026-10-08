@@ -143,6 +143,16 @@ class StopHostScopeTest(StopHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.hosts(lines)), set(FOUR_HOSTS + ["moa"]))
 
+    def test_family_launch_limits_do_not_block_stop(self):
+        for family in ["GLM-5.3", "GLM-5.3-Flash", "MiMo-V2.6-Pro", "Qwen3.8-Flash-Next", "DeepSeek-V4-Flash"]:
+            config = self.root / "family.config"
+            config.write_text(f"MODEL_ID=test/{family}\nSPARK_HOSTS=moa\nSPARK_COUNT=1\n"
+                              "CONCURRENCY=32\nRTX_EXPERT_LAYERS=70\nPREFILL_BATCH_TOKENS=32\n"
+                              "KV_POOL_TOKENS=100\nMAX_CONTEXT_TOKENS=2097152\n")
+            result, lines, _ = self.run_stop("--config", str(config))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(self.hosts(lines)), {"moa"})
+
     def test_mimo_dflash_config_stops_every_named_host(self):
         config = write_config(self.root / "mimo.config", SIX_HOSTS, spark_count=6,
                               extra="SPECULATOR=dflash2\n"

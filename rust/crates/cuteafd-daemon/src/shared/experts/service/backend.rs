@@ -167,6 +167,19 @@ pub(super) fn load_fp8<'a>(
         package = %directory.display(), "FP8 Spark residency plan");
     // The BF16-input sibling package, when built, lets the coordinator send unquantized rows.
     let bf16 = crate::shared::experts::fp8::bf16_sibling(&directory).filter(|d| d.is_dir());
+    let layer_bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, config.world, config.rank, slicing)?;
+    let resident = layer_bytes.checked_mul(layers.len()).context("FP8 resident overflow")?;
+    // A projection is read into pageable memory then uploaded through pinned
+    // staging; reserve two whole layers as a conservative host transient bound.
+    let reader_scratch = layer_bytes.checked_mul(config.world).and_then(|bytes| bytes.checked_mul(16))
+        .context("FP8 reader scratch overflow")?.div_ceil(tensors.shape().experts);
+    let host_staging = layer_bytes.checked_mul(2).and_then(|bytes| bytes.checked_add(reader_scratch))
+        .context("FP8 host staging overflow")?;
+    let peak = spark_admission_budget(config, resident, 0, host_staging, 0, workspace)?;
+    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    let actual_budget = worker_available(library)?.saturating_sub(host_staging)
+        .saturating_sub(peak.serve_peak.saturating_sub(resident));
+    let budget = budget.min(actual_budget);
     let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), layers,
         config.world, config.rank, config.capacity as usize, budget)?;
     if let Some(bf16) = bf16 {
@@ -219,6 +232,11 @@ pub(super) fn load_exl3<'a>(
     tracing::info!(rank=config.rank, world=config.world, first_layer=config.first_layer,
         layer_count=plans.len(), resident_bytes=resident, workspace_bytes=workspace,
         device_budget_bytes=config.device_budget, "EXL3 Spark residency plan");
+    let staging = plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0);
+    let pinned = plans.iter().map(|p| p.pinned_host_bytes).max().unwrap_or(0);
+    let scratch = plans.iter().map(|p| p.read_scratch_bytes).max().unwrap_or(0);
+    let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
+    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     let mut weights = Vec::with_capacity(plans.len());
     let mut remaining = config.device_budget;
     for (index, plan) in plans.iter().enumerate() {

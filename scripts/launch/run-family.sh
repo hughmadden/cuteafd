@@ -854,12 +854,17 @@ if [[ -n "$device_map" ]]; then
   device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
   device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
-# GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts, through
-# SparkNest's nest when it is installed, otherwise over ssh (passwordless sudo on each host).
+# SparkNest cache management stays available when installed. Without it the
+# workers advise their checkpoint pages after loading; global sudo cache drops
+# are an explicit operator opt-in, never required infrastructure.
 spark_hosts=()
 spark_host_names=()
 for ((rank = 0; rank < ranks; rank++)); do
   spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")")
+  if [[ "${CUTEAFD_GLOBAL_PAGE_CACHE_DROP:-0}" != 1 ]]; then
+    echo "SparkNest absent: workers use checkpoint fadvise(DONTNEED); no global cache drop."
+    return 0
+  fi
   spark_host_names+=("$(get "SPARK_${rank}_HOST")")
 done
 drop_spark_caches() {
