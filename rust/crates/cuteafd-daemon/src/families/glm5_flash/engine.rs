@@ -1417,6 +1417,38 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
     counts
 }
 
+/// A Spark wave of `layer`: `rows` rows of E4M3 input with a UE8M0 scale per 32 values
+/// (`hidden + hidden / 32` bytes each) and `topk` routes per row, answered with compact BF16
+/// partials. Serving waves (`spark_dispatch`) and the start-up warm-up ([`spark_warmup_request`])
+/// both take this format.
+fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: Vec<u8>, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
+    let topk = topk as u32;
+    let mut request = ExpertProtocolV2Request::new(layer as u64 + 1, 17, layer as u32, hidden as u32,
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk, route_count: topk,
+        }).collect(),
+        routes, wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+/// The wave that warms a Spark transport at start-up (as GLM-5, MiMo and DeepSeek V4 warm theirs):
+/// `rows` zero rows of prefill at the first MoE layer, every gate zero and the experts in turn. Each
+/// rank's session sizes its rings for the request that opens it, and the transport drops and
+/// reconnects a rank whose rings a later request outgrows, so a transport warmed with the most rows
+/// any of its waves carries never reconnects while serving.
+pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize) -> Result<ExpertProtocolV2Request> {
+    let layer = (0..cfg.layers).find(|&layer| !cfg.dense[layer]).context("no MoE layer to warm the Spark transports")?;
+    let (h, topk) = (cfg.hidden, cfg.topk);
+    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
+        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
+    }).collect();
+    spark_request(h, topk, layer, rows, routes, vec![0; rows * (h + h / 32)], ExpertV2SourceKind::Prefill)
+}
+
 impl<'a> GlmfEngine<'a> {
     /// `index_cache`: the DSA index cache (`compact` needs at least one MLA layer to matter;
     /// without one there is no index cache, and the engine records `keys`).
@@ -3547,14 +3579,7 @@ impl<'a> GlmfEngine<'a> {
         }).collect();
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
         drop(staging);
-        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire)?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let request = spark_request(h, topk, index, t, routes, wire, kind)?;
         if self.split_audit && !decode && t >= 256 {
             let counts = audit_route_counts(&request.routes);
             tracing::info!(layer = index, rows = t, distinct = counts.len(),
@@ -4453,5 +4478,113 @@ mod replay_record_tests {
         assert_eq!(replay_bytes(64, 3 * 64 * 128), 9_453_568);
         assert_eq!(34 * replay_bytes(64, 3 * 64 * 128), 321_421_312);
         assert!(34 * replay_bytes(64, 3 * 64 * 128) < 782_236_672);
+    }
+}
+
+#[cfg(test)]
+mod spark_warmup_tests {
+    use super::{prefill_lane_capacity, prefill_lane_plan, prefill_workspace_count, spark_request, spark_warmup_request,
+        DECODE_ROWS, MAX_PREFILL_LANES};
+    use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
+    use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
+        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
+    use std::collections::BTreeSet;
+
+    /// GLM 5.3 Flash: 45 layers (0-2 dense), 288 routed experts, top-8, hidden 4096.
+    fn glm53_flash() -> GlmNextConfig {
+        GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
+            attention: (0..45).map(|i| if i % 4 == 3 { GlmNextAttention::Mla } else { GlmNextAttention::Kda }).collect(),
+            dense: (0..45).map(|i| i < 3).collect(), dense_intermediate: 12288, experts: 288, topk: 8,
+            moe_intermediate: 2048, routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4,
+            kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256,
+            v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] }
+    }
+
+    /// The answer bytes a rank's session reserves for `request` (the transport's
+    /// `verbs_host_expected_response_wire_bytes` without a reduced-precision answer): the header,
+    /// then a row index and a partial row at least BF16-wide per row.
+    fn response_bytes(request: &ExpertProtocolV2Request) -> usize {
+        let header = &request.header;
+        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + header.row_count as usize
+            * (4 + (header.hidden_row_stride_bytes as usize).max(2 * header.hidden_dim as usize))
+    }
+
+    /// A serving wave of `t` rows at the first MoE layer, as `spark_dispatch` builds one.
+    fn wave(cfg: &GlmNextConfig, t: usize, kind: ExpertV2SourceKind) -> ExpertProtocolV2Request {
+        let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / cfg.topk) as u32,
+            expert_id: (7 * i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
+        spark_request(cfg.hidden, cfg.topk, 3, t, routes, vec![0x38; t * (cfg.hidden + cfg.hidden / 32)], kind).unwrap()
+    }
+
+    /// The warm-up is a full lane of prefill in the serving format: 4,096 zero rows at the first MoE
+    /// layer (3), every gate zero, all 288 experts routed, eight distinct a row. Each rank's session
+    /// then keeps 17,858,656 request and 33,570,912 answer bytes a slot: at the transport's default
+    /// eight 4 KiB-aligned slots, 411,500,544 B of rings, what the coordinator's `transport/rdma-rings`
+    /// ledger held per session once a 4,096-row lane had opened it (3,292,004,352 B for two lanes of
+    /// four ranks).
+    #[test]
+    fn the_warmup_is_a_full_lane_of_zero_gates_in_the_serving_format() {
+        let cfg = glm53_flash();
+        let warm = spark_warmup_request(&cfg, 4096).unwrap();
+        let serving = wave(&cfg, 4096, ExpertV2SourceKind::Prefill);
+        assert_eq!((&warm.header, &warm.rows), (&serving.header, &serving.rows));
+        assert_eq!((warm.header.layer_id, warm.header.row_count, warm.header.hidden_dtype, warm.header.flags),
+            (3, 4096, ExpertV2Dtype::Fp8E4m3Ue8m0K32, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16));
+        assert!(warm.rows.iter().all(|row| row.source_kind == ExpertV2SourceKind::Prefill));
+        assert!(warm.routes.iter().all(|route| route.gate_weight == 0.0));
+        assert!(warm.routes.chunks(8).enumerate().all(|(row, routes)| routes.iter().all(|r| r.row_index == row as u32)
+            && routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>().len() == 8));
+        assert_eq!(warm.routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>(), (0..288).collect());
+        assert!(warm.hidden_payload.len() == 4096 * (4096 + 128) && warm.hidden_payload.iter().all(|&b| b == 0));
+        let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
+        assert_eq!((request, answer), (17_858_656, 33_570_912));
+        assert_eq!(8 * (request.next_multiple_of(4096) + answer.next_multiple_of(4096)), 411_500_544);
+    }
+
+    /// No wave of a warmed transport is larger than its warm-up: decode and verify steps and prefill
+    /// lanes or serial chunks of up to the warmed rows fit the slots it opened, so `post` never drops
+    /// and reconnects a warmed rank while serving.
+    #[test]
+    fn no_wave_outgrows_a_warmed_session() {
+        let cfg = glm53_flash();
+        for rows in [2048, 4096] {
+            let warm = spark_warmup_request(&cfg, rows).unwrap();
+            let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
+            for t in [1, 2, DECODE_ROWS - 1, DECODE_ROWS, 128, 1023, 1024, 2048, 2072, 2109, 2176, 4095, 4096]
+                .into_iter().filter(|&t| t <= rows) {
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                    let serving = wave(&cfg, t, kind);
+                    assert!(serving.wire_stats().wire_bytes <= request && response_bytes(&serving) <= answer,
+                        "{t} rows of {kind:?} after a {rows}-row warm-up");
+                }
+            }
+            let largest = wave(&cfg, rows, ExpertV2SourceKind::Prefill);
+            assert_eq!((largest.wire_stats().wire_bytes, response_bytes(&largest)), (request, answer));
+        }
+    }
+
+    /// Start-up warms each transport a prefill runs on (`configured_prefill_lanes`, which agrees with
+    /// `GlmfEngine::pipelined`): every lane's while lanes run (1 to 4), else transport 0, which also
+    /// carries decode, verify and serial chunks. No chunk the engine takes uses another transport or
+    /// puts more rows on one than the warm-up sent.
+    #[test]
+    fn the_warmup_covers_every_transport_a_prefill_uses() {
+        let rows = 4096;
+        for lanes in 1..=MAX_PREFILL_LANES {
+            for (setting, complete) in [(None, true), (Some("1"), true), (None, false), (Some("subset"), false),
+                (Some("subset"), true)] {
+                let warmed = prefill_workspace_count(true, complete, setting, lanes);
+                // `lane_setting`: lanes run unless set to 1, over every layer or a subset with `subset`.
+                let pipelined = setting != Some("1") && (complete || setting == Some("subset"));
+                assert_eq!(warmed, if pipelined { lanes } else { 1 }, "{lanes} lanes, {setting:?}, {complete}");
+                let capacity = if pipelined { prefill_lane_capacity(lanes, rows) } else { rows };
+                for tokens in (1..=capacity).step_by(61).chain([capacity]) {
+                    let (used, per_lane) = if pipelined { prefill_lane_plan(tokens, lanes, rows).unwrap() }
+                        else { (1, tokens) };
+                    assert!(used <= warmed && per_lane <= rows, "{tokens} tokens, {lanes} lanes, {setting:?}");
+                }
+            }
+        }
     }
 }

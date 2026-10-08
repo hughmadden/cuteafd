@@ -656,6 +656,17 @@ mod draft_cli_tests {
                 "--prefill-lanes", lanes]).is_err());
         }
     }
+
+    /// Only Spark experts have transports to warm at start-up: `experts` returns skipped and local
+    /// experts before any transport exists, and `--local-experts` cannot be given with `--peers`.
+    #[test]
+    fn only_spark_experts_have_transports_to_warm() {
+        assert!(parse(&["--local-experts"]).peers.is_none());
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--local-experts", "--peers", "127.0.0.1:19441"]).is_err());
+        let spark = parse(&SPARKS);
+        assert_eq!((spark.peers.as_deref(), spark.local_experts, spark.prefill_rows), (Some(SPARKS[1]), false, 4096));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1415,12 +1426,39 @@ impl Opened {
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
-        let transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
+        let mut transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
             &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        // Connect every rank and register full-size buffers now, as GLM-5, MiMo and DeepSeek V4 do: a
+        // rank's session fits the request that opened it, and a request that does not fit reconnects
+        // the rank first (`LocalTp4Client::post`). A lane's rows follow the prompt, so each new longest
+        // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
+        // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
+        // is warmed with `prefill_rows` rows, the most any of its waves carries.
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
+        let warm = engine::spark_warmup_request(&self.cfg, args.prefill_rows)?;
+        let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
+            .get("transport/rdma-rings").copied().unwrap_or(0);
+        let (started, before) = (Instant::now(), rings());
+        let warm_stream = self.library.cuda_stream_create()?;
+        for (index, transport) in transports[..warmed].iter_mut().enumerate() {
+            runtime.block_on(async {
+                let wave = transport.dispatch(&warm)?;
+                transport.receive(wave, args.prefill_rows, warm_stream).await
+            }).with_context(|| format!("warming Spark expert transport {index} with {} rows", args.prefill_rows))?;
+        }
+        // SAFETY: the stream was created above; its waits drain before it goes.
+        unsafe {
+            self.library.cuda_stream_synchronize(warm_stream)?;
+            self.library.cuda_stream_destroy(warm_stream)?;
+        }
+        tracing::info!(transports = warmed, lanes = transports.len(), ranks = peers.len(), rows = args.prefill_rows,
+            ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
+            "Spark expert transports warm");
         Ok(Some(engine::Experts::Spark { transports: std::cell::RefCell::new(transports), runtime }))
     }
 }
