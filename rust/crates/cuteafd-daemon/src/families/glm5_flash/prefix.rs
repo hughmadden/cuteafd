@@ -881,7 +881,7 @@ mod tests {
         use cuteafd_loader::families::glm5_flash::GlmNextAttention;
         let kda = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Kda).count();
         let mla = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Mla).count();
-        let (state, conv, _) = super::super::engine::kda_layer_bytes(cfg, cfg.kda_heads / ranks, state);
+        let (state, conv, _) = super::super::engine::kda_layer_bytes(cfg, cfg.kda_heads / ranks, state, super::super::engine::DECODE_ROWS);
         let tails = if index == super::IndexCache::Compact { mla * super::super::engine::TAIL_BYTES } else { 0 };
         let parts = vec![kda * (state + conv) + tails; ranks];
         let mark = parts.iter().sum();
