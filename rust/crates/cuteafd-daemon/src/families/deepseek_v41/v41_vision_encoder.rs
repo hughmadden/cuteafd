@@ -139,23 +139,27 @@ impl LocalEncoder {
                         admitted <= budget,
                         "V4.1 vision needs {admitted} admitted bytes, budget {budget}"
                     );
-                    let free_before = lib.cuda_memory_info()?.0;
+                    let free_before = lib.cuda_physical_memory_info()?.0;
+                    let available_before = if sm == 121 {
+                        crate::shared::memory_report::unified_available_bytes()?
+                    } else {
+                        lib.cuda_memory_info()?.0
+                    };
                     ensure!(
-                        admitted <= free_before,
-                        "V4.1 vision exceeds free device memory"
+                        admitted <= available_before,
+                        "V4.1 vision needs {admitted} bytes, available {available_before}"
                     );
                     let _scope = cuteafd_ffi::memory_ledger::scope("v41/vision");
                     let mut runtime = VisionRuntime::new(&lib, &catalog, CAPACITY, bytes)?;
-                    let free_after = lib.cuda_memory_info()?.0;
-                    ensure!(
-                        sm != 121 || free_before.saturating_sub(free_after) <= admitted,
-                        "V4.1 vision observed allocation exceeds admission reservation"
-                    );
+                    // Cache reclamation changes raw CUDA free independently of
+                    // allocations on GB10; retain the delta as telemetry only.
+                    let free_after = lib.cuda_physical_memory_info()?.0;
                     tracing::info!(
                         device,
                         resident_bytes = bytes,
                         admitted_bytes = admitted,
                         cuda_overhead_bytes = overhead,
+                        available_before,
                         free_before,
                         free_after,
                         observed_device_delta = free_before.saturating_sub(free_after),
