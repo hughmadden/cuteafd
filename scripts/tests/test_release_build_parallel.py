@@ -188,7 +188,7 @@ def test_split_state_and_tail_wiring():
     invocation = text.index("\nrelease_build_legs\n")
     assert invocation < text.index('echo "== exporting release binaries =="')
     assert invocation < text.index('echo "== distributing fresh Spark inference image =="')
-    assert text.index('release_dev_reuse_manifest="$release_leg_log_dir/DEV_IMAGE_REUSE.json"') < text.index('build_coordinator_release() (')
+    assert text.index('release_dev_reuse_manifest="$release_leg_log_dir/coordinator-dev-image.json"') < text.index('build_coordinator_release() (')
     assert 'build_coordinator_release() (' in text and 'build_spark_release() (' in text
     assert 'setsid --wait bash -s --' in text
     assert 'trap cleanup_spark_phase EXIT' in text
