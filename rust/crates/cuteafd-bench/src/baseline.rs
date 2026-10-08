@@ -1,12 +1,14 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
-//! with thinking off; 8K prefill rate and TTFT) and quick quality (logit
+//! with thinking off; C8 code aggregate tok/s; 8K prefill rate and TTFT) and quick quality (logit
 //! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
+//! The warmed C8 batch adds about 20-30 seconds, clamped to server admission.
 use crate::client::{Chat, Client};
-use crate::panels::{Progress, Rates};
+use crate::panels::{common, speed, Progress, Rates};
 use crate::report::{
-    now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ContentRate, PrefillRate, Quality, ServerInfo, StreamTiming,
+    now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ConcurrentRate, ConcurrentTiming, ContentRate,
+    PrefillRate, Quality, ServerInfo, StreamTiming,
 };
 use crate::text::{filler, nonce};
 use anyhow::{Context, Result};
@@ -38,7 +40,7 @@ fn plain(text: &str, max_tokens: u64) -> Value {
 }
 
 /// Expected seconds of the whole baseline at `rates`.
-pub fn estimate_s(rates: &Rates) -> f64 {
+pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
@@ -46,7 +48,27 @@ pub fn estimate_s(rates: &Rates) -> f64 {
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
-    decode + prefill + fidelity + cache + spec + template + c4 + 4.0
+    decode + concurrent_estimate_s(rates, info) + prefill + fidelity + cache + spec + template + c4 + 4.0
+}
+
+fn concurrent_width(info: &ServerInfo) -> usize {
+    common::concurrency(info).min(8)
+}
+
+fn concurrent_estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
+    let width = concurrent_width(info) as f64;
+    if width == 0.0 { return 0.0; }
+    // Warm-up and timed wave; the sweep's estimate models the same batching cost.
+    2.0 * rates.seconds(120.0 * width, DECODE_TOKENS as f64) * (1.0 + 0.08 * width)
+}
+
+fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64) -> ConcurrentRate {
+    let mut per: Vec<_> = results.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
+    let first = results.iter().map(common::Timed::first).fold(f64::INFINITY, f64::min);
+    let last = results.iter().map(common::Timed::last).fold(0.0, f64::max);
+    ConcurrentRate { width: results.len(), aggregate_tok_s: common::aggregate(&results),
+        per_stream_median_tok_s: common::median(&mut per), decode_s: (last - first).max(0.0), warmup_s,
+        runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect() }
 }
 
 struct Run<'a> {
@@ -133,15 +155,29 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
     // C1 decode per content type.
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
-        run.step(0.04 + 0.1 * i as f64, &format!("C1 decode · {content}"));
+        run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
         let chat = client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
         run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
             runs: vec![chat.timing], acceptance: None });
         run.publish();
     }
+    // C8 code: never enqueue more than the server admits, and keep warm-up untimed.
+    let width = concurrent_width(info);
+    anyhow::ensure!(width > 0, "server admits no concurrent sequences");
+    run.step(0.28, &format!("C{width} code warm-up"));
+    let warmup = Instant::now();
+    speed::code_batch(client, width, DECODE_TOKENS).into_iter().collect::<Result<Vec<_>>>()
+        .with_context(|| format!("C{width} code warm-up"))?;
+    let warmup_s = warmup.elapsed().as_secs_f64();
+    client.check()?;
+    run.step(0.34, &format!("C{width} code aggregate"));
+    let batch = speed::code_batch(client, width, DECODE_TOKENS).into_iter().collect::<Result<Vec<_>>>()
+        .with_context(|| format!("C{width} code decode"))?;
+    run.baseline.card.concurrent = Some(concurrent_rate(batch, warmup_s));
+    run.publish();
     // 8K prefill: a cold prompt sized from the fit.
-    run.step(0.34, "8K prefill");
+    run.step(0.40, "8K prefill");
     let (slope, intercept) = match fit.as_slice() {
         [(w0, t0), (w1, t1)] if w1 > w0 && t1 > t0 => ((t1 - t0) / (w1 - w0), t0 - (t1 - t0) / (w1 - w0) * w0),
         _ => (1.3, 20.0),
@@ -168,11 +204,11 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         ttft_s: t.ttft_s, runs: vec![t] });
     run.publish();
     // Quick quality.
-    run.step(0.45, "logit fidelity");
+    run.step(0.50, "logit fidelity");
     run.check("fidelity", "Logit fidelity", fidelity);
-    run.step(0.58, "prefix-cache restore");
+    run.step(0.62, "prefix-cache restore");
     run.check("cache_exact", "Prefix-cache restore", cache_exact);
-    run.step(0.70, "lossless speculation");
+    run.step(0.74, "lossless speculation");
     run.check("spec_lossless", "Speculation lossless", spec_lossless);
     run.step(0.82, "chat-template round trip");
     run.check("template", "Template round trip", template);
@@ -193,7 +229,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         return Ok(());
     }
     let scored = crate::panels::fidelity::score(run.client, run.info, "quick", "decode", run.progress,
-        0.45, 0.12, run.max_context)?;
+        0.50, 0.11, run.max_context)?;
     let verdict = crate::fidelity::verdict(&scored);
     let f = &verdict.generated;
     check.set("kl", f.kl); check.set("top1", f.top1); check.set("nll", f.nll);
@@ -703,6 +739,55 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn concurrent_width_never_exceeds_server_admission() {
+        use crate::report::Setting;
+        let mut info = ServerInfo::default();
+        assert_eq!(concurrent_width(&info), 8);
+        for name in ["concurrency", "max-sequences"] {
+            for (limit, width) in [(0, 0), (1, 1), (4, 4), (6, 6), (8, 8), (16, 8)] {
+                info.configuration.settings = vec![Setting { name: name.into(), value: Some(limit.to_string()),
+                    ..Setting::default() }];
+                assert_eq!(concurrent_width(&info), width);
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_includes_warm_and_timed_concurrent_batches() {
+        use crate::report::Setting;
+        let rates = Rates { decode_tok_s: 50.0, prefill_tok_s: 1500.0, measured: true };
+        let mut info = ServerInfo::default();
+        let c8 = estimate_s(&rates, &info);
+        let expected = 2.0 * rates.seconds(8.0 * 120.0, DECODE_TOKENS as f64) * 1.64;
+        assert!((20.0..30.0).contains(&expected));
+        assert!((concurrent_estimate_s(&rates, &info) - expected).abs() < 1e-9);
+        info.configuration.settings = vec![Setting { name: "concurrency".into(), value: Some("0".into()),
+            ..Setting::default() }];
+        assert!((c8 - estimate_s(&rates, &info) - expected).abs() < 1e-9);
+        info.configuration.settings[0].value = Some("4".into());
+        assert!(concurrent_estimate_s(&rates, &info) < expected);
+    }
+
+    #[test]
+    fn concurrent_rate_matches_sweep_and_preserves_batch_clock() {
+        let timed = |sent, ttft_s, decode_s, completion_tokens| common::Timed { sent,
+            chat: Chat { timing: StreamTiming { ttft_s, decode_s, completion_tokens,
+                ..StreamTiming::default() }, ..Chat::default() } };
+        let results = vec![timed(0.0, 1.0, 4.0, 321), timed(0.5, 1.5, 2.0, 161)];
+        let expected = common::aggregate(&results);
+        let rate = concurrent_rate(results, 9.0);
+        assert_eq!(rate.width, 2);
+        assert_eq!(rate.aggregate_tok_s, expected);
+        // 320 + 160 emitted decode tokens over [1, 5], not a sum of stream rates.
+        assert_eq!(rate.aggregate_tok_s, 120.0);
+        assert_eq!(rate.per_stream_median_tok_s, 80.0);
+        assert_eq!(rate.decode_s, 4.0);
+        assert_eq!(rate.warmup_s, 9.0);
+        assert_eq!(rate.runs[1].sent_s, 0.5);
+        assert_eq!(rate.runs[1].timing.completion_tokens, 161);
+    }
 
     #[test]
     fn row_noise_compares_the_shared_top_token_over_the_identical_prefix() {

@@ -33,6 +33,13 @@ pub const CONTENT: [(&str, &str); 8] = [
 
 const DECODE_TOKENS: u64 = 256;
 
+/// Distinct code prompts per stream, shared by the sweep and basic card.
+pub(crate) fn code_batch(client: &crate::client::Client, width: usize, tokens: u64)
+    -> Vec<Result<common::Timed>> {
+    let bodies = (0..width).map(|_| plain(&format!("[{}] {}", nonce(), CONTENT[0].1), tokens)).collect();
+    wave(client, bodies)
+}
+
 pub struct DecodeContent;
 pub struct Concurrency;
 pub struct Prefill;
@@ -88,7 +95,7 @@ impl Panel for Concurrency {
          prompts, thinking off."
     }
     fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
-        Self::levels(info).iter().map(|&c| rates.seconds(120.0 * c as f64, 192.0) * (1.0 + 0.08 * c as f64)).sum()
+        Self::levels(info).iter().map(|&c| 2.0 * rates.seconds(120.0 * c as f64, 192.0) * (1.0 + 0.08 * c as f64)).sum()
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let levels = Self::levels(ctx.info);
@@ -96,9 +103,12 @@ impl Panel for Concurrency {
         for (i, &c) in levels.iter().enumerate() {
             ctx.progress.step(i as f64 / levels.len() as f64, format!("C{c}"));
             ctx.client.check()?;
-            let bodies = (0..c).map(|k| plain(&format!("[{}] {}", nonce(), CONTENT[k % 2 * 6].1), 192)).collect();
+            // Prime each width before measuring: graphs, workspaces and mapped tables.
+            code_batch(ctx.client, c, 192).into_iter().collect::<Result<Vec<_>>>()
+                .with_context(|| format!("C{c} warm-up"))?;
+            ctx.client.check()?;
             let table_before = common::mapped_counters(ctx.client);
-            let results = wave(ctx.client, bodies);
+            let results = code_batch(ctx.client, c, 192);
             let errors = results.iter().filter(|r| r.is_err()).count();
             let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
             let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();

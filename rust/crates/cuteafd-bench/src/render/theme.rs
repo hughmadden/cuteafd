@@ -18,6 +18,8 @@ pub struct Theme {
     pub bad: &'static str,
     /// Series colors in order (content types, configurations, ...).
     pub series: [&'static str; 8],
+    /// Concurrent code headline, distinct from the C1 content bars and prefill.
+    pub concurrent: &'static str,
     /// The two ends of the brand gradient (RTX blue, Spark violet).
     pub accent: (&'static str, &'static str),
 }
@@ -37,6 +39,7 @@ pub const NORMAL: Theme = Theme {
     warn: "#ffb547",
     bad: "#ff5d73",
     series: ["#4cc3ff", "#2ee6a6", "#ffb547", "#a27bff", "#ff5d73", "#c08bff", "#7ee0ff", "#f5d76e"],
+    concurrent: "#d66086",
     accent: ("#4cc3ff", "#c08bff"),
 };
 
@@ -55,6 +58,7 @@ pub const SCARY: Theme = Theme {
     warn: "#ffb020",
     bad: "#ff3b4e",
     series: ["#ff3b4e", "#ffb020", "#ff7a2f", "#ffd166", "#e0365a", "#ff9f6e", "#ff5d73", "#f5a524"],
+    concurrent: "#d66086",
     accent: ("#ff3b4e", "#ffb020"),
 };
 

@@ -193,21 +193,24 @@ pub fn results(placed: &[Placed]) -> String {
             card(cells[0]), card(cells[1])));
     }
     out.push_str("</table>\n\n");
-    out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
-    out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+    out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | Concurrent code (aggregate) | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
+    out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
     for (family, name, class, p) in &rows {
         let r = &p.report;
         let b = r.baseline.as_ref().expect("filtered");
         let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
+        let concurrent = b.card.concurrent.as_ref().map_or("—".into(),
+            |c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s)));
         let (prefill, ttft) = b.card.prefill.as_ref()
             .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
         let hardware = format!("{} ({})", short_hardware(r), if *class == 0 { "min" } else { "max" });
-        out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {} | {} | {prefill} | {ttft} | {} | \
+        out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
             [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
             decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
             link(&p.dir, "report.svg")));
     }
-    out.push_str("\ntok/s; C1 decode with thinking off, 8K prefill cold. Quality: logit fidelity against the family golden \
+    out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (up to C8, clamped to server admission), \
+        8K prefill cold. Quality: logit fidelity against the family golden \
         reference, prefix-cache restore exactness, lossless speculation.\n");
     out
 }

@@ -375,7 +375,18 @@ function tableFor(id, comparedResult = null) {
       const r = d.runs[0] || {};
       return [`C1 decode · ${d.content}`, d.tok_s, r.completion_tokens, r.ttft_s * 1000, r.decode_s];
     });
+    if (b.card.concurrent) {
+      const c = b.card.concurrent;
+      const tokens = c.runs.reduce((n, r) => n + (r.timing.completion_tokens || 0), 0);
+      const codeRow = b.card.decode.findIndex((d) => d.content === 'code');
+      rows.splice(codeRow + 1, 0, [`C${c.width} code, aggregate`, c.aggregate_tok_s, tokens, '', c.decode_s]);
+    }
     if (b.card.prefill) { const p = b.card.prefill; rows.push(['8K prefill', p.tok_s, p.prompt_tokens, p.ttft_s * 1000, '']); }
+    const concurrent = b.card.concurrent;
+    const streams = concurrent ? tableHtml(['stream', 'tok/s', 'tokens', 'sent s', 'TTFT ms', 'decode s'],
+      concurrent.runs.map((r, i) => [i + 1, r.timing.decode_s > 0 ? Math.max(0, r.timing.completion_tokens - 1) / r.timing.decode_s : 0,
+        r.timing.completion_tokens, r.sent_s, r.timing.ttft_s * 1000, r.timing.decode_s]))
+      + `<p class="note">C${concurrent.width} per-stream median ${fmt.n1(concurrent.per_stream_median_tok_s)} tok/s · untimed warm-up ${secs(concurrent.warmup_s)}</p>` : '';
     const checks = b.quality.checks.map((c) => [c.title, c.status, c.summary, c.seconds]);
     const cap = b.card.capacity || {};
     const capRows = [['KV pool', cap.kv_tokens != null ? `${fmt.n0(cap.kv_tokens)} tokens${cap.kv_pages != null ? ` · ${fmt.n0(cap.kv_pages)} pages` : ''}` : '—'],
@@ -383,7 +394,7 @@ function tableFor(id, comparedResult = null) {
       ['max context / output', `${cap.max_context ?? '—'} / ${cap.max_output ?? '—'}`],
       ['host prefix cache', cap.host_cache_bytes != null ? (cap.host_cache_bytes ? fmt.bytes(cap.host_cache_bytes) : 'off') : '—']];
     return tableHtml(['capacity', ''], capRows) + tableHtml(['measurement', 'tok/s', 'tokens', 'TTFT ms', 'decode s'], rows)
-      + tableHtml(['check', 'status', 'result', 'seconds'], checks);
+      + streams + tableHtml(['check', 'status', 'result', 'seconds'], checks);
   }
   if (id === 'hardware') {
     const hw = report.server.hardware;
