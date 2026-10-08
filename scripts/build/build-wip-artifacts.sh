@@ -91,6 +91,12 @@ if [[ "$xgrammar" == ON ]]; then
 fi
 
 mkdir -p "$build_dir" "$output_dir"
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_EXTENSIONS_DIR="$build_dir/cache/torch-extensions"
+export XDG_CACHE_HOME="$build_dir/cache/xdg"
+export B12X_ROCE_CACHE_DIR="$build_dir/cache/roce"
+export TRITON_CACHE_DIR="$build_dir/cache/triton"
+mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
 export PYO3_PYTHON=python3
 export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/cuteafd_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export CARGO_TARGET_DIR="$build_dir/cargo-target"

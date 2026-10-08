@@ -176,7 +176,10 @@ def test_build_metadata_does_not_pin_retired_b12x_package() -> None:
 
 
 def test_images_validate_the_pinned_b12x_import_namespace() -> None:
-    for relative in ("docker/Dockerfile.dev", "docker/Dockerfile.release"):
+    dev = (ROOT / "docker/Dockerfile.dev").read_text()
+    assert "COPY third_party/sparkinfer" not in dev
+    assert "io.cuteafd.sparkinfer.revision" not in dev
+    for relative in ("docker/Dockerfile.release",):
         text = (ROOT / relative).read_text(encoding="utf-8")
         assert "pathlib, b12x" in text
         assert 'importlib.metadata.version("b12x")' in text
@@ -218,6 +221,8 @@ def test_metadata_free_release_copies_filter_and_reject_python_caches() -> None:
     for relative in ("docker/Dockerfile.dev", "docker/Dockerfile.release"):
         text = (ROOT / relative).read_text(encoding="utf-8")
         assert "ENV PYTHONDONTWRITEBYTECODE=1" in text
+        if relative.endswith(".dev"):
+            continue
         assert "--require-no-python-cache" in text, (
             f"{relative} must reject cached Python artifacts after COPY"
         )

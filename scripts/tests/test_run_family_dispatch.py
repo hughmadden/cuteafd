@@ -144,7 +144,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
-                                     'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh" ;; esac\n'
+                                     'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
+                                     'if [[ "$2" == *verify-sparkinfer-source.py ]]; then printf "print(42)\\n" > "$dst/verify-sparkinfer-source.py"; fi ;; esac\n'
                                      if tool == "docker" and wip else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None and encoder_plan is None else '') +

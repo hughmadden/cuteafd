@@ -13,7 +13,7 @@ HELPER = ROOT / "scripts/build/compiler-cache.sh"
 
 def run_setup(tmp_path, extra=None, expression='env | sort'):
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("CUTEAFD_KACHE", "KACHE_")) and key not in
+           if not key.startswith(("CUTEAFD_KACHE", "KACHE_", "CUTEAFD_SCCACHE", "SCCACHE_")) and key not in
            ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX",
             "CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_CUDA_COMPILER_LAUNCHER")}
     env.update(extra or {})
@@ -77,8 +77,9 @@ def test_native_launchers_and_wrapper_fallback(tmp_path):
     assert result.stderr.count("warning:") == 1
     assert f"CC={shim_directory(tmp_path)}/cc" in result.stdout
     assert f"CXX={shim_directory(tmp_path)}/c++" in result.stdout
-    for language in ("C", "CXX", "CUDA"):
+    for language in ("C", "CXX"):
         assert f"CMAKE_{language}_COMPILER_LAUNCHER={HELPER}" in result.stdout
+    assert "CMAKE_CUDA_COMPILER_LAUNCHER=" not in result.stdout
     assert "CUTEAFD_KACHE_MODE=enabled" in result.stdout
     assert not (tmp_path / "cache/target").exists()
 
@@ -224,8 +225,7 @@ def test_cmake_opt_out_clears_persisted_cache_launcher(tmp_path):
     result = subprocess.run(["bash", "-c", f'source "{HELPER}"; unset CUTEAFD_KACHE_MODE; '
                              'cuteafd_compiler_cache_cmake_args "$1"', "test", str(native)],
                             text=True, capture_output=True, check=True)
-    assert result.stdout.splitlines() == [f"-DCMAKE_{language}_COMPILER_LAUNCHER="
-                                         for language in ("C", "CXX", "CUDA")]
+    assert result.stdout.splitlines() == ["-DCMAKE_C_COMPILER_LAUNCHER="]
 
 
 @pytest.mark.parametrize("cached,current", [
@@ -347,3 +347,44 @@ def test_docker_unset_is_noop(tmp_path):
     result = subprocess.run(["bash", "-c", f'source "{HELPER}"; cuteafd_compiler_cache_docker_args'],
                             env=env, text=True, capture_output=True, check=True)
     assert result.stdout == result.stderr == ""
+
+
+@pytest.mark.parametrize("kache", [False, True])
+def test_sccache_selects_only_cuda(tmp_path, kache):
+    binary = tmp_path / "sccache"
+    binary.write_text('#!/bin/sh\nexit 0\n')
+    binary.chmod(0o755)
+    extra = {"CUTEAFD_SCCACHE_CUDA": "1", "SCCACHE_DIR": str(tmp_path / "cuda-cache"),
+             "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    if kache:
+        extra.update(CUTEAFD_KACHE=fake_kache(tmp_path), CUTEAFD_KACHE_CACHE_DIR=str(tmp_path / "cache"))
+    result = run_setup(tmp_path, extra, 'cuteafd_compiler_cache_cmake_args "$1/native"; env | sort')
+    assert f"CMAKE_CUDA_COMPILER_LAUNCHER={binary}" in result.stdout
+    assert f"-DCMAKE_CUDA_COMPILER_LAUNCHER={binary}" in result.stdout
+    assert (f"RUSTC_WRAPPER={HELPER}" in result.stdout) == kache
+    assert (f"CMAKE_C_COMPILER_LAUNCHER={HELPER}" in result.stdout) == kache
+    assert result.stderr == ""
+
+
+def test_image_cache_tools_need_no_host_binary(tmp_path):
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": "1", "CUTEAFD_SCCACHE_CUDA": "1",
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "kache-cache"),
+                                "CUTEAFD_SCCACHE_CACHE_DIR": str(tmp_path / "sccache-cache")},
+                       'cuteafd_compiler_cache_docker_args')
+    assert "dst=/opt/cuteafd-kache,readonly" not in result.stdout
+    assert "dst=/opt/cuteafd-kache-cache" in result.stdout
+    assert "dst=/opt/cuteafd-sccache-cache" in result.stdout
+    assert "CUTEAFD_SCCACHE_CUDA=1" in result.stdout
+
+
+@pytest.mark.parametrize("language", ["C", "CXX", "CUDA"])
+def test_managed_cache_preserves_other_launchers(tmp_path, language):
+    binary = tmp_path / "sccache"
+    binary.write_text('#!/bin/sh\nexit 0\n')
+    binary.chmod(0o755)
+    result = run_setup(tmp_path, {"CUTEAFD_SCCACHE_CUDA": "1", "CUTEAFD_KACHE": fake_kache(tmp_path),
+                                 "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache"),
+                                 f"CMAKE_{language}_COMPILER_LAUNCHER": "/custom/launcher",
+                                 "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+                       'cuteafd_compiler_cache_cmake_args "$1/native"')
+    assert f"-DCMAKE_{language}_COMPILER_LAUNCHER=/custom/launcher" in result.stdout

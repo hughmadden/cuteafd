@@ -123,4 +123,6 @@ def test_wip_builder_refuses_stale_dev_images_before_recreating() -> None:
     assert (ROOT / "scripts/build/build-dev-images.sh").stat().st_mode & 0o111
     checks = builder.index("\nensure_local_image\nensure_seed_image\n")
     assert checks < builder.index("if ((recreate)); then")
-    assert builder.count("release_require_dev_image_sparkinfer") == 2
+    assert builder.count("release_ensure_dev_image") == 2
+    assert "release_require_dev_image_sparkinfer" not in builder
+    assert "verify-sparkinfer-source.py" in builder

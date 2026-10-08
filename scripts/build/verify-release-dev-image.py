@@ -13,6 +13,10 @@ import signal
 import subprocess
 import sys
 import uuid
+import importlib.util
+_spec = importlib.util.spec_from_file_location('dev_toolchain', Path(__file__).with_name('dev-toolchain.py'))
+_toolchain = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_toolchain)
 
 
 class VerificationError(RuntimeError):
@@ -77,10 +81,11 @@ expected = json.loads(pathlib.Path('/expected.json').read_text())
 require(call(['rustc', '--version']).split()[1] == expected['toolchain'], 'toolchain mismatch: rustc')
 require(call(['cargo', '--version']).split()[1] == expected['toolchain'], 'toolchain mismatch: cargo')
 require('rustfmt-' in call(['rustup', 'component', 'list', '--installed']), 'toolchain mismatch: rustfmt missing')
-require(os.environ.get('CUTEAFD_SPARKINFER_COMMIT') == expected['sparkinfer_revision'], 'SparkInfer revision mismatch')
 require(hashlib.sha256(pathlib.Path('/usr/local/bin/cuteafd-entrypoint').read_bytes()).hexdigest() == expected['entrypoint_sha256'], 'entrypoint mismatch')
-require(pathlib.Path('/opt/cuteafd/third_party/sparkinfer.lock.json').read_bytes() == (s/'third_party/sparkinfer.lock.json').read_bytes(), 'SparkInfer lock mismatch')
-call(['python3', str(s/'scripts/build/verify-sparkinfer-source.py'), '--source', '/opt/cuteafd/third_party/sparkinfer', '--lock', str(s/'third_party/sparkinfer.lock.json'), '--require-no-python-cache'])
+spec = importlib.util.spec_from_file_location('verify_sparkinfer', s/'scripts/build/verify-sparkinfer-source.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+lock = json.loads((s/'third_party/sparkinfer.lock.json').read_text())
+require(m.source_tree_sha256(s/'third_party/sparkinfer') == lock['source_tree_sha256'], 'SparkInfer source-tree mismatch')
 # Worktree gitfiles refer outside the read-only mount. The host checks git identity;
 # inside the image, the same official verifier computes the mounted source digest.
 spec = importlib.util.spec_from_file_location('verify_transformers', s/'scripts/build/verify-transformers-source.py')
@@ -97,21 +102,34 @@ def verify(source, image, output):
     obj = json.loads(run(['docker', 'image', 'inspect', image]))[0]
     if obj['Id'] != image or obj['Architecture'] != 'amd64':
         raise VerificationError('coordinator dev image ID/architecture mismatch')
+    labels = obj['Config'].get('Labels') or {}
     env = dict(value.split('=', 1) for value in obj['Config']['Env'])
-    if (env.get('CUTEAFD_ROLE') != 'coordinator' or env.get('CUTEAFD_CUDA_ARCH') != '120'
-            or env.get('CUTEAFD_TARGET_PLATFORM') != 'linux/amd64'
-            or obj['Config']['Entrypoint'] != ['/usr/local/bin/cuteafd-entrypoint']):
-        raise VerificationError('coordinator dev image role/architecture/entrypoint mismatch')
-    ref, revision, dockerfile = provenance(image)
     current = (source / 'docker/Dockerfile.dev').read_bytes()
-    if dockerfile != current:
-        raise VerificationError('Dockerfile.dev hash mismatch')
     transformers = (source / 'third_party/transformers.lock.json').read_bytes()
-    historical = run(['git', '-C', str(source), 'show', f'{revision}:third_party/transformers.lock.json']).encode()
-    if historical != transformers:
-        raise VerificationError('Transformers lock mismatch against dev image build revision')
+    if labels.get('io.cuteafd.toolchain.hash'):
+        if labels['io.cuteafd.toolchain.hash'] != _toolchain.identity(source):
+            raise VerificationError('dev toolchain hash mismatch')
+        if labels.get('io.cuteafd.base.digest') != _toolchain.BASE + _toolchain.BASE_DIGESTS['amd64']:
+            raise VerificationError('dev base digest mismatch')
+        if obj['Config']['Entrypoint'] != ['/usr/local/bin/cuteafd-entrypoint']:
+            raise VerificationError('dev entrypoint mismatch')
+        ref, revision = 'toolchain-label', labels['org.opencontainers.image.revision']
+    else:
+        # Campaign si-* images retain their image-ID-bound legacy admission.
+        if (env.get('CUTEAFD_ROLE') != 'coordinator' or env.get('CUTEAFD_CUDA_ARCH') != '120'
+                or env.get('CUTEAFD_TARGET_PLATFORM') != 'linux/amd64'
+                or obj['Config']['Entrypoint'] != ['/usr/local/bin/cuteafd-entrypoint']):
+            raise VerificationError('coordinator dev image role/architecture/entrypoint mismatch')
+        ref, revision, dockerfile = provenance(image)
+        if dockerfile != current:
+            raise VerificationError('Dockerfile.dev hash mismatch')
+        historical = run(['git', '-C', str(source), 'show', f'{revision}:third_party/transformers.lock.json']).encode()
+        if historical != transformers:
+            raise VerificationError('Transformers lock mismatch against dev image build revision')
     run(['python3', str(source / 'scripts/build/verify-transformers-source.py'), '--source',
          str(source / 'third_party/transformers'), '--lock', str(source / 'third_party/transformers.lock.json')], timeout=180)
+    run(['python3', str(source / 'scripts/build/verify-sparkinfer-source.py'), '--source',
+         str(source / 'third_party/sparkinfer'), '--lock', str(source / 'third_party/sparkinfer.lock.json')], timeout=180)
     matches = re.findall(rb'^ARG RUST_TOOLCHAIN=([0-9]+\.[0-9]+\.[0-9]+)$', current, re.MULTILINE)
     if len(matches) != 1:
         raise VerificationError('Dockerfile.dev must pin one Rust toolchain version')
@@ -129,7 +147,9 @@ def verify(source, image, output):
     probe = None
     try:
         probe = json.loads(run(['docker', 'run', '--rm', '--name', name, '--runtime', 'runc', '--network', 'none',
-            '-e', 'NVIDIA_VISIBLE_DEVICES=void', '--entrypoint', 'python3',
+            '-e', 'NVIDIA_VISIBLE_DEVICES=void', '-e', 'HOME=/tmp/cuteafd-home', '-e', 'USER=tj',
+            '-e', 'LOGNAME=tj', '-e', 'TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions',
+            '-e', 'XDG_CACHE_HOME=/tmp/cuteafd-home/.cache', '--entrypoint', 'python3',
             '-v', f'{source}:/checkout:ro', '-v', f'{expected_path}:/expected.json:ro', image, '-c', PROBE], timeout=240))
     finally:
         found = subprocess.run(['docker', 'inspect', name], capture_output=True, text=True, timeout=30)

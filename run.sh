@@ -352,9 +352,7 @@ if [[ -n "$wip_slot" ]]; then
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
-  release_require_dev_image_sparkinfer "$(hostname)" "$COORDINATOR_DOCKER_INFERENCE" \
-    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")" \
-    "$sparkinfer_commit"
+  release_ensure_dev_image "$COORDINATOR_DOCKER_INFERENCE"
   release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
 else
@@ -389,13 +387,17 @@ wip_layout_slot="${10:-$wip_slot}"
 # Diagnostics go to stderr; stdout stays the EXL3 manifest alone.
 die() { echo "spark preflight on $host: $*" >&2; exit 1; }
 docker info >/dev/null 2>&1 || die "the Docker daemon is unavailable"
-docker image inspect "$image" >/dev/null 2>&1 || die "inference image is missing: $image (pull or distribute it)"
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  registry="${image%%/*}"
+  [[ "$wip_slot" != __none__ && "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || die "inference image is missing: $image (pull or distribute it)"
+  docker pull "$image" >&2 || die "cannot pull $image"
+fi
 if [[ "$wip_slot" == __none__ ]]; then
 [[ "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" == "$engine" ]] ||
   die "$image has another engine revision"
 fi
 image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image")"
-if [[ "$image_sparkinfer" != "$sparkinfer" ]]; then
+if [[ "$wip_slot" == __none__ && "$image_sparkinfer" != "$sparkinfer" ]]; then
   # WIP launches run the shared development image, which has its own rebuild.
   [[ "$wip_slot" == __none__ ]] && remedy="./build.sh, or pull the matching pair" ||
     remedy="scripts/build/build-dev-images.sh, then ./wip.sh --recreate"
@@ -417,6 +419,13 @@ if [[ "$wip_slot" != __none__ ]]; then
   mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
   [[ ! -d "$layout.tmp/raw/exl3" ]] || mv "$layout.tmp/raw/exl3" "$layout.tmp/lib/exl3"
   mv "$layout.tmp/raw/"* "$layout.tmp/share/"
+  mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
+  slot_source="$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace"
+  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
+    --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json" >&2 || die "slot SparkInfer verification failed"
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
 fi
 if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
@@ -564,6 +573,13 @@ if [[ -n "$wip_layout" ]]; then
   wip_mount_args=(
     -v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
+    -v "$wip_layout/source:/source:ro"
+    -e PYTHONPATH=/source/third_party/sparkinfer
+    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh
@@ -714,6 +730,12 @@ if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   wip_args=(-v "$layout/bin:/opt/cuteafd/bin:ro" -v "$layout/lib:/opt/cuteafd/lib:ro"
     -v "$layout/share:/opt/cuteafd/share:ro"
+    -v "$layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
+    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)

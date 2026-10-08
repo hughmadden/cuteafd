@@ -127,16 +127,26 @@ if [[ -n "$wip_slot" ]]; then
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
+  release_ensure_dev_image "$coordinator_image"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
   release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
+    -v "$wip_layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
+    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
   wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/bin:/opt/cuteafd/bin:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/source:/source:ro \
+    -e PYTHONPATH=/source/third_party/sparkinfer -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj \
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache \
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor \
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
@@ -985,16 +995,17 @@ if [[ -n "$wip_slot" ]]; then
   # carry the SparkInfer revision this checkout pins.
   pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
-  release_require_dev_image_sparkinfer "$(hostname)" "$coordinator_image" \
-    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$coordinator_image")" "$pinned_sparkinfer"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" <<'STAGE' ||
 set -euo pipefail
 slot="$1" image="$2" pinned="$3"
 container="$4" layout_slot="$5"
-label="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image" 2>/dev/null || true)"
-[[ "$label" == "$pinned" ]] || { echo "$(hostname): $image carries SparkInfer ${label:-<none>}, this checkout pins $pinned" >&2; exit 1; }
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  registry="${image%%/*}"
+  [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || { echo "missing local dev image $image" >&2; exit 1; }
+  docker pull "$image"
+fi
 layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
 docker cp "$container:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
@@ -1004,6 +1015,13 @@ mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
 [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
 [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
 mv "$raw/"* "$layout.tmp/share/"
+mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
+slot_source="$container:/wip/slots/$slot/spark-expert/workspace"
+docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
+  --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
 rm -rf "$raw" "$layout" && mv "$layout.tmp" "$layout"
 STAGE
       { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }

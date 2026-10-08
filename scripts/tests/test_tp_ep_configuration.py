@@ -1542,8 +1542,8 @@ unset HF_HOME
         self.assertIn("./build.sh", release.stderr)
         wip = self.preflight(sparkinfer="old-revision", wip_slot='"slot"')
         self.assertNotEqual(wip.returncode, 0)
-        self.assertIn("scripts/build/build-dev-images.sh", wip.stderr)
-        self.assertIn("spark preflight on dodo", wip.stderr)
+        self.assertNotIn("carries SparkInfer", wip.stderr)
+        self.assertIn("Spark host preflight failed on dodo", wip.stderr)
 
     def test_exl3_family_tag_reaches_the_manifest_path(self) -> None:
         result = self.preflight(exl3="true", family='"k23"')
