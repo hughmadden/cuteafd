@@ -106,6 +106,11 @@ async fn main() -> Result<()> {
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend.clone()),
     };
+    if let Some((_, options)) = matches.subcommand() {
+        if let Ok(Some(path)) = options.try_get_one::<std::path::PathBuf>("native_lib") {
+            cuteafd_transport::set_verbs_host_native_library_path(path.clone())?;
+        }
+    }
     // Preserve the original explicit option when family resolution reparses argv.
     if let Some(backend) = initial_table_backend.or(family_table_backend) {
         cuteafd_loader::TableBackend::set_override(backend.parse().expect("clap validates table backend"));
