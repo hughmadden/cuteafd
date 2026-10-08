@@ -1784,7 +1784,13 @@ Ideas TJ wants kept for later; not v2 work.
   - smaller prefill units need the fidelity gate;
   - the shared queue should take time-sized chunks (generalise MiMo's
     `--prefill-chunk-s`);
-  - a share-0 C16 drop is being rechecked (result to be recorded here).
+  - share-0 C16 recheck (1 RTX + 4, 3 interleaved pairs, pre0 vs the branch at
+    share 0): the first single-run -25% did not reproduce (the earlier arm had
+    run an extra probe panel first). Paired ratios 0.931 / 1.003 / 0.947,
+    median -5.3%; arm medians 734.6 -> 714.5 (-2.7%). The CPU audit found no
+    hot-path cause: the share-0 queue stays empty and lane moves are
+    identical. The unification must keep the share-0 path free of per-round
+    overhead and re-measure C16.
 - Deterministic Spark expert reduction for prefill (ordered FP32 route planes;
   an export option today): cold V4.1 prefill isn't bit-reproducible run to
   run because of FP32 atomics, which blocks exact cache/golden/A-B checks.
