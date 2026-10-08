@@ -589,6 +589,16 @@ def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(
         assert f"--draft-fp8 {expected}" in launch
 
 
+def test_mimo_drafter_context_override_reaches_serving(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo",
+                                  "SPECULATOR=dflash2\nDRAFT_CONTEXT_SLOTS=25\nDRAFT_SEQUENCES=8\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert "--draft-context-slots 25" in launch
+    assert "--draft-sequences 8" in launch
+
+
 @pytest.mark.parametrize("policy, expected", [(None, None), ("auto", None), ("checkpoint", "checkpoint")])
 def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_forwarded(tmp_path, policy, expected):
     config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
