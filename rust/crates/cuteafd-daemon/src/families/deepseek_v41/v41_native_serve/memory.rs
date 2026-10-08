@@ -45,6 +45,116 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
     Ok(Some(ByteSize(bytes)))
 }
 
+pub(super) fn startup_phase(lib: &cuteafd_ffi::NativeLibrary, phase: &str, device_total: usize) -> Result<()> {
+    if device_total <= 32usize << 30 {
+        let (free, total) = lib.cuda_memory_info()?;
+        let device = lib.cuda_get_device()?;
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        let space = cuteafd_ffi::memory_ledger::Space::Device;
+        tracing::info!(phase, occupied_bytes=total-free, tracked_live_bytes=ledger.total(space, device),
+            tracked_peak_bytes=ledger.peak.get(&(space, device)).copied().unwrap_or(0),
+            "V4.1 small-card startup phase high-water ledger");
+    }
+    Ok(())
+}
+
+/// Small-card startup admission runs before any weight payload or device owner.
+/// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
+pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
+    catalog: &cuteafd_loader::OfficialV41Catalog, args: &crate::cli::NativeServeArgs) -> Result<()> {
+    use super::*;
+    let (free, total) = lib.cuda_memory_info()?;
+    if total > 32usize << 30 { return Ok(()); }
+    ensure!(args.rtx_expert_layers == LocalLayers::Count(0),
+        "32 GB V4.1 startup admission requires --rtx-expert-layers 0; use a larger coordinator for local experts");
+    let capacity = args.prefill_batch_tokens.max(256);
+    let rows = capacity as usize;
+    let head_rows = if args.dspark_draft_limit > 5 { 64 } else { 48 };
+    let mut owners: Vec<(&str, usize)> = vec![
+        ("backbone weights/load bound", BackboneLaneWeights::device_bytes(lib, catalog)?),
+        ("cache producer weights", CacheProducerWeights::device_bytes(lib, catalog)?),
+        ("index weights", IndexLaneWeights::device_bytes(lib, catalog)?),
+        ("embedding", if args.embedding_placement == crate::shared::memory::EmbedPlacement::Gpu {
+            NativeRtxTensors::plan(catalog, &["embed.weight".into()])? } else { 0 }),
+        ("vocabulary resident", VocabularyHead::resident_bytes(catalog)?),
+        ("head weights", TargetHeadWeights::device_bytes(catalog)?),
+        ("engram weights", EngramLayerWeights::device_bytes(lib, catalog, 0)?
+            + EngramLayerWeights::device_bytes(lib, catalog, 1)?),
+        ("vision", crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)?),
+    ];
+    let weight_bytes = owners.iter().take(4).try_fold(0usize, |n, (_, b)|
+        n.checked_add(*b).context("startup weights overflow"))?;
+    let engram_bytes = owners.iter().find(|(name, _)| *name == "engram weights").unwrap().1;
+    let vocabulary_peak = VocabularyHead::plan(catalog)?;
+    let lane = [TargetEmbeddingWave::device_bytes(rows)?,
+        BackboneLane::workspace_bytes(lib, capacity)?.into_iter().sum(),
+        IndexLane::workspace_bytes(lib, capacity)?.into_iter().sum(),
+        BackboneExecution::workspace_bytes(lib, capacity)?, EngramDeviceRows::device_bytes(rows)?,
+        EngramGate::device_bytes(lib, rows)? * 2, TargetHeadWave::device_bytes(head_rows)?,
+        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?]
+        .into_iter().try_fold(0usize, |n, b| n.checked_add(b).context("target lane admission overflow"))?;
+    let mut loading_peaks = vec![("vocabulary packing", weight_bytes.checked_add(engram_bytes)
+        .and_then(|n| n.checked_add(lane))
+        .and_then(|n| n.checked_add(vocabulary_peak)).context("vocabulary phase overflow")?)];
+    owners.push(("target/prefill lanes", lane.checked_mul(2).context("lane admission overflow")?));
+    if crate::families::deepseek_v41::v41_tensors::fp8_head() == crate::families::deepseek_v41::v41_tensors::Fp8Head::All {
+        owners.push(("target vocabulary FP8 scratch", lib.fp8_w8a16_workspace(head_rows, 5120, 129280)?
+            .max(256).checked_mul(2).context("target FP8 scratch overflow")?));
+    }
+    owners.push(("target/prefill transports", NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?
+        .checked_mul(2).context("transport admission overflow")?));
+    if args.dspark {
+        let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
+        let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, tiers, "dspark");
+        let (weights, runtime, staging) = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::serving_bytes(
+            lib, catalog, capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
+        // Expert staging drains before auxiliary tensors and serving waves are allocated.
+        let before_draft = owners.iter().filter(|(name, _)| *name != "vision")
+            .try_fold(0usize, |n, (_, b)| n.checked_add(*b).context("pre-draft owners overflow"))?;
+        loading_peaks.push(("dSpark loading", before_draft.checked_add(weights)
+            .and_then(|n| n.checked_add(staging)).context("dSpark phase overflow")?));
+        owners.extend([("dSpark weights", weights), ("dSpark lanes/windows", runtime)]);
+        if args.dspark_draft_limit > 5 {
+            let sparse = cuteafd_ffi::V41SparseAttention::split_scratch_bytes(64, 10)? / 64 * 64
+                + cuteafd_ffi::V41SparseAttention::batch_descriptor_bytes(64)?;
+            owners.push(("K7 sparse replacement peak", sparse * 2));
+        }
+    }
+    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
+    let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
+    let snapshots = snapshot_slots * (crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256
+        + if args.dspark { 3 * 128 * 528 } else { 0 });
+    owners.push(("snapshot arenas", snapshots));
+    let fixed = owners.iter().try_fold(0usize, |n, (_, b)| n.checked_add(*b).context("startup fixed-owner overflow"))?;
+    let peak = startup_peak(fixed, &loading_peaks)?;
+    ensure!(peak <= free, "32 GB V4.1 startup refused before weights: peak {peak} bytes, free {free}, phases {loading_peaks:?}, owners {owners:?}; use --prefill-batch-tokens 256 or a larger coordinator");
+    let after = free.checked_sub(fixed).with_context(|| format!("32 GB V4.1 fixed startup owners need {fixed} bytes, free {free}; set --prefill-batch-tokens 256, --rtx-expert-layers 0 or use a larger coordinator; owners {owners:?}"))?;
+    let exact = planned_pool_size(args, &[(after, total)])?;
+    let pool = PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
+        args.prefix_cache_entries as usize, snapshots, exact, args.memory_reservation, after, total)
+        .with_context(|| format!("32 GB V4.1 startup refused before weights: fixed-owner bound {fixed}, owners {owners:?}; use --prefill-batch-tokens 256 or increase coordinator memory"))?;
+    tracing::info!(fixed_owner_bound_bytes=fixed, startup_peak_bound_bytes=peak, loading_phases=?loading_peaks, owners=?owners, admitted_cache_bytes=pool.cache_bytes,
+        "V4.1 complete small-card startup admission before weight loads");
+    Ok(())
+}
+
+fn startup_peak(fixed: usize, loading_phases: &[(&str, usize)]) -> Result<usize> {
+    Ok(loading_phases.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0).max(fixed))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[test]
+    fn sequential_loading_peaks_do_not_shrink_the_serving_pool() {
+        let fixed = 26usize << 30;
+        let phases = [("head packing", 20usize << 30), ("draft staging", 27usize << 30)];
+        assert_eq!(super::startup_peak(fixed, &phases).unwrap(), 27usize << 30);
+        assert_eq!(super::startup_peak(fixed, &[]).unwrap(), fixed);
+        // Retained residency, not sum of loading phases, is subtracted before KV.
+        assert_eq!((32usize << 30) - fixed, 6usize << 30);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ByteSize(pub usize);
 #[derive(Clone, Copy, Debug)]
