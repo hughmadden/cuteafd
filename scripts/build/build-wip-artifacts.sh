@@ -96,6 +96,7 @@ export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/referen
 export CARGO_TARGET_DIR="$build_dir/cargo-target"
 source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_dir"
+cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"
 compiler_cache_cmake_args=()
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_dir/native")
 

@@ -1,7 +1,11 @@
 """Opt-in cache setup, Docker argument transport, and plain compiler fallback."""
+import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/build/compiler-cache.sh"
@@ -24,6 +28,12 @@ def fake_kache(tmp_path):
     binary.write_text('#!/bin/sh\nif [ "$1" = --version ]; then printf "kache test\\n"; exit 0; fi\nexit 42\n')
     binary.chmod(0o755)
     return str(binary)
+
+
+def shim_directory(tmp_path, cc="cc", cxx="c++"):
+    compilers = [str(Path(shutil.which(name)).resolve()) for name in (cc, cxx)]
+    identity = hashlib.sha256('\n'.join(compilers).encode()).hexdigest()[:16]
+    return tmp_path / "build/compiler-cache/bin" / identity
 
 
 def test_unset_is_noop(tmp_path):
@@ -65,12 +75,111 @@ def test_native_launchers_and_wrapper_fallback(tmp_path):
                        '"$RUSTC_WRAPPER" /usr/bin/printf "%s\\n" rust-success; env | sort')
     assert "native-success" in result.stdout and "rust-success" in result.stdout
     assert result.stderr.count("warning:") == 1
-    assert f"CC={HELPER} cc" in result.stdout
-    assert f"CXX={HELPER} c++" in result.stdout
+    assert f"CC={shim_directory(tmp_path)}/cc" in result.stdout
+    assert f"CXX={shim_directory(tmp_path)}/c++" in result.stdout
     for language in ("C", "CXX", "CUDA"):
         assert f"CMAKE_{language}_COMPILER_LAUNCHER={HELPER}" in result.stdout
     assert "CUTEAFD_KACHE_MODE=enabled" in result.stdout
     assert not (tmp_path / "cache/target").exists()
+
+
+def test_unset_preserves_compilers(tmp_path):
+    result = run_setup(tmp_path, {"CC": "/custom/cc", "CXX": "/custom/c++"})
+    assert "CC=/custom/cc\n" in result.stdout
+    assert "CXX=/custom/c++\n" in result.stdout
+    assert result.stderr == ""
+    assert not (tmp_path / "build").exists()
+
+
+def test_shims_are_single_executables_with_absolute_compilers(tmp_path):
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
+                       '"$CC" --version; "$CXX" --version; printf "%s\\n" "$CC" "$CXX"')
+    cc, cxx = result.stdout.splitlines()[-2:]
+    assert " " not in cc + cxx
+    for shim in (Path(cc), Path(cxx)):
+        assert shim.is_file() and os.access(shim, os.X_OK)
+        import shlex
+        compiler = shlex.split(shim.read_text().splitlines()[1])[2]
+        assert Path(compiler).is_absolute() and Path(compiler).is_file()
+    assert result.stderr.count("warning:") == 1
+    assert "Copyright" in result.stdout
+
+
+def test_shim_respects_custom_compiler_and_argument_boundaries(tmp_path):
+    compiler = tmp_path / "custom-compiler"
+    compiler.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    compiler.chmod(0o755)
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache"),
+                                "CC": str(compiler)},
+                       '"$CC" "argument with spaces" -shared')
+    assert result.stdout.splitlines() == ["argument with spaces", "-shared"]
+    assert result.stderr.count("warning:") == 1
+    assert str(compiler.resolve()) in (shim_directory(tmp_path, str(compiler)) / "cc").read_text()
+
+
+def test_cmake_configures_and_builds_with_single_path_shims(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "CMakeLists.txt").write_text('cmake_minimum_required(VERSION 3.18)\n'
+                                          'project(shim_test LANGUAGES C CXX)\n'
+                                          'add_library(shim_test SHARED source.c source.cpp)\n')
+    (source / "source.c").write_text('int c_value(void) { return 1; }\n')
+    (source / "source.cpp").write_text('int cpp_value() { return 2; }\n')
+    native = tmp_path / "native"
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
+                       f'cmake -S "{source}" -B "{native}"; cmake --build "{native}"; '
+                       f'cuteafd_compiler_cache_check_cmake_compilers "{native}"')
+    assert "Built target shim_test" in result.stdout
+    cache = (native / "CMakeCache.txt").read_text()
+    for language, name in (("C", "cc"), ("CXX", "c++")):
+        assert f'CMAKE_{language}_COMPILER:FILEPATH={shim_directory(tmp_path)}/{name}\n' in cache
+        assert f'CMAKE_{language}_COMPILER_ARG1:STRING=' not in cache
+
+
+def test_changed_toolchain_gets_new_shims_and_requires_fresh_configure(tmp_path):
+    extra = {"CUTEAFD_KACHE": fake_kache(tmp_path),
+             "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")}
+    original = run_setup(tmp_path, extra, 'printf "%s\\n" "$CC"').stdout.strip()
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "CMakeCache.txt").write_text(f'CMAKE_C_COMPILER:FILEPATH={original}\n')
+    compiler = tmp_path / "other-compiler"
+    compiler.write_text('#!/bin/sh\nexec /usr/bin/cc "$@"\n')
+    compiler.chmod(0o755)
+    changed = run_setup(tmp_path, {**extra, "CC": str(compiler)},
+                        f'printf "%s\\n" "$CC"; '
+                        f'if cuteafd_compiler_cache_check_cmake_compilers "{native}"; then exit 99; fi')
+    assert changed.stdout.strip() != original
+    assert "rerun with fresh configure" in changed.stderr
+    assert str(compiler) not in Path(original).read_text()
+
+
+def test_cmake_launcher_wraps_real_compiler_only_once(tmp_path):
+    binary = tmp_path / "kache"
+    log = tmp_path / "invocations"
+    binary.write_text('#!/bin/sh\nif [ "$1" = --version ]; then exit 0; fi\n'
+                      f'printf "%s\\n" "$1" >> "{log}"\nexec "$@"\n')
+    binary.chmod(0o755)
+    run_setup(tmp_path, {"CUTEAFD_KACHE": str(binary),
+                        "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
+              '"$CMAKE_C_COMPILER_LAUNCHER" "$CC" --version; '
+              '"$CMAKE_CXX_COMPILER_LAUNCHER" "$CXX" --version')
+    assert log.read_text().splitlines() == [str(Path(shutil.which(name)).resolve())
+                                           for name in ("cc", "c++")]
+
+
+def test_shim_setup_failure_preserves_compilers(tmp_path):
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache"),
+                                "CC": "/missing/compiler", "CXX": "c++"})
+    assert "CC=/missing/compiler\n" in result.stdout
+    assert "CXX=c++\n" in result.stdout
+    assert "CUTEAFD_KACHE_MODE=disabled" in result.stdout
+    assert "RUSTC_WRAPPER=" not in result.stdout
+    assert "cannot create compiler shims" in result.stderr
 
 
 def test_local_index_rejects_remote_filesystem(tmp_path):
@@ -117,6 +226,56 @@ def test_cmake_opt_out_clears_persisted_cache_launcher(tmp_path):
                             text=True, capture_output=True, check=True)
     assert result.stdout.splitlines() == [f"-DCMAKE_{language}_COMPILER_LAUNCHER="
                                          for language in ("C", "CXX", "CUDA")]
+
+
+@pytest.mark.parametrize("cached,current", [
+    ("/usr/bin/cc", "shim"),
+    ("shim", "/usr/bin/cc"),
+    (str(HELPER), "/usr/bin/cc"),
+    (str(HELPER), "shim"),
+])
+def test_cmake_compiler_toggle_requires_fresh_configure(tmp_path, cached, current):
+    native = tmp_path / "native"
+    native.mkdir()
+    shim = tmp_path / "shim"
+    shim.write_text("#!/bin/sh\nexec /usr/bin/cc \"$@\"\n")
+    shim.chmod(0o755)
+    cached = str(shim) if cached == "shim" else cached
+    current = str(shim) if current == "shim" else current
+    (native / "CMakeCache.txt").write_text(f'CMAKE_C_COMPILER:FILEPATH={cached}\n')
+    result = subprocess.run(["bash", "-c", f'set -eu; source "{HELPER}"; '
+                             'cuteafd_compiler_cache_check_cmake_compilers "$1"', "test", str(native)],
+                            env={**os.environ, "CC": current}, text=True, capture_output=True)
+    assert result.returncode == 1
+    assert "rerun with fresh configure" in result.stderr
+    assert cached in result.stderr and current in result.stderr
+    assert result.stdout == ""
+
+
+def test_cmake_unchanged_compilers_allow_reconfigure(tmp_path):
+    import shutil
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "CMakeCache.txt").write_text(''.join(
+        f'CMAKE_{language}_COMPILER:FILEPATH={Path(shutil.which(compiler)).resolve()}\n'
+        for language, compiler in (("C", "cc"), ("CXX", "c++"))))
+    result = run_setup(tmp_path, {"CC": "cc", "CXX": "c++"},
+                       f'cuteafd_compiler_cache_check_cmake_compilers "{native}"')
+    assert result.stdout == result.stderr == ""
+
+
+def test_cmake_cxx_toggle_is_detected_and_build_scripts_check_it(tmp_path):
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "CMakeCache.txt").write_text(f'CMAKE_CXX_COMPILER:FILEPATH={HELPER}\n'
+                                          'CMAKE_CXX_COMPILER_ARG1:STRING= c++\n')
+    result = subprocess.run(["bash", "-c", f'source "{HELPER}"; '
+                             'cuteafd_compiler_cache_check_cmake_compilers "$1"', "test", str(native)],
+                            env={**os.environ, "CXX": "c++"}, text=True, capture_output=True)
+    assert result.returncode == 1 and "CMake CXX compiler changed" in result.stderr
+    for name in ("build-wip-artifacts.sh", "build-release-artifacts.sh"):
+        text = (ROOT / "scripts/build" / name).read_text()
+        assert text.index("cuteafd_compiler_cache_check_cmake_compilers") < text.index("cargo build")
 
 
 def test_docker_missing_remote_emits_no_partial_mounts(tmp_path):

@@ -75,13 +75,40 @@ PY
   if [[ "$launcher" == *[[:space:]]* || "$wrapper" == *[[:space:]]* ]]; then
     cuteafd_compiler_cache_warn 'wrapper paths contain whitespace'; return 0
   fi
+  # Some AOT exporters exec CC/CXX as a single path, not a shell command.
+  # Keep shims build-local so concurrent toolchains cannot overwrite each other.
+  local shim_dir
+  if ! shim_dir="$(python3 - "$build_dir/compiler-cache/bin" "$launcher" "${CC:-cc}" "${CXX:-c++}" <<'PY'
+import hashlib, os, shlex, shutil, sys
+from pathlib import Path
+compilers = [shutil.which(name) for name in sys.argv[3:]]
+if not all(compilers):
+    raise SystemExit('cannot resolve C/C++ compilers')
+compilers = [str(Path(compiler).resolve()) for compiler in compilers]
+# A new toolchain needs a new shim path so CMake's compiler-change check sees it.
+identity = hashlib.sha256('\n'.join(compilers).encode()).hexdigest()[:16]
+root = Path(sys.argv[1]).resolve() / identity
+root.mkdir(parents=True, exist_ok=True)
+for name, compiler in zip(('cc', 'c++'), compilers):
+    path = root / name
+    text = '#!/bin/sh\nexec ' + shlex.quote(sys.argv[2]) + ' ' + shlex.quote(str(Path(compiler).resolve())) + ' "$@"\n'
+    if not path.exists() or path.read_text() != text:
+        stage = path.with_suffix('.tmp')
+        stage.write_text(text)
+        stage.chmod(0o755)
+        os.replace(stage, path)
+print(root)
+PY
+)"; then
+    cuteafd_compiler_cache_warn 'cannot create compiler shims'; return 0
+  fi
   export CUTEAFD_KACHE_ACTIVE="$wrapper" KACHE_CONFIG="$config" KACHE_HOST_CONFIG=
   export KACHE_CACHE_DIR="$cache" KACHE_BUILD_SCRIPT_CACHE=0 KACHE_OUT_DIR_ALIAS=0
   export KACHE_VERIFY_RESTORES=always
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"
   rmdir "$CUTEAFD_KACHE_WARNING_DIR" 2>/dev/null || true
   export RUSTC_WRAPPER="$launcher" CC_KNOWN_WRAPPER_CUSTOM=compiler-cache
-  export CC="$launcher ${CC:-cc}" CXX="$launcher ${CXX:-c++}"
+  export CC="$shim_dir/cc" CXX="$shim_dir/c++" CUTEAFD_KACHE_SHIM_DIR="$shim_dir"
   export CMAKE_C_COMPILER_LAUNCHER="$launcher" CMAKE_CXX_COMPILER_LAUNCHER="$launcher"
   # Native CUDA remains opt-in with the rest of the build; not part of the CPU pilot.
   export CMAKE_CUDA_COMPILER_LAUNCHER="$launcher"
@@ -99,6 +126,35 @@ mounts = json.loads(subprocess.check_output(['findmnt', '--json', '--target', st
                                            '--output', 'FSTYPE'], text=True))['filesystems']
 raise SystemExit(0 if len(mounts) == 1 and mounts[0]['fstype'] in
                  {'ext4', 'xfs', 'btrfs', 'zfs', 'tmpfs', 'overlay'} else 1)
+PY
+}
+
+cuteafd_compiler_cache_check_cmake_compilers() {
+  local native_dir="$1"
+  [[ -f "$native_dir/CMakeCache.txt" ]] || return 0
+  # CMake ignores new CC/CXX values after its first configure. Refuse before
+  # building with stale shims (including the former two-word wrapper setup).
+  python3 - "$native_dir" "${CC:-cc}" "${CXX:-c++}" <<'PY'
+import shlex, shutil, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+values = {}
+for line in (root / 'CMakeCache.txt').read_text().splitlines():
+    if line.startswith('CMAKE_') and ':' in line and '=' in line:
+        key, value = line.split('=', 1)
+        values[key.split(':', 1)[0]] = value
+for language, current in zip(('C', 'CXX'), sys.argv[2:]):
+    cached = values.get(f'CMAKE_{language}_COMPILER')
+    if not cached:
+        continue
+    # Preserve support for callers' plain, multi-word compiler commands.
+    resolved = shutil.which(current) or shutil.which(shlex.split(current)[0])
+    if resolved and Path(cached).resolve() == Path(resolved).resolve():
+        continue
+    print(f'error: CMake {language} compiler changed: {cached} -> {current}; '
+          f'rerun with fresh configure (remove {root / "CMakeCache.txt"} and '
+          f'{root / "CMakeFiles"} first)', file=sys.stderr)
+    raise SystemExit(1)
 PY
 }
 
@@ -152,6 +208,12 @@ cuteafd_compiler_cache_docker_args() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # CMake also uses us as a launcher. Let the shim wrap its real compiler once;
+  # otherwise kache sees a shell script as the compiler, not cc/c++.
+  if [[ -n "${CUTEAFD_KACHE_SHIM_DIR:-}" ]] &&
+     [[ "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/cc" || "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/c++" ]]; then
+    exec "$@"
+  fi
   # One failing cache invocation disables it for the remainder of this build.
   if [[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]]; then
     exec "$@"
