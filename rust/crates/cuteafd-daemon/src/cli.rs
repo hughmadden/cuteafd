@@ -244,6 +244,9 @@ pub(crate) struct PlanArgs {
     /// itself, as its measured admission does; other layouts keep at least the allowance.
     #[arg(long)]
     pub(crate) graph_budget_mib: Option<u64>,
+    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU).
+    #[arg(long, value_enum, default_value = "own")]
+    pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,

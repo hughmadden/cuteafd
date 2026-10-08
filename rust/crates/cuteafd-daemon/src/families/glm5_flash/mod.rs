@@ -81,6 +81,14 @@ pub(crate) struct EngineArgs {
     /// 1.5 GiB graph allowance (unset: the startup set's reserve, else the allowance).
     #[arg(long)]
     pub graph_budget_mib: Option<u64>,
+    /// Where the KDA speculative replay records live: `own`, their own allocation (321 MB with 64
+    /// decode rows), or `shared`, the prefill lanes' scratch, which no decode step reads (782 MB with
+    /// the 4,096-row KDA prefill programs). A record lives only from a speculative verify to its
+    /// commit, with no prefill in between; a commit that would read records a prefill overwrote
+    /// fails. One GPU whose pool is sized from measured memory (an automatic pool with Spark
+    /// experts, or a coordinator GPU budget), where the step workspaces precede the KV pool.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
+    pub replay_records: engine::ReplayRecords,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -180,7 +188,9 @@ pub(crate) struct EngineArgs {
     /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    /// Context slots: one ring per sequence under serve-glmf (--max-sequences; the draft batch
+    /// then takes at most that many), max(20, draft_sequences) for glmf-golden. The target head
+    /// is shared.
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
     /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
@@ -238,6 +248,30 @@ mod draft_cli_tests {
         assert!(parse_cache(&["--index-cache", "tails"]).is_err());
     }
 
+    /// Start-up loads GLM Flash's own programs, the head split's shares with a second GPU, nothing
+    /// of another family: the engine resolves programs only as `glmf_`/`glmf2_` (`run_on`) and the
+    /// FP8 head's `glmf_head_fp8`.
+    #[test]
+    fn startup_loads_only_the_programs_a_glm_flash_engine_launches() {
+        let names = ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows", "dsv4f_attention_m64", "dsv4p_compressor_m4096",
+            "glm_mla_m64", "mimo_attention_m64", "qwen4_gdn_m64"];
+        let kept = |split: bool| -> Vec<&str> { names.iter().copied().filter(|n| glmf_startup_program(n, split)).collect() };
+        assert_eq!(kept(false), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8"]);
+        assert_eq!(kept(true), ["glmf_kda_m64", "glmf_kda_s16_m4096", "glmf_kda_commit_c_s16", "glmf_index_producer_c_m64",
+            "glmf_head_fp8", "glmf2_kda_m64", "glmf2_join_rows"]);
+        // Every program lookup the engine makes: `run_on`'s prefix and the FP8 head (re-check the
+        // predicate if another appears).
+        let engine = include_str!("engine.rs");
+        let engine = &engine[..engine.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(engine.matches("programs.program(").count(), 1);
+        assert!(engine.contains("let name = format!(\"{}_{name}\", if split { \"glmf2\" } else { \"glmf\" });"));
+        let head = include_str!("head.rs");
+        assert_eq!((head.matches("programs.program(").count(), head.matches("programs.program(\"glmf_head_fp8\"").count()),
+            (1, 1));
+    }
+
     #[test]
     fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
         let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
@@ -285,6 +319,20 @@ mod draft_cli_tests {
         }
         assert!(check_options(&parse(&["--fp8-prefill", "none,mla"])).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
+    }
+
+    /// `--replay-records shared` keeps the records in one GPU's prefill scratch.
+    #[test]
+    fn replay_records_take_shared_on_one_gpu() {
+        assert_eq!(parse(&[]).replay_records, engine::ReplayRecords::Own);
+        assert_eq!(parse(&["--replay-records", "shared"]).replay_records, engine::ReplayRecords::Shared);
+        check_options(&parse(&["--replay-records", "shared"])).unwrap();
+        check_options(&parse(&["--replay-records", "own", "--split-device", "1"])).unwrap();
+        let error = check_options(&parse(&["--replay-records", "shared", "--split-device", "1"])).unwrap_err()
+            .to_string();
+        assert!(error.contains("--replay-records shared") && error.contains("--split-device"), "{error}");
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--replay-records", "host"]).is_err());
     }
 
     #[test]
@@ -760,6 +808,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
         "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
+        "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
     Ok(())
 }
 
@@ -782,7 +832,15 @@ impl EngineArgs {
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache, kda_state: args.kda_state }
+        max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records }
+}
+
+/// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`), and
+/// the head split's `glmf2_` shares with a second GPU (rank 0 runs shares too). Every program a
+/// step can launch inside a decode graph capture is loaded; the engine launches no other family's
+/// program.
+pub(crate) fn glmf_startup_program(name: &str, split: bool) -> bool {
+    name.starts_with("glmf_") || (split && name.starts_with("glmf2_"))
 }
 
 /// What a measured admission keeps free for decode graph executables: the graph budget, else the
@@ -979,7 +1037,10 @@ impl Opened {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \
                 program {name}; this native library predates it"))?;
         }
-        programs.load_all()?;
+        // GLM Flash's programs only (a release library carries every family's): the head split's
+        // `glmf2_` share programs only with a second GPU.
+        let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name, args.split_device.is_some()))?;
+        tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
         // (`glmf2`) in this build.
@@ -1086,7 +1147,11 @@ impl Opened {
         // all-row prefill logits the lanes' temporaries already hold them.
         let admission = kv_admission(args, gpu_budget, peer_stream.is_some());
         let eager = admission == KvAdmission::Measured;
+        ensure!(eager || args.replay_records == engine::ReplayRecords::Own, "--replay-records shared needs the step \
+            workspaces before the KV pool: one GPU whose pool is sized from measured memory (an automatic pool with \
+            Spark experts, or a coordinator GPU budget)");
         let mut early = None;
+        let mut records = None;
         // Admit the package before KV sizing; measured free memory then excludes its buffers (the
         // eager admission loads it with the rest of start-up).
         let mut scoring_dense = if args.full_prefill_logits && !eager { self.load_dense(args, &model.layers)? }
@@ -1115,8 +1180,12 @@ impl Opened {
                 index_cache.into(), args.kda_state.bytes() as u64)?;
             let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
             let unit = geometry.logical_unit_rows.max(1);
+            // Shared replay records sit in the prefill scratch the workspaces already hold.
+            let shared_records = if args.replay_records == engine::ReplayRecords::Shared {
+                cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes(&self.cfg, layers, 1)?
+            } else { 0 };
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
-                + rank.speculative_replay_bytes;
+                + rank.speculative_replay_bytes - shared_records;
             // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
             // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
             let (headroom, later) = (args.headroom_bytes()?, state + after_pool(rank) + future_expert_bytes);
@@ -1127,6 +1196,11 @@ impl Opened {
                     (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64))
             })?;
+            records = if shared_records > 0 {
+                tracing::info!(records_bytes = shared_records, later_bytes = later,
+                    "GLM 5.3 Flash KDA replay records in the prefill lanes' scratch");
+                Some(workspaces.prefill_scratch().context("shared replay records need the prefill lanes")?)
+            } else { None };
             early = Some((experts, drafter, dense, selector, workspaces));
             admitted
         } else if admission == KvAdmission::Planned {
@@ -1206,7 +1280,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state)?;
+            args.kda_state, records)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }

@@ -546,6 +546,28 @@ def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, m
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,shared", [("", False), ("GLM5_FLASH_REPLAY_RECORDS=own\n", False),
+                                        ("GLM5_FLASH_REPLAY_RECORDS=shared\n", True)])
+def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shared):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--replay-records shared" in launch) == shared, launch
+    assert "--replay-records own" not in launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_REPLAY_RECORDS=shared\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_REPLAY_RECORDS=host\n", "GLM5_FLASH_REPLAY_RECORDS must be own or shared"),
+])
+def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()

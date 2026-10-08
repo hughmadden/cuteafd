@@ -1007,6 +1007,60 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert_eq!(graphs, [("graph budget", 512 << 20)]);
 }
 
+#[test]
+fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
+    use crate::serving_capacity::glm_flash_kda_replay_bytes;
+    use cuteafd_core::memory_layout::Category;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    // `small`: every prefill program's scratch 1 MiB, under the records.
+    let manifest = |small: bool| {
+        let prefill = |bytes: u64| if small { 1 << 20 } else { bytes };
+        let programs: Vec<Value> = [("glmf_mhc_pre", prefill(26_214_400)), ("glmf_index_producer_m64", 561_152),
+            ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+            ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+            ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592),
+            ("glmf_index_producer_m4096", prefill(35_913_728)), ("glmf_index_topk_prefill_m4096", 558_007_296),
+            ("glmf_mhc_post_pre_m4096", prefill(26_214_400)), ("glmf_kda_m4096", prefill(782_236_672)),
+            ("glmf_mla_producer_m4096", prefill(168_296_448)), ("glmf_o_m4096", prefill(203_423_744)),
+            ("glmf_sparse_mla_prefill_m4096", prefill(1_048_576)), ("glmf_ffn_i2048_m4096", prefill(67_633_152)),
+            ("glmf_ffn_i12288_m4096", prefill(353_894_400))].into_iter()
+            .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+        json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072}, "programs": programs})
+    };
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    // One KDA layer's records (the fixture has one KDA and one MLA layer).
+    let records = glm_flash_kda_replay_bytes(&cfg, 2, 1).unwrap();
+    assert_eq!(records, 9_453_568);
+    let report = |path: &std::path::Path, shared: bool, pool: Option<u64>| {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30],
+            context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()), glmf_shared_replay: shared,
+            pool_tokens: pool, ..Default::default() }), ..sparks(4) };
+        plan(dir.path(), &options).unwrap()
+    };
+    let item = |path: &std::path::Path, shared: bool, pool: Option<u64>, category: Category, group: &str| {
+        report(path, shared, pool).memory_layout.unwrap().devices[0].items.iter()
+            .find(|i| i.category == category && i.group == group).unwrap().bytes
+    };
+    // The export's prefill scratch (782 MB, the 4,096-row KDA programs) holds the records: the state
+    // sheds them and the step workspaces do not grow.
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest(false).to_string()).unwrap();
+    assert_eq!(item(&path, false, None, Category::Kv, "state") - item(&path, true, None, Category::Kv, "state"), records);
+    assert_eq!(item(&path, false, None, Category::Workspace, "steps"), item(&path, true, None, Category::Workspace, "steps"));
+    // A prefill scratch smaller than the records grows to hold them.
+    let small = dir.path().join("SMALL.json");
+    std::fs::write(&small, manifest(true).to_string()).unwrap();
+    assert_eq!(item(&small, true, None, Category::Workspace, "steps"),
+        item(&small, false, None, Category::Workspace, "steps") + records - (1 << 20));
+    assert_eq!(item(&small, false, None, Category::Kv, "state") - item(&small, true, None, Category::Kv, "state"), records);
+    // A fixed pool admits from the planner's costs, where the engine keeps the records of their own.
+    let fixed = Some(131_072);
+    assert_eq!(item(&path, true, fixed, Category::Kv, "state"), item(&path, false, fixed, Category::Kv, "state"));
+    let notes = report(&path, true, fixed).memory_layout.unwrap().notes.join("\n");
+    assert!(notes.contains("--replay-records shared needs one GPU"), "{notes}");
+}
+
 /// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
 /// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
 /// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
