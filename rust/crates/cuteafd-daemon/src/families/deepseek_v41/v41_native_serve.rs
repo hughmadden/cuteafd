@@ -595,6 +595,7 @@ fn worker(
         local_layers = plan.layers;
         tracing::info!(layers=plan.layers, resident_bytes=plan.resident_bytes,
             workspace_bytes=plan.workspace_bytes, peak_bytes=plan.peak_bytes,
+            graph_reserve_bytes=plan.graph_reserve_bytes,
             "bottom-up RTX expert placement");
         // Publish the resolved boundary before anything waits on it. On 1 RTX the
         // 2-RTX distributed path never ran, so without this the launcher cannot

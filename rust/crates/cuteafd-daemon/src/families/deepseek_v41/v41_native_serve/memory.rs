@@ -13,6 +13,22 @@ const GROUP_BYTES: usize = 5 * 256 * (68 + cuteafd_ffi::V41Kv::COMPRESSED_ROW_BY
 // Request scratch and graph/runtime allocations. Snapshot arenas are already live.
 // Kept outside the eagerly allocated cache; this is not a CUDA process quota.
 pub(super) const RUNTIME_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
+// Post-ready untracked growth in official-native C1/C16 (plus single-RTX tools),
+// plus 25%, rounded up to 64 MiB. Separate from transient runtime scratch.
+pub(super) const SINGLE_GRAPH_RESERVE: usize = 3264 * 1024 * 1024;
+pub(super) const DUAL_GPU0_GRAPH_RESERVE: usize = 320 * 1024 * 1024;
+pub(super) const DUAL_GPU1_GRAPH_RESERVE: usize = 384 * 1024 * 1024;
+
+pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
+    // Plat2 already charges its measured fixed-shape graph envelope.
+    if total <= 32usize << 30 { return 0; }
+    match dual_gpu {
+        None => SINGLE_GRAPH_RESERVE,
+        Some(0) => DUAL_GPU0_GRAPH_RESERVE,
+        Some(1) => DUAL_GPU1_GRAPH_RESERVE,
+        Some(_) => unreachable!("V4.1 has at most two RTX owners"),
+    }
+}
 // CUDA allocation granularity and modules first used after this startup sample.
 const SMALL_CARD_SAMPLE_MARGIN: usize = 32 * 1024 * 1024;
 
@@ -69,6 +85,7 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
         // The small-card ceiling already includes its absolute runtime slack.
         let runtime = if small_card { 0 } else if automatic { 3usize << 30 }
             else if memory.len() == 1 { RUNTIME_HEADROOM } else { distributed::RUNTIME_HEADROOM };
+        let runtime = runtime + graph_reserve_bytes(total, (memory.len() == 2).then_some(gpu));
         Ok(ceiling.checked_sub(total - free).and_then(|n| n.checked_sub(runtime))
             .with_context(|| format!("GPU {gpu} planner leaves no room after fixed owners and runtime reserve"))? as u64)
     }).collect::<Result<_>>()?;
@@ -379,7 +396,7 @@ impl PoolPlan {
             total as u64, 97, cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64))? as usize)
         } else { ceiling };
         // The absolute runtime floor is already charged in the ceiling.
-        let runtime_headroom = if small_card { 0 } else { RUNTIME_HEADROOM };
+        let runtime_headroom = if small_card { 0 } else { RUNTIME_HEADROOM + graph_reserve_bytes(total, None) };
         let available = ceiling.checked_sub(occupied).and_then(|v| v.checked_sub(runtime_headroom))
             .context("memory reservation leaves no space after existing allocations and runtime headroom")?;
         ensure!(retained_turns <= 128, "invalid retained-turn limit");
@@ -454,10 +471,10 @@ mod tests {
         auto.snapshot = directory.path().to_owned();
         let full = planned_pool_size(&auto, &[(96 << 30, 96 << 30)])?.unwrap();
         assert_eq!(full.0 / GROUP_BYTES, 14 * 2048 + 16 + 40);
-        let limited = planned_pool_size(&auto, &[(6 << 30, 96 << 30)])?.unwrap();
+        let limited = planned_pool_size(&auto, &[((6 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30)])?.unwrap();
         assert!(limited.0 < full.0);
         auto.pool_tokens = Some(14 * 1_048_576);
-        assert!(planned_pool_size(&auto, &[(6 << 30, 96 << 30)]).is_err());
+        assert!(planned_pool_size(&auto, &[((6 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30)]).is_err());
         Ok(())
     }
     #[test]
@@ -585,11 +602,11 @@ mod tests {
         assert_eq!(c2.pages[0], 2048 * 4 + 50);
         let reservation = Some("80GiB".parse().unwrap());
         let p = PoolPlan::new(16, 1_048_576, 24, 0, None, reservation, free, total).unwrap();
-        assert!(p.cache_bytes + p.occupied_before + RUNTIME_HEADROOM <= 80 << 30);
+        assert!(p.cache_bytes + p.occupied_before + p.runtime_headroom_bytes <= 80 << 30);
         let next =
             PoolPlan::from_groups(16, p.pages[0] + 1, p.occupied_before, p.reservation_bytes)
                 .unwrap();
-        assert!(next.cache_bytes + p.occupied_before + RUNTIME_HEADROOM > 80 << 30);
+        assert!(next.cache_bytes + p.occupied_before + p.runtime_headroom_bytes > 80 << 30);
         assert!(PoolPlan::new(
             16,
             1_048_576,
@@ -640,6 +657,7 @@ pub(super) struct LocalLayerPlan {
     pub resident_bytes: usize,
     pub workspace_bytes: usize,
     pub peak_bytes: usize,
+    pub graph_reserve_bytes: usize,
 }
 impl LocalLayerPlan {
     /// Free memory is sampled after mandatory weights, KV and both lanes exist.
@@ -647,10 +665,12 @@ impl LocalLayerPlan {
     pub fn new(requested: LocalLayers, budgets: &[crate::families::deepseek_v41::v41_experts::ExpertLoadBudget],
         workspace_bytes: usize, free: usize, total: usize, ceiling: usize) -> Result<Self> {
         ensure!(free <= total && ceiling <= total && budgets.len() <= 40, "invalid local memory inventory");
-        let available = ceiling.saturating_sub(total - free).saturating_sub(RUNTIME_HEADROOM);
+        let graph_reserve_bytes = graph_reserve_bytes(total, None);
+        let available = ceiling.saturating_sub(total - free).saturating_sub(RUNTIME_HEADROOM)
+            .saturating_sub(graph_reserve_bytes);
         let target = match requested { LocalLayers::Auto => budgets.len(), LocalLayers::Count(n) => n };
         ensure!(target <= budgets.len(), "requested RTX layers exceed available layer plans");
-        let mut plan = Self { layers: 0, resident_bytes: 0, workspace_bytes: 0, peak_bytes: 0 };
+        let mut plan = Self { layers: 0, resident_bytes: 0, workspace_bytes: 0, peak_bytes: 0, graph_reserve_bytes };
         let mut staging = 0;
         for budget in budgets.iter().take(target) {
             let resident = plan.resident_bytes.checked_add(budget.resident_bytes).context("local weight size overflow")?;
@@ -658,10 +678,10 @@ impl LocalLayerPlan {
             let peak = resident.checked_add(workspace_bytes).and_then(|b| b.checked_add(staging))
                 .context("local layer peak size overflow")?;
             if peak > available { break; }
-            plan = Self { layers: plan.layers + 1, resident_bytes: resident, workspace_bytes, peak_bytes: peak };
+            plan = Self { layers: plan.layers + 1, resident_bytes: resident, workspace_bytes, peak_bytes: peak, graph_reserve_bytes };
         }
         if let LocalLayers::Count(n) = requested {
-            ensure!(plan.layers == n, "requested {n} RTX expert layers but only {} fit after KV, workspaces, staging and runtime headroom", plan.layers);
+            ensure!(plan.layers == n, "requested {n} RTX expert layers but only {} fit after KV, workspaces, staging, runtime headroom and graph reserve", plan.layers);
         }
         Ok(plan)
     }
@@ -675,19 +695,36 @@ mod local_tests {
             device_staging_bytes: 20 << 20, pinned_host_bytes: 0, read_scratch_bytes: 0 }; 40]
     }
     #[test]
+    fn lazy_graph_reserve_is_charged_before_expert_admission() {
+        let b = budgets();
+        let free = (35usize << 30) + (600 << 20) + (20 << 20) + RUNTIME_HEADROOM;
+        let plan = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20,
+            free, 96 << 30, 96 << 30).unwrap();
+        assert_eq!(plan.layers, 4);
+        assert_eq!(plan.graph_reserve_bytes, SINGLE_GRAPH_RESERVE);
+        assert!(LocalLayerPlan::new(LocalLayers::Count(5), &b, 600 << 20,
+            free, 96 << 30, 96 << 30).is_err());
+        for role in [None, Some(0), Some(1)] {
+            assert_eq!(graph_reserve_bytes(32 << 30, role), 0);
+        }
+        assert_eq!(graph_reserve_bytes(96 << 30, Some(0)), DUAL_GPU0_GRAPH_RESERVE);
+        assert_eq!(graph_reserve_bytes(96 << 30, Some(1)), DUAL_GPU1_GRAPH_RESERVE);
+    }
+
+    #[test]
     fn local_prefix_respects_workspace_staging_and_ceiling() {
         let b = budgets();
-        let p = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20, 38 << 30, 96 << 30, 96 << 30).unwrap();
+        let p = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20, (38 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30, 96 << 30).unwrap();
         assert_eq!(p.layers, 5);
         assert_eq!(p.resident_bytes, 35 << 30);
-        let limited = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20, 38 << 30, 96 << 30, 90 << 30).unwrap();
+        let limited = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20, (38 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30, 90 << 30).unwrap();
         assert_eq!(limited.layers, 4);
-        assert!(LocalLayerPlan::new(LocalLayers::Count(5), &b, 600 << 20, 38 << 30, 96 << 30, 90 << 30).is_err());
+        assert!(LocalLayerPlan::new(LocalLayers::Count(5), &b, 600 << 20, (38 << 30) + SINGLE_GRAPH_RESERVE, 96 << 30, 90 << 30).is_err());
         let exact = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20,
-            p.peak_bytes + RUNTIME_HEADROOM, 96 << 30, 96 << 30).unwrap();
+            p.peak_bytes + RUNTIME_HEADROOM + SINGLE_GRAPH_RESERVE, 96 << 30, 96 << 30).unwrap();
         assert_eq!(exact.layers, 5);
         let short = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20,
-            p.peak_bytes + RUNTIME_HEADROOM - 1, 96 << 30, 96 << 30).unwrap();
+            p.peak_bytes + RUNTIME_HEADROOM + SINGLE_GRAPH_RESERVE - 1, 96 << 30, 96 << 30).unwrap();
         assert_eq!(short.layers, 4);
         let zero = LocalLayerPlan::new(LocalLayers::Auto, &b, 600 << 20, 1 << 30, 96 << 30, 96 << 30).unwrap();
         assert_eq!((zero.layers, zero.peak_bytes), (0, 0));

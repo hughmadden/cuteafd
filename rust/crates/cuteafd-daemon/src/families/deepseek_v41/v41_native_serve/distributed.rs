@@ -346,6 +346,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let rank_budgets = prefix_peak[expert_layers-1];
     tracing::info!(expert_layers, expert_budget=?expert_budget, rank_peak_bytes=?rank_budgets,
         reserved_cache_bytes=?reserved_pool.cache_bytes, transport_bytes=?transport_bytes,
+        graph_reserve_bytes=?std::array::from_fn::<_, 2, _>(|gpu| memory::graph_reserve_bytes(before_experts[gpu].1, Some(gpu))),
         setup_headroom_bytes=memory::distributed::EXPERT_SETUP_HEADROOM, "dual RTX bottom-up expert placement");
     let placement_handoff=args.placement_directory.as_deref().map(|directory|
         super::placement::StartupPlacement::publish(directory, args.rtx_gpus, expert_layers)).transpose()?;
