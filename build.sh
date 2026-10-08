@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
+audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
+case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
 [[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
@@ -85,6 +87,8 @@ packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES (e.g. mimo, or mimo;glm) adds optional
 BF16-input Spark siblings for the requested FAMILY:fp8 packages. It does not
 change serving precision defaults. Empty builds the existing artifact set.
+CUTEAFD_RELEASE_AUDIO_AOT=OFF leaves the optional audio tower out of both images
+(default ON: AUDIO=auto serves it for the qualified MiMo V2.6 checkpoints).
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
 mimo,mimo2,mimop,mimop2: V2 Flash, V2.6 Pro and their two-GPU head splits). p7's set, everything scripts/launch/run-family.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
@@ -730,6 +734,7 @@ timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_expo
   "${compiler_cache_args[@]}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
@@ -991,6 +996,7 @@ docker run --rm --name "$export_container" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \

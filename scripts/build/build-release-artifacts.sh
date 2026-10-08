@@ -71,6 +71,9 @@ exl3_paired_tp4=OFF
 exl3_residency=""
 # Opt-in replicated-group Spark expert roles. Empty is the default and keeps
 # the historical Spark TP4 shard (and every release default) byte-identical.
+# Release images carry the audio tower: AUDIO=auto serves it for qualified checkpoints.
+audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
+case "$audio_aot" in ON|OFF) ;; *) echo "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" >&2; exit 2 ;; esac
 spark_tp_roles="${CUTEAFD_RELEASE_SPARK_TP_ROLES:-}"
 spark_tp_role_list=()
 if [[ -n "$spark_tp_roles" ]]; then
@@ -201,6 +204,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
