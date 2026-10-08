@@ -34,6 +34,15 @@ SCALAR_KINDS = {"int32": "i", "int64": "l", "float32": "f"}
 PAGE_ROWS = 64
 
 
+def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
+    # Fused top-k has fixed CTA-group spin barriers. The native table has no
+    # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
+    # silently introduce this route into serving.
+    if geometry.get("route") == "paged_fused" and not diagnostic:
+        raise ValueError(f"{stem}: co-resident paged_fused program requires a live-kernel "
+                         "residency gate and grid-agnostic fallback before entering the serving table")
+
+
 def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """(stem suffix, op, params, compile thunk) for every exported program."""
     from b12x.integration.cuteafd import dsv4_compressor as comp
@@ -486,6 +495,7 @@ def main() -> None:
         stem = f"{family}_{suffix}"
         with exportable_compilation():
             program = thunk()
+        validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
         program.export_to_c(str(output), stem, "cuteafd_" + stem)
         header = output / f"{stem}.h"
         checked = validate_exported_header(program, header, "cuteafd_" + stem)
@@ -499,6 +509,7 @@ def main() -> None:
             "family": family,
             "op": op,
             "params": params,
+            "geometry": dict(program.geometry),
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
             "scalars": [dict(zip(("name", "type"), s)) for s in abi["scalars"]],
             "scratch_bytes_at_capacity": program.scratch_bytes(capacity),
