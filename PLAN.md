@@ -848,11 +848,17 @@ Work, in priority order:
    host-mapped embedding (like Engram) is a planner lever only when memory
    binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
    within ~0.5% (TJ, 2026-10-05).
-   **32 GB candidate issues (2026-10-08, work/plat2-32gb):** one heap abort
-   (`corrupted size vs. prev_size while consolidating`) in the initial C16
-   attempt; not reproduced in four corrected launches plus ten distinct C16
-   soak batches with MALLOC_CHECK_=3/GDB. No fix or memory-safety qualification
-   claimed. Independently, lazy target graph retention grew to ~12.6K counted
+   **32 GB candidate issues (2026-10-08, work/plat2-32gb):** one serving heap
+   abort (`corrupted size vs. prev_size while consolidating`) in the initial
+   C16 attempt; not reproduced in four corrected launches plus ten distinct
+   C16 soak batches with MALLOC_CHECK_=3/GDB. Separately, one complete CPU
+   loader suite aborted with `corrupted double-linked list`; 50 exact parallel
+   MALLOC_CHECK_=3 repeats, three matching-image ASAN full suites and 24 ASAN
+   Engram/media/tokenizer subgroup runs passed. Baseline parallel/serial and
+   exact GDB repeats also passed. Memcheck/Helgrind were time-boxed; huge
+   fixture mappings limit coverage. Neither abort is fixed or proven related;
+   the heap hunt is closed for v2 unless it recurs. MALLOC_CHECK_=3 serving
+   soaks remain required; no memory-safety qualification is claimed. Independently, lazy target graph retention grew to ~12.6K counted
    executables with unchanged device owners: untracked residency 3.24 ->
    5.16 GB after batches 1 -> 5, leaving only 0.35 GiB of the logical 31.8 GiB
    budget. A fixed small-card graph set and charged reserve, host embedding,
