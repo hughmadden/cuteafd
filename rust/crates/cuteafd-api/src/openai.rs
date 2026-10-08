@@ -1322,7 +1322,7 @@ mod tests {
         let spec = probe::ProbeSpec { prompt_ids: Some(vec![1;11]), audio: vec![probe::ProbeAudio { start:2,len:7,samples:24000,
             key: clip.key.0.iter().map(|v| format!("{v:02x}")).collect(), pcm_sha256:"ab".repeat(32) }], ..Default::default() };
         for source_present in [false,true] {
-            let (id, _) = probe::registry().register(spec.clone());
+            let (id, _probe) = probe::registry().register(spec.clone());
             let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
             let expected = clip.key;
             let worker = source_present.then(|| tokio::spawn(async move {
@@ -1362,7 +1362,7 @@ mod tests {
             ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())),
             ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))] {
             let image = image.clone();
-            let (id, _) = probe::registry().register(spec.clone());
+            let (id, _probe) = probe::registry().register(spec.clone());
             let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
             let worker = tokio::spawn(async move {
                 let job = rx.recv().await.unwrap();
@@ -1398,7 +1398,7 @@ mod tests {
         let spec: probe::ProbeSpec = serde_json::from_value(request["spec"].clone()).unwrap();
         spec.validate_media().unwrap();
         let expected = spec.clone();
-        let (id, _) = probe::registry().register(spec);
+        let (id, _probe) = probe::registry().register(spec);
         let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::from_snapshot(&snapshot,
             ImageFamily::Mimo).unwrap(), EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
         let profile = ModelProfile::new(request["body"]["model"].as_str().unwrap(),
