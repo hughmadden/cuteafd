@@ -147,7 +147,8 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         };
         ensure!(!partial || window % PAGE_ROWS == 0, "partial reuse replays a whole number of pages");
         Ok(Self { engine, full, states, rank_mark_bytes: offsets, mark_bytes, arenas, slots, partial,
-            draft_slots: RefCell::new(vec![None; engine.rings]), draft_floors: RefCell::new(vec![0; engine.rings]),
+            draft_slots: RefCell::new(if draft_metadata.is_some() { vec![None; engine.rings] } else { Vec::new() }),
+            draft_floors: RefCell::new(if draft_metadata.is_some() { vec![0; engine.rings] } else { Vec::new() }),
             draft_metadata, draft_offset })
     }
 
@@ -330,7 +331,7 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             None => return Err("MiMo restores exact snapshots with their positional mark".into()),
         }
         let ring = placement.ring as usize;
-        self.draft_floors.borrow_mut()[ring] = len;
+        if self.draft_metadata.is_some() { self.draft_floors.borrow_mut()[ring] = len; }
         if let (Some(slot), Some(metadata)) = (mark, &self.draft_metadata) {
             let source = view(self.arenas[0].buffer,
                 slot.0 as usize * self.rank_mark_bytes[0] + self.draft_metadata_offset(), 8)?;

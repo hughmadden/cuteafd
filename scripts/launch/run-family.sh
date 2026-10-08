@@ -758,7 +758,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_gib="${coordinator_budget:-95.5}"
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
-    plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
+    plan_draft_args+=(--concurrency "$(get CONCURRENCY 8)"
       --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")

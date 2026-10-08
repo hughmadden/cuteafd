@@ -1178,13 +1178,16 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
 
 
 @pytest.mark.parametrize("warm", [False, True])
-def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm):
+@pytest.mark.parametrize("concurrency", [None, 16])
+def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    keys = "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nCONCURRENCY=16\nMAX_CONTEXT_TOKENS=131072\n"
+    keys = "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nMAX_CONTEXT_TOKENS=131072\n"
+    if concurrency is not None:
+        keys += f"CONCURRENCY={concurrency}\n"
     keys += f"MIMO_PREFIX_DRAFT={'on' if warm else 'off'}\n"
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
@@ -1192,8 +1195,11 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--mimo-prefix-draft" in preflight) == warm
     assert ("--mimo-prefix-draft" in launch) == warm
+    effective = concurrency if concurrency is not None else 8
+    assert f"--concurrency {effective}" in preflight
+    assert f"--max-sequences {effective}" in launch
+    assert "unbound variable" not in result.stderr
     if warm:
-        assert "--concurrency 16" in preflight
         assert "--context-tokens 131072" in preflight
 
 

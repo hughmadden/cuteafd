@@ -57,7 +57,7 @@ pub(crate) struct ServeArgs {
     /// Sequences decoding at once (each holds an SWA ring).
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
-    /// Bounded pending API requests (default at least the number of decoding slots).
+    /// Bounded pending API requests (default 16).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]
     pub http_queue_depth: Option<usize>,
     /// Time a caller waits for a pending-queue permit.
@@ -123,7 +123,7 @@ pub(crate) struct ServeArgs {
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     anyhow::ensure!(args.prefill_chunk_s.is_none_or(|s| s.is_finite() && s > 0.0 && s <= 5.0),
         "--prefill-chunk-s must be finite and in (0, 5]");
     anyhow::ensure!(args.prefill_chunk_s.is_none() || args.decode_share.decode_share > 0.0,
@@ -137,9 +137,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
-    anyhow::ensure!(args.max_sequences > 0 && args.max_sequences <= DECODE_ROWS,
-        "--max-sequences must be in 1..={DECODE_ROWS}");
-    let depth = args.http_queue_depth.unwrap_or(args.max_sequences.max(16));
+    let effective_sequences = args.max_sequences.clamp(1, DECODE_ROWS);
+    if effective_sequences != args.max_sequences {
+        tracing::warn!(requested = args.max_sequences, effective = effective_sequences, "clamping MiMo decoding sequences");
+        args.max_sequences = effective_sequences;
+    }
+    let depth = serving_queue_depth(args.http_queue_depth);
     anyhow::ensure!(depth > 0, "--http-queue-depth must be positive");
     let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
@@ -148,10 +151,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
-    engine_args.draft_context_slots = Some(usize::try_from(
-        cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_context_slots(
-            engine_args.draft_sequences as u64, engine_args.rings as u64,
-            engine_args.draft_context_slots.map(|n| n as u64)))?);
+    engine_args.draft_context_slots = Some(serving_context_slots(
+        engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, args.prefix.mimo_prefix_draft));
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s, indexed_copy: args.mimo_copy_windows,
         snapshot_wait: args.mimo_snapshot_wait };
@@ -332,7 +333,7 @@ struct Active<'a> {
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
-    copy_index: copy::CopyIndex,
+    copy_index: Option<copy::CopyIndex>,
     keyed_history: Vec<u32>,
     media: RequestMedia,
     /// The sequence's DFlash ring slot (None: copy-window drafts only).
@@ -632,7 +633,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let slot = if probe::no_speculation(&ready.job().job.probe) || policy.fixed == Some(0) {
                 None
             } else { free_slots.pop() };
-            family.bind_drafter(ring, slot);
+            if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.bind_drafter(ring, slot); }
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
@@ -740,6 +741,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 !replay && round_target.is_none_or(|target| rows.iter().sum::<usize>() as f64 * row_cost <= target)
                     && engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
             }, |batch| {
+                if policy.chunk_s.is_none() {
+                    return prefill_batch(engine, family, cache, selector, batch);
+                }
                 let rows: usize = batch.iter().map(|p| p.plan.chunks.get(p.chunks).copied()
                     .unwrap_or(p.tokens.len()).saturating_sub(p.done)).sum();
                 let clock = Instant::now();
@@ -809,14 +813,14 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 // state. Keep its event sender until that error is reported.
                 let admission_events = p.job.events.clone();
                 let job_events = p.job.events.clone();
-                let draft_from = family.draft_from(p.placement.ring);
+                let draft_from = if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.draft_from(p.placement.ring) } else { resume };
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         slot,
                         drafts: DraftHistory::default(),
                         counts: [0; 6],
                         history: p.tokens,
-                        copy_index: copy::CopyIndex::default(),
+                        copy_index: policy.indexed_copy.then(copy::CopyIndex::default),
                         keyed_history: p.keys.tokens().to_vec(),
                         media: p.media,
                         draft_limit: draft,
@@ -886,21 +890,17 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
             .min(a.capacity - a.placement.len - 1) }).collect();
         // Greedy copy windows replace, rather than accompany, this sequence's neural draft.
-        let copies: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
-            if a.draft_pause > 0 {
-                a.draft_pause -= 1;
-                if a.draft_pause == 0 { a.draft_limit = draft.min(1); }
-            }
-            if policy.indexed_copy && a.job.sampling.is_greedy() {
-                a.copy_index.propose(&a.history, limits[i].min(draft))
+        let copies = policy.indexed_copy.then(|| active.iter_mut().enumerate().map(|(i, a)| {
+            if a.job.sampling.is_greedy() {
+                a.copy_index.as_mut().expect("indexed mode owns its copy index").propose(&a.history, limits[i].min(draft))
             } else { Vec::new() }
-        }).collect();
+        }).collect::<Vec<_>>());
         // DFlash drafts after every next token (sequences with a ring slot),
         // then the adaptive plan's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0 && copies[i].is_empty()) => {
+            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0 && copies.as_ref().is_none_or(|copies| copies[i].is_empty())) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0 && copies[i].is_empty()).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0 && copies.as_ref().is_none_or(|copies| copies[i].is_empty())).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
                     .collect();
                 for &(i, _) in &seqs {
@@ -932,7 +932,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             None if skip.drafts() && engine.mtp.is_some() && policy.fixed != Some(0)
                 && limits.iter().any(|&limit| limit > 0) => {
                 let indices: Vec<usize> = (0..active.len()).filter(|&i| {
-                    if limits[i] == 0 || !copies[i].is_empty() { return false; }
+                    if limits[i] == 0 || copies.as_ref().is_some_and(|copies| !copies[i].is_empty()) { return false; }
                     let a = &active[i];
                     let start = a.placement.len.saturating_sub(engine.cfg.window + engine.mtp.as_ref().unwrap().stages.len());
                     if !a.media.ready(start, a.history.len()) {
@@ -983,17 +983,21 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         // an agreeing neural proposal. Both verify against the same target.
         let mut used_copy = vec![false; active.len()];
         let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
+            if a.draft_pause > 0 {
+                a.draft_pause -= 1;
+                if a.draft_pause == 0 { a.draft_limit = draft.min(1); }
+            }
             let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
-            let legacy = if policy.indexed_copy { Vec::new() } else {
-                let copy = crate::families::glm5_flash::serve::copy_drafts(&a.history, limits[i].min(a.draft_limit));
-                let full = drafted[i].as_ref().map_or(&[][..], |d| &d.tokens[..]);
-                let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
-                if copy.len() > dflash.len() && agrees { copy } else { Vec::new() }
+            let draft = if let Some(copies) = &copies {
+                if copies[i].is_empty() { dflash.to_vec() } else {
+                    used_copy[i] = true;
+                    copies[i].clone()
+                }
+            } else {
+                legacy_copy_proposal(&a.history, limits[i].min(a.draft_limit), dflash,
+                    drafted[i].as_ref().map_or(&[], |d| &d.tokens), &mut used_copy[i])
             };
-            used_copy[i] = !copies[i].is_empty() || !legacy.is_empty();
-            let draft = if !copies[i].is_empty() { &copies[i][..] }
-                else if !legacy.is_empty() { &legacy[..] } else { dflash };
-            let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft.iter().copied()).collect();
+            let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
             // Drafts the grammar rejects could never be kept: verify none of them.
             if let Some(state) = a.constraint.as_ref() {
                 state.truncate_proposal(&mut rows)?;
@@ -1174,6 +1178,19 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     }
 }
 
+fn serving_queue_depth(explicit: Option<usize>) -> usize { explicit.unwrap_or(16) }
+
+fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>, warm: bool) -> usize {
+    if warm { explicit.unwrap_or(sequences).max(sequences).max(rings) }
+    else { explicit.unwrap_or(sequences).max(rings) }
+}
+
+fn legacy_copy_proposal(history: &[u32], limit: usize, dflash: &[u32], full: &[u32], used: &mut bool) -> Vec<u32> {
+    let copy = crate::families::glm5_flash::serve::copy_drafts(history, limit);
+    let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
+    if copy.len() > dflash.len() && agrees { *used = true; copy } else { dflash.to_vec() }
+}
+
 #[cfg(test)]
 mod port_tests {
     use super::*;
@@ -1201,6 +1218,47 @@ mod port_tests {
         assert_eq!((enabled.serve.max_sequences, enabled.serve.http_queue_depth), (16, Some(32)));
         assert_eq!(enabled.serve.prefix.host_cache_bytes, crate::shared::prefix::HostBudget::Bytes(0));
         assert_eq!(enabled.serve.prefill_chunk_s, Some(4.0));
+    }
+
+    #[test]
+    fn flags_off_queue_depth_matches_legacy_for_every_sequence_count() {
+        for sequences in [1, 4, 16, 32, 64] {
+            let parsed = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib",
+                "--max-sequences", &sequences.to_string()]);
+            assert_eq!(serving_queue_depth(parsed.serve.http_queue_depth), 16);
+        }
+        assert_eq!(serving_queue_depth(Some(32)), 32);
+        assert_eq!(serving_queue_depth(Some(1)), 1);
+    }
+
+    #[test]
+    fn flags_off_context_slots_match_legacy_explicit_policy() {
+        for sequences in [4, 16, 32] {
+            for rings in [4, 16, 32] {
+                for explicit in [None, Some(1), Some(24), Some(64)] {
+                    assert_eq!(serving_context_slots(sequences, rings, explicit, false),
+                        explicit.unwrap_or(sequences).max(rings));
+                }
+            }
+        }
+        assert_eq!(serving_context_slots(32, 16, Some(1), true), 32);
+    }
+
+    #[test]
+    fn flags_off_copy_proposals_match_legacy_scan_and_agreement() {
+        let history: Vec<u32> = (0..24).chain(0..16).collect();
+        for limit in 0..=COPY_DRAFT {
+            for neural in [vec![], vec![16], vec![16, 17], vec![999], vec![16, 999]] {
+                let full = [16, 17, 18, 19, 20, 21, 22];
+                let copy = crate::families::glm5_flash::serve::copy_drafts(&history, limit);
+                let agrees = copy.iter().zip(&full).take_while(|(c, d)| c == d).count() >= neural.len();
+                let expected_copy = copy.len() > neural.len() && agrees;
+                let expected = if expected_copy { copy } else { neural.clone() };
+                let mut used = false;
+                assert_eq!(legacy_copy_proposal(&history, limit, &neural, &full, &mut used), expected);
+                assert_eq!(used, expected_copy);
+            }
+        }
     }
 
     #[test]
