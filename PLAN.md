@@ -1713,6 +1713,13 @@ Ideas TJ wants kept for later; not v2 work.
 - Segmented full-attention prefill packing for MiMo: pack many short prompts
   into one ~1,024-row pass (Hugh's FR-M.8a). Needs a new exporter/engine
   route; MiMo keeps two prefill lanes for v2.
+- MiMo ports from Hugh (merged opt-in, e6ec0318): indexed copy windows LOSE on our
+  engine (C1 0.957, copy-heavy rewrite -14.5%: copied tokens accepted ~45% vs our DFlash
+  ~99.5%, and the indexed path ignores draft_limit/draft_pause). Keep them off; revisit only
+  with an acceptance-gated copy (copy when it beats the neural draft). Snapshot wait + 4 s
+  prefill chunks + queue 32 without copies: C1 0.999, rewrite +1.6%, C16 TTFT 91 -> 67 ms,
+  C16 throughput 0.971 in one pair. Promote only after 3 interleaved pairs show C16 >= 0.98.
+  Warm drafter marks and the host tier remain unmeasured on hardware.
 - MiMo RoPE computed on the fly instead of `max_context × 64` tables (FR-M.5b),
   if 32 GB plans still need the memory; a SparkInfer export change.
 - MiMo host prefix tier on by default: needs `--host-cache-bytes` to become
