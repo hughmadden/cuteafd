@@ -1747,30 +1747,44 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 ## Explore after v2
 
 Ideas TJ wants kept for later; not v2 work.
-- **First after v2: V4.1 onto the shared serving infrastructure (TJ, 2026-10-09).**
-  V4.1 came in as the ds41rt engine, the speed floor, and under the old "never
-  slower than the replaced engine" rule its hot path was left alone while the
-  shared layer grew beside it. It has ~60K lines of family code (the next
-  largest family has ~12.5K) and uses none of `shared/prefill_share` (decode
-  share), the generic prefix cache, shared decode graphs or the shared expert
-  service. Features and fixes land on it separately, or not at all.
-  1. Design first (one Astra/Fable session): map V4.1's scheduler, two-lane
-     encoder pipeline, HC-lagged replay, compressed KV, Engram tables and
-     expert path onto `PrefillQueue`, `PrefixFamily`/`RefPagePool`, shared
-     decode graphs and the expert service; name what the shared layer must grow.
-  2. Migrate in stages, each with the quick A/B at the 2M operating point:
-     decode share (supersedes `work/v41-decode-share`), prefix cache, decode
-     graphs, then the expert service.
-  3. Goal: V4.1 is one family among six; its model-specific code (attention,
-     Engram, HC) lives in a family module.
-  Input from `work/v41-decode-share` (2026-10-09):
-  - one 1024-row encoder wave is 400-700 ms, so wave-boundary interleaving
-    can't bring gaps to tens of ms;
+- **First after v2: retire ds41rt; V4.1 becomes an ordinary family (TJ, 2026-10-09).**
+  The goal is to remove ds41rt as a separate engine, not only to move its
+  scheduler: V4.1 should be a model the shared engine runs, as GLM Flash and
+  MiMo are. It came in as the ds41rt speed floor. Under the old "never slower
+  than the replaced engine" rule its hot path was left alone while `shared/`
+  grew beside it. Today:
+  - ~60K lines in 141 files in `families/deepseek_v41/` (the next largest
+    family has ~12.5K);
+  - 42 native files (~4.2K lines);
+  - 228 ds41-named references;
+  - none of `shared/prefill_share`, the generic prefix cache, shared decode
+    graphs or the expert service is used.
+  Features and fixes land on it separately, or not at all.
+  1. **Inventory (Fable design session).** Classify every V4.1-specific
+     mechanism as (a) truly model-specific, (b) a generic capability
+     `shared/` lacks, or (c) a ds41rt vestige.
+     - Model-specific: compressed/sparse KV and indexer attention, HC/mHC,
+       Engram tables, weight formats.
+     - Likely generic: two-lane encoder pipelining, HC-lagged replay as a
+       "lagged state" concept, independent decode lanes, memory placement.
+  2. **Grow `shared/`** for the (b) items, so any family can use them.
+  3. **Migrate in stages,** each gated by the quick A/B at the 2M operating
+     point: serve loop and decode share (`PrefillQueue`, with time-sized
+     chunks), prefix cache (`PrefixFamily`/`RefPagePool`), decode graphs, the
+     expert exchange and service, memory planning. Delete the (c) vestiges
+     as each stage lands.
+  4. **End state:** `families/deepseek_v41/` holds only model code, roughly
+     a GLM Flash-sized module; no ds41/ds41rt names remain in configs,
+     scripts or docs.
+  Input from `work/v41-decode-share` (2026-10-09; the branch is closed, not
+  merged; the unification supersedes it):
+  - a 2048-row text encoder wave costs 480-680 ms and the 128-row replay
+    ~250 ms, so wave-boundary interleaving can't bring decode gaps to tens of
+    ms;
   - smaller prefill units need the fidelity gate;
   - the shared queue should take time-sized chunks (generalise MiMo's
     `--prefill-chunk-s`);
-  - share 0 on that branch measured C16 -25% vs pre0 (single run; repeat
-    pending).
+  - a share-0 C16 drop is being rechecked (result to be recorded here).
 - Deterministic Spark expert reduction for prefill (ordered FP32 route planes;
   an export option today): cold V4.1 prefill isn't bit-reproducible run to
   run because of FP32 atomics, which blocks exact cache/golden/A-B checks.
