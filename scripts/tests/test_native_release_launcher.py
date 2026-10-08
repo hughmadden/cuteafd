@@ -142,6 +142,7 @@ sparkinfer_commit=fork
 release_version=v5
 EXL3_PAIRED_TP4=on
 bf16_families=
+audio_aot=OFF
 source_manifest_sha256={shlex.quote(digest)}
 spark_tp_roles={shlex.quote(roles)}
 native_build_jobs={shlex.quote(jobs)}
@@ -205,6 +206,7 @@ sparkinfer_commit=fork
 release_version=v5
 EXL3_PAIRED_TP4=on
 bf16_families=
+audio_aot=OFF
 source_manifest_sha256=
 spark_tp_roles=
 '''

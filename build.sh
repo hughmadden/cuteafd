@@ -846,7 +846,7 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -902,6 +902,8 @@ if [[ "${16:-__legacy__}" != __legacy__ || "${19:-0}" == 1 ]]; then
   mapfile -t compiler_cache_args < <(cuteafd_compiler_cache_docker_args)
 fi
 phase="${13:?}"
+# The audio tower switch reaches the remote leg as its own argument (ON/OFF).
+audio_aot="${21:-ON}"
 export_container="${14:?}"
 native_build_jobs="${15-__legacy__}"
 [[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
