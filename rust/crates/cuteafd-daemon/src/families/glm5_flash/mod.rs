@@ -53,11 +53,11 @@ pub(crate) struct EngineArgs {
     /// Sequences with KDA state (136 MiB each; 68 MiB with --kda-state bf16).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
-    /// Slots of the prefix mark arena the command allocates on every GPU (serve: its prefix
-    /// cache; golden: the --resume-at check), reserved before an automatic pool is sized, by the
-    /// planned admission and by the measured one alike.
+    /// The prefix mark arena the command allocates on every GPU (serve: its prefix cache;
+    /// golden: the --resume-at check), counted on the layout the engine serves and reserved
+    /// before an automatic pool is sized, by the planned admission and by the measured one alike.
     #[arg(skip)]
-    pub planner_mark_slots: usize,
+    pub mark_arena: prefix::ArenaMarks,
     /// Where prefix-cache snapshots keep their KDA state marks: `arena`, a device arena of
     /// 2C + 2 marks (147.6 MB each with FP32 state) beside the KV pool, or `pool`, units of
     /// the KV pool itself (49 per mark), taken at capture and evicted (to the host tier when
@@ -948,14 +948,22 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
+/// The DSA index cache an engine builds for `requested`: both GPUs of a head split run the indexer,
+/// and their index tails are not built yet, so a head split keeps the token keys.
+pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool) -> engine::IndexCache {
+    if head_split { engine::IndexCache::Keys } else { requested }
+}
+
 impl Opened {
-    /// Builds the engine and hands it to `body`. Either KV admission keeps the
-    /// `args.planner_mark_slots` prefix marks the caller allocates once the engine exists free.
+    /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
+    /// `args.mark_arena` the caller allocates once the engine exists free, counted on the layout
+    /// the engine serves (`engine.mark_slots`).
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
-        // admission. `planner_mark_slots` counts marks, so it stands: each admitted GPU reserves its part of
-        // every mark (a lone GPU, the whole mark), as the prefix cache then allocates.
+        // admission. The arena is counted after both decisions (below), on the layout this engine serves:
+        // each admitted GPU reserves its part of every mark (a lone GPU, the whole mark), as the prefix
+        // cache then allocates.
         let mut resolved = args.clone();
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
@@ -1032,14 +1040,10 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
-        // Both GPUs of a head split run the indexer; their index tails are not built yet.
-        let index_cache = match (args.index_cache, split_device) {
-            (engine::IndexCache::Compact, Some(device)) => {
-                tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
-                engine::IndexCache::Keys
-            }
-            (cache, _) => cache,
-        };
+        let index_cache = served_index_cache(args.index_cache, split_device.is_some());
+        if let (Some(device), true) = (split_device, index_cache != args.index_cache) {
+            tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
+        }
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -1053,6 +1057,9 @@ impl Opened {
         };
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        // The prefix mark arena on the layout this engine serves, its index cache resolved above:
+        // both admissions reserve these marks, and `prefix_cache` allocates as many.
+        let mark_slots = args.mark_arena.slots_on(&self.cfg, layers, index_cache, args.kda_state)?;
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
@@ -1175,8 +1182,8 @@ impl Opened {
             let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
                 + rank.speculative_replay_bytes - shared_records;
             // The prefix mark arena the caller allocates once the engine exists.
-            let marks = args.planner_mark_slots as u64 * rank.retained_mark_bytes;
-            tracing::info!(device = args.device, state_bytes = state, mark_slots = args.planner_mark_slots,
+            let marks = mark_slots as u64 * rank.retained_mark_bytes;
+            tracing::info!(device = args.device, state_bytes = state, mark_slots,
                 mark_bytes = marks, "KV admission reserves recurrent state, replay records and prefix marks");
             // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
             // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
@@ -1242,7 +1249,7 @@ impl Opened {
             let lazy_extra = planned_graph_extra(args, None, allowance);
             let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
                 reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
-            // Every GPU keeps the prefix mark arena the caller allocates (its part of `planner_mark_slots`
+            // Every GPU keeps the prefix mark arena the caller allocates (its part of `mark_slots`
             // marks, whatever the KDA state) and the speculative replay records free, as the runtime
             // allocates them.
             engine::admit_beside_decode_graphs(startup, |graphs| {
@@ -1254,7 +1261,7 @@ impl Opened {
                         workspace_bytes: args.full_prefill_logits.then_some(workspace),
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
-                    args.draft.as_deref(), args.prefill_rows, args.slots, args.planner_mark_slots as u64,
+                    args.draft.as_deref(), args.prefill_rows, args.slots, mark_slots as u64,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
                     index_cache.into(), args.kda_state.bytes() as u64)
             })?
@@ -1272,6 +1279,7 @@ impl Opened {
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
+        engine.mark_slots = mark_slots;
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
@@ -1440,8 +1448,8 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
     // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
-    args.engine.planner_mark_slots =
-        if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena { 2 } else { 0 };
+    args.engine.mark_arena = if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena {
+        prefix::ArenaMarks::Slots(2) } else { prefix::ArenaMarks::None };
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
