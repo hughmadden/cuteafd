@@ -1,5 +1,7 @@
 //! Incremental Qwen output parser: `<think>` reasoning, visible content and
 //! Qwen3-Coder XML tool calls, emitted as protocol-neutral [`OutputChunk`]s.
+//! MiMo V2 is served through this same dialect (`ModelEncoding::Qwen`), so its
+//! malformed-call fixtures live here too.
 //!
 //! ```text
 //! <tool_call>
@@ -13,11 +15,30 @@
 //!
 //! Values follow vLLM's `qwen3_coder` parser: one leading and one trailing
 //! newline are stripped; a parameter whose declared schema admits a string
-//! (or has no type, or is not declared) is the raw text, streamed as it
-//! arrives (JSON-escaped); other values wait for `</parameter>` and parse as
+//! (or has no type, or is not declared) is the raw text; other values parse as
 //! JSON, then `true`/`false` in any case, else stay text. Several calls may
-//! follow each other; text after the first call is dropped and turn markers
-//! end the output. Results are independent of how the text is chunked.
+//! follow each other; text after the first parsed call is dropped and turn
+//! markers end the output.
+//!
+//! A call is held until its closing `</tool_call>` (the SSE keepalive covers
+//! the wait), so a client never sees part of a call that turns out malformed.
+//! FR-G.14's hold-until-close contract is adopted from glm53f-api's
+//! `dialect/glm.rs` (Hugh Madden, MIT); the code here reads the tag format
+//! above (vLLM's `qwen3_coder` dialect):
+//!
+//! - a call that cannot be read (closing tag missing, `<function=...>` absent,
+//!   markup in the name, arguments without a name, or an empty/markup
+//!   parameter key) is returned as content from its opening tag;
+//! - `finish_reason: tool_calls` counts only calls that parsed, so an
+//!   unreadable call never fails the request and never claims a tool call;
+//! - an unreadable parameter key loses the whole call: the argument cannot be
+//!   named, and the call that would be released (with that argument silently
+//!   missing, or with a `""` key) is not the one the model meant. Stray text
+//!   between arguments is still dropped from its call (its bytes still return
+//!   as content if the call is later lost);
+//! - each lost call is logged.
+//!
+//! Results are independent of how the text is chunked.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
@@ -35,6 +56,9 @@ const PARAMETER: &str = "<parameter=";
 const PARAMETER_END: &str = "</parameter>";
 /// Turn markers that end the assistant message when decoded as text.
 pub const STOP_MARKERS: [&str; 5] = ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "<tool_response>", "</tool_response>"];
+/// What ends a call's name or stray text in a call: a parameter, the function
+/// close, or the call close.
+const CALL_TAGS: [&str; 3] = [PARAMETER, FUNCTION_END, TOOL_CALL_END];
 
 /// Parser settings for one request.
 #[derive(Debug, Clone, Default)]
@@ -49,20 +73,34 @@ pub struct QwenParserOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode { Reasoning, Content, Function, Name, Arguments, Key, Value, CallEnd, Discard, Done }
+enum Mode {
+    Reasoning,
+    Content,
+    Function,
+    Name,
+    Arguments,
+    Key,
+    Value,
+    CallEnd,
+    Skip,
+    Lost(&'static str),
+    Done,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Marker { ThinkOpen, ThinkClose, Call, Stop, Sequence }
 
-#[derive(Debug)]
+/// A call being read; nothing of it goes out before its closing tag.
+#[derive(Debug, Default)]
 struct Call {
     name: String,
     key: Option<String>,
-    arguments: usize,
-    /// The current value streams as a JSON string.
-    string_open: bool,
-    /// The value's leading newline has been handled.
-    value_started: bool,
+    /// Each argument's `"key":value` JSON, in the order keys first appear.
+    arguments: Vec<(String, String)>,
+    /// The call's text from its opening tag, content again if the call is lost.
+    text: String,
+    /// Whitespace held before the opening tag, kept with a lost call's text.
+    before: String,
 }
 
 #[derive(Debug)]
@@ -72,7 +110,6 @@ pub struct QwenOutputParser {
     pending: String,
     call: Option<Call>,
     calls: usize,
-    saw_tool_call: bool,
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
@@ -82,7 +119,7 @@ impl QwenOutputParser {
     pub fn new(mut options: QwenParserOptions) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
-        Self { options, mode, pending: String::new(), call: None, calls: 0, saw_tool_call: false,
+        Self { options, mode, pending: String::new(), call: None, calls: 0,
             content_started: false, held_whitespace: String::new(), stop: None }
     }
 
@@ -95,18 +132,18 @@ impl QwenOutputParser {
         out
     }
 
-    /// Flush held text at end of output. An open call is closed so its
-    /// arguments stay a JSON object.
+    /// Flush held text at end of output. A call still open never closed: its
+    /// text is returned as content.
     pub fn finish(&mut self) -> Vec<OutputChunk> {
         let mut out = Vec::new();
         if self.mode != Mode::Done {
             while self.step(true, &mut out) {}
-            if self.mode == Mode::Value && self.call.as_ref().is_some_and(|call| call.string_open) {
-                let fragment = std::mem::take(&mut self.pending);
-                let fragment = fragment.strip_suffix('\n').unwrap_or(&fragment);
-                out.push(arguments(json_string_contents(fragment)));
+            if self.call.is_some() {
+                let reason = if let Mode::Lost(reason) = self.mode { reason } else { "closing tag missing" };
+                let pending = std::mem::take(&mut self.pending);
+                if let Some(call) = self.call.as_mut() { call.text.push_str(&pending); }
+                self.lose(reason, &mut out);
             }
-            self.close_call(&mut out);
             self.mode = Mode::Done;
         }
         self.held_whitespace.clear();
@@ -116,19 +153,22 @@ impl QwenOutputParser {
     /// The reason the parser stopped early, if it did.
     pub fn stop(&self) -> Option<&GlmStop> { self.stop.as_ref() }
 
-    /// Tool calls started so far (each produced a `ToolCall` chunk).
+    /// Parsed (closed) tool calls so far; a lost call never counts.
     pub fn tool_calls(&self) -> usize { self.calls }
+
+    fn tools_enabled(&self) -> bool { self.options.tools.is_some() }
 
     fn step(&mut self, finishing: bool, out: &mut Vec<OutputChunk>) -> bool {
         match self.mode {
             Mode::Reasoning | Mode::Content => self.step_text(finishing, out),
-            Mode::Function => self.step_expect(&[FUNCTION], out),
-            Mode::Name => self.step_name(out),
-            Mode::Arguments => self.step_expect(&[PARAMETER, FUNCTION_END], out),
-            Mode::Key => self.step_key(out),
-            Mode::Value => self.step_value(out),
-            Mode::CallEnd => self.step_expect(&[TOOL_CALL_END], out),
-            Mode::Discard => self.step_discard(),
+            Mode::Function => self.step_function(),
+            Mode::Name => self.step_name(),
+            Mode::Arguments => self.step_arguments(),
+            Mode::Key => self.step_key(),
+            Mode::Value => self.step_value(),
+            Mode::CallEnd => self.step_call_end(out),
+            Mode::Skip => self.step_skip(),
+            Mode::Lost(reason) => self.step_lost(reason, out),
             Mode::Done => false,
         }
     }
@@ -136,7 +176,7 @@ impl QwenOutputParser {
     fn markers(&self) -> Vec<(&str, Marker)> {
         let mut markers = vec![(THINK_OPEN, Marker::ThinkOpen), (THINK_CLOSE, Marker::ThinkClose)];
         markers.extend(STOP_MARKERS.iter().map(|marker| (*marker, Marker::Stop)));
-        if self.options.tools.is_some() {
+        if self.tools_enabled() {
             if self.mode == Mode::Content { markers.push((TOOL_CALL, Marker::Call)); }
         } else {
             markers.push((TOOL_CALL, Marker::Stop));
@@ -171,8 +211,8 @@ impl QwenOutputParser {
             Marker::ThinkOpen => self.mode = Mode::Reasoning,
             Marker::ThinkClose => self.mode = Mode::Content,
             Marker::Call => {
-                self.held_whitespace.clear();
-                self.saw_tool_call = true;
+                let before = std::mem::take(&mut self.held_whitespace);
+                self.call = Some(Call { text: TOOL_CALL.into(), before, ..Call::default() });
                 self.mode = Mode::Function;
             }
             Marker::Stop => self.halt(GlmStop::Marker(marker)),
@@ -185,6 +225,7 @@ impl QwenOutputParser {
         self.stop = Some(reason);
         self.pending.clear();
         self.held_whitespace.clear();
+        self.call = None;
         self.mode = Mode::Done;
     }
 
@@ -194,8 +235,13 @@ impl QwenOutputParser {
             out.push(OutputChunk::Reasoning { content: text });
             return;
         }
-        if self.saw_tool_call { return; }
-        let text = if self.content_started { text.as_str() } else { text.trim_start() };
+        if self.calls == 0 { self.emit_content(&text, out); }
+    }
+
+    /// Visible content: leading whitespace is dropped, trailing whitespace
+    /// waits for more content.
+    fn emit_content(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
+        let text = if self.content_started { text } else { text.trim_start() };
         if text.is_empty() { return; }
         self.content_started = true;
         let body = text.trim_end();
@@ -207,118 +253,179 @@ impl QwenOutputParser {
         self.held_whitespace.push_str(trailing);
     }
 
-    /// Skip whitespace, then one of `expected` (a malformed call is discarded).
-    fn step_expect(&mut self, expected: &[&str], out: &mut Vec<OutputChunk>) -> bool {
-        trim_start(&mut self.pending);
-        if let Some(marker) = expected.iter().find(|marker| self.pending.starts_with(**marker)) {
-            self.pending.drain(..marker.len());
-            self.mode = match *marker {
-                FUNCTION => Mode::Name,
-                PARAMETER => Mode::Key,
-                FUNCTION_END => {
-                    self.close_call(out);
-                    Mode::CallEnd
-                }
-                _ => Mode::Content,
-            };
+    /// Consume `length` bytes of pending text; an open call keeps them.
+    fn take(&mut self, length: usize) -> String {
+        let text: String = self.pending.drain(..length).collect();
+        if let Some(call) = self.call.as_mut() { call.text.push_str(&text); }
+        text
+    }
+
+    fn take_whitespace(&mut self) {
+        self.take(self.pending.len() - self.pending.trim_start().len());
+    }
+
+    /// After `<tool_call>`: expect `<function=NAME>`; anything else is a lost
+    /// call (empty, arguments without a name, or no function tag at all).
+    fn step_function(&mut self) -> bool {
+        self.take_whitespace();
+        if self.pending.starts_with(FUNCTION) {
+            self.take(FUNCTION.len());
+            self.mode = Mode::Name;
             return true;
         }
-        if expected.iter().any(|marker| marker.starts_with(self.pending.as_str())) { return false; }
-        self.enter_discard(out);
+        if [FUNCTION, TOOL_CALL_END].iter().any(|tag| tag.starts_with(self.pending.as_str())) { return false; }
+        let text = self.pending.trim_start();
+        let reason = if text.starts_with(TOOL_CALL_END) { "empty call" }
+            else if text.starts_with(PARAMETER) { "arguments without a name" }
+            else { "missing <function=...>" };
+        self.mode = Mode::Lost(reason);
         true
     }
 
-    fn step_name(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+    /// Read the function name up to `>`.
+    fn step_name(&mut self) -> bool {
         let Some(end) = self.pending.find('>') else { return false; };
         let name = self.pending[..end].trim().to_owned();
-        self.pending.drain(..=end);
+        self.take(end + 1);
         if name.is_empty() || name.contains(['<', '\n']) {
-            self.mode = Mode::Discard;
+            self.mode = Mode::Lost(if name.is_empty() { "empty call" } else { "markup in the name" });
             return true;
         }
-        self.calls += 1;
-        out.push(OutputChunk::ToolCall { tool_name: name.clone(), arguments: "{".into() });
-        self.call = Some(Call { name, key: None, arguments: 0, string_open: false, value_started: false });
+        self.call.as_mut().expect("a call is open").name = name;
         self.mode = Mode::Arguments;
         true
     }
 
-    fn step_key(&mut self, out: &mut Vec<OutputChunk>) -> bool {
-        let Some(end) = self.pending.find('>') else { return false; };
-        let key = self.pending[..end].trim().to_owned();
-        self.pending.drain(..=end);
-        if key.is_empty() || key.contains(['<', '\n']) {
-            self.enter_discard(out);
+    /// After the name: expect `<parameter=...>` or `</function>`; stray text is
+    /// dropped from the call.
+    fn step_arguments(&mut self) -> bool {
+        self.take_whitespace();
+        if self.pending.starts_with(PARAMETER) {
+            self.take(PARAMETER.len());
+            self.mode = Mode::Key;
             return true;
         }
-        let string = value_is_string(&self.options, self.call.as_ref().expect("a call is open").name.as_str(), &key);
-        let call = self.call.as_mut().expect("a call is open");
-        call.value_started = false;
-        if string {
-            let separator = if call.arguments == 0 { "" } else { "," };
-            call.arguments += 1;
-            call.string_open = true;
-            out.push(arguments(format!("{separator}{}:\"", serde_json::to_string(&key).expect("string key"))));
+        if self.pending.starts_with(FUNCTION_END) {
+            self.take(FUNCTION_END.len());
+            self.mode = Mode::CallEnd;
+            return true;
         }
-        call.key = Some(key);
+        if self.pending.starts_with(TOOL_CALL_END) {
+            self.mode = Mode::Lost("closing tag missing before </function>");
+            return true;
+        }
+        if CALL_TAGS.iter().any(|tag| tag.starts_with(self.pending.as_str())) { return false; }
+        self.skip("stray text between arguments");
+        true
+    }
+
+    /// Read the parameter key up to `>`; an unreadable key loses the whole
+    /// call — the argument it introduces cannot be named, and the call that
+    /// would be released is not the one the model meant.
+    fn step_key(&mut self) -> bool {
+        let Some(end) = self.pending.find('>') else { return false; };
+        let key = self.pending[..end].trim().to_owned();
+        self.take(end + 1);
+        if key.is_empty() || key.contains(['<', '\n']) {
+            self.mode = Mode::Lost("unreadable argument key");
+            return true;
+        }
+        self.call.as_mut().expect("a call is open").key = Some(key);
         self.mode = Mode::Value;
         true
     }
 
-    fn step_value(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+    /// Read a value up to `</parameter>`; one leading and one trailing newline
+    /// are stripped, then the value is typed by the tool schema.
+    fn step_value(&mut self) -> bool {
+        let Some(end) = self.pending.find(PARAMETER_END) else { return false; };
+        let raw: String = self.pending[..end].to_owned();
+        self.take(end + PARAMETER_END.len());
+        let raw = raw.strip_prefix('\n').unwrap_or(&raw);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        let (name, key) = {
+            let call = self.call.as_mut().expect("a call is open");
+            let key = call.key.take().expect("a key precedes its value");
+            (call.name.clone(), key)
+        };
+        let value = if value_is_string(&self.options, &name, &key) { Value::String(raw.to_owned()) }
+            else { typed_value(raw) };
+        let text = format!("{}:{}", serde_json::to_string(&key).expect("string key"),
+            serde_json::to_string(&value).expect("JSON value"));
         let call = self.call.as_mut().expect("a call is open");
-        if !call.value_started {
-            if self.pending.is_empty() { return false; }
-            if self.pending.starts_with('\n') { self.pending.drain(..1); }
-            call.value_started = true;
+        match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(argument) => {
+                tracing::warn!(tool = %call.name, key = %key,
+                    "Qwen tool call argument repeated; the last value is kept");
+                argument.1 = text;
+            }
+            None => call.arguments.push((key, text)),
         }
-        let Some(end) = self.pending.find(PARAMETER_END) else {
-            if !call.string_open { return false; }
-            // Hold a possible split `</parameter>` and a trailing newline (the wrapper's).
-            let mut emit = self.pending.len() - held_prefix(&self.pending, PARAMETER_END);
-            if self.pending[..emit].ends_with('\n') { emit -= 1; }
-            if emit == 0 { return false; }
-            let fragment: String = self.pending.drain(..emit).collect();
-            out.push(arguments(json_string_contents(&fragment)));
-            return true;
-        };
-        let raw: String = self.pending.drain(..end).collect();
-        self.pending.drain(..PARAMETER_END.len());
-        let raw = raw.strip_suffix('\n').unwrap_or(&raw);
-        let call = self.call.as_mut().expect("a call is open");
-        let key = call.key.take().expect("a key precedes its value");
-        let delta = if call.string_open {
-            call.string_open = false;
-            format!("{}\"", json_string_contents(raw))
-        } else {
-            let separator = if call.arguments == 0 { "" } else { "," };
-            call.arguments += 1;
-            format!("{separator}{}:{}", serde_json::to_string(&key).expect("string key"),
-                serde_json::to_string(&typed_value(raw)).expect("JSON value"))
-        };
-        out.push(arguments(delta));
         self.mode = Mode::Arguments;
         true
     }
 
-    /// Drop malformed call text through `</tool_call>`. A call whose name was
-    /// already streamed is closed so clients never see unbalanced JSON.
-    fn step_discard(&mut self) -> bool {
-        let Some(end) = self.pending.find(TOOL_CALL_END) else { return false; };
-        self.pending.drain(..end + TOOL_CALL_END.len());
-        self.mode = Mode::Content;
+    /// After `</function>`: expect `</tool_call>`.
+    fn step_call_end(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+        self.take_whitespace();
+        if self.pending.starts_with(TOOL_CALL_END) {
+            self.take(TOOL_CALL_END.len());
+            self.release(out);
+            return true;
+        }
+        if TOOL_CALL_END.starts_with(self.pending.as_str()) { return false; }
+        self.mode = Mode::Lost("closing tag missing before </tool_call>");
         true
     }
 
-    fn enter_discard(&mut self, out: &mut Vec<OutputChunk>) {
-        self.close_call(out);
-        self.mode = Mode::Discard;
+    /// Drop stray text between arguments up to the call's next tag.
+    fn skip(&mut self, reason: &'static str) {
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = None;
+        tracing::warn!(tool = %call.name, reason, "Qwen tool call text dropped");
+        self.mode = Mode::Skip;
     }
 
-    fn close_call(&mut self, out: &mut Vec<OutputChunk>) {
-        if let Some(call) = self.call.take() {
-            out.push(arguments(if call.string_open { "\"}" } else { "}" }.into()));
+    fn step_skip(&mut self) -> bool {
+        if let Some((index, _)) = first_of(&self.pending, &CALL_TAGS) {
+            self.take(index);
+            self.mode = Mode::Arguments;
+            return true;
         }
+        let held = CALL_TAGS.iter().map(|tag| held_prefix(&self.pending, tag)).max().unwrap_or(0);
+        self.take(self.pending.len() - held);
+        false
+    }
+
+    /// A lost call runs through its closing tag, or up to a new call.
+    fn step_lost(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) -> bool {
+        let Some((index, tag)) = first_of(&self.pending, &[TOOL_CALL_END, TOOL_CALL]) else { return false; };
+        self.take(if tag == TOOL_CALL_END { index + tag.len() } else { index });
+        self.lose(reason, out);
+        true
+    }
+
+    /// Return a call that cannot be read as content, from its opening tag
+    /// (after the whitespace that preceded it), and log it.
+    fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
+        let call = self.call.take().expect("a call is open");
+        tracing::warn!(reason, text = %excerpt(&call.text), "Qwen tool call returned as content");
+        self.held_whitespace = call.before;
+        self.emit_content(&call.text, out);
+        self.mode = Mode::Content;
+    }
+
+    /// The call closed: send it, a comma before each argument but the first.
+    fn release(&mut self, out: &mut Vec<OutputChunk>) {
+        let call = self.call.take().expect("a call is open");
+        out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
+        for (index, (_, text)) in call.arguments.into_iter().enumerate() {
+            let text = if index > 0 { format!(",{text}") } else { text };
+            out.push(arguments(text));
+        }
+        out.push(arguments("}".into()));
+        self.calls += 1;
+        self.mode = Mode::Content;
     }
 }
 
@@ -342,14 +449,17 @@ fn held_prefix(text: &str, marker: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn trim_start(text: &mut String) {
-    let whitespace = text.len() - text.trim_start().len();
-    text.drain(..whitespace);
+/// The earliest of `tags` in `text`: (index, tag).
+fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
+    tags.iter().filter_map(|&tag| text.find(tag).map(|index| (index, tag))).min_by_key(|&(index, _)| index)
 }
 
-fn json_string_contents(value: &str) -> String {
-    let quoted = serde_json::to_string(value).expect("string serializes");
-    quoted[1..quoted.len() - 1].to_owned()
+/// A short excerpt of model text for a log line.
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(80) {
+        Some((cut, _)) => format!("{:?}...", &text[..cut]),
+        None => format!("{text:?}"),
+    }
 }
 
 /// A non-string parameter: JSON, else `true`/`false` in any case, else the text.

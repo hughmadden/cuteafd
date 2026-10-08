@@ -56,6 +56,14 @@ def test_tools_are_deterministic_and_validated():
     assert workspace.execute("delete_everything", "{}")[1] == "unknown tool 'delete_everything'"
 
 
+def test_missing_jsonschema_keeps_the_validation_error_contract(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    bench = load()
+    assert bench.validate_call("read_file", '{"file": "x"}').startswith("arguments do not match the schema:")
+    assert bench.validate_call("read_file", '{"path": "x"}') is None
+
+
 def test_stream_accumulates_tool_call_deltas_and_times_first_output(monkeypatch):
     bench = load()
     events = [

@@ -21,7 +21,9 @@
   let shown = false;
   async function poll() {
     try {
-      const status = await (await fetch('/v1/bench/status', {cache: 'no-store'})).json();
+      const response = await (window.cuteafdAuthenticatedFetch || fetch)('/v1/bench/status', {cache: 'no-store'});
+      if (response.status === 404) return; // Bench controls are opt-in.
+      const status = response.ok ? await response.json() : {};
       const active = status.active;
       if (active) {
         if (!bar.isConnected) document.body.prepend(bar);

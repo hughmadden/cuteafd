@@ -36,3 +36,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 cuteafd-ffi = { path = "../cuteafd-ffi", features = ["test-support"] }
 tempfile.workspace = true
+tower.workspace = true

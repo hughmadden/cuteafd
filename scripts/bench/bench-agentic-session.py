@@ -339,7 +339,7 @@ def validate_call(name: str, arguments: str) -> str | None:
     except ImportError:
         schema = TOOL_SCHEMAS[name]["parameters"]
         missing = [key for key in schema["required"] if key not in args]
-        return f"missing {missing}" if missing else None
+        return f"arguments do not match the schema: missing {missing}" if missing else None
     try:
         jsonschema.validate(args, TOOL_SCHEMAS[name]["parameters"])
     except jsonschema.ValidationError as error:

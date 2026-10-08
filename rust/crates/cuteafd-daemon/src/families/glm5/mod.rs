@@ -264,6 +264,7 @@ impl Opened {
             }
             None => None,
         };
+        let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");

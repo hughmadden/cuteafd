@@ -2875,6 +2875,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create(
 
 static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
     const char* requested_device_name, uint32_t port_num, uint32_t local_psn,
+    int requested_gid_index,
     size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
     size_t recv_registered_span_bytes, uint32_t max_send_wr, uint32_t max_recv_wr,
     uint32_t max_sge, uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out) {
@@ -2997,8 +2998,14 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   ibv_gid local_gid = {};
   uint32_t local_gid_index = 0;
   cuteafd_status_t status =
-      select_rc_gid(endpoint->context, endpoint->port_attr, port_num, &local_gid,
-                    &local_gid_index);
+      requested_gid_index < 0
+          ? select_rc_gid(endpoint->context, endpoint->port_attr, port_num, &local_gid,
+                          &local_gid_index)
+          : (ibv_query_gid(endpoint->context, static_cast<uint8_t>(port_num),
+                           requested_gid_index, &local_gid) == 0
+                 ? CUTEAFD_STATUS_OK
+                 : fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "selected RoCE GID is unavailable"));
+  if (requested_gid_index >= 0) local_gid_index = static_cast<uint32_t>(requested_gid_index);
   if (status != CUTEAFD_STATUS_OK) {
     destroy_rdma_rc_endpoint(endpoint);
     return status;
@@ -3135,7 +3142,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_with_buffer_flags(
     uint32_t max_recv_wr, uint32_t max_sge, uint64_t host_buffer_flags,
     cuteafd_rdma_rc_endpoint_info_t* out) {
   return create_rdma_rc_endpoint_with_buffer_flags(
-      nullptr, port_num, local_psn, send_frame_bytes, recv_frame_bytes,
+      nullptr, port_num, local_psn, -1, send_frame_bytes, recv_frame_bytes,
       send_registered_span_bytes, recv_registered_span_bytes, max_send_wr, max_recv_wr, max_sge,
       host_buffer_flags, out);
 }
@@ -3150,9 +3157,23 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_device_with_buffe
                 "RDMA RC endpoint requested device name is empty");
   }
   return create_rdma_rc_endpoint_with_buffer_flags(
-      device_name, port_num, local_psn, send_frame_bytes, recv_frame_bytes,
+      device_name, port_num, local_psn, -1, send_frame_bytes, recv_frame_bytes,
       send_registered_span_bytes, recv_registered_span_bytes, max_send_wr, max_recv_wr, max_sge,
       host_buffer_flags, out);
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+    const char* device_name, uint32_t port_num, uint32_t gid_index, uint32_t local_psn,
+    size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
+    size_t recv_registered_span_bytes, uint32_t max_send_wr, uint32_t max_recv_wr,
+    uint32_t max_sge, uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out) {
+  if (device_name == nullptr || device_name[0] == '\0' || gid_index > 255) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid RDMA device or GID index");
+  }
+  return create_rdma_rc_endpoint_with_buffer_flags(
+      device_name, port_num, local_psn, static_cast<int>(gid_index), send_frame_bytes,
+      recv_frame_bytes, send_registered_span_bytes, recv_registered_span_bytes,
+      max_send_wr, max_recv_wr, max_sge, host_buffer_flags, out);
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_buffer_view(

@@ -19,6 +19,7 @@ pub struct Client {
     pub model: String,
     agent: ureq::Agent,
     token: Option<String>,
+    api_key: Option<cuteafd_api::openai::auth::ApiKey>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -49,9 +50,18 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel }
+        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None }
     }
 
+    pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
+        self.api_key = key;
+        self
+    }
+    fn authorize(&self, mut request: ureq::Request) -> ureq::Request {
+        if let Some(key) = &self.api_key { request = request.set("Authorization", &key.authorization()); }
+        else if let Some(token) = &self.token { request = request.set("Authorization", &format!("Bearer {token}")); }
+        request
+    }
     /// The run's lockout token (subprocesses pass it as their API key).
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
@@ -66,7 +76,7 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        let response = self.agent.get(&format!("{}{path}", self.base)).call()
+        let response = self.authorize(self.agent.get(&format!("{}{path}", self.base))).call()
             .with_context(|| format!("GET {path}"))?;
         Ok(response.into_json()?)
     }
@@ -96,7 +106,7 @@ impl Client {
         if let Some(token) = &self.token {
             request = request.set(BENCH_HEADER, token).set("Authorization", &format!("Bearer {token}"));
         }
-        match request.send_json(serde_json::json!({"body": body, "spec": spec})) {
+        match self.authorize(request).send_json(serde_json::json!({"body": body, "spec": spec})) {
             Ok(response) => Ok(response.into_json()?),
             Err(ureq::Error::Status(code, response)) => {
                 let detail = response.into_string().unwrap_or_default();
@@ -127,7 +137,7 @@ impl Client {
             request = request.set(probe::HEADER, id);
         }
         let started = Instant::now();
-        let response = match request.send_string(&body.to_string()) {
+        let response = match self.authorize(request).send_string(&body.to_string()) {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();

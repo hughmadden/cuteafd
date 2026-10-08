@@ -114,6 +114,7 @@ impl LocalTp4Client {
     /// arrive as RDMA writes (their flags tell the GPU). Send completions are
     /// reaped as send slots are reused.
     pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        crate::health::ensure_available()?;
         anyhow::ensure!(self.deadline.is_none(), "a received wave is pending on this transport");
         self.flows.ensure_all(&self.peers)?;
         for rank in 0..self.peers.len() {
@@ -159,11 +160,13 @@ impl LocalTp4Client {
         self.deadline = None;
     }
     pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        crate::health::ensure_available()?;
         anyhow::ensure!(!self.terminal_failed && !self.terminal_quiesced,
             "terminal-owned Spark transport cannot be reused after failure or quiescence");
         anyhow::ensure!(self.deadline.is_none(), "local TP4 request already pending");
         let result = self.post(request);
-        if result.is_err() {
+        if let Err(error) = &result {
+            crate::health::record_failure(format!("expert dispatch failed: {error:#}"));
             self.reset();
         }
         result
@@ -265,7 +268,15 @@ impl LocalTp4Client {
         self.terminal_released = true;
         Ok(())
     }
-    pub(crate) fn poll<F>(&mut self, mut sink: F) -> Result<bool>
+    pub(crate) fn poll<F>(&mut self, sink: F) -> Result<bool>
+    where F: FnMut(VerbsHostProtocolV2ResponseChunk) -> Result<()>, {
+        let result = self.poll_inner(sink);
+        if let Err(error) = &result {
+            crate::health::record_failure(format!("expert response failed: {error:#}"));
+        }
+        result
+    }
+    fn poll_inner<F>(&mut self, mut sink: F) -> Result<bool>
     where
         F: FnMut(VerbsHostProtocolV2ResponseChunk) -> Result<()>,
     {

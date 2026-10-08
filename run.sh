@@ -55,7 +55,8 @@ container-name characters, [A-Za-z0-9_.-], as scripts/launch/run-family.sh does.
   --tp2-dspark-experts          split native draft routed experts (default off)
   --no-tp2-<option>             disable the corresponding configured TP2 option
   --wip SLOT                     serve a ./wip.sh slot's artifacts in the dev images
-  --restart                     replace the current release deployment
+  --restart                     replace this instance's release deployment
+  --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate without changing services
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
@@ -75,6 +76,7 @@ EOF
 
 config="$repo_root/cuteafd.config"
 restart=0
+restart_all=0
 dry_run=0
 dspark_draft_limit=""
 wip_slot=""
@@ -111,11 +113,14 @@ while [[ $# -gt 0 ]]; do
     --no-tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=off; shift ;;
     --wip) wip_slot="${2:?$1 requires SLOT}"; shift 2 ;;
     --restart) restart=1; shift ;;
+    --all) restart_all=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) release_die "unknown run argument: $1" ;;
   esac
 done
+
+((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
 
 # Every family but DeepSeek V4.1 launches through scripts/launch/run-family.sh
 # (same config file, same container names, so ./stop.sh stops it); the family
@@ -131,6 +136,7 @@ if [[ "$family" != deepseek_v41 ]]; then
   [[ -z "$table_override" ]] || family_args+=(--table-backend "$table_override")
   [[ -z "$embedding_override" ]] || family_args+=(--embedding-placement "$embedding_override")
   ((restart == 0)) || family_args+=(--restart)
+  ((restart_all == 0)) || family_args+=(--all)
   [[ -z "$wip_slot" ]] || family_args+=(--wip "$wip_slot")
   exec "$repo_root/scripts/launch/run-family.sh" "${family_args[@]}"
 fi
@@ -482,8 +488,10 @@ if ((dry_run)); then
   [[ -z "$spark_exl3_identity" ]] || echo "  Spark EXL3 package: $spark_exl3_identity"
   exit 0
 fi
+release_prepare_api_key "${ENABLE_BENCH:-off}" "${INSTANCE:-default}"
 if ((restart)); then
   release_stop_services "$coordinator" "$spark_prefix"
+  ((restart_all == 0)) || release_stop_all_worker_containers
 else
   docker inspect "$coordinator" >/dev/null 2>&1 && release_die "$coordinator already exists; use --restart"
   for i in "${!hosts[@]}"; do
@@ -555,6 +563,17 @@ start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
+local -a api_mount_args=()
+if [[ -n "${API_KEY_FILE:-}" ]]; then
+  [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
+  api_mount_args=(--mount "type=bind,src=$(readlink -f "$API_KEY_FILE"),dst=/run/cuteafd-api-key,readonly")
+  args+=(--api-key-file /run/cuteafd-api-key)
+fi
+case "${ENABLE_BENCH:-off}" in
+  on) args+=(--enable-bench) ;;
+  off) ;;
+  *) release_die "ENABLE_BENCH must be on or off" ;;
+esac
 args+=(--table-backend "$TABLE_BACKEND")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
@@ -586,7 +605,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   "${rdma_env_args[@]}" "${table_env_args[@]}" \
   "${wip_mount_args[@]}" \
-  -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
+  "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
@@ -597,15 +616,15 @@ if [[ -n "$placement_directory" ]]; then
     ((SECONDS < deadline)) || release_die "timed out waiting for coordinator placement"
     sleep 1
   done
-  # Accept the coordinator's actual RTX count (1 or 2) and require it to match
-  # the layout this launch selected.
+  # A failed P2P startup probe may reduce a selected two-GPU layout to one.
+  # Never accept an expansion beyond the GPUs admitted by this launch.
   spark_first_layer="$(jq -er --argjson gpus "$RELEASE_RTX_GPUS" --arg requested "$RTX_EXPERT_LAYERS" '
     select(.version == 1)
-    | select((.rtx_gpus | type) == "number" and .rtx_gpus == $gpus)
+    | select((.rtx_gpus | type) == "number" and (.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus)
     | select((.nonce | type) == "string" and (.nonce | length) > 0)
     | select((.rtx_expert_layers | type) == "number")
     | select(.rtx_expert_layers == (.rtx_expert_layers | floor) and .rtx_expert_layers >= 0 and .rtx_expert_layers <= 40)
-    | select(.rtx_expert_layers > 0 or $gpus == 1)
+    | select(.rtx_expert_layers > 0 or .rtx_gpus == 1)
     | select($requested == "auto" or .rtx_expert_layers == ($requested | tonumber))
     | select(.spark_first_layer == ([.rtx_expert_layers, 39] | min))
     | .spark_first_layer' <<<"$placement_plan")" || release_die "invalid coordinator placement plan"

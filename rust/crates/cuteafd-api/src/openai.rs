@@ -12,7 +12,6 @@ use deepseek_recipe::{
     openai::ChatCompletionRequest,
     request::{ConversionOptions, ProtocolRequest},
     response::ProtocolResponse,
-    stream::StreamProcessor,
     util::append_delta::AppendDelta,
 };
 use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, v4::dsv41::DeepseekV41Encoding, PromptEncoding};
@@ -77,6 +76,7 @@ pub fn set_media_input_policy(vision: bool, audio: bool) {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    pub engine_health: Option<health::HealthWitness>,
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
@@ -96,7 +96,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, media_preparer: None, vision_health: None,
+        Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None }
     }
 
@@ -139,12 +139,14 @@ impl Default for ModelProfile {
         Self::new(MODEL, ModelEncoding::DeepseekV41)
     }
 }
+pub mod auth;
+pub mod health;
 mod limits;
 mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{glm5, qwen4};
+use chat::{deepseek, glm5, qwen4};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -234,12 +236,21 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         profile.capabilities.vision &= vision;
         profile.capabilities.audio &= audio;
     }
+    let health_queue = queue.clone();
+    let engine_health = profile.engine_health.clone();
+    let middleware_health = engine_health.clone().unwrap_or_else(|| health::HealthWitness(Arc::new(|| None)));
+    let witness = health::HealthWitness(Arc::new(move || {
+        engine_health.as_ref().and_then(health::HealthWitness::reason)
+            .or_else(|| health_queue.is_closed().then(|| "scheduler stopped".into()))
+    }));
+    profile.engine_health = Some(witness.clone());
     let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
+        .route("/v1/console/events", get(console::events))
         .route("/v1/console/snapshot", get(console::snapshot))
         .route("/assets/cuteafd-ui.css", get(console::ui_css))
         .route("/assets/cuteafd-ui.js", get(console::ui_js))
@@ -254,6 +265,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
         .with_state(NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) })
         .merge(console_routes)
+        .layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
@@ -294,13 +306,17 @@ async fn models(State(state): State<NativeState>) -> Json<Value> {
     Json(json!({"object":"list","data":[model]}))
 }
 async fn health(State(state): State<NativeState>) -> Response {
+    if let Some(reason) = state.profile.engine_health.as_ref().and_then(health::HealthWitness::reason) {
+        return health::unavailable(reason);
+    }
     let vision = state.profile.vision_health.as_ref().map(|h| h.load(Ordering::Acquire));
     let audio = state.profile.audio_health.as_ref().map(|h| h.load(Ordering::Acquire));
     let status = if state.queue.is_closed() || vision == Some(false) || audio == Some(false) {
         StatusCode::SERVICE_UNAVAILABLE
     } else { StatusCode::OK };
-    if vision.is_none() && audio.is_none() { return status.into_response(); }
     let mut readiness = serde_json::Map::new();
+    readiness.insert("status".into(), json!(if status == StatusCode::OK { "ok" } else { "unavailable" }));
+    if status != StatusCode::OK { readiness.insert("reason".into(), json!("media encoder failed")); }
     if let Some(healthy) = vision { readiness.insert("vision".into(), json!(if healthy { "ready" } else { "failed" })); }
     if let Some(healthy) = audio { readiness.insert("audio".into(), json!(if healthy { "ready" } else { "failed" })); }
     (status, Json(Value::Object(readiness))).into_response()
@@ -408,7 +424,7 @@ impl Templated {
 
 /// The family's generated-text parser in front of the OpenAI chunk generator.
 enum OutputProcessor {
-    Deepseek(StreamProcessor<ChatGenerator>),
+    Deepseek(glm5::GlmStreamProcessor<ChatGenerator, deepseek::parser::DeepseekOutputParser>),
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
 }
@@ -588,6 +604,11 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if let Some(thinking) = enable_thinking {
         converted.conversation.thinking_mode = thinking;
     }
+    // `convert` derives the stream parser's starting stage from the thinking
+    // mode before the overrides above can change it; a stale stage delivers the
+    // answer's leading text as reasoning_content.
+    converted.parsing_options.reasoning_initial_stage = converted.conversation.thinking_mode
+        .then_some(deepseek_recipe::stream::state_machine::ReasoningStage::Start);
     let model = state.profile.id.clone();
     if converted.model.as_deref() != Some(model.as_str()) {
         return error(StatusCode::BAD_REQUEST, format!("model must be {model}"));
@@ -670,7 +691,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         None => {
             if expanded_media_probe {
                 // Supplied native ids already contain image rows; do not render another prompt.
-                (String::new(), Vec::new(), OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
+                (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
             } else {
             let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
@@ -683,7 +704,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 rendered
             };
             (rendered.prompt, rendered.image_sources,
-                OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
+                OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
             }
         }
     };
@@ -1098,6 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
         let profiles = [ModelProfile::default(),
+            ModelProfile::new("test-dsv4", ModelEncoding::DeepseekV4),
             ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
             ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))];
         for profile in profiles {
