@@ -771,7 +771,7 @@ rm -rf "$release_source_dir"
 release_source_dir=""
 
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=coordinator \
@@ -1044,7 +1044,7 @@ fi
 if [[ "$phase" == image ]]; then
 python3 scripts/build/select-dev-image.py labels --manifest "$dev_manifest" >"$dev_manifest.labels"
 mapfile -t release_dev_reuse_label_args <"$dev_manifest.labels"
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=expert \

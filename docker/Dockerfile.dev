@@ -1,5 +1,8 @@
+# syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
 FROM ${BASE_IMAGE}
+ARG TARGETARCH
+# Cache mounts stay out of layers. Reset with: docker buildx prune --filter type=exec.cachemount
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HF_HUB_OFFLINE=1
@@ -30,12 +33,14 @@ RUN KACHE_VERSION=${KACHE_VERSION} SCCACHE_VERSION=${SCCACHE_VERSION} bash /opt/
 
 ENV UV_SYSTEM_PYTHON=1
 
-RUN python3 -m pip install --no-cache-dir "uv==0.12.23" && \
-    uv pip install --system --break-system-packages --no-cache \
+RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+    python3 -m pip install "uv==0.12.23" && \
+    uv pip install --system --break-system-packages \
       "pytest==9.1.1" \
       "safetensors==0.8.0" \
       "huggingface-hub==1.14.0" && \
-    uv pip install --system --break-system-packages --no-cache \
+    uv pip install --system --break-system-packages \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
       "cuda-tile==1.5.0" \
@@ -47,7 +52,7 @@ RUN python3 -m pip install --no-cache-dir "uv==0.12.23" && \
       "tabulate==0.10.0" \
       "transformers==5.13.0" \
       "rich==15.0.0" && \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
+    uv pip install --system --break-system-packages --no-deps \
       "flashinfer-python==0.6.14"
 
 # Toolchain only: kernels and their lock come from the mounted checkout.

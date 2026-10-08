@@ -86,7 +86,7 @@ run_id="${leg_log_dir##*/}"
 
 build_coordinator_dev() (
   [[ "$(uname -m)" == x86_64 ]] || release_die 'coordinator build must be native amd64'
-  docker build --build-arg BASE_IMAGE="$base_amd64" --build-arg CUTEAFD_ENGINE_COMMIT="$revision" \
+  DOCKER_BUILDKIT=1 docker build --build-arg BASE_IMAGE="$base_amd64" --build-arg CUTEAFD_ENGINE_COMMIT="$revision" \
     --build-arg CUTEAFD_TOOLCHAIN_HASH="$hash" -f "$repo_root/docker/Dockerfile.dev" -t "$coordinator_tag" "$repo_root"
   bash -c "$check_body" _ "$coordinator_tag" "$hash" amd64
 )
@@ -120,7 +120,7 @@ trap 'exit 143' TERM
 # Close the race between the first marker check and PID publication.
 [[ ! -e "$cancel_file" ]] || exit 143
 cd "$2"
-docker build --build-arg BASE_IMAGE="$3" --build-arg CUTEAFD_ENGINE_COMMIT="$4" \
+DOCKER_BUILDKIT=1 docker build --build-arg BASE_IMAGE="$3" --build-arg CUTEAFD_ENGINE_COMMIT="$4" \
   --build-arg CUTEAFD_TOOLCHAIN_HASH="$5" -f docker/Dockerfile.dev -t "$6" .
 REMOTE
   ssh -o BatchMode=yes "$seed_host" bash -s -- "$spark_tag" "$hash" arm64 <<<"$check_body"
