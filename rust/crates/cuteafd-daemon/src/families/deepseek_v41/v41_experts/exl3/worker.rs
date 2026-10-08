@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
     Exl3Weights,
 };
 use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
@@ -140,14 +140,18 @@ impl<'a> Exl3Worker<'a> {
         Exl3RowPolicy::active().capacities(capacity as usize)
     }
 
-    /// Validate every capacity before allocating or reading resident weights.
-    pub(crate) fn partition(directory: &Path, capacity: u32, rank: usize) -> Result<cuteafd_loader::V41Exl3Partition> {
+    /// Validate every capacity before allocating or reading resident weights,
+    /// including that each export carries the requested decode schedule.
+    pub(crate) fn partition(directory: &Path, capacity: u32, rank: usize, schedule: Exl3Schedule)
+        -> Result<cuteafd_loader::V41Exl3Partition> {
         use cuteafd_ffi::V41Exl3Layout;
         use cuteafd_loader::V41Exl3Partition;
         ensure!(rank < 6, "EXL3 worker rank must be 0..5");
+        schedule.validate(Exl3RowPolicy::active())?;
         let mut selected = None;
         for c in Self::capacities(capacity)? {
-            let layout = Exl3Execution::artifact_layout(&directory.join(format!("m{c}")))?;
+            schedule.check_export(directory, c)?;
+            let layout = Exl3Execution::artifact_layout(&schedule.directory(directory, c))?;
             ensure!(selected.is_none_or(|previous| previous == layout), "EXL3 capacity artifacts disagree on partition");
             ensure!(layout == V41Exl3Layout::Disjoint || layout == if rank % 2 == 0 {
                 V41Exl3Layout::PairedLast
@@ -168,9 +172,9 @@ impl<'a> Exl3Worker<'a> {
         cuteafd_core::expert_geometry().topk as usize
     }
 
-    pub(crate) fn plan(directory: &Path, capacity: u32) -> Result<usize> {
+    pub(crate) fn plan(directory: &Path, capacity: u32, schedule: Exl3Schedule) -> Result<usize> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
-            .map(|c| directory.join(format!("m{c}"))).collect();
+            .map(|c| schedule.directory(directory, c)).collect();
         let ownership_bytes = Exl3Execution::ownership_bytes(&directories[0])?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
@@ -190,6 +194,7 @@ impl<'a> Exl3Worker<'a> {
         directory: &Path,
         capacity: u32,
         available_bytes: usize,
+        schedule: Exl3Schedule,
     ) -> Result<Self> {
         let first = weights.first().context("EXL3 worker has no layers")?;
         let cuteafd_loader::V41Exl3Layer::Backbone(first_layer) = first.layout.layer else {
@@ -205,7 +210,7 @@ impl<'a> Exl3Worker<'a> {
             );
         }
         let layer_count = weights.len();
-        let budget = Self::plan(directory, capacity)?;
+        let budget = Self::plan(directory, capacity, schedule)?;
         ensure!(
             budget <= available_bytes,
             "EXL3 worker workspace exceeds device budget"
@@ -213,14 +218,14 @@ impl<'a> Exl3Worker<'a> {
         let mut executions = Vec::new();
         let row_policy = Exl3RowPolicy::active();
         let capacities = Self::capacities(capacity)?;
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = capacities.iter().map(|&c| schedule.directory(directory, c)).collect();
         let arena = Exl3Workspace::new(library, &directories)?;
         for c in capacities {
             let execution = unsafe {
                 Exl3Execution::with_shared_workspace(
                     library,
                     weights.clone(),
-                    &directory.join(format!("m{c}")),
+                    &schedule.directory(directory, c),
                     Exl3InputFormat::Fp8K32,
                     Some(arena.clone()),
                 )?

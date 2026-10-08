@@ -504,6 +504,35 @@ def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, f
 def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+@pytest.mark.parametrize("keys,schedule", [("", None), ("GLM5_FLASH_EXL3_SCHEDULE=default\n", None),
+                                            ("GLM5_FLASH_EXL3_SCHEDULE=gb10\n", "gb10")])
+def test_glmf_exl3_schedule_reaches_only_the_spark_workers(tmp_path, keys, schedule):
+    """The Spark EXL3 decode schedule is a worker option: gb10 is forwarded to every Spark
+    rank as --exl3-schedule gb10, the default passes nothing, the coordinator never sees it."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert "--exl3-schedule" not in coordinator
+    if schedule is None:
+        assert "--exl3-schedule" not in worker, worker
+    else:
+        assert f"--exl3-schedule {schedule} " in worker, worker
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_EXL3_SCHEDULE=fast\n", "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10"),
+    ("GLM5_FLASH_EXL3_SCHEDULE=gb10\nSPARK_COUNT=0\n", "GLM5_FLASH_EXL3_SCHEDULE=gb10 is a Spark expert schedule"),
+])
+def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, message):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
