@@ -143,6 +143,16 @@ class StopHostScopeTest(StopHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.hosts(lines)), set(FOUR_HOSTS + ["moa"]))
 
+    def test_family_launch_limits_do_not_block_stop(self):
+        for family in ["GLM-5.3", "GLM-5.3-Flash", "MiMo-V2.6-Pro", "Qwen3.8-Flash-Next", "DeepSeek-V4-Flash"]:
+            config = self.root / "family.config"
+            config.write_text(f"MODEL_ID=test/{family}\nSPARK_HOSTS=moa\nSPARK_COUNT=1\n"
+                              "CONCURRENCY=32\nRTX_EXPERT_LAYERS=70\nPREFILL_BATCH_TOKENS=32\n"
+                              "KV_POOL_TOKENS=100\nMAX_CONTEXT_TOKENS=2097152\n")
+            result, lines, _ = self.run_stop("--config", str(config))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(self.hosts(lines)), {"moa"})
+
     def test_mimo_dflash_config_stops_every_named_host(self):
         config = write_config(self.root / "mimo.config", SIX_HOSTS, spark_count=6,
                               extra="SPECULATOR=dflash2\n"
@@ -182,9 +192,33 @@ class StopHostScopeTest(StopHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(set(self.hosts(lines))), sorted(FOUR_HOSTS))
 
-    def test_wip_container_is_stopped_on_every_named_host(self):
-        config = write_config(self.root / "six.config", SIX_HOSTS, spark_count=4)
+    def test_default_stop_keeps_persistent_wip_containers_and_other_ports(self):
+        config = write_config(self.root / "own.config", FOUR_HOSTS, spark_count=4,
+                              extra="INSTANCE=own\nEXPERT_PORT=19555")
         result, lines, _ = self.run_stop("--config", str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("docker ps -aq" in line for line in lines))
+        self.assertFalse(any("bash -s --" in line and "cuteafd-spark-expert-wip" in line for line in lines))
+        for host in FOUR_HOSTS:
+            self.assertTrue(any(f"cuteafd-spark-expert-{host}-19555" in line for line in lines))
+            self.assertFalse(any(f"cuteafd-spark-expert-{host}-19441" in line for line in lines))
+
+    def test_default_stop_terminates_only_port_tracked_local_wip_process(self):
+        docker = self.bin / "docker"
+        docker.write_text(DOCKER_STUB.replace("container) exit 1", "container) exit 0")
+                          .replace("printf 'false", "printf 'true"))
+        config = write_config(self.root / "own.config", FOUR_HOSTS, spark_count=4,
+                              extra="INSTANCE=own\nADDR=127.0.0.1:19500\nEXPERT_PORT=19555")
+        result, _, log = self.run_stop("--config", str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("exec -i cuteafd-coordinator-wip bash -s -- coordinator-19500", log)
+        self.assertNotIn("stop -t 30 cuteafd-coordinator-wip", log)
+        self.assertNotIn("rm -f cuteafd-coordinator-wip", log)
+        self.assertIn("stop -t 30 cuteafd-coordinator-own", log)
+
+    def test_all_stops_wip_container_on_every_named_host(self):
+        config = write_config(self.root / "six.config", SIX_HOSTS, spark_count=4)
+        result, lines, _ = self.run_stop("--config", str(config), "--all")
         self.assertEqual(result.returncode, 0, result.stderr)
         for host in SIX_HOSTS:
             self.assertTrue(

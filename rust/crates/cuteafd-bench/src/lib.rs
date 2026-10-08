@@ -1,6 +1,6 @@
 //! The in-server benchmark: `/bench`, `/v1/bench/*` and `cuteafd bench`.
 //!
-//! A normally launched server runs benchmarks on request. The runner drives
+//! An explicitly enabled, keyed server runs benchmarks on request. The runner drives
 //! the server through its own OpenAI API over loopback (so SSE and the
 //! scheduler are measured), holds every other inference request off with
 //! 503 + Retry-After while it runs, and stores each report in SQLite. The
@@ -30,13 +30,12 @@ pub mod text;
 
 pub use runner::Bench;
 
-/// `router` with the benchmark mounted (routes and lockout) on the process-wide
-/// bench. `console` is the server's live console: a run allows token text on it
-/// while the lockout makes the run's own requests the only ones served.
+/// Compatibility entry point: no benchmark routes or lockout by default.
+/// Serving explicitly mounts `http::mount` only after validating its key.
 pub fn app(router: axum::Router, console: std::sync::Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
-    let bench = Bench::global();
-    bench.set_console(console);
-    http::mount(router, bench)
+    let _ = console;
+    // Serving opts in explicitly with a key via the daemon's API policy.
+    router
 }
 
 /// Records that the API now accepts requests on `listener` (readiness time

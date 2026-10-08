@@ -6,6 +6,20 @@ use std::time::Duration;
 pub mod bond;
 mod capabilities;
 pub mod fabric;
+
+/// A failed expert wire is terminal for a serving process. Never clear this on
+/// a new request: other lanes may still own queued work from the failed pass.
+pub mod health {
+    static FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    pub fn record_failure(reason: impl Into<String>) { let _ = FAILURE.set(reason.into()); }
+    pub fn failure_reason() -> Option<String> { FAILURE.get().cloned() }
+    pub(crate) fn ensure_available() -> anyhow::Result<()> {
+        if let Some(reason) = FAILURE.get() {
+            anyhow::bail!("expert wire unavailable until restart: {reason}");
+        }
+        Ok(())
+    }
+}
 mod debug_json;
 pub mod protocol_v2;
 pub mod expert;
@@ -14,6 +28,7 @@ pub use expert as v41_expert;
 mod protocol_v2_tcp;
 mod synthetic;
 mod verbs;
+pub use verbs::set_verbs_host_native_library_path;
 
 pub use capabilities::{
     inproc_capabilities, tcp_capabilities, verbs_host_app_transport_blocker, verbs_host_available,

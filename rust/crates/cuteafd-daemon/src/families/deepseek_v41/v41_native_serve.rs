@@ -76,6 +76,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         args.memory_reservation = Some("97%".parse()?);
     }
     args.host_cache_config()?;
+    let api = args.api.load()?;
     let listen = args.listen.clone();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
@@ -89,7 +90,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         .name("v41-target-cuda".into())
         .spawn(move || {
             let mut ready = Some(ready);
-            let result = worker(args, receive, &mut ready, worker_stats);
+            let result = crate::shared::api::catch_scheduler_panic(|| worker(args, receive, &mut ready, worker_stats));
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err(result
                     .as_ref()
@@ -97,9 +98,10 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
                     .map(|e| format!("{e:#}"))
                     .unwrap_or_else(|| "worker stopped during startup".into())));
             }
-            if let Err(error) = result {
-                tracing::error!(%error,"native target worker stopped");
-            }
+            let reason = result.err().map(|error| format!("scheduler stopped: {error:#}"))
+                .unwrap_or_else(|| "scheduler stopped".into());
+            tracing::error!(%reason, "native target worker stopped");
+            cuteafd_transport::health::record_failure(reason);
         })?;
     readiness
         .await
@@ -109,8 +111,9 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
-    let router = cuteafd_api::openai::router_with_console(send, limits, stats, http_queue_wait, console_hub.clone());
-    axum::serve(listener, cuteafd_bench::app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
+    let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
+        crate::shared::api::profile(cuteafd_api::openai::ModelProfile::default()));
+    axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -284,7 +287,20 @@ fn worker(
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
-    if args.rtx_gpus == 2 { return distributed::worker(args, receive, ready, stats); }
+    if args.rtx_gpus == 2 {
+        // Probe before the distributed loader reserves either device's weights.
+        // SAFETY: the configured native library is trusted and remains live for the probe.
+        let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+        if crate::shared::peer_split::probed_device(&library, 0, Some(1))?.is_none() {
+            args.rtx_gpus = 1;
+            args.tp2_dspark_experts = false;
+            args.tp2_output_projection = false;
+            args.tp2_query_projection = false;
+            args.tp2_attention = false;
+        } else {
+            return distributed::worker(args, receive, ready, stats);
+        }
+    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.

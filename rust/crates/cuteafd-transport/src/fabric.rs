@@ -84,6 +84,35 @@ pub struct Rail {
     pub effective_gbps: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdmaSelection {
+    pub device: String,
+    pub port: u32,
+    pub gid_index: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no active RoCE v2 IPv4 GID matches control address {address}{device_hint}")]
+pub struct RdmaAddressError {
+    pub address: std::net::IpAddr,
+    device_hint: String,
+}
+
+/// Select an exact source GID, not the first device or the first IPv4 rail.
+pub fn select_rdma_address(ports: &[RdmaPort], address: std::net::IpAddr,
+                           device_override: Option<&str>) -> std::result::Result<RdmaSelection, RdmaAddressError> {
+    for port in ports.iter().filter(|p| p.usable()) {
+        if device_override.is_some_and(|device| device != port.device) { continue; }
+        for &(gid_index, ipv4) in &port.roce_v2 {
+            if address == std::net::IpAddr::V4(ipv4) {
+                return Ok(RdmaSelection { device: port.device.clone(), port: port.port, gid_index });
+            }
+        }
+    }
+    Err(RdmaAddressError { address,
+        device_hint: device_override.map(|d| format!(" on overridden device {d}")).unwrap_or_default() })
+}
+
 /// Discovers this host's RDMA ports. A host without RDMA returns an empty report.
 pub fn discover() -> Result<FabricReport> {
     let root = Path::new(SYSFS_INFINIBAND);
@@ -306,6 +335,35 @@ mod tests {
             subnets: vec![(network(address, 24), 24)],
             pci: Some(PciLink { address: "0000:01:00.0".into(), gts: 32.0, width: pcie_width, numa_node: None }),
         }
+    }
+
+    #[test]
+    fn selects_exact_address_device_port_and_gid_from_sysfs() {
+        let root = std::env::temp_dir().join(format!("cuteafd-fabric-{}", std::process::id()));
+        let device = root.join("mlx5_fixture");
+        let port_path = device.join("ports/2");
+        for directory in ["gid_attrs/types", "gid_attrs/ndevs", "gids"] {
+            fs::create_dir_all(port_path.join(directory)).unwrap();
+        }
+        for (name, value) in [("state", "4: ACTIVE"), ("rate", "200 Gb/sec"),
+            ("link_layer", "Ethernet"), ("gid_attrs/types/3", "RoCE v2"),
+            ("gid_attrs/types/7", "RoCE v2"), ("gid_attrs/types/9", "RoCE v1"),
+            ("gid_attrs/ndevs/3", "bond0"), ("gid_attrs/ndevs/7", "bond0"),
+            ("gids/3", "0000:0000:0000:0000:0000:ffff:0a37:0016"),
+            ("gids/7", "0000:0000:0000:0000:0000:ffff:0a37:0116"),
+            ("gids/9", "0000:0000:0000:0000:0000:ffff:0a37:0216")] {
+            fs::write(port_path.join(name), value).unwrap();
+        }
+        let ports = read_device(&device, &[]).unwrap();
+        let address = "10.55.1.22".parse().unwrap();
+        assert_eq!(select_rdma_address(&ports, address, None).unwrap(),
+            RdmaSelection { device: "mlx5_fixture".into(), port: 2, gid_index: 7 });
+        assert!(select_rdma_address(&ports, address, Some("mlx5_other")).is_err());
+        assert!(select_rdma_address(&ports, "10.55.2.22".parse().unwrap(), None).is_err());
+        let mut inactive = ports;
+        inactive[0].active = false;
+        assert!(select_rdma_address(&inactive, address, None).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

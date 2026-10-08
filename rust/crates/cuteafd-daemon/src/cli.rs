@@ -789,6 +789,8 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "false",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
+    #[command(flatten)]
+    pub api: crate::shared::api::ApiArgs,
 
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long)] pub native_lib: PathBuf,

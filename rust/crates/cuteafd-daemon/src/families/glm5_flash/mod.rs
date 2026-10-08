@@ -895,6 +895,18 @@ impl Opened {
     /// `args.planner_mark_slots` prefix marks the caller allocates once the engine exists free.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
+        // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
+        // admission. `planner_mark_slots` counts marks, so it stands: each admitted GPU reserves its part of
+        // every mark (a lone GPU, the whole mark), as the prefix cache then allocates.
+        let mut resolved = args.clone();
+        if args.split_device.is_some()
+            && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
+            resolved.split_device = None;
+            resolved.kda_fp32_partials = false;
+            resolved.kda_output_shard = false;
+            resolved.kda_prefill_expanded = false;
+        }
+        let args = &resolved;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.

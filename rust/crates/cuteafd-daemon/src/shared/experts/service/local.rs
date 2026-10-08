@@ -54,10 +54,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         load_weights(&library, &catalog, &config)?
     };
-    let mut execution = {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining)?
-    };
     // The loaders' synchronous uploads grew the library's pinned staging buffer
     // to the largest projection (hundreds of MB of unified memory on GB10);
     // requests stage far smaller rows, so drop it and let them regrow it.
@@ -69,6 +65,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     tracing::info!(released_bytes = released, page_cache_advised_bytes = advised, cached_before,
         cached_after = crate::shared::memory_report::cached_bytes(),
         "released load-time pinned upload staging and checkpoint page cache");
+    let mut execution = {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
+        weights.execution(&library, &config, remaining)?
+    };
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot

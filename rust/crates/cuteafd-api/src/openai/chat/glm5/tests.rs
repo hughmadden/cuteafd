@@ -619,22 +619,34 @@ fn a_repeated_argument_keeps_its_last_value() {
     assert_eq!(call_texts(&parser, &characters.iter().map(String::as_str).collect::<Vec<_>>()), expected);
 }
 
-/// An argument that cannot be read, or stray text between arguments, is
-/// dropped; the call and its other arguments survive.
+/// Stray text between arguments is dropped; the call and its other arguments
+/// survive.
 #[test]
-fn unreadable_arguments_are_dropped_from_their_call() {
+fn stray_text_is_dropped_from_its_call() {
+    let limit = "<arg_key>limit</arg_key><arg_value>4</arg_value>";
+    let text = format!("<tool_call>search{limit} stray </tool_call>");
+    let projection = parse_everywhere(&options(false, Some(tools())), &text);
+    assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("search".into(), json!({"limit": 4}))]));
+}
+
+/// An argument that cannot be read — a markup or empty key, or a key with no
+/// `<arg_value>` — loses its whole call: the call comes back as content,
+/// nothing of it is a tool call, and it is not counted. The call would
+/// otherwise be released with that argument silently missing, which is not
+/// the call the model meant.
+#[test]
+fn an_unreadable_argument_returns_its_whole_call_as_content() {
     let limit = "<arg_key>limit</arg_key><arg_value>4</arg_value>";
     for (shape, text) in [
         ("no value", format!("<tool_call>search<arg_key>query</arg_key>no value{limit}</tool_call>")),
         ("markup in the key", format!("<tool_call>search<arg_key><bad></arg_key><arg_value>1</arg_value>{limit}</tool_call>")),
         ("markup in the key, >", format!("<tool_call>search<arg_key>a>b</arg_key><arg_value>1</arg_value>{limit}</tool_call>")),
-        ("stray text", format!("<tool_call>search{limit} stray </tool_call>")),
-        ("all of them", format!(concat!("<tool_call>search<arg_key>query</arg_key>no value",
+        ("empty key", format!("<tool_call>search<arg_key></arg_key><arg_value>1</arg_value>{limit}</tool_call>")),
+        ("the first one", format!(concat!("<tool_call>search<arg_key>query</arg_key>no value",
             "<arg_key><bad></arg_key><arg_value>1</arg_value>{} stray </tool_call>"), limit)),
     ] {
         let projection = parse_everywhere(&options(false, Some(tools())), &text);
-        assert_eq!((projection.content.as_str(), projection.calls), ("", vec![("search".into(), json!({"limit": 4}))]),
-            "{shape}");
+        assert_eq!((projection.content.as_str(), projection.calls), (text.as_str(), vec![]), "{shape}");
     }
 }
 
@@ -884,6 +896,13 @@ mod router {
             (format!("Plan.</think>Checking.\n{nameless}"), format!("Checking.\n{nameless}"), 0, "stop"),
             (format!("Plan.</think>Checking.\n{nameless}{oslo}"), format!("Checking.\n{nameless}"), 1, "tool_calls"),
             (format!("Plan.</think>{truncated}"), truncated.to_owned(), 0, "stop"),
+            // An argument whose value never opens loses the whole call:
+            // content, stop, never a tool call.
+            (format!("Plan.</think><tool_call>lookup<arg_key>city</arg_key>Oslo</tool_call>"),
+                "<tool_call>lookup<arg_key>city</arg_key>Oslo</tool_call>".to_owned(), 0, "stop"),
+            // Markup in the key does the same.
+            (format!("Plan.</think><tool_call>lookup<arg_key><bad></arg_key><arg_value>Oslo</arg_value></tool_call>"),
+                "<tool_call>lookup<arg_key><bad></arg_key><arg_value>Oslo</arg_value></tool_call>".to_owned(), 0, "stop"),
         ] {
             for streaming in [false, true] {
                 let body = json!({"model": MODEL, "stream": streaming, "tools": tools,

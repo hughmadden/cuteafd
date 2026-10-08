@@ -132,6 +132,16 @@ wip_slot=
                 self.assertEqual(len(ready),4)
                 self.assertGreater(ack[0],max(ready))
 
+    def test_unavailable_p2p_accepts_single_gpu_fallback_before_worker_handoff(self):
+        for layers in [0, 5]:
+            with self.subTest(layers=layers):
+                result, events = self.run_startup(2, dict(version=1, rtx_gpus=1,
+                    nonce='fresh', rtx_expert_layers=layers, spark_first_layer=layers))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                starts = [args for tool, args in events if tool == 'ssh' and '-s' in args]
+                self.assertEqual(len(starts), 4)
+                self.assertTrue(all(self.worker_tail(args)[8] == str(layers) for args in starts))
+
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
         self.assertEqual(result.returncode,0,result.stderr)

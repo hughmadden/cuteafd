@@ -4,7 +4,7 @@
 //! when the run finishes or is cancelled.
 mod common;
 use common::fake_engine;
-use cuteafd_api::openai::{router_with_console, ConsoleHub, NativeLimits, NativeRequest};
+use cuteafd_api::openai::{auth::ApiKey, router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use cuteafd_bench::store::Store;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,7 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
     let dir = tempfile::tempdir().unwrap();
     let bench = cuteafd_bench::Bench::new(Store::open(dir.path()).unwrap());
     bench.set_console(hub.clone());
+    bench.set_api_key(ApiKey::new("integration-test-key").unwrap());
     let app = cuteafd_bench::http::mount(router, bench.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     cuteafd_bench::ready(&listener);
@@ -43,10 +44,10 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
     tokio::task::spawn_blocking(move || {
         let agent = ureq::agent();
         let status = |id: &str| -> Value {
-            agent.get(&format!("{base}/v1/bench/runs/{id}")).call().unwrap().into_json().unwrap()
+            agent.get(&format!("{base}/v1/bench/runs/{id}")).set("Authorization", "Bearer integration-test-key").call().unwrap().into_json().unwrap()
         };
         let start = || -> String {
-            let started: Value = agent.post(&format!("{base}/v1/bench/runs")).send_json(json!({"profile": "share"}))
+            let started: Value = agent.post(&format!("{base}/v1/bench/runs")).set("Authorization", "Bearer integration-test-key").send_json(json!({"profile": "share"}))
                 .unwrap().into_json().unwrap();
             let id = started["id"].as_str().unwrap().to_string();
             let report = status(&id);
@@ -57,7 +58,7 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
         // and cleared once the cancel lands.
         let id = start();
         assert!(hub.text_enabled(), "a run must allow console text");
-        agent.post(&format!("{base}/v1/bench/runs/{id}/cancel")).call().unwrap();
+        agent.post(&format!("{base}/v1/bench/runs/{id}/cancel")).set("Authorization", "Bearer integration-test-key").call().unwrap();
         assert!(wait_until(Duration::from_secs(30), || !hub.text_enabled()), "text stayed on after cancel");
         let report = status(&id);
         assert_eq!(report["status"], "cancelled", "{report:#}");

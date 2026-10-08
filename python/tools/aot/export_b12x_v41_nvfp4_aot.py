@@ -136,7 +136,6 @@ def export(
     source_intermediate = intermediate
     if pad_intermediate:
         intermediate = (intermediate + 127) // 128 * 128
-    torch.cuda.init()
     properties = torch.cuda.get_device_properties(0)
     if (properties.major, properties.minor) != capability:
         raise ValueError(

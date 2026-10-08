@@ -17,6 +17,41 @@ use cuteafd_ffi::NativeLibrary;
 use std::cell::Cell;
 use std::ffi::c_void;
 
+/// Probe both directions before admitting or loading a two-GPU layout. Cards
+/// without peer access (including GeForce) retain the single-device path.
+pub(crate) fn probed_device(library: &NativeLibrary, home: i32, requested: Option<i32>) -> Result<Option<i32>> {
+    let Some(peer) = requested else { return Ok(None) };
+    ensure!(home != peer, "--split-device must differ from --device");
+    let result = if std::env::var("CUTEAFD_P2P_PROBE").is_ok_and(|v| v == "unavailable") {
+        Err(anyhow::anyhow!("P2P probe forced unavailable"))
+    } else {
+        crate::shared::memory::device::Device { library, id: home }.run(|| library.cuda_enable_peer(peer))
+            .and_then(|()| crate::shared::memory::device::Device { library, id: peer }.run(|| library.cuda_enable_peer(home)))
+    };
+    // A failed peer capability must not leave subsequent allocations on the peer.
+    library.cuda_set_device(home)?;
+    Ok(peer_probe_result(peer, result))
+}
+
+fn peer_probe_result(peer: i32, result: Result<()>) -> Option<i32> {
+    match result {
+        Ok(()) => Some(peer),
+        Err(error) => {
+            tracing::warn!(peer, reason = %format!("{error:#}"), "P2P unavailable; serving from one GPU");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    #[test]
+    fn unavailable_peer_falls_back_before_loading() {
+        assert_eq!(super::peer_probe_result(1, Err(anyhow::anyhow!("unavailable"))), None);
+        assert_eq!(super::peer_probe_result(1, Ok(())), Some(1));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalState {
     Active,

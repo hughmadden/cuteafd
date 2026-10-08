@@ -29,3 +29,17 @@ pub fn drop_snapshot_pages(snapshot: &Path) -> u64 {
     }
     advised
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_snapshot_advice_needs_no_nest_and_preserves_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let weights = directory.path().join("weights.safetensors");
+        std::fs::write(&weights, b"checkpoint").unwrap();
+        std::fs::write(directory.path().join("config.json"), b"{}").unwrap();
+        assert_eq!(super::drop_snapshot_pages(directory.path()), 10);
+        assert_eq!(std::fs::read(&weights).unwrap(), b"checkpoint");
+        assert_eq!(super::drop_snapshot_pages(&directory.path().join("missing")), 0);
+    }
+}

@@ -101,6 +101,32 @@ pub(crate) struct NativeExpertServiceConfig {
     native_spark_tp2: bool,
 }
 
+fn mem_available(text: &str) -> Result<usize> {
+    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("/proc/meminfo has no MemAvailable")?;
+    let fields: Vec<_> = value.split_whitespace().collect();
+    ensure!(fields.len() == 2 && fields[1] == "kB", "invalid MemAvailable units");
+    fields[0].parse::<usize>()?.checked_mul(1024).context("MemAvailable overflow")
+}
+
+/// GB10 device and host allocations consume the same pool. CUDA's free-byte
+/// counter alone omits reclaimable cache; use the OS's unified availability.
+fn worker_available(library: &NativeLibrary) -> Result<usize> {
+    let info = library.cuda_device_info(library.cuda_get_device()?)?;
+    if info.compute_capability_major == 12 && info.compute_capability_minor == 1 {
+        mem_available(&std::fs::read_to_string("/proc/meminfo")?)
+    } else {
+        Ok(library.cuda_memory_info()?.0)
+    }
+}
+
+fn admit_worker_peak(library: &NativeLibrary, load_peak: usize, serve_peak: usize) -> Result<()> {
+    let available = worker_available(library)?;
+    ensure!(load_peak <= available && serve_peak <= available,
+        "Spark worker needs {load_peak} bytes at load / {serve_peak} at serve but only {available} bytes are available");
+    Ok(())
+}
+
 fn load_weights<'a>(
     library: &'a NativeLibrary,
     catalog: &OfficialV41Catalog,
@@ -152,14 +178,13 @@ fn load_weights<'a>(
             <= config.device_budget,
         "native TP weights and execution workspace exceed device budget"
     );
-    // Explicit replicated topologies additionally admit every known Spark-side
-    // transient. On the unified GB10 pool the loader's pinned host staging, the
-    // read scratch, the host exchange and the row-index scratch all compete with
-    // device memory, so the weight-only and workspace-only checks are not a fit
-    // proof. This does not change the legacy EXL3/TP4 admission above.
+    // Every layout admits the unified-pool peak before allocation. Pinned host
+    // staging, read scratch and exchange storage compete with device weights on
+    // GB10; explicit topologies also enforce the configured reservation below.
+    let budget = spark_admission_budget(config, resident, staging, pinned_host,
+        read_scratch, workspace)?;
+    admit_worker_peak(library, budget.load_peak, budget.serve_peak)?;
     if config.topology.is_some() {
-        let budget = spark_admission_budget(config, resident, staging, pinned_host,
-            read_scratch, workspace)?;
         ensure!(
             budget.load_peak <= config.device_budget
                 && budget.serve_peak <= config.device_budget,
@@ -177,9 +202,7 @@ fn load_weights<'a>(
         // by construction; page-cache bytes are reclaimable and are not added.
         // This is a safety gate, so a failed query fails closed instead of
         // silently skipping the real-availability check.
-        let (free, _total) = library
-            .cuda_memory_info()
-            .context("query Spark memory for admission")?;
+        let free = worker_available(library).context("query Spark memory for admission")?;
         ensure!(
             budget.load_peak <= free && budget.serve_peak <= free,
             "explicit replicated Spark admission needs {} bytes at load / {} at serve \
@@ -488,6 +511,15 @@ mod tests {
             encoder: None,
             audio_encoder: None,
         }
+    }
+
+    #[test]
+    fn gb10_available_uses_reclaimable_memory_and_rejects_bad_snapshots() {
+        assert_eq!(mem_available("MemFree: 1 kB\nMemAvailable: 1024 kB\n").unwrap(), 1 << 20);
+        for text in ["MemFree: 1 kB", "MemAvailable: 8 MB", "MemAvailable: nope kB"] {
+            assert!(mem_available(text).is_err());
+        }
+        assert!(mem_available(&format!("MemAvailable: {} kB", usize::MAX)).is_err());
     }
 
     #[test]

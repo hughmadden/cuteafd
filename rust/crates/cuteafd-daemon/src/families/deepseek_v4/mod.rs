@@ -223,6 +223,7 @@ pub(crate) fn with_engine<T>(
         }
         None => None,
     };
+    let split_device = crate::shared::peer_split::probed_device(&loaded.library, args.device, split_device)?;
     let peer_stream = match split_device {
         Some(device) => {
             ensure!(device != args.device, "--split-device must differ from --device");
@@ -381,7 +382,8 @@ pub(crate) fn with_engine<T>(
         engine.warm_transport(transport, &runtime)?;
     }
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-    if crate::shared::spark_intake::device_exchange_enabled() && !skip {
+    if crate::shared::spark_intake::device_exchange_enabled() && !skip
+        && crate::shared::spark_intake::device_exchange_available(&loaded.library)? {
         let started = Instant::now();
         engine.attach_device_link(&peers, &executors,
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;

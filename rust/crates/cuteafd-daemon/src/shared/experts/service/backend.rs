@@ -143,6 +143,23 @@ impl<'w, 'a> Execution<'w, 'a> {
     }
 }
 
+fn fp8_resident_budget(available: usize, resident: usize, serve_peak: usize) -> usize {
+    available.saturating_sub(serve_peak.saturating_sub(resident))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    #[test]
+    fn fp8_load_transients_do_not_reduce_serve_residency() {
+        // The load and serve peaks fit independently, not simultaneously.
+        let (available, resident, staging, scratch, serve_overhead) = (100, 70, 25, 10, 20);
+        assert!(resident + staging <= available);
+        assert!(resident + scratch + serve_overhead <= available);
+        assert_eq!(super::fp8_resident_budget(available, resident, resident + serve_overhead), 80);
+        assert_eq!(super::fp8_resident_budget(10, 20, 40), 0);
+    }
+}
+
 /// The checkpoint's own FP8 experts (E4M3 + FP32 128x128 block scales) for
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
@@ -168,6 +185,20 @@ pub(super) fn load_fp8<'a>(
         package = %directory.display(), "FP8 Spark residency plan");
     // The BF16-input sibling package, when built, lets the coordinator send unquantized rows.
     let bf16 = crate::shared::experts::fp8::bf16_sibling(&directory).filter(|d| d.is_dir());
+    let layer_bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, config.world, config.rank, slicing)?;
+    let resident = layer_bytes.checked_mul(layers.len()).context("FP8 resident overflow")?;
+    // Per-projection pageable buffers and parallel reader scratch are temporary;
+    // reserve two whole layers conservatively for the host upload transients.
+    let reader_scratch = layer_bytes.checked_mul(config.world).and_then(|bytes| bytes.checked_mul(16))
+        .context("FP8 reader scratch overflow")?.div_ceil(tensors.shape().experts);
+    let host_staging = layer_bytes.checked_mul(2).and_then(|bytes| bytes.checked_add(reader_scratch))
+        .context("FP8 host staging overflow")?;
+    let peak = spark_admission_budget(config, resident, 0, host_staging, 0, workspace)?;
+    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    // Loading buffers are gone before package scratch and worker storage exist;
+    // admit their peak above, rather than subtracting both lifetimes here.
+    let actual_budget = fp8_resident_budget(worker_available(library)?, resident, peak.serve_peak);
+    let budget = budget.min(actual_budget);
     let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), layers,
         config.world, config.rank, config.capacity as usize, budget)?;
     if let Some(bf16) = bf16 {
@@ -222,6 +253,11 @@ pub(super) fn load_exl3<'a>(
         layer_count=plans.len(), resident_bytes=resident, workspace_bytes=workspace,
         device_budget_bytes=config.device_budget, schedule=config.exl3_schedule.name(),
         "EXL3 Spark residency plan");
+    let staging = plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0);
+    let pinned = plans.iter().map(|p| p.pinned_host_bytes).max().unwrap_or(0);
+    let scratch = plans.iter().map(|p| p.read_scratch_bytes).max().unwrap_or(0);
+    let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
+    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     let mut weights = Vec::with_capacity(plans.len());
     let mut remaining = config.device_budget;
     for (index, plan) in plans.iter().enumerate() {

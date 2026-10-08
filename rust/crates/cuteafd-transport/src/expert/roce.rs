@@ -226,7 +226,9 @@ impl SparkExperts {
         }
         ensure!(request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG == 0 || self.topology.is_some(),
             "native group request requires a topology-bound transport");
+        crate::health::ensure_available()?;
         let result = self.clients.post_written(request);
+        if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
         if result.is_err() {
             self.reset_connections();
         }
@@ -321,7 +323,8 @@ impl SparkExperts {
         F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
         let result = drain(&mut self.clients, &mut wave.receiver, wave.poll_quantum, sink).await;
-        if result.is_err() {
+        if let Err(error) = &result {
+            crate::health::record_failure(format!("expert receive failed: {error:#}"));
             self.reset_connections();
         }
         self.wave_open = false;
@@ -329,6 +332,7 @@ impl SparkExperts {
     }
 
     fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
+        crate::health::ensure_available()?;
         if std::mem::take(&mut self.wave_open) {
             self.reset_connections();
         }
@@ -427,10 +431,10 @@ impl SparkExpertPending<'_, '_> {
                 std::hint::spin_loop();
             }
         }
-        ensure!(
-            self.receiver.complete(),
-            "native TP RoCE response coverage is incomplete"
-        );
+        if !self.receiver.complete() {
+            crate::health::record_failure("native TP RoCE response coverage is incomplete");
+            anyhow::bail!("native TP RoCE response coverage is incomplete");
+        }
         self.complete = true;
         Ok(())
     }

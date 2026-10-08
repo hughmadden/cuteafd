@@ -1,5 +1,6 @@
 #include "cuteafd_v41_fp8.h"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <mutex>
 #include "v41_fp8_variants.h"
@@ -23,6 +24,7 @@ struct Variant {
   uint32_t groups;
   uint64_t grouped_output_offset;
   int device = -1;
+  int device_sms = 0;
 };
 Variant variants[] = {CUTEAFD_V41_FP8_VARIANTS};
 Variant peer_variants[] = {CUTEAFD_V41_FP8_VARIANTS};
@@ -70,9 +72,7 @@ bool span(const void* p, uint64_t bytes, uintptr_t& start, uintptr_t& end) {
   if (!start || start % 16 || start > UINTPTR_MAX - bytes) return false;
   end = start + bytes; return true;
 }
-// The AOT kernels are exported for one exact device: the SM count (and the launch grids
-// sized from it) come from the GPU that ran export_b12x_v41_fp8_aot.py. A bare
-// cudaErrorInvalidDevice (101) gives the operator nothing to act on, so name the mismatch.
+// Cubins require the exported architecture, not the export host's SM count.
 int reject_device(int device, int major, int minor, int sms) {
   std::fprintf(stderr,
                "cuteafd: v41 fp8 AOT kernels were exported for compute 12.0 with %d SMs, but "
@@ -102,7 +102,7 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != 0 || sms != CUTEAFD_V41_FP8_SMS) return reject_device(device, major, minor, sms);
+  if (major != 12 || minor != 0) return reject_device(device, major, minor, sms);
   std::lock_guard<std::mutex> lock(mutex);
   const int slot=device_slot(device);
   if (slot<0) return cudaErrorInvalidDevice;
@@ -119,7 +119,13 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
       if (!existing) { modules->quant.reset(); modules->gemm.reset(); modules->quant_rope.reset(); }
       return result;
     }
+    v->device_sms = sms;
     v->device = device;
+    if (sms != CUTEAFD_V41_FP8_SMS)
+      std::fprintf(stderr,
+                   "cuteafd: v41 fp8 AOT exported on %d SMs; device %d has %d SMs; "
+                   "using the same kernels with quantization grid capped at %d CTAs\n",
+                   int(CUTEAFD_V41_FP8_SMS), device, sms, 4 * sms);
   }
   *out = v; return 0;
 }
@@ -148,7 +154,8 @@ extern "C" int32_t cuteafd_v41_fp8_launch_rope(void* kernel, const uint16_t* sou
   void* a = static_cast<char*>(scratch)+v->info.values_offset;
   void* sr = static_cast<char*>(scratch)+v->info.row_scales_offset;
   void* sm = static_cast<char*>(scratch)+v->info.mma_scales_offset;
-  int grid = v->grids[rows-1];
+  // Both row/group quantizers stride by the live grid; retain exported buffers.
+  int grid = std::min<int>(v->grids[rows-1], 4 * v->device_sms);
   void* quant_args[] = {&x,&a,&sr,&sm,&rows,&grid,&stream,&status};
   if (v->groups == 1) v->quant.launch(quant_args,8);
   else {
