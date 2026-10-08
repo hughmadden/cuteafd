@@ -1523,3 +1523,35 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap()
         .rejections.iter().any(|r| r.reason.contains("intermediate_size")));
 }
+
+/// GLM 5.3 Flash's layout reserves the mark arena its server allocates at the default knobs
+/// (`MarkArena::slots_for`: 2C + 2 for its 147.6 MB FP32 marks, where it reserved a flat 18),
+/// and its state carries the speculative replay records.
+#[test]
+fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
+    use cuteafd_core::memory_layout::Category;
+    let marks = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].by_category()
+        .get(&Category::Prefix).copied().unwrap_or(0);
+    let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(4) };
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    let mut config = glm5_flash_config(45);
+    config["text_config"]["layer_types"] = json!((0..45)
+        .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+    assert_eq!((rank.retained_mark_bytes, rank.speculative_replay_bytes), (147_619_840, 321_421_312));
+    let dir = snapshot(config, &[]);
+    for (concurrency, slots) in [(8, 18), (16, 34)] {
+        let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
+        assert_eq!(cuteafd_core::prefix::mark_slots_for(concurrency, 20, rank.retained_mark_bytes, 2 << 30), slots);
+        assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
+        let state = memory.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * (concurrency + 2)
+            + rank.speculative_replay_bytes);
+    }
+    // An explicit arena (0: none) is taken as given.
+    let mut none = layout(96 << 30, 16);
+    none.layout.as_mut().unwrap().prefix_slots = Some(0);
+    assert_eq!(marks(&plan(dir.path(), &none).unwrap().memory_layout.unwrap()), 0);
+}

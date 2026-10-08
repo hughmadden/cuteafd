@@ -63,6 +63,16 @@ pub(crate) enum Toggle {
 }
 
 impl PrefixArgs {
+    /// Slots of the device mark arena for marks of `mark_bytes` (every rank's part) and `lanes`
+    /// decoding sequences: what the runtime allocates (`MarkArena::slots_for`) and what its planner
+    /// reserves ([`cuteafd_core::prefix::mark_slots_for`]).
+    pub fn mark_slots(&self, lanes: usize, mark_bytes: usize) -> usize {
+        let budget = (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20);
+        let slots = cuteafd_core::prefix::mark_slots_for(lanes as u64, self.prefix_cache_entries as u64,
+            mark_bytes as u64, budget);
+        slots as usize
+    }
+
     pub fn points(&self) -> PointPolicy {
         PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
             per_request: self.prefix_points_per_request }

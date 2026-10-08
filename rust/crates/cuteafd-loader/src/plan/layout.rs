@@ -279,7 +279,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             graph_bytes: [gib(150), gib(150), gib(150)],
             workspace_bytes: [gib(268), gib(472), gib(472)],
             drafter_bytes: gib(324),
-            mark_slots: 18,
             mtp_resident: false,
             spark_workspace_bytes: gib(56),
             spark_ring_bytes: gib(78),
@@ -776,7 +775,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
                     cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
                         bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
-                } else if matches!(family, "deepseek_v4" | "qwen4") {
+                } else if matches!(family, "deepseek_v4" | "qwen4" | "glm5_flash") {
+                    // The arena the family's server allocates at the default knobs (`MarkArena::slots_for`).
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
                 } else { costs.mark_slots }
             });
