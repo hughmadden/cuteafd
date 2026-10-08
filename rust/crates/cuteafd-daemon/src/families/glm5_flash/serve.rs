@@ -25,6 +25,7 @@
 //! the cache's counters.
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
+use super::verify::{self, VerifyPolicy};
 use super::packing;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
@@ -77,6 +78,16 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
+    /// Which drafts a speculative step verifies under the verify budget (64 rows, or the GPU's
+    /// whole sparse MLA waves with --decode-rows 128): `cost` (every sequence the same room,
+    /// budget / sequences - 1 drafts, the cost model's depth within it) or `chain` (each
+    /// sequence's drafts cut where the product of the drafter's probabilities falls below
+    /// --spec-tau, then the least likely drafts across sequences dropped first).
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
+    pub verify_policy: VerifyPolicy,
+    /// The chain cut of --verify-policy chain (0 < tau <= 1).
+    #[arg(long, env = "CUTEAFD_GLMF_SPEC_TAU", default_value_t = verify::DEFAULT_TAU)]
+    pub spec_tau: f64,
     /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
     /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
     /// layer for all of them. Off: one pass per prompt.
@@ -112,11 +123,14 @@ pub(crate) struct ServeArgs {
 }
 
 /// Speculation and admission settings: copy-window draft cap (0 disables), a fixed DFlash2 draft
-/// count replacing the adaptive policy, and packed admission prefill.
+/// count replacing the adaptive policy, the verify-row policy and its chain cut, and packed
+/// admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     copy: usize,
     fixed: Option<usize>,
+    verify: VerifyPolicy,
+    tau: f64,
     batch: bool,
 }
 
@@ -152,8 +166,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
+    anyhow::ensure!(args.spec_tau > 0.0 && args.spec_tau <= 1.0, "--spec-tau must be in (0, 1], got {}", args.spec_tau);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
-        batch: args.prefill_batch };
+        verify: args.verify_policy, tau: args.spec_tau, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
@@ -189,7 +204,11 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
-    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    let policy = match (args.draft_fixed, args.verify_policy) {
+        (Some(n), _) => format!("fixed {n}"),
+        (None, VerifyPolicy::Chain) => format!("chain tau {}", args.spec_tau),
+        (None, VerifyPolicy::Cost) => "adaptive".to_string(),
+    };
     let drafter = args.engine.draft.as_deref()
         .map(|snapshot| if super::dspark::is_dspark(snapshot) { "dSpark" } else { "DFlash2" });
     layout.speculator = match (drafter, args.no_copy_drafts) {
@@ -421,6 +440,16 @@ const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn digest(state: u64, token: u32) -> u64 {
     (state ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3)
+}
+
+/// The drafter's probability of each of a draft's tokens: a dSpark confidence head's predicted
+/// acceptance, else the DFlash2 selector's probability of the chosen candidate.
+fn draft_probs(draft: &Draft) -> Vec<f32> {
+    if draft.confidence.is_empty() {
+        draft.features.iter().map(|f| f[1]).collect()
+    } else {
+        draft.confidence.clone()
+    }
 }
 
 fn media_digest(tokens: &[u32], spans: &[cuteafd_loader::media::MediaSpan]) -> u64 {
@@ -1074,13 +1103,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token: an even share of the verify budget.
-        let room = (verify_rows / active.len()).max(1) - 1;
+        // Rows each sequence may add after its next token: an even share of the verify budget (cost),
+        // or the whole budget, the step's rows budgeted after drafting (chain).
+        let room = policy.verify.room(verify_rows, active.len());
         let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // With the wide programs the rows the even share leaves over go to the first sequences that can
         // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-        if engine.decode_rows > DECODE_ROWS {
+        // Under chain the room is the whole budget: nothing is left over.
+        if policy.verify == VerifyPolicy::Cost && engine.decode_rows > DECODE_ROWS {
             super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
                 let a = &active[i];
                 !probe::no_speculation(&a.job.probe)
@@ -1126,13 +1157,18 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
-        let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
+        let mut planned = match (policy.verify, policy.fixed) {
+            // The chain cut on the drafter's own probabilities.
+            (VerifyPolicy::Chain, None) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
+                .map_or(0, |d| verify::chain_length(&draft_probs(d), limit, policy.tau))).collect(),
+            _ => dflash_policy::plan_counts(&inputs, policy.fixed, &cost),
+        };
         drop(inputs);
         skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // Each sequence verifies its next token, then its DFlash2 drafts, or
         // a copy-window draft when it agrees with them and runs longer.
         let mut used_copy = vec![false; active.len()];
-        let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
+        let mut sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
             if a.draft_pause > 0 {
                 a.draft_pause -= 1;
                 if a.draft_pause == 0 {
@@ -1157,6 +1193,25 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
+        if policy.verify == VerifyPolicy::Chain {
+            // The step under the verify budget: the least likely drafts across sequences go first (a
+            // copy-window token the drafter also proposed keeps the drafter's probability).
+            let probs: Vec<Vec<f32>> = sequences.iter().zip(&drafted).zip(&used_copy).map(|((rows, draft), &copy)| {
+                let probs = draft.as_ref().map(draft_probs).unwrap_or_default();
+                if copy {
+                    verify::copy_probs(&rows[1..], draft.as_ref().map_or(&[][..], |d| &d.tokens), &probs)
+                } else {
+                    probs
+                }
+            }).collect();
+            let drafts: Vec<usize> = sequences.iter().map(|rows| rows.len() - 1).collect();
+            for (i, kept) in verify::budget(&probs, &drafts, verify_rows).into_iter().enumerate() {
+                sequences[i].truncate(kept + 1);
+                if !used_copy[i] {
+                    planned[i] = planned[i].min(kept);
+                }
+            }
+        }
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let plan_us = console::us(plan_timer);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
@@ -1601,11 +1656,24 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn packed_admission_prefill_is_off_by_default() {
-        assert!(!parse(&[]).unwrap().prefill_batch);
-        assert!(parse(&["--prefill-batch"]).unwrap().prefill_batch);
+    fn admission_and_verify_rows_default_to_todays_policies() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!((defaults.verify_policy, defaults.spec_tau, defaults.prefill_batch),
+            (VerifyPolicy::Cost, verify::DEFAULT_TAU, false));
+        let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch"]).unwrap();
+        assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, true));
         assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
         assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
         assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
+        assert!(parse(&["--verify-policy", "greedy"]).is_err());
+    }
+
+    #[test]
+    fn draft_probabilities_come_from_the_selector_or_the_confidence_head() {
+        let dflash = Draft { tokens: vec![1, 2], features: vec![[0.5, 0.9, 0.1, 0.0], [0.2, 0.6, 0.3, 1.0]],
+            confidence: Vec::new() };
+        assert_eq!(draft_probs(&dflash), vec![0.9, 0.6]);
+        let dspark = Draft { tokens: vec![1, 2], features: vec![[0.0; 4]; 2], confidence: vec![0.8, 0.4] };
+        assert_eq!(draft_probs(&dspark), vec![0.8, 0.4]);
     }
 }
