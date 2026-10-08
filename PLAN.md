@@ -1707,6 +1707,16 @@ Ideas TJ wants kept for later; not v2 work.
   from 0.
 - Whole-wave sparse-MLA blocks for the 5090 (FR-G.10) and per-SM-count
   exports, only where measured to pay.
+- V4.1 asynchronous image encode: today the V4.1 scheduler waits for each
+  image's encode before stepping text lanes. Make admission pending (keep the
+  prepared job, cache lease and `EncoderTicket`s, poll between decode
+  iterations, install features then prefill, release on cancel/failure).
+  `EncoderClient` already has the bounded queue/poll/cancel; the work is the
+  scheduler restructure.
+- One shared adaptive-draft policy for every family (TJ, 2026-10-08): a
+  CPU-only core with per-family topology/traffic/shape adapters, replacing
+  V4.1's own dSpark policy and the separate GLM/Qwen/generic ones. Design
+  review under way (Astra); decide after discussing it.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
