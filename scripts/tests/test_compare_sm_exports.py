@@ -35,6 +35,11 @@ def exports(tmp_path, host=(b"host", b"host"), kernels=(b"kernel", b"kernel"), s
         (directory / "comparison-context.json").write_text(json.dumps({
             "sms": (188, 170)[i], "capability": [12, 0], "cuda_initialized": False,
             "sparkinfer_revision": "pin", "source_tree_sha256": "tree", "exporter": "export.py", "args": [],
+            "toolchain": {"torch": "test", "triton": "test", "nvidia-cutlass-dsl": "test"},
+            "environment": {"CUTEAFD_EXPORT_NARROW_AOT": "1", "CUTEAFD_EXPORT_HC_LAGGED": "1"},
+            "exporter_sha256": "exporter", "comparison_script_sha256": "script",
+            "export_sources_sha256": {"export.py": "source"},
+            "max_shared_memory_per_block": 101376, "max_shared_memory_per_multiprocessor": 102400,
         }))
         (directory / "table.json").write_text(json.dumps({
             "physical_sms": (188, 170)[i], "device": "offline", "artifacts": {"hash": "varies"},
@@ -96,6 +101,28 @@ def test_changed_export_arguments_fail_closed(tmp_path):
     context["args"] = ["different-capacity"]
     path.write_text(json.dumps(context))
     with pytest.raises(ValueError, match="beyond SM count: args"):
+        compare_sm.compare(left, right)
+
+
+@pytest.mark.parametrize("field", ["toolchain", "export_sources_sha256", "max_shared_memory_per_block"])
+def test_missing_provenance_on_both_targets_fails_closed(tmp_path, field):
+    left, right = exports(tmp_path)
+    for directory in (left, right):
+        path = directory / "comparison-context.json"
+        context = json.loads(path.read_text())
+        del context[field]
+        path.write_text(json.dumps(context))
+    with pytest.raises(ValueError, match=f"missing provenance: {field}"):
+        compare_sm.compare(left, right)
+
+
+def test_same_sm_count_does_not_prove_a_cross_device_comparison(tmp_path):
+    left, right = exports(tmp_path)
+    path = right / "comparison-context.json"
+    context = json.loads(path.read_text())
+    context["sms"] = 188
+    path.write_text(json.dumps(context))
+    with pytest.raises(ValueError, match="two distinct SM counts"):
         compare_sm.compare(left, right)
 
 

@@ -277,10 +277,18 @@ def compare(left, right):
     contexts = [json.loads((directory / "comparison-context.json").read_text()) for directory in (left, right)]
     if any(context.get("cuda_initialized") is not False for context in contexts):
         raise ValueError("comparison context did not prove CPU-only export")
+    for context in contexts:
+        sms = context.get("sms")
+        if type(sms) is not int or sms <= 0 or context.get("capability") != [12, 0]:
+            raise ValueError("comparison context must identify positive SM count and compute 12.0")
+    if contexts[0]["sms"] == contexts[1]["sms"]:
+        raise ValueError("comparison contexts must have two distinct SM counts")
     for key in ("capability", "sparkinfer_revision", "source_tree_sha256", "exporter", "args",
                 "toolchain", "environment", "exporter_sha256", "comparison_script_sha256", "export_sources_sha256",
                 "max_shared_memory_per_block", "max_shared_memory_per_multiprocessor"):
-        if contexts[0].get(key) != contexts[1].get(key):
+        if any(key not in context for context in contexts):
+            raise ValueError(f"comparison context missing provenance: {key}")
+        if contexts[0][key] != contexts[1][key]:
             raise ValueError(f"comparison target differs beyond SM count: {key}")
     metas = [metadata(directory) for directory in (left, right)]
     if contexts[0]["exporter"] == "export_b12x_dsv4_aot.py" and "--only" not in contexts[0]["args"]:
