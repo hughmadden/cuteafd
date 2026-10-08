@@ -181,11 +181,10 @@ fi
 
 export PYO3_PYTHON=python3
 compiler_cache_cmake_args=()
-if [[ -n "${CUTEAFD_KACHE:-}" ]]; then
-  source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
-  cuteafd_compiler_cache_setup "$build_root"
-  mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
-fi
+source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
+cuteafd_compiler_cache_setup "$build_root"
+cuteafd_compiler_cache_check_cmake_compilers "$build_root/native"
+mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
 CARGO_TARGET_DIR="$cargo_target_dir" cargo build \
   --manifest-path "$build_root/source/rust/Cargo.toml" \
   -p cuteafd-daemon \
