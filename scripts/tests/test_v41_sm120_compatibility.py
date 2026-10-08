@@ -145,8 +145,9 @@ def test_capability_only_admission_and_live_launch_caps(family):
             source = ROOT / "native/shared/src/v41_experts.cc"
             main = EXPERT_MAIN
         (directory / "main.cc").write_text(main.replace("SOURCE", str(source)))
-        subprocess.run(["flock", "-w", "600", str(Path.home() / ".cache/cuteafd/build.lock"),
-                        compiler, "-std=c++17", "-pthread", "-I", str(directory),
+        # A single small translation unit in a private temp dir: no build.lock, so a
+        # long compile elsewhere can't time this test out.
+        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
                         "-I", str(ROOT / "native/shared/include"),
                         "-I", str(ROOT / "native/families/deepseek_v41/include"),
                         str(directory / "main.cc"), "-o", str(directory / "test")],
