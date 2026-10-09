@@ -322,8 +322,8 @@ struct Prefill<'a> {
     first: Option<u32>,
     prompt_row: Option<Vec<f32>>,
     started: Instant,
-    /// Seconds in this prompt's chunks, and their engine phases (a packed pass's split evenly among
-    /// its prompts: bookkeeping, not attribution).
+    /// Seconds in this prompt's chunks, and their engine phases (a packed pass's split among its
+    /// prompts by their rows, as their own passes' would compare).
     busy: f64,
     phases: [f64; 3],
     /// Chunks prefilled in packed passes (`--prefill-batch`).
@@ -375,6 +375,22 @@ fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected
         state.accept(token)?;
     }
     Ok(token)
+}
+
+/// A sequence's verify rows in order (its next token, then its drafts): `emit(j)` emits row `j`'s
+/// selection (the token, and whether the request is done), and row `j + 1` stands only while its
+/// draft is that token, so the policy that chose the drafts never chooses a token. Returns the
+/// rows committed and whether the request finished (an `emit` error finishes it too).
+fn accept_rows(rows: &[u32], mut emit: impl FnMut(usize) -> Result<(u32, bool)>) -> (usize, Result<bool>) {
+    for j in 0..rows.len() {
+        match emit(j) {
+            Ok((token, done)) => if done || rows.get(j + 1) != Some(&token) {
+                return (j + 1, Ok(done));
+            },
+            Err(error) => return (j + 1, Err(error)),
+        }
+    }
+    (rows.len(), Ok(false))
 }
 
 /// Selects (and commits) a token from host logits: a whole-prompt prefix hit's retained row.
@@ -1263,31 +1279,24 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 offset += rows.len();
                 return true;
             }
-            let mut finished = false;
-            for j in 0..rows.len() {
+            let (_, outcome) = accept_rows(rows, |j| {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
                 probe::decode_row(&opened.library, &request.job.probe, &logits, offset + j, request.generated,
                     request.history.len());
-                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
-                    Ok((token, done)) => {
-                        finished = done;
-                        if done && caching && !probe::cold(&request.job.probe) {
-                            // A normal finish (the client took the last chunk): the row that
-                            // produced the last token follows the turn snapshot.
-                            request.turn = logits.row_host(&opened.library, offset + j).ok();
-                        }
-                        if done || rows.get(j + 1) != Some(&token) {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                        finished = true;
-                        break;
-                    }
+                let token = take(request.constraint.as_mut(), &selected[offset + j])?;
+                let done = request.emit(token)?;
+                if done && caching && !probe::cold(&request.job.probe) {
+                    // A normal finish (the client took the last chunk): the row that
+                    // produced the last token follows the turn snapshot.
+                    request.turn = logits.row_host(&opened.library, offset + j).ok();
                 }
-            }
+                Ok((token, done))
+            });
+            let finished = outcome.unwrap_or_else(|error| {
+                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                true
+            });
             let committed = request.placement.len - start;
             // A turn snapshot captures the KDA state at the kept length: commit it too.
             if !finished || request.turn.is_some() {
@@ -1518,7 +1527,7 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let ends: Vec<usize> = group.iter().map(chunk_end).collect();
     let rows: usize = group.iter().zip(&ends).map(|(p, &end)| end - p.done).sum();
     let memory_before = first_prefill_sample(cx.first_prefill_seen, false, prefill_memory_sample);
-    let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+    let (result, phases) = isolated_phases(&engine.profile, || -> Result<Vec<Result<()>>> {
         let mut sequences = Vec::with_capacity(group.len());
         let mut firsts = Vec::with_capacity(group.len());
         for (p, &end) in group.iter_mut().zip(&ends) {
@@ -1527,65 +1536,94 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
             sequences.push((placement, &tokens[*done..end]));
             firsts.push((&*job, constraint, first, prompt_row, *resume, len, end));
         }
-        let segments = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+        let (segments, outcomes) = engine.prefill_packed(&mut sequences, &mut |i, logits| {
             let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
             if *end < *len {
-                return Ok(());
+                return Ok(Ok(()));
             }
-            // The first token, while this prompt's logits are the workspace's.
+            // The first token, while this prompt's logits are the workspace's. The device work
+            // (the row download, the selection) is the pass's: its failure fails every member.
+            // The prompt's probe, grammar mask and token are its own: they fail it alone.
             if cx.caching && !probe::cold(&job.probe) && *resume < *len {
                 **prompt_row = Some(logits.row_host(cx.library, 0)?);
             }
             if probe::wants_first(&job.probe) {
-                probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len)?;
+                if let Err(error) = probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len) {
+                    return Ok(Err(error));
+                }
             }
             let mut batch = SelectBatch::default();
-            batch.push_next(job.sampling, constraint.as_mut(), *end as u64)?;
+            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                return Ok(Err(error));
+            }
             let selected = selector.select(&logits, &batch)?;
-            **first = Some(take(constraint.as_mut(), &selected[0])?);
-            Ok(())
+            Ok(take(constraint.as_mut(), &selected[0]).map(|token| **first = Some(token)))
         })?;
         drop((sequences, firsts));
-        // Each prompt's tapped tail becomes its drafter context before the next step.
+        // Each healthy prompt's tapped tail becomes its drafter context before the next step (a
+        // failed prompt's slot is released with its placement).
         if let Some(drafter) = engine.drafter.as_ref() {
-            for ((p, segment), &end) in group.iter().zip(&segments).zip(&ends) {
-                if let Some(slot) = p.slot {
+            for (((p, segment), &end), outcome) in group.iter().zip(&segments).zip(&ends).zip(&outcomes) {
+                if let (Some(slot), true) = (p.slot, outcome.is_ok()) {
                     let n = segment.tap_rows;
                     drafter.update(&(0..n).map(|r| ContextRow { tap_row: segment.tap_offset + r, slot,
                         position: end - n + r }).collect::<Vec<_>>())?;
                 }
             }
         }
-        Ok(())
+        Ok(outcomes)
     });
     if let Some(before) = memory_before {
         // The first text prefill's boundary, around the packed pass.
         let boundary = serde_json::json!({"kind": "first-text-prefill", "rows": rows, "packed_prompts": group.len(),
-            "success": result.is_ok(), "before": before, "after": prefill_memory_sample(),
+            "success": result.as_ref().is_ok_and(|outcomes| outcomes.iter().all(Result::is_ok)),
+            "before": before, "after": prefill_memory_sample(),
             "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
         tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
         cx.memory_boundaries.borrow_mut().push(boundary);
     }
-    // One pass for the group: its time and phases split evenly among the prompts.
-    let share = 1.0 / group.len() as f64;
-    let busy = timer.elapsed().as_secs_f64() * share;
-    for (p, &end) in group.iter_mut().zip(&ends) {
+    // One pass for the group: its time and phases split among the prompts by their rows.
+    let elapsed = timer.elapsed().as_secs_f64();
+    let shares = row_shares(&group.iter().zip(&ends).map(|(p, &end)| end - p.done).collect::<Vec<_>>());
+    for ((p, &end), share) in group.iter_mut().zip(&ends).zip(shares) {
         let rows = end - p.done;
         p.done = end;
         add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
-        p.busy += busy;
+        p.busy += elapsed * share;
         p.packed += 1;
         p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
     }
-    if let Err(error) = result {
-        let message = format!("packed prefill of {} prompts: {error:#}", group.len());
-        return group.iter().map(|_| Err(anyhow::anyhow!("{message}"))).collect();
-    }
-    group.iter_mut().map(|p| {
+    let outcomes = member_outcomes(group.len(), result);
+    group.iter_mut().zip(outcomes).map(|(p, outcome)| {
+        outcome?;
         capture_points(cx.family, cache, p);
         p.chunks += 1;
         Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
     }).collect()
+}
+
+/// Each member's outcome of a packed pass ([`prefill_group`]): a failure the pass shares (the
+/// engine's step or head, a selection, the drafter's context) fails every member; otherwise each
+/// member has its own, so one prompt's grammar or sampling failure leaves the others' first
+/// tokens, drafter context and snapshot points as their own passes would.
+fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> Vec<Result<()>> {
+    match pass {
+        Ok(outcomes) => {
+            let mut outcomes = outcomes.into_iter();
+            (0..members).map(|_| outcomes.next()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("a packed prefill gave no outcome")))).collect()
+        }
+        Err(error) => {
+            let message = format!("packed prefill of {members} prompts: {error:#}");
+            (0..members).map(|_| Err(anyhow::anyhow!("{message}"))).collect()
+        }
+    }
+}
+
+/// Each member's share of a packed pass's time: its rows over the pass's (even when no rows).
+fn row_shares(rows: &[usize]) -> Vec<f64> {
+    let total: usize = rows.iter().sum();
+    rows.iter().map(|&r| if total == 0 { 1.0 / rows.len() as f64 } else { r as f64 / total as f64 }).collect()
 }
 
 /// Coordinator share of `GLMF_TP2_STEP_MS` at one row (GPU 6.7 ms of 18.8).
@@ -1675,5 +1713,172 @@ mod serve_cli_tests {
         assert_eq!(draft_probs(&dflash), vec![0.9, 0.6]);
         let dspark = Draft { tokens: vec![1, 2], features: vec![[0.0; 4]; 2], confidence: vec![0.8, 0.4] };
         assert_eq!(draft_probs(&dspark), vec![0.8, 0.4]);
+    }
+}
+
+#[cfg(test)]
+mod packed_member_tests {
+    use super::*;
+    use crate::shared::prefill_share::PrefillQueue;
+    use crate::shared::token_io::Selected;
+
+    /// A packed member's first token (`take` over its selected row): `token`, or an empty grammar.
+    fn first_token(token: Option<u32>) -> Result<()> {
+        let row: RowResult = token.map(|token| Selected { token, logprob: None })
+            .ok_or(cuteafd_core::TargetSamplingError::EmptyCandidates);
+        take(None, &row).map(drop)
+    }
+
+    #[test]
+    fn a_packed_member_whose_grammar_allows_no_token_fails_alone() {
+        // Two healthy prompts around one whose grammar allows no token, in one packed pass.
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..3usize {
+            queue.push(id);
+        }
+        let finished = queue.round_groups(3, |_, _| true, |group| {
+            let pass = Ok(group.iter().map(|&id| first_token((id != 1).then_some(9))).collect());
+            member_outcomes(group.len(), pass).into_iter().map(|outcome| outcome.map(|()| Chunk::Done)).collect()
+        });
+        let outcomes: Vec<(usize, Option<String>)> = finished.into_iter()
+            .map(|(id, outcome)| (id, outcome.err().map(|e| format!("{e:#}")))).collect();
+        assert_eq!(outcomes, [(0, None), (1, Some("sampling: EmptyCandidates".into())), (2, None)]);
+    }
+
+    #[test]
+    fn a_shared_failure_fails_every_member_and_a_short_outcome_list_the_rest() {
+        let all = member_outcomes(3, Err(anyhow::anyhow!("head failed")));
+        assert_eq!(all.iter().map(|o| o.as_ref().unwrap_err().to_string()).collect::<Vec<_>>(),
+            vec!["packed prefill of 3 prompts: head failed"; 3]);
+        let short = member_outcomes(3, Ok(vec![Ok(())]));
+        assert_eq!(short.iter().map(Result::is_ok).collect::<Vec<_>>(), [true, false, false]);
+    }
+
+    #[test]
+    fn a_packed_pass_is_timed_by_each_members_rows() {
+        assert_eq!(row_shares(&[30, 10]), [0.75, 0.25]);
+        assert_eq!(row_shares(&[1, 1, 2]), [0.25, 0.25, 0.5]);
+        assert_eq!(row_shares(&[0, 0]), [0.5, 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod verify_policy_tests {
+    use super::*;
+
+    const VOCAB: u32 = 16;
+
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+
+    fn digest(context: &[u32]) -> u64 {
+        context.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &t| mix(h ^ u64::from(t)))
+    }
+
+    /// The target's logits for the row after `context`: the same for both policies.
+    fn target_logits(context: &[u32]) -> Vec<f32> {
+        let h = digest(context);
+        (0..VOCAB).map(|t| (mix(h ^ u64::from(t)) % 1000) as f32 / 100.0).collect()
+    }
+
+    /// The served greedy selection of a row.
+    fn greedy(context: &[u32]) -> u32 {
+        cuteafd_core::TargetSamplingParams::greedy().select_token(&target_logits(context), None, context.len() as u64)
+            .unwrap() as u32
+    }
+
+    /// Seven drafts after `context` and the drafter's probability of each: the target's own
+    /// tokens, but a wrong one where the drafter guesses, with likelihoods that vary by row.
+    fn drafts(context: &[u32]) -> (Vec<u32>, Vec<f32>) {
+        let mut ctx = context.to_vec();
+        let (mut tokens, mut probs) = (Vec::new(), Vec::new());
+        for _ in 0..7 {
+            let h = mix(digest(&ctx) ^ 0x5eed);
+            let wrong = h % 5 == 0;
+            let token = if wrong { (greedy(&ctx) + 1) % VOCAB } else { greedy(&ctx) };
+            probs.push(if wrong { 0.4 } else { 0.6 + (h % 40) as f32 / 100.0 });
+            tokens.push(token);
+            ctx.push(token);
+        }
+        (tokens, probs)
+    }
+
+    /// `streams` sequences decoded by speculative steps under `policy` and a 64-row budget until
+    /// each has `tokens` tokens: the emitted tokens (rows from [`accept_rows`], every row's
+    /// selection the target's greedy token) and the rows verified.
+    fn decode(policy: VerifyPolicy, streams: usize, tokens: usize) -> (Vec<Vec<u32>>, usize) {
+        let mut history: Vec<Vec<u32>> = (0..streams as u32).map(|s| vec![s, s * 7 % VOCAB]).collect();
+        // The prefill's first token, then every step's.
+        let mut next: Vec<u32> = history.iter().map(|h| greedy(h)).collect();
+        let mut out: Vec<Vec<u32>> = next.iter().map(|&n| vec![n]).collect();
+        let mut verified = 0;
+        while out.iter().any(|o| o.len() < tokens) {
+            for (h, &n) in history.iter_mut().zip(&next) {
+                h.push(n);
+            }
+            let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
+            let room = policy.room(64, streams);
+            let mut ks: Vec<usize> = proposals.iter().map(|(_, probs)| match policy {
+                VerifyPolicy::Cost => room.min(7),
+                VerifyPolicy::Chain => verify::chain_length(probs, room, verify::DEFAULT_TAU),
+            }).collect();
+            if policy == VerifyPolicy::Chain {
+                ks = verify::budget(&proposals.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), &ks, 64);
+            }
+            for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
+                let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
+                verified += rows.len();
+                let start = history[i].clone();
+                let (committed, finished) = accept_rows(&rows, |j| {
+                    let token = greedy(&[start.as_slice(), &rows[1..=j]].concat());
+                    out[i].push(token);
+                    Ok((token, false))
+                });
+                assert!(!finished.unwrap() && committed >= 1);
+                history[i].extend_from_slice(&rows[1..committed]);
+                next[i] = *out[i].last().unwrap();
+            }
+        }
+        (out.into_iter().map(|mut o| { o.truncate(tokens); o }).collect(), verified)
+    }
+
+    #[test]
+    fn cost_and_chain_emit_identical_tokens_from_identical_target_logits() {
+        let (cost, cost_rows) = decode(VerifyPolicy::Cost, 16, 48);
+        let (chain, chain_rows) = decode(VerifyPolicy::Chain, 16, 48);
+        // The policies verify different rows (the test would prove nothing otherwise) ...
+        assert_ne!(cost_rows, chain_rows);
+        // ... and emit the same tokens: the target's own greedy decode, row by row.
+        assert_eq!(cost, chain);
+        for (s, emitted) in cost.iter().enumerate() {
+            let mut context = vec![s as u32, s as u32 * 7 % VOCAB];
+            for &token in emitted {
+                assert_eq!(token, greedy(&context), "stream {s}");
+                context.push(token);
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_stands_only_while_it_is_the_rows_selection() {
+        // Rows: next, then drafts 5, 6, 7; the selections are 5, 6, 8: the third draft goes and
+        // the step emits 5, 6 and the correction 8.
+        let selections = [5, 6, 8, 9];
+        let mut emitted = Vec::new();
+        let (committed, finished) = accept_rows(&[4, 5, 6, 7], |j| {
+            emitted.push(selections[j]);
+            Ok((selections[j], false))
+        });
+        assert_eq!((committed, finished.unwrap(), emitted), (3, false, vec![5, 6, 8]));
+        // A finished request stops at its row; an error finishes it there.
+        assert_eq!(accept_rows(&[4, 5, 6], |_| Ok((5, true))).0, 1);
+        let (committed, error) = accept_rows(&[4, 5, 6],
+            |j| if j == 1 { anyhow::bail!("grammar") } else { Ok((5, false)) });
+        assert_eq!((committed, error.unwrap_err().to_string()), (2, "grammar".to_string()));
     }
 }

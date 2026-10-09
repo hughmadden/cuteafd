@@ -11,7 +11,10 @@
 //! confident sequence verifies up to its seven drafts while a doubtful one verifies few, so the
 //! rows go to the drafts most likely to be kept.
 //!
-//! It changes only which drafts a step verifies: verification decides what is kept.
+//! It changes only which drafts a step verifies: verification decides what is kept. Given the
+//! same target logits both policies emit the same tokens (`serve::verify_policy_tests`); on the
+//! GPU a different verify shape can round a near-tie the other way, so chain need not be
+//! output-identical to cost, while every emitted greedy token is its own verified row's argmax.
 //!
 //! The drafter's probability of a draft is its selector's softmax over the position's 16
 //! candidates (DFlash2: the `best probability` feature, as glm53f-afd's `conf`), or a dSpark

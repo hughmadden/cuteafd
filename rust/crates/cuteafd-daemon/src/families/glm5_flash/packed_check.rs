@@ -61,7 +61,7 @@ pub(crate) fn packed_check(engine: &GlmfEngine<'_>, tokens: &[u32], sequences: u
             .map(|(i, placement)| (placement, chunk(i))).collect();
         engine.prefill_packed(&mut segments, &mut |i, logits| {
             packed_logits[i] = logits.row_host(engine.library, 0)?;
-            Ok(())
+            Ok(Ok(()))
         })?;
     }
     engine.synchronize()?;

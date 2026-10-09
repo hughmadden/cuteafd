@@ -341,6 +341,24 @@ fn single_pass_rows(pipelined: bool, lanes: usize, rows: usize) -> usize {
     if pipelined && lanes > 1 { (2 * MIN_LANE_ROWS - 1).min(rows) } else { rows }
 }
 
+/// What a packed pass's `on_logits` returns for one sequence ([`GlmfEngine::prefill_packed`]):
+/// `Err` is a failure the pass shares (the engine's), which ends it for every sequence;
+/// `Ok(Err)` is that sequence's own (its grammar, its sampling), which fails it alone.
+pub(crate) type PackedOutcome = Result<Result<()>>;
+
+/// A packed pass once its step has run: the step wrote every sequence's KDA state and pages, so
+/// every placement advances first, then each sequence's `head(i)` logits go to `on_logits` in
+/// order. A sequence's own failure does not stop the others'; it is returned among the outcomes,
+/// and its caller releases or resets that placement.
+fn packed_tail<L>(sequences: &mut [(&mut GlmfPlacement, &[u32])], mut head: impl FnMut(usize) -> Result<L>,
+    on_logits: &mut dyn FnMut(usize, L) -> PackedOutcome) -> Result<Vec<Result<()>>> {
+    for (placement, tokens) in sequences.iter_mut() {
+        placement.len += tokens.len();
+        placement.kda_len = placement.len;
+    }
+    (0..sequences.len()).map(|i| on_logits(i, head(i)?)).collect()
+}
+
 /// CUTEAFD_GLMF_PREFILL_LANES: (lanes on: unset or not `1`, lanes with a `--layers` subset: `subset`).
 fn lane_setting() -> (bool, bool) {
     let setting = std::env::var("CUTEAFD_GLMF_PREFILL_LANES");
@@ -2604,10 +2622,12 @@ impl<'a> GlmfEngine<'a> {
     /// back in the first prefill lane's workspace, each sequence's mHC sites, router scores, KDA
     /// layers, DSA indexer, top-k and selection run over its rows alone, everything else over all
     /// rows, and one Spark wave per MoE layer. `on_logits(i, logits)` then receives sequence `i`'s
-    /// last row's logits, in order (valid until it returns). Advances every placement; returns the
-    /// layout (each sequence's drafter tap rows).
+    /// last row's logits, in order (valid until it returns), and returns a [`PackedOutcome`].
+    /// Once the step has run every placement advances, whatever the callbacks return. Returns the
+    /// layout (each sequence's drafter tap rows) and each sequence's own outcome.
     pub fn prefill_packed(&self, sequences: &mut [(&mut GlmfPlacement, &[u32])],
-        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>) -> Result<Vec<packing::Segment>> {
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> PackedOutcome)
+        -> Result<(Vec<packing::Segment>, Vec<Result<()>>)> {
         ensure!(self.packs_prefill(), "a packed prefill runs on one GPU with every layer");
         let chunks: Vec<(usize, usize)> = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect();
         let segments = packing::plan(&chunks, &self.packed_limits())?;
@@ -2626,22 +2646,16 @@ impl<'a> GlmfEngine<'a> {
         tables.segments = segments.clone();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
         self.step(&tables, &tokens, 1, None, None, None, None)?;
-        {
-            let lanes = self.prefill_lanes_of(0, 1)?;
-            let w = lanes.first().context("prefill workspace")?;
-            for (i, segment) in segments.iter().enumerate() {
-                // The sequence's last normalized row through the head alone, as its own pass's.
-                let timer = std::time::Instant::now();
-                self.logits(w, segment.end_row(), 1, false)?;
-                self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-                on_logits(i, self.device_logits(w, 1, false))?;
-            }
-        }
-        for (placement, tokens) in sequences.iter_mut() {
-            placement.len += tokens.len();
-            placement.kda_len = placement.len;
-        }
-        Ok(segments)
+        let lanes = self.prefill_lanes_of(0, 1)?;
+        let w = lanes.first().context("prefill workspace")?;
+        let outcomes = packed_tail(sequences, |i| {
+            // The sequence's last normalized row through the head alone, as its own pass's.
+            let timer = std::time::Instant::now();
+            self.logits(w, segments[i].end_row(), 1, false)?;
+            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+            Ok(self.device_logits(w, 1, false))
+        }, on_logits)?;
+        Ok((segments, outcomes))
     }
 
     pub fn prefill(&self, placement: &mut GlmfPlacement, tokens: &[u32],
@@ -5249,7 +5263,98 @@ mod spark_warmup_tests {
 
 #[cfg(test)]
 mod packed_step_tests {
-    use super::{packing, Span, StepTables};
+    use super::{packed_tail, packing, GlmfPlacement, Span, StepTables};
+    use anyhow::{anyhow, ensure, Result};
+    use std::collections::HashMap;
+
+    /// The device as a packed pass leaves it: each KDA slot's consumed rows (its KDA state and
+    /// its MLA/index pages), written by the step for every sequence before any callback.
+    #[derive(Default)]
+    struct Device {
+        rows: HashMap<i32, Vec<u32>>,
+    }
+
+    impl Device {
+        fn step(&mut self, sequences: &[(&mut GlmfPlacement, &[u32])]) {
+            for (placement, tokens) in sequences {
+                self.rows.entry(placement.slot).or_default().extend_from_slice(tokens);
+            }
+        }
+
+        /// A decode step: it writes at the placement's length, which must be what the device holds.
+        fn decode(&mut self, placement: &mut GlmfPlacement, token: u32) -> Result<()> {
+            let rows = self.rows.entry(placement.slot).or_default();
+            ensure!(rows.len() == placement.len && placement.kda_len == placement.len,
+                "decode at {} (KDA {}) over {} rows", placement.len, placement.kda_len, rows.len());
+            rows.push(token);
+            placement.len += 1;
+            placement.kda_len = placement.len;
+            Ok(())
+        }
+    }
+
+    /// Three prompts in one packed pass (the second resumed at 64 rows), the second of which fails
+    /// on its own (its grammar allows no token).
+    fn pass(device: &mut Device, head: impl FnMut(usize) -> Result<usize>)
+        -> (Vec<GlmfPlacement>, Result<Vec<Result<()>>>, Vec<usize>) {
+        let chunks: [Vec<u32>; 3] = [(0..40).collect(), (100..110).collect(), vec![7]];
+        let mut placements: Vec<GlmfPlacement> = (0..3).map(|i| GlmfPlacement::new(vec![i], i as i32)).collect();
+        device.rows.insert(1, (0..64).collect());
+        placements[1].len = 64;
+        placements[1].kda_len = 64;
+        let mut called = Vec::new();
+        let outcomes = {
+            let mut sequences: Vec<(&mut GlmfPlacement, &[u32])> = placements.iter_mut().zip(&chunks)
+                .map(|(p, c)| (p, c.as_slice())).collect();
+            device.step(&sequences);
+            packed_tail(&mut sequences, head, &mut |i, row| {
+                assert_eq!(row, i, "each sequence gets its own head row");
+                called.push(i);
+                Ok(if i == 1 { Err(anyhow!("grammar allows no target token")) } else { Ok(()) })
+            })
+        };
+        (placements, outcomes, called)
+    }
+
+    #[test]
+    fn a_member_that_fails_alone_leaves_its_neighbours_to_finish_and_decode() {
+        let mut device = Device::default();
+        let (mut placements, outcomes, called) = pass(&mut device, Ok);
+        // Every callback ran; the failure is the second member's alone, reported afterwards.
+        assert_eq!(called, [0, 1, 2]);
+        let outcomes = outcomes.unwrap();
+        assert_eq!(outcomes.iter().map(Result::is_ok).collect::<Vec<_>>(), [true, false, true]);
+        assert_eq!(outcomes[1].as_ref().unwrap_err().to_string(), "grammar allows no target token");
+        // Every placement, the failed one's too, matches what the step wrote.
+        for p in &placements {
+            assert_eq!((p.len, p.kda_len), (device.rows[&p.slot].len(), device.rows[&p.slot].len()), "slot {}", p.slot);
+        }
+        assert_eq!(placements.iter().map(|p| p.len).collect::<Vec<_>>(), [40, 74, 1]);
+        // The healthy members decode on top of their own rows, and only those.
+        for token in [900, 901] {
+            device.decode(&mut placements[0], token).unwrap();
+            device.decode(&mut placements[2], token + 10).unwrap();
+        }
+        assert_eq!(device.rows[&0], (0..40).chain([900, 901]).collect::<Vec<_>>());
+        assert_eq!(device.rows[&2], [7, 910, 911]);
+        // The failed member's caller releases it: a fresh placement over a reset slot starts clean.
+        device.rows.remove(&1);
+        let mut fresh = GlmfPlacement::new(vec![1], 1);
+        device.decode(&mut fresh, 5).unwrap();
+    }
+
+    #[test]
+    fn a_shared_failure_ends_the_pass_with_every_placement_where_the_step_left_it() {
+        let mut device = Device::default();
+        let (placements, outcomes, called) = pass(&mut device,
+            |i| if i == 2 { Err(anyhow!("head failed")) } else { Ok(i) });
+        // The head's failure is the pass's: it ends it (every member fails and is released).
+        assert_eq!(outcomes.unwrap_err().to_string(), "head failed");
+        assert_eq!(called, [0, 1]);
+        for p in &placements {
+            assert_eq!((p.len, p.kda_len), (device.rows[&p.slot].len(), device.rows[&p.slot].len()), "slot {}", p.slot);
+        }
+    }
 
     #[test]
     fn a_step_of_one_sequence_runs_every_per_sequence_program_once_over_all_rows() {

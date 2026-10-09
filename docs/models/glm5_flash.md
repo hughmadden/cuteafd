@@ -117,7 +117,10 @@ Attention (KDA), a minority run MLA + DSA.
   default 0.7) cuts each sequence's drafts at that cumulative draft probability and drops the
   least likely drafts across sequences when a step exceeds the verify budget (64 rows, or the
   GPU's whole sparse MLA waves with `GLM5_FLASH_DECODE_ROWS=128`), in place of the same room for
-  every sequence.
+  every sequence. A packed prompt whose own grammar or sampling fails fails alone; the others
+  keep their first tokens. `chain` need not be output-identical to `cost`: a different verify
+  shape can round a near-tie the other way, while every emitted greedy token remains the target
+  argmax of its own verified row.
 
 ## Default precision (single residency)
 
