@@ -874,19 +874,29 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-95.5}"
   plan_draft_args=()
-  # MiMo and GLM 5.3 Flash: the sequences and prefix knobs the server gets, so the plan reserves
-  # the mark arena (and the per-sequence state) the server allocates.
-  if [[ "$family" == mimo_v2 || "$family" == glm5_flash ]]; then
+  if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
       --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
-  fi
-  if [[ "$family" == mimo_v2 ]]; then
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
     if [[ "$(get MIMO_PREFIX_DRAFT off)" == on ]]; then
       plan_draft_args+=(--mimo-prefix-draft --context-tokens "$(get MAX_CONTEXT_TOKENS 131072)")
     fi
+  fi
+  # GLM 5.3 Flash: the counts serve-glmf allocates for the keys a launch sets (unset keys keep
+  # the planner's defaults, which are serving's). Its recurrent state holds max(--slots, which
+  # is 8, --max-sequences) slots, and its prefix mark arena counts min(--max-sequences,
+  # DECODE_ROWS = 64) lanes, so both go to the plan as such beside the sequences.
+  if [[ "$family" == glm5_flash ]]; then
+    glmf_sequences="$(get CONCURRENCY)"
+    if [[ -n "$glmf_sequences" ]]; then
+      [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive sequence count" >&2; exit 2; }
+      plan_draft_args+=(--concurrency "$glmf_sequences" --state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
+        --mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))")
+    fi
+    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
