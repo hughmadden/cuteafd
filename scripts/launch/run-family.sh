@@ -83,9 +83,11 @@ read -r detected model_type first_layer last_layer <<<"$described"
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
 attention_placement="$(get ATTENTION_PLACEMENT auto)"
-case "$attention_placement" in
-  auto|heads) ;;
-  context|layers) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
+# auto is the family's recorded default (GLM 5.3: context where the image carries its programs);
+# the planner and the server resolve it. Explicit modes run only where an executor exists.
+case "$attention_placement:$family" in
+  auto:*|heads:*|context:glm5) ;;
+  context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac
 case "$family" in

@@ -51,7 +51,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
     def test_attention_placement_is_strict_before_starting_containers(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         block = source.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
-        self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
+        self.assertLess(source.index('case "$attention_placement:$family" in'), source.index('docker run'))
         self.assertIn('--attention-placement "$attention_placement"', source)
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
@@ -60,8 +60,10 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                     'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
                     'family="$1"; attention_placement="$2"; ' + block,
                     'test', family, mode], cwd=ROOT, text=True, capture_output=True)
-                self.assertEqual(result.returncode == 0, mode in ['auto', 'heads'], result.stderr)
-                if mode in ['context', 'layers']:
+                # GLM 5.3 runs context (K3); every other non-heads mode is refused.
+                runs = mode in ['auto', 'heads'] or (family, mode) == ('glm5', 'context')
+                self.assertEqual(result.returncode == 0, runs, result.stderr)
+                if mode in ['context', 'layers'] and not runs:
                     self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
 
     def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
