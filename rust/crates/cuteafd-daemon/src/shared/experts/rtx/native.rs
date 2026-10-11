@@ -52,7 +52,7 @@ impl CompletionEvent for Event<'_> {
             .run(|| unsafe { self.device.library.cuda_event_record(self.raw, stream) })
     }
     fn drain(&self, stream: *mut c_void) -> Result<()> {
-        // SAFETY: partial launches retain their caller's stream until this drain returns.
+        // SAFETY: the caller already published every peer abort word and retains the stream.
         self.device
             .run(|| unsafe { self.device.library.cuda_stream_synchronize(stream) })
     }
@@ -67,6 +67,7 @@ impl CompletionEvent for Event<'_> {
 pub(super) struct RankCompletion<E: CompletionEvent> {
     event: E,
     queued: bool,
+    failed_record_stream: Option<usize>,
 }
 
 impl<E: CompletionEvent> RankCompletion<E> {
@@ -74,24 +75,39 @@ impl<E: CompletionEvent> RankCompletion<E> {
         Self {
             event,
             queued: false,
+            failed_record_stream: None,
         }
     }
-    pub(super) fn finish(&mut self, result: Result<()>, stream: *mut c_void) -> Result<()> {
+    pub(super) fn finish(
+        &mut self,
+        result: Result<()>,
+        stream: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()> {
         let recorded = self.event.record(stream);
         self.queued |= recorded.is_ok();
-        if result.is_err() || recorded.is_err() {
-            self.event.drain(stream)?;
+        if recorded.is_err() {
+            self.failed_record_stream = Some(stream as usize);
         }
-        result.and(recorded)
+        let result = result.and(recorded);
+        if result.is_err() {
+            // An unmatched peer wait may precede this launch. Never drain here:
+            // the engine publishes abort first, then drains every consumer.
+            abort();
+        }
+        result
     }
 }
 
 impl<E: CompletionEvent> Drop for RankCompletion<E> {
     fn drop(&mut self) {
-        if self.queued {
-            if let Err(error) = self.event.wait() {
-                tracing::error!(%error, "draining TP2 rank owner");
-            }
+        if let Some(stream) = self.failed_record_stream {
+            crate::shared::decode_graph::fatal_drain(
+                self.event.drain(stream as *mut c_void),
+                "RTX failed completion record Drop",
+            );
+        } else if self.queued {
+            crate::shared::decode_graph::fatal_drain(self.event.wait(), "RTX rank completion Drop");
         }
     }
 }
@@ -353,77 +369,85 @@ impl RtxExpertLayer for NativeTp2<'_> {
         input: ExpertInput,
         routes: Routes,
         stream: *mut c_void,
+        abort: &mut dyn FnMut(),
     ) -> Result<()> {
-        ensure!(
-            self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
-            "TP2 layer/rows not resident"
-        );
-        let ExpertInput::Fp8K32(wire) = input else {
-            bail!("NativeTp2 requires FP8 K32 input")
-        };
-        ensure!(
-            !wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(),
-            "null TP2 input"
-        );
-        let result = self.device.run(|| {
-            let state = self
-                .states
-                .iter_mut()
-                .find(|s| s.kernel.info().capacity_rows as usize >= rows)
-                .unwrap();
-            // SAFETY: caller retains complete rank-local inputs and owns exclusive stream/output use.
-            unsafe {
-                self.weights[layer - self.layers.start].bind(&state.kernel, &mut state.slots)?;
-                state.slots[0] = wire;
-                state.slots[1] = routes.ids;
-                state.slots[2] = routes.weights;
-                let info = state.kernel.info();
-                state.kernel.launch(&V41ExpertLaunchArgs {
-                    tensors: state.slots,
-                    num_tokens: rows as i32,
-                    max_rows: info.max_rows,
-                    scatter_rows: rows as i32 * self.geometry.topk as i32,
-                    rows_padded: info.rows_padded,
-                    max_tasks: info.max_tasks,
-                    max_phys_tiles: info.max_phys_tiles,
-                    max_active_clusters: info.max_active_clusters,
-                    stream,
-                })?;
-                let mut source = CuteafdDeviceBuffer {
-                    ptr: state.slots[41],
-                    bytes: output_bytes(self.geometry, rows)?,
-                    device_id: self.device.id,
-                    flags: 0,
-                };
-                match state.kernel.output_kind() {
-                    V41ExpertOutputKind::Fp32Routes => {
-                        source.bytes *= self.geometry.topk as usize;
-                        if self.geometry.same_shape(&ExpertGeometry::DEEPSEEK_V41) {
-                            self.reducer
-                                .sum_routes(source, self.output.buffer, rows as u32, stream)
-                        } else {
-                            self.reducer.sum_routes_geometry(
-                                source,
-                                self.output.buffer,
-                                rows as u32,
-                                self.geometry,
-                                stream,
-                            )
+        let result = (|| {
+            ensure!(
+                self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
+                "TP2 layer/rows not resident"
+            );
+            let ExpertInput::Fp8K32(wire) = input else {
+                bail!("NativeTp2 requires FP8 K32 input")
+            };
+            ensure!(
+                !wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(),
+                "null TP2 input"
+            );
+            self.device.run(|| {
+                let state = self
+                    .states
+                    .iter_mut()
+                    .find(|s| s.kernel.info().capacity_rows as usize >= rows)
+                    .unwrap();
+                // SAFETY: caller retains complete rank-local inputs and owns exclusive stream/output use.
+                unsafe {
+                    self.weights[layer - self.layers.start]
+                        .bind(&state.kernel, &mut state.slots)?;
+                    state.slots[0] = wire;
+                    state.slots[1] = routes.ids;
+                    state.slots[2] = routes.weights;
+                    let info = state.kernel.info();
+                    state.kernel.launch(&V41ExpertLaunchArgs {
+                        tensors: state.slots,
+                        num_tokens: rows as i32,
+                        max_rows: info.max_rows,
+                        scatter_rows: rows as i32 * self.geometry.topk as i32,
+                        rows_padded: info.rows_padded,
+                        max_tasks: info.max_tasks,
+                        max_phys_tiles: info.max_phys_tiles,
+                        max_active_clusters: info.max_active_clusters,
+                        stream,
+                    })?;
+                    let mut source = CuteafdDeviceBuffer {
+                        ptr: state.slots[41],
+                        bytes: output_bytes(self.geometry, rows)?,
+                        device_id: self.device.id,
+                        flags: 0,
+                    };
+                    match state.kernel.output_kind() {
+                        V41ExpertOutputKind::Fp32Routes => {
+                            source.bytes *= self.geometry.topk as usize;
+                            if self.geometry.same_shape(&ExpertGeometry::DEEPSEEK_V41) {
+                                self.reducer.sum_routes(
+                                    source,
+                                    self.output.buffer,
+                                    rows as u32,
+                                    stream,
+                                )
+                            } else {
+                                self.reducer.sum_routes_geometry(
+                                    source,
+                                    self.output.buffer,
+                                    rows as u32,
+                                    self.geometry,
+                                    stream,
+                                )
+                            }
+                        }
+                        V41ExpertOutputKind::Fp32Tokens => self.device.library.copy_d2d_async(
+                            self.output.buffer,
+                            source,
+                            source.bytes,
+                            stream,
+                        ),
+                        V41ExpertOutputKind::Bf16Routes => {
+                            bail!("NativeTp2 excludes NVFP4 BF16 routes")
                         }
                     }
-                    V41ExpertOutputKind::Fp32Tokens => self.device.library.copy_d2d_async(
-                        self.output.buffer,
-                        source,
-                        source.bytes,
-                        stream,
-                    ),
-                    V41ExpertOutputKind::Bf16Routes => {
-                        bail!("NativeTp2 excludes NVFP4 BF16 routes")
-                    }
                 }
-            }
-        });
-        self.completion.finish(result, stream)
+            })
+        })();
+        self.completion.finish(result, stream, abort)
     }
 }
 
@@ -476,7 +500,11 @@ mod tests {
             }),
             _storage: Storage(freed.clone()),
         };
-        executor.completion.finish(Ok(()), std::ptr::null_mut())?;
+        executor
+            .completion
+            .finish(Ok(()), std::ptr::null_mut(), &mut || {
+                panic!("success must not abort")
+            })?;
         let (returned, done) = mpsc::channel();
         let dropper = std::thread::spawn(move || {
             drop(executor);
@@ -496,50 +524,80 @@ mod tests {
     }
 
     #[test]
-    fn failed_launch_or_event_record_drains_the_caller_stream() {
-        use std::{cell::RefCell, rc::Rc};
+    fn rank1_launch_error_aborts_waiting_rank0_before_return_without_inline_drain() -> Result<()> {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, mpsc, Arc, Condvar, Mutex};
+        use std::time::Duration;
         struct ProbeEvent {
             fail_record: bool,
-            calls: Rc<RefCell<Vec<&'static str>>>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            drains: Arc<AtomicUsize>,
         }
         impl CompletionEvent for ProbeEvent {
             fn record(&self, _: *mut c_void) -> Result<()> {
-                self.calls.borrow_mut().push("record");
                 ensure!(!self.fail_record, "injected record failure");
                 Ok(())
             }
             fn drain(&self, _: *mut c_void) -> Result<()> {
-                self.calls.borrow_mut().push("drain");
-                Ok(())
+                self.wait()
             }
             fn wait(&self) -> Result<()> {
-                self.calls.borrow_mut().push("wait");
+                self.drains.fetch_add(1, Ordering::SeqCst);
+                let (lock, wake) = &*self.gate;
+                let _aborted = wake
+                    .wait_while(lock.lock().unwrap(), |aborted| !*aborted)
+                    .unwrap();
                 Ok(())
             }
         }
-        for fail_record in [false, true] {
-            let calls = Rc::new(RefCell::new(Vec::new()));
-            let mut completion = RankCompletion::new(ProbeEvent {
-                fail_record,
-                calls: calls.clone(),
+        for (fail_launch, fail_record) in [(true, false), (false, true), (true, true)] {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let peer_gate = gate.clone();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (peer_tx, peer_rx) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let (lock, wake) = &*peer_gate;
+                let guard = lock.lock().unwrap();
+                waiting_tx.send(()).unwrap();
+                let _aborted = wake.wait_while(guard, |aborted| !*aborted).unwrap();
+                peer_tx.send(()).unwrap();
             });
-            let launch = if fail_record {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("injected partial launch failure"))
-            };
-            assert!(completion.finish(launch, std::ptr::null_mut()).is_err());
-            assert_eq!(*calls.borrow(), ["record", "drain"]);
-            drop(completion);
-            assert_eq!(
-                *calls.borrow(),
-                if fail_record {
-                    vec!["record", "drain"]
+            waiting_rx.recv_timeout(Duration::from_secs(5))?;
+            let rank_gate = gate.clone();
+            let drains = Arc::new(AtomicUsize::new(0));
+            let rank_drains = drains.clone();
+            let (returned_tx, returned_rx) = mpsc::channel();
+            let rank = std::thread::spawn(move || {
+                let mut completion = RankCompletion::new(ProbeEvent {
+                    fail_record,
+                    gate: rank_gate.clone(),
+                    drains: rank_drains.clone(),
+                });
+                let mut abort = || {
+                    *rank_gate.0.lock().unwrap() = true;
+                    rank_gate.1.notify_all();
+                };
+                let launch = if fail_launch {
+                    Err(anyhow::anyhow!("injected rank1 launch failure"))
                 } else {
-                    vec!["record", "drain", "wait"]
-                }
-            );
+                    Ok(())
+                };
+                let result = completion.finish(launch, std::ptr::null_mut(), &mut abort);
+                returned_tx
+                    .send((result.is_err(), *rank_gate.0.lock().unwrap(), rank_drains.load(Ordering::SeqCst)))
+                    .unwrap();
+                drop(completion);
+            });
+            let returned = returned_rx.recv_timeout(Duration::from_secs(5));
+            // Always release before assertions, so a regression cannot hang the suite.
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            peer.join().unwrap();
+            rank.join().unwrap();
+            assert_eq!(returned?, (true, true, 0));
+            assert_eq!(drains.load(Ordering::SeqCst), 1, "Drop drains only after abort");
+            peer_rx.recv_timeout(Duration::from_secs(5))?;
         }
+        Ok(())
     }
 
     #[test]

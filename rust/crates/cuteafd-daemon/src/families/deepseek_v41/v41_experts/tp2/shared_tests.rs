@@ -399,6 +399,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
                         weights: buffers[2].buffer.ptr,
                     },
                     stream.raw,
+                    &mut || {}, // Independent fixture streams have no peer waits.
                 )?;
             }
             stream.drain()?;

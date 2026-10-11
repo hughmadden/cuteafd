@@ -218,6 +218,7 @@ fn compare(exl3: bool) -> Result<()> {
                         weights: inputs[rank].0[2].buffer.ptr,
                     },
                     inputs[rank].1.raw,
+                    &mut || {}, // Independent fixture streams have no peer waits.
                 )?;
             }
             inputs[rank].1.drain()?;

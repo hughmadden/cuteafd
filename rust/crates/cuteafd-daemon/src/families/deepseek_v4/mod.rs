@@ -414,73 +414,79 @@ pub(crate) fn with_engine<T>(
         embedding,
         skip_routed: skip,
     })?;
-    if let Some((device, stream)) = peer_stream {
-        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
-    }
-    let held = held(&engine)?;
-    let _ = held; // Prefix bytes were reserved before placement.
-    let started = Instant::now();
-    let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    let max_rows = engine.decode_rows.max(engine.prefill_rows);
-    let range = &placement.expert_ranges[0];
-    ensure!(split_device.is_none() || range.layers == 0,
-        "TP1 backbone layers are forbidden under a head split");
-    let local = if skip { None } else { local::LocalExperts::load_range(&loaded.library, &args.native_lib,
-        &loaded.catalog, stages, range.first..range.first + range.layers,
-        max_rows, usize::try_from(range.peak_bytes)?, stream)? };
-    ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
-        "DeepSeek V4 TP1 allocation differs from admitted placement");
-    engine.install_local(local);
-    if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
-        use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
-        use crate::shared::memory::device::Device;
-        let devices = [Device { library: &loaded.library, id: args.device },
-            Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
-        let layers = tp2.first..tp2.first + tp2.layers;
-        let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
-        let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
-            let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
-                manifest.decoder_tiers(), "rtx-tp2");
-            Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
-                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
-        } else {
-            NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
-                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
-        };
-        ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
-        engine.install_tp2(ranks)?;
-    }
-    tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
-        elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
-    // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
-    let executors = (0..peers.len())
-        .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-        .collect::<Result<Vec<u64>>>()?;
-    // One transport (connection set) per prefill lane, so each lane can keep
-    // a Spark wave in flight; decode uses the first.
-    let lanes = if skip { 0 } else { engine::PREFILL_LANES };
-    let mut transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
-        TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-        loaded.cfg.dim * 2))
-        .collect::<Result<Vec<_>>>()?;
-    crate::shared::memory_report::release_load_staging(&loaded.library);
+    // Startup and inference share retirement: an error must not drop a rank
+    // owner while the other rank is waiting for its missing publication.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let started = Instant::now();
-    for transport in &mut transports {
-        engine.warm_transport(transport, &runtime)?;
-    }
-    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-    if crate::shared::spark_intake::device_exchange_enabled() && !skip
-        && crate::shared::spark_intake::device_exchange_available(&loaded.library)? {
+    let mut transports = Vec::new();
+    let result = (|| -> Result<T> {
+        if let Some((device, stream)) = peer_stream {
+            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
+        }
+        let held = held(&engine)?;
+        let _ = held; // Prefix bytes were reserved before placement.
         let started = Instant::now();
-        engine.attach_device_link(&peers, &executors,
-            TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
-        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
-    }
-    if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
-    engine.warm_local_graphs()?;
-    engine.check_routes(&mut transports, &runtime)?;
-    let result = body(&engine, &mut transports, &runtime);
+        let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
+        let max_rows = engine.decode_rows.max(engine.prefill_rows);
+        let range = &placement.expert_ranges[0];
+        ensure!(split_device.is_none() || range.layers == 0,
+            "TP1 backbone layers are forbidden under a head split");
+        let local = if skip { None } else { local::LocalExperts::load_range(&loaded.library, &args.native_lib,
+            &loaded.catalog, stages, range.first..range.first + range.layers,
+            max_rows, usize::try_from(range.peak_bytes)?, stream)? };
+        ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
+            "DeepSeek V4 TP1 allocation differs from admitted placement");
+        engine.install_local(local);
+        if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
+            use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
+            use crate::shared::memory::device::Device;
+            let devices = [Device { library: &loaded.library, id: args.device },
+                Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
+            let layers = tp2.first..tp2.first + tp2.layers;
+            let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
+            let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
+                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                    manifest.decoder_tiers(), "rtx-tp2");
+                Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
+                    .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+            } else {
+                NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
+                    .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+            };
+            ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
+            engine.install_tp2(ranks)?;
+        }
+        tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
+            elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
+        // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
+        let executors = (0..peers.len())
+            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
+            .collect::<Result<Vec<u64>>>()?;
+        // One transport (connection set) per prefill lane, so each lane can keep
+        // a Spark wave in flight; decode uses the first.
+        let lanes = if skip { 0 } else { engine::PREFILL_LANES };
+        transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
+            TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+            loaded.cfg.dim * 2))
+            .collect::<Result<Vec<_>>>()?;
+        crate::shared::memory_report::release_load_staging(&loaded.library);
+        let started = Instant::now();
+        for transport in &mut transports {
+            engine.warm_transport(transport, &runtime)?;
+        }
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        if crate::shared::spark_intake::device_exchange_enabled() && !skip
+            && crate::shared::spark_intake::device_exchange_available(&loaded.library)? {
+            let started = Instant::now();
+            engine.attach_device_link(&peers, &executors,
+                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
+        }
+        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        engine.warm_local_graphs()?;
+        engine.check_routes(&mut transports, &runtime)?;
+        body(&engine, &mut transports, &runtime)
+    })();
+    crate::shared::decode_graph::fatal_drain(engine.retire_tp2(), "V4 RTX engine retirement");
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.
         tracing::error!("{error:#}");
