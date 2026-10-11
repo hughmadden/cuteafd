@@ -94,11 +94,11 @@ enum Phase {
 // Keep this bank before the allocations referenced by its graphs.
 struct Tp2FfnGraphs<'w,'a> {
     device: Device<'a>,
-    bank: crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
+    bank: crate::shared::decode_graph::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs::new(device.library);
+        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));
         bank.enable_small_shapes();Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
@@ -198,13 +198,14 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
-                    if let Some((graph,_))=cached {
+                    if cached.is_some() && !crate::shared::decode_graph::census::eager("layer_row") {
                         lane.block.prepare_ffn_graph_replay(binding,rows)?;
-                        library.cuda_graph_launch(graph,stream)?;
-                    } else {lane.block.enqueue_ffn(binding,rows,projected,stream)?;}
+                    }
+                    crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
+                        cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))?;
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
-            if cached.is_none() {
+            if cached.is_none() && !crate::shared::decode_graph::census::eager("layer_row") {
                 // Warm output is complete. Recording the next invocation restores
                 // host phase without executing the FFN prefix a second time.
                 unsafe {graphs.capture_ready(&mut lane.block,weights,binding,rows,projected,stream)?;}
@@ -228,7 +229,7 @@ impl Drop for PendingLaneFfn<'_, '_, '_> {
             let drained=if let Some(dual)=lane.dual_sparse.as_mut() { dual.drain() }
                 else { lane.sparse.as_mut().map_or(Ok(()),|sparse|sparse.drain_chain()) };
             if let Err(error) = drained {
-                tracing::error!(%error, "draining cancelled attention chain");
+                crate::shared::decode_graph::fatal_drain(Err(error), "attention chain cancellation");
             }
             lane.block.reset();
             lane.phase = Phase::Invalid;

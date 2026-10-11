@@ -1,6 +1,6 @@
 //! Backbone inverse rotary, grouped FP8 wo_a and native FP8 wo_b.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionOutput;
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -118,7 +118,7 @@ impl<'a> AttentionOutputWeights<'a> {
             position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
             capacity,
-            graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             ready: None,
             origin: None,
         };
@@ -371,7 +371,7 @@ impl AttentionOutputWave<'_, '_> {
                 )?;
             }
             let rows = attention.rows as u32;
-            if super::v41_layer_graphs::captures_shape(rows) {
+            if super::graph_policy::captures_shape(rows) {
                 if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
                     unsafe { self.capture(rows)?; }
                 }
@@ -415,8 +415,10 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
-        if !super::v41_layer_graphs::captures_shape(rows) {
-            unsafe { self.enqueue_on(rows, stream)?; }
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
+            let library = self.stream.library;
+            unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                None, || self.enqueue_on(rows, stream))?; }
             let mut output = self.b(2);
             output.bytes = attention.rows * ROW_BYTES[2];
             return Ok(output);
@@ -429,7 +431,9 @@ impl AttentionOutputWave<'_, '_> {
         let (graph, count) = self.graphs.get_shape(self.weights.layer, self.weights, rows)
             .context("queued output graph missing")?;
         ensure!(count == rows, "queued output graph shape differs");
-        unsafe { self.stream.library.cuda_graph_launch(graph, stream)?; }
+        let library = self.stream.library;
+        unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+            Some(graph), || self.enqueue_on(rows, stream))?; }
         let mut output = self.b(2);
         output.bytes = attention.rows * ROW_BYTES[2];
         Ok(output)
@@ -455,9 +459,17 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
+        if crate::shared::decode_graph::census::enabled() && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some() {
+            let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
+            let library = self.stream.library;
+            unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                graph, || self.enqueue_on(rows, stream))?; }
+            let mut output = self.b(2); output.bytes = attention.rows * ROW_BYTES[2];
+            return Ok(Some(output));
+        }
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             unsafe { self.enqueue_on(rows, stream)?; }
-            if !super::v41_layer_graphs::captures_shape(rows) {
+            if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
                 let mut output = self.b(2);
                 output.bytes = attention.rows * ROW_BYTES[2];
                 return Ok(Some(output));
@@ -577,7 +589,7 @@ impl Drop for AttentionOutputWave<'_, '_> {
             .synchronize()
             .and_then(|()| unsafe { self.graphs.clear() })
         {
-            tracing::error!(%error,"draining attention output graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "attention output");
         }
     }
 }

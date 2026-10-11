@@ -1,7 +1,7 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 
@@ -83,7 +83,7 @@ impl<'w,'a> Rank<'w,'a> {
         let alpha=Allocation::new(device,16)?;
         let initialized=device.run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) });
         let drained=stream.drain();initialized.and(drained)?;
-        let mut graphs=LayerGraphs::new(device.library);graphs.enable_small_shapes();
+        let mut graphs=LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));graphs.enable_small_shapes();
         Ok(Self { graphs,weights,stream,plan,copy:device.run(||device.library.v41_peer_copy())?,
             input:Allocation::new(device,capacity as usize*k*2)?,
             output:Allocation::new(device,capacity as usize*n)?,scratch,alpha })
@@ -99,7 +99,7 @@ impl<'w,'a> Rank<'w,'a> {
     // the peer rank. Capture records the next invocation without repeating work.
     fn capture_ready(&mut self,layer:usize,rows:u32)->Result<()> {
         let weights=self.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
-        if !super::v41_layer_graphs::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.stream.device;
         device.run(||unsafe {
@@ -121,7 +121,7 @@ impl<'w,'a> Rank<'w,'a> {
 }
 impl Drop for Rank<'_,'_> {
     fn drop(&mut self) {
-        if let Err(error)=self.stream.drain() { tracing::error!(%error,"draining projection rank"); }
+        if let Err(error)=self.stream.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection rank"); }
         let device=self.stream.device;
         if let Err(error)=device.run(||unsafe { self.graphs.clear() }) {
             tracing::error!(%error,"destroying projection rank graphs");
@@ -143,7 +143,7 @@ struct Drain<'s,'w,'a> { wave: &'s mut Wave<'w,'a>, complete: bool }
 impl Drop for Drain<'_,'_,'_> {
     fn drop(&mut self) {
         if !self.complete {
-            if let Err(error)=self.wave.drain() { tracing::error!(%error,"draining interrupted projection"); }
+            if let Err(error)=self.wave.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection unwind"); }
         }
     }
 }
@@ -170,7 +170,7 @@ impl<'w,'a> Wave<'w,'a> {
             device.run(||device.library.cuda_enable_peer(peer.id))?;
         }
         let devices=[a.device,b.device];let (_,n)=a.kind.geometry();
-        let mut gather_graphs=LayerGraphs::new(a.device.library);gather_graphs.enable_small_shapes();
+        let mut gather_graphs=LayerGraphs::new(a.device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));gather_graphs.enable_small_shapes();
         Ok(Self { gather_graphs,ranks:[Rank::new(weights[0],capacity)?,Rank::new(weights[1],capacity)?],
             output:Allocation::new(devices[owner],capacity as usize*n*2)?,
             peer_done:Event::new(devices[1-owner])?,
@@ -188,7 +188,7 @@ impl<'w,'a> Wave<'w,'a> {
     fn capture_gather_ready(&mut self,rows:u32)->Result<()> {
         // The gather uses only this wave's fixed storage, independent of layer.
         let weights=&self.ranks[self.owner].weights[0];
-        if !super::v41_layer_graphs::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].stream.raw;let device=self.output.device;
         device.run(||unsafe {
@@ -244,18 +244,18 @@ impl<'w,'a> Wave<'w,'a> {
                     rank.stream.device.library.cuda_stream_wait_event(rank.stream.raw,wave.input_ready[input_rank].raw)?;
                 }
                 rank.copy.launch_rows(rank.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.stream.raw)?;
-                if let Some((graph,_))=rank.graphs.get_shape(layer,weights,rows) {
-                    rank.stream.device.library.cuda_graph_launch(graph,rank.stream.raw)
-                } else { rank.enqueue(weights,rows) }
+                crate::shared::decode_graph::census::dispatch(rank.stream.device.library, rank.stream.raw,
+                    c"layer_row", rows as usize, rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw),
+                    || rank.enqueue(weights,rows))
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
         wave.peer_done.record(&peer.stream)?;
         owner.stream.device.run(||unsafe {
             owner.stream.device.library.cuda_stream_wait_event(owner.stream.raw,wave.peer_done.raw)?;
-            if let Some((graph,_))=wave.gather_graphs.get_shape(0,&owner.weights[0],rows) {
-                owner.stream.device.library.cuda_graph_launch(graph,owner.stream.raw)
-            } else { wave.enqueue_gather(rows) }
+            crate::shared::decode_graph::census::dispatch(owner.stream.device.library, owner.stream.raw,
+                c"layer_row", rows as usize, wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw),
+                || wave.enqueue_gather(rows))
         })?;
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.output.buffer };
         let result=owner.stream.device.run(||consume(output,owner.stream.raw))?;
@@ -267,7 +267,7 @@ impl<'w,'a> Wave<'w,'a> {
 }
 impl Drop for Wave<'_,'_> {
     fn drop(&mut self) {
-        if let Err(error)=self.drain() { tracing::error!(%error,"draining projection wave"); }
+        if let Err(error)=self.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection"); }
         let device=self.output.device;
         if let Err(error)=device.run(||unsafe { self.gather_graphs.clear() }) {
             tracing::error!(%error,"destroying projection gather graphs");

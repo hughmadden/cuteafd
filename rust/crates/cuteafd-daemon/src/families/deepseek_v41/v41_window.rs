@@ -1,5 +1,6 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
@@ -314,7 +315,7 @@ impl<'a> WindowWeights<'a> {
             staging: HostAllocation::new(self.library, rows * 8 + 128)?,
             capacity: rows,
             graph: None,
-            retained_graphs: [None; 64],
+            graphs: GraphBank::new(None),
             ready: None,
             pending_query: None,
             pending_commit: None,
@@ -410,9 +411,9 @@ pub(crate) struct WindowWave<'w, 'a> {
     destinations: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize, u64)>,
-    // Lane-local decode shapes; large prefill retains only the current graph.
-    retained_graphs: [Option<(*mut c_void, usize, u64)>; 64],
+    graph: Option<(usize, u64)>,
+    // Exact cache-owner bindings; containing wave pins workspace and weights.
+    graphs: GraphBank<(usize, u64), GraphOwner<'a, ()>>,
     ready: Option<Prepared>,
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
@@ -539,18 +540,23 @@ impl WindowWave<'_, '_> {
             && query.hidden.device_id == self.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
-        self.select_graph(prepared.rows, state.owner, false)?;
-        let capture = self.graph.is_none();
+        let forced_eager = crate::shared::decode_graph::census::eager("window");
+        if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
+        let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
             unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
             unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload(&prepared)?;
-            unsafe {
-                if capture { self.enqueue(prepared.rows) }
-                else { self.stream.library.cuda_graph_launch(self.graph.unwrap().0, self.stream.raw) }
-            }
+            let dispatch = || unsafe {
+                if capture || forced_eager { self.enqueue(prepared.rows) }
+                else { self.stream.library.cuda_graph_launch(self.current_graph().unwrap().0, self.stream.raw) }
+            };
+            if crate::shared::decode_graph::census::enabled() {
+                unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"window", prepared.rows,
+                    !capture && !forced_eager, crate::shared::decode_graph::census::arm(), dispatch) }
+            } else { dispatch() }
         })();
         self.pending_query = Some((prepared, capture));
         if let Err(error) = result { self.abort_query()?; return Err(error); }
@@ -576,7 +582,7 @@ impl WindowWave<'_, '_> {
                     }
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
                 };
-                self.graph = Some((graph, prepared.rows, state.owner));
+                self.insert_graph(prepared.rows, state.owner, graph)?;
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
@@ -672,7 +678,7 @@ impl WindowWave<'_, '_> {
         let launched = unsafe { self.enqueue(p.rows) };
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(g)) => self.graph = Some((g, p.rows, state.owner)),
+            (Ok(()), Ok(g)) => self.insert_graph(p.rows, state.owner, g)?,
             (Err(e), Ok(g)) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(g)?;
@@ -691,13 +697,20 @@ impl WindowWave<'_, '_> {
         chunks: &[WindowChunk],
     ) -> Result<WindowOutput<'s>> {
         let p = self.prepare(state, chunks)?;
-        let (g, rows, owner) = self.graph.context("window graph missing")?;
+        let (g, rows, owner) = self.current_graph().context("window graph missing")?;
         ensure!(
             rows == p.rows && owner == state.owner,
             "window capture binding differs"
         );
-        let launched = self.upload(&p).and_then(|()| unsafe {
-            self.stream.library.cuda_graph_launch(g, self.stream.raw)
+        let launched = self.upload(&p).and_then(|()| {
+            let eager = crate::shared::decode_graph::census::eager("window");
+            let dispatch = || unsafe {
+                if eager { self.enqueue(p.rows) } else { self.stream.library.cuda_graph_launch(g, self.stream.raw) }
+            };
+            if crate::shared::decode_graph::census::enabled() {
+                unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"window", p.rows, !eager,
+                    crate::shared::decode_graph::census::arm(), dispatch) }
+            } else { dispatch() }
         });
         launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
         self.ready = Some(p);
@@ -775,32 +788,39 @@ impl WindowWave<'_, '_> {
     /// Switch only after prior launches finish. Graphs bind the cache owner and
     /// lane workspace, while current request descriptors are uploaded on replay.
     fn select_graph(&mut self, rows: usize, owner: u64, drain: bool) -> Result<()> {
-        if self.graph.is_some_and(|(_, n, o)| n == rows && o == owner) { return Ok(()); }
+        if self.graph == Some((rows, owner)) { return Ok(()); }
         ensure!(self.pending_query.is_none() && self.pending_commit.is_none(),
             "cannot switch a pending cache producer graph");
-        if self.graph.is_some_and(|(_, _, o)| o != owner)
-            || self.retained_graphs.iter().flatten().any(|(_, _, o)| *o != owner) {
+        if self.graph.is_some_and(|(_, o)| o != owner)
+            || self.graphs.count(|(_, o)| *o != owner) > 0 {
             return self.clear_graph_inner(drain);
         }
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
         if let Some(old) = self.graph.take() {
-            if (1..=self.retained_graphs.len()).contains(&old.1) {
-                let slot = &mut self.retained_graphs[old.1 - 1];
-                ensure!(slot.is_none(), "duplicate retained cache producer shape");
-                *slot = Some(old);
-            } else {
-                unsafe { self.stream.library.cuda_graph_exec_destroy(old.0)?; }
-            }
+            if old.0 > 64 { self.graphs.retire(&old); }
         }
-        if (1..=self.retained_graphs.len()).contains(&rows) {
-            self.graph = self.retained_graphs[rows - 1].take();
-        }
+        drop(self.graphs.drain_retired(|| Ok(()))?);
+        self.graph = self.graphs.launch(&(rows, owner)).map(|_| (rows, owner));
         if self.graph.is_none() {
             tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
-                rows, owner, bank=self as *const Self as usize,
-                retained=self.retained_graphs.iter().flatten().count(), "graph cache miss");
+                rows, owner, device=self.input.buffer.device_id, bank=self as *const Self as usize,
+                retained=self.graphs.len(), "graph cache miss");
         }
+        Ok(())
+    }
+    fn current_graph(&self) -> Option<(*mut c_void, usize, u64)> {
+        let (rows, owner) = self.graph?;
+        Some((self.graphs.get(&(rows, owner))?.raw, rows, owner))
+    }
+    fn insert_graph(&mut self, rows: usize, owner: u64, raw: *mut c_void) -> Result<()> {
+        let device = self.input.buffer.device_id;
+        // SAFETY: the wave pins weights/workspace; Drop drains before releasing fields.
+        let graph = unsafe { GraphOwner::new(self.stream.library, device, raw, ())? };
+        self.graphs.insert((rows, owner), graph, None);
+        self.graph = Some((rows, owner));
+        tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
+            rows, owner, device, bank=self as *const Self as usize, "window graph captured");
         Ok(())
     }
     pub fn clear_graph(&mut self) -> Result<()> {
@@ -811,25 +831,18 @@ impl WindowWave<'_, '_> {
         ensure!(self.pending_commit.is_none(), "cannot reset a pending window commit");
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
-        for (g, _, _) in self.graph.take().into_iter()
-            .chain(self.retained_graphs.iter_mut().filter_map(Option::take)) {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(g)?;
-            }
-        }
+        self.graph = None;
+        self.graphs.retire_all();
+        drop(self.graphs.drain_retired(|| Ok(()))?);
         Ok(())
     }
 }
 impl Drop for WindowWave<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error, "draining pending window writes");
-        }
+        fatal_drain(self.synchronize(), "pending window writes");
         self.pending_query = None;
         self.pending_commit = None;
-        if let Err(error) = self.clear_graph() {
-            tracing::error!(%error,"draining window graph");
-        }
+        fatal_drain(self.clear_graph(), "window graph");
     }
 }
 

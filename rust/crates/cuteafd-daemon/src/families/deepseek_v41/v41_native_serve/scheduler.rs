@@ -253,6 +253,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
+    let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     // Shared prefill only: one encoder wave per round, then the decode debt.
     let mut prefills = crate::shared::prefill_share::PrefillQueue::<Prefilling<'a, P::Suffix>>::new(
@@ -332,7 +333,13 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
                     }
-                    match receive.blocking_recv() { Some(job) => job, None => { closed = true; break; } }
+                    match receive.blocking_recv() {
+                        Some(job) => {
+                            crate::shared::decode_graph::census::idle();
+                            job
+                        }
+                        None => { closed = true; break; }
+                    }
                 } else {
                     match receive.try_recv() {
                         Ok(job) => job,
@@ -567,6 +574,8 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             }
         }
         if active.iter().all(Option::is_none) {
+            crate::shared::decode_graph::census::idle();
+            crate::shared::decode_graph::CaptureWatch::flush();
             if closed && media.is_empty() && kv_waiter.is_empty()
                 && (!SHARED_PREFILL || prefills.is_empty()) { break; }
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
@@ -595,6 +604,11 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 continue;
             }
         }
+        let census_started = crate::shared::decode_graph::census::enabled().then(|| {
+            tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
+                requests=members.iter().map(Vec::len).sum::<usize>(), "graph census decode step begin");
+            Instant::now()
+        });
         let parked = if SHARED_PREFILL { prefills.len() } else { 0 };
         let decode_started = SHARED_PREFILL.then(Instant::now);
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
@@ -607,6 +621,10 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 prefill_deadline: decode_started.filter(|_| parked > 0)
                     .map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
         if let Some(started) = decode_started { prefills.stepped(started.elapsed().as_secs_f64()); }
+        if let Some(started) = census_started {
+            tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
+                host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
+        }
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
@@ -1472,6 +1490,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     transport: &mut NativeTp4Wave<'a>, active: &mut [Option<Active<'a>>],
     members: &[usize], mut draft: Option<&mut DraftRuntime<'_, 'a>>, retain_enabled: bool,
 ) -> Result<()> {
+    let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
@@ -1591,7 +1610,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane,
             requests=members.len(), rows=inputs.iter().map(Vec::len).sum::<usize>(),
             prepared_us, verify_us=executed_us-prepared_us, "verification round cost");
-            graph_capture_watch();
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
@@ -2836,28 +2854,5 @@ mod sampling_tests {
         assert_eq!(row.output_row, 3);
         // The device never calls logf, so this must be the host f32::ln bits.
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
-    }
-}
-
-/// Every 512 verification rounds: CUDA graph captures begun since the last
-/// report (a warm server should capture none; AGENTS.md).
-pub(super) fn graph_capture_watch() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ROUNDS: AtomicU64 = AtomicU64::new(0);
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let rounds = ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
-    let interval = if tracing::enabled!(target: "cuteafd::graph_capture", tracing::Level::DEBUG) { 32 } else { 512 };
-    if rounds % interval == 0 {
-        let captures = cuteafd_ffi::graph_captures();
-        let previous = LAST.swap(captures, Ordering::Relaxed);
-        static SITES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
-        let now = cuteafd_ffi::graph_capture_sites();
-        let mut before = SITES.lock().unwrap_or_else(|p| p.into_inner());
-        let mut delta: Vec<_> = now.iter().map(|(site, n)| (site.rsplit('/').next().unwrap_or(site).to_string(),
-            n - before.iter().find(|(s, _)| s == site).map_or(0, |(_, m)| *m))).filter(|(_, n)| *n > 0).collect();
-        delta.sort_by(|a, b| b.1.cmp(&a.1));
-        *before = now;
-        tracing::info!(rounds, interval, captures = captures - previous, sites = ?delta,
-            "graph captures in recent verification rounds");
     }
 }
