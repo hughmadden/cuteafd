@@ -144,9 +144,11 @@ mod owner_graph_tests {
         cfg.ple_layers = vec![1];
         for cut in [1, 2, 24, 47] {
             let owners: Vec<_> = (0..48).map(|layer| usize::from(layer >= cut)).collect();
-            for mtp in [false, true] {
-                let whole = super::super::qwen_cache_geometry(&cfg, 48, mtp).unwrap();
-                let placed = qwen_cache_geometry_placed(&cfg, &owners, mtp).unwrap();
+            for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
+                [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8]
+                    .into_iter().map(move |format| (mtp, format))) {
+                let whole = super::super::qwen_cache_geometry(&cfg, 48, mtp, kv_format).unwrap();
+                let placed = qwen_cache_geometry_placed(&cfg, &owners, mtp, kv_format).unwrap();
                 assert_eq!(placed.placement, super::super::KvPlacement::PartitionedLayers);
                 assert_eq!(placed.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>(), whole.ranks[0].persistent_unit_bytes);
                 assert_eq!(placed.ranks.iter().map(|rank| rank.active_state_per_sequence_bytes).sum::<u64>(), whole.ranks[0].active_state_per_sequence_bytes);
@@ -154,7 +156,7 @@ mod owner_graph_tests {
                 assert_eq!(placed.ranks.iter().map(|rank| rank.speculative_replay_bytes).sum::<u64>(), whole.ranks[0].speculative_replay_bytes);
                 assert_eq!(placed.ranks[0].fixed_state_bytes, whole.ranks[0].fixed_state_bytes);
                 assert_eq!(placed.ranks[1].fixed_state_bytes, 3 * 64 * 4);
-                let no_mtp = qwen_cache_geometry_placed(&cfg, &owners, false).unwrap();
+                let no_mtp = qwen_cache_geometry_placed(&cfg, &owners, false, kv_format).unwrap();
                 assert_eq!(placed.ranks[1], no_mtp.ranks[1]);
             }
         }
@@ -171,12 +173,13 @@ mod owner_graph_tests {
 /// Partition the authoritative cache geometry by whole-layer owner, while
 /// retaining logical global unit ids. Commit tables exist on each owner;
 /// the deferred MTP id buffer and MTP pools remain on the head's owner0.
-pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool)
+pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache)
     -> anyhow::Result<super::FamilyCacheGeometry> {
     use super::{KvPlacement, RankCacheGeometry};
     let segments = qwen_graph_segments(owners).ok_or_else(|| anyhow::anyhow!("invalid Qwen cache owners"))?;
     anyhow::ensure!(owners.len() <= cfg.layers, "Qwen cache owner count exceeds the backbone");
-    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp)?;
+    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp, kv_format)?;
     if segments.len() == 1 { return Ok(geometry); }
     let mut ranks = vec![RankCacheGeometry::default(); 2];
     let mut previous = RankCacheGeometry::default();
@@ -185,7 +188,7 @@ pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, own
         Ok(())
     };
     for (layer, &owner) in owners.iter().enumerate() {
-        let current = super::qwen_cache_geometry(cfg, layer + 1, false)?.ranks[0];
+        let current = super::qwen_cache_geometry(cfg, layer + 1, false, kv_format)?.ranks[0];
         let rank = &mut ranks[owner];
         add(&mut rank.persistent_unit_bytes, current.persistent_unit_bytes - previous.persistent_unit_bytes)?;
         add(&mut rank.active_state_per_sequence_bytes,

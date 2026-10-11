@@ -1145,11 +1145,16 @@ impl<'a> Qwen4Engine<'a> {
         cfg.check_programs()?;
         let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
         let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
-        for cap in ["m64", "m4096"] {
-            programs.spec(&format!("qwen4_sparse_gqa{kv_suffix}_{cap}"))?;
-            for layer in weights.layers.iter().chain(weights.mtp.iter().map(|m| &m.layer)).filter(|l| l.attention == Qwen4Attention::Full) {
-                let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
-                programs.spec(&format!("qwen4_{stem}{kv_suffix}_{cap}"))?;
+        for (owner, &(_, owner_programs, _)) in ranks.iter().enumerate() {
+            for cap in ["m64", "m4096"] {
+                for layer in weights.layers.iter().enumerate()
+                    .filter(|(global, _)| owners[*global] == owner).map(|(_, layer)| layer)
+                    .chain(weights.mtp.iter().filter(|_| owner == 0).map(|m| &m.layer))
+                    .filter(|layer| layer.attention == Qwen4Attention::Full) {
+                    owner_programs.spec(&format!("qwen4_sparse_gqa{kv_suffix}_{cap}"))?;
+                    let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
+                    owner_programs.spec(&format!("qwen4_{stem}{kv_suffix}_{cap}"))?;
+                }
             }
         }
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
