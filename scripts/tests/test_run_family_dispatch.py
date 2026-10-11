@@ -155,6 +155,20 @@ def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path)
     assert "cuteafd expertd-native" not in result.stderr
 
 
+def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None:
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    pair = source.split("    fn tp2_pair(", 1)[1].split("    fn tp2_publish(", 1)[0]
+    assert "self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;" in pair
+    assert "self.tp2_rank(1, layer, lane, w1, rows, w1.shared.buffer.ptr)" not in pair
+    assert pair.index("self.tp2_rank(1,") < pair.index("self.library.copy_d2d_async(")
+    assert "self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer," in pair
+    assert "rows * self.cfg.hidden * 2, self.stream_of(1)" in pair
+    publish = source.split("    fn tp2_publish(", 1)[1].split("    fn router_on(", 1)[0]
+    assert "workspaces.get(lane)?.shared.buffer.ptr" in publish
+    header = (ROOT / "native/shared/include/cuteafd_experts.h").read_text()
+    assert "No output/input overlap." in header
+
+
 def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]

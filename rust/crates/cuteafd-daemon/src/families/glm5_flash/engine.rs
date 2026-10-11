@@ -2010,7 +2010,14 @@ impl<'a> GlmfEngine<'a> {
         // outside padded attention graphs, so only genuine rows enter routes.
         self.router_on(1, w1, &peer.layers[layer], rows, &[Span { first: 0, rows }])?;
         self.tp2_rank(0, layer, lane, w, rows, w.delta.buffer.ptr)?;
-        self.tp2_rank(1, layer, lane, w1, rows, w1.shared.buffer.ptr)?;
+        self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;
+        // The native combine forbids input/output overlap. Keep the existing
+        // shared-slot exchange contract after consuming the shared input.
+        self.on(1, || unsafe {
+            // SAFETY: disjoint rank-local buffers stay live and are ordered after combine.
+            self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer,
+                rows * self.cfg.hidden * 2, self.stream_of(1))
+        })?;
         Ok(())
     }
 
