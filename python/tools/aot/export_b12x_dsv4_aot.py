@@ -551,13 +551,22 @@ def context_split_programs(g, decode_rows: int, max_context: int):
     ]
     # Both SM120 products share the same table; select its explicit split
     # variant once at load, not whichever GPU happened to run the exporter.
-    device_plans = {sms: split.sparse_mla_partial_split_plan(
-        g, max_rows=decode_rows, head_count=g.heads // 2, sm_count=sms) for sms in (170, 188)}
+    # Split plans per (SM count, row cap): the full decode rows, plus the small buckets a C1
+    # verify step runs (one sequence of 1-8 rows), which plan more splits so a few rows still
+    # fill the SMs. One variant per distinct split count; each records every (SM count, row cap)
+    # it serves, and the engine picks per captured graph's rows (static per graph shape). Both
+    # SM120 products share the table; never chosen by the exporting GPU.
+    caps = sorted({cap for cap in (1, 8) if cap < decode_rows} | {decode_rows})
+    plans = {(sms, cap): split.sparse_mla_partial_split_plan(
+        g, max_rows=cap, head_count=g.heads // 2, sm_count=sms) for sms in (170, 188) for cap in caps}
     for begin in (0, g.heads // 2):
-        for splits in sorted(set(device_plans.values())):
+        for splits in sorted(set(plans.values())):
+            served = sorted(key for key, s in plans.items() if s == splits)
+            sms_served = sorted({sm for sm, _ in served})
             out.append((f"sparse_mla_partial_h{begin}_s{splits}_m{decode_rows}", "sparse_mla_partial",
                         {"max_rows": decode_rows, "head_begin": begin, "head_count": g.heads // 2,
-                         "num_splits": splits, "device_sm_counts": [sm for sm, s in device_plans.items() if s == splits]},
+                         "num_splits": splits, "device_sm_counts": sms_served,
+                         "row_caps": {str(sm): [cap for s2, cap in served if s2 == sm] for sm in sms_served}},
                         lambda begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
                             g, max_rows=decode_rows, head_begin=begin, head_count=g.heads // 2, num_splits=splits)))
     layouts = [("index", 128, 64, 8448)]
