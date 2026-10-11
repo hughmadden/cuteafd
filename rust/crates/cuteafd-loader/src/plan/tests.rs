@@ -255,7 +255,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
             drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
-            full_prefill_logits: false };
+            full_prefill_logits: false, context: None };
         let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
         assert_eq!(working.spark.spark_ranks, 4);
         assert_eq!(working.spark.prefill_lanes, 3);

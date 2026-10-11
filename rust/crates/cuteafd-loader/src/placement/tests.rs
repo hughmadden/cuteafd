@@ -166,7 +166,7 @@ const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
 const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
 /// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
 const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
-const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true };
+const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
 fn residual_transitions_follow_the_section_3_table() {
@@ -273,7 +273,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert!(solve(&req).unwrap().layers.iter().all(|l| l.mode == LayerMode::HeadSplit));
     // An executor without hop points refuses modes that need them (ranges need a boundary hop).
     let mut req = request(2, 44 * GIB, 4, 4, Onboard::Layers(0));
-    req.executor = ExecutorModes { family: "nohops", modes: &[W0, W1], hops: false };
+    req.executor = ExecutorModes { family: "nohops", modes: &[W0, W1], hops: false, attention: AttentionPlacement::Heads };
     req.policy.default = vec![W0];
     req.layers[3].modes = vec![W1];
     assert!(matches!(solve(&req), Err(PlacementError::UnsupportedHop { family: "nohops",
@@ -404,7 +404,10 @@ fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
 #[test]
 fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
-        assert_eq!(executor.check_attention(None, 2, true).unwrap(), AttentionPlacement::Heads);
+        // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3), heads on one.
+        let recorded = if executor.family == "glm5" { AttentionPlacement::Context } else { AttentionPlacement::Heads };
+        assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
+        assert_eq!(executor.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
             let supported = match mode {
                 AttentionPlacement::Context => executor.runs(LayerMode::ContextSplit),
@@ -423,7 +426,7 @@ fn attention_selectors_follow_declared_executor_capabilities() {
 }
 
 const CONTEXT: ExecutorModes = ExecutorModes { family: "fixture", modes: &[
-    LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0], hops: true };
+    LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
 fn context_residuals_and_buffers_match_heads_and_section_6() {
@@ -434,7 +437,7 @@ fn context_residuals_and_buffers_match_heads_and_section_6() {
         (179, 32_768, 32_896, 4_096, 0.35), (179, 65_536, 65_792, 8_192, 0.35),
         (561, 32_768, 32_896, 4_096, 1.10)] {
         let buffers = ContextBuffers { staging_unit_bytes: token, staging_unit_rows: 1, query_row_bytes: q, partial_row_bytes: p,
-            candidate_row_bytes: c, compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+            candidate_row_bytes: c, compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
         let demands = buffers.demands().unwrap();
         assert!((demands[0].bytes as f64 / GIB as f64 - stage).abs() < 0.005);
         // Two parities x two lanes of [64 rows x (both query halves + partial + both
@@ -492,7 +495,7 @@ fn only_auto_uses_the_memory_lever_and_colocate_groups_keep_their_owner() {
 
 #[test]
 fn layers_selector_supports_gqa_gdn_owner_reduction_and_prefers_split() {
-    const OWNERS: ExecutorModes = ExecutorModes { family: "owner", modes: &[W0, W1], hops: true };
+    const OWNERS: ExecutorModes = ExecutorModes { family: "owner", modes: &[W0, W1], hops: true, attention: AttentionPlacement::Heads };
     let mut req = request(2, 96 * GIB, 4, 0, Onboard::Auto);
     req.executor = OWNERS;
     req.attention_placement = Some(AttentionPlacement::Layers);
@@ -511,7 +514,7 @@ fn layers_selector_supports_gqa_gdn_owner_reduction_and_prefers_split() {
     assert_eq!(plan.hops[0].at, HopPoint::BeforeLayer(2));
     assert_eq!(plan.hops[1].at, HopPoint::Exit);
     assert!(OWNERS.check_attention(req.attention_placement, 1, true).is_err());
-    req.executor = ExecutorModes { family: "both", modes: &[W0, W1, S0, S1], hops: true };
+    req.executor = ExecutorModes { family: "both", modes: &[W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
     for layer in &mut req.layers { layer.modes = vec![W0, W1, S0, S1]; }
     assert_eq!(req.executor.whole_mode(0), Some(S0));
     assert_eq!(solve(&req).unwrap().layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S1, S1]);
@@ -529,7 +532,7 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
     let fixed = [30_180_346_250u64, 18_353_380_746];
     let buffers = ContextBuffers { staging_unit_bytes: 788, staging_unit_rows: 1, query_row_bytes: 36_864,
         partial_row_bytes: 32_896, candidate_row_bytes: 16_384,
-        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
     for nvfp4 in [false, true] {
         let mut req = request(2, inventory::PRO_TOTAL_BYTES - 2 * GIB, 78, 6, Onboard::Auto);
         req.pool_overhead = vec![0; 2];
@@ -632,7 +635,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             query_row_bytes: if dim == 4096 { 32_768 } else { 65_536 },
             partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
             candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
-            compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+            compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
         req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
         let half = (half * GIB as f64) as u64;
         let state_unit = (state * GIB as f64 / count as f64) as u64;
@@ -676,7 +679,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     req.pool_overhead = vec![0; 2];
     req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
         query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
-        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
     req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
     for (i, layer) in req.layers.iter_mut().enumerate() {
         let mla = i % 4 == 3;
@@ -750,7 +753,11 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
         let auto = solve(&req).unwrap();
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
-        if executor.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err() {
+        if executor.attention_default() != AttentionPlacement::Heads {
+            // A recorded non-heads default is not a flip: auto runs it outright.
+            req.attention_placement = Some(executor.attention_default());
+            assert_eq!(auto, solve(&req).unwrap(), "{}", executor.family);
+        } else if executor.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err() {
             assert_eq!(auto, heads, "{}", executor.family);
         } else {
             assert!(auto.pool_tokens >= heads.pool_tokens);

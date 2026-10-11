@@ -10,7 +10,7 @@ pub mod deepseek_v4;
 pub mod glm5;
 pub mod qwen4;
 
-use super::{ExecutorModes, FfnMode, LayerMode};
+use super::{AttentionPlacement, ExecutorModes, FfnMode, LayerMode};
 
 const WHOLE0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
@@ -20,18 +20,23 @@ const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 /// Per-layer ownership (`Whole{gpu}` mixes, ranges) waits for its per-layer
 /// executor (P7).
 pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4", modes: &[LayerMode::HeadSplit, WHOLE0],
-    hops: false };
+    hops: false, attention: AttentionPlacement::Heads };
 /// V4.1: layer ranges, layers 0-19 / 20-39 whole on each GPU with one boundary
 /// hop (`BlockTransfer`) and the owner-reduce FFN.
-pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true };
-/// GLM 5.3, GLM Flash and MiMo: `attach_peer` requires every layer split.
-pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5", modes: &[LayerMode::HeadSplit, WHOLE0], hops: false };
+pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true, attention: AttentionPlacement::Heads };
+/// GLM 5.3: every layer split over two GPUs, by heads (latent replicated) or
+/// by context (heads for the projections, KV pages owned by parity; K3).
+/// `context` is its recorded default (K3); a build without the context
+/// programs keeps `heads` (`glm5::request`).
+pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
+/// GLM Flash and MiMo: `attach_peer` requires every layer split.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash", modes: &[LayerMode::HeadSplit, WHOLE0],
-    hops: false };
+    hops: false, attention: AttentionPlacement::Heads };
 pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[LayerMode::HeadSplit, WHOLE0],
-    hops: false };
+    hops: false, attention: AttentionPlacement::Heads };
 /// Qwen: one GPU.
-pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0], hops: false };
+pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0], hops: false, attention: AttentionPlacement::Heads };
 
 /// Every family's executor set, for lookups by family name.
 pub const EXECUTORS: [ExecutorModes; 6] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4];

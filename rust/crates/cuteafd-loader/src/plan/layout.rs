@@ -1028,7 +1028,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 if pool_tokens < context_tokens {
                     notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
                 }
-                if active_gpus == 2 {
+                if active_gpus == 2 && placement.attention_placement == crate::placement::AttentionPlacement::Heads {
                     waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent)".into(),
                         bytes: placement.items[1].iter().filter(|i| i.group == "records").map(|i| i.bytes).sum() });
                 }
@@ -1046,6 +1046,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
             Ok((placement, working)) => {
+                // The solver resolved auto against this build's programs.
+                report.attention_placement = placement.attention_placement;
+                if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
+                    *note = format!("attention placement {}", placement.attention_placement);
+                }
                 if working.spark.spark_layers.is_empty() { spark_devices.clear(); }
                 notes.push(format!("GLM selected working set: {} Spark layers, {} ranks, {} prefill lanes",
                     working.spark.spark_layers.len(), working.spark.spark_ranks, working.spark.prefill_lanes));
@@ -1058,7 +1063,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     + placement.expert_ranges.iter().map(|r| r.peak_bytes).sum::<u64>();
                 pool_tokens = placement.pool_tokens;
                 notes.push(format!("placement: {}", placement.summary()));
-                if active_gpus == 2 {
+                if active_gpus == 2 && placement.attention_placement == crate::placement::AttentionPlacement::Heads {
                     waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent)".into(),
                         bytes: placement.items[1].iter().filter(|i| i.group == "records").map(|i| i.bytes).sum() });
                 }
@@ -1511,8 +1516,10 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
         headroom_bytes: options.headroom_bytes, spark_ranks, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: options.pool_tokens,
-        onboard, full_prefill_logits: options.full_prefill_logits };
-    Ok(glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement))?)
+        onboard, full_prefill_logits: options.full_prefill_logits,
+        context: manifest.and_then(glm::manifest_context) };
+    // Auto resolves in the solver (context where the build carries its programs), as at runtime.
+    Ok(glm::solve_working_set(&inputs, [0; 2], report.requested_attention)?)
 }
 
 struct V4PlanShape {

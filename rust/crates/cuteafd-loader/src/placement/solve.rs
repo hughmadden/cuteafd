@@ -95,13 +95,15 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // policy until a qualified memory lever is needed.
     let executor = &request.executor;
     let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
-        .or(request.attention_placement).unwrap_or_else(|| executor.attention_default()) == AttentionPlacement::Layers
+        .or(request.attention_placement)
+        .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads }) == AttentionPlacement::Layers
         && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
     let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
             .or(request.attention_placement)
-            .or_else(|| (executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
+            // A family default other than heads applies only where it can run.
+            .or_else(|| (split && executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
         let desired = match selected {
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
@@ -349,7 +351,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             } else { AttentionPlacement::Heads },
         attention_by_kind: request.layers.iter().map(|layer| {
             let mode = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, mode)| *mode)
-                .or(request.attention_placement).unwrap_or_else(|| executor.attention_default());
+                .or(request.attention_placement)
+                .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads });
             (layer.kind, mode)
         }).collect::<std::collections::BTreeMap<_, _>>().into_iter().collect(),
         peer_row_bytes: if context {

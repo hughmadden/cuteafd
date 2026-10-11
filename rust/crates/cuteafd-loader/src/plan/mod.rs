@@ -158,6 +158,10 @@ pub struct RoleReadiness {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub attention_placement: crate::placement::AttentionPlacement,
+    /// What the caller asked for (None: auto); families whose solver resolves
+    /// auto itself (GLM 5.3) take this rather than the resolved default.
+    #[serde(skip)]
+    pub requested_attention: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
     pub disabled_media_bytes: u64,
@@ -301,6 +305,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
     let mut report = PlanReport {
         attention_placement: options.attention_placement.unwrap_or_default(),
+        requested_attention: options.attention_placement,
         vision: options.vision,
         audio: resolve_audio(options.audio, snapshot)?,
         disabled_media_bytes: 0,
