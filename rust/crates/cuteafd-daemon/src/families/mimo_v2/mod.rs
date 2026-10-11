@@ -32,6 +32,9 @@ pub(crate) struct EngineArgs {
     /// Checkpoint snapshot (XiaomiMiMo/MiMo-V2-Flash).
     #[arg(long)]
     pub snapshot: PathBuf,
+    /// Send the solved Spark layer set before opt-in workers allocate experts.
+    #[arg(long)]
+    pub placement_handshake: bool,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -86,6 +89,9 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
+    /// RTX expert prefix: auto reserves the KV pool first; max prioritizes experts.
+    #[arg(long, default_value = "auto")]
+    pub onboard: cuteafd_loader::placement::Onboard,
     /// DFlash drafter: a directory with dflash_draft_model.safetensors, or a
     /// snapshot with one under dflash/ (MiMo V2.6 Pro); taps the target
     /// layers and drafts on this GPU.
@@ -746,7 +752,7 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
         "selected resident weight formats");
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
-    let catalog = (args.local_experts && !args.skip_experts)
+    let catalog = (!args.skip_experts)
         .then(|| cuteafd_loader::read_expert_catalog(&args.snapshot)).transpose()?;
     let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
     let shape = cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
@@ -954,8 +960,32 @@ impl Opened {
             }
             let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
             engine.expert_input = args.expert_input;
-            if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
+            let remote_layers = if args.skip_experts || args.expert_window.is_some() { moe_layers.clone() }
+                else { moe_layers.iter().copied().filter(|&layer|
+                    preflight.placement.layers[layer].experts == cuteafd_loader::placement::ExpertHome::Spark)
+                    .collect::<Vec<_>>() };
+            if let Some(experts) = self.experts(args, &remote_layers, preflight.local_expert_budget)? {
                 engine.set_experts(experts);
+            }
+            if let Some(tp2) = preflight.placement.tp2 {
+                use crate::shared::experts::rtx::fp8moe::Fp8MoeTp2;
+                use crate::shared::memory::device::Device;
+                let peer = peer_stream.context("MiMo TP2 requires two GPUs")?;
+                let tensors = self.catalog.as_ref().and_then(|catalog| catalog.fp8()).context("MiMo expert headers")?;
+                let pair = Fp8MoeTp2::load_pair([Device { library: &self.library, id: args.device },
+                    Device { library: &self.library, id: peer.0 }], tensors,
+                    preflight.expert_directory.as_deref().context("MiMo expert package")?,
+                    tp2.first..tp2.first + tp2.layers, args.prefill_rows.max(engine::DECODE_ROWS),
+                    tp2.peak_bytes.map(|bytes| bytes as usize))?;
+                engine.install_tp2(pair)?;
+            } else if preflight.placement.onboard_layers > 0 {
+                let range = preflight.placement.expert_ranges[0];
+                let tensors = self.catalog.as_ref().and_then(|catalog| catalog.fp8()).context("MiMo expert headers")?;
+                let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors,
+                    preflight.expert_directory.as_deref().context("MiMo expert package")?,
+                    range.first..range.first + range.layers, 1, 0, args.prefill_rows.max(engine::DECODE_ROWS),
+                    range.peak_bytes as usize)?;
+                engine.set_rtx_local(local);
             }
             engine.prepare_prefill_pair()?;
             if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
@@ -1035,6 +1065,19 @@ impl Opened {
     /// warmed with a full-capacity request) or the local TP1 package.
     fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize)
         -> Result<Option<engine::Experts<'s>>> {
+        let selected_peers = args.peers.as_deref().map(|peers| peers.split(',')
+            .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()).transpose()?;
+        if let Some(peers) = selected_peers.as_ref().filter(|_| args.placement_handshake) {
+            let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
+                experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
+                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+                &args.snapshot, geometry, peers.len(), None)?;
+            let layers = if args.skip_experts || args.local_experts { &[][..] } else { moe_layers };
+            let selection = cuteafd_transport::worker_selection::WorkerSelection::new(identity, layers)?;
+            cuteafd_transport::worker_selection::select_worker_layers(peers, &selection,
+                std::time::Duration::from_secs(1200))?;
+        }
         if moe_layers.is_empty() {
             return Ok(None);
         }
@@ -1169,11 +1212,12 @@ fn golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
-    if args.capture_graphs {
+    if args.capture_graphs || engine.decode_graphs {
         let started = Instant::now();
         let graphs = engine.capture_decode_graphs(engine::DECODE_ROWS)?;
         println!("decode graphs: {graphs} captured in {:.2} s", started.elapsed().as_secs_f64());
     }
+    engine.check_tp2_routers()?;
     let result = golden_body(args, opened, engine);
     if args.capture_graphs {
         println!("decode graphs captured after startup: {}", engine.late_captures());

@@ -64,6 +64,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     .ok_or_else(|| PlanError::InvalidOption { option: "--prefix-cache-mark-mib", reason: "byte budget overflows".into() })?,
                 mimo_prefix_draft: args.mimo_prefix_draft,
                 mimo_rings: args.mimo_rings,
+                mimo_expert_input: args.expert_input.into(),
                 draft_sequences: args.draft_sequences,
                 draft_context_slots: args.draft_context_slots,
                 mimo_decode_graphs: args.mimo_decode_graphs,
@@ -585,6 +586,7 @@ mod tests {
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
             mimo_rings: 16,
+            expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: 4,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -1077,11 +1079,11 @@ mod tests {
         let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
-        assert!(plan(snapshot.path(), &weight_only).unwrap().executable(), "weight inventory fits");
+        assert!(plan(snapshot.path(), &weight_only).unwrap().fits, "weight inventory fits");
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
         assert!(!report.fits && !report.executable());
-        assert!(report.hints.iter().any(|h| h.what.contains("full memory layout")
-            && h.what.contains("shortfall") && h.what.contains("bytes")));
+        assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
+            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
     }
@@ -1095,7 +1097,12 @@ mod tests {
         // Complete inventories at packaged worlds are servable.
         run_plan(args(flash.path(), 4, true)).unwrap();
         run_plan(args(pro.path(), 6, true)).unwrap();
-        run_plan(args(pro.path(), 0, true)).unwrap();
+        // No implicit local native package is installed in this CPU fixture.
+        run_plan(args(pro.path(), 0, false)).unwrap();
+        let local_error = run_plan(args(pro.path(), 0, true)).unwrap_err();
+        assert!(local_error.to_string().contains("is not servable"), "{local_error:#}");
+        assert!(plan(pro.path(), &options(&args(pro.path(), 0, false)).unwrap()).unwrap().hints
+            .iter().any(|h| h.what.contains("BF16 package manifest")));
         // V2.6 Pro has no tp4 MXFP4 layout: a verdict, an error only with --require-ready.
         run_plan(args(pro.path(), 4, false)).unwrap();
         let error = run_plan(args(pro.path(), 4, true)).unwrap_err();

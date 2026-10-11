@@ -633,9 +633,14 @@ fn mimo_flash_complete_inventory_is_ready() {
 #[test]
 fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    for (ranks, executable) in [(0, true), (2, true), (3, false), (4, false), (6, true)] {
+    // No generated local manifest is present in this fixture. Checkpoint
+    // support alone cannot advertise unadmitted Spark-free expert residency.
+    for (ranks, executable) in [(0, false), (2, true), (3, false), (4, false), (6, true)] {
         let report = plan(dir.path(), &sparks(ranks)).unwrap();
         assert_eq!(report.executable(), executable, "{ranks} ranks\n{}", render(&report));
+        if ranks == 0 {
+            assert!(report.hints.iter().any(|hint| hint.what.contains("BF16 package manifest")));
+        }
     }
     let report = plan(dir.path(), &sparks(6)).unwrap();
     let contract = report.experts.as_ref().unwrap();
@@ -653,7 +658,7 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
     tensors.extend([t("visual.blocks.0.norm.weight", "BF16", &[64]),
         t("audio_encoder.norm.weight", "BF16", &[64])]);
     let dir = snapshot_tp(config, &tensors, Some(4));
-    for (ranks, executable) in [(0, true), (2, true), (3, false), (4, true), (6, false)] {
+    for (ranks, executable) in [(0, false), (2, true), (3, false), (4, true), (6, false)] {
         let report = plan(dir.path(), &sparks(ranks)).unwrap();
         assert_eq!(report.executable(), executable, "{ranks}: {}", render(&report));
         let experts = report.experts.as_ref().unwrap();
@@ -729,7 +734,7 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
         let fallback = plan(&snapshot, &constrained).unwrap();
         assert_eq!(fallback.audio, MediaMode::Off);
         assert_eq!(component(&fallback, Component::Audio).status, Status::Disabled);
-        assert!(fallback.placement_supported);
+        assert!(!fallback.placement_supported, "one-byte target budget cannot admit mandatory MiMo state");
         assert!(fallback.audio_encoder.as_ref().unwrap().shortfall > 0);
         let explicit = plan(&snapshot, &PlanOptions { audio: MediaMode::Spark(Some(0)), ..constrained }).unwrap();
         assert!(!explicit.placement_supported);
@@ -1063,7 +1068,9 @@ fn spark_rank_options_follow_transport_and_packages() {
             continue;
         }
         // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
-        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, matches!(ranks, 0 | 2 | 4 | 6), "mimo {ranks}");
+        let mimo = plan(flash.path(), &options).unwrap();
+        assert_eq!(mimo.placement_supported, matches!(ranks, 2 | 4 | 6), "mimo {ranks}");
+        if ranks == 0 { assert!(mimo.hints.iter().any(|h| h.what.contains("BF16 package manifest"))); }
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
         assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
     }
@@ -1677,7 +1684,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     config["tie_word_embeddings"] = json!(false);
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
     let mut options = PlanOptions {
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true, ..Default::default() }),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
+            context_tokens: 256 << 10, ..Default::default() }),
         ..sparks(6)
     };
     let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -1695,7 +1703,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     let report = plan(dir.path(), &options).unwrap();
     let host = report.memory_layout.unwrap();
     assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
-    assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={}", host.pool_tokens, gpu.pool_tokens);
+    assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
+        host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
     assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
     config["tie_word_embeddings"] = json!(true);

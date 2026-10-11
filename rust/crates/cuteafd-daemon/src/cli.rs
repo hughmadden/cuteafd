@@ -377,6 +377,9 @@ pub(crate) struct PlanArgs {
     /// MiMo target ring count for --layout (at least concurrency).
     #[arg(long = "rings", default_value_t = 16)]
     pub(crate) mimo_rings: u64,
+    /// MiMo Spark activation format for --layout (matches serve-mimo).
+    #[arg(long, value_enum, default_value = "fp8")]
+    pub(crate) expert_input: crate::families::mimo_v2::engine::ExpertInput,
     /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
     #[arg(long, default_value_t = 4)]
     pub(crate) draft_sequences: u64,

@@ -428,7 +428,7 @@ fn block(
                 (intermediate / ranks) as u64,
                 true,
             )?;
-        } else if rank == 0 {
+        } else {
             let name = format!("{prefix}.mlp.gate.weight");
             let router = tensor(
                 checkpoint,
@@ -552,10 +552,12 @@ mod tests {
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             let one = MimoResidentLayout::new(&checkpoint, &cfg, &options(1, tp)).unwrap();
             let split = MimoResidentLayout::new(&checkpoint, &cfg, &options(2, tp)).unwrap();
-            assert_eq!(total(&split) - total(&one), 4 * cfg.hidden as u64 * 2 + 256);
+            let router: u64 = one.ranks[0].iter().filter(|r| r.name.contains(".mlp.gate.")).map(|r| r.bytes).sum();
+            assert_eq!(total(&split) - total(&one), 4 * cfg.hidden as u64 * 2 + 256 + router);
             assert!(split.ranks[1].iter().all(|r| !r.name.starts_with("lm_head")
-                && !r.name.starts_with("model.embed_tokens")
-                && !r.name.contains(".mlp.gate.")));
+                && !r.name.starts_with("model.embed_tokens")));
+            let replica: Vec<_> = split.ranks[1].iter().filter(|r| r.name.contains(".mlp.gate.")).collect();
+            assert_eq!(replica, split.ranks[0].iter().filter(|r| r.name.contains(".mlp.gate.")).collect::<Vec<_>>());
             assert_eq!(
                 split.loading_temporary_rank_bytes,
                 [cfg.hidden as u64 * cfg.heads as u64 * 128 * 2, 0]

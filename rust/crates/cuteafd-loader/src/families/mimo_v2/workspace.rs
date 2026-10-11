@@ -5,6 +5,25 @@ use super::{MimoAttention, MimoKvCache, MimoV2Config};
 use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::serving_capacity::MemoryReservation;
 
+/// Spark activation format; coordinator-native packages always consume BF16.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MimoExpertInput {
+    #[default]
+    Fp8,
+    Bf16,
+    Bf16Decode,
+}
+
+impl MimoExpertInput {
+    pub fn bf16(self, decode: bool) -> bool {
+        match self {
+            Self::Fp8 => false,
+            Self::Bf16 => true,
+            Self::Bf16Decode => decode,
+        }
+    }
+}
+
 /// Immutable prefill output contract. Decode/verify always retain every row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoPrefillOutput {
@@ -34,6 +53,7 @@ pub struct MimoWorkspaceOptions {
     pub lead: bool,
     pub with_head: bool,
     pub spark: bool,
+    pub expert_input: MimoExpertInput,
     pub max_context: u64,
     pub pool_pages: u64,
     pub kv_cache: MimoKvCache,
@@ -167,7 +187,6 @@ impl MimoWorkspaceLayout {
             .record_bytes(MimoAttention::Sliding, options.kv_cache)
             .max(attention.record_bytes(MimoAttention::Full, options.kv_cache))
             as u64;
-        let lead_only = |bytes| if options.lead { bytes } else { 256 };
         let page_table_rows = if options.decode { t } else { 1 };
         let logits_rows = options.prefill_output.logits_rows(t, options.decode, options.with_head);
         let layout = Self {
@@ -207,17 +226,19 @@ impl MimoWorkspaceLayout {
             } else {
                 256
             },
-            router_logits: lead_only(bytes("MiMo router logits", &[t, cfg.experts as u64, 4])?),
-            route_ids: lead_only(bytes("MiMo route ids", &[t, cfg.topk as u64, 4])?),
-            route_weights: lead_only(bytes("MiMo route weights", &[t, cfg.topk as u64, 4])?),
-            wire: lead_only(bytes(
+            router_logits: bytes("MiMo router logits", &[t, cfg.experts as u64, 4])?,
+            route_ids: bytes("MiMo route ids", &[t, cfg.topk as u64, 4])?,
+            route_weights: bytes("MiMo route weights", &[t, cfg.topk as u64, 4])?,
+            // BF16 Spark ingress borrows x, while still needing Spark's zero
+            // plane and pinned route staging. Only FP8 ingress owns K32 wire.
+            wire: if options.spark && !options.expert_input.bf16(options.decode) { bytes(
                 "MiMo expert wire",
                 &[
                     t,
                     h.checked_add(h / 32)
                         .ok_or(CacheGeometryError::Overflow("MiMo wire width"))?,
                 ],
-            )?),
+            )? } else { 256 },
             zero_plane: if options.spark {
                 bytes("MiMo empty shared expert", &[t, h, 2])?
             } else {
@@ -262,6 +283,7 @@ mod tests {
             lead: true,
             with_head: true,
             spark: true,
+            expert_input: MimoExpertInput::Fp8,
             max_context: 1 << 20,
             pool_pages: 1 << 14,
             kv_cache: MimoKvCache::Int8,
@@ -269,6 +291,33 @@ mod tests {
             prefill_output: MimoPrefillOutput::AllRows,
             native_scratch_bytes: 16 << 20,
             head_workspace_bytes: 32 << 20,
+        }
+    }
+
+    #[test]
+    fn expert_ingress_owns_wire_only_for_fp8_spark_shapes() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        for spark in [false, true] {
+            for decode in [false, true] {
+                for expert_input in [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode] {
+                    let opts = MimoWorkspaceOptions { spark, decode, expert_input, ..options() };
+                    let actual = MimoWorkspaceLayout::new(&cfg, opts).unwrap();
+                    let fp8 = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+                        expert_input: MimoExpertInput::Fp8, ..opts
+                    }).unwrap();
+                    let needs_wire = spark && !expert_input.bf16(decode);
+                    assert_eq!(actual.wire, if needs_wire {
+                        opts.rows * (cfg.hidden + cfg.hidden / 32) as u64
+                    } else { 256 });
+                    for ((name, bytes), (fp8_name, fp8_bytes)) in actual.device_buffers().zip(fp8.device_buffers()) {
+                        assert_eq!(name, fp8_name);
+                        if name != "wire" { assert_eq!(bytes, fp8_bytes, "{name}"); }
+                    }
+                    assert_eq!(actual.router_host, fp8.router_host);
+                    assert_eq!(fp8.device_bytes().unwrap() - actual.device_bytes().unwrap(), fp8.wire - actual.wire);
+                    assert_eq!(actual.zero_plane, if spark { opts.rows * cfg.hidden as u64 * 2 } else { 256 });
+                }
+            }
         }
     }
 

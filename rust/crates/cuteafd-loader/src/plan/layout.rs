@@ -104,6 +104,8 @@ pub struct LayoutOptions {
     pub mimo_prefix_draft: bool,
     /// MiMo target rings (serving default: 16, at least concurrency).
     pub mimo_rings: u64,
+    /// MiMo Spark activation format, matching serving's --expert-input.
+    pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
     /// MiMo drafter batch limit (serving raises it to concurrency).
     pub draft_sequences: u64,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -175,6 +177,7 @@ impl Default for LayoutOptions {
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
             mimo_rings: 16,
+            mimo_expert_input: Default::default(),
             draft_sequences: 4,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -424,18 +427,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         spark_host_bytes: 13 * GIB,
     };
     match family {
-        // Coordinator inventory comes from MiMo's shared admission contract.
-        // Spark-side allowances remain separate from this coordinator port.
-        "mimo_v2" => FamilyCosts {
-            runtime_bytes: [0; 3],
-            graph_bytes: [0; 3],
-            workspace_bytes: [0; 3],
-            exchange_bytes: 0,
-            drafter_bytes: 0,
-            mark_slots: 42,
-            mtp_resident: false,
-            spark_workspace_bytes: gib(51),
-            spark_ring_bytes: gib(117),
             ..generic
         },
         // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split). Without a program manifest,
@@ -569,6 +560,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
+    if family == "mimo_v2" {
+        return mimo::layout(report, model, checkpoint, options, prefill_rows, concurrency,
+            context_tokens, workspace_manifest.as_ref());
+    }
     let conversions = load_conversions(family, checkpoint);
     let mut costs = family_costs(family);
     // Coordinator GLM demands come only from its request. These remaining
@@ -1243,23 +1238,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     _ => 0,
                 };
             }
-            let warm_draft = if family == "mimo_v2" && drafter > 0 && options.mimo_prefix_draft {
-                let draft_config = checkpoint.snapshot.join("dflash/config.json");
-                if draft_config.is_file() {
-                    Some(std::fs::read(&draft_config).map_err(|e| e.to_string())
-                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string()))
-                        .and_then(|draft| mimo_draft_prefix_bytes(&draft, 1, options.mimo_rings.max(concurrency))))
-                } else { None }
-            } else { None };
             // GLM 5.3 Flash takes no mark without entries, so pool marks then keep no unit back.
             let pool_marks = family == "glm5_flash" && options.glmf_pool_marks && options.mimo_prefix_entries > 0;
             let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                if family == "mimo_v2" {
-                    let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
-                    cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
-                        bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
-                } else if family == "glm5_flash" {
+                if family == "glm5_flash" {
                     // serve-glmf's arena with the same knobs, over one whole mark of the layout
                     // planned here (token keys, which a head split keeps).
                     cuteafd_core::prefix::mark_slots_for(options.glmf_mark_lanes.unwrap_or(concurrency),
@@ -1291,25 +1274,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     device.items.push(Item::new(Category::Prefix, "reserved units", "",
                         (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
                             * crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
-                }
-            }
-            if let Some(reservation) = warm_draft {
-                let rings = options.mimo_rings.max(concurrency);
-                let context_slots = crate::families::mimo_v2::draft_representation::mimo_draft_context_slots(
-                    options.draft_sequences.max(concurrency), rings, options.draft_context_slots);
-                notes.push(format!("MiMo DFlash context slots {context_slots}; valid-floor transfer uses {rings} target rings"));
-                match reservation.and_then(|(bytes, floors)| bytes.checked_mul(marks)
-                    .map(|bytes| (bytes, floors)).ok_or_else(|| "DFlash prefix marks overflow".into())) {
-                    Ok((bytes, floors)) => {
-                        devices[0].items.push(Item::new(Category::Prefix, "DFlash context marks", "BF16", bytes, Basis::Formula));
-                        devices[0].items.push(Item::new(Category::Prefix, "DFlash valid-floor transfer", "i64", floors, Basis::Formula));
-                    }
-                    Err(reason) => {
-                        report.placement_supported = false;
-                        notes.push(format!("DFlash prefix reservation unsupported: {reason}"));
-                        report.hints.push(super::Hint { what: format!("invalid dflash/config.json: {reason}"),
-                            how: "Provide the loaded DFlash geometry before admitting its prefix marks.".into() });
-                    }
                 }
             }
             if family == "deepseek_v41" {
@@ -1405,35 +1369,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         Ok(None) if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2" | "glm5") => {}
         Ok(None) => notes.push(format!("{family}: no cache geometry in the planner yet (engine sizes its own pool)")),
         Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
-    }
-
-    if family == "mimo_v2" {
-        let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
-        if report.encoder.is_none() {
-            let kv = mimo::profile(checkpoint, options, active_gpus, spark_ranks,
-                prefill_rows, concurrency, context_tokens, workspace_manifest.as_ref()).ok()
-                .map(|profile| profile.steady.devices.iter().map(|rank| rank.pool_unit_bytes
-                    * options.pool_tokens.filter(|&tokens| tokens > 0).unwrap_or(target_pool_tokens)
-                        .div_ceil(profile.steady.pool_unit_rows)).collect::<Vec<_>>())
-                .unwrap_or_else(|| vec![0; gpus]);
-            resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
-        }
-        match mimo::apply(checkpoint, options, &mut devices[..active_gpus], spark_ranks,
-            prefill_rows, concurrency, context_tokens, workspace_manifest.as_ref()) {
-            Ok(tokens) => pool_tokens = tokens,
-            Err(error) => { report.placement_supported = false; notes.push(format!("MiMo allocation contract: {error:#}")); }
-        }
-        if workspace_manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; tensor allocations are exact but native scratch is not qualified".into()); }
-        if spark_ranks == 0 && options.mimo_expert_manifest.is_none()
-            && !devices[0].items.iter().any(|item| item.group == "experts.local_scratch") {
-            notes.push("MiMo local expert scratch package was not found; use --mimo-expert-manifest to qualify local admission".into());
-        }
-        if checkpoint.snapshot.join("dflash/config.json").is_file() {
-            let rings = options.mimo_rings.max(concurrency);
-            let slots = crate::families::mimo_v2::draft_representation::mimo_draft_context_slots(
-                options.draft_sequences.max(concurrency), rings, options.draft_context_slots);
-            notes.push(format!("MiMo DFlash context slots {slots}; valid-floor transfer uses {rings} target rings"));
-        }
     }
 
     if family == "deepseek_v41" && options.local_expert_layers.is_none() && layer_bytes > 0 {
@@ -1782,24 +1717,7 @@ struct Conversion {
 }
 
 fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Conversion> {
-    use crate::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation as R};
-    use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
     match family {
-        // The measured MiMo default stores the head and every target o_proj
-        // as FP8 (one copy), not the checkpoint's BF16.
-        "mimo_v2" => {
-            let Ok(cfg) = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config) else { return Vec::new() };
-            if default_policy(checkpoint, &cfg) != MimoDefaultPolicy::Fp8 {
-                return Vec::new();
-            }
-            let bytes = |rows: usize, cols: usize, r: R, ranks: u64| MimoProjectionLayout::new(rows as u64, cols as u64, r, ranks)
-                .ok().and_then(|l| l.resident_bytes().ok()).unwrap_or(0);
-            let head = bytes(cfg.vocab_size, cfg.hidden, R::Bf16, 1).saturating_sub(bytes(cfg.vocab_size, cfg.hidden, R::Fp8, 1));
-            let o = cfg.heads * cfg.v_head_dim;
-            let output = (bytes(cfg.hidden, o, R::Bf16, 1).saturating_sub(bytes(cfg.hidden, o, R::Fp8, 1))) * cfg.layers as u64;
-            vec![Conversion { component: Component::LmHead, saved_bytes: head, format: "fp8-block128" },
-                Conversion { component: Component::Attention, saved_bytes: output, format: "fp8-block128" }]
-        }
         // GLM 5.3 Flash serves MLA, dense and shared-expert projections as FP8
         // from the official FP8 release (--fp8-snapshot); a BF16 checkpoint's
         // copies of them are not loaded. KDA in/out projections and the head
@@ -1827,13 +1745,9 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
 }
 
 /// Exact per-rank resident weights `(group, format, bytes)` for families
-/// whose loader publishes its resident layout (MiMo: the codex capacity
-/// contract's `MimoResidentLayout`, with the default weight policy).
+/// whose loader publishes its resident layout.
 fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, mtp: bool,
     glmf_repr: crate::families::glm5_flash::resident::GlmfRepresentation) -> Option<Vec<Vec<(String, String, u64)>>> {
-    use crate::families::mimo_v2::projection::MimoProjectionRepresentation as R;
-    use crate::families::mimo_v2::resident::{MimoResidentLayout, MimoResidentOptions};
-    use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
     if family == "glm5_flash" {
         let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
         return crate::families::glm5_flash::resident::resident_weights(checkpoint, &cfg, cfg.layers, ranks,
@@ -1858,41 +1772,7 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
     if family == "deepseek_v4" {
         return deepseek_v4::resident_weights(checkpoint, ranks);
     }
-    if family != "mimo_v2" {
-        return None;
-    }
-    let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()?;
-    let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
-    let source = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
-        .map(|t| if t.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
-    let output_formats = (0..cfg.layers).filter_map(|layer| {
-        let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
-        source(&name).map(|r| (name, r))
-    }).collect();
-    let options = MimoResidentOptions {
-        layers: cfg.layers,
-        coordinator_ranks: ranks,
-        checkpoint_tp: crate::families::mimo_v2::qkv::checkpoint_tp(&checkpoint.snapshot).ok()?,
-        native_mtp_layers: 0,
-        gpu_embedding: true,
-        head_format: source("lm_head.weight").unwrap_or(R::Bf16),
-        output_formats,
-    };
-    let layout = MimoResidentLayout::new(checkpoint, &cfg, &options).ok()?;
-    Some(layout.ranks.iter().map(|rank| {
-        let mut groups: std::collections::BTreeMap<(String, String), u64> = std::collections::BTreeMap::new();
-        for reservation in rank {
-            let name = reservation.name.as_str();
-            let group = if name.contains("embed") { "embedding" } else if name.starts_with("lm_head") { "lm_head" }
-                else if name.contains("mlp.gate") { "router" } else if name.contains("norm") { "norm" }
-                else if name.contains("gate_up") || name.contains(".down") || name.contains("mlp.") { "dense_ffn" }
-                else { "attention" };
-            let format = if name.ends_with(".fp8") { "fp8" } else if name.ends_with("scale") { "fp8-scale" }
-                else if name.ends_with(".bf16") { "bf16" } else { "native" };
-            *groups.entry((group.to_string(), format.to_string())).or_default() += reservation.bytes;
-        }
-        groups.into_iter().map(|((g, f), b)| (g, f, b)).collect()
-    }).collect())
+    None
 }
 
 // The host footprint belongs to physical capacity, not expertd's allocation
@@ -1963,7 +1843,8 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
             });
         }
         EncoderKind::Off => {
-            if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Vision) {
+            if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Vision)
+                .filter(|c| c.status != Status::Unused) {
                 report.disabled_media_bytes += c.bytes;
                 c.bytes = 0;
                 c.status = Status::Disabled;
