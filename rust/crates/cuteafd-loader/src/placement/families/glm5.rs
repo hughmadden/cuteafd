@@ -310,7 +310,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: Some([unit.div_ceil(2), unit / 2]) }
         },
-        fixed_bytes: ModeBytes::default(),
+        fixed_bytes: ModeBytes::default(), extra: Vec::new(),
         context_indexer: cfg.indexers[layer] == GlmIndexer::Full,
         colocate: Some(cfg.index_source(layer) as u16),
         // Preserve routed identity even without local kernels: Spark-free and

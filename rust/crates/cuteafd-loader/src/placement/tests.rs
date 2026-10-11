@@ -18,7 +18,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256, sparks == 0),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
-            fixed_bytes: ModeBytes::default(), context_indexer: false,
+            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
             experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }).collect(),
         pool_overhead: vec![UNIT; gpus],
@@ -825,10 +825,130 @@ fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {
     req.layers[2].colocate = Some(7);
     // k=1 and k=3 have equal largest owned bytes; the asymmetric fixed
     // demand makes GPU1's larger suffix worse, so choose k=3.
-    req.fixed = vec![Demand::new(1, Category::Workspace, "rank1 fixed", 8 * GIB, Basis::Exact)];
+    // Explicit paired declaration keeps these asymmetric bytes in secondary fit.
+    req.fixed = [0, 8 * GIB].into_iter().enumerate().map(|(gpu, bytes)|
+        Demand::new(gpu as u8, Category::Workspace, "rank fixed", bytes, Basis::Exact)).collect();
     let p = solve(&req).unwrap();
     assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S0, S1]);
     req.fixed.clear();
     let p = solve(&req).unwrap();
     assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S1, S1, S1]);
+}
+
+fn owner_balance_request() -> PlacementRequest {
+    let mut req = request(2, 96 * GIB, 4, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    req.pool_overhead = vec![0; 2];
+    for layer in &mut req.layers {
+        layer.experts = None;
+        layer.modes = vec![LayerMode::HeadSplit, S0, S1];
+        // 2 GiB per layer at the wanted 2M pool.
+        layer.kv_unit = ModeBytes::replicated(UNIT / 16).into();
+    }
+    req
+}
+
+fn owner_cut(req: &PlacementRequest) -> usize {
+    let p = solve(req).unwrap();
+    p.layers.iter().take_while(|layer| layer.mode == S0).count()
+}
+
+#[test]
+fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
+    let mut req = owner_balance_request();
+    req.layers[1].extra = vec![LayerExtraDemand::new(Category::Tables, "side table", GIB,
+        LayerResidency::Owner, Basis::Exact)];
+    let first = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 2);
+    assert!(first.items[0].iter().any(|i| i.category == Category::Tables && i.group == "side table" && i.bytes == GIB));
+    assert!(!first.items[1].iter().any(|i| i.group == "side table"));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 4 * GIB, Basis::Exact));
+    let moved = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 1);
+    assert!(moved.items[1].iter().any(|i| i.group == "side table" && i.bytes == GIB));
+    assert!(!moved.items[0].iter().any(|i| i.group == "side table"));
+    req.layers[1].extra[0].bytes = 8 * GIB;
+    req.fixed.clear();
+    // A large side table participates in the primary owner balance, not just
+    // the final charge: k2 has 12/4 GiB, better than k1's 2/14 or k0's 0/16.
+    assert_eq!(owner_cut(&req), 2);
+    req.layers[0].extra = std::mem::take(&mut req.layers[1].extra);
+    assert_eq!(owner_cut(&req), 1);
+    req.layers[1].extra = std::mem::take(&mut req.layers[0].extra);
+    req.attention_placement = Some(AttentionPlacement::Heads);
+    req.layers[1].extra[0].bytes = GIB;
+    assert!(matches!(solve(&req), Err(PlacementError::OwnerDemand { layer: 1, .. })));
+    req.layers[1].extra[0].residency = LayerResidency::Replicated;
+    let split = solve(&req).unwrap();
+    assert!(split.items.iter().all(|rank| rank.iter().any(|i| i.group == "side table" && i.bytes == GIB)));
+    req.inventory.gpus.iter_mut().for_each(|gpu| gpu.baseline = Baseline::Measured { free_bytes: 2 * GIB });
+    req.pool.target = 2 << 20;
+    req.pool.floor = 1;
+    let limited = solve(&req).unwrap();
+    assert_eq!(limited.pool_tokens, GIB / (UNIT / 4) * 256);
+    req.layers[1].extra[0].bytes = u64::MAX;
+    req.layers[1].extra.push(LayerExtraDemand::new(Category::Tables, "scale", 256,
+        LayerResidency::Replicated, Basis::Formula));
+    assert!(matches!(solve(&req), Err(PlacementError::Overflow(_))));
+}
+
+#[test]
+fn layer_switch_balances_owner_only_head_mtp_and_layer_weights() {
+    let mut req = owner_balance_request();
+    assert_eq!(owner_cut(&req), 2);
+    req.fixed.push(Demand::new(0, Category::Weights, "Qwen head", 3 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Drafter, "Qwen MTP", GIB, Basis::Exact));
+    assert_eq!(owner_cut(&req), 1);
+    // Same names on both ranks are paired, even when the byte totals differ.
+    req.fixed.push(Demand::new(1, Category::Weights, "Qwen head", 0, Basis::Exact));
+    req.fixed.push(Demand::new(1, Category::Drafter, "Qwen MTP", 0, Basis::Exact));
+    assert_eq!(owner_cut(&req), 2);
+    // Category is part of the key: an unrelated workspace cannot pair a head.
+    req.fixed.retain(|d| d.gpu == 0 || d.category != Category::Weights);
+    req.fixed.push(Demand::new(1, Category::Workspace, "Qwen head", 0, Basis::Exact));
+    assert_eq!(owner_cut(&req), 1);
+    req.fixed.clear();
+    req.layers[0].weights.whole = 8 * GIB;
+    // k1 holds 10/6 GiB, better than k0's 0/16 GiB or k2's 12/4 GiB.
+    assert_eq!(owner_cut(&req), 1);
+}
+
+#[test]
+fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
+    let mut req = owner_balance_request();
+    for layer in &mut req.layers {
+        layer.experts = Some(ExpertCost { whole: Bytes2::default(),
+            half: [Bytes2 { resident: 3 * GIB, staging: 0 }, Bytes2 { resident: 2 * GIB, staging: 0 }],
+            tp2: true, spark_ok: true });
+    }
+    // 384/256 resident ratio must not become mandatory under Auto with Sparks.
+    assert_eq!(owner_cut(&req), 2);
+    req.onboard = Onboard::Layers(4);
+    assert_eq!(owner_cut(&req), 1);
+    req.onboard = Onboard::Fraction(1.0);
+    assert_eq!(owner_cut(&req), 1);
+    req.onboard = Onboard::Auto;
+    req.inventory.spark_ranks = 0;
+    assert_eq!(owner_cut(&req), 1);
+    // An unequal mandatory workspace participates in the same primary score.
+    req.tp2_workspace = [0, 8 * GIB];
+    assert_eq!(owner_cut(&req), 3);
+}
+
+#[test]
+fn qwen_refuses_shared_solver_empty_owner_chain() {
+    let mut req = owner_balance_request();
+    req.fixed.push(Demand::new(1, Category::Workspace, "owner1 fixed", 8 * GIB, Basis::Exact));
+    assert_eq!(owner_cut(&req), 4);
+    let p = solve(&req).unwrap();
+    let owners = p.layers.iter().map(|layer| match layer.mode {
+        LayerMode::Whole { gpu, .. } => usize::from(gpu), _ => unreachable!(),
+    }).collect::<Vec<_>>();
+    assert!(families::qwen4::check_dual_layer_owners(&owners).is_err());
+    req.fixed[0].gpu = 0;
+    assert_eq!(owner_cut(&req), 0);
+    assert!(families::qwen4::check_dual_layer_owners(&[1; 4]).is_err());
+    assert!(families::qwen4::check_dual_layer_owners(&[]).is_err());
+    families::qwen4::check_dual_layer_owners(&[0, 0, 1, 1]).unwrap();
 }

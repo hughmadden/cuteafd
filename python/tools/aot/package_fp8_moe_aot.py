@@ -72,10 +72,10 @@ os.environ.setdefault("B12X_COMPILE_DISK_CACHE", "0")
 os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
-ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1",)}
-MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1",)}
+ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1", "tp2")}
+MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
 # NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
-NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1",)}
+NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
 ABI = {"fp8": 1, "mxfp4": 2, "nvfp4": 3, "nvfp4a4": 4}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -90,6 +90,16 @@ FORMS = ("auto", "w8a16", "w8a8")
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def capacity_scratch(programs: list[dict]) -> list[dict]:
+    """Match the static ABI reservation across every retained prefill form."""
+    scratch = {}
+    for program in programs:
+        capacity = program["capacity"]
+        scratch[capacity] = max(scratch.get(capacity, 0), program["scratch"])
+    return [{"capacity": capacity, "scratch_bytes": scratch[capacity]}
+            for capacity in sorted(scratch)]
 
 
 def bridge_source(programs: list[dict], info: list[int]) -> str:
@@ -306,7 +316,7 @@ def build(args: argparse.Namespace) -> None:
     # whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none), and
     # TP6 of any intermediate of at least six blocks: uneven whole blocks
     # zero-padded to the widest (2048: 3, 3, 3, 3, 2, 2 blocks stored as 384).
-    elif not args.layouts and not getattr(args, "all_spark_counts", False):
+    elif args.role == "spark" and not args.layouts and not getattr(args, "all_spark_counts", False):
         def servable(tp: int) -> bool:
             blocks = base.intermediate // 128
             return base.intermediate % (128 * tp) == 0 or (tp == 6 and blocks >= 6)
@@ -321,6 +331,8 @@ def build(args: argparse.Namespace) -> None:
         if args.layouts:
             raise SystemExit("--all-spark-counts and --layouts are mutually exclusive")
         layouts = spark_layouts(base.intermediate)
+    if args.geometry.startswith("glmfdense") and not args.layouts:
+        layouts = ["tp1"]  # One always-selected dense expert is not an RTX TP2 backend.
     if args.exact_slices:
         # Exact layouts beside each padded TP layout whose ranks would store padding.
         for layout in list(layouts):
@@ -370,8 +382,7 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights,
-                "capacities": [{"capacity": p["capacity"], "scratch_bytes": p["scratch"]} for p in programs
-                               if p["form"] == "auto"],
+                "capacities": capacity_scratch(programs),
                 "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form]
                                   for form in FORMS[1:]}}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
