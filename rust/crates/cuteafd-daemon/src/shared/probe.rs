@@ -297,6 +297,11 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
         if step.logit_rows > 0 {
             logits.ok_or_else(|| anyhow::anyhow!("scoring produced no logits"))?
                 .record(library, probe, step.logit_rows, step.position)?;
+            if step.path == ScorePath::Prefill && step.logit_rows == chunk.len() {
+                if let Some(probe) = probe {
+                    probe.scored_prefill_chunk(step.position, chunk.len());
+                }
+            }
             scored += step.logit_rows;
         }
     }

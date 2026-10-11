@@ -251,6 +251,9 @@ pub struct ProbeRecord {
     /// The scoring path actually selected by the engine, not just requested.
     #[serde(default)]
     pub score_path: Option<String>,
+    /// Successful scored prefill chunks: [first predicted position, input rows].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_prefill_chunks: Vec<[usize; 2]>,
     pub error: Option<String>,
 }
 
@@ -350,6 +353,10 @@ impl Probe {
 
     pub fn selected_score_path(&self, path: &str) {
         self.with(|r| r.score_path = Some(path.to_owned()));
+    }
+
+    pub fn scored_prefill_chunk(&self, first_position: usize, rows: usize) {
+        self.with(|r| r.scored_prefill_chunks.push([first_position, rows]));
     }
 
     /// The scoring request's rows: positions `from..len` of the prompt.
