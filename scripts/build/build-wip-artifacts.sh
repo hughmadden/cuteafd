@@ -49,6 +49,7 @@ fi
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
+[[ "$role" != expert || ";$expert_families;" != *";glmfdense:"* ]] || { echo "CUTEAFD_WIP_EXPERT_FAMILIES: glmfdense is coordinator-only; remove it from the Spark expert scope" >&2; exit 2; }
 # Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
 # the existing artifact set; requesting one also requires its main FP8 family.
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
