@@ -122,6 +122,7 @@ def bridge_source(programs: list[dict], info: list[int]) -> str:
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 {includes}
 
 namespace {{
@@ -141,8 +142,18 @@ const Program kPrograms[] = {{
 constexpr uint32_t kCount = sizeof(kPrograms) / sizeof(kPrograms[0]);
 const uint32_t kInfo[{INFO_WORDS}] = {{{words}}};
 struct Context {{
-  cudaLibrary_t libraries[kCount];
   uint32_t form;
+}};
+// AOT launchers keep package-global kernel handles. Reuse the same libraries
+// across ranks so per-device loading never replaces another rank's handles.
+std::mutex library_mutex;
+cudaLibrary_t libraries[kCount] = {{}};
+uint32_t library_references = 0;
+void unload_libraries() {{
+  for (uint32_t i = 0; i < kCount; ++i) {{
+    if (libraries[i]) cudaLibraryUnload(libraries[i]);
+    libraries[i] = nullptr;
+  }}
 }};
 // The capacity's program in the requested form; the default program when the
 // capacity has no such form (the forms are the same program there).
@@ -182,8 +193,8 @@ extern "C" int32_t cuteafd_fp8moe_set_options(void* context, uint32_t options) {
 extern "C" void cuteafd_fp8moe_destroy(void* context) {{
   auto* ctx = static_cast<Context*>(context);
   if (!ctx) return;
-  for (uint32_t i = 0; i < kCount; ++i)
-    if (ctx->libraries[i]) cudaLibraryUnload(ctx->libraries[i]);
+  std::lock_guard<std::mutex> guard(library_mutex);
+  if (--library_references == 0) unload_libraries();
   delete ctx;
 }}
 
@@ -192,17 +203,26 @@ extern "C" int32_t cuteafd_fp8moe_create(void** context) {{
   int device = -1;
   cudaError_t status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
-  auto* ctx = new Context{{}};
+  std::lock_guard<std::mutex> guard(library_mutex);
   for (uint32_t i = 0; i < kCount; ++i) {{
-    cudaLibrary_t* library = &ctx->libraries[i];
-    void* init_args[] = {{&library, &status}};
-    kPrograms[i].initialize(init_args);
-    if (status != cudaSuccess) {{ cuteafd_fp8moe_destroy(ctx); return status; }}
+    cudaLibrary_t* library = &libraries[i];
+    if (!library_references) {{
+      void* init_args[] = {{&library, &status}};
+      kPrograms[i].initialize(init_args);
+      if (status != cudaSuccess) {{ unload_libraries(); return status; }}
+    }}
+    // The AOT loader sets dynamic-SMEM opt-in for this device on the shared
+    // kernels, including programs needing more than the default 48 KiB.
     int32_t device_id = device;
     void* load_args[] = {{&library, &device_id, &status}};
     kPrograms[i].load(load_args);
-    if (status != cudaSuccess) {{ cuteafd_fp8moe_destroy(ctx); return status; }}
+    if (status != cudaSuccess) {{
+      if (!library_references) unload_libraries();
+      return status;
+    }}
   }}
+  auto* ctx = new Context{{}};
+  ++library_references;
   *context = ctx;
   return cudaSuccess;
 }}

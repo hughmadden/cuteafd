@@ -408,7 +408,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             // Exact representations (including replicated routers and the lead head) are
             // already in the profile; later ownership executors must split them.
             weights: ModeBytes::default(),
-            fixed_bytes: ModeBytes::default(), context_indexer: false, colocate: None,
+            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             kv_unit: KvDemand::from(ModeBytes { whole: bytes(&whole), split: [bytes(&split); 2] }),
             experts: inputs.experts[layer],
             modes: if ranks == 2 { vec![LayerMode::HeadSplit] }

@@ -91,10 +91,18 @@ impl<'a> MimoEngine<'a> {
                 }
             }
             let mut experts = tp2.ranks[rank].borrow_mut();
+            let mut abort = || {
+                crate::shared::decode_graph::fatal_drain(tp2.routes.publish_abort(),
+                    "MiMo TP2 RTX route abort");
+                if let Some(exchange) = &self.exchange {
+                    crate::shared::decode_graph::fatal_drain(exchange.publish_abort(),
+                        "MiMo TP2 RTX FFN abort");
+                }
+            };
             // SAFETY: router, BF16 input and package output are rank-local,
             // stream-ordered, and no next launch may precede this output copy.
             unsafe {
-                experts.enqueue(index, rows, RtxInput::Bf16(w.x.buffer.ptr), routes, stream)?;
+                experts.enqueue(index, rows, RtxInput::Bf16(w.x.buffer.ptr), routes, stream, &mut abort)?;
                 self.library.copy_d2d_async(w.delta.buffer, cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: experts.output(), bytes, ..w.delta.buffer }, bytes, stream)?;
             }
