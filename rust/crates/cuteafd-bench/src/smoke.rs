@@ -105,6 +105,9 @@ pub struct Entry {
 pub struct Hook {
     pub argv: Vec<String>,
     pub timeout_s: u64,
+    /// Grace after the observer stop signal, still bounded by the total timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_timeout_s: Option<u64>,
     /// Observer errors are diagnostic unless explicitly required.
     #[serde(default)]
     pub required: bool,
@@ -117,6 +120,7 @@ pub struct Hook {
 struct HookChild {
     child: Child,
     deadline: Instant,
+    finish_timeout: Duration,
     stop: PathBuf,
     cleanup: Option<Vec<String>>,
 }
@@ -125,6 +129,10 @@ impl HookChild {
     fn spawn(hook: &Hook, url: &str, config: &Path, log: &Path, kind: &str) -> Result<Self> {
         if hook.argv.is_empty() || hook.timeout_s == 0 || hook.timeout_s > 7200 {
             bail!("{kind} hook needs argv and timeout_s in 1..=7200");
+        }
+        let finish_timeout = Duration::from_secs(hook.finish_timeout_s.unwrap_or(5));
+        if finish_timeout.is_zero() || finish_timeout.as_secs() > 7200 {
+            bail!("{kind} hook finish_timeout_s must be in 1..=7200");
         }
         let stop = log.with_extension(format!("{kind}.stop"));
         let _ = std::fs::remove_file(&stop);
@@ -135,7 +143,7 @@ impl HookChild {
             .env("CUTEAFD_SMOKE_STOP", &stop)
             .stdout(output.try_clone()?).stderr(output).process_group(0).spawn()
             .with_context(|| format!("starting {kind} hook"))?;
-        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), stop, cleanup: hook.cleanup.clone() })
+        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), finish_timeout, stop, cleanup: hook.cleanup.clone() })
     }
 
     fn wait(&mut self) -> Result<()> {
@@ -156,7 +164,7 @@ impl HookChild {
         }
         if Instant::now() >= self.deadline { bail!("observer timed out"); }
         std::fs::write(&self.stop, b"stop\n")?;
-        self.deadline = self.deadline.min(Instant::now() + Duration::from_secs(5));
+        self.deadline = self.deadline.min(Instant::now() + self.finish_timeout);
         self.wait()
     }
 }
@@ -803,16 +811,39 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cuteafd-smoke-hook-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("test.log");
-        let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None };
+        let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None, finish_timeout_s: None };
         let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "precheck").unwrap();
         assert!(child.wait().unwrap_err().to_string().contains("exited"));
         drop(child);
-        let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None };
+        let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None, finish_timeout_s: None };
         let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
         let started = Instant::now();
         assert!(child.wait().is_err());
         drop(child);
         assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn observer_finish_grace_is_configurable_but_cannot_extend_total_deadline() {
+        let root = std::env::temp_dir().join(format!("cuteafd-smoke-finish-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("test.log");
+        let mut hook: Hook = serde_json::from_value(serde_json::json!({
+            "argv": ["sleep", "20"], "timeout_s": 30, "finish_timeout_s": 300
+        })).unwrap();
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
+        assert_eq!(child.finish_timeout, Duration::from_secs(300));
+        child.deadline = Instant::now() + Duration::from_millis(100);
+        let total_deadline = child.deadline;
+        assert!(child.finish().unwrap_err().to_string().contains("timed out"));
+        assert_eq!(child.deadline, total_deadline);
+        assert!(child.stop.exists());
+        drop(child);
+        for invalid in [0, 7201] {
+            hook.finish_timeout_s = Some(invalid);
+            assert!(HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").is_err());
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
