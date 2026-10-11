@@ -883,7 +883,11 @@ impl<'a> QwenTp2<'a> {
         // SAFETY: forwards the retained input/output and ordering contract.
         let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, shared, output) };
         if result.is_err() {
-            let aborted = self.exchange.publish_abort();
+            // A failed rank launch already published abort through its callback.
+            let aborted = match self.exchange.terminal_state() {
+                crate::shared::peer_split::TerminalState::Aborting => Ok(()),
+                _ => self.exchange.publish_abort(),
+            };
             let drained = self.exchange.drain_compute();
             let complete = aborted.is_ok() && drained.is_ok();
             self.exchange.finish_terminal(complete);
@@ -919,9 +923,15 @@ impl<'a> QwenTp2<'a> {
         let peer_input = self.input(peer_ptr);
         let peer_routes = self.routes(peer_ptr, extent);
         // SAFETY: broadcast is ordered before the peer and owner input packing before local work.
+        // A failed rank launch publishes both abort words from the home device
+        // before returning, so no queued peer wait outlives its producer.
+        let exchange = &*self.exchange;
+        let home = &self.ranks[0];
+        let mut abort = || crate::shared::decode_graph::fatal_drain(home.run(|| exchange.publish_abort()),
+            "Qwen TP2 RTX enqueue abort");
         unsafe {
-            self.experts[owner].enqueue(layer, rows, local_input, local_routes, stream)?;
-            self.experts[peer].enqueue(layer, rows, peer_input, peer_routes, self.exchange.stream(peer))?;
+            self.experts[owner].enqueue(layer, rows, local_input, local_routes, stream, &mut abort)?;
+            self.experts[peer].enqueue(layer, rows, peer_input, peer_routes, exchange.stream(peer), &mut abort)?;
         }
         self.exchange.push(peer, 1, self.experts[peer].output(), extent.partial_bytes)?;
         self.exchange.wait(owner, 1)?;

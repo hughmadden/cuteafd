@@ -279,52 +279,55 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
         input: ExpertInput,
         routes: Routes,
         stream: *mut c_void,
+        abort: &mut dyn FnMut(),
     ) -> Result<()> {
-        ensure!(
-            self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
-            "EXL3 TP2 layer/rows not resident"
-        );
-        let ExpertInput::Fp8K32(wire) = input else {
-            bail!("Exl3Tp2 requires FP8 K32 input")
-        };
-        ensure!(
-            !wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(),
-            "null EXL3 TP2 input"
-        );
-        let buffer = |ptr, width| CuteafdDeviceBuffer {
-            ptr,
-            bytes: rows * width,
-            device_id: self.device.id,
-            flags: 0,
-        };
-        let inputs = [
-            buffer(wire, self.geometry.hidden as usize * 33 / 32),
-            buffer(routes.ids, self.geometry.topk as usize * 4),
-            buffer(routes.weights, self.geometry.topk as usize * 4),
-        ];
-        let result = self.device.run(|| {
-            let execution = self
-                .executions
-                .as_mut()
-                .expect("initialized EXL3 rank")
-                .iter_mut()
-                .find(|e| e.capacity() >= rows)
-                .unwrap();
-            // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
-            unsafe {
-                execution.launch_layer_into(
-                    layer - self.layers.start,
-                    inputs,
-                    rows,
-                    stream,
-                    self.output
-                        .as_ref()
-                        .expect("initialized EXL3 output")
-                        .buffer,
-                )
-            }
-        });
-        self.completion.finish(result.map(|_| ()), stream)
+        let result = (|| {
+            ensure!(
+                self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
+                "EXL3 TP2 layer/rows not resident"
+            );
+            let ExpertInput::Fp8K32(wire) = input else {
+                bail!("Exl3Tp2 requires FP8 K32 input")
+            };
+            ensure!(
+                !wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(),
+                "null EXL3 TP2 input"
+            );
+            let buffer = |ptr, width| CuteafdDeviceBuffer {
+                ptr,
+                bytes: rows * width,
+                device_id: self.device.id,
+                flags: 0,
+            };
+            let inputs = [
+                buffer(wire, self.geometry.hidden as usize * 33 / 32),
+                buffer(routes.ids, self.geometry.topk as usize * 4),
+                buffer(routes.weights, self.geometry.topk as usize * 4),
+            ];
+            self.device.run(|| {
+                let execution = self
+                    .executions
+                    .as_mut()
+                    .expect("initialized EXL3 rank")
+                    .iter_mut()
+                    .find(|e| e.capacity() >= rows)
+                    .unwrap();
+                // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
+                unsafe {
+                    execution.launch_layer_into(
+                        layer - self.layers.start,
+                        inputs,
+                        rows,
+                        stream,
+                        self.output
+                            .as_ref()
+                            .expect("initialized EXL3 output")
+                            .buffer,
+                    )
+                }
+            })
+        })();
+        self.completion.finish(result.map(|_| ()), stream, abort)
     }
 }
 
