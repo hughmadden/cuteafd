@@ -30,16 +30,13 @@ pub struct V41Exl3Info {
 }
 
 /// Rank shard widths an EXL3 export may carry for `geometry`: whole H128
-/// rotation blocks of the intermediate split over one to four ranks, the
-/// first ranks owning any extra block. For V4.1 (2304) these are 2304 full
-/// (RTX local), 1152 (TP2), 768 (TP3) and 640/512 (TP4). Other geometries
-/// also carry TP6 (V4 Pro: 512; 2048: 384 and 256).
+/// rotation blocks of the intermediate split over the published rank counts,
+/// the first ranks owning any extra block. V4.1 (2304) includes a clean TP6
+/// split of three H128 blocks per rank (384 rows), alongside TP3's six blocks.
 pub fn exl3_shard_widths(geometry: cuteafd_core::ExpertGeometry) -> Vec<u32> {
     let blocks = geometry.intermediate / 128;
-    let six = geometry != cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
     let mut widths: Vec<u32> = [1u32, 2, 3, 4, 6]
         .into_iter()
-        .filter(|&world| world != 6 || six)
         .filter(|&world| geometry.intermediate % 128 == 0 && blocks >= world)
         .flat_map(|world| [blocks / world, blocks.div_ceil(world)])
         .map(|count| count * 128)
@@ -414,21 +411,19 @@ mod info_tests {
         }
     }
 
-    /// Every published rank shard width is a distinct accepted geometry. The
-    /// implicit three-rank EXL3 group exports 768 (18 whole H128 blocks split
-    /// three ways), which must not be confused with the native FP8 shard widths
-    /// 384/576 that no EXL3 publication ever produces.
+    /// Whole-H128 disjoint shards include TP3's 768 and TP6's 384 rows;
+    /// fractional-block TP4 width 576 is still not a valid EXL3 publication.
     #[test]
     fn native_info_accepts_every_published_shard_width() {
         let base = [2u32, 5120, 768, 384, 16, 6, 2, 44, 18, 7, 3, 2, 3, 0, 0, 2];
-        for intermediate in [512u32, 640, 768, 1152, 2304] {
+        for intermediate in [384u32, 512, 640, 768, 1152, 2304] {
             let mut words = base;
             words[2] = intermediate;
             let info = V41Exl3Info::from_words(words)
                 .unwrap_or_else(|error| panic!("shard width {intermediate} must be accepted: {error}"));
             assert_eq!(info.intermediate, intermediate as usize);
         }
-        for intermediate in [0u32, 384, 576, 896, 1024, 1280] {
+        for intermediate in [0u32, 256, 576, 896, 1024, 1280] {
             let mut words = base;
             words[2] = intermediate;
             assert!(
@@ -439,9 +434,23 @@ mod info_tests {
     }
 
     #[test]
+    fn native_info_accepts_published_v41_tp6_abi() {
+        let words = [2, 5120, 384, 384, 1, 6, 2, 32, 11, 6, 3, 2, 3, 0, 0, 2];
+        let info = V41Exl3Info::from_words(words).unwrap();
+        assert_eq!(info.intermediate, 3 * 128);
+        assert_eq!(info.hidden, 5120);
+        assert_eq!(info.experts, 384);
+        assert_eq!(info.capacity, 1);
+        assert_eq!(info.topk, 6);
+        assert_eq!(info.output_element_bytes, 2);
+        assert_eq!(info.bits, [2, 3, 0, 0]);
+        assert!(info.require_layout(V41Exl3Layout::Disjoint).is_ok());
+    }
+
+    #[test]
     fn shard_widths_follow_the_expert_geometry() {
         use cuteafd_core::ExpertGeometry;
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [512, 640, 768, 1152, 2304]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [384, 512, 640, 768, 1152, 2304]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [256, 384, 512, 640, 768, 1024, 2048]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::QWEN4), [128, 256, 384, 640]);
