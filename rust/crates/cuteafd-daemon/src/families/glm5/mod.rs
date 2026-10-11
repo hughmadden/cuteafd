@@ -957,6 +957,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% golden {:.1}%",
             100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / (rows - 1).max(1) as f64,
             100.0 * golden_next as f64 / (rows - 1).max(1) as f64);
+        use std::hash::{Hash, Hasher};
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        decode_logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
+        println!("decode logits: mean KL(golden||engine) {:.5} | logits digest {:016x}",
+            mean_kl(&decode_logits, &golden[prefill * vocab..][..decode_logits.len()], vocab), digest.finish());
+        // A/B between builds or attention placements: every decode row's logits (F32).
+        if let Some(dir) = &args.save_logits {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("decode-logits.bin"),
+                decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
