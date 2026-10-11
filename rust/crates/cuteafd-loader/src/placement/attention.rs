@@ -64,6 +64,10 @@ pub struct ContextBuffers {
     /// Decode lanes that exchange concurrently (the gather-route prefill
     /// never uses the context exchange).
     pub lanes: u64,
+    /// Per-GPU executor workspace that exists only under `context` (partials,
+    /// candidate lists, program scratch, gather and commit tables), exactly as
+    /// the family's engine allocates it; 0 when the family charges none.
+    pub workspace_bytes: u64,
 }
 
 /// One GPU's context exchange storage, per (layer parity, lane) slot:
@@ -120,16 +124,19 @@ impl ContextBuffers {
         let staging = self.staging_unit_bytes.checked_mul(units)
             .and_then(|n| n.checked_mul(2)).ok_or_else(overflow)?;
         let exchange = ContextExchangeLayout::new(&self).bytes().ok_or_else(overflow)?;
+        let workspace = self.workspace_bytes;
         Ok((0..2).flat_map(|gpu| [
             Demand::new(gpu, Category::Workspace, "context staging", staging, Basis::Formula),
             Demand::new(gpu, Category::Transport, "context exchange", exchange, Basis::Formula),
-        ]).collect())
+        ].into_iter().chain((workspace > 0).then(||
+            Demand::new(gpu, Category::Workspace, "context workspace", workspace, Basis::Formula)))).collect())
     }
 }
 
 impl ExecutorModes {
-    /// Recorded family default. No decision gate has enabled another mode yet.
-    pub fn attention_default(&self) -> AttentionPlacement { AttentionPlacement::Heads }
+    /// Recorded family default on two GPUs with peer access (one GPU always
+    /// runs heads). Each family's own decision gate sets it (GLM 5.3: K3).
+    pub fn attention_default(&self) -> AttentionPlacement { self.attention }
 
     /// Prefer split FFN ownership when available, otherwise owner reduction.
     pub fn whole_mode(&self, gpu: u8) -> Option<LayerMode> {
@@ -141,7 +148,9 @@ impl ExecutorModes {
     /// never silently become heads or a one-GPU layout.
     pub fn check_attention(&self, requested: Option<AttentionPlacement>, gpus: usize, peer: bool)
         -> Result<AttentionPlacement, PlacementError> {
-        let mode = requested.unwrap_or_else(|| self.attention_default());
+        // Auto takes the family default only where it can run: one GPU is heads.
+        let mode = requested.unwrap_or_else(|| if gpus == 2 && peer { self.attention_default() }
+            else { AttentionPlacement::Heads });
         if mode != AttentionPlacement::Heads {
             if gpus != 2 || !peer {
                 return Err(PlacementError::AttentionPlacement { family: self.family, mode,

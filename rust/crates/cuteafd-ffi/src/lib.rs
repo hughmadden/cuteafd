@@ -2465,6 +2465,26 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_copy_d2d_async", status)
     }
 
+    /// Copies `count` byte blocks from `src` to `cache` on `cuda_stream`: block `i` is
+    /// `block_bytes[i]` bytes from `src + src_offsets[i]` to `cache + cache_offsets[i]`
+    /// (three device arrays of `count` u64).
+    ///
+    /// # Safety
+    /// Both bases and the three arrays are live device memory of the stream's device (or
+    /// peer-accessible), every block lies inside its allocation, blocks do not overlap, and
+    /// all stay valid until the stream reaches the copy.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn cuda_kv_cache_write_blocks_async(&self, src: *const c_void, cache: *mut c_void,
+        src_offsets: *const c_void, cache_offsets: *const c_void, block_bytes: *const c_void, count: usize,
+        cuda_stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u8, *mut u8, *const u64, *const u64, *const u64, usize, *mut c_void)
+            -> CuteafdStatus;
+        let copy_fn: Symbol<F> = unsafe { self.lib.get(b"cuteafd_cuda_kv_cache_write_blocks_async")? };
+        let status = unsafe { copy_fn(src.cast(), cache.cast(), src_offsets.cast(), cache_offsets.cast(),
+            block_bytes.cast(), count, cuda_stream) };
+        self.status_to_result("cuteafd_cuda_kv_cache_write_blocks_async", status)
+    }
+
 
 
 

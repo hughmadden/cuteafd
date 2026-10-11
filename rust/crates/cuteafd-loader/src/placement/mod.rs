@@ -203,6 +203,8 @@ pub struct ExecutorModes {
     /// Whether it runs hop points beyond the entry broadcast (ownership
     /// boundaries, split-FFN broadcasts, the exit hop to the head's GPU).
     pub hops: bool,
+    /// What `auto` attention placement resolves to on two peer GPUs.
+    pub attention: AttentionPlacement,
 }
 
 impl ExecutorModes {

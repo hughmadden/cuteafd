@@ -101,6 +101,8 @@ pub(crate) fn check(schedule: &Schedule) -> Result<(), Deadlock> {
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+#[cfg(test)]
+pub(crate) mod host;
 
 #[cfg(test)]
 mod tests {

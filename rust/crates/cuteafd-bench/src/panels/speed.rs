@@ -234,7 +234,9 @@ impl Panel for Prefill {
 impl Retained {
     fn contexts(max_context: u64) -> Vec<u64> {
         let mut out = vec![0];
-        out.extend([4096u64, 16_384, 65_536, 131_072].into_iter().filter(|&c| c + 512 <= max_context));
+        // 256K: the agentic floor, where token-split attention's halved indexer scan shows (PLAN
+        // v3 attention placement, decision 8); servers below it skip the point.
+        out.extend([4096u64, 16_384, 65_536, 131_072, 262_144].into_iter().filter(|&c| c + 512 <= max_context));
         out
     }
 }
@@ -243,7 +245,7 @@ impl Panel for Retained {
     fn id(&self) -> &'static str { "retained" }
     fn title(&self) -> &'static str { "Decode vs retained context" }
     fn description(&self) -> &'static str {
-        "C1 decode tok/s after 0, 4K, 16K, 64K and 128K tokens of context (up to the limit), thinking off."
+        "C1 decode tok/s after 0, 4K, 16K, 64K, 128K and 256K tokens of context (up to the limit), thinking off."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
         Self::contexts(131_072 + 512).iter().map(|&c| rates.seconds(c as f64, 160.0) * 1.2).sum()

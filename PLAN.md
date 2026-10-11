@@ -3834,8 +3834,9 @@ earlier per-kind-alternating records but with one ownership transition.
 GLM contiguous records are 27560/26380 B per token versus alternating
 25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners.
 Fewer owner transitions do not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
-The extra TP2 counts are calibrated admission fixtures, not executor gates;
-all production attention-placement defaults remain `heads`.
+The extra TP2 counts are calibrated admission fixtures, not executor gates.
+GLM 5.3's default is `context` (K3, 2026-10-11, measured below); every other
+family's production default remains `heads`.
 
 ### 7. Cost against today's head split
 
@@ -3915,6 +3916,7 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
 | K1 | Fork kernels (sparkinfer-glmrt master, then pin): scored index top-k (GLM, GLM Flash pools, V4 C4); `dsa_candidate_merge` (2k → k by (score, logical), emits the compacted local slot list); sparse MLA decode `partial` route (head range, partial + LSE, no sink) for 656 / 528 / 584 records (V4's "584" is a planar 576 B payload row plus an 8 B per-row footer, in 576-aligned padded pages: C4 37,440 B, SWA 149,760 B; indexer keys keep planar scales); `lse_combine2` (optional sink); paged → contiguous staging gather of whole pages, footers and padding included, byte-exact | M | — | SM120 + SM121 tests vs an FP64 reference: merged selection bit-equal to single-GPU top-k on random and all-ties inputs; empty shard gives −inf / 0; combine matches the 2-split merge |
 | K2 | Shared parts: `shared/peer_split/context.rs` (`ContextExchange`, page owner map), `RefPagePool` parity half-pools, `PrefixFamily::page_device`, per-device host-tier copies; `order::check` fixtures for the context decode and the two-lane `layers` schedules | M | K0 | prefix-cache tests (fork, tail copy on owner, eviction balance, host round trip); order fixtures |
 | K3 | GLM 5.3 `context` (needs P9's solver port, pulled ahead of P7: it depends only on P1/P3): attention path of section 1, gather prefill, single-owner prefix pages, host tier on | L | K1, K2, P9a | section 4's GLM 5.3 row; exact-prefix byte-exact incl. host tier; planner == runtime; the 2M pool admits at max; quick A/B at max: C1 ≥ `heads` C1 (at its 1.29M pool), C8, 8K prefill within 3%; one 256K-context C1 decode for the indexer claim |
+| K3 result (2026-10-11) | Done, default `context` (TJ: no replicated KV; pool first, not C1-gated). Max EXL3 K4, 2 RTX + 6 Sparks at 100G, one matched pair: pool 1,321,216 → 2,097,152; C1 54.68 → 52.74 (0.965); C8 105.9 → 107.5; 8K prefill 3,042 → 3,125; fidelity KL 0.0378 → 0.0390, top-1 96.2 → 96.6%; retained C1 0.89-0.94× to 128K, 1.00× at 256K (30.0 vs 29.9), 256K TTFT 114 → 107 s. Prefill logits byte-identical to `heads`; exact restores byte-identical; planner == ledger to the byte. C1 recovery is a follow-up (fuse the q push into the producer, overlap own-head partials). | | | |
 | K4 | GLM 5.3 `layers`: per-layer executor (`Whole{g, Split}` by indexer group, `AfterAttention` hops via `HopLink`), two-lane decode/verify | L | K2, P9a | quick fidelity; order fixtures per interleaving; A/B at max at 2M |
 | D-GLM | **Decision:** C1 `context` vs `layers` at 2M on max (3 interleaved sessions; 6 if within 1%), plus C8/C16 for both. Default per TJ's rule, recorded in `docs/models/glm5.md` with the numbers. | — | K3, K4 | — |
 | K5 | V4 Flash/Pro `context` on C4 layers (C128 and window layers stay `HeadSplit`), sink in the combine, with P4 TP2 (+2 / +1 pairs) | M | K3, P4 | section 4's V4 rows; exact cache; A/B at max at 2M |
