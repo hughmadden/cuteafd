@@ -16,7 +16,7 @@ pub(super) struct Preflight {
     pub local_expert_budget: usize,
     pub placement: cuteafd_loader::placement::Placement,
     pub expert_directory: Option<std::path::PathBuf>,
-    pub working_set: cuteafd_loader::placement::families::mimo_v2::MimoWorkingSet,
+    pub working_set: cuteafd_loader::placement::SparkWorkingSet,
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)

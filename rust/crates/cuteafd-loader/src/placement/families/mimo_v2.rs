@@ -30,24 +30,19 @@ pub struct MimoInputs<'a> {
     pub lanes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MimoWorkingSet {
-    pub spark_layers: Vec<usize>,
-    pub spark_ranks: usize,
-    pub prefill_lanes: u64,
-}
-
 pub struct MimoSolution {
     pub request: PlacementRequest,
     pub placement: Placement,
-    pub working_set: MimoWorkingSet,
+    pub working_set: SparkWorkingSet,
 }
 
 impl<'a> MimoInputs<'a> {
-    pub fn selected<'b>(&'b self, no_spark: &'b CapacityProfile, working_set: &MimoWorkingSet) -> MimoInputs<'b> {
-        MimoInputs { profile: if working_set.spark_ranks == 0 { no_spark } else { self.profile },
-            spark_ranks: working_set.spark_ranks, lanes: working_set.prefill_lanes,
-            startup_probe_bytes: if working_set.spark_ranks == 0 { 0 } else { self.startup_probe_bytes },
+    pub fn selected<'b>(&'b self, no_spark: &'b CapacityProfile, working_set: &SparkWorkingSet) -> MimoInputs<'b> {
+        let remote = working_set.includes(WorkingSetComponent::SparkExperts);
+        MimoInputs { profile: if remote { self.profile } else { no_spark },
+            spark_ranks: working_set.selected_ranks().len(),
+            lanes: if remote { working_set.prefill_lanes } else { 1 },
+            startup_probe_bytes: if remote { self.startup_probe_bytes } else { 0 },
             ..self.clone() }
     }
 }
@@ -78,7 +73,7 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
             continue;
         }
         let remote = !spark_layers.is_empty();
-        let working_set = MimoWorkingSet { spark_layers,
+        let working_set = SparkWorkingSet { rtx_layers: routed[..n].to_vec(), spark_layers,
             spark_ranks: if remote { inputs.spark_ranks } else { 0 },
             prefill_lanes: if remote { inputs.lanes } else { 1 } };
         let selected = inputs.selected(no_spark, &working_set);
@@ -106,7 +101,11 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
             let placement = solve(&request)?;
             let actual = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
                 (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
-            if actual != working_set.spark_layers || placement.onboard_layers != n {
+            let local = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                matches!(assignment.experts, ExpertHome::RtxTp2 | ExpertHome::RtxWhole { .. })
+                    .then_some(layer)).collect::<Vec<_>>();
+            if actual != working_set.spark_layers || local != working_set.rtx_layers
+                || placement.onboard_layers != n {
                 return Err(PlacementError::Inventory("MiMo solved prefix disagrees with its working set").into());
             }
             Ok::<_, CacheGeometryError>(MimoSolution { request, placement, working_set })
@@ -237,7 +236,11 @@ mod tests {
                 tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
             let all = solve_working_set(&inputs, &local).unwrap();
             assert_eq!(all.placement.onboard_layers, 3);
-            assert_eq!(all.working_set, MimoWorkingSet { spark_layers: vec![], spark_ranks: 0, prefill_lanes: 1 });
+            assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
+                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 1 });
+            assert!(all.working_set.includes(WorkingSetComponent::RtxExperts));
+            assert!(!all.working_set.includes(WorkingSetComponent::SparkExperts));
+            assert!(all.working_set.selected_ranks().is_empty());
             assert_eq!(all.request.fixed[0].group, "workspace.local");
             assert_eq!(all.request.inventory.gpus[0].headroom_bytes, headroom_bytes(96 << 30, false));
             let tight = MimoInputs { gpus: all.placement.items.iter().enumerate().map(|(rank, items)|
@@ -249,11 +252,20 @@ mod tests {
             overcharged.onboard = Onboard::Layers(3);
             assert!(solve(&overcharged).is_err(), "configured-peer costs would incorrectly reject all-local");
             let selected = inputs.selected(&local, &all.working_set);
+            let configured_only = inputs.selected(&local, &SparkWorkingSet { spark_ranks: 6,
+                prefill_lanes: 3, ..SparkWorkingSet::default() });
+            assert_eq!((configured_only.spark_ranks, configured_only.lanes,
+                configured_only.startup_probe_bytes), (0, 1, 0));
+            assert!(std::ptr::eq(configured_only.profile, &local));
             assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
                 .reservations[0].name, "workspace.local");
             for onboard in [Onboard::Layers(2), Onboard::Fraction(2.0 / 3.0)] {
                 let partial = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
+                assert_eq!(partial.working_set.rtx_layers, vec![1, 2]);
                 assert_eq!(partial.working_set.spark_layers, vec![3]);
+                assert!(partial.working_set.includes(WorkingSetComponent::RtxExperts));
+                assert!(partial.working_set.includes(WorkingSetComponent::SparkExperts));
+                assert_eq!(partial.working_set.selected_ranks(), 0..6);
                 assert_eq!((partial.working_set.spark_ranks, partial.working_set.prefill_lanes), (6, 3));
                 assert_eq!(partial.request.fixed[0].group, "transport.spark_intake_planes");
                 assert_eq!(partial.request.inventory.gpus[0].headroom_bytes, (96u64 << 30)
@@ -267,6 +279,9 @@ mod tests {
             let fallback = solve_working_set(&MimoInputs { expert_workspace: 0, tp2_workspace: [0; 2],
                 requested_pool: None, ..inputs.clone() }, &local).unwrap();
             assert_eq!(fallback.placement.onboard_layers, 0);
+            assert!(fallback.working_set.rtx_layers.is_empty());
+            assert!(!fallback.working_set.includes(WorkingSetComponent::RtxExperts));
+            assert!(fallback.working_set.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(fallback.working_set.spark_layers, vec![1, 2, 3]);
             assert_eq!(fallback.placement.pool_tokens, 2 << 20);
             let constrained = MimoInputs { context: 1 << 20, requested_pool: None,
