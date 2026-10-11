@@ -6205,12 +6205,20 @@ Ideas TJ wants kept for later; not v2 work.
 - **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
 - **DSH dashboard model gate** is unverified: the automation could not find
   the composer iframe.
-- **Dual-GPU jobs starve in the lock queue.** Ordered flocks give no
-  fairness: a sparks->gpu0->gpu1 job holds gpu0 while single-GPU1 jobs keep
-  taking gpu1. On 2026-10-11, P9 timed out at 6 h twice and P6 at 8 h. Add a
-  `gpu-pair.reserve` lock: dual-GPU waiters take it first, and every single-GPU
-  path (smoke, wip-cards, build-slot GPU tests, agent scripts) waits on it
-  before taking gpu0 or gpu1. Put it in one shared helper, not per script.
+- **GLM Flash NVFP4 nextn (layer 45) runs BF16 experts.** NVIDIA's config
+  declares W4A4 for all Linear modules and excludes nothing, but layer 45's
+  experts are stored BF16 with no scales. The selector follows the stored
+  tensors (unscaled BF16 keeps BF16; partial NVFP4 tensors are an error), but
+  there is no BF16 expert backend (`Fp8ExpertTensors::layer_format` takes
+  only F8E4M3/U8/I8), and GLM Flash serves external DFlash2/dSpark, not native
+  nextn. A native BF16 expert package is needed only if native MTP is
+  enabled for this checkpoint.
+- **Qwen NVFP4 C16 W4A4 throughput.** Making W4A4 the only expert path (the
+  small-row W4A16 fallback is deleted) dropped C16 code decode 631 -> 416 tok/s
+  (C1 80 -> 76); the wire was already BF16. Tune the small-row W4A4 GEMM
+  and dispatch.
+- **Dual-GPU lock starvation** is fixed by the fair FIFO queue
+  (`scripts/hw/hwlock.py`, smoke's `fair` ticket).
 - **Qualify the opt-in shelf (audit 2026-10-11).** Each item needs one
   hardware decision:
   - mapped-table uring/mincore;
