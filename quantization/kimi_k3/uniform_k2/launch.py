@@ -67,13 +67,13 @@ def main():
                "--export", str(args.export.expanduser().resolve())]
     if args.resume:
         command.append("--resume")
-    publication_command = (["timeout", "--signal=TERM", "7d", *command, "--resume", "--publish-only"]
+    publication_command = (["timeout", "--foreground", "--signal=TERM", "7d", *command, "--resume", "--publish-only"]
                            if args.publish else None)
     # GPU ownership ends when the quantizer process exits. Uploading runs in a
     # separate process with no CUDA device visible and no hardware lock held.
     hardware_lock = Path.home() / ".cache/cuteafd/gpu1.lock"
     hardware_lock.parent.mkdir(parents=True, exist_ok=True)
-    command = ["flock", "--wait", "60", str(hardware_lock), "timeout", "--signal=TERM", "30d", *command]
+    command = ["flock", "--wait", "60", str(hardware_lock), "timeout", "--foreground", "--signal=TERM", "30d", *command]
     # Persist only execution settings; credentials stay in the existing HF
     # credential store and never appear in launch data or commands.
     environment = {name: os.environ[name] for name in
