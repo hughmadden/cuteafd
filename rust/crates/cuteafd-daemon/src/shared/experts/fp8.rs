@@ -1,6 +1,6 @@
 //! Exact FP8 routed experts (the `fp8` family): the checkpoint's E4M3 expert
 //! weights with FP32 128x128 block scales (or MXFP4, MiMo V2.6 Pro:
-//! `fp8-mimop` packages; or ModelOpt NVFP4 run W4A16, `fp8-<family>-nvfp4`
+//! `fp8-mimop` packages; or ModelOpt NVFP4 run W4A4, `fp8-<family>-nvfp4a4`
 //! packages), resident per TP slice and run by
 //! an `fp8-<family>` package (`python/tools/aot/package_fp8_moe_aot.py`,
 //! `native/shared/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
@@ -82,46 +82,23 @@ pub(super) fn package_family(family: Option<&'static str>, format: ExpertFormat)
 /// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
 /// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
 /// releases share their geometry with the FP8 ones and get packages of their
-/// own). The W4A4 package (`-nvfp4a4`: large-row steps quantize activations
-/// with the checkpoint's input_scale, as ModelOpt calibrated them) is the
-/// default when built; `CUTEAFD_NVFP4_ACTIVATIONS=a16` keeps W4A16 (GLM 5.3
-/// Flash: KL vs golden 0.0589 W4A16, 0.0791 W4A4; 8K prefill 1.33x).
+/// own). NVFP4 always uses W4A4 (`-nvfp4a4`), quantizing original BF16
+/// activations with each expert's checkpoint input_scale at every row count.
 pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
     let family = package_family(cuteafd_core::expert_geometry().family(), format);
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
     let layout = format!("tp{tp}");
-    if format == ExpertFormat::Nvfp4 && nvfp4_activations() == Nvfp4Activations::A4 {
-        let a4 = root.join(format!("fp8-{family}-nvfp4a4")).join(&layout);
-        if a4.is_dir() {
-            return a4;
-        }
+    if format == ExpertFormat::Nvfp4 {
+        return root.join(format!("fp8-{family}-nvfp4a4")).join(&layout);
     }
     root.join(format!("fp8-{family}{}", format.package_suffix())).join(layout)
 }
 
-/// `<libdir>/fp8/fp8-<geometry>-nvfp4[a4]/tp1`: a coordinator NVFP4 dense-MLP
-/// package (one always-selected expert), W4A4 when built unless
-/// `CUTEAFD_NVFP4_ACTIVATIONS=a16`.
+/// `<libdir>/fp8/fp8-<geometry>-nvfp4a4/tp1`: mandatory coordinator W4A4
+/// dense-MLP package (one always-selected expert).
 pub(crate) fn dense_package_directory(native_lib: &Path, geometry: &str) -> PathBuf {
     cuteafd_loader::placement::inventory::dense_package_directory(
-        native_lib.parent().unwrap_or(Path::new(".")), geometry,
-        nvfp4_activations() == Nvfp4Activations::A4)
-}
-
-/// How NVFP4 experts treat activations (`CUTEAFD_NVFP4_ACTIVATIONS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Nvfp4Activations {
-    /// W4A4 large-row steps where a `-nvfp4a4` package is built (default).
-    A4,
-    /// W4A16 at every row count.
-    A16,
-}
-
-pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
-    match std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() {
-        Ok("a16") => Nvfp4Activations::A16,
-        _ => Nvfp4Activations::A4,
-    }
+        native_lib.parent().unwrap_or(Path::new(".")), geometry)
 }
 
 /// Exact slices: a package that also holds `tp<n>-w<width>` layouts (ranks
@@ -304,12 +281,14 @@ impl<'a> Fp8Experts<'a> {
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: matches!(info.weights, Fp8MoeWeights::Nvfp4 { w4a4: true }) },
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: true },
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
             && info.slice == tensors.rank_width(tp, rank, slicing)?,
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
+        ensure!(tensors.format() != ExpertFormat::Nvfp4 || !info.wire_input,
+            "NVFP4 experts require a BF16-input package; rebuild {}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
         let primary_scratch = module.scratch_bytes(top)?;
@@ -533,7 +512,9 @@ impl<'a> Fp8Experts<'a> {
     /// As `run`, with `rows` BF16 `[rows, H]` input rows.
     pub unsafe fn run_bf16(&self, index: usize, rows: usize, input: *mut c_void, ids: *mut c_void,
         weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
-        let module = self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?;
+        let module = if !self.wire_input() { &self.module } else {
+            self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
+        };
         self.run_with(module, index, rows, input, ids, weights, out, stream)
     }
 

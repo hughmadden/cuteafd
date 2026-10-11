@@ -14,7 +14,9 @@ pub static FULL: FidelityPanel = FidelityPanel { full: true };
 pub struct FidelityPanel { full: bool }
 
 pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
-    let admitted = crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
+    // V4.1's native sparse scorer admits selected prefill rows without an all-row workspace switch.
+    let admitted = info.family.as_deref() == Some("deepseek_v41")
+        || crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
     (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
 }
 
@@ -147,6 +149,19 @@ impl Panel for FidelityPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_v41_sparse_prefill_is_admitted_in_old_and_new_arms_without_cli_flag() {
+        let info = ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(),
+            family: Some("deepseek_v41".into()), ..Default::default() };
+        assert!(info.configuration.settings.is_empty());
+        assert!(prefill_unavailable(&info).is_none());
+        assert!(FULL.unavailable(&info).is_none());
+        for family in ["deepseek_v4", "glm5", "glm5_flash", "qwen4", "mimo_v2"] {
+            let info = ServerInfo { family: Some(family.into()), ..Default::default() };
+            assert!(prefill_unavailable(&info).is_some(), "{family}");
+        }
+    }
+
     #[test]
     fn full_requires_launch_admission_and_standard_does_not() {
         let mut info = ServerInfo {model:"Qwen/Qwen3.8-Flash-Next-FP8".into(),..Default::default()};

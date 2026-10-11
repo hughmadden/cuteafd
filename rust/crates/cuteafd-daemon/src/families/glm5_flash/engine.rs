@@ -805,6 +805,7 @@ pub(crate) struct StepPlan<'p, 'a> {
     /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
+    spark_bf16: bool,
 }
 
 /// The engine settings a step plan depends on besides its layers and experts.
@@ -814,6 +815,7 @@ pub(crate) struct StepSettings {
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
     pub full_prefill_logits: bool,
+    pub spark_bf16: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
     /// The DSA index cache: the compact one runs the `index_producer_c` programs, whose scratch
@@ -864,6 +866,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             },
             decode_rows: settings.decode_rows,
             shared_records,
+            spark_bf16: settings.spark_bf16,
         }
     }
 
@@ -1006,7 +1009,10 @@ impl<'a> StepPlan<'_, 'a> {
             route_ids: self.alloc(bytes.route_ids)?,
             route_weights: self.alloc(bytes.route_weights)?,
             wire: self.alloc(bytes.wire)?,
-            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(bytes.router_host)?)?),
+            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(bytes.router_host)?
+                + if self.spark_bf16 && rank == 0 && self.shape.spark {
+                    rows * (self.cfg.hidden - self.cfg.hidden / 32)
+                } else { 0 })?),
             temps,
         })
     }
@@ -1191,6 +1197,7 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    pub(crate) spark_bf16: bool,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -1497,10 +1504,10 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 /// partials. Serving waves (`spark_dispatch`) and the start-up warm-up ([`spark_warmup_request`])
 /// both take this format.
 fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
-    wire: Vec<u8>, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
+    wire: Vec<u8>, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
     let topk = topk as u32;
     let mut request = ExpertProtocolV2Request::new(layer as u64 + 1, 17, layer as u32, hidden as u32,
-        ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
             token_position: u64::from(row), route_offset: row * topk, route_count: topk,
@@ -1515,13 +1522,13 @@ fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: 
 /// rank's session sizes its rings for the request that opens it, and the transport drops and
 /// reconnects a rank whose rings a later request outgrows, so a transport warmed with the most rows
 /// any of its waves carries never reconnects while serving.
-pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize) -> Result<ExpertProtocolV2Request> {
+pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
     let layer = (0..cfg.layers).find(|&layer| !cfg.dense[layer]).context("no MoE layer to warm the Spark transports")?;
     let (h, topk) = (cfg.hidden, cfg.topk);
     let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
         row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
     }).collect();
-    spark_request(h, topk, layer, rows, routes, vec![0; rows * (h + h / 32)], ExpertV2SourceKind::Prefill)
+    spark_request(h, topk, layer, rows, routes, vec![0; rows * (if bf16 { h * 2 } else { h + h / 32 })], ExpertV2SourceKind::Prefill, bf16)
 }
 
 impl<'a> GlmfEngine<'a> {
@@ -1587,7 +1594,7 @@ impl<'a> GlmfEngine<'a> {
             lanes: lane_setting().0,
             subset_lanes: lane_setting().1,
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            spark_bf16: false, full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
@@ -2153,7 +2160,7 @@ impl<'a> GlmfEngine<'a> {
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
-            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+            StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })
@@ -2554,9 +2561,13 @@ impl<'a> GlmfEngine<'a> {
             for (name, buffer, bytes) in [("route_ids.bin", &w.route_ids, rows * self.cfg.topk * 4),
                 ("route_weights.bin", &w.route_weights, rows * self.cfg.topk * 4),
                 ("router_logits.bin", &w.router_logits, rows * self.cfg.experts * 4),
-                ("wire.bin", &w.wire, rows * (self.cfg.hidden + self.cfg.hidden / 32)),
                 ("shared.bin", &w.shared, rows * self.cfg.hidden * 2)] {
                 std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+            }
+            // BF16 ingress bypasses w.wire; x already holds the next layer's input.
+            if !self.spark_bf16 {
+                std::fs::write(dir.join("wire.bin"), self.download(&w.wire,
+                    rows * (self.cfg.hidden + self.cfg.hidden / 32))?)?;
             }
         }
         Ok(())
@@ -3711,7 +3722,7 @@ impl<'a> GlmfEngine<'a> {
             }
         })?;
         self.probe_ring(index, w, t, matches!(experts, Experts::Spark { .. }))?;
-        if !matches!(experts, Experts::Local(_)) {
+        if !matches!(experts, Experts::Local(_)) && !self.spark_bf16 {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
@@ -3909,7 +3920,7 @@ impl<'a> GlmfEngine<'a> {
         shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
         let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
         let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
@@ -3923,7 +3934,7 @@ impl<'a> GlmfEngine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.stream)?;
             self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
         // The shared expert queues behind the copies and runs during the exchange;
@@ -3943,7 +3954,7 @@ impl<'a> GlmfEngine<'a> {
         }).collect();
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
         drop(staging);
-        let request = spark_request(h, topk, index, t, routes, wire, kind)?;
+        let request = spark_request(h, topk, index, t, routes, wire, kind, self.spark_bf16)?;
         if self.split_audit && !decode && t >= 256 {
             let counts = audit_route_counts(&request.routes);
             tracing::info!(layer = index, rows = t, distinct = counts.len(),
@@ -4240,7 +4251,9 @@ mod prefill_lane_tests {
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
             ("integration/cuteafd/glmf.py", 0x4949_583b_7962_90f6_u64),
-            ("integration/cuteafd/_glm_kernels.py", 0xabb3_5df9_3a4c_9796),
+            // 9769b043 adds GlmQueryRope query_row (default heads * latent, the prior stride; GLM
+            // Flash decode never passes it), so projection shapes and routes are unchanged.
+            ("integration/cuteafd/_glm_kernels.py", 0x3aa5_9169_9149_9ba0),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
@@ -5144,7 +5157,7 @@ mod spark_warmup_tests {
     fn wave(cfg: &GlmNextConfig, t: usize, kind: ExpertV2SourceKind) -> ExpertProtocolV2Request {
         let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / cfg.topk) as u32,
             expert_id: (7 * i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
-        spark_request(cfg.hidden, cfg.topk, 3, t, routes, vec![0x38; t * (cfg.hidden + cfg.hidden / 32)], kind).unwrap()
+        spark_request(cfg.hidden, cfg.topk, 3, t, routes, vec![0x38; t * (cfg.hidden + cfg.hidden / 32)], kind, false).unwrap()
     }
 
     /// The warm-up is a full lane of prefill in the serving format: 4,096 zero rows at the first MoE
@@ -5156,7 +5169,7 @@ mod spark_warmup_tests {
     #[test]
     fn the_warmup_is_a_full_lane_of_zero_gates_in_the_serving_format() {
         let cfg = glm53_flash();
-        let warm = spark_warmup_request(&cfg, 4096).unwrap();
+        let warm = spark_warmup_request(&cfg, 4096, false).unwrap();
         let serving = wave(&cfg, 4096, ExpertV2SourceKind::Prefill);
         assert_eq!((&warm.header, &warm.rows), (&serving.header, &serving.rows));
         assert_eq!((warm.header.layer_id, warm.header.row_count, warm.header.hidden_dtype, warm.header.flags),
@@ -5179,7 +5192,7 @@ mod spark_warmup_tests {
     fn no_wave_outgrows_a_warmed_session() {
         let cfg = glm53_flash();
         for rows in [2048, 4096] {
-            let warm = spark_warmup_request(&cfg, rows).unwrap();
+            let warm = spark_warmup_request(&cfg, rows, false).unwrap();
             let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
             for t in [1, 2, DECODE_ROWS - 1, DECODE_ROWS, 128, 1023, 1024, 2048, 2072, 2109, 2176, 4095, 4096]
                 .into_iter().filter(|&t| t <= rows) {

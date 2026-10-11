@@ -814,6 +814,27 @@ impl ScoringPlan {
         Ok(Self { path, rows })
     }
 
+    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize) -> Result<Self> {
+        let mut plan = Self::new(spec)?;
+        if plan.path == crate::shared::probe::ScorePath::Prefill && spec.score_positions.is_some() {
+            // Sparse scoring keeps the head bounded while exercising the actual prefill geometry.
+            ensure!(chunk_rows > 0, "prefill scoring capacity is zero");
+            plan.rows = chunk_rows;
+        }
+        Ok(plan)
+    }
+
+    fn head_rows(&self, probe: &cuteafd_api::openai::probe::Probe,
+        step: &std::ops::Range<usize>) -> Result<Vec<usize>> {
+        let sparse = self.path == crate::shared::probe::ScorePath::Prefill
+            && probe.spec.score_positions.is_some();
+        let mut rows: Vec<usize> = (0..step.len())
+            .filter(|&row| !sparse || probe.wants(step.start + row + 1)).collect();
+        ensure!(rows.len() <= SCORING_ROWS, "scored prefill selection exceeds target head capacity");
+        if rows.is_empty() { rows.push(step.len() - 1); }
+        Ok(rows)
+    }
+
     fn steps(&self, from: usize, len: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
         let rows = self.rows;
         (from..len - 1).step_by(rows).map(move |start| start..(start + rows).min(len - 1))
@@ -840,7 +861,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    let plan = ScoringPlan::new(&probe.spec)?;
+    let plan = ScoringPlan::for_probe(&probe.spec, chunk_rows)?;
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
@@ -850,9 +871,9 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     for step in plan.steps(from, tokens.len()) {
         ensure!(!job.events.is_closed(), "client disconnected");
         let chunk = &tokens[step.clone()];
+        let selected = plan.head_rows(probe, &step)?;
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: plan.source_kind(chunk.len()) }])?;
-        let selected: Vec<usize> = (0..chunk.len()).collect();
         let result = (|| -> Result<Vec<u8>> {
             let bytes = match plan.path {
                 crate::shared::probe::ScorePath::Prefill => {
@@ -870,7 +891,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
                     pass.download_logits(&batch, &selected).await
                 })?,
             };
-            ensure!(bytes.len() == chunk.len() * scores::ROW_BYTES, "scoring logits extent differs");
+            ensure!(bytes.len() == selected.len() * scores::ROW_BYTES, "scoring logits extent differs");
             // Scoring never proposes drafts. Retain the legacy draft/cache
             // commit for calibration, but verify commits only teacher-forced rows.
             let scoring_draft = if plan.path == crate::shared::probe::ScorePath::Prefill { draft.as_deref_mut() } else { None };
@@ -879,8 +900,11 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         })();
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
-        for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
-            probe.row(step.start + j + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+        for (&selected_row, row) in selected.iter().zip(bytes.chunks_exact(scores::ROW_BYTES)) {
+            probe.row(step.start + selected_row + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+        }
+        if plan.path == crate::shared::probe::ScorePath::Prefill {
+            probe.scored_prefill_chunk(step.start + 1, chunk.len());
         }
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
@@ -906,6 +930,29 @@ mod scoring_tests {
         assert_eq!(decode.source_kind(8), ExpertV2SourceKind::MtpVerify);
         let prefill = ScoringPlan::new(&ProbeSpec { score_path: Some("prefill".into()), ..ProbeSpec::default() }).unwrap();
         assert_eq!(prefill.rows, legacy.rows);
+    }
+
+    #[test]
+    fn sparse_prefill_uses_backbone_capacity_without_changing_decode_head_indices() {
+        let spec = ProbeSpec { score_path: Some("prefill".into()),
+            score_positions: Some(vec![101, 1100, 2048]), ..ProbeSpec::default() };
+        let plan = ScoringPlan::for_probe(&spec, 2048).unwrap();
+        assert_eq!(plan.rows, 2048);
+        let probe = Probe::new(spec.clone());
+        assert_eq!(plan.head_rows(&probe, &(100..2148)).unwrap(), vec![0, 999, 1947]);
+        assert_eq!(plan.head_rows(&probe, &(2148..4196)).unwrap(), vec![2047]);
+        assert!(ScoringPlan::for_probe(&spec, 0).is_err());
+        let too_many = Probe::new(ProbeSpec { score_positions: Some((101..150).collect()),
+            ..spec.clone() });
+        assert!(plan.head_rows(&too_many, &(100..2148)).is_err());
+
+        let decode_spec = ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(8), ..spec };
+        let decode = ScoringPlan::for_probe(&decode_spec, 2048).unwrap();
+        assert_eq!(decode.rows, 8);
+        assert_eq!(decode.head_rows(&Probe::new(decode_spec), &(100..108)).unwrap(),
+            (0..8).collect::<Vec<_>>());
+        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048).unwrap().rows, 48);
     }
 
     #[test]

@@ -504,6 +504,12 @@ pub(crate) struct NativeExpertDaemonArgs {
     pub(crate) device_budget_bytes: usize,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub(crate) max_frame_bytes: usize,
+    /// Persistent decode/prefill endpoints per selected Spark rank, from the family's working set.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) rdma_endpoints: u32,
+    /// Admit wide BF16 input for an optional BF16-input package (mandatory for NVFP4 automatically).
+    #[arg(long)]
+    pub(crate) bf16_ingress: bool,
     #[arg(long, default_value = "0.0.0.0:9100")]
     pub(crate) listen: String,
 }
@@ -739,12 +745,26 @@ mod tests {
     }
 
     #[test]
+    fn expert_endpoint_geometry_is_required_and_nonzero() {
+        use clap::Parser;
+        let base = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--device-budget-bytes", "1000", "--rank", "0"];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--rdma-endpoints", "0"])).is_err());
+        for endpoints in ["1", "2", "4"] {
+            let cli = Cli::try_parse_from(base.into_iter().chain(["--rdma-endpoints", endpoints])).unwrap();
+            let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
+            assert_eq!(args.rdma_endpoints.to_string(), endpoints);
+        }
+    }
+
+    #[test]
     fn spark_topology_flags_are_opt_in_all_or_none_and_range_checked() {
         use clap::Parser;
         let serve = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--device-budget-bytes", "1000", "--rank", "0", "--world", "4"];
+            "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "0", "--world", "4"];
         // Absent keys preserve the legacy launch vector exactly.
         for base in [&serve[..], &expert[..]] {
             let cli = Cli::try_parse_from(base).unwrap();
@@ -779,7 +799,7 @@ mod tests {
         }
         // Whole-expert Qwen TP1 must reach the worker's family validation.
         let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--device-budget-bytes", "1000", "--rank", "0", "--world"];
+            "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "0", "--world"];
         let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (0, 1));
@@ -788,7 +808,7 @@ mod tests {
         }
         // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
-            "--native-lib", "/native.so", "--device-budget-bytes", "1000",
+            "--native-lib", "/native.so", "--device-budget-bytes", "1000", "--rdma-endpoints", "2",
             "--rank", "5", "--world", "6"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
@@ -796,7 +816,7 @@ mod tests {
         // Pure TP6EP1 is a real shard family on both processes. Five is not a
         // family and stays rejected even though it is inside the numeric range.
         let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
-            "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
+            "/native.so", "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "5", "--world", "6"];
         for command in [&serve[..], &six_expert[..]] {
             let cli = Cli::try_parse_from(command.iter().copied()
                 .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();

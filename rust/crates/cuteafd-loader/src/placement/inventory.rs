@@ -414,30 +414,25 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 }
 
 /// The `fp8moe` package a coordinator loads for `format` experts of geometry
-/// `family` (`fp8-<family>[-nvfp4[a4]]`, W4A4 preferred where built, as
+/// `family` (`fp8-<family>[-nvfp4a4]`, mandatory W4A4 for NVFP4, as
 /// `shared::experts::fp8::package_directory`), under `lib`'s `fp8/` tree, and
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
     format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
     use crate::formats::fp8_experts::ExpertFormat;
     let a4 = (format == ExpertFormat::Nvfp4).then(|| format!("fp8-{family}-nvfp4a4"));
-    let name = a4.filter(|n| lib.join("fp8").join(n).is_dir())
-        .unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
+    let name = a4.unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
     let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
 }
 
-/// Dense NVFP4 package selection shared with the coordinator loader. A4 is
-/// preferred only when its tp1 package exists; A16 selects the NVFP4 package.
-pub fn dense_package_directory(lib: &std::path::Path, geometry: &str, a4: bool) -> std::path::PathBuf {
-    let root = lib.join("fp8");
-    let preferred = root.join(format!("fp8-{geometry}-nvfp4a4")).join("tp1");
-    if a4 && preferred.is_dir() { preferred }
-    else { root.join(format!("fp8-{geometry}-nvfp4")).join("tp1") }
+/// Mandatory native W4A4 dense package; missing exports never select W4A16.
+pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::path::PathBuf {
+    lib.join("fp8").join(format!("fp8-{geometry}-nvfp4a4")).join("tp1")
 }
 
-pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64, a4: bool) -> Option<u64> {
-    let directory = dense_package_directory(lib, geometry, a4);
+pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
+    let directory = dense_package_directory(lib, geometry);
     let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
     fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }

@@ -1177,7 +1177,7 @@ class CandidateLauncherTest(unittest.TestCase):
         for rank, line in enumerate(experts):
             self.assertIn(f"--rank {rank}", line)
             self.assertIn("--world 4", line)
-            self.assertIn(f"--rank {rank} --world 4 --spark-tp 2 --spark-ep 2", line)
+            self.assertIn(f"--rank {rank} --world 4 --rdma-endpoints 2 --spark-tp 2 --spark-ep 2", line)
             self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/candidate/libcuteafd_native.so", line)
             self.assertIn("-e RUST_LOG=info", line)
             self.assertIn("--native-lib /scratch/candidate/libcuteafd_native.so", line)
@@ -1227,7 +1227,7 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertEqual(len(experts), 6)
         self.assertIn("rhea", [line for line in experts if "--rank 4" in line][0])
         self.assertIn("moa", [line for line in experts if "--rank 5" in line][0])
-        self.assertTrue(all("--world 6 --spark-tp 3 --spark-ep 2" in line for line in experts))
+        self.assertTrue(all("--world 6 --rdma-endpoints 2 --spark-tp 3 --spark-ep 2" in line for line in experts))
         order = [line for line in lines if line.startswith("STEP")]
         self.assertLess(order.index("STEP expert-start rank=5"), order.index("STEP worker-ready"))
         self.assertLess(order.index("STEP worker-ready"), order.index("STEP coordinator-start"))
@@ -1238,7 +1238,7 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertIn("topology tp=4 ep=1 world=4", result.stdout.splitlines())
         # No tp4 extra role: the reference arm runs without a role manifest.
         provider = next(line for line in result.stdout.splitlines() if line.startswith("CMD expert-0:"))
-        self.assertIn("--world 4 --spark-tp 4 --spark-ep 1", provider)
+        self.assertIn("--world 4 --rdma-endpoints 2 --spark-tp 4 --spark-ep 1", provider)
 
     def test_default_config_without_explicit_topology_is_rejected(self) -> None:
         result = self.plan(CONFIG)

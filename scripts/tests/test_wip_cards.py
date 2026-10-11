@@ -140,6 +140,32 @@ def test_slot_check_every_host_and_seal(monkeypatch):
         cards.slot_check(arm, 'rhea')
 
 
+@pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
+@pytest.mark.parametrize('declared_by', ['name', 'model', 'format'])
+def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by):
+    values = {'SPARK_COUNT': str(count)}
+    name = 'unlabelled-native-card'
+    if declared_by == 'name':
+        name = tag + '-nvfp4-min'
+    elif declared_by == 'model':
+        values['MODEL_ID'] = 'nvidia/Model-NVFP4'
+    else:
+        values['EXPERT_FORMAT'] = 'nvfp4'
+    matrix_entry = {**entry, 'name': name, 'family': family, 'set': values}
+    build = cards.build_scopes([matrix_entry])
+    built = set(build['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    assert str(count) in build['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')
+    # native/cmake/shared/fp8_moe.cmake expands nvfp4 to both historical
+    # nvfp4 and mandatory all-row nvfp4a4 packages at supported TP layouts.
+    cmake = (ROOT / 'native/cmake/shared/fp8_moe.cmake').read_text()
+    assert tag + ':nvfp4' in built
+    assert 'if(entry MATCHES ":nvfp4$")' in cmake
+    assert 'list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}a4")' in cmake
+    assert 'list(APPEND requested_layouts "tp${count}")' in cmake
+    assert count in (2, 4)
+    assert 'glmfdense:nvfp4' not in built
+
+
 def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_path, monkeypatch, capsys):
     other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2'}}
     arms = cards.arms_from(['base=b:s', 'candidate=c:s'])
@@ -160,6 +186,20 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
     families = cards.build_scopes([qwen, other])['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
+    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
+             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
+    scopes = cards.build_scopes(nvfp4)
+    families = set(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    coordinator = set(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';'))
+    assert {'glm:nvfp4', 'glmf:nvfp4'} <= families
+    assert 'glmfdense:nvfp4' not in families
+    assert coordinator == families | {'glmfdense:nvfp4'}
+    assert 'glm:fp8' not in families and 'glmf:fp8' not in families
+    wip = (cards.REPO / 'wip.sh').read_text()
+    coordinator_leg = wip.split('build_coordinator() {', 1)[1].split('build_expert() (', 1)[0]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}' in coordinator_leg
+    expert_leg = wip.split('build_expert() (', 1)[1]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES' not in expert_leg
 
 
 @pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])

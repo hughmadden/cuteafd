@@ -421,6 +421,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
+        engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
@@ -439,6 +440,11 @@ impl Opened {
 
     fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void)
         -> Result<Option<engine::Experts<'s>>> {
+        if args.mtp > 0 && layers == self.cfg.layers
+            && self.checkpoint.module_numerics("mtp.layers.0.mlp.experts.0.gate_proj")?
+                == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
+            tracing::warn!("Qwen MTP experts: deviation from declared W8A8, kernel pending; existing FP8 expert path retained");
+        }
         if args.shared_only {
             tracing::warn!("--shared-only: routed experts are skipped (outputs do not match the model)");
             return Ok(Some(engine::Experts::SharedOnly));

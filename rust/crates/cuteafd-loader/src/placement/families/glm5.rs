@@ -128,9 +128,9 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
         format!("{prefix}_ffn_i{moe}_{cap}"), format!("{prefix}_ffn_i{dense}_{cap}")] {
         programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("GLM step needs program {name}"))?);
     }
-    let mut optional = vec![format!("glm_index_producer_bf16_{cap}"), format!("{prefix}_producer_bf16_{cap}"),
-        format!("{prefix}_o_bf16_{cap}"), format!("{prefix}_ffn_i{moe}_bf16_{cap}")];
-    if !decode { optional.push(format!("{prefix}_ffn_i{dense}_pt_{cap}")); }
+    let optional = [format!("glm_index_producer_bf16_{cap}"), format!("{prefix}_producer_bf16_{cap}"),
+        format!("{prefix}_o_bf16_{cap}"), format!("{prefix}_ffn_i{moe}_bf16_{cap}"),
+        format!("{prefix}_ffn_i{dense}_pt_{cap}")];
     for name in optional { programs = programs.max(lookup(&name).unwrap_or(0)); }
     let name = format!("glm_index_topk_{mode}_{cap}");
     Ok(GlmScratch { programs, topk: lookup(&name).ok_or_else(|| anyhow::anyhow!("GLM step needs program {name}"))? })
@@ -575,8 +575,7 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
 
 pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool) -> anyhow::Result<LocalInventory> {
-    local_inventory_selected(catalog, manifest, selected_layers, rows, lanes, exchange_f32,
-        std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16"))
+    local_inventory_selected(catalog, manifest, selected_layers, rows, lanes, exchange_f32, true)
 }
 
 /// Explicit activation selection keeps package admission deterministic in tests.
@@ -655,12 +654,10 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
     let roots = [parent.join("fp8"), parent.join("../lib/fp8")];
     let find = |name: &str| roots.iter().map(|root| root.join(name).join("tp2")).find(|p| p.is_dir());
-    let (package, w4a4) = if let Some(package) = a4.then(|| find("fp8-glm-nvfp4a4")).flatten() {
-        (package, true)
-    } else {
-        (find("fp8-glm-nvfp4").ok_or_else(|| anyhow::anyhow!(
-            "missing GLM native NVFP4 tp2 package (fp8-glm-nvfp4a4/tp2 or fp8-glm-nvfp4/tp2)"))?, false)
-    };
+    anyhow::ensure!(a4, "checkpoint-declared GLM NVFP4 requires W4A4 at every row count");
+    let package = find("fp8-glm-nvfp4a4").ok_or_else(|| anyhow::anyhow!(
+        "missing calibrated GLM NVFP4 W4A4 tp2 package (fp8-glm-nvfp4a4/tp2)"))?;
+    let w4a4 = true;
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
         package.parent().unwrap().join("manifest.json"))?)?;
     let shape = catalog.routed_experts();
@@ -1235,7 +1232,8 @@ mod tests {
         let whole = 3 * (256 * 6144 * 2048 / 2 + 256 * 6144 * 2048 / 16 + 256 * 8);
         let half = 3 * (256 * 6144 * 1024 / 2 + 256 * 6144 * 1024 / 16 + 256 * 8);
         for rows in [1u64, 16, 63, 64, 81, 4096] {
-            for a4 in [false, true] {
+            assert!(local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, false).is_err());
+            for a4 in [true] {
                 let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 assert_eq!(local.format, GlmLocalFormat::Nvfp4 { w4a4: a4 });
                 assert_eq!(local.experts.len(), 1);
@@ -1254,9 +1252,7 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir.path().join("lib/fp8/fp8-glm-nvfp4a4/tp2")).unwrap();
-        let fallback = local_inventory_selected(&catalog, &manifest, 2, 64, 1, false, true).unwrap();
-        assert_eq!(fallback.format, GlmLocalFormat::Nvfp4 { w4a4: false });
-        assert!(fallback.package.ends_with("fp8-glm-nvfp4/tp2"));
+        assert!(local_inventory_selected(&catalog, &manifest, 2, 64, 1, false, true).is_err());
     }
 
     #[test]
@@ -1275,8 +1271,9 @@ mod tests {
             else { tensors.remove(index); }
             write_snapshot(&snapshot, &config, &tensors, None);
             // The first gate still establishes NVFP4; the later expert must not escape admission validation.
-            let catalog = crate::read_expert_catalog(&snapshot).unwrap();
-            let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+            let error = crate::read_expert_catalog(&snapshot)
+                .and_then(|catalog| local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true))
+                .unwrap_err();
             assert!(format!("{error:#}").contains(name), "{name}: {error:#}");
         }
     }
@@ -1285,7 +1282,7 @@ mod tests {
     fn native_nvfp4_inventory_planner_equals_runtime_selected_working_set() {
         let (_dir, catalog, manifest) = nvfp4_fixture();
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
-        for a4 in [false, true] {
+        for a4 in [true] {
             for rows in [1, 63, 4096] {
                 let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 let serial = local.workspace_for(&cfg, rows, 1, false);
@@ -1355,7 +1352,7 @@ mod tests {
         assert!(error.to_string().contains("missing binary"), "{error:#}");
         std::fs::remove_dir_all(dir.path().join("lib/fp8")).unwrap();
         let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
-        assert!(error.to_string().contains("missing GLM native NVFP4 tp2 package"), "{error:#}");
+        assert!(error.to_string().contains("missing calibrated GLM NVFP4 W4A4 tp2 package"), "{error:#}");
     }
 
     #[test]
@@ -1476,6 +1473,12 @@ mod tests {
         let cfg = config();
         let lookup = |name: &str| Some(if name.contains("bf16") { 500 } else if name.contains("topk") { 80 } else { 100 });
         assert_eq!(step_scratch(&cfg, true, false, lookup).unwrap(), GlmScratch { programs: 500, topk: 80 });
+        for split in [false, true] {
+            for decode in [false, true] {
+                let lookup = |name: &str| Some(if name.contains("_pt_") { 900 } else { 100 });
+                assert_eq!(step_scratch(&cfg, split, decode, lookup).unwrap().programs, 900);
+            }
+        }
         assert!(step_scratch(&cfg, false, true, |_| None).is_err());
         assert_eq!(default_onboard(), Onboard::Auto);
     }

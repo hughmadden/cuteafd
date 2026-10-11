@@ -114,11 +114,8 @@ def export(
     tile_m: int | None,
     max_active_clusters: int | None = None,
     output_shards: int = 1,
-    share_input: bool = False,
     pad_intermediate: bool = False,
 ) -> None:
-    if type(share_input) is not bool:
-        raise TypeError("share_input must be boolean")
     if type(pad_intermediate) is not bool:
         raise TypeError("pad_intermediate must be boolean")
     if type(output_shards) is not int or output_shards < 0 or (output_shards and 40 % output_shards):
@@ -174,7 +171,7 @@ def export(
         "capability": [properties.major, properties.minor],
         "physical_sms": properties.multi_processor_count,
         "tile_m": tile_m,
-        "share_input": share_input,
+        "share_input": False,
         "pad_intermediate": pad_intermediate,
         "geometry": {
             "experts": experts,
@@ -208,7 +205,7 @@ def export(
             dynamic_tile_m=tile_m,
             dynamic_route_mode=route_mode,
             w4a16_route_mode=None,
-            nvfp4_share_input=share_input,
+            nvfp4_share_input=False,
         )
         scratch_plan = moe.plan_tp_moe_scratch(
             moe.TPMoEScratchCaps(
@@ -240,10 +237,8 @@ def export(
             quant_mode="nvfp4",
             w4a8_repacked=False,
             nvfp4_materialize_intermediate=False,
-            # The front end quantizes each token once with a single shared
-            # activation scale and fans the row out to every routed expert,
-            # instead of re-quantizing the identical BF16 row per route.
-            share_input_across_experts=share_input,
+            # Each route retains its expert's static checkpoint scale.
+            share_input_across_experts=False,
             direct_routing=route_mode == "direct",
             # Compile with the same resolved tile that sized the scratch arena.
             planned_tile_m=plan.execution.tile_m,
@@ -395,6 +390,7 @@ def export(
                 *includes,
                 f"#define CUTEAFD_V41_CC_MINOR {properties.minor}",
                 f"#define CUTEAFD_V41_SMS {workspace_sms}",
+                "#define CUTEAFD_V41_NVFP4_SHARED_INPUT 0",
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
@@ -434,16 +430,11 @@ def main() -> None:
                         help="experimental output shards: 0 adapts direct/grouped routing; positive divisors of 40 split direct routing")
     parser.add_argument("--pad-intermediate", action="store_true",
                         help="zero-pad intermediate to 128 to avoid transposed FC1")
-    parser.add_argument(
-        "--share-input",
-        action="store_true",
-        help="quantize each token's activation once with a shared scale and fan it "
-             "out to every routed expert instead of per route",
-    )
+
     args = parser.parse_args()
     rows = [int(value) for value in args.rows.split(",") if value]
     export(args.output_dir, args.role, rows, args.tile_m, args.max_active_clusters,
-           args.output_shards, args.share_input, args.pad_intermediate)
+           args.output_shards, args.pad_intermediate)
 
 
 if __name__ == "__main__":

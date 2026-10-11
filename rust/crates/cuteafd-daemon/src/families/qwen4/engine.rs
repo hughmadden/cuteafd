@@ -980,6 +980,7 @@ impl Drop for QwenTp2<'_> {
 }
 
 pub(crate) struct Qwen4Engine<'a> {
+    pub(crate) spark_bf16: bool,
     quantize_grids: Vec<Fp8QuantizeGrid>,
     active_owner: Cell<usize>,
     pub library: &'a NativeLibrary,
@@ -1224,7 +1225,7 @@ impl<'a> Qwen4Engine<'a> {
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
-            warming_graphs: Cell::new(false), w8a8_prefill: false, full_prefill_logits: false,
+            warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
@@ -1756,7 +1757,7 @@ impl<'a> Qwen4Engine<'a> {
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
             router_host: RefCell::new(HostAllocation::new(self.library,
-                if spark { t * (topk * 8 + h + h / 32) } else { 256 })?),
+                if spark { t * (topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 }) } else { 256 })?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
             ids: self.alloc(t * 4)?,
@@ -3039,7 +3040,10 @@ impl<'a> Qwen4Engine<'a> {
                 else { matches!(mtp, Some(MtpExperts::Exl3(_))) },
             _ => false,
         };
-        if tp2_wire || matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
+        // NVFP4 Spark layers send original BF16 rows; each expert applies its own input_scale.
+        let spark_wire = matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. })
+            && !(self.spark_bf16 && index < self.cfg.layers);
+        if tp2_wire || spark_wire {
             let grid = self.quantize_grids[self.active_owner.get()].blocks(t, h);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
@@ -3177,7 +3181,7 @@ impl<'a> Qwen4Engine<'a> {
         runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
         let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
         let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
@@ -3191,7 +3195,7 @@ impl<'a> Qwen4Engine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.execution_stream())?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.execution_stream())?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.execution_stream())?;
             self.library.cuda_event_record(self.routes_ready, self.execution_stream())?;
         }
         // The shared expert queues behind the copies and runs during the
@@ -3209,7 +3213,7 @@ impl<'a> Qwen4Engine<'a> {
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
         drop(staging);
         let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            if self.spark_bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
                 row_id: u64::from(row), source_kind: kind, source_request_id: 1,
                 token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,

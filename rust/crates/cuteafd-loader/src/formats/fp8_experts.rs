@@ -40,6 +40,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, thiserror::Error)]
+#[error("{module}: BF16 expert backend not implemented; preserve checkpoint precision and add a native BF16 expert kernel/package")]
+pub struct Bf16ExpertBackendNotImplemented {
+    pub module: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fp8Projection {
     Gate,
@@ -238,11 +244,36 @@ impl Fp8ExpertTensors {
             format: ExpertFormat::Fp8Block128, tensors };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
+        if catalog.located(&first)?.dtype == DType::Bf16 {
+            return Err(Bf16ExpertBackendNotImplemented { module:first }.into());
+        }
         if matches!(catalog.located(&first)?.dtype, DType::U8 | DType::I8) {
             // E4M3 scales with a second-level FP32 scale: ModelOpt NVFP4; UE8M0 ones: MXFP4.
             let nvfp4 = catalog.tensors.get(&format!("{first}_scale")).is_some_and(|s| s.dtype == DType::F8E4M3)
                 && catalog.tensors.contains_key(&format!("{first}_scale_2"));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
+        }
+        let checkpoint = crate::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+        for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
+            use crate::plan::checkpoint::ModuleNumerics;
+            let numerics = checkpoint.module_numerics_with_header(name, catalog.tensors[name].dtype.clone())?;
+            let nvfp4 = catalog.tensors.contains_key(&format!("{name}_scale_2"));
+            match numerics {
+                ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
+                ModuleNumerics::W8A8 => {
+                    ensure!(!nvfp4, "{name}: declared W8A8 cannot execute as W4A4");
+                    let qwen = checkpoint.model_type() == Some("qwen4_exp")
+                        || checkpoint.text_config().get("model_type").and_then(serde_json::Value::as_str)
+                            == Some("qwen4_exp_text");
+                    ensure!(qwen && name.starts_with("mtp.layers."),
+                        "{name}: declared expert W8A8 needs a both-projection native kernel");
+                    // Qwen MTP is an explicitly reported, temporary deviation.
+                }
+                ModuleNumerics::CheckpointPrecision | ModuleNumerics::W8CheckpointActivations => {
+                    ensure!(!nvfp4 || checkpoint.quantization().is_none(),
+                        "{name}: NVFP4 storage disagrees with declared {numerics:?}");
+                }
+            }
         }
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
@@ -272,6 +303,7 @@ impl Fp8ExpertTensors {
                     && self.tensors.contains_key(&format!("{first}_scale_2"));
                 Ok(if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 })
             }
+            DType::Bf16 => Err(Bf16ExpertBackendNotImplemented { module:first }.into()),
             dtype => anyhow::bail!("{first}: unsupported expert dtype {dtype:?}"),
         }
     }
@@ -681,10 +713,23 @@ mod tests {
     }
 
     #[test]
+    fn bf16_nextn_package_request_has_typed_native_backend_error() {
+        let mut tensors = catalog(ExpertFormat::Nvfp4, 2048);
+        let name = tensors.name(78, 0, Fp8Projection::Gate);
+        tensors.tensors.insert(name.clone(), Located { shard:"nextn.safetensors".into(),
+            offset:0, bytes:2048*4096*2, dtype:DType::Bf16, shape:vec![2048,4096] });
+        let error = tensors.for_layer(78).unwrap_err();
+        let typed = error.downcast_ref::<Bf16ExpertBackendNotImplemented>().unwrap();
+        assert_eq!(typed.module, name);
+        assert!(error.to_string().contains("BF16 expert backend not implemented"));
+    }
+
+    #[test]
     fn mtp_only_reads_its_format_and_ignores_missing_or_corrupt_backbone() {
         use crate::plan::testing::{t, write_safetensors};
         for nvfp4 in [false, true] {
             let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
             let shape = RoutedExpertShape { layers: 2, first_layer: 0, experts: 1, topk: 1,
                 hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
             let mut map = BTreeMap::new();

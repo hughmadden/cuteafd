@@ -82,25 +82,25 @@
   ],
   "worker_argv": [
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+      "expertd-native", "--rdma-endpoints", "2", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "0", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+      "expertd-native", "--rdma-endpoints", "2", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "1", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+      "expertd-native", "--rdma-endpoints", "2", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "2", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+      "expertd-native", "--rdma-endpoints", "2", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "3", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
