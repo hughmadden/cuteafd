@@ -230,6 +230,24 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
         assert result.returncode != 0
 
 
+@pytest.mark.parametrize('role,scope,refused', [
+    ('expert', 'glmf:nvfp4;glmfdense:nvfp4', True),
+    ('expert', 'glmfdense:fp8', True),
+    ('expert', 'glmf:nvfp4', False),
+    ('expert', '', False),
+    ('coordinator', 'glmf:nvfp4;glmfdense:nvfp4', False),
+])
+def test_wip_refuses_coordinator_only_dense_scope_on_spark(role, scope, refused):
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = 'expert_families=' + script.split('expert_families=', 1)[1].split('# Optional Spark siblings', 1)[0]
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+                            env={**os.environ, 'role': role, 'CUTEAFD_WIP_EXPERT_FAMILIES': scope},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == (2 if refused else 0)
+    if refused:
+        assert 'glmfdense is coordinator-only' in result.stderr
+
+
 def test_pinned_transformers_digest_invalidates_rust_with_old_source_mtimes(tmp_path):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     block = 'wip_tree_fingerprint() {' + script.split('wip_tree_fingerprint() {', 1)[1].split('\nrust_phase_marker=', 1)[0]

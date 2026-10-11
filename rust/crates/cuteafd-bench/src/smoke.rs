@@ -105,6 +105,9 @@ pub struct Entry {
 pub struct Hook {
     pub argv: Vec<String>,
     pub timeout_s: u64,
+    /// Grace after the observer stop signal, still bounded by the total timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_timeout_s: Option<u64>,
     /// Observer errors are diagnostic unless explicitly required.
     #[serde(default)]
     pub required: bool,
@@ -117,6 +120,7 @@ pub struct Hook {
 struct HookChild {
     child: Child,
     deadline: Instant,
+    finish_timeout: Duration,
     stop: PathBuf,
     cleanup: Option<Vec<String>>,
 }
@@ -125,6 +129,10 @@ impl HookChild {
     fn spawn(hook: &Hook, url: &str, config: &Path, log: &Path, kind: &str) -> Result<Self> {
         if hook.argv.is_empty() || hook.timeout_s == 0 || hook.timeout_s > 7200 {
             bail!("{kind} hook needs argv and timeout_s in 1..=7200");
+        }
+        let finish_timeout = Duration::from_secs(hook.finish_timeout_s.unwrap_or(5));
+        if finish_timeout.is_zero() || finish_timeout.as_secs() > 7200 {
+            bail!("{kind} hook finish_timeout_s must be in 1..=7200");
         }
         let stop = log.with_extension(format!("{kind}.stop"));
         let _ = std::fs::remove_file(&stop);
@@ -135,7 +143,7 @@ impl HookChild {
             .env("CUTEAFD_SMOKE_STOP", &stop)
             .stdout(output.try_clone()?).stderr(output).process_group(0).spawn()
             .with_context(|| format!("starting {kind} hook"))?;
-        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), stop, cleanup: hook.cleanup.clone() })
+        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), finish_timeout, stop, cleanup: hook.cleanup.clone() })
     }
 
     fn wait(&mut self) -> Result<()> {
@@ -156,7 +164,7 @@ impl HookChild {
         }
         if Instant::now() >= self.deadline { bail!("observer timed out"); }
         std::fs::write(&self.stop, b"stop\n")?;
-        self.deadline = self.deadline.min(Instant::now() + Duration::from_secs(5));
+        self.deadline = self.deadline.min(Instant::now() + self.finish_timeout);
         self.wait()
     }
 }
@@ -259,6 +267,107 @@ fn read_config(path: &Path) -> Result<HashMap<String, String>> {
     }).collect())
 }
 
+/// First-come turn order for the hardware locks, the same protocol as
+/// scripts/hw/hwlock.py: numbered tickets in `<lock dir>/hwq`, each flocked by
+/// its live owner; a ticket whose flock is free is stale and removed.
+mod fair {
+    use anyhow::Result;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    pub(super) struct Ticket {
+        queue: PathBuf,
+        seq: u64,
+        path: PathBuf,
+        locks: Vec<String>,
+        _file: File,
+    }
+
+    impl Ticket {
+        pub(super) fn take(dir: &Path, locks: &[&str]) -> Result<Self> {
+            let queue = dir.join("hwq");
+            std::fs::create_dir_all(&queue)?;
+            let seq = {
+                let guard = File::options().create(true).append(true).open(queue.join(".seq.lock"))?;
+                guard.lock()?;
+                let counter = queue.join("seq");
+                let next = std::fs::read_to_string(&counter).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0) + 1;
+                std::fs::write(&counter, next.to_string())?;
+                next
+            };
+            let locks: Vec<String> = locks.iter().map(|n| n.trim_end_matches(".lock").to_string()).collect();
+            let pid = std::process::id();
+            let staged = queue.join(format!(".{seq:012}.{pid}.tmp"));
+            let mut file = File::create(&staged)?;
+            // Locked before it becomes visible, so it is never mistaken for stale.
+            file.lock()?;
+            file.write_all(serde_json::json!({"locks": locks, "pid": pid, "argv": ["cuteafd", "bench", "smoke"]}).to_string().as_bytes())?;
+            let path = queue.join(format!("{seq:012}.{pid}.ticket"));
+            std::fs::rename(&staged, &path)?;
+            Ok(Self { queue, seq, path, locks, _file: file })
+        }
+
+        /// Whether a live, older ticket wants any of our locks (prunes stale ones).
+        pub(super) fn older_conflict(&self) -> Result<bool> {
+            let mut names: Vec<_> = std::fs::read_dir(&self.queue)?.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".ticket")).collect();
+            names.sort();
+            for name in names {
+                let Some(seq) = name.split('.').next().and_then(|s| s.parse::<u64>().ok()) else { continue };
+                let path = self.queue.join(&name);
+                let Ok(mut other) = File::open(&path) else { continue };
+                match other.try_lock() {
+                    Ok(()) => { let _ = std::fs::remove_file(&path); continue; } // owner gone
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(_) => continue,
+                }
+                if seq >= self.seq {
+                    continue;
+                }
+                let mut text = String::new();
+                let _ = other.read_to_string(&mut text);
+                let theirs: Vec<String> = serde_json::from_str::<serde_json::Value>(&text).ok()
+                    .and_then(|v| v["locks"].as_array().cloned()).unwrap_or_default()
+                    .into_iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                if theirs.iter().any(|l| self.locks.contains(l)) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    impl Drop for Ticket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Ticket;
+
+        #[test]
+        fn older_live_ticket_blocks_and_stale_ones_are_pruned() {
+            let dir = tempfile::tempdir().unwrap();
+            let older = Ticket::take(dir.path(), &["gpu0.lock", "gpu1.lock"]).unwrap();
+            let newer = Ticket::take(dir.path(), &["gpu1.lock"]).unwrap();
+            let disjoint = Ticket::take(dir.path(), &["sparks.lock"]).unwrap();
+            assert!(newer.older_conflict().unwrap());
+            assert!(!disjoint.older_conflict().unwrap());
+            assert!(!older.older_conflict().unwrap());
+            drop(older);
+            assert!(!newer.older_conflict().unwrap());
+            let stale = dir.path().join("hwq").join("000000000001.4242.ticket");
+            std::fs::write(&stale, r#"{"locks":["gpu1"]}"#).unwrap();
+            assert!(!newer.older_conflict().unwrap());
+            assert!(!stale.exists());
+        }
+    }
+}
+
 /// Lock order: Spark pool, GPU0, GPU1, then the two out-of-pool hosts.
 fn locks_for(entry: &Entry) -> Vec<&'static str> {
     let gpus = entry.gpus.clone().unwrap_or_else(|| vec![0]);
@@ -313,21 +422,42 @@ impl Locks {
         // A deep shared queue can hold the pool for hours; CUTEAFD_SMOKE_LOCK_WAIT_S raises the bound.
         let wait = std::env::var("CUTEAFD_SMOKE_LOCK_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
         let deadline = Instant::now() + Duration::from_secs(wait);
-        for name in ordered {
-            if self.held.contains_key(name) {
-                continue;
-            }
-            let file = File::options().create(true).append(true).open(dir.join(name))?;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline =>
-                        std::thread::sleep(Duration::from_millis(500)),
-                    Err(error) => bail!("timed out or failed waiting for {name}: {error}"),
+        // A parent `hwlock.py` already holding a lock for us names it here; taking it
+        // again would deadlock on our own parent.
+        let parent: Vec<String> = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default()
+            .split(',').filter(|s| !s.is_empty()).map(|s| format!("{}.lock", s.trim_end_matches(".lock"))).collect();
+        let wanted: Vec<&'static str> = ordered.iter().copied()
+            .filter(|n| !self.held.contains_key(n) && !parent.iter().any(|p| p == n)).collect();
+        if wanted.is_empty() {
+            return Ok(true);
+        }
+        // Fair turn order shared with scripts/hw/hwlock.py: a waiter takes its
+        // locks only when no older live ticket wants any of them.
+        let ticket = fair::Ticket::take(&dir, &wanted)?;
+        loop {
+            if !ticket.older_conflict()? {
+                let mut taken = Vec::new();
+                for &name in &wanted {
+                    let file = File::options().create(true).append(true).open(dir.join(name))?;
+                    match file.try_lock() {
+                        Ok(()) => taken.push((name, file)),
+                        Err(std::fs::TryLockError::WouldBlock) => break,
+                        Err(error) => bail!("locking {name}: {error}"),
+                    }
+                }
+                if taken.len() == wanted.len() {
+                    for (name, file) in taken {
+                        self.held.insert(name, (file, 0));
+                    }
+                    break;
                 }
             }
-            self.held.insert(name, (file, 0));
+            if Instant::now() >= deadline {
+                bail!("timed out after {wait} s waiting for a fair turn on {}", wanted.join(","));
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
+        drop(ticket);
         for name in names {
             if let Some((_, count)) = self.held.get_mut(name) {
                 *count += 1;
@@ -803,16 +933,39 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cuteafd-smoke-hook-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("test.log");
-        let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None };
+        let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None, finish_timeout_s: None };
         let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "precheck").unwrap();
         assert!(child.wait().unwrap_err().to_string().contains("exited"));
         drop(child);
-        let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None };
+        let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None, finish_timeout_s: None };
         let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
         let started = Instant::now();
         assert!(child.wait().is_err());
         drop(child);
         assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn observer_finish_grace_is_configurable_but_cannot_extend_total_deadline() {
+        let root = std::env::temp_dir().join(format!("cuteafd-smoke-finish-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("test.log");
+        let mut hook: Hook = serde_json::from_value(serde_json::json!({
+            "argv": ["sleep", "20"], "timeout_s": 30, "finish_timeout_s": 300
+        })).unwrap();
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
+        assert_eq!(child.finish_timeout, Duration::from_secs(300));
+        child.deadline = Instant::now() + Duration::from_millis(100);
+        let total_deadline = child.deadline;
+        assert!(child.finish().unwrap_err().to_string().contains("timed out"));
+        assert_eq!(child.deadline, total_deadline);
+        assert!(child.stop.exists());
+        drop(child);
+        for invalid in [0, 7201] {
+            hook.finish_timeout_s = Some(invalid);
+            assert!(HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").is_err());
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

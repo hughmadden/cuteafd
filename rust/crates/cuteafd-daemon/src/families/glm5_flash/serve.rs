@@ -282,6 +282,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         engine.warm_decode_graphs(max_sequences.min(DECODE_ROWS), engine.drafter.is_some() || policy.copy > 0)?;
+        let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
         let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
@@ -1255,6 +1256,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
+            crate::shared::decode_graph::CaptureWatch::flush();
             if !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }

@@ -72,7 +72,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let dense = options.glmf_dense_manifest.as_ref().and_then(|p| std::fs::read(p).ok())
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .and_then(|m| placement::inventory::fp8moe_scratch_bytes(&m, "tp1", max_rows))
-                .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows, glmf::nvfp4_a4()))
+                .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows))
                 .ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
             for profile in [&mut workspace, &mut local_workspace] {
                 profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, 0,
@@ -177,11 +177,26 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let routed = model.spec().moe_layers().max(1);
         let remaining = total.saturating_sub(total / routed as u64 * working.rtx_layers.len() as u64);
         for rank in 0..working.spark_ranks {
-            devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed_expert", "", (remaining as f64 * report.spark_rank_share) as u64, Basis::Exact),
-                    Item::new(Category::Workspace, "expert waves", "", gib(56) * options.spark_capacity_rows / 4096, Basis::Calibrated),
-                    Item::new(Category::Transport, "rdma rings", "", gib(78), Basis::Calibrated),
-                    Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] });
+                    Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] };
+            let io = model.spec().moe.as_ref()
+                .ok_or(placement::PlacementError::Inventory("Spark experts need routed geometry"))
+                .and_then(|moe| {
+                    let geometry = cuteafd_core::ExpertGeometry { hidden: model.spec().hidden as u32,
+                        experts: moe.experts as u32, topk: moe.top_k as u32,
+                        intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32 };
+                    u32::try_from(options.spark_capacity_rows)
+                        .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
+                        .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,
+                            checkpoint.spark_input_is_bf16(), spark_ring_geometry("glm5_flash", working.prefill_lanes),
+                            gib(56) * options.spark_capacity_rows / 4096))
+                });
+            if let Err(error) = io {
+                report.placement_supported = false;
+                notes.push(format!("Spark rank {rank} I/O admission: {error}"));
+            }
+            devices.push(device);
         }
     }
     // Media placement is still the shared planner path, outside the coordinator solver port.

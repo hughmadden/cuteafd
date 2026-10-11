@@ -48,6 +48,9 @@ impl SparkWorkingSet {
     pub fn coordinator_staging(&self, geometry: ExpertGeometry, capacity: u32, bf16: bool)
         -> Result<u64, PlacementError> {
         if self.selected_ranks().is_empty() { return Ok(0); }
+        if self.prefill_lanes == 0 {
+            return Err(PlacementError::Inventory("selected Spark staging needs nonzero lanes"));
+        }
         let hidden = geometry.hidden as u64;
         let input = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
         (input + geometry.topk as u64 * 8).checked_mul(capacity as u64)
@@ -55,7 +58,7 @@ impl SparkWorkingSet {
             .ok_or(PlacementError::Overflow("Spark coordinator staging"))
     }
 
-    /// Each selected rank owns its intake/exchange and two persistent endpoints.
+    /// Each selected rank owns its intake/exchange and the stated endpoint rings.
     /// Unselected ranks (including every rank of an empty set) charge nothing.
     pub fn rank_io(&self, rank: usize, geometry: ExpertGeometry, capacity: u32,
         bf16: bool, rings: SparkRingGeometry) -> Result<SparkIoBytes, PlacementError> {
@@ -143,6 +146,15 @@ mod tests {
                     serial.coordinator_staging(geometry, 4096, true).unwrap() * 2);
             }
         }
+    }
+
+    #[test]
+    fn selected_coordinator_staging_requires_nonzero_lanes() {
+        let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+            ..SparkWorkingSet::default() };
+        assert!(set.coordinator_staging(ExpertGeometry::GLM5, 4096, true).is_err());
+        let unselected = SparkWorkingSet { spark_layers: vec![], ..set };
+        assert_eq!(unselected.coordinator_staging(ExpertGeometry::GLM5, 4096, true).unwrap(), 0);
     }
 
     #[test]

@@ -34,11 +34,15 @@ placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm
   BF16 RoPE where the layer carries rotary dims); mHC hyper-connections with
   Sinkhorn iterations and an `hc_head` final collapse.
 - RTX/Spark layouts: natural minimum is 1 RTX + 4 Sparks with a DFlash2
-  drafter; maximum is 2 RTX + 6 Sparks with head split as the default
-  (replicated latent, split `q_b`/`kv_b`/`o_proj`/shared-expert across both
-  GPUs with one hidden all-reduce per layer).
-- Prefix cache: merged — page-only state (no host-tier compaction yet; a
-  stand-in tail covers that path).
+  drafter; maximum is 2 RTX + 6 Sparks. On two GPUs the projections are
+  head-split (`q_b`/`kv_b`/`o_proj`/shared expert, one hidden all-reduce per
+  layer) and the attention placement defaults to `context`: each 64-row KV
+  page lives once, on GPU `j mod 2`, and decode exchanges the query halves,
+  the indexer candidates and the head partials (`ATTENTION_PLACEMENT=heads`
+  keeps the replicated latent). Prefill gathers the history into a staging
+  view and runs the head-split programs on it, byte-identical to `heads`.
+- Prefix cache: page-only state; under `context` each page is stored once
+  from its owner, and the pinned host tier is on.
 
 ## Default precision (single residency)
 

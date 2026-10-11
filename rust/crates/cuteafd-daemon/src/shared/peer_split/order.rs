@@ -144,6 +144,8 @@ pub(crate) fn glmf_tp2_fixture(layers: usize, local: std::ops::Range<usize>, lan
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+#[cfg(test)]
+pub(crate) mod host;
 
 #[cfg(test)]
 mod tests {

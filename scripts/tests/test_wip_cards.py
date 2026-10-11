@@ -41,6 +41,36 @@ def test_matrix_private_key_and_complete_lanes(entry, tmp_path):
     assert job['simulated']
 
 
+@pytest.mark.parametrize('source', ['config', 'set', 'override'])
+def test_glm_ring_expectation_is_observer_only(entry, tmp_path, source):
+    entry['observer'] = dict(argv=['python3', 'ring-observer.py'], timeout_s=300)
+    overrides = {}
+    if source == 'config':
+        with Path(entry['config']).open('a') as stream:
+            stream.write('BENCH_EXPECT_GLM_RING=on\n')
+    elif source == 'set':
+        entry['set']['BENCH_EXPECT_GLM_RING'] = 'on'
+    else:
+        overrides['BENCH_EXPECT_GLM_RING'] = 'on'
+    job = cards.generate(entry, 'candidate', dict(instance='ring-test', slot='s'),
+                         tmp_path, tmp_path / 'key', overrides, set(), None, 1)
+    generated = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert 'BENCH_EXPECT_GLM_RING' not in generated['set']
+    assert 'BENCH_EXPECT_GLM_RING' not in Path(generated['config']).read_text()
+    assert generated['observer']['argv'] == ['env', 'BENCH_EXPECT_GLM_RING=on', 'python3', 'ring-observer.py']
+    assert entry['observer']['argv'] == ['python3', 'ring-observer.py']
+
+
+def test_glm_ring_expectation_requires_preserved_observer(entry, tmp_path):
+    entry['set']['BENCH_EXPECT_GLM_RING'] = 'on'
+    with pytest.raises(ValueError, match='requires an observer'):
+        make(entry, tmp_path)
+    entry['observer'] = dict(argv=['python3', 'ring-observer.py'])
+    with pytest.raises(ValueError, match='probe replacement'):
+        cards.generate(entry, 'candidate', dict(instance='ring-test', slot='s'),
+                       tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+
+
 def test_key_file_created_private_and_never_printed(tmp_path, entry, monkeypatch, capsys):
     kit = tmp_path / 'kit'
     kit.mkdir()
@@ -140,6 +170,32 @@ def test_slot_check_every_host_and_seal(monkeypatch):
         cards.slot_check(arm, 'rhea')
 
 
+@pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
+@pytest.mark.parametrize('declared_by', ['name', 'model', 'format'])
+def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by):
+    values = {'SPARK_COUNT': str(count)}
+    name = 'unlabelled-native-card'
+    if declared_by == 'name':
+        name = tag + '-nvfp4-min'
+    elif declared_by == 'model':
+        values['MODEL_ID'] = 'nvidia/Model-NVFP4'
+    else:
+        values['EXPERT_FORMAT'] = 'nvfp4'
+    matrix_entry = {**entry, 'name': name, 'family': family, 'set': values}
+    build = cards.build_scopes([matrix_entry])
+    built = set(build['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    assert str(count) in build['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')
+    # native/cmake/shared/fp8_moe.cmake expands nvfp4 to both historical
+    # nvfp4 and mandatory all-row nvfp4a4 packages at supported TP layouts.
+    cmake = (ROOT / 'native/cmake/shared/fp8_moe.cmake').read_text()
+    assert tag + ':nvfp4' in built
+    assert 'if(entry MATCHES ":nvfp4$")' in cmake
+    assert 'list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}a4")' in cmake
+    assert 'list(APPEND requested_layouts "tp${count}")' in cmake
+    assert count in (2, 4)
+    assert 'glmfdense:nvfp4' not in built
+
+
 def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_path, monkeypatch, capsys):
     other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2'}}
     arms = cards.arms_from(['base=b:s', 'candidate=c:s'])
@@ -160,6 +216,20 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
     families = cards.build_scopes([qwen, other])['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
+    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
+             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
+    scopes = cards.build_scopes(nvfp4)
+    families = set(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    coordinator = set(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';'))
+    assert {'glm:nvfp4', 'glmf:nvfp4'} <= families
+    assert 'glmfdense:nvfp4' not in families
+    assert coordinator == families | {'glmfdense:nvfp4'}
+    assert 'glm:fp8' not in families and 'glmf:fp8' not in families
+    wip = (cards.REPO / 'wip.sh').read_text()
+    coordinator_leg = wip.split('build_coordinator() {', 1)[1].split('build_expert() (', 1)[0]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}' in coordinator_leg
+    expert_leg = wip.split('build_expert() (', 1)[1]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES' not in expert_leg
 
 
 @pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])
@@ -191,7 +261,7 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
     cards.build_arms(['base=old'], arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
     assert 'legacy arm: GPU lock held for the full build' in text
-    assert 'gpu1.lock' in text and 'flock -w 1800' in text
+    assert 'hwlock.py --locks gpu1 --wait 1800' in text
     assert arms['base']['build_lock_mode'] == 'legacy-full-build'
     assert 'source-base' in text and 'cp ' not in text
 

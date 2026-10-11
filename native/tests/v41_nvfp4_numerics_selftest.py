@@ -10,7 +10,9 @@ separately (e.g. --rows 1 and --rows 16), on each target device.
 Both arms receive identical packed ModelOpt-NVFP4 tensors. The oracle is the
 normal public prepare/bind/run path, NOT return_route_partials (which supports
 only the silu_v41/FP32 family). This detects native ABI/bridge/scales/routing and
-route reduction mistakes, not bugs shared by b12x's underlying CUDA kernel.
+route reduction mistakes. An independent CPU FP64 W4A4 oracle also checks
+exact dequantized products with per-expert activation calibration; it does not
+call a native or b12x quantizer. Run small and large capacities separately.
 """
 import argparse
 import ctypes as C
@@ -84,8 +86,8 @@ def main():
     w2[2::3] = 0x44
     ws13 = (torch.arange(e, device=device, dtype=torch.float32).remainder(3) + 1) / 64
     ws2 = (torch.arange(e, device=device, dtype=torch.float32).remainder(2) + 1) / 32
-    a1 = torch.full((e,), 16.0, device=device)
-    a2 = torch.full((e,), 16.0, device=device)
+    a1 = 16.0 * torch.pow(2.0, torch.arange(e, device=device).remainder(5).float() - 2)
+    a2 = 16.0 * torch.pow(2.0, torch.arange(e, device=device).remainder(3).float() - 1)
     alpha, down_alpha = ws13 / a1, ws2 / a2
     x = torch.full((m, h), 1 / 16, dtype=torch.bfloat16, device=device)
     x[:, 1::2] = 1 / 32
@@ -151,6 +153,45 @@ def main():
                                  w4a16_route_mode=None, nvfp4_share_input=False,
                                  nvfp4_materialize_intermediate=False))
 
+    def cpu_fp64_reference():
+        # This fixture has uniform unswizzled block scales and constant weight
+        # rows, so exact FP64 matmuls reduce analytically to sums without a
+        # multi-gigabyte CPU weight expansion. No native/b12x oracle is used.
+        def quantized(values, reciprocal):
+            blocks = values.float().reshape(values.shape[0], -1, 16)
+            sf = (blocks.abs().amax(-1, keepdim=True) * reciprocal / 6).clamp(max=448)
+            sf = sf.to(torch.float8_e4m3fn).float()
+            scaled = torch.where(sf > 0, blocks * reciprocal / sf, 0)
+            levels = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
+            # Explicit nearest-even ties at each E2M1 midpoint.
+            mag = scaled.abs()
+            code = torch.zeros_like(mag, dtype=torch.long)
+            for j, midpoint in enumerate([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.]):
+                code = torch.where((mag > midpoint) | ((mag == midpoint) & (j % 2 == 1)), j + 1, code)
+            return (scaled.sign() * levels[code] * sf / reciprocal).reshape(values.shape).double()
+
+        source, expert_ids, route_weights = x.cpu(), ids.cpu(), routing.cpu()
+        gs1, gs2, weight1, weight2 = (t.cpu() for t in (a1, a2, ws13, ws2))
+        result = torch.zeros((m, h), dtype=torch.float32)
+        for route in range(k):
+            for expert in expert_ids[:, route].unique().tolist():
+                rows = torch.where(expert_ids[:, route] == expert)[0]
+                qx = quantized(source[rows], gs1[expert])
+                up = qx.sum(-1) * (1 / 16) * weight1[expert].double()
+                gate = up * (2 if expert % 2 else 1)
+                # Fused FC1 keeps FP32 gate/up until the BF16 SwiGLU store.
+                gate, up = gate.float().clamp(max=10), up.float().clamp(-10, 10)
+                act = (torch.nn.functional.silu(gate) * up).bfloat16()
+                intermediate = act[:, None].expand(-1, n).contiguous()
+                qa = quantized(intermediate, gs2[expert])
+                down = qa.sum(-1) * (1 / 16) * weight2[expert].double()
+                if expert % 3 == 2: down *= 2
+                # FC2 stores BF16 before route weighting; its weighted route
+                # is rounded again before ordered FP32 reduction.
+                contribution = (down.bfloat16().float() * route_weights[rows, route]).bfloat16().float()
+                result[rows] += contribution[:, None]
+        return result.bfloat16().to(device)
+
     def prepare_call(state):
         scratch = tuple(torch.empty(s.shape, dtype=s.dtype, device=s.device)
                         for s in state.scratch.scratch_specs())
@@ -189,6 +230,10 @@ def main():
             print(f"{label}: max_abs={error:.8g} exact={torch.equal(actual, expected)} "
                   f"native_absmax={actual.float().abs().max().item():.8g}", flush=True)
             torch.testing.assert_close(actual, expected, rtol=opt.rtol, atol=opt.atol)
+            independent = cpu_fp64_reference()
+            cpu_error = (actual.float() - independent.float()).abs().max().item()
+            print(f"{label}: independent CPU FP64 W4A4 max_abs={cpu_error:.8g}", flush=True)
+            torch.testing.assert_close(actual, independent, rtol=0.02, atol=1e-5)
             return expected
 
         first = compare("initial")

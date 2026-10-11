@@ -267,14 +267,15 @@ minimum_expert_layers=1
 expert_format=native
 model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
 [[ "$model_is_nvfp4" == "NVFP4" ]] && expert_format=nvfp4
-# The explicit replicated topology is approved for the official native
-# checkpoint only. Reject a routed quant before any service change; EXL3 and
-# NVFP4 keep their existing non-topology behavior.
+# Replicated groups require native experts; NVFP4 supports pure TP3/4/6.
+# EXL3 uses implicit disjoint groups. Reject other modes before service changes.
 if ((topology_explicit)); then
   [[ "$model_is_exl3" != true ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires the native official checkpoint; EXL3 is not supported"
-  [[ "$model_is_nvfp4" != "NVFP4" ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires the native official checkpoint; NVFP4 is not supported"
+  if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
+    [[ "$spark_ep" == 1 && ( "$spark_tp" == 3 || "$spark_tp" == 4 || "$spark_tp" == 6 ) ]] ||
+      release_die "NVFP4 supports pure SPARK_TP=3/4/6 SPARK_EP=1, not replicated groups"
+  fi
 fi
 if [[ "$model_is_exl3" == true ]]; then
   case "$exl3_family_tag" in
@@ -289,7 +290,7 @@ fi
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
 if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
-  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp")))
+  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
   ((topology_min_layers < 1)) && topology_min_layers=1
@@ -349,7 +350,7 @@ if ((topology_explicit)); then
   if [[ "$spark_first_layer" == runtime-plan ]]; then
     spark_admission="PENDING (coordinator placement plan not yet published; weight-only check uses the real dynamic boundary)"
   else
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES")"
+    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
   fi
 fi
 if ((RELEASE_RTX_GPUS == 2)); then
@@ -449,7 +450,7 @@ REMOTE
 )" || release_die "Spark host preflight failed on $host (see the messages above)"
   if [[ "$model_is_exl3" == true ]]; then
     identity="$(release_exl3_package_identity "$sparkinfer_commit" <<<"$spark_manifest")"
-    if release_spark_compact_active; then
+    if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 ]]; then
       [[ "$identity" != paired:* ]] ||
         release_die "SPARK_COUNT=$SPARK_COUNT requires disjoint EXL3 packages, not paired TP4"
       release_validate_exl3_compact_variants "$expert_capacity" "$exl3_family_tag" "$SPARK_COUNT" <<<"$spark_manifest"
@@ -474,7 +475,7 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        docker exec -i "$wip_spark_container" python3 - "$wip_slot" <<'PY'
+        docker exec -i "$wip_spark_container" python3 - "$wip_slot" "${expert_format:-native}" "$spark_tp_roles_required" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -495,6 +496,8 @@ try:
     assert manifest.get('schema') == 1 and isinstance(roles, list) and all(role in ('tp2', 'tp3', 'tp6') for role in roles), 'invalid TP roles'
     assert roles == meta.get('spark_tp_roles'), 'slot and artifact roles differ'
     assert manifest.get('symbols_verified') is True, 'TP symbols are not verified'
+    if sys.argv[2] == 'nvfp4':
+        assert sys.argv[3] in manifest.get('nvfp4_spark_tp_roles', []), 'NVFP4 TP role is not built'
     assert hashlib.sha256((artifacts / 'libcuteafd_native.so').read_bytes()).hexdigest() == manifest.get('native_library_sha256'), 'native library hash mismatch'
     print(';'.join(roles))
 except (OSError, ValueError, AssertionError) as error:
@@ -512,6 +515,17 @@ PY
         release_die "$host WIP slot $wip_slot does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); rebuild with CUTEAFD_WIP_SPARK_TP_ROLES=$spark_tp_roles_required"
       fi
       release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
+    fi
+    if [[ "${expert_format:-native}" == nvfp4 && -z "${wip_slot:-}" ]]; then
+      release_ssh -o ConnectTimeout=10 "$host" docker run --rm --network none \
+        --entrypoint python3 "$SPARK_EXPERT_DOCKER_INFERENCE" -c '
+import hashlib, json, pathlib, sys
+root = pathlib.Path("/opt/cuteafd")
+manifest = json.loads((root / "share/V41_EXPERT_TP_AOT.json").read_text())
+assert manifest.get("symbols_verified") is True, "NVFP4 TP symbols are not verified"
+assert sys.argv[1] in manifest.get("nvfp4_spark_tp_roles", []), "NVFP4 TP role is not built"
+assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdigest() == manifest.get("native_library_sha256"), "NVFP4 library hash mismatch"
+' "$spark_tp_roles_required" || release_die "$host lacks verified NVFP4 $spark_tp_roles_required exports; rebuild the Spark image"
     fi
     [[ -n "$spark_advertised_roles" ]] || spark_advertised_roles="$advertised_roles"
   done
@@ -620,6 +634,23 @@ table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
+graph_census_args=()
+if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
+  [[ -n "$wip_layout" ]] || release_die 'Graph census requires a WIP build'
+  graph_census_args+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug')
+  if [[ -n "${CUTEAFD_GRAPH_CENSUS_CONTROL:-}" ]]; then
+    [[ "$CUTEAFD_GRAPH_CENSUS_CONTROL" == /* && -f "$CUTEAFD_GRAPH_CENSUS_CONTROL" ]] || release_die 'Graph census control must be an existing absolute file'
+    # Mount its parent so atomic file replacement remains visible to the server.
+    graph_census_args+=(-v "$(dirname "$CUTEAFD_GRAPH_CENSUS_CONTROL"):/run/cuteafd-graph-census:ro"
+      -e "CUTEAFD_GRAPH_CENSUS_CONTROL=/run/cuteafd-graph-census/$(basename "$CUTEAFD_GRAPH_CENSUS_CONTROL")")
+  fi
+fi
+if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
+  [[ -n "$wip_layout" ]] || release_die 'Graph eager override requires a WIP build'
+  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row ]] || release_die 'Graph eager override must be layer_row'
+  [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || release_die 'Graph eager A/B requires census timing disabled'
+  graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
+fi
 
 wip_mount_args=()
 if [[ -n "$wip_layout" ]]; then
@@ -731,7 +762,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
-  "${rdma_env_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
+  "${rdma_env_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${graph_census_args[@]}" \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
@@ -760,7 +791,7 @@ if [[ -n "$placement_directory" ]]; then
   if ((topology_explicit)); then
     # Re-check against the boundary the coordinator actually published; this is
     # the dynamic value, not the auto placeholder.
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES")"
+    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
     echo "  runtime Spark weight admission (workspace/staging NOT accounted): $spark_admission"
   fi
 fi
@@ -817,7 +848,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
-docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done

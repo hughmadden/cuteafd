@@ -4596,37 +4596,36 @@ fn verbs_host_persistent_rings(
     minimum_request_wire_bytes: usize,
     minimum_response_wire_bytes: usize,
 ) -> Result<(VerbsHostRdmaRing, VerbsHostRdmaRing)> {
-    if config.max_frame_bytes == 0 {
-        bail!("persistent verbs-host ProtocolV2 max frame bytes must be non-zero");
-    }
-    if minimum_request_wire_bytes > config.max_frame_bytes {
-        bail!(
-            "persistent verbs-host ProtocolV2 request frame length {minimum_request_wire_bytes} exceeds max frame bytes {}",
-            config.max_frame_bytes
-        );
-    }
-    if minimum_response_wire_bytes > config.max_frame_bytes {
-        bail!(
-            "persistent verbs-host ProtocolV2 expected response frame length {minimum_response_wire_bytes} exceeds max frame bytes {}",
-            config.max_frame_bytes
-        );
-    }
-    let alignment = crate::verbs_host_capabilities().preferred_alignment;
-    let requested_slot_bytes = parse_env_usize(
-        "CUTEAFD_VERBS_HOST_RING_SLOT_BYTES",
-        VERBS_HOST_RDMA_RING_SLOT_BYTES,
-    )?;
-    let depth = parse_env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", VERBS_HOST_RDMA_RING_DEPTH)?;
-    let request_capacity = requested_slot_bytes
-        .max(minimum_request_wire_bytes)
-        .min(config.max_frame_bytes);
-    let response_capacity = requested_slot_bytes
-        .max(minimum_response_wire_bytes)
-        .min(config.max_frame_bytes);
+    persistent_ring_geometry(config.max_frame_bytes, minimum_request_wire_bytes,
+        minimum_response_wire_bytes,
+        parse_env_usize("CUTEAFD_VERBS_HOST_RING_SLOT_BYTES", VERBS_HOST_RDMA_RING_SLOT_BYTES)?,
+        crate::verbs_host_capabilities().preferred_alignment,
+        parse_env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", VERBS_HOST_RDMA_RING_DEPTH)?)
+}
+
+fn persistent_ring_geometry(max_frame_bytes: usize, request_wire_bytes: usize,
+    response_wire_bytes: usize, slot_bytes: usize, alignment: usize, depth: usize)
+    -> Result<(VerbsHostRdmaRing, VerbsHostRdmaRing)> {
+    anyhow::ensure!(max_frame_bytes > 0,
+        "persistent verbs-host ProtocolV2 max frame bytes must be non-zero");
+    anyhow::ensure!(request_wire_bytes <= max_frame_bytes,
+        "persistent verbs-host ProtocolV2 request frame length {request_wire_bytes} exceeds max frame bytes {max_frame_bytes}");
+    anyhow::ensure!(response_wire_bytes <= max_frame_bytes,
+        "persistent verbs-host ProtocolV2 expected response frame length {response_wire_bytes} exceeds max frame bytes {max_frame_bytes}");
     Ok((
-        VerbsHostRdmaRing::new(request_capacity, alignment, depth)?,
-        VerbsHostRdmaRing::new(response_capacity, alignment, depth)?,
+        VerbsHostRdmaRing::new(slot_bytes.max(request_wire_bytes).min(max_frame_bytes), alignment, depth)?,
+        VerbsHostRdmaRing::new(slot_bytes.max(response_wire_bytes).min(max_frame_bytes), alignment, depth)?,
     ))
+}
+
+/// Registered request/response spans for one endpoint, using the allocation path's sizing.
+pub fn verbs_host_persistent_ring_bytes(max_frame_bytes: usize, request_wire_bytes: usize,
+    response_wire_bytes: usize, slot_bytes: usize, alignment: usize, depth: usize)
+    -> Result<usize> {
+    let (request, response) = persistent_ring_geometry(max_frame_bytes, request_wire_bytes,
+        response_wire_bytes, slot_bytes, alignment, depth)?;
+    request.registered_span_bytes.checked_add(response.registered_span_bytes)
+        .context("persistent verbs-host RDMA endpoint span overflow")
 }
 
 fn default_control_timeout() -> Duration {

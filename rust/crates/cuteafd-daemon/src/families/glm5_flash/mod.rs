@@ -10,7 +10,6 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
-mod graphs;
 mod lane_check;
 mod packed_check;
 pub(crate) mod packing;
@@ -976,8 +975,8 @@ fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
 /// with the DSA index cache `with_engine` resolved (a head split keeps `keys`).
-fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
-    engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache, spark_bf16: bool) -> engine::StepSettings {
+    engine::StepSettings { spark_bf16, kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
         max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
         decode_rows: args.decode_rows }
@@ -1407,9 +1406,13 @@ impl Opened {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
         let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
+        if engine::startup_graphs_enabled() && !startup_graphs {
+            tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
+                "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
+        }
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
-            let mut settings = step_settings(args, index_cache);
+            let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
             let spark = !spark_layers.is_empty();
             let local = !args.skip_experts && !placement.expert_ranges.is_empty() && self.fp8().is_some();
@@ -1425,6 +1428,8 @@ impl Opened {
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records)?;
+        engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
+
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
@@ -1620,7 +1625,7 @@ impl Opened {
         // is warmed with `expert_rows` rows, the most any of its waves carries.
         let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote.start)?;
+        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());

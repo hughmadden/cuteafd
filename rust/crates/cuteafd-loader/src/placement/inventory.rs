@@ -189,6 +189,12 @@ pub fn glmf_local_tp2_runtime_items(rank: usize) -> Vec<cuteafd_core::memory_lay
     terms.into_iter().map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Calibrated)).collect()
 }
 
+/// GLM Flash startup executable means (SM120 RTX PRO 6000, CUDA driver
+/// 595.91.07, EXL3 K3.25, 64 decode rows, v3-p2 ready ledgers, 2026-10-10).
+/// One GPU: 1,946,157,056 / 13,800; split lead: 2,231,369,728 / 13,800;
+/// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
+pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
+
 /// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');
@@ -310,7 +316,61 @@ pub struct GraphSet {
     pub shapes: u64,
 }
 
+/// Exact startup keys paired with the admission ledger. Keys describe immutable
+/// launch geometry, never process-local pointer addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupGraphs<K> {
+    pub inventory: GraphSet,
+    pub keys: Vec<K>,
+}
+
+/// A measured V4.1 executable class on one lane/device. bindings counts stable
+/// source/table geometries of this exact row shape, not a padding bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct V41GraphShape {
+    pub device: u8,
+    pub lane: u8,
+    pub site: String,
+    pub layer: Option<u8>,
+    pub rows: u32,
+    pub bindings: u32,
+}
+
 impl GraphSet {
+    /// Couple a family's exact warm keys to the very ledger charged by its
+    /// planner. Refuse a growth ledger or a shape-count mismatch at startup.
+    pub fn startup<K>(self, keys: Vec<K>) -> Result<StartupGraphs<K>, String> {
+        if self.lifetime != Lifetime::Startup {
+            return Err("cannot warm a graph-growth inventory".into());
+        }
+        if self.shapes != keys.len() as u64 {
+            return Err(format!("startup shape inventory {} differs from warm list {}", self.shapes, keys.len()));
+        }
+        Ok(StartupGraphs { inventory: self, keys })
+    }
+
+    /// Build V4.1's admission from a measured census; deliberately no guessed
+    /// default census or bytes-per-executable. The serving warm-up and planner
+    /// consume this same result once the hardware census is qualified.
+    pub fn v41_startup(shapes: Vec<V41GraphShape>, per_executable: &[u64], margin_percent: u64,
+        minimum_margin: u64) -> Result<StartupGraphs<V41GraphShape>, String> {
+        let mut counts = vec![0u64; per_executable.len()];
+        let mut seen = std::collections::HashSet::new();
+        for shape in &shapes {
+            if shape.rows == 0 || shape.rows > 4096 || shape.bindings == 0
+                || shape.lane > 1 || !seen.insert((shape.device, shape.lane, shape.site.clone(), shape.layer, shape.rows)) {
+                return Err("invalid or duplicate V4.1 startup graph shape".into());
+            }
+            let count = counts.get_mut(shape.device as usize).ok_or("V4.1 startup graph device outside inventory")?;
+            *count = count.checked_add(u64::from(shape.bindings)).ok_or("V4.1 graph count overflow")?;
+        }
+        let ranks = counts.into_iter().zip(per_executable).map(|(count, &each)| {
+            let set = Self::new(&[count], each, margin_percent, minimum_margin, 0, Lifetime::Startup);
+            set.ranks[0]
+        }).collect();
+        Self { ranks, lifetime: Lifetime::Startup, shapes: shapes.len() as u64 }.startup(shapes)
+    }
+
     /// `executables` per rank at `per_executable` bytes, plus `margin_percent`
     /// of that (at least `minimum_margin`) per rank.
     pub fn new(executables: &[u64], per_executable: u64, margin_percent: u64, minimum_margin: u64,
@@ -379,30 +439,25 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 }
 
 /// The `fp8moe` package a coordinator loads for `format` experts of geometry
-/// `family` (`fp8-<family>[-nvfp4[a4]]`, W4A4 preferred where built, as
+/// `family` (`fp8-<family>[-nvfp4a4]`, mandatory W4A4 for NVFP4, as
 /// `shared::experts::fp8::package_directory`), under `lib`'s `fp8/` tree, and
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
     format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
     use crate::formats::fp8_experts::ExpertFormat;
     let a4 = (format == ExpertFormat::Nvfp4).then(|| format!("fp8-{family}-nvfp4a4"));
-    let name = a4.filter(|n| lib.join("fp8").join(n).is_dir())
-        .unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
+    let name = a4.unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
     let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
 }
 
-/// Dense NVFP4 package selection shared with the coordinator loader. A4 is
-/// preferred only when its tp1 package exists; A16 selects the NVFP4 package.
-pub fn dense_package_directory(lib: &std::path::Path, geometry: &str, a4: bool) -> std::path::PathBuf {
-    let root = lib.join("fp8");
-    let preferred = root.join(format!("fp8-{geometry}-nvfp4a4")).join("tp1");
-    if a4 && preferred.is_dir() { preferred }
-    else { root.join(format!("fp8-{geometry}-nvfp4")).join("tp1") }
+/// Mandatory native W4A4 dense package; missing exports never select W4A16.
+pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::path::PathBuf {
+    lib.join("fp8").join(format!("fp8-{geometry}-nvfp4a4")).join("tp1")
 }
 
-pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64, a4: bool) -> Option<u64> {
-    let directory = dense_package_directory(lib, geometry, a4);
+pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
+    let directory = dense_package_directory(lib, geometry);
     let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
     fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }
@@ -426,6 +481,22 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn startup_keys_match_planner_shapes_and_v41_rank_bytes() {
+        let shape = |device, lane, rows| V41GraphShape {
+            device, lane, site: "query".into(), layer: Some(3), rows, bindings: 2,
+        };
+        let keys = vec![shape(0, 0, 1), shape(0, 1, 6), shape(1, 0, 1)];
+        let startup = GraphSet::v41_startup(keys.clone(), &[10, 20], 10, 0).unwrap();
+        assert_eq!(startup.keys, keys);
+        assert_eq!(startup.inventory.ranks.iter().map(|r| (r.executables, r.bytes, r.margin)).collect::<Vec<_>>(),
+            vec![(4, 44, 4), (2, 44, 4)]);
+        assert!(GraphSet::budget(&[100]).startup(vec![1]).is_err());
+        assert!(GraphSet::new(&[2], 10, 0, 0, 2, Lifetime::Startup).startup(vec![1]).is_err());
+        assert!(GraphSet::v41_startup(vec![shape(0, 0, 1), shape(0, 0, 1)], &[10], 0, 0).is_err());
+        assert!(GraphSet::v41_startup(vec![shape(2, 0, 1)], &[10], 0, 0).is_err());
+    }
 
     #[test]
     fn ready_untracked_is_context_plus_code_plus_startup_graphs() {

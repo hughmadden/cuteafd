@@ -38,13 +38,14 @@ pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheG
     width.ok_or_else(unsupported)
 }
 
-/// Four peer slots per each of the two prefill lanes, plus release flags.
+/// Four peer slots per each of the two prefill lanes, release flags, and
+/// the local TP2 pair's persistent abort word.
 pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64,
     tp2: bool, exchange_f32: bool) -> Result<u64, CacheGeometryError> {
     let slot = if exchange_f32 { product("V4 F32 peer slot", &[prefill_rows.max(decode_rows), hidden, 4])? }
         else { product("V4 prefill peer slot", &[prefill_rows, hidden, 2])?
             .max(product("V4 decode peer slot", &[decode_rows, hidden, if tp2 { 4 } else { 2 }])?) };
-    sum("V4 peer exchange", &[product("V4 peer slots", &[8, slot])?, 256])
+    sum("V4 peer exchange", &[product("V4 peer slots", &[8, slot])?, 256, if tp2 { 256 } else { 0 }])
 }
 
 /// TP2 route-broadcast fallback: two lanes, two parities, per GPU. No
@@ -52,7 +53,7 @@ pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_ro
 pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, decode: u64, _rank: usize)
     -> Result<u64, CacheGeometryError> {
     let payload = sum("V4 route payload", &[product("V4 route rows", &[prefill.max(decode), topk, 8])?, 16])?;
-    sum("V4 route exchange", &[product("V4 route slots", &[4, payload])?, 256])
+    sum("V4 route exchange", &[product("V4 route slots", &[4, payload])?, 256, 256])
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,12 +297,14 @@ mod expert_exchange_tests {
         for h in [4096, 7168] {
             for (prefill, decode) in [(4096, 64), (16, 64)] {
                 let payload = prefill.max(decode) * 6 * 8 + 16;
-                let lead = 4 * payload + 256;
+                let lead = 4 * payload + 512;
                 let peer = lead;
                 assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, false).unwrap(),
-                    8 * (prefill * h * 2).max(decode * h * 4) + 256);
+                    8 * (prefill * h * 2).max(decode * h * 4) + 512);
                 assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, true).unwrap(),
-                    8 * prefill.max(decode) * h * 4 + 256);
+                    8 * prefill.max(decode) * h * 4 + 512);
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, false, false).unwrap(),
+                    8 * prefill.max(decode) * h * 2 + 256);
                 assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 0).unwrap(), lead);
                 assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 1).unwrap(), peer);
             }

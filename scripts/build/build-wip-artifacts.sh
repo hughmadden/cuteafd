@@ -49,6 +49,7 @@ fi
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
+[[ "$role" != expert || ";$expert_families;" != *";glmfdense:"* ]] || { echo "CUTEAFD_WIP_EXPERT_FAMILIES: glmfdense is coordinator-only; remove it from the Spark expert scope" >&2; exit 2; }
 # Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
 # the existing artifact set; requesting one also requires its main FP8 family.
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
@@ -196,6 +197,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
+  -DCUTEAFD_GENERIC_SPARK_COUNTS="${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
   -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES="$exl3_aot" \
@@ -206,6 +208,7 @@ cmake \
   -DCUTEAFD_DSV4_MAX_CONTEXT="${CUTEAFD_WIP_DSV4_MAX_CONTEXT:-1048576}" \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_DSV4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLM_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && "${CUTEAFD_WIP_GLM_AOT:-OFF}" == ON ]] && echo "${CUTEAFD_WIP_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MIMO_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_WIP_MIMO_GEOMETRIES:-mimo}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLMF_AOT:-OFF}" || echo OFF)" \
@@ -304,7 +307,10 @@ install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V4
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the
 # built library hash, so a stale/partial export cannot advertise a role.
+nvfp4_manifest_args=()
+[[ "$nvfp4_aot" != ON ]] || nvfp4_manifest_args+=(--nvfp4)
 python3 "$source_dir/scripts/build/write-v41-expert-tp-manifest.py" \
+  "${nvfp4_manifest_args[@]}" \
   --role "$role" \
   --requested "$spark_tp_roles" \
   --native-build-dir "$build_dir/native" \

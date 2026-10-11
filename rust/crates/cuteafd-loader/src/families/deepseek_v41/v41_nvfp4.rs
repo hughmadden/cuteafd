@@ -54,7 +54,16 @@ pub fn read_v41_nvfp4_contract(snapshot: &Path) -> Result<Option<V41Nvfp4Contrac
     if !is_v41_nvfp4_publication(quant) {
         return Ok(None);
     }
-    parse_v41_nvfp4_contract(raw).map(Some)
+    let contract = parse_v41_nvfp4_contract(raw)?;
+    let checkpoint = crate::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    for module in checkpoint.tensor_names().filter_map(|name| name.strip_suffix(".weight")) {
+        if !module.starts_with("layers.") || !module.contains(".ffn.experts.") {
+            continue;
+        }
+        ensure!(checkpoint.module_numerics(module)? == crate::plan::checkpoint::ModuleNumerics::W4A4,
+            "{module}: native V4.1 NVFP4 requires checkpoint-declared W4A4");
+    }
+    Ok(Some(contract))
 }
 
 fn parse_v41_nvfp4_contract(mut config: Value) -> Result<V41Nvfp4Contract> {
@@ -206,6 +215,30 @@ mod tests {
             .quantization()
             .quant_method
             .eq_ignore_ascii_case("fp8"));
+    }
+
+    #[test]
+    fn shared_selector_is_required_for_native_routed_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = nvfp4_config();
+        let module = "layers.0.ffn.experts.0.w1";
+        crate::plan::testing::write_snapshot(dir.path(), &config, &[
+            crate::plan::testing::t(format!("{module}.weight"), "U8", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale"), "F8_E4M3", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale_2"), "F32", &[1]),
+            crate::plan::testing::t(format!("{module}.input_scale"), "F32", &[1]),
+        ], None);
+        assert!(read_v41_nvfp4_contract(dir.path()).unwrap().is_some());
+        config["quantization_config"]["config_groups"]["ignored"] = serde_json::json!({
+            "targets":[module], "weights":{"num_bits":8}, "input_activations":{"num_bits":8}
+        });
+        crate::plan::testing::write_snapshot(dir.path(), &config, &[
+            crate::plan::testing::t(format!("{module}.weight"), "U8", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale"), "F8_E4M3", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale_2"), "F32", &[1]),
+            crate::plan::testing::t(format!("{module}.input_scale"), "F32", &[1]),
+        ], None);
+        assert!(read_v41_nvfp4_contract(dir.path()).unwrap_err().to_string().contains("conflicting quantization groups"));
     }
 
     #[test]

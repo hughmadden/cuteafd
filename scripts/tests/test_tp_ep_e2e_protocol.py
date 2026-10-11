@@ -42,7 +42,7 @@ def _row(index: int, text: str) -> dict:
 
 def _identity(tp: int) -> dict:
     topology = ["--spark-tp", str(tp), "--spark-ep", str(4 // tp)]
-    workers = [["expertd-native", "--rank", str(rank), "--world", "4", "--capacity", "4096",
+    workers = [["expertd-native", "--rdma-endpoints", "2", "--rank", str(rank), "--world", "4", "--capacity", "4096",
                 "--device-budget-bytes", "107374182400", "--first-layer", "11"] + topology
                for rank in range(4)]
     base = dict(source_commit="abc", source_artifact="manifest:1", model="deepseek-ai/DeepSeek-V4.1-Flash",

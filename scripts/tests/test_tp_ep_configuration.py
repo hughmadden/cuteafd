@@ -59,6 +59,20 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_pure_tp_counts_one_through_eight_use_configured_hosts(self) -> None:
+        for count in range(1, 9):
+            overlay = [f"SPARK_COUNT={count}", f"SPARK_TP={count}", "SPARK_EP=1"]
+            for rank in range(8):
+                overlay += [f"SPARK_{rank}_HOST=worker-{rank}",
+                            f"SPARK_{rank}_LANE_A=192.0.2.{rank + 1}",
+                            f"SPARK_{rank}_LANE_B="]
+            with self.subTest(count=count):
+                result = load("\n".join(overlay), "release_spark_rank_map; release_hosts_csv")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 [f"{rank} 0 {rank}" for rank in range(count)] +
+                                 [",".join(f"worker-{rank}" for rank in range(count))])
+
     def test_v41_accepts_explicit_vision_placement(self) -> None:
         for vision in ("auto", "off", "rtx", "rtx:0", "spark", "spark:3"):
             with self.subTest(vision=vision):
@@ -148,7 +162,8 @@ class TopologyConfigTest(unittest.TestCase):
     def test_invalid_combinations_are_rejected(self) -> None:
         cases = {
             "SPARK_TP=2\nSPARK_EP=1\n": "must equal SPARK_COUNT",
-            "SPARK_TP=5\nSPARK_EP=2\n": "SPARK_TP must be 2, 3, 4, or 6",
+            "SPARK_TP=5\nSPARK_EP=2\n": "must equal SPARK_COUNT",
+            "SPARK_TP=9\nSPARK_EP=1\n": "SPARK_TP must be in 1..8",
             "SPARK_EP=4\n": "SPARK_EP must be 1, 2, or 3",
             "SPARK_TP=2\n": "set together or omitted together",
             "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=3\n" + SIX_HOSTS: "must equal SPARK_COUNT",
@@ -424,6 +439,7 @@ topology_explicit={topology_explicit}
 spark_tp={spark_tp}
 spark_ep={spark_ep}
 spark_admission=not-applicable
+expert_format=native
 spark_exl3_identity=
 gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
@@ -1161,7 +1177,7 @@ class CandidateLauncherTest(unittest.TestCase):
         for rank, line in enumerate(experts):
             self.assertIn(f"--rank {rank}", line)
             self.assertIn("--world 4", line)
-            self.assertIn(f"--rank {rank} --world 4 --spark-tp 2 --spark-ep 2", line)
+            self.assertIn(f"--rank {rank} --world 4 --rdma-endpoints 2 --spark-tp 2 --spark-ep 2", line)
             self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/candidate/libcuteafd_native.so", line)
             self.assertIn("-e RUST_LOG=info", line)
             self.assertIn("--native-lib /scratch/candidate/libcuteafd_native.so", line)
@@ -1211,7 +1227,7 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertEqual(len(experts), 6)
         self.assertIn("rhea", [line for line in experts if "--rank 4" in line][0])
         self.assertIn("moa", [line for line in experts if "--rank 5" in line][0])
-        self.assertTrue(all("--world 6 --spark-tp 3 --spark-ep 2" in line for line in experts))
+        self.assertTrue(all("--world 6 --rdma-endpoints 2 --spark-tp 3 --spark-ep 2" in line for line in experts))
         order = [line for line in lines if line.startswith("STEP")]
         self.assertLess(order.index("STEP expert-start rank=5"), order.index("STEP worker-ready"))
         self.assertLess(order.index("STEP worker-ready"), order.index("STEP coordinator-start"))
@@ -1222,7 +1238,7 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertIn("topology tp=4 ep=1 world=4", result.stdout.splitlines())
         # No tp4 extra role: the reference arm runs without a role manifest.
         provider = next(line for line in result.stdout.splitlines() if line.startswith("CMD expert-0:"))
-        self.assertIn("--world 4 --spark-tp 4 --spark-ep 1", provider)
+        self.assertIn("--world 4 --rdma-endpoints 2 --spark-tp 4 --spark-ep 1", provider)
 
     def test_default_config_without_explicit_topology_is_rejected(self) -> None:
         result = self.plan(CONFIG)
@@ -1584,7 +1600,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
                               text=True, capture_output=True, timeout=20)
 
     def wip_gate(self, *, roles: list[str], verified: bool = True,
-                 corrupt_hash: bool = False, corrupt_host: bool = False) -> subprocess.CompletedProcess[str]:
+                 corrupt_hash: bool = False, corrupt_host: bool = False,
+                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None) -> subprocess.CompletedProcess[str]:
         block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1594,6 +1611,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
                 artifacts.mkdir(parents=True)
                 (artifacts / 'libcuteafd_native.so').write_bytes(b'test library')
                 manifest = json.dumps({'schema': 1, 'spark_tp_roles': roles,
+                                      'nvfp4_spark_tp_roles': nvfp4_roles or [],
                                       'symbols_verified': verified,
                                       'native_library_sha256': hashlib.sha256(b'test library').hexdigest()}).encode()
                 (artifacts / 'V41_EXPERT_TP_AOT.json').write_bytes(manifest)
@@ -1610,7 +1628,7 @@ release_ssh() {
   [[ "$1" == -o ]]; shift 2
   host="$1"; shift
   [[ "$1" == docker && "$2" == exec && "$3" == -i && "$5" == python3 ]]
-  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",sys.argv[2]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7"
+  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",*sys.argv[2:]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7" "$8" "$9"
 }
 hosts=(h0 h1 h2)
 spark_tp=3
@@ -1618,7 +1636,7 @@ spark_tp_roles_required=tp3
 wip_slot=slot
 wip_spark_container=wip-test
 SPARK_EXPERT_DOCKER_INFERENCE=unused
-''' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
+''' + f'expert_format={expert_format}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
             return subprocess.run(['bash', '-c', script], cwd=ROOT, text=True,
                                   capture_output=True, timeout=20,
                                   env={**os.environ, 'MOCK_SLOTS': str(root)})
@@ -1627,6 +1645,13 @@ SPARK_EXPERT_DOCKER_INFERENCE=unused
         result = self.wip_gate(roles=['tp3', 'tp6'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('advertised=tp3;tp6', result.stdout)
+
+    def test_wip_nvfp4_requires_its_own_verified_role(self) -> None:
+        result = self.wip_gate(roles=['tp3'], expert_format='nvfp4')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NVFP4 TP role is not built', result.stderr)
+        result = self.wip_gate(roles=['tp3'], expert_format='nvfp4', nvfp4_roles=['tp3'])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wip_rejects_missing_role_or_unverified_symbols(self) -> None:
         for roles, verified in ((['tp6'], True), (['tp3'], False)):

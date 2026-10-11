@@ -96,6 +96,18 @@ pub(crate) trait RtxExpertLayer {
     /// `input` and `routes` hold `rows` complete rows on this rank's device,
     /// ordered before `stream` (which belongs to this rank's device) and
     /// unchanged until it drains; the previous use of the output is complete.
-    unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, routes: Routes,
-        stream: *mut c_void) -> Result<()>;
+    /// On any error, `abort` publishes every associated peer exchange's abort
+    /// words before returning (or terminates if publication fails). It must not
+    /// wait on a compute stream. The caller then drains all consumers before
+    /// releasing storage; a failed drain must terminate, not release owners.
+    /// An independent qualification stream with no peer waits may use a no-op.
+    unsafe fn enqueue(
+        &mut self,
+        layer: usize,
+        rows: usize,
+        input: ExpertInput,
+        routes: Routes,
+        stream: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()>;
 }

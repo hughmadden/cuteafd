@@ -98,7 +98,7 @@ impl<'a> TargetHeadWeights<'a> {
             weights: self,
             head,
             capacity,
-            graphs: vec![None; capacity],
+            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
             fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.fp8(), capacity,
                 crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
             ready: None,
@@ -139,7 +139,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     capacity: usize,
     /// Captured head graphs by row count (index rows - 1), kept while serving:
     /// verification widths vary round to round.
-    graphs: Vec<Option<*mut c_void>>,
+    graphs: crate::shared::decode_graph::RowGraphs<'a>,
     /// Scratch of the FP8 head copy when the target head projects through it.
     fp8_scratch: Option<DeviceAllocation<'a>>,
     ready: Option<usize>,
@@ -237,7 +237,12 @@ impl TargetHeadWave<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graphs[rows - 1] = Some(graph);
+                // SAFETY: warmup drained and the wave owns every captured pointer.
+                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                    // SAFETY: failed insertion did not take ownership of graph.
+                    unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
                 Ok(())
             }
             (Err(e), Ok(graph)) => {
@@ -331,7 +336,7 @@ impl TargetHeadWave<'_, '_> {
         Ok(())
     }
     unsafe fn capture_block_head(&mut self, rows: usize) -> Result<()> {
-        if super::v41_layer_graphs::captures_shape(rows as u32) && self.graph(rows).is_none() {
+        if super::graph_policy::captures_shape(rows as u32) && self.graph(rows).is_none() {
             unsafe { self.capture(rows)?; }
         }
         Ok(())
@@ -342,7 +347,7 @@ impl TargetHeadWave<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
-        if super::v41_layer_graphs::captures_shape(rows as u32) {
+        if super::graph_policy::captures_shape(rows as u32) {
             unsafe { self.capture_ready(rows) }
         } else { Ok(()) }
     }
@@ -357,7 +362,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
-        if super::v41_layer_graphs::captures_shape(selected.len() as u32) {
+        if super::graph_policy::captures_shape(selected.len() as u32) {
             unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
         } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
@@ -369,7 +374,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
-        let captured = super::v41_layer_graphs::captures_shape(selected.len() as u32);
+        let captured = super::graph_policy::captures_shape(selected.len() as u32);
         if captured && self.graph(selected.len()).is_none() {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
@@ -388,7 +393,7 @@ impl TargetHeadWave<'_, '_> {
         selected: &[usize], cooperative: bool) -> Result<()> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        let captured = super::graph_policy::captures_shape(rows as u32);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
@@ -445,7 +450,7 @@ impl TargetHeadWave<'_, '_> {
         );
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        let captured = super::graph_policy::captures_shape(rows as u32);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
@@ -519,23 +524,20 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
     fn graph(&self, rows: usize) -> Option<*mut c_void> {
-        rows.checked_sub(1).and_then(|i| self.graphs.get(i).copied().flatten())
+        self.graphs.get(rows)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.stream.require_complete()?;
-        for graph in self.graphs.iter_mut().filter_map(Option::take) {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
-        Ok(())
+        // SAFETY: require_complete drained all users before releasing captures.
+        unsafe { self.graphs.clear() }
+
     }
 }
 impl Drop for TargetHeadWave<'_, '_> {
     fn drop(&mut self) {
         if let Err(e) = self.clear_graph() {
-            tracing::error!(%e,"draining target head");
+            crate::shared::decode_graph::fatal_drain(Err(e), "target head");
         }
     }
 }
@@ -1108,12 +1110,12 @@ mod sampler_wiring_tests {
         }
     }
 
-    /// A full-logit `BatchScores` whose every value is `value(row)`. Used to
+    /// A full-logit `ScoreRows` whose every value is `value(row)`. Used to
     /// plant a deliberately stale device id in a row's slot: the commit path for
     /// a device-routed row reads `best`, and a kernel that failed leaves that
     /// slot at the caller's sentinel.
     fn batch_with_value(value: impl Fn(usize) -> u32, rows: usize,
-    ) -> crate::families::deepseek_v41::v41_native_serve::scores::BatchScores {
+    ) -> crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows {
         use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
         let mut bytes = Vec::with_capacity(rows * ROW_BYTES);
         for row in 0..rows {
@@ -1123,7 +1125,7 @@ mod sampler_wiring_tests {
                 bytes.extend_from_slice(&logit.to_ne_bytes());
             }
         }
-        crate::families::deepseek_v41::v41_native_serve::scores::BatchScores::new(VOCAB, bytes).unwrap()
+        crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows::new(VOCAB, bytes).unwrap()
     }
 
     fn wiring_library() -> Option<NativeLibrary> {
@@ -1224,7 +1226,7 @@ mod sampler_wiring_tests {
     fn resolving_a_fallback_row_stores_the_cpu_token_in_its_best_slot() {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{resolve_fallback_rows, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::{BatchScores, ROW_BYTES};
+        use crate::families::deepseek_v41::v41_native_serve::scores::{ScoreRows, ROW_BYTES};
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -1235,7 +1237,7 @@ mod sampler_wiring_tests {
         let Some(fixture) = WiringWave::build(&plan, &arena, 7, vocab) else { return };
         let rows = fixture.rows;
         let dummy = 129_279u32;
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &vec![dummy; rows], logit_bytes(&fixture.values))
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &vec![dummy; rows], logit_bytes(&fixture.values))
             .unwrap();
         assert!(next.best.iter().all(|id| *id == dummy), "the fixture starts stale");
         let fallback: Vec<usize> = (0..rows)
@@ -1273,7 +1275,7 @@ mod sampler_wiring_tests {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{admit_device_rows, resolve_fallback_rows,
             select_routed, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -1296,7 +1298,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == 5 { dummy } else { sampled.ids[row] }
         }).collect();
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&fixture.values)).unwrap();
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&fixture.values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         let (device_rows, refused) = admit_device_rows(&round, &sampled).unwrap();
         assert_eq!(refused, vec![5], "the INTERNAL row is the refused set");
@@ -1357,7 +1359,7 @@ mod sampler_wiring_tests {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{frontier_retain, resolve_fallback_rows,
             resolve_frontier, FrontierRetain, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(library) = wiring_library() else {
@@ -1389,7 +1391,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == frontier { stale } else { row_argmax(&values, row, vocab) }
         }).collect();
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&values)).unwrap();
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         resolve_fallback_rows(&mut next, &round, &[frontier]).unwrap();
         let draw = next.best[frontier];
@@ -1953,7 +1955,7 @@ mod sampler_device_tests {
 
         // Chunk 4b retention gate: the one-row frontier transfer the gate removes
         // when the turn bank is disabled. This is the production pageable D2H
-        // (`BatchScores::retain_from_device`), measured per row and extrapolated
+        // (`ScoreRows::retain_from_device`), measured per row and extrapolated
         // to a representative finishing batch (every one of 8 requests finishing
         // in its last round).
         {
@@ -2266,7 +2268,7 @@ mod sampler_device_tests {
         }
 
         /// Download one row's full logits (the per-row D2H the production
-        /// `BatchScores::retain_from_device` performs).
+        /// `ScoreRows::retain_from_device` performs).
         fn download_row(&self, row: usize) -> Result<Vec<u8>> {
             let mut slice = self.logits;
             slice.ptr = unsafe { slice.ptr.cast::<u8>().add(row * VOCAB * 4).cast() };

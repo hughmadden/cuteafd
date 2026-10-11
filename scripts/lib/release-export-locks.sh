@@ -9,8 +9,15 @@ release_with_export_locks() (
   local wait_seconds="${CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS:-1200}"
   [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || release_die "CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS must be positive seconds"
   mkdir -p "$lock_dir"
+  # Queue fairly (scripts/hw/hwlock.py) so the waiter isn't overtaken by later
+  # single-lock jobs; hwlock releases its ticket once the turn is ours, and the
+  # flocks below then hold the locks for the export's lifetime.
+  local hwlock
+  hwlock="$(dirname "${BASH_SOURCE[0]}")/../hw/hwlock.py"
+  echo "== waiting for a fair turn on release export hardware locks (sparks, gpu1; ${wait_seconds}s) =="
   exec 9>"$lock_dir/sparks.lock" 8>"$lock_dir/gpu1.lock"
-  echo "== waiting for release export hardware locks (sparks then gpu1, ${wait_seconds}s each) =="
+  CUTEAFD_LOCK_DIR="$lock_dir" python3 "$hwlock" --locks sparks,gpu1 --wait "$wait_seconds" -- true \
+    || release_die "timed out waiting for a fair turn on sparks.lock and gpu1.lock"
   flock -w "$wait_seconds" 9 || release_die "timed out waiting for sparks.lock"
   flock -w "$wait_seconds" 8 || release_die "timed out waiting for gpu1.lock"
   # The Docker client being terminated does not stop a daemon-owned container.

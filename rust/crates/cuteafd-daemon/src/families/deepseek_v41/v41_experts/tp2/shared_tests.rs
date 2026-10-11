@@ -314,10 +314,30 @@ fn v41_equality(exl3: bool) -> Result<()> {
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
     )?;
-    let capacity = 256;
+    let diagnostic_layer = std::env::var("CUTEAFD_TP2_FIXTURE_LAYER")
+        .ok().map(|value| value.parse::<usize>()).transpose()?.unwrap_or(0);
+    let capacity = std::env::var("CUTEAFD_TP2_FIXTURE_CAPACITY")
+        .ok().map(|value| value.parse::<usize>()).transpose()?.unwrap_or(256);
+    ensure!(diagnostic_layer < 40 && (1..=4096).contains(&capacity), "invalid V4.1 fixture layer/capacity");
     let input = inputs(devices, capacity)?;
     let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default());
-    let weights = if exl3 {
+    let weights = if exl3 && diagnostic_layer != 0 {
+        let mut pair = Vec::with_capacity(2);
+        for rank in 0..2 {
+            let weight = devices[rank].run(|| Exl3Weights::load(
+                devices[rank].library, &catalog,
+                ExpertLayer::BackboneTp2 { layer: diagnostic_layer, rank },
+                8_000_000_000,
+            ))?;
+            pair.push(RankWeights {
+                device: devices[rank],
+                weights: ManuallyDrop::new(RankStorage::Exl3 {
+                    weights: Rc::new(vec![weight]), directory: package.clone(),
+                }),
+            });
+        }
+        pair.try_into().ok().expect("two diagnostic ranks")
+    } else if exl3 {
         RankWeights::load_exl3_pair(devices, &catalog, 1, [8_000_000_000; 2], &package)?
     } else {
         [
@@ -336,7 +356,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
             devices,
             &catalog,
             &package,
-            0..1,
+            diagnostic_layer..diagnostic_layer + 1,
             capacity,
             [8_000_000_000; 2],
         )?;
@@ -368,7 +388,10 @@ fn v41_equality(exl3: bool) -> Result<()> {
     let mut reduction = PeerReduction::new(devices[1], devices[0], capacity as u32)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let mut failed_atomic = Vec::new();
-    for rows in [1, 3, 16, 80, 255, 256] {
+    let mut row_counts = vec![1, 3, 16, 80, 255, 256, 512, 1024, 2048, 4096];
+    row_counts.retain(|&rows| rows <= capacity);
+    if !row_counts.contains(&capacity) { row_counts.push(capacity); }
+    for rows in row_counts {
         let mut shared_values = [Vec::new(), Vec::new()];
         for rank in 0..2 {
             let (buffers, stream) = &input[rank];
@@ -391,7 +414,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
             // SAFETY: identical rank-local inputs, exclusive fixture stream and workspace.
             unsafe {
                 shared[rank].enqueue(
-                    0,
+                    diagnostic_layer,
                     rows,
                     ExpertInput::Fp8K32(buffers[0].buffer.ptr),
                     Routes {
@@ -399,6 +422,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
                         weights: buffers[2].buffer.ptr,
                     },
                     stream.raw,
+                    &mut || {}, // Independent fixture streams have no peer waits.
                 )?;
             }
             stream.drain()?;
@@ -411,6 +435,13 @@ fn v41_equality(exl3: bool) -> Result<()> {
             };
             let actual = host(devices[rank], source, source.bytes)?;
             shared_values[rank] = actual.clone();
+            if exl3 {
+                if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
+                    let directory = Path::new(&directory);
+                    std::fs::create_dir_all(directory)?;
+                    std::fs::write(directory.join(format!("v41-exl3-r{rows}-rank{rank}.f32")), &actual)?;
+                }
+            }
             let (max_abs, rel_l2) = errors(&reference, &actual);
             eprintln!("V41_SHARED backend={} rows={rows} rank={rank} identical={} max_abs={max_abs:.9e} rel_l2={rel_l2:.9e}",
                 if exl3 {"exl3"} else {"native"}, reference==actual);
@@ -437,6 +468,11 @@ fn v41_equality(exl3: bool) -> Result<()> {
             )
         })?;
         let actual = host(devices[0], output, rows * 5120 * 2)?;
+        if exl3 {
+            if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
+                std::fs::write(Path::new(&directory).join(format!("v41-exl3-r{rows}-owner.bf16")), &actual)?;
+            }
+        }
         let make_inputs = || {
             std::array::from_fn(|rank| RankInputs {
                 wire: input[rank].0[0].buffer,

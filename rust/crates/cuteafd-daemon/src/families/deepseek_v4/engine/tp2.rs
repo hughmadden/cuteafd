@@ -105,7 +105,7 @@ impl<'a> Engine<'a> {
         ensure!(self.local.borrow().as_ref().is_none_or(|l| l.layers() == 0),
             "TP1 backbone experts cannot coexist with TP2");
         let rows = self.prefill_rows.max(self.decode_rows);
-        let routes = PeerExchange::new(self.library,
+        let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: peer.device, stream: peer.stream }],
             2 * PREFILL_LANES, rows * self.cfg.n_activated_experts * 8 + 16)?;
@@ -122,6 +122,46 @@ impl<'a> Engine<'a> {
         tracing::info!(layers = ?layers, "V4 RTX TP2 expert halves resident on both GPUs");
         cuteafd_bench::context::set_resolved("rtx-tp2-layers", &format!("{}..{}", layers.start, layers.end));
         Ok(())
+    }
+
+    fn publish_tp2_abort(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+            match exchange.terminal_state() {
+                crate::shared::peer_split::TerminalState::Aborting
+                | crate::shared::peer_split::TerminalState::Drained => continue,
+                _ => {}
+            }
+            if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
+        }
+        ensure!(failures.is_empty(), "V4 TP2 abort publication: {}", failures.join("; "));
+        Ok(())
+    }
+
+    fn abort_tp2_or_terminate(&self) {
+        // enqueue may fail inside rank 1's device scope; legacy exchange.on(0)
+        // assumes the home device is current before publishing either word.
+        let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+        crate::shared::decode_graph::fatal_drain(home.run(|| self.publish_tp2_abort()), "V4 RTX enqueue abort");
+    }
+
+    /// Both abort words precede either drain; graphs and backend owners remain live.
+    pub fn retire_tp2(&self) -> Result<()> {
+        if self.tp2.is_none() { return Ok(()); }
+        let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+        home.run(|| {
+            self.publish_tp2_abort()?;
+            let mut failures = Vec::new();
+            for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                if let Err(error) = exchange.drain_compute() { failures.push(format!("{error:#}")); }
+            }
+            ensure!(failures.is_empty(), "V4 TP2 rank drainage: {}", failures.join("; "));
+            self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
+            self.on(1, || { self.peer()?.graphs.borrow_mut().clear(); Ok(()) })?;
+            self.exchange()?.finish_terminal(true);
+            self.tp2.as_ref().unwrap().routes.finish_terminal(true);
+            Ok(())
+        })
     }
 
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
@@ -189,7 +229,8 @@ impl<'a> Engine<'a> {
             ensure!(combine.payload_bytes(rows, self.cfg.dim) <= payload.buffer.bytes, "TP2 payload exceeds admission");
             let mut experts = tp2.ranks[rank].borrow_mut();
             // SAFETY: routes and locally quantized wire rows are complete on this rank's stream.
-            unsafe { experts.enqueue(layer, rows, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes, stream)?; }
+            unsafe { experts.enqueue(layer, rows, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes, stream,
+                &mut || self.abort_tp2_or_terminate())?; }
             tp2.output_pending[rank].set(true);
             // SAFETY: owned FP32 output and shared BF16 rows remain live through this stream-ordered copy.
             let copied = unsafe { combine.partial(experts.output().cast(), lane.shared.buffer.ptr.cast(),

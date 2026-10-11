@@ -19,8 +19,8 @@ pub(crate) enum ExpertLayer {
     BackboneTp2 { layer: usize, rank: usize },
     /// Explicit replicated-group native Spark shard. `world` is this group's
     /// tensor-parallel degree (2, 3, 4 or 6) and `rank` is the shard index
-    /// inside the group (`global_rank % world`). Only the official native
-    /// checkpoint may select it; EXL3/NVFP4 keep their own layers. `world: 6`
+    /// inside the group (`global_rank % world`). Native checkpoints support
+    /// replicated groups; NVFP4 uses pure TP3/TP6 only. `world: 6`
     /// is the pure unreplicated `TP6EP1` layout: six disjoint intermediate
     /// slices of every expert, so every rank sees every route.
     BackboneReplicatedTp { layer: usize, rank: usize, world: usize },
@@ -149,6 +149,8 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_kernel(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_kernel(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_kernel(capacity),
+            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+                library.v41_nvfp4_spark_expert_kernel(capacity, tp),
             // Raw publications keep draft experts at source MXFP4 precision.
             other => other.kernel(library, capacity),
         }
@@ -159,6 +161,8 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_info(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_info(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_info(capacity),
+            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+                library.v41_nvfp4_spark_expert_info(capacity, tp),
             other => other.info(library, capacity),
         }
     }
@@ -193,10 +197,17 @@ impl ExpertLayer {
 
     /// True when this layer's routed experts use the W4A4 NVFP4 family.
     fn is_quantized_nvfp4(self, catalog: &OfficialV41Catalog) -> bool {
-        catalog.nvfp4().is_some()
+        self.uses_nvfp4(ExpertFormat::of(catalog))
+    }
+
+    fn uses_nvfp4(self, format: ExpertFormat) -> bool {
+        format.is_nvfp4()
             && matches!(
                 self,
-                Self::Backbone { .. } | Self::BackboneTp2 { .. } | Self::BackboneFull { .. }
+                Self::Backbone { .. }
+                    | Self::BackboneTp2 { .. }
+                    | Self::BackboneFull { .. }
+                    | Self::BackboneReplicatedTp { world: 3 | 6, .. }
             )
     }
 }
@@ -228,6 +239,35 @@ impl ExpertFormat {
     }
     pub(crate) fn is_nvfp4(self) -> bool {
         matches!(self, Self::Nvfp4)
+    }
+}
+
+#[cfg(test)]
+mod format_dispatch_tests {
+    use super::{ExpertFormat, ExpertLayer};
+
+    #[test]
+    fn every_backbone_variant_dispatches_by_checkpoint_format() {
+        let cases = [
+            (ExpertLayer::Backbone { layer: 2, rank: 0 }, true),
+            (ExpertLayer::BackboneFull { layer: 2 }, true),
+            (ExpertLayer::BackboneTp2 { layer: 2, rank: 0 }, true),
+            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 3 }, true),
+            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 6 }, true),
+            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 2 }, false),
+            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 4 }, false),
+            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 5 }, false),
+            (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 3 }, false),
+            (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 6 }, false),
+            (ExpertLayer::Dspark { stage: 0 }, false),
+            (ExpertLayer::DsparkTp2 { stage: 0, rank: 0 }, false),
+        ];
+        for format in [ExpertFormat::Native, ExpertFormat::Exl3, ExpertFormat::Nvfp4] {
+            for (layer, supports_nvfp4) in cases {
+                assert_eq!(layer.uses_nvfp4(format), format == ExpertFormat::Nvfp4 && supports_nvfp4,
+                    "{layer:?} with {format:?}");
+            }
+        }
     }
 }
 

@@ -183,7 +183,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         layers.push(LayerDemand { kind: if mla { AttentionClass::Dsa } else { AttentionClass::Kda },
             weights: ModeBytes::default(), kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: mla.then_some([unit / 2; 2]) },
-            fixed_bytes: ModeBytes::default(), context_indexer: mla, colocate: None,
+            fixed_bytes: ModeBytes::default(), context_indexer: mla, colocate: None, extra: vec![],
             experts: if i.cfg.dense[layer] { None } else { expert.next().copied() },
             modes: if ranks == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] } });
     }

@@ -197,7 +197,7 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
-    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start)" in expert
+    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())" in expert
 
 
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
@@ -383,6 +383,43 @@ def test_qwen_invalid_kv_format_fails_before_launch(tmp_path):
     assert "serve-qwen4 --snapshot" not in result.stderr
 
 
+@pytest.mark.parametrize("config,keys,env,endpoints", [
+    ({"model_type": "deepseek_v4"}, "", {}, 2),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
+    ({"model_type": "glm5_next"}, "", {}, 2),
+    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {}, 4),
+    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {"CUTEAFD_GLMF_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "qwen4_exp"}, "", {}, 1),
+    ({"model_type": "mimo_v2_flash"}, "", {}, 2),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {"CUTEAFD_MIMO_PREFILL_LANES": "4"}, 4),
+])
+def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, config, keys, env, endpoints):
+    dense_layers = config.get("first_k_dense_replace", 0)
+    fixture = {"num_hidden_layers": 4, "layer_types": ["linear_attention"] * 4,
+        "mlp_layer_types": ["dense"] * dense_layers + ["sparse"] * (4 - dense_layers), **config}
+    result = _family_launch_result(tmp_path, fixture, "test/model",
+        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n" + keys,
+        extra_env=env)
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert workers
+    assert all(f"--rdma-endpoints {endpoints}" in line for line in workers)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert all(f"{name}={value}" in launch for name, value in env.items())
+
+
+@pytest.mark.parametrize("mode,wide", [("fp8", False), ("bf16", True), ("bf16-decode", False)])
+def test_only_wide_optional_bf16_changes_worker_ring_admission(tmp_path, mode, wide):
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 4}, "test/model",
+        f"EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nEXPERT_INPUT={mode}\n")
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert ("--bf16-ingress" in worker) == wide
+
+
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
     result = _family_launch_result(tmp_path, config, "test/model",
@@ -410,6 +447,49 @@ def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str
     assert message in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
     assert "cuteafd serve-qwen4" not in result.stderr
+
+
+@pytest.mark.parametrize("count", [1, 5, 7, 8])
+def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
+    hosts = [f"spark-{rank}.example" for rank in range(count)]
+    script = ['set -eu', 'source "$1"']
+    for rank, host in enumerate(hosts):
+        script += [f'SPARK_{rank}_HOST={host}', f'SPARK_{rank}_LANE_A=192.0.2.{rank + 1}',
+                   f'SPARK_{rank}_LANE_B=198.51.100.{rank + 1}']
+    script.append(f'release_spark_host_rows "{",".join(reversed(hosts))}" {count}')
+    result = subprocess.run(["bash", "-c", "\n".join(script), "test",
+                             str(ROOT / "scripts/lib/release-common.sh")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{rank} {host} 192.0.2.{count - rank} 198.51.100.{count - rank}"
+        for rank, host in enumerate(reversed(hosts))]
+
+
+@pytest.mark.parametrize("host,lane_a,message", [
+    ("spark-7.example", "", "configure SPARK_<rank>_HOST and LANE_A"),
+    ("spark-7.example,spark-7.example", "192.0.2.8", "duplicate host"),
+    ("spark-7.example,", "192.0.2.8", "comma-separated Spark pool host list"),
+    ("spark;bad", "192.0.2.8", "comma-separated Spark pool host list"),
+])
+def test_explicit_custom_hosts_fail_closed(host, lane_a, message):
+    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": lane_a}
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
+                             "test", str(ROOT / "scripts/lib/release-common.sh"), host,
+                             str(len(host.split(",")))], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+def test_explicit_custom_host_secondary_rail_is_optional():
+    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": "192.0.2.8",
+           "SPARK_7_LANE_B": ""}
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows spark-7.example 1',
+                             "test", str(ROOT / "scripts/lib/release-common.sh")], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0 spark-7.example 192.0.2.8 \n"
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:

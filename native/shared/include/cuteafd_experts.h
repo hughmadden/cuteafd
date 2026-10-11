@@ -150,16 +150,14 @@ int32_t cuteafd_reduce_compact_bf16_async(const uint16_t* const planes[4],
  * Same alias/lifetime rules as TP4 above; no allocation or synchronization. */
 int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
-/* Replicated-group compact reduction: sum `ranks` BF16 [rows,5120] physical-rank
- * partial planes in rank order in FP32, add optional BF16 shared exactly once,
- * then round once to BF16. ranks must be 1, 2, 3, 4 or 6. planes is a host array of
- * six device pointers: entries [0,ranks) must be non-null and aligned; entries
- * [ranks,6) must be null. No group-local reduction is performed: every physical
- * rank contributes one plane directly. Same alias/lifetime rules as the fixed
- * TP2/TP4 entry points (output may equal shared exactly; output must not overlap
- * any plane). 1 <= rows <= 4096. The kernel receives the six pointers by value;
- * no device pointer array and no per-call allocation are used. */
-int32_t cuteafd_reduce_compact_bf16_planes_async(const uint16_t* const planes[6],
+/* Replicated-group compact reduction: sum ranks BF16 [rows,hidden] planes
+ * in physical-rank order in FP32, add optional shared once and round once to
+ * BF16. planes is a host array of eight device pointers; ranks is in 1..8.
+ * Active pointers must be aligned and non-null; inactive slots must be null.
+ * Output cannot overlap any plane; exact output==shared is permitted, partial
+ * overlap is not. 1 <= rows <= 4096. Pointers are passed by value; no allocation
+ * or synchronization. Storage must remain valid through stream completion. */
+int32_t cuteafd_reduce_compact_bf16_eight_planes_async(const uint16_t* const planes[8],
     const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
     void* stream);
 /* Full local routed output: sum six FP32 routes (token_sums=0) or consume

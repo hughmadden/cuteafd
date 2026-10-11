@@ -18,7 +18,8 @@ pub enum Fp8MoeWeights {
     Mxfp4,
     /// ABI 3 / 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
     /// scale region followed by the experts' FP32 `weight_scale_2` and
-    /// `input_scale` (W4A16; ABI 4 runs its large-row steps W4A4).
+    /// `input_scale`. Serving requires ABI 4: calibrated W4A4 at every row count;
+    /// ABI 3 is decoded only to identify and reject stale A16 packages.
     Nvfp4 { w4a4: bool },
 }
 

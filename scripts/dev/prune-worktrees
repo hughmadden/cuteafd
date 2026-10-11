@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Prune clean merged/deleted worktrees (dry run by default).
+
+--apply checks readable process cwd entries, task PID files and a 30-minute
+file-mtime guard. Inaccessible /proc cwd entries are warned about and skipped:
+these checks cannot prove a quiet, unreadable process is not using a worktree.
+Processes whose cwd can't be read are not checked; --apply removes only clean,
+merged worktrees (or clean worktrees whose tracked origin branch was deleted).
+"""
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+BASE = 'origin/work/p0'
+
+
+def git(root, *args, check=True):
+    result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True)
+    if check and result.returncode:
+        raise ValueError(f'git {args[0]} failed (exit {result.returncode})')
+    return result
+
+
+def entries(root):
+    records = git(root, 'worktree', 'list', '--porcelain', '-z').stdout.split('\0\0')
+    for record in records:
+        fields = dict(line.split(' ', 1) if ' ' in line else (line, '')
+                      for line in record.split('\0') if line)
+        if 'worktree' in fields:
+            yield fields
+
+
+def dirty(root):
+    fields = git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all').stdout.split('\0')
+    index = 0
+    while index < len(fields):
+        item = fields[index]
+        index += 1
+        if not item:
+            continue
+        state, path = item[:2], item[3:]
+        if state == '??' and any(part.startswith('target') for part in Path(path).parts[:-1]):
+            continue
+        return True
+    return False
+
+
+def live_cwds():
+    found, unknown = [], False
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            found.append((int(proc.name), (proc / 'cwd').resolve(strict=True)))
+        except FileNotFoundError:
+            continue
+        except (PermissionError, OSError):
+            unknown = True
+    if unknown:
+        print('prune-worktrees: warning: inaccessible /proc cwd entries skipped', file=sys.stderr)
+    return found
+
+
+def recent_files(root):
+    cutoff = time.time() - 1800
+    def denied(error):
+        raise error
+    try:
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=denied):
+            dirs[:] = [name for name in dirs if not name.startswith('target') and name != '.git']
+            for name in files:
+                if name == '.git':
+                    continue
+                if (Path(directory) / name).stat().st_mtime > cutoff:
+                    return True
+    except OSError:
+        return True
+    return False
+
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def live_pids(task):
+    directory = Path.home() / '.cache/cuteafd/builds' / task
+    if not directory.exists():
+        return False
+    for path in directory.glob('*.pid'):
+        try:
+            if pid_alive(int(path.read_text().strip())):
+                return True
+        except (OSError, ValueError):
+            return True  # unreadable PID evidence needs a human review
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--apply', action='store_true')
+    args = parser.parse_args()
+    try:
+        root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel').stdout.strip())
+        worktrees = list(entries(root))
+        # The first registered entry is the main checkout, even from a linked cwd.
+        main_path = Path(worktrees[0]['worktree']).resolve()
+        git(root, 'rev-parse', '--verify', BASE)
+        remote = git(root, 'ls-remote', '--heads', 'origin').stdout
+        remote_branches = {line.split('\t', 1)[1].removeprefix('refs/heads/')
+                           for line in remote.splitlines() if '\t' in line}
+        cwds = live_cwds()
+        print("caveat: processes whose cwd can't be read are not checked; --apply removes only clean, merged worktrees")
+        print('        (also clean worktrees whose tracked origin branch was deleted)')
+        candidates, keep = [], []
+        for entry in worktrees:
+            path = Path(entry['worktree']).resolve()
+            if path == main_path:
+                continue
+            branch = entry.get('branch', '').removeprefix('refs/heads/')
+            merged = git(root, 'merge-base', '--is-ancestor', entry['HEAD'], BASE, check=False)
+            if merged.returncode not in (0, 1):
+                raise ValueError('could not check merge ancestry')
+            upstream = git(root, 'for-each-ref', '--format=%(upstream)',
+                           'refs/heads/' + branch).stdout.strip() if branch else ''
+            deleted = bool(branch and branch not in remote_branches and
+                           upstream == 'refs/remotes/origin/' + branch)
+            eligible = merged.returncode == 0 or deleted
+            reasons = []
+            if 'locked' in entry:
+                reasons.append('locked')
+            if not path.exists():
+                reasons.append('missing directory')
+            elif dirty(path):
+                reasons.append('dirty')
+            if path.exists() and recent_files(path):
+                reasons.append('file modified within 30 minutes')
+            if any(cwd.is_relative_to(path) for _, cwd in cwds):
+                reasons.append('live cwd')
+            task = branch.removeprefix('work/') if branch else path.name.removeprefix('cuteafd-')
+            if live_pids(task):
+                reasons.append('live task pid')
+            if not eligible:
+                reasons.append('unmerged branch (not proven deleted on origin)')
+            if reasons:
+                keep.append((path, ', '.join(reasons)))
+            else:
+                candidates.append(path)
+        print('remove' if args.apply else 'would remove (dry run)')
+        for path in candidates:
+            # Recheck liveness and dirt immediately before a destructive action.
+            if args.apply:
+                now = live_cwds()
+                entry = next(item for item in worktrees if Path(item['worktree']).resolve() == path)
+                task = entry.get('branch', '').removeprefix('refs/heads/').removeprefix('work/') or path.name.removeprefix('cuteafd-')
+                if dirty(path) or recent_files(path) or any(cwd.is_relative_to(path) for _, cwd in now) or live_pids(task):
+                    keep.append((path, 'changed during scan'))
+                    continue
+                git(root, 'worktree', 'remove', '--force', str(path))
+            print(f'  {path}')
+        if args.apply:
+            git(root, 'worktree', 'prune')
+        print('keep (review)')
+        for path, reason in keep:
+            print(f'  {path}: {reason}')
+        print('orphan dirs (list only)')
+        registered = {Path(item['worktree']).resolve() for item in worktrees}
+        for path in sorted((Path.home() / 'Developer').glob('cuteafd-*')):
+            if path.is_dir() and path.resolve() not in registered:
+                print(f'  {path}')
+    except (ValueError, OSError, KeyError) as error:
+        print(f'prune-worktrees: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

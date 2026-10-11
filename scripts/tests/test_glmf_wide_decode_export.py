@@ -37,12 +37,14 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
-    package.context_split.sparse_mla_partial_split_plan = lambda g, **kw: 1 if kw["sm_count"] == 170 else 4
+    # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
+    package.context_split.sparse_mla_partial_split_plan = lambda g, **kw: {
+        (170, 1): 32, (170, 8): 8, (170, 64): 1, (188, 1): 32, (188, 8): 11, (188, 64): 4}[(kw["sm_count"], kw["max_rows"])]
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", package)
@@ -81,6 +83,16 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
         assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
             "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
+
+
+def test_glm_declared_static_w8a8_exports_decode_and_prefill(exporter):
+    for make in (exporter.glm_programs, exporter.glm_head_split_programs):
+        programs = make(GEOMETRY, 64, 4096, 1048576)
+        calls = {stem: (params, thunk()[3]) for stem, _, params, thunk in programs}
+        for rows in (64, 4096):
+            params, kwargs = calls[f"ffn_i12288_pt_m{rows}"]
+            expected = {"inter": 12288, "max_rows": rows, "fp8_only": "prefill", "tensor_scales": True}
+            assert params == kwargs == expected
 
 
 def test_wide_index_uses_clamped_extent(exporter):
@@ -140,7 +152,12 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
     assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
     # The 128-row bucket keeps one split where the planner would split it maximally.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
-                                                "fp32_partials": True, "full_launch_splits": 1}
+                                                "fp32_partials": True, "full_launch_splits": 1, "sm_count": None}
+    mla = next(thunk for stem, _, _, thunk in exporter.glmf_wide_decode_programs(
+        GEOMETRY, 64, 128, 131072) if stem == "sparse_mla_decode_m128")
+    for sms in (170, 188):
+        planned = mla(sm_count=sms)[3]
+        assert planned == {**kwargs["sparse_mla_decode_m128"], "sm_count": sms}
     assert kwargs["index_topk_decode_m128"] == {"max_rows": 128, "max_pages": 512, "mode": "decode"}
     assert kwargs["index_producer_c_m128"] == {"max_rows": 128, "verify_rows": 128}
     for stem in ("mla_producer_m128", "o_m128"):
@@ -192,11 +209,16 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
     assert calls["dsa_candidate_merge"][1][3]["topk"] == (index_topk//pool if family=="glmf" else index_topk)
     assert calls["lse_combine2"][1][3] == {"heads":heads//2,"has_sink":family in ("flash","pro")}
     assert calls["scored_index_topk_decode_m64"][1][3]["max_pages"] == 1048576//pool//64
+    # One variant per split count across (SM count, row cap); each records what it serves.
     for begin in (0,heads//2):
-        for splits, sms in ((1,170),(4,188)):
+        variants = {stem for stem in calls if stem.startswith(f"sparse_mla_partial_h{begin}_s")}
+        assert variants == {f"sparse_mla_partial_h{begin}_s{s}_m64" for s in (1, 4, 8, 11, 32)}
+        for splits, caps in ((1, {"170": [64]}), (4, {"188": [64]}), (8, {"170": [8]}), (11, {"188": [8]}),
+                             (32, {"170": [1], "188": [1]})):
             params, call = calls[f"sparse_mla_partial_h{begin}_s{splits}_m64"]
             assert call[3] == {"max_rows":64,"head_begin":begin,"head_count":heads//2,"num_splits":splits}
-            assert params["device_sm_counts"] == [sms]
+            assert params["row_caps"] == caps
+            assert params["device_sm_counts"] == sorted(int(sm) for sm in caps)
     layouts = {stem: call[3]["page_bytes"] for stem, (_, call) in calls.items() if "gather" in stem}
     assert layouts["paged_staging_gather_index"] == 8448
     if family in ("flash","pro"):

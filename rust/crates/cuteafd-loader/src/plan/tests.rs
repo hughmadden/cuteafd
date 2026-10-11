@@ -5,6 +5,28 @@ use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[test]
+fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
+    use checkpoint::ModuleNumerics;
+    let modules = BTreeMap::from([("mtp.layers.0.mlp.experts.0.down_proj".into(), ModuleNumerics::W8A8)]);
+    let deviations = numerics_deviations("qwen4", &modules);
+    assert_eq!(deviations.len(), 1);
+    assert!(deviations[0].contains("deviation from declared W8A8, kernel pending"));
+    assert!(numerics_deviations("glm5", &modules).is_empty());
+    assert!(numerics_deviations("qwen4", &BTreeMap::new()).is_empty());
+    let options = PlanOptions::default();
+    assert!(precision_optimizations("qwen4", &options).iter().any(|text| text.contains("shared head")));
+    let defaults = precision_optimizations("glm5_flash", &options);
+    assert!(defaults.iter().any(|text| text.contains("KDA")));
+    assert!(defaults.iter().any(|text| text.contains("head:")));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+            kda_fp8: false, fp8_head: false, output_shard: false },
+        glmf_drafter_disabled: true, ..Default::default() }), ..Default::default() };
+    let overridden = precision_optimizations("glm5_flash", &options);
+    assert!(!overridden.iter().any(|text| text.contains("KDA") || text.contains("head:") || text.contains("drafter:")));
+}
+
 fn snapshot(config: Value, tensors: &[Tensor]) -> tempfile::TempDir {
     snapshot_tp(config, tensors, None)
 }
@@ -104,6 +126,63 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    for nvfp4 in [false, true] {
+        let mut tensors = Vec::new();
+        for projection in ["w1", "w2", "w3"] {
+            let (n, k) = if projection == "w2" { (5120, 2304) } else { (2304, 5120) };
+            let prefix = format!("layers.0.ffn.experts.0.{projection}");
+            if nvfp4 {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                    t(&format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                    t(&format!("{prefix}.weight_scale_2"), "F32", &[]),
+                    t(&format!("{prefix}.input_scale"), "F32", &[]),
+                ]);
+            } else {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "I8", &[n, k / 2]),
+                    t(&format!("{prefix}.scale"), "F8_E8M0", &[n, k / 32]),
+                ]);
+            }
+        }
+        let dir = snapshot(v41_config(), &tensors);
+        for (ranks, gpus) in [(3, 1), (6, 2)] {
+            let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                pool_tokens: Some(2_097_152), ..Default::default()
+            }), ..sparks(ranks) };
+            let report = plan(dir.path(), &options).unwrap();
+            let memory = report.memory_layout.as_ref().unwrap();
+            let experts = report.experts.as_ref().unwrap();
+            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            let packed = |tp: u64| {
+                let width = (2304 / tp).div_ceil(128) * 128;
+                if nvfp4 { 384 * (3 * 5120 * width * 9 / 16 + 16) }
+                else { 384 * 5120 * width * 51 / 32 }
+            };
+            for device in &memory.devices {
+                match device.kind {
+                    DeviceKind::Spark => {
+                        assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64));
+                        let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+                        assert_eq!(rings.bytes, layout::v41_spark_ring_allowance(
+                            "deepseek_v41", options.layout.as_ref().unwrap().spark_capacity_rows, 0, nvfp4,
+                        ));
+                    }
+                    DeviceKind::Rtx => {
+                        let local = device.items.iter().find(|item| item.group == "resident routed layers").unwrap();
+                        assert_eq!(local.bytes, packed(gpus as u64));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
     let dir = snapshot(
         v41_config(),
@@ -198,10 +277,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
             drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
-            full_prefill_logits: false };
+            full_prefill_logits: false, context: None };
         let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
-        assert_eq!(working.spark_ranks, 4);
-        assert_eq!(working.prefill_lanes, 3);
+        assert_eq!(working.spark.spark_ranks, 4);
+        assert_eq!(working.spark.prefill_lanes, 3);
         assert_eq!(memory.pool_tokens, runtime.pool_tokens);
         for (rank, items) in runtime.items.iter().enumerate() {
             for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
@@ -517,17 +596,17 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let mut config = glm5_flash_config(2);
     config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4",
         "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
-        "ignore": ["lm_head", "model.language_model.layers.1.mlp.gate"], "producer": {"name": "modelopt"}});
+        "ignore": ["lm_head", "model.language_model.layers.1.mlp.gate", "*.shared_experts.*", "*.self_attn.*"], "producer": {"name": "modelopt"}});
     let dir = snapshot(config, &tensors);
     let hf = json!({"producer": {"name": "modelopt", "version": "0.47"}, "quantization": {"quant_algo": "NVFP4",
-        "group_size": 16, "kv_cache_quant_algo": "FP8", "exclude_modules": ["lm_head", "model.language_model.layers.1.mlp.gate"]}});
+        "group_size": 16, "kv_cache_quant_algo": "FP8", "exclude_modules": ["lm_head", "model.language_model.layers.1.mlp.gate", "*.shared_experts.*", "*.self_attn.*"]}});
     std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
     let report = plan(dir.path(), &quant_options(3)).unwrap();
     assert_eq!(component(&report, Component::RoutedExpert).status, Status::Ready, "{}", render(&report));
     assert_eq!(component(&report, Component::DenseFfn).status, Status::Ready, "{}", render(&report));
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
-        ("glmf:nvfp4", 16, &[2, 3, 4, 6][..]));
+        ("glmf:nvfp4", 16, &[2, 3, 4, 5, 6][..]));
     assert!(contract.local.is_ok());
     assert!(report.executable(), "{}", render(&report));
     assert!(render(&report).contains("quant      modelopt 0.47 (hf_quant_config.json) NVFP4: every Linear NVFP4 g16"),
@@ -538,9 +617,13 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
     assert_eq!(tensors.rank_range(3, 2).unwrap(), (1376, 672));
+    let report_tp5 = plan(dir.path(), &quant_options(5)).unwrap();
+    assert!(report_tp5.executable(), "{}", render(&report_tp5));
+    assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
+    assert!((report_tp5.spark_rank_share - 512.0 / 2048.0).abs() < 1e-9);
     // Metadata that excludes the experts contradicts their NVFP4 tensors.
     let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4", "group_size": 16,
-        "exclude_modules": ["model.language_model.layers.1.mlp.experts*"]}});
+        "exclude_modules": ["model.language_model.layers.1.mlp.experts*", "*.shared_experts.*", "*.self_attn.*"]}});
     std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
     let report = plan(dir.path(), &quant_options(3)).unwrap();
     let reason = &rejected(&report, Component::RoutedExpert)[0];
@@ -1009,17 +1092,98 @@ fn spark_rank_options_follow_transport_and_packages() {
     let qwen = qwen_snapshot(4);
     let dsv41 = snapshot(v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
         t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
-    for ranks in 0..=8 {
+    for ranks in 0..=9 {
         let options = sparks(ranks);
-        if !matches!(ranks, 0 | 1 | 2 | 3 | 4 | 6) {
+        if ranks > 8 {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
         }
         // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
-        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, !matches!(ranks, 1 | 3), "mimo {ranks}");
-        assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, ranks != 6, "qwen {ranks}");
-        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, !matches!(ranks, 0 | 1), "v41 {ranks}");
+        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, matches!(ranks, 0 | 2 | 4 | 6), "mimo {ranks}");
+        assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
+        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
+    }
+}
+
+#[test]
+fn qwen_empty_h128_spark_ranks_are_geometry_invalid_not_fit() {
+    let qwen = qwen_snapshot(4);
+    for ranks in [6, 7, 8] {
+        let options = sparks(ranks);
+        let report = plan(qwen.path(), &options).unwrap();
+        assert!(!report.fits && !report.placement_supported && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+    // A missing TP5 package is distinct from invalid geometry: all five
+    // ranks own one H128 block, even before its hardware gate qualifies it.
+    let report = plan(qwen.path(), &sparks(5)).unwrap();
+    assert!(report.fits);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")));
+}
+
+#[test]
+fn exl3_tp6_geometry_remains_supported_for_glm_and_flash() {
+    // V4.1 EXL3 TP6 stays refused until it qualifies on remote experts (c7fb59ce).
+    for (mut config, prefix, hidden, intermediate) in [
+        (glm5_config(), "model.layers.1.mlp.experts.0.gate_proj", 6144, 2048),
+        (glm5_flash_config(2), "model.language_model.layers.1.mlp.experts.0.gate_proj", 4096, 2048),
+    ] {
+        config["quantization_config"] = exl3_compact(4);
+        // The GLM solver validates resident headers independently of expert geometry.
+        let mut tensors = if hidden == 6144 { glm5_tensors(|_, _, _| Vec::new()) } else {
+            let mut tensors = glm5_flash_tensors(&config);
+            tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
+            tensors
+        };
+        let mut projections = Vec::new();
+        if prefix.starts_with("layers.") {
+            tensors.extend(exl3(prefix, intermediate, hidden, 4));
+            projections.push((prefix.to_string(), 4, hidden, intermediate));
+        } else {
+            let stem = prefix.strip_suffix("0.gate_proj").unwrap();
+            let count = if hidden == 6144 { 256 } else { 288 };
+            for expert in 0..count {
+                for (projection, n, k) in [("gate_proj", intermediate, hidden), ("up_proj", intermediate, hidden),
+                    ("down_proj", hidden, intermediate)] {
+                    let name = format!("{stem}{expert}.{projection}");
+                    tensors.extend(exl3(&name, n, k, 4));
+                    projections.push((name, 4, k, n));
+                }
+            }
+        }
+        let dir = snapshot(config, &tensors);
+        write_quantize_config(dir.path(), &exl3_manifest(&exl3_compact(4), &projections));
+        let report = plan(dir.path(), &sparks(6)).unwrap();
+        assert!(report.placement_supported && report.fits && report.executable(), "{}", render(&report));
+        assert!(report.experts.as_ref().unwrap().spark_worlds.contains(&6));
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+}
+
+#[test]
+fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
+    let mut config = qwen4_config(1);
+    config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16});
+    let mut tensors = Vec::new();
+    for expert in 0..512 {
+        for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+            let prefix = format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}");
+            tensors.extend([
+                t(format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                t(format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                t(format!("{prefix}.weight_scale_2"), "F32", &[]),
+                t(format!("{prefix}.input_scale"), "F32", &[]),
+            ]);
+        }
+    }
+    let dir = snapshot(config, &tensors);
+    let legacy = plan(dir.path(), &sparks(6)).unwrap();
+    assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
+    for ranks in [7, 8] {
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert!(!report.placement_supported && !report.fits && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
     }
 }
 
@@ -1241,6 +1405,18 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         }
         let memory = report.memory_layout.unwrap();
         assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count(), working.spark_ranks);
+        for device in memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark) {
+            let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
+                topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+            let io = working.rank_io(device.index as usize, geometry, 4096, checkpoint.spark_input_is_bf16(),
+                placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
+                    alignment: 4096, endpoints: working.prefill_lanes as usize }).unwrap();
+            for (group, bytes) in [("expert intake", io.intake), ("host expert exchange", io.host_exchange),
+                ("expert row indices", io.row_indices), ("rdma rings", io.mapped_rings)] {
+                let item = device.items.iter().find(|item| item.group == group).unwrap();
+                assert_eq!((item.bytes, item.basis), (bytes, cuteafd_core::memory_layout::Basis::Formula));
+            }
+        }
         for rank in 0..2 {
             // Plan ledger is exactly the selected request's solver ledger, not configured-peer rows.
             let plan_rows: Vec<_> = memory.devices[rank].items.iter().filter(|item| item.group != "context+modules").collect();
@@ -1587,6 +1763,57 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     let disabled = run(&options);
     assert_eq!(bytes(&disabled,0,Category::Drafter), 0);
     assert_eq!(bytes(&disabled,0,Category::Workspace), 0);
+}
+
+#[test]
+fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
+    let dir = snapshot(glm5_flash_config(45),
+        &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let mut plans = serde_json::Map::new();
+    for (name, gpus, ranks) in [("min", 1, 4), ("max", 2, 4), ("two-rtx-no-spark", 2, 0)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30; gpus], pool_tokens: Some(2_097_152),
+            context_tokens: 1_048_576, ..Default::default()
+        }), ..sparks(ranks) };
+        let mut value = serde_json::to_value(plan(dir.path(), &options).unwrap()).unwrap();
+        value["snapshot"] = json!("<fixture>");
+        let fields = value.as_object_mut().unwrap();
+        assert_eq!(fields.shift_remove("module_numerics"), Some(json!({})));
+        assert_eq!(fields.shift_remove("numerics_deviations"), Some(json!([])));
+        let precision = fields.shift_remove("precision_optimizations").unwrap();
+        assert_eq!(precision, serde_json::to_value(precision_optimizations("glm5_flash", &options)).unwrap());
+        plans.insert(name.into(), value);
+    }
+    let actual = Value::Object(plans);
+    let expected: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
+    // The shared solver cannot admit this historical A_log-only checkpoint.
+    // Preserve the old snapshot/hash as provenance, but require a named refusal
+    // instead of manufacturing resident weights and an executable layout.
+    for (name, report) in actual.as_object().unwrap() {
+        assert_eq!(report["attention_placement"], expected[name]["attention_placement"]);
+        assert_eq!(report["cache_requirements"], expected[name]["cache_requirements"]);
+        assert_eq!(report["placement_supported"], json!(false));
+        let memory = &report["memory_layout"];
+        assert_eq!(memory["pool_tokens"], json!(0));
+        assert!(memory["devices"].as_array().unwrap().iter().all(|device|
+            device["kind"] == json!("rtx") && device["items"].as_array().unwrap().is_empty()));
+        assert!(memory["notes"].as_array().unwrap().iter().any(|note|
+            note.as_str().unwrap().contains("resident operand missing: model.language_model.embed_tokens.weight")));
+    }
+    // Complete-header solver/working-set tests check the admitted inventory and
+    // exact Spark I/O; this fixture remains the unchanged historical reference.
+    let mut legacy = expected;
+    for report in legacy.as_object_mut().unwrap().values_mut() {
+        assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
+        let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
+        assert_eq!(notes.remove(1), json!("attention placement heads"));
+    }
+    // Removing only K0's heads metadata must recover the pre-rebase full plan:
+    // every byte, startup inventory, and admission field remains unchanged.
+    use sha2::{Digest, Sha256};
+    assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy).unwrap())),
+        "c8e254afb255deb186853608e055d56e7f1bd841f1b12cf3cab108e92794c67f");
 }
 
 #[test]

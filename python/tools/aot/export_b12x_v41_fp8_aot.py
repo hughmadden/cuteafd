@@ -55,7 +55,7 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
 def dispatch_header(output: Path, manifest: dict) -> None:
     from b12x._lib.quant.mxfp8_rows import mxfp8_rows_quant_aot_grid
     lines = ['#pragma once', '#include <stdint.h>',
-             f"#define CUTEAFD_V41_FP8_SMS {manifest['physical_sms']}"]
+             '#define CUTEAFD_V41_FP8_SMS 188']
     lines.append('#include "v41_hc_project.h"')
     prefix = '_mlir_cuteafd_v41_hc_project'
     lines.append('#define CUTEAFD_V41_HC_PROJECT_MODULE {' + ','.join((
@@ -75,9 +75,9 @@ def dispatch_header(output: Path, manifest: dict) -> None:
         if groups > 1:
             lines.append(f'#include "{label}_quant_rope.h"')
         grids = [mxfp8_rows_quant_aot_grid(size_k=k, rows=rows, expected_m=variant.get('expected_m', capacity),
-                                         sm_count=manifest['physical_sms']) for rows in range(1, capacity + 1)]
+                                         sm_count=188) for rows in range(1, capacity + 1)]
         if groups > 1:
-            grids = [min(rows * 32, manifest['physical_sms'] * 4) for rows in range(1, capacity + 1)]
+            grids = [min(rows * 32, 188 * 4) for rows in range(1, capacity + 1)]
         lines.append('static const uint32_t ' + label + '_grids[] = {' + ','.join(map(str, grids)) + '};')
         info = [1, capacity, k, n, variant['scratch_bytes'],
                 variant['activation_values_offset'], variant['activation_row_scales_offset'],
@@ -89,7 +89,7 @@ def dispatch_header(output: Path, manifest: dict) -> None:
                                            variant[kind + '_abi']['symbol'])) + '}')
         if groups == 1:
             modules.append('{nullptr,nullptr,nullptr}')
-        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + '}')
+        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + ',' + str(variant.get('plan_sms', 0)) + '}')
     lines.append('#define CUTEAFD_V41_FP8_VARIANTS ' + ','.join(variants))
     (output / 'v41_fp8_variants.h').write_text('\n'.join(lines) + '\n')
 
@@ -118,56 +118,58 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 'variants': []}
     for name, n, k in projections:
         for capacity in rows:
-            label = f'v41_{name}_fp8_m{capacity}'
-            groups = 8 if name == 'o_a' else 1
-            expected_m = capacity
-            if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
-                from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
-                expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
-                    sm_count=props.multi_processor_count, num_groups=groups)
-            quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
-                     if groups > 1 else compile_mxfp8_rows_quant_aot(
-                         size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
-            quant.export_to_c(str(output), label + '_quant', 'cuteafd_' + label + '_quant')
-            if groups > 1:
-                rope_quant = compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups, row_frequencies=True)
-                rope_quant.export_to_c(str(output), label + '_quant_rope', 'cuteafd_' + label + '_quant_rope')
-            gemm, split_k = compile_dense_gemm_mxfp8_aot(size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
-                                              expected_m=expected_m, sfb_k_replicated=False, device=device,
-                                              return_split_k_metadata=True)
-            gemm.export_to_c(str(output), label + '_gemm', 'cuteafd_' + label + '_gemm')
-            layout = _block_fp8_linear_scratch_layout(tokens=capacity, in_features=k,
-                                                    out_features=n, output_dtype=torch.bfloat16)
-            split_offset = ((layout.nbytes + 255) // 256) * 256 if split_k > 1 else 0
-            split_bytes = split_k * capacity * n * 4 if split_k > 1 else 0
-            group_layout = {}
-            if groups > 1:
-                values_bytes = capacity * k
-                row_scale_offset = (values_bytes + 255) // 256 * 256
-                mma_offset = (row_scale_offset + capacity * k // 32 + 255) // 256 * 256
-                mma_bytes = groups * ((capacity + 127) // 128) * 512 * (k // groups // 128)
-                output_offset = (mma_offset + mma_bytes + 255) // 256 * 256
-                group_layout = dict(groups=groups, activation_values_offset=0,
-                                    activation_row_scales_offset=row_scale_offset,
-                                    activation_mma_scales_offset=mma_offset,
-                                    grouped_output_offset=output_offset,
-                                    activation_scratch_bytes=output_offset,
-                                    scratch_bytes=output_offset + capacity * n * 2,
-                                    activation_mma_scale_shape=[32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
-            manifest['variants'].append({'capacity': capacity, 'expected_m': expected_m, 'label': label, 'input_dim': k, 'output_dim': n,
-                'activation_scratch_bytes': layout.nbytes,
-                'scratch_bytes': split_offset + split_bytes if split_k > 1 else layout.nbytes,
-                'split_k_offset': split_offset, 'split_k_bytes': split_bytes,
-                'activation_values_offset': layout.x_values_offset_bytes,
-                'activation_row_scales_offset': layout.x_scale_rows_offset_bytes,
-                'activation_mma_scales_offset': layout.x_scale_mma_offset_bytes,
-                'activation_mma_scale_shape': list(layout.x_scale_mma_physical_shape),
-                'split_k_slices': split_k, 'gemm_output_dtype': 'FP32' if split_k > 1 else 'BF16', 'output_dtype': 'BF16', 'output_bytes': capacity * n * 2,
-                'quant_abi': validate_abi(output / (label + '_quant.h'), label + '_quant', 'group_quant' if groups > 1 else 'quant'),
-                'gemm_abi': validate_abi(output / (label + '_gemm.h'), label + '_gemm', 'gemm'), **group_layout})
-            if groups > 1:
-                manifest['variants'][-1]['quant_rope_abi'] = validate_abi(output / (label + '_quant_rope.h'), label + '_quant_rope', 'group_quant')
-            print(f'exported {label}', flush=True)
+            dual = name in ('q_a', 'kv') and capacity in (1, 16)
+            for plan_sms in ((170, 188) if dual else (188,)):
+                label = f'v41_{name}_fp8_m{capacity}' + (f'_sm{plan_sms}' if dual else '')
+                groups = 8 if name == 'o_a' else 1
+                expected_m = capacity
+                if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
+                    from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
+                    expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
+                        sm_count=plan_sms, num_groups=groups)
+                quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
+                         if groups > 1 else compile_mxfp8_rows_quant_aot(
+                             size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
+                quant.export_to_c(str(output), label + '_quant', 'cuteafd_' + label + '_quant')
+                if groups > 1:
+                    rope_quant = compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups, row_frequencies=True)
+                    rope_quant.export_to_c(str(output), label + '_quant_rope', 'cuteafd_' + label + '_quant_rope')
+                gemm, split_k = compile_dense_gemm_mxfp8_aot(size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
+                                                  expected_m=expected_m, sfb_k_replicated=False, device=device,
+                                                  return_split_k_metadata=True, sm_count=plan_sms)
+                gemm.export_to_c(str(output), label + '_gemm', 'cuteafd_' + label + '_gemm')
+                layout = _block_fp8_linear_scratch_layout(tokens=capacity, in_features=k,
+                                                        out_features=n, output_dtype=torch.bfloat16)
+                split_offset = ((layout.nbytes + 255) // 256) * 256 if split_k > 1 else 0
+                split_bytes = split_k * capacity * n * 4 if split_k > 1 else 0
+                group_layout = {}
+                if groups > 1:
+                    values_bytes = capacity * k
+                    row_scale_offset = (values_bytes + 255) // 256 * 256
+                    mma_offset = (row_scale_offset + capacity * k // 32 + 255) // 256 * 256
+                    mma_bytes = groups * ((capacity + 127) // 128) * 512 * (k // groups // 128)
+                    output_offset = (mma_offset + mma_bytes + 255) // 256 * 256
+                    group_layout = dict(groups=groups, activation_values_offset=0,
+                                        activation_row_scales_offset=row_scale_offset,
+                                        activation_mma_scales_offset=mma_offset,
+                                        grouped_output_offset=output_offset,
+                                        activation_scratch_bytes=output_offset,
+                                        scratch_bytes=output_offset + capacity * n * 2,
+                                        activation_mma_scale_shape=[32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
+                manifest['variants'].append({'capacity': capacity, 'plan_sms': plan_sms if dual else 0, 'expected_m': expected_m, 'label': label, 'input_dim': k, 'output_dim': n,
+                    'activation_scratch_bytes': layout.nbytes,
+                    'scratch_bytes': split_offset + split_bytes if split_k > 1 else layout.nbytes,
+                    'split_k_offset': split_offset, 'split_k_bytes': split_bytes,
+                    'activation_values_offset': layout.x_values_offset_bytes,
+                    'activation_row_scales_offset': layout.x_scale_rows_offset_bytes,
+                    'activation_mma_scales_offset': layout.x_scale_mma_offset_bytes,
+                    'activation_mma_scale_shape': list(layout.x_scale_mma_physical_shape),
+                    'split_k_slices': split_k, 'gemm_output_dtype': 'FP32' if split_k > 1 else 'BF16', 'output_dtype': 'BF16', 'output_bytes': capacity * n * 2,
+                    'quant_abi': validate_abi(output / (label + '_quant.h'), label + '_quant', 'group_quant' if groups > 1 else 'quant'),
+                    'gemm_abi': validate_abi(output / (label + '_gemm.h'), label + '_gemm', 'gemm'), **group_layout})
+                if groups > 1:
+                    manifest['variants'][-1]['quant_rope_abi'] = validate_abi(output / (label + '_quant_rope.h'), label + '_quant_rope', 'group_quant')
+                print(f'exported {label}', flush=True)
     from b12x.norm.mhc._v41_project import compile_v41_mhc_project_aot
     compile_v41_mhc_project_aot().export_to_c(str(output), 'v41_hc_project', 'cuteafd_v41_hc_project')
     manifest['hc_project'] = {'split_k': 8, 'scratch_bytes_per_row': 1536,

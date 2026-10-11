@@ -5,12 +5,11 @@
 # build (RTX local / MTP and TP2 routed layers), tp4, tp2 and tp6 in the SM121 Spark build. The daemon
 # resolves <libdir>/fp8/fp8-FAMILY/tp<world>; the artifact scripts install
 # the packages there. FAMILY:nvfp4 entries (glm, glmf, qwen4) build
-# fp8-FAMILY-nvfp4/ the same way for NVIDIA ModelOpt NVFP4 releases (W4A16:
-# packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
-# exporter geometry FAMILY_nvfp4); FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/,
-# whose large-row steps run W4A4 (activations quantized with the checkpoint's
-# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). A FAMILY:nvfp4
-# entry builds both, since the daemon serves W4A4 by default. glmfdense:nvfp4[a4]
+# fp8-FAMILY-nvfp4/ as a compatibility name for NVIDIA ModelOpt W4A4.
+# FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/, the runtime's required package:
+# every row count quantizes original BF16 inputs with each expert's calibrated
+# input_scale and uses block-scaled FP4 MMAs. No NVFP4 W4A16 serving mode exists.
+# A FAMILY:nvfp4 entry builds both naming aliases. glmfdense:nvfp4[a4]
 # is GLM 5.3 Flash's NVFP4 dense MLP (one always-selected expert, coordinator tp1).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
@@ -56,20 +55,32 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
     message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|mimof|glm|glmf|qwen4):fp8 (mimof/mimop: MXFP4 weights) \
-or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
+or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts)")
   endif()
   # Both roles carry exact layouts where TP slices differ in width; RTX TP2
   # uses the same whole-H128 contract as the Spark backend.
   set(exact_slices "--exact-slices")
+  set(requested_layouts)
+  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND NOT CUTEAFD_GENERIC_SPARK_COUNTS STREQUAL "")
+    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)
+      if(NOT count MATCHES "^[1-8]$")
+        message(FATAL_ERROR "CUTEAFD_GENERIC_SPARK_COUNTS requires counts 1..8, got ${count}")
+      endif()
+      list(APPEND requested_layouts "tp${count}")
+    endforeach()
+    list(REMOVE_DUPLICATES requested_layouts)
+    list(JOIN requested_layouts "," requested_layout_csv)
+    set(requested_layouts --layouts "${requested_layout_csv}")
+  endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
-  file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}\n")
+  file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
   add_custom_command(
     OUTPUT "${package}/manifest.json"
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${package}"
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
       "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
-      --role "${CUTEAFD_FP8_MOE_ROLE}" --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices}
+      --role "${CUTEAFD_FP8_MOE_ROLE}" --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports" --output "${package}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
       --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
@@ -78,7 +89,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
     COMMENT "Building exact FP8 expert package fp8-${geometry} (${CUTEAFD_FP8_MOE_ROLE})"
     VERBATIM)
   list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${package}/manifest.json")
-  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES)
+  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES AND NOT entry MATCHES ":nvfp4")
     set(bf16_package "${package}-bf16")
     add_custom_command(
       OUTPUT "${bf16_package}/manifest.json"
@@ -86,7 +97,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
       COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
         "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
-        --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices}
+        --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_bf16" --output "${bf16_package}"
         --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
         --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"

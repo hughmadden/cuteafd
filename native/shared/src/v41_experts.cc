@@ -64,9 +64,8 @@ struct Variant {
   uint64_t scratch_offsets[CUTEAFD_V41_EXPERT_POINTERS];
   cudaLibrary_t library = nullptr;
   int device = -1;
-  // The export host's SM count is a ceiling on the cooperative grid, not a
-  // property of the cubin: the same artifact serves any SM120 part. Remember
-  // the live device's count so the launch can clamp to it.
+  // The header declares capacity; only the queried device count controls the
+  // cooperative launch grid.
   int device_sms = 0;
   ~Variant() { if (library) cudaLibraryUnload(library); }
 };
@@ -138,6 +137,17 @@ extern "C" int32_t cuteafd_expert_initialize_scratch_async(void* kernel,
       variant->info.experts, stream);
 }
 
+#ifdef CUTEAFD_V41_NVFP4_VARIANTS_HEADER
+extern "C" int32_t cuteafd_expert_shared_input() {
+#ifdef CUTEAFD_V41_NVFP4_SHARED_INPUT
+  return CUTEAFD_V41_NVFP4_SHARED_INPUT;
+#else
+  // Old artifacts did not advertise the policy: never claim they are exact.
+  return -1;
+#endif
+}
+#endif
+
 extern "C" int32_t cuteafd_expert_info(int32_t capacity, cuteafd_expert_info_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
@@ -156,8 +166,8 @@ namespace {
 // Cubins require the exported architecture, not the export host's SM count.
 int32_t reject_expert_device(const char* what, int device, int major, int minor, int sms) {
   std::fprintf(stderr,
-               "cuteafd: %s AOT kernels were exported for compute 12.%d with %d SMs, but device "
-               "%d is compute %d.%d with %d SMs; rebuild the AOT export on the target GPU "
+               "cuteafd: %s AOT kernels support compute 12.%d up to %d SMs, but device "
+               "%d is compute %d.%d with %d SMs; rebuild with sufficient architecture capacity "
                "(cudaErrorInvalidDevice)\n",
                what, int(CUTEAFD_V41_CC_MINOR), int(CUTEAFD_V41_SMS), device, major, minor, sms);
   return cudaErrorInvalidDevice;
@@ -177,7 +187,7 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   if (status != cudaSuccess) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
   if (status != cudaSuccess) return status;
-  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
+  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR || sms <= 0 || sms > CUTEAFD_V41_SMS)
     return reject_expert_device("v41 expert", device, major, minor, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   if (variant->device >= 0) {
@@ -216,8 +226,8 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   variant->device = device;
   if (sms != CUTEAFD_V41_SMS)
     std::fprintf(stderr,
-                 "cuteafd: v41 expert AOT was exported on a %d-SM part but device %d has %d SMs; "
-                 "using the same kernels with the launch cluster cap clamped to %d\n",
+                 "cuteafd: v41 expert AOT reserves %d-SM capacity; device %d has %d SMs; "
+                 "using runtime launch cluster cap %d\n",
                  int(CUTEAFD_V41_SMS), device, sms, sms);
   *out = variant;
   return cudaSuccess;
@@ -240,9 +250,8 @@ extern "C" int32_t cuteafd_expert_launch(void* kernel, const cuteafd_expert_laun
   if (device != variant->device) return cudaErrorInvalidDevice;
   void* pointers[44];
   std::copy(args->tensors, args->tensors + 44, pointers);
-  // The cooperative grid cannot exceed the live device's SM count. The export
-  // host may have had more, which is the only respect in which the artifact is
-  // host-specific.
+  // Respect explicit tuning below the live residency limit. Architecture
+  // capacity is only validation/allocation metadata, never a runtime SM count.
   int32_t max_active_clusters = args->max_active_clusters;
   if (max_active_clusters > 0 && variant->device_sms > 0 &&
       max_active_clusters > variant->device_sms)
@@ -271,9 +280,8 @@ namespace {
 struct InputQuantModule {
   cudaLibrary_t library = nullptr;
   int device = -1;
-  // The export host's SM count is a ceiling on the cooperative grid, not a
-  // property of the cubin: the same artifact serves any SM120 part. Remember
-  // the live device's count so the launch can clamp to it.
+  // The header declares capacity; only the queried device count controls the
+  // cooperative launch grid.
   int device_sms = 0;
   ~InputQuantModule() { if (library) cudaLibraryUnload(library); }
 } input_quant, peer_input_quant;

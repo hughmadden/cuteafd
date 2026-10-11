@@ -7,7 +7,7 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
-use scores::TokenScores;
+use scores::RetainedScores;
 mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
@@ -128,12 +128,12 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     // is never compact.
     let compact = legacy_compact(topology, args.peers.len());
     ensure!(
-        topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4),
-        "two, three or four Spark peers required for the legacy non-topology layout; \
+        topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
+        "two, three, four or six Spark peers required for the legacy non-topology layout; \
          an explicit --spark-tp/--spark-ep topology carries its own rank count"
     );
     ensure!(
-        args.peers.len() == 4 || topology.is_some() || (args.rtx_gpus == 1 && !args.exl3_paired_tp4),
+        matches!(args.peers.len(), 4 | 6) || topology.is_some() || (args.rtx_gpus == 1 && !args.exl3_paired_tp4),
         "two or three Spark peers require the single-RTX, non-paired EXL3 profile"
     );
     if compact {
@@ -148,6 +148,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
+    ensure!((0.0..1.0).contains(&args.decode_share), "--decode-share must be in [0, 1)");
     args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
@@ -329,9 +330,14 @@ fn spark_transport(
             cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
         ], capacity, config),
         4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
+        6 => {
+            let ids = (0..6).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(6, rank))
+                .collect::<Result<Vec<_>>>()?;
+            SparkExperts::new_ranks(peers, &ids, capacity, config)
+        }
         _ => anyhow::bail!(
-            "the legacy non-topology transport takes two, three or four Spark peers; \
-             a six-rank layout (pure TP6EP1 or replicated) must pass --spark-tp/--spark-ep"
+            "the legacy non-topology transport takes two, three, four or six Spark peers; \
+             replicated layouts must pass --spark-tp/--spark-ep"
         ),
     }
 }
@@ -380,9 +386,9 @@ fn worker(
     let small_card = device_total <= 32usize << 30;
     if small_card {
         let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
-        if let Some(shapes) = super::v41_layer_graphs::profile_fixed_shapes(device_total, explicit.as_deref())? {
+        if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
             tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
-            super::v41_layer_graphs::set_fixed_shapes(shapes)?;
+            super::graph_policy::set_fixed_shapes(shapes)?;
         }
     }
     if small_card && !legacy_compact(None, args.peers.len()) {
@@ -415,11 +421,10 @@ fn worker(
         // library cannot reduce this physical-rank count.
         lib.v41_compact_reducer()?
             .require_rank_count(topology.world_size() as u32)?;
-    } else if args.peers.len() == 3 {
-        // The implicit three-rank EXL3 group reduces through the N-plane entry,
-        // so it gets the same fail-fast rule. The two-rank group keeps using its
-        // historical pairwise reducer path untouched.
-        lib.v41_compact_reducer()?.require_rank_count(3)?;
+    } else if matches!(args.peers.len(), 3 | 6) {
+        // Implicit EXL3 groups use the N-plane reducer too; reject missing
+        // artifacts before weights are loaded. TP2 keeps its pairwise path.
+        lib.v41_compact_reducer()?.require_rank_count(args.peers.len() as u32)?;
     }
     ensure!(
         args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),
@@ -767,111 +772,12 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     job: &NativeRequest,
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     hold: &mut dyn FnMut() -> Result<()>,
-) -> Result<TokenScores> {
-    use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
-    let end = tokens.len() as u64;
-    let cached = requests.cache().committed_end(lease)? as usize;
-    let stage = requests.cache().stage(lease)?;
-    let replay = stage == CacheStage::EncoderReplay;
-    if cached > 0 && stage == CacheStage::Full {
-        return prefill_continuation(
-            lib,
-            runtime,
-            pass,
-            requests,
-            transport,
-            lease,
-            &tokens[cached..],
-            chunk_rows,
-            job,
-            draft,
-            hold,
-        );
-    }
-    let mut suffix = pass.new_suffix(lib, end)?;
-    if replay {
-        let start = requests.cache().history_end(lease)? as usize;
-        ensure!(
-            cached - start <= 128,
-            "encoder prefix replay exceeds one window"
-        );
-        for chunk in tokens[start..cached].chunks(chunk_rows) {
-            ensure!(!job.events.is_closed(), "client disconnected");
-            prefill_hold(hold);
-            let mut batch = requests.prepare(&[RequestTokens {
-                lease,
-                tokens: chunk,
-                image_mask: None,
-                kind: ExpertV2SourceKind::Prefill,
-            }])?;
-            let result = (|| -> Result<()> {
-                runtime.block_on(unsafe {
-                    pass.encoder_part(requests, &mut batch, transport, &mut suffix)
-                })?;
-                ensure!(!job.events.is_closed(), "client disconnected");
-                runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, None, chunk.len() as u32))
-            })();
-            if result.is_err() {
-                pass.discard(&mut batch)?;
-            }
-            result?;
-        }
-    } else if stage == CacheStage::Full {
-        requests.begin_encoder(lease, end)?;
-    }
-    let mut chunks = tokens[cached..].chunks(chunk_rows);
-    // Keep the ordinary path for short prompts; pair full chunks first otherwise.
-    if chunks.len() == 1 {
-        let chunk = chunks.next().expect("one chunk");
-        ensure!(!job.events.is_closed(), "client disconnected");
-        prefill_hold(hold);
-        let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
-            image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        let started = Instant::now();
-        let result = (|| -> Result<()> {
-            runtime.block_on(unsafe { pass.encoder_part(requests, &mut batch, transport, &mut suffix) })?;
-            ensure!(!job.events.is_closed(), "client disconnected");
-            runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, None, chunk.len() as u32))
-        })();
-        if result.is_err() { pass.discard(&mut batch)?; }
-        result?;
-        console::totals::prefill(chunk.len());
-        console::Prefill::done(console::PrefillKind::Single, 0, 0, 1, chunk.len(), started);
-        tracing::debug!(target: "cuteafd::timing", rows=chunk.len(), total_us=started.elapsed().as_micros() as u64, "target encoder step");
-    }
-    if chunks.len() != 0 {
-        let chunks: Vec<_> = chunks.collect();
-        let started = Instant::now();
-        // The hold must reach every chunk the stream dispatches; both lanes share one
-        // `&dyn Fn` hook, so the mutable callback goes through a RefCell (calls are
-        // synchronous, single-threaded, never nested).
-        let hold = std::cell::RefCell::new(&mut *hold);
-        let before_chunk = || -> Result<()> {
-            prefill_hold(&mut *hold.borrow_mut());
-            Ok(())
-        };
-        runtime.block_on(unsafe { pass.execute_encoder_stream_held(other, requests, lease, &chunks,
-            [transport, other_transport], &mut suffix, &|| !job.events.is_closed(), &before_chunk) })?;
-        tracing::debug!(target: "cuteafd::timing", rows=tokens.len(),
-            total_us=started.elapsed().as_micros() as u64, "target encoder stream");
-    }
-    ensure!(!job.events.is_closed(), "client disconnected");
-    let start = requests.begin_decoder_replay(lease)?;
-    let rows = (end - start) as u32;
-    let mut batch = requests.prepare_replay(&[CacheWork { lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
-    let started = Instant::now();
-    let result = (|| -> Result<TokenScores> {
-        let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
-            transport, &[rows as usize - 1], Some(&suffix)) })?;
-        let scores = TokenScores::new(scores::VOCAB, bytes)?;
-        ensure!(!job.events.is_closed(), "client disconnected");
-        runtime.block_on(pass.commit_prefill(requests, &mut batch, draft, rows))?;
-        Ok(scores)
-    })();
-    if result.is_err() { pass.discard(&mut batch)?; }
-    console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
-    tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
-    result
+) -> Result<RetainedScores> {
+    use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
+    let mut times = V41PrefillTimes::default();
+    let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
+        other_transport, lease, tokens, chunk_rows, job, draft, hold, times: &mut times };
+    crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
 }
 
 /// A benchmark probe's teacher-forced scoring pass finished: the request
@@ -908,6 +814,27 @@ impl ScoringPlan {
         Ok(Self { path, rows })
     }
 
+    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize) -> Result<Self> {
+        let mut plan = Self::new(spec)?;
+        if plan.path == crate::shared::probe::ScorePath::Prefill && spec.score_positions.is_some() {
+            // Sparse scoring keeps the head bounded while exercising the actual prefill geometry.
+            ensure!(chunk_rows > 0, "prefill scoring capacity is zero");
+            plan.rows = chunk_rows;
+        }
+        Ok(plan)
+    }
+
+    fn head_rows(&self, probe: &cuteafd_api::openai::probe::Probe,
+        step: &std::ops::Range<usize>) -> Result<Vec<usize>> {
+        let sparse = self.path == crate::shared::probe::ScorePath::Prefill
+            && probe.spec.score_positions.is_some();
+        let mut rows: Vec<usize> = (0..step.len())
+            .filter(|&row| !sparse || probe.wants(step.start + row + 1)).collect();
+        ensure!(rows.len() <= SCORING_ROWS, "scored prefill selection exceeds target head capacity");
+        if rows.is_empty() { rows.push(step.len() - 1); }
+        Ok(rows)
+    }
+
     fn steps(&self, from: usize, len: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
         let rows = self.rows;
         (from..len - 1).step_by(rows).map(move |start| start..(start + rows).min(len - 1))
@@ -934,7 +861,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    let plan = ScoringPlan::new(&probe.spec)?;
+    let plan = ScoringPlan::for_probe(&probe.spec, chunk_rows)?;
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
@@ -944,9 +871,9 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     for step in plan.steps(from, tokens.len()) {
         ensure!(!job.events.is_closed(), "client disconnected");
         let chunk = &tokens[step.clone()];
+        let selected = plan.head_rows(probe, &step)?;
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: plan.source_kind(chunk.len()) }])?;
-        let selected: Vec<usize> = (0..chunk.len()).collect();
         let result = (|| -> Result<Vec<u8>> {
             let bytes = match plan.path {
                 crate::shared::probe::ScorePath::Prefill => {
@@ -964,7 +891,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
                     pass.download_logits(&batch, &selected).await
                 })?,
             };
-            ensure!(bytes.len() == chunk.len() * scores::ROW_BYTES, "scoring logits extent differs");
+            ensure!(bytes.len() == selected.len() * scores::ROW_BYTES, "scoring logits extent differs");
             // Scoring never proposes drafts. Retain the legacy draft/cache
             // commit for calibration, but verify commits only teacher-forced rows.
             let scoring_draft = if plan.path == crate::shared::probe::ScorePath::Prefill { draft.as_deref_mut() } else { None };
@@ -973,8 +900,11 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         })();
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
-        for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
-            probe.row(step.start + j + 1, &TokenScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+        for (&selected_row, row) in selected.iter().zip(bytes.chunks_exact(scores::ROW_BYTES)) {
+            probe.row(step.start + selected_row + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+        }
+        if plan.path == crate::shared::probe::ScorePath::Prefill {
+            probe.scored_prefill_chunk(step.start + 1, chunk.len());
         }
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
@@ -1000,6 +930,29 @@ mod scoring_tests {
         assert_eq!(decode.source_kind(8), ExpertV2SourceKind::MtpVerify);
         let prefill = ScoringPlan::new(&ProbeSpec { score_path: Some("prefill".into()), ..ProbeSpec::default() }).unwrap();
         assert_eq!(prefill.rows, legacy.rows);
+    }
+
+    #[test]
+    fn sparse_prefill_uses_backbone_capacity_without_changing_decode_head_indices() {
+        let spec = ProbeSpec { score_path: Some("prefill".into()),
+            score_positions: Some(vec![101, 1100, 2048]), ..ProbeSpec::default() };
+        let plan = ScoringPlan::for_probe(&spec, 2048).unwrap();
+        assert_eq!(plan.rows, 2048);
+        let probe = Probe::new(spec.clone());
+        assert_eq!(plan.head_rows(&probe, &(100..2148)).unwrap(), vec![0, 999, 1947]);
+        assert_eq!(plan.head_rows(&probe, &(2148..4196)).unwrap(), vec![2047]);
+        assert!(ScoringPlan::for_probe(&spec, 0).is_err());
+        let too_many = Probe::new(ProbeSpec { score_positions: Some((101..150).collect()),
+            ..spec.clone() });
+        assert!(plan.head_rows(&too_many, &(100..2148)).is_err());
+
+        let decode_spec = ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(8), ..spec };
+        let decode = ScoringPlan::for_probe(&decode_spec, 2048).unwrap();
+        assert_eq!(decode.rows, 8);
+        assert_eq!(decode.head_rows(&Probe::new(decode_spec), &(100..108)).unwrap(),
+            (0..8).collect::<Vec<_>>());
+        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048).unwrap().rows, 48);
     }
 
     #[test]
@@ -1046,7 +999,7 @@ mod scoring_tests {
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,
-    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<TokenScores> {
+    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<RetainedScores> {
     ensure!(!tokens.is_empty(), "prefix continuation has no uncached rows");
     let mut anchor = None;
     let count = tokens.len().div_ceil(chunk_rows);
@@ -1056,10 +1009,10 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         let started = Instant::now();
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        let result = (|| -> Result<TokenScores> {
+        let result = (|| -> Result<RetainedScores> {
             let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
                 &[chunk.len() - 1], None) })?;
-            let scores = TokenScores::new(scores::VOCAB, bytes)?;
+            let scores = RetainedScores::new(scores::VOCAB, bytes)?;
             ensure!(!job.events.is_closed(), "client disconnected");
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)

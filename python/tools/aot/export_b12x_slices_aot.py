@@ -130,6 +130,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             raise ValueError("compact live-row cutoff must fit the selected capacities")
     elif compact_live_rows is not None:
         raise ValueError("compact live-row cutoff requires compact capacity selection")
+    workspace_sms = 48 if props.minor == 1 else 188
     output.mkdir(parents=True, exist_ok=True)
     manifest = dict(
         schema=1,
@@ -330,7 +331,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             capacity,
             routes,
             routes,
-            props.multi_processor_count,
+            workspace_sms,
             1 if coordinator else 7,
         ]
         prefix = "_mlir_cuteafd_" + label
@@ -370,7 +371,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 "#pragma once",
                 *includes,
                 f"#define CUTEAFD_V41_CC_MINOR {props.minor}",
-                f"#define CUTEAFD_V41_SMS {props.multi_processor_count}",
+                f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) (" +
                 (" || ".join(f"((capacity)=={v['capacity_rows']})" for v in manifest['variants']

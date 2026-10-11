@@ -1749,6 +1749,56 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 
 ## Release v3 scope (decided 2026-10-09)
 
+### V4.1 Spark TP3 is a fit-minimum option (2026-10-11)
+
+Keep TP4 as the serving default wherever four Sparks fit; TP3 is a
+three-Spark fit-minimum option, not a speed default. TP3 eliminates TP4's
+576-to-640 row padding, but each rank owns one third rather than one quarter
+of the expert, increasing per-rank logical expert traffic by 33%.
+
+Native MXFP4, one RTX PRO 6000, 100G Spark links (one selected rail), raptor
+400G, 2M admitted KV, C16, prefill2048, auto-local8, dSpark adaptive,
+vision-spark/audio-auto/prefix20: three warmed matched-prompt pairs at the
+same sealed `tp36fix` build, ordered TP4/TP3, TP3/TP4, TP4/TP3. Both arms use
+coordinator runtime `f67f71da`, Spark daemon `d6694d9c`, fork `8c211189`.
+
+| Metric | Pair 1 TP4 -> TP3 | Pair 2 TP4 -> TP3 | Pair 3 TP4 -> TP3 | Median paired TP3/TP4 |
+| --- | --- | --- | --- | --- |
+| C1 code tok/s | 136.37 -> 103.86 | 136.48 -> 124.07 | 124.23 -> 115.81 | 0.9091 |
+| C8 aggregate tok/s | 331.12 -> 259.03 | 388.83 -> 274.62 | 347.04 -> 276.36 | 0.7823 |
+| C16 aggregate tok/s | 384.26 -> 316.88 | 453.88 -> 337.59 | 452.51 -> 327.03 | 0.7438 |
+| 8K prefill tok/s | 6541.53 -> 6552.47 | 6530.27 -> 6466.19 | 6555.15 -> 6331.78 | 0.9902 |
+| Server readiness s | 50.161 -> 51.367 | 49.596 -> 51.266 | 48.990 -> 51.469 | 1.0337 |
+
+Resident expert bytes per Spark are 64,172,851,200 (TP4) versus
+77,007,421,440 (TP3), exact planner/runtime equality in all six launches.
+Median readiness per aggregate resident decimal GB is 0.193213 versus
+0.222345 s/GB; the denominator excludes coordinator weights and workspaces.
+Both arms admit 2,097,152 tokens; physical capacity rounds to 2,125,824 with
+prefix reservations, global pool 1,891,983,360 B and cache 1,936,487,936 B.
+Ring admission is 1,024,851,968 B/rank, observed high-water 512,491,520 B.
+Cache exactness passes; speculation reports the project's accepted INFO
+status; Quick fidelity and fabric checks pass. Neither wide paired median
+is within 3%, so the full-policy control is not triggered. TP3's lower decode
+speed is expected rank traffic, not a kernel correctness regression.
+Evidence: `~/.cache/cuteafd/builds/v41-tp3/hardware/perf-native-min/measurements.json`.
+NVFP4 correctness is independently qualified against release TP4; perf
+panel KL is informational and must not replace that qualification gate.
+
+V4.1 EXL3 `diffbot/DeepSeek-V4.1-Flash-EXL3-2.0bpw-2x-RTX-PRO-6000`
+(revision `28b7ab71`, 2026-10-12): fidelity **FAIL due to the uncalibrated
+checkpoint**, not an engine defect. The publication uses greedy MCG trellis
+search at beam 16 for routed experts only. Whole-model Quick KL is 0.3003
+with local40 and 0.3053 with local8 plus genuine remote TP4. An independent
+CPU official-reference forward with EXL3-dequantized experts on the legacy
+256-token prefix (192 scored positions) reproduces root KL: 0.659690 versus
+engine 0.638246 (+3.36%), per-position correlation 0.987669. Its 15 argmax
+disagreements have median top1/top2 margin 0.174255 nat; all 15 engine
+choices are in the reference top3. The engine reproduces the quantized
+model; retain the checkpoint fidelity FAIL and TP3/TP4 layout support.
+EXL3 TP6 remains refused pending genuine remote qualification; TP4 stays
+the serving default. Evidence: `~/.cache/cuteafd/builds/v41-tp3/independent-exl3-cpu-256/{result,argmax-confirmation}.json`.
+
 TJ: two key items, both urgent right after v2.0.0.
 1. **Multi-GPU coordinator placement and memory management for every family.**
    One shared design replaces today's per-family patchwork:
@@ -3798,8 +3848,9 @@ earlier per-kind-alternating records but with one ownership transition.
 GLM contiguous records are 27560/26380 B per token versus alternating
 25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners.
 Fewer owner transitions do not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
-The extra TP2 counts are calibrated admission fixtures, not executor gates;
-all production attention-placement defaults remain `heads`.
+The extra TP2 counts are calibrated admission fixtures, not executor gates.
+GLM 5.3's default is `context` (K3, 2026-10-11, measured below); every other
+family's production default remains `heads`.
 
 ### 7. Cost against today's head split
 
@@ -3879,6 +3930,7 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
 | K1 | Fork kernels (sparkinfer-glmrt master, then pin): scored index top-k (GLM, GLM Flash pools, V4 C4); `dsa_candidate_merge` (2k → k by (score, logical), emits the compacted local slot list); sparse MLA decode `partial` route (head range, partial + LSE, no sink) for 656 / 528 / 584 records (V4's "584" is a planar 576 B payload row plus an 8 B per-row footer, in 576-aligned padded pages: C4 37,440 B, SWA 149,760 B; indexer keys keep planar scales); `lse_combine2` (optional sink); paged → contiguous staging gather of whole pages, footers and padding included, byte-exact | M | — | SM120 + SM121 tests vs an FP64 reference: merged selection bit-equal to single-GPU top-k on random and all-ties inputs; empty shard gives −inf / 0; combine matches the 2-split merge |
 | K2 | Shared parts: `shared/peer_split/context.rs` (`ContextExchange`, page owner map), `RefPagePool` parity half-pools, `PrefixFamily::page_device`, per-device host-tier copies; `order::check` fixtures for the context decode and the two-lane `layers` schedules | M | K0 | prefix-cache tests (fork, tail copy on owner, eviction balance, host round trip); order fixtures |
 | K3 | GLM 5.3 `context` (needs P9's solver port, pulled ahead of P7: it depends only on P1/P3): attention path of section 1, gather prefill, single-owner prefix pages, host tier on | L | K1, K2, P9a | section 4's GLM 5.3 row; exact-prefix byte-exact incl. host tier; planner == runtime; the 2M pool admits at max; quick A/B at max: C1 ≥ `heads` C1 (at its 1.29M pool), C8, 8K prefill within 3%; one 256K-context C1 decode for the indexer claim |
+| K3 result (2026-10-11) | Done, default `context` (TJ: no replicated KV; pool first, not C1-gated). Max EXL3 K4, 2 RTX + 6 Sparks at 100G, one matched pair: pool 1,321,216 → 2,097,152; C1 54.68 → 52.74 (0.965); C8 105.9 → 107.5; 8K prefill 3,042 → 3,125; fidelity KL 0.0378 → 0.0390, top-1 96.2 → 96.6%; retained C1 0.89-0.94× to 128K, 1.00× at 256K (30.0 vs 29.9), 256K TTFT 114 → 107 s. Prefill logits byte-identical to `heads`; exact restores byte-identical; planner == ledger to the byte. C1 recovery is a follow-up (fuse the q push into the producer, overlap own-head partials). | | | |
 | K4 | GLM 5.3 `layers`: per-layer executor (`Whole{g, Split}` by indexer group, `AfterAttention` hops via `HopLink`), two-lane decode/verify | L | K2, P9a | quick fidelity; order fixtures per interleaving; A/B at max at 2M |
 | D-GLM | **Decision:** C1 `context` vs `layers` at 2M on max (3 interleaved sessions; 6 if within 1%), plus C8/C16 for both. Default per TJ's rule, recorded in `docs/models/glm5.md` with the numbers. | — | K3, K4 | — |
 | K5 | V4 Flash/Pro `context` on C4 layers (C128 and window layers stay `HeadSplit`), sink in the combine, with P4 TP2 (+2 / +1 pairs) | M | K3, P4 | section 4's V4 rows; exact cache; A/B at max at 2M |
@@ -6140,6 +6192,72 @@ Ideas TJ wants kept for later; not v2 work.
   item 6, "v3 draft policy: resource-priced, shared". The Astra review
   (`builds/draft-policy-review/REPORT.md`) is an input; its deterministic
   cohort mode and cross-lane contention pricing stay here, after v3.
+
+## v3 follow-ups found in gates (2026-10-11)
+
+- **Encoder placement in the solve.** On V4.1 NVFP4 TP3, 1 RTX, the planner
+  decides the vision tower before onboarding local layers and keeps that
+  verdict: the tower needs 4,003,895,360 B with margin, pre-onboarding
+  headroom is 3,340,082,217 B, final auto-local-8 headroom is
+  23,724,448,809 B. The launcher forces local 0. Place the encoder as a
+  solver item beside local layers and the pool, so plan and launcher agree.
+  Evidence: `builds/v41-tp3/hardware/nvfp4-tp3-vision-finding.json`.
+- **GLM 5.3 `context` C1.** It is 0.965x `heads` because extra kernels cost
+  about 65 us per layer, not the exchanges. Fuse the q push into the producer
+  and overlap own-head partials with the peer push. Stop at C1 >= `heads` or
+  a measured floor.
+- **Qwen NVFP4 FP8-KV decode.** It runs 0.93 (C1) / 0.91 (C8) of BF16 KV;
+  EXL3 is 0.97-0.99. The cause is unknown; attention explains about 2%.
+- **GLM Flash fresh C1.** Shared drafting is 0.971 of the old policy over
+  six pairs.
+- **Qwen TP5 sharding bug.** Same-harness EXL3 logits, TP5 against TP4: mean
+  KL 0.076, top-1 agreement 54/64, divergence from row 0 (KL 0.012). A correct
+  sharding should differ only in reduction order (about 1e-4). The CPU reducer
+  arithmetic and slice offsets pass, so the cause is Qwen-specific TP5 plumbing
+  shared by both formats. NVFP4 also fails the 1,500-row W4A4 reference at TP5
+  (normalized max 0.33-0.58 against TP4's 0.014). TP5 stays refused for Qwen.
+- **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
+- **DSH dashboard model gate** is unverified: the automation could not find
+  the composer iframe.
+- **GLM Flash NVFP4 nextn (layer 45) runs BF16 experts.** NVIDIA's config
+  declares W4A4 for all Linear modules and excludes nothing, but layer 45's
+  experts are stored BF16 with no scales. The selector follows the stored
+  tensors (unscaled BF16 keeps BF16; partial NVFP4 tensors are an error), but
+  there is no BF16 expert backend (`Fp8ExpertTensors::layer_format` takes
+  only F8E4M3/U8/I8), and GLM Flash serves external DFlash2/dSpark, not native
+  nextn. A native BF16 expert package is needed only if native MTP is
+  enabled for this checkpoint.
+- **Qwen NVFP4 C16 W4A4 throughput.** Making W4A4 the only expert path (the
+  small-row W4A16 fallback is deleted) dropped C16 code decode 631 -> 416 tok/s
+  (C1 80 -> 76); the wire was already BF16. Tune the small-row W4A4 GEMM
+  and dispatch.
+- **Dual-GPU lock starvation** is fixed by the fair FIFO queue
+  (`scripts/hw/hwlock.py`, smoke's `fair` ticket).
+- **Qualify the opt-in shelf (audit 2026-10-11).** Each item needs one
+  hardware decision:
+  - mapped-table uring/mincore;
+  - GLM Flash split-KDA FP8 rows (already passed 3 pairs on K3.25);
+  - GLM Flash GB10 schedule (bit-identical);
+  - MiMo prefill chunk and snapshot wait (C16 TTFT 91 -> 67 ms);
+  - GLM Flash BF16 KDA state and pool prefix marks (memory to KV);
+  - MiMo warm drafter marks and host tier;
+  - GLM Flash packed admission and chain verify.
+  Also: revive the deterministic Spark prefill reducer; delete
+  `work/mxfp4-tails` and `work/v41-exact`, and the old draft-policy switches
+  once shared drafting covers every family.
+- **Qualify the mapped-table io_uring backends (TJ).** They already exist
+  in the shared `cuteafd-loader` `MappedTable` (6b2a47bf, 10-07), used by
+  V4.1 engram and Qwen PLE: `mmap` (default), `uring` and `mincore-routed`
+  (mincore residency check, resident rows copied, misses as concurrent
+  io_uring reads), with hit/miss, byte and 7-tier miss-latency stats in the
+  console and bench. CPU cold-page witness, mmap -> mincore-routed: 3,072
+  rows 197 -> 4.6 ms. Warm pages: equal. What is missing is the
+  identical-config hardware A/B that the code requires before a default
+  change: V4.1 (engram on raptor) and Qwen (95 GiB BF16 PLE), cold and warm
+  page cache, C1/C16 and readiness. Flip the default if it is no worse warm.
+  The 10-01 mapped-tables campaign predates these backends.
+  `HostPreload` (whole table in pinned RAM) and `Device` stay opt-in and are
+  never auto-selected for tables this size.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

@@ -177,33 +177,7 @@ spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"
 # CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
 # topology A/B or a legacy TP4-only rebuild (empty).
 # release-spark-tp-roles:start
-release_spark_tp_roles_canonical() {
-  # Echo a role list sorted and de-duplicated, or die. An unknown token, an empty
-  # element, an embedded newline or a duplicate would advertise a topology the
-  # image cannot serve. The wholly empty list is the explicit legacy TP4-only
-  # request. $2 names the source in diagnostics: the build override or the label.
-  local raw="$1" source_name="${2:-CUTEAFD_RELEASE_SPARK_TP_ROLES}"
-  local entry prior
-  local -a parts=() selected=()
-  [[ -n "$raw" ]] || return 0
-  [[ "$raw" != *";;"* && "$raw" != ";"* && "$raw" != *";" && "$raw" != *$'\n'* ]] ||
-    release_die "$source_name is not a ';'-separated role list: $raw"
-  IFS=';' read -ra parts <<<"$raw"
-  for entry in "${parts[@]}"; do
-    case "$entry" in
-      tp2|tp3|tp6) ;;
-      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
-    esac
-    for prior in ${selected[@]+"${selected[@]}"}; do
-      [[ "$prior" != "$entry" ]] ||
-        release_die "$source_name lists $entry more than once"
-    done
-    selected+=("$entry")
-  done
-  printf '%s\n' "${selected[@]}" | sort | paste -sd';' -
-}
-
-release_universal_spark_tp_roles="tp2;tp3;tp6"
+release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 # `${VAR-default}`, not `:-`, so an explicitly empty override stays the legacy
 # TP4-only request rather than falling back to the universal set.
 spark_tp_roles="$(release_spark_tp_roles_canonical \
@@ -758,11 +732,13 @@ timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_expo
   "${release_build_user_args[@]}" \
   "${compiler_cache_args[@]}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   -e "CUTEAFD_RELEASE_DSV4_MAX_CONTEXT=${CUTEAFD_RELEASE_DSV4_MAX_CONTEXT:-1048576}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT=${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
@@ -1023,6 +999,7 @@ docker run --rm --name "$export_container" \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \

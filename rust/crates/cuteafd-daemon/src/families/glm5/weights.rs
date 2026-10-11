@@ -30,6 +30,7 @@ use crate::shared::peer_split::{slice_2d, Axis};
 pub(crate) struct GlmLayer<'a> {
     pub dense: bool,
     pub full_indexer: bool,
+    pub mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics,
     /// One GPU's share of a head split: q_b, kv_b and o_proj cover its heads
     /// (o_proj gives a partial sum), the dense / shared-expert MLP its slice of
     /// the intermediate (a partial sum); it runs the split (`glm2`) programs.
@@ -547,7 +548,8 @@ impl<'a> GlmLoader<'a> {
     /// of the dense or shared-expert intermediate; every rank the replicated
     /// latent projection (q_a | kv_a), its norms and the DSA indexer; rank 0
     /// the router.
-    pub fn layer(&self, cfg: &GlmDsaConfig, layer: usize) -> Result<Vec<GlmLayer<'a>>> {
+    fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
+        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint) -> Result<Vec<GlmLayer<'a>>> {
         let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
         let dense = layer < cfg.first_moe_layer;
@@ -646,6 +648,11 @@ impl<'a> GlmLoader<'a> {
             put(&mut ops, "k_norm_b", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.bias")))?);
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+        let mlp_numerics = checkpoint.module_numerics(&format!("{mlp}.gate_proj"))?;
+        for projection in ["up_proj", "down_proj"] {
+            ensure!(checkpoint.module_numerics(&format!("{mlp}.{projection}"))? == mlp_numerics,
+                "{mlp}: mixed declared MLP arithmetic is unsupported");
+        }
         let (gate_up, down) = ([format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")],
             [format!("{mlp}.down_proj.weight")]);
         if !dense && self.bf16_native(&[&gate_up[..], &down[..]].concat())? {
@@ -656,7 +663,7 @@ impl<'a> GlmLoader<'a> {
             with_fp8(&mut ops, "w_gate_up", &gate_up, Axis::Rows)?;
             with_fp8(&mut ops, "w_down", &down, Axis::Cols)?;
         }
-        // ModelOpt per-tensor FP8 dense MLPs also carry their static W8A8 scales (prefill).
+        // Retain the checkpoint's static activation scales for every execution shape.
         if dense {
             if let (Some(gu), Some(d)) = (self.tensor_scales(&gate_up)?, self.tensor_scales(&down)?) {
                 put(&mut ops, "w_gate_up_tscale", self.upload_all(ranks, &gu)?);
@@ -667,7 +674,12 @@ impl<'a> GlmLoader<'a> {
             ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
         }
-        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, split: ranks > 1, operands }).collect())
+        if mlp_numerics == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
+            ensure!(ops.iter().all(|operands| operands.contains_key("w_gate_up_tscale")
+                && operands.contains_key("w_down_tscale")),
+                "{mlp}: declared W8A8 needs native per-tensor activation scales");
+        }
+        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, operands }).collect())
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
@@ -675,9 +687,10 @@ impl<'a> GlmLoader<'a> {
     /// other rank's layer shares.
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmDsaConfig, layers: usize) -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
-            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint)?) {
                 share.push(part);
             }
         }

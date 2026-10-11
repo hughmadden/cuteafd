@@ -38,6 +38,8 @@ import _pinned_sparkinfer
 # role -> (experts, intermediate, topk, capability)
 ROLES = {
     "spark": (384, 576, 6, (12, 1)),
+    "spark_tp3": (384, 768, 6, (12, 1)),
+    "spark_tp6": (384, 384, 6, (12, 1)),
     "rtx_backbone": (384, 2304, 6, (12, 0)),
     "rtx_tp2": (384, 1152, 6, (12, 0)),
     "dspark_tp2": (128, 1152, 3, (12, 0)),
@@ -112,11 +114,8 @@ def export(
     tile_m: int | None,
     max_active_clusters: int | None = None,
     output_shards: int = 1,
-    share_input: bool = False,
     pad_intermediate: bool = False,
 ) -> None:
-    if type(share_input) is not bool:
-        raise TypeError("share_input must be boolean")
     if type(pad_intermediate) is not bool:
         raise TypeError("pad_intermediate must be boolean")
     if type(output_shards) is not int or output_shards < 0 or (output_shards and 40 % output_shards):
@@ -143,6 +142,12 @@ def export(
             f"got {properties.major}{properties.minor}"
         )
     device = torch.device("cuda", torch.cuda.current_device())
+    workspace_sms = 188 if capability == (12, 0) else 48
+    # The dynamic kernel takes its cooperative grid as a runtime scalar.
+    # Reserve the architecture capacity, retaining explicit tuning overrides.
+    launch_clusters = workspace_sms if max_active_clusters is None else max_active_clusters
+    if type(launch_clusters) is not int or not 0 < launch_clusters <= 2 * workspace_sms:
+        raise ValueError(f"invalid NVFP4 cooperative launch capacity: {launch_clusters}")
     weight_plan = moe.plan_b12x_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
@@ -166,7 +171,7 @@ def export(
         "capability": [properties.major, properties.minor],
         "physical_sms": properties.multi_processor_count,
         "tile_m": tile_m,
-        "share_input": share_input,
+        "share_input": False,
         "pad_intermediate": pad_intermediate,
         "geometry": {
             "experts": experts,
@@ -187,6 +192,8 @@ def export(
         },
         "variants": [],
     }
+    if role.startswith("spark"):
+        manifest["spark_tp_degree"] = {"spark": 4, "spark_tp3": 3, "spark_tp6": 6}[role]
     includes: list[str] = []
     entries: list[str] = []
     for requested_rows in rows:
@@ -198,7 +205,7 @@ def export(
             dynamic_tile_m=tile_m,
             dynamic_route_mode=route_mode,
             w4a16_route_mode=None,
-            nvfp4_share_input=share_input,
+            nvfp4_share_input=False,
         )
         scratch_plan = moe.plan_tp_moe_scratch(
             moe.TPMoEScratchCaps(
@@ -230,19 +237,17 @@ def export(
             quant_mode="nvfp4",
             w4a8_repacked=False,
             nvfp4_materialize_intermediate=False,
-            # The front end quantizes each token once with a single shared
-            # activation scale and fans the row out to every routed expert,
-            # instead of re-quantizing the identical BF16 row per route.
-            share_input_across_experts=share_input,
+            # Each route retains its expert's static checkpoint scale.
+            share_input_across_experts=False,
             direct_routing=route_mode == "direct",
             # Compile with the same resolved tile that sized the scratch arena.
             planned_tile_m=plan.execution.tile_m,
             deterministic_output=True,
             swiglu_limit=10,
-            mac_override=max_active_clusters,
+            mac_override=launch_clusters,
             nvfp4_output_shards=output_shards if route_mode == "direct" or output_shards == 0 else 1,
         )
-        if not 0 < clusters <= 2 * properties.multi_processor_count:
+        if not 0 < clusters <= 2 * workspace_sms:
             raise ValueError(f"invalid NVFP4 cooperative launch grid: {clusters}")
         label = f"v41_nvfp4_{role}_m{requested_rows}"
         symbol = "cuteafd_" + label
@@ -322,7 +327,8 @@ def export(
             raise ValueError(f"unexpected deterministic NVFP4 route output for {label}")
         info = [
             2,  # abi_version: bridge layout only, no compact variant
-            {"spark": 1, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4}[role],
+            {"spark": 1, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4,
+             "spark_tp3": 6, "spark_tp6": 7}[role],
             experts,
             5120,
             source_intermediate,
@@ -383,7 +389,8 @@ def export(
                 "#pragma once",
                 *includes,
                 f"#define CUTEAFD_V41_CC_MINOR {properties.minor}",
-                f"#define CUTEAFD_V41_SMS {properties.multi_processor_count}",
+                f"#define CUTEAFD_V41_SMS {workspace_sms}",
+                "#define CUTEAFD_V41_NVFP4_SHARED_INPUT 0",
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
@@ -417,22 +424,17 @@ def main() -> None:
         "--max-active-clusters",
         type=int,
         default=None,
-        help="positive cooperative grid override; unset uses measured kernel occupancy",
+        help="positive cooperative grid override; unset reserves the architecture SM capacity",
     )
     parser.add_argument("--output-shards", type=int, default=1,
                         help="experimental output shards: 0 adapts direct/grouped routing; positive divisors of 40 split direct routing")
     parser.add_argument("--pad-intermediate", action="store_true",
                         help="zero-pad intermediate to 128 to avoid transposed FC1")
-    parser.add_argument(
-        "--share-input",
-        action="store_true",
-        help="quantize each token's activation once with a shared scale and fan it "
-             "out to every routed expert instead of per route",
-    )
+
     args = parser.parse_args()
     rows = [int(value) for value in args.rows.split(",") if value]
     export(args.output_dir, args.role, rows, args.tile_m, args.max_active_clusters,
-           args.output_shards, args.share_input, args.pad_intermediate)
+           args.output_shards, args.pad_intermediate)
 
 
 if __name__ == "__main__":

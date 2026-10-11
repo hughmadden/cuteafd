@@ -105,13 +105,15 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // policy until a qualified memory lever is needed.
     let executor = &request.executor;
     let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
-        .or(request.attention_placement).unwrap_or_else(|| executor.attention_default()) == AttentionPlacement::Layers
+        .or(request.attention_placement)
+        .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads }) == AttentionPlacement::Layers
         && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
     let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
             .or(request.attention_placement)
-            .or_else(|| (executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
+            // A family default other than heads applies only where it can run.
+            .or_else(|| (split && executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
         let desired = match selected {
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
@@ -135,6 +137,13 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
             .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })
     }).collect::<Result<Vec<_>, _>>()?;
+    for (index, (layer, &mode)) in request.layers.iter().zip(&modes).enumerate() {
+        if !matches!(mode, LayerMode::Whole { .. }) {
+            if let Some(demand) = layer.extra.iter().find(|d| d.residency == LayerResidency::Owner) {
+                return Err(PlacementError::OwnerDemand { layer: index, group: demand.group.clone(), mode });
+            }
+        }
+    }
     // Residual homes and the hops the modes imply (one GPU never hops).
     let (residual, hops) = residual_plan(&modes, &request.hops, gpus);
     if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !executor.hops) {
@@ -176,6 +185,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     }
     for (gpu, &bytes) in layer_fixed.iter().enumerate() {
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Kv, "layer state and marks", "", bytes, Basis::Formula))?; }
+    }
+    for (layer, &mode) in request.layers.iter().zip(&modes) {
+        for demand in &layer.extra {
+            for gpu in 0..gpus {
+                if demand.on_gpu(mode, gpu) {
+                    charge(&mut items, &mut used, gpu,
+                        Item::new(demand.category, demand.group.clone(), "", demand.bytes, demand.basis))?;
+                }
+            }
+        }
     }
     // Hop receive buffers are fixed demands of the modes (charged before the pool).
     let hop_bytes = hop_buffer_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
@@ -378,7 +397,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             } else { AttentionPlacement::Heads },
         attention_by_kind: request.layers.iter().map(|layer| {
             let mode = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, mode)| *mode)
-                .or(request.attention_placement).unwrap_or_else(|| executor.attention_default());
+                .or(request.attention_placement)
+                .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads });
             (layer.kind, mode)
         }).collect::<std::collections::BTreeMap<_, _>>().into_iter().collect(),
         peer_row_bytes: if context {
@@ -403,25 +423,51 @@ fn layer_whole_mode(request: &PlacementRequest, layer: &LayerDemand, gpu: u8) ->
         .find(|mode| layer.modes.contains(mode) && request.executor.runs(*mode))
 }
 
-/// One ownership boundary, never inside an indexer/colocate group. Compare
-/// persistent bytes at the requested pool, then the pool left by fixed state.
+/// One ownership boundary, never inside an indexer/colocate group. Balance
+/// owner-local weights, state and KV at the wanted pool, plus mandatory TP2
+/// residency. A fixed demand is owner-only when its (category, group) appears
+/// on only one rank: name head/MTP demands separately from paired rank groups.
+/// Paired groups (even with unequal bytes) and transient staging affect only
+/// the secondary actual-fit score. Auto with Sparks has no mandatory experts.
 fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
+    let mut groups = std::collections::BTreeMap::new();
+    for demand in &request.fixed {
+        *groups.entry((demand.category, demand.group.as_str())).or_insert(0u8) |= 1 << demand.gpu;
+    }
+    let mut owner_fixed = [0u64; 2];
+    for demand in &request.fixed {
+        if groups[&(demand.category, demand.group.as_str())].count_ones() == 1 {
+            let gpu = usize::from(demand.gpu);
+            owner_fixed[gpu] = owner_fixed[gpu].checked_add(demand.bytes)
+                .ok_or(PlacementError::Overflow("owner-only fixed"))?;
+        }
+    }
+    let mandatory_tp2 = mandatory_tp2_arenas(request)?;
     let mut best = None;
     for k in 0..=request.layers.len() {
         if request.layers.iter().enumerate().any(|(i, layer)| selected(layer) && layer.colocate.is_some_and(|group|
             request.layers.iter().enumerate().any(|(j, other)| selected(other) && other.colocate == Some(group) && (i < k) != (j < k)))) { continue; }
         let mut kv = [0u64; 2];
-        let mut fixed = [0u64; 2];
+        let mut fixed = owner_fixed;
+        for gpu in 0..2 {
+            fixed[gpu] = fixed[gpu].checked_add(mandatory_tp2[gpu].resident)
+                .ok_or(PlacementError::Overflow("owned TP2 residency"))?;
+        }
         for (i, layer) in request.layers.iter().enumerate().filter(|(_, l)| selected(l)) {
             let gpu = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
             kv[gpu] = kv[gpu].checked_add(layer.kv_unit.unit_bytes_whole).ok_or(PlacementError::Overflow("owned KV bytes"))?;
-            fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).ok_or(PlacementError::Overflow("owned state"))?;
+            fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).and_then(|n| n.checked_add(layer.weights.whole))
+                .ok_or(PlacementError::Overflow("owned state and weights"))?;
+            for demand in &layer.extra {
+                fixed[gpu] = fixed[gpu].checked_add(demand.bytes)
+                    .ok_or(PlacementError::Overflow("owned layer extras"))?;
+            }
         }
         let mut owned = [0u64; 2];
         for gpu in 0..2 { owned[gpu] = kv[gpu].checked_mul(request.pool.wanted_units()).and_then(|b| b.checked_add(fixed[gpu]))
             .ok_or(PlacementError::Overflow("owned pool bytes"))?; }
         let mut pool_bytes = request.pool_overhead.clone();
-        let mut base = [0u64; 2];
+        let mut base = mandatory_tp2.each_ref().map(|arena| arena.peak);
         for demand in &request.fixed {
             let g = usize::from(demand.gpu);
             base[g] = base[g].checked_add(demand.bytes).ok_or(PlacementError::Overflow("ownership fixed"))?;
@@ -434,6 +480,14 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
                 } else { (layer.kv_unit.unit_bytes_split[g], layer.fixed_bytes.split[g], layer.weights.split[g]) };
                 pool_bytes[g] = pool_bytes[g].checked_add(bytes).ok_or(PlacementError::Overflow("ownership pool"))?;
                 base[g] = base[g].checked_add(state).and_then(|n| n.checked_add(weights)).ok_or(PlacementError::Overflow("ownership fixed"))?;
+                let mode = if selected(layer) { LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Owner } }
+                    else { LayerMode::HeadSplit };
+                for demand in &layer.extra {
+                    if demand.on_gpu(mode, g) {
+                        base[g] = base[g].checked_add(demand.bytes)
+                            .ok_or(PlacementError::Overflow("ownership layer extras"))?;
+                    }
+                }
             }
         }
         let fit = (0..request.inventory.gpus.len()).filter(|&g| pool_bytes[g] > 0).map(|g|
@@ -442,6 +496,27 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
         if best.as_ref().is_none_or(|(old, _)| score < *old) { best = Some((score, k)); }
     }
     best.map(|(_, k)| k).ok_or(PlacementError::Inventory("no legal layer ownership boundary"))
+}
+
+/// Only the compulsory routed prefix is known before choosing layer owners.
+/// Match place_tp2's resident workspace and largest retained staging peak.
+fn mandatory_tp2_arenas(request: &PlacementRequest) -> Result<[Arena; 2], PlacementError> {
+    let mut arenas = [Arena::default(), Arena::default()];
+    let routed = count_moe(request);
+    let mandatory = request.onboard.layers(routed).unwrap_or_else(||
+        if request.inventory.spark_ranks == 0 { routed } else { 0 });
+    if request.expert_gpus == 0 { return Ok(arenas); }
+    for cost in request.layers.iter().filter_map(|layer| layer.experts).take(mandatory) {
+        if !cost.tp2 { break; }
+        for gpu in 0..2 {
+            arenas[gpu].open(request.tp2_workspace[gpu]);
+            arenas[gpu].add(cost.half[gpu])?;
+            arenas[gpu].staging = arenas[gpu].staging.max(cost.half[gpu].staging);
+            arenas[gpu].peak = arenas[gpu].resident.checked_add(arenas[gpu].staging)
+                .ok_or(PlacementError::Overflow("mandatory TP2 peak"))?;
+        }
+    }
+    Ok(arenas)
 }
 
 /// The residual's home at every layer boundary (`[0]`: the embedding's GPU,

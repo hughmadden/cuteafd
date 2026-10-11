@@ -69,7 +69,7 @@ def _metadata(config_id: str) -> dict:
     requested = config["requested_rtx_expert_layers"]
     rtx_argv = ["--rtx-expert-layers", str(requested)]
     placement = ["--placement-directory", "/run/cuteafd-placement"] if config["require_placement_directory"] else []
-    workers = [["expertd-native", "--rank", str(rank), "--world", str(world), "--capacity", "4096",
+    workers = [["expertd-native", "--rdma-endpoints", "2", "--rank", str(rank), "--world", str(world), "--capacity", "4096",
                 "--device-budget-bytes", "109119320064", "--first-layer",
                 str(config["expected_spark_first_layer"])] + topology
                for rank in range(world)]

@@ -91,6 +91,11 @@ pub(crate) struct EngineArgs {
     pub prefill_w8a16: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+    /// Attention over the two GPUs: auto (the recorded default: context where this build
+    /// carries its programs), context (KV pages split by parity, a q/candidate/partial
+    /// exchange per layer), or heads (replicated latent, head-split attention).
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
+    pub attention_placement: String,
 }
 
 #[cfg(test)]
@@ -332,6 +337,10 @@ impl Opened {
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*"))
             .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
+        // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
+        let names: Vec<&str> = programs.names().collect();
+        let context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
+            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
         let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
             spark_ranks, skip_routed_experts: args.skip_routed_experts,
@@ -341,20 +350,32 @@ impl Opened {
             drafter_bytes, drafter_staging, pending_code, experts: Vec::new(),
             expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
-                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits };
-        let (placement, working) = glm::solve_working_set(&inputs, [0; 2], None)?;
-        let prefill_lanes = usize::try_from(working.prefill_lanes)?;
-        let selected_peers = if working.spark_ranks > 0 { args.peers.as_deref() } else { None };
+                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits, context };
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?;
+        let (placement, working) = glm::solve_working_set(&inputs, [0; 2], requested)?;
+        let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
+        let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
+        let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
+        ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
+        cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
+        cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
         let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, pages, embedding, prefill_lanes)?;
+            max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
+        engine.spark_bf16 = cuteafd_loader::plan::Checkpoint::inventory(&self.snapshot)?.spark_input_is_bf16();
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
+        }
+        if context_kv {
+            // The solver charged staging over the compiled extent it was given.
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+            engine.attach_context(args.max_context, &manifest)?;
         }
         engine.prefill_w8a8 = !args.prefill_w8a16;
         if args.skip_routed_experts {
@@ -405,19 +426,20 @@ impl Opened {
         // request otherwise pays seconds of connection setup.
         let (rows, h, topk, experts, layer) =
             (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts,
-                working.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
+                working.spark.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
         let warm = move || -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
             }).collect();
             let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
-                h as u32, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                    else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                 (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
                     row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
                     source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
                     route_count: topk as u32,
                 }).collect(),
-                routes, vec![0; rows * (h + h / 32)])?;
+                routes, vec![0; rows * (if engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
@@ -642,7 +664,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let vocab = opened.cfg.vocab_size;
-    let mut placement = engine::PageAllocator::new(engine.pages).admit(tokens.len())?;
+    let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let started = Instant::now();
     let mut logits = Vec::new();
     for chunk in tokens.chunks(engine.prefill_capacity()) {
@@ -698,7 +720,7 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     ensure!(transport.is_some() || engine.skip_routed(), "--bench-verify needs Spark peers or --skip-routed-experts");
     let prefill = args.bench_context.or(args.prefill).unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
-    let mut placement = engine::PageAllocator::new(engine.pages).admit(prefill + max_rows)?;
+    let mut placement = engine::PageAllocator::new(engine).admit(prefill + max_rows)?;
     for chunk in tokens[..prefill].chunks(engine.prefill_capacity()) {
         engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
     }
@@ -779,7 +801,7 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let n = args.bench_prefill_tokens;
     let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
-    let mut allocator = engine::PageAllocator::new(engine.pages);
+    let mut allocator = engine::PageAllocator::new(engine);
     let mut times = Vec::new();
     for round in 0..=args.bench_prefill {
         if round == 1 {
@@ -873,7 +895,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let mut placement = engine::PageAllocator::new(engine.pages).admit(tokens.len())?;
+    let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let row = cfg.hidden * 2;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let started = Instant::now();
@@ -937,6 +959,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% golden {:.1}%",
             100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / (rows - 1).max(1) as f64,
             100.0 * golden_next as f64 / (rows - 1).max(1) as f64);
+        use std::hash::{Hash, Hasher};
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        decode_logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
+        println!("decode logits: mean KL(golden||engine) {:.5} | logits digest {:016x}",
+            mean_kl(&decode_logits, &golden[prefill * vocab..][..decode_logits.len()], vocab), digest.finish());
+        // A/B between builds or attention placements: every decode row's logits (F32).
+        if let Some(dir) = &args.save_logits {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("decode-logits.bin"),
+                decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
@@ -970,7 +1003,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         }
         None => sequence.len(),
     };
-    let mut placement = engine::PageAllocator::new(engine.pages).admit(end + 1)?;
+    let mut placement = engine::PageAllocator::new(engine).admit(end + 1)?;
     let started = Instant::now();
     let logits = engine.prefill(&mut placement, &sequence[..prefill],
         transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("drafting needs every target layer")?;
@@ -1098,7 +1131,7 @@ fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
         .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     let prefill = args.prefill.unwrap_or(512);
-    let mut pages = engine::PageAllocator::new(engine.pages);
+    let mut pages = engine::PageAllocator::new(engine);
     let mut placements = Vec::new();
     for copy in 0..copies {
         let mut placement = pages.admit(tokens.len())?;
@@ -1147,7 +1180,7 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_
     if let Some(p) = args.prefill {
         tokens.truncate(p);
     }
-    let mut allocator = engine::PageAllocator::new(engine.pages);
+    let mut allocator = engine::PageAllocator::new(engine);
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let mut last = None;
     for chunk in tokens.chunks(engine.prefill_capacity()) {

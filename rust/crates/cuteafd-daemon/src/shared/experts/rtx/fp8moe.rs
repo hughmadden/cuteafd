@@ -164,8 +164,9 @@ impl<'a> Fp8MoeTp2<'a> {
         let capacities: Vec<_> = self.experts.module.info().capacities.iter().copied()
             .filter(|&capacity| capacity <= top).collect();
         for capacity in capacities {
-            // SAFETY: caller supplies retained rows/routes for every startup bucket.
-            unsafe { self.enqueue(self.layers.start, capacity.min(self.max_rows), input, routes, stream)?; }
+            // SAFETY: caller supplies retained rows/routes for every startup bucket;
+            // startup streams carry no peer waits, so a failed launch has nothing to abort.
+            unsafe { self.enqueue(self.layers.start, capacity.min(self.max_rows), input, routes, stream, &mut || {})?; }
             self.device.run(|| {
                 // SAFETY: this rank owns the startup stream, with no peer waits.
                 unsafe { self.device.library.cuda_stream_synchronize(stream) }
@@ -189,17 +190,19 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
     }
 
     unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, routes: Routes,
-        stream: *mut c_void) -> Result<()> {
-        ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
-            "FP8 MoE TP2 layer/row range exceeded");
-        let ExpertInput::Bf16(input) = input else { bail!("FP8 MoE TP2 requires BF16 input rows") };
-        let index = self.experts.index_of(layer)?;
-        let result = self.device.run(|| {
-            // SAFETY: caller retains rank-local input, routes and stream through
-            // completion, and serializes reuse of this owner's scratch/output.
-            unsafe { self.experts.run(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
-        });
-        self.completion.finish(result, stream)
+        stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
+        let result = (|| {
+            ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
+                "FP8 MoE TP2 layer/row range exceeded");
+            let ExpertInput::Bf16(input) = input else { bail!("FP8 MoE TP2 requires BF16 input rows") };
+            let index = self.experts.index_of(layer)?;
+            self.device.run(|| {
+                // SAFETY: caller retains rank-local input, routes and stream through
+                // completion, and serializes reuse of this owner's scratch/output.
+                unsafe { self.experts.run(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
+            })
+        })();
+        self.completion.finish(result, stream, abort)
     }
 }
 
