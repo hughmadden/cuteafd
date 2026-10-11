@@ -22,7 +22,7 @@
 use super::chain::{content_id, page_chain_media};
 use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
 use super::entry::{victim, After, Entry, EntryId, Mark};
-use super::family::{BoxError, CaptureTicket, Eviction, FamilyLayout, MarkStore, PageOwners, PrefixFamily<M>, RestoreCandidate,
+use super::family::{BoxError, CaptureTicket, Eviction, FamilyLayout, MarkStore, PageOwners, PrefixFamily, RestoreCandidate,
     RestoreContext, RestorePlan};
 use super::marks::MarkArena;
 use super::pages::{Need, PoolExhausted, RefPagePool};
