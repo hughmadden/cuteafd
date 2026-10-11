@@ -137,6 +137,10 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
+    // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
+    if family == "v41" && exl3 && world == 6 {
+        return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
+    }
     let block = if nvfp4 && !native && !matches!(world, 1 | 5 | 7 | 8) { 16 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
@@ -186,7 +190,12 @@ mod tests {
         assert_eq!(recipe.slicing, Slicing::Padded);
         assert_eq!(recipe.widths, [128; 6]);
         assert_eq!(recipe.required_layouts, ["tp6"]);
-        assert_eq!(spark_recipe("v41:exl3-k23 (expertd-native)", 2304, 6).unwrap().widths, [384; 6]);
+        assert!(matches!(spark_recipe("v41:exl3-k23 (expertd-native)", 2304, 6),
+            Err(SparkRecipeRefusal::MissingPackage { .. })));
+        assert_eq!(spark_recipe("v41:exl3-k23 (expertd-native)", 2304, 3).unwrap().widths, [768; 3]);
+        assert_eq!(spark_worlds("v41:exl3-k23", 2304), [2, 3, 4]);
+        assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 6]);
+        assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
             for world in [7, 8] {
                 assert!(matches!(spark_recipe(package, 640, world), Err(SparkRecipeRefusal::GeometryInvalid { .. })));
