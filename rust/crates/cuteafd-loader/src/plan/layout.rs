@@ -1026,9 +1026,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
             Ok((placement, working)) => {
-                if working.spark_layers.is_empty() { spark_devices.clear(); }
+                if working.spark.spark_layers.is_empty() { spark_devices.clear(); }
                 notes.push(format!("GLM selected working set: {} Spark layers, {} ranks, {} prefill lanes",
-                    working.spark_layers.len(), working.spark_ranks, working.prefill_lanes));
+                    working.spark.spark_layers.len(), working.spark.spark_ranks, working.spark.prefill_lanes));
                 for (device, items) in devices.iter_mut().zip(&placement.items) {
                     device.items.extend(items.iter().cloned());
                     device.kv_tokens = placement.pool_tokens;
