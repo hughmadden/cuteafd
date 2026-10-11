@@ -6205,6 +6205,24 @@ Ideas TJ wants kept for later; not v2 work.
 - **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
 - **DSH dashboard model gate** is unverified: the automation could not find
   the composer iframe.
+- **Dual-GPU jobs starve in the lock queue.** Ordered flocks give no
+  fairness: a sparks->gpu0->gpu1 job holds gpu0 while single-GPU1 jobs keep
+  taking gpu1. On 2026-10-11, P9 timed out at 6 h twice and P6 at 8 h. Add a
+  `gpu-pair.reserve` lock: dual-GPU waiters take it first, and every single-GPU
+  path (smoke, wip-cards, build-slot GPU tests, agent scripts) waits on it
+  before taking gpu0 or gpu1. Put it in one shared helper, not per script.
+- **Qualify the opt-in shelf (audit 2026-10-11).** Each item needs one
+  hardware decision:
+  - mapped-table uring/mincore;
+  - GLM Flash split-KDA FP8 rows (already passed 3 pairs on K3.25);
+  - GLM Flash GB10 schedule (bit-identical);
+  - MiMo prefill chunk and snapshot wait (C16 TTFT 91 -> 67 ms);
+  - GLM Flash BF16 KDA state and pool prefix marks (memory to KV);
+  - MiMo warm drafter marks and host tier;
+  - GLM Flash packed admission and chain verify.
+  Also: revive the deterministic Spark prefill reducer; delete
+  `work/mxfp4-tails` and `work/v41-exact`, and the old draft-policy switches
+  once shared drafting covers every family.
 - **Qualify the mapped-table io_uring backends (TJ).** They already exist
   in the shared `cuteafd-loader` `MappedTable` (6b2a47bf, 10-07), used by
   V4.1 engram and Qwen PLE: `mmap` (default), `uring` and `mincore-routed`
