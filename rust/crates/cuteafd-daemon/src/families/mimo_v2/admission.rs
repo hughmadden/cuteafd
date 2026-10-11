@@ -14,6 +14,73 @@ pub(super) struct Preflight {
     pub graph_bound_bytes: Vec<u64>,
     pub host_config: Option<cuteafd_hostcache::config::Config>,
     pub local_expert_budget: usize,
+    pub placement: cuteafd_loader::placement::Placement,
+    pub expert_directory: Option<std::path::PathBuf>,
+    pub working_set: cuteafd_loader::placement::SparkWorkingSet,
+}
+
+fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
+    -> Result<(Vec<Option<cuteafd_loader::placement::ExpertCost>>, u64, [u64; 2], Option<std::path::PathBuf>)> {
+    use crate::shared::experts::fp8::bf16_sibling;
+    use crate::shared::experts::rtx::fp8moe::Fp8MoeTp2;
+    use cuteafd_loader::placement::{Bytes2, ExpertCost, families::mimo_v2::{expert_layer_bytes, package_directory, package_manifest}};
+    use cuteafd_loader::formats::fp8_experts::Slicing;
+    if args.skip_experts || args.expert_window.is_some() || opened.cfg.dense.iter().take(layers).all(|&dense| dense) {
+        ensure!(ranks == 1 || args.expert_window.is_none(), "MiMo streamed TP1 experts require one RTX");
+        return Ok((vec![None; layers], 0, [0; 2], None));
+    }
+    let tensors = opened.catalog.as_ref().and_then(|catalog| catalog.fp8())
+        .context("MiMo routed expert headers are required for shared placement")?;
+    let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
+    let mut directory = match &args.fp8_package {
+        Some(path) => path.clone(),
+        None => package_directory(args.native_lib.parent().context("MiMo native library parent")?,
+            &opened.cfg, tensors.format(), ranks)?,
+    };
+    if bf16_sibling(&directory).is_some_and(|path| path.is_dir()) {
+        directory = bf16_sibling(&directory).context("MiMo BF16 package sibling")?;
+    }
+    let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
+    let routed = opened.cfg.dense.iter().take(layers).filter(|&&dense| !dense).count();
+    let zero_local = args.onboard.layers(routed) == Some(0);
+    let metadata = if zero_local { None } else { package_manifest(&directory, None)? };
+    if zero_local || (metadata.is_none()
+        && args.onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
+        ensure!(args.peers.is_some(), "MiMo zero local experts requires Spark peers");
+        let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
+            whole, half: [Bytes2::default(); 2], tp2: ranks == 2, spark_ok: true,
+        })).collect();
+        return Ok((costs, 0, [0; 2], None));
+    }
+    let metadata = metadata.context("MiMo local experts need a generated BF16-input package manifest")?;
+    let scratch = |path: &std::path::Path| -> Result<u64> {
+        let layout = path.file_name().and_then(|name| name.to_str()).context("MiMo package layout")?;
+        cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)
+            .context("MiMo expert manifest lacks selected capacity")
+    };
+    let (half, workspace, tp2_workspace) = if ranks == 2 {
+        let plans = [Fp8MoeTp2::plan(tensors, &directory, 0, rows)?, Fp8MoeTp2::plan(tensors, &directory, 1, rows)?];
+        for plan in &plans {
+            ensure!(scratch(&plan.directory)? == plan.scratch_bytes as u64,
+                "MiMo expert manifest scratch differs from native package ABI");
+        }
+        (plans.each_ref().map(|plan| Bytes2 { resident: plan.resident_layer_bytes as u64, staging: plan.staging_bytes as u64 }),
+            0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
+    } else {
+        // SAFETY: this reads only the trusted generated package's static ABI.
+        let metadata = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeMetadata::read(&directory) }?;
+        ensure!(scratch(&directory)? == metadata.scratch_for(rows)?.max(256) as u64,
+            "MiMo expert manifest scratch differs from native package ABI");
+        ensure!(!metadata.info.wire_input && metadata.info.tp == 1 && metadata.info.hidden == opened.cfg.hidden
+            && metadata.info.experts == opened.cfg.experts && metadata.info.topk == opened.cfg.topk
+            && metadata.info.intermediate == opened.cfg.moe_intermediate,
+            "MiMo local package does not match BF16-input checkpoint geometry: {:?}", metadata.info);
+        ([Bytes2::default(); 2], metadata.scratch_for(rows)?.max(256) as u64, [0; 2])
+    };
+    let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
+        whole, half, tp2: ranks == 2, spark_ok: args.peers.is_some(),
+    })).collect();
+    Ok((costs, workspace, tp2_workspace, Some(directory)))
 }
 
 fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, automatic: bool, unit_rows: u64) -> Result<()> {
@@ -120,7 +187,7 @@ pub(super) fn preflight(
     automatic_context: bool,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
-        admit_device_reservations_with_headroom, resolve_capacity_with_startup_peaks, CapacityPolicy, DeviceMemory,
+        admit_device_reservations_with_headroom, CapacityPolicy, DeviceMemory,
         small_card_headroom_bytes,
     };
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
@@ -250,10 +317,12 @@ pub(super) fn preflight(
         }
         None => 0,
     };
+    let (expert_costs, expert_workspace, tp2_workspace, expert_directory) = routed_costs(opened, args, layers, ranks)?;
     let mut runtime = Vec::with_capacity(ranks);
     let mut memory = Vec::with_capacity(ranks);
     let mut post_kv_loading_additional = Vec::with_capacity(ranks);
     let mut draft_packing = Vec::new();
+    let mut first_lane_tap_bytes = 0;
     for (rank, &device) in devices.iter().enumerate() {
         let device_id = u32::try_from(device).context("negative CUDA device id")?;
         let (free, total) =
@@ -311,16 +380,10 @@ pub(super) fn preflight(
                 additional.extend(reservations.steady);
                 additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
                     args.rings as u64)?);
-                if cuteafd_loader::families::mimo_v2::admission::prefill_lane_taps(
-                    transport_lanes, args.prefill_rows, args.mtp, prefill_output) {
-                    additional.push(MemoryReservation {
-                        name: "draft.prefill_first_lane_taps".into(),
-                        bytes: draft.prefill_lane_tap_bytes()? as u64,
-                    });
-                }
+                first_lane_tap_bytes = draft.prefill_lane_tap_bytes()? as u64;
                 draft_packing = reservations.packing;
             }
-            if backend == ExpertBackend::Local {
+            if backend == ExpertBackend::Local && args.expert_window.is_some() {
                 additional.extend(local_expert_reservations(opened, args, layers)?);
             }
         }
@@ -344,7 +407,25 @@ pub(super) fn preflight(
             loading_additional: vec![cublas],
         });
     }
-    let profiles = mimo_capacity_profiles(
+    let profiles_for = |selected_spark_ranks: usize| -> Result<_> {
+        let lanes = if selected_spark_ranks == 0 { 1 } else { transport_lanes };
+        let mut selected_runtime = runtime.clone();
+        for (rank, costs) in selected_runtime.iter_mut().enumerate() {
+            costs.additional.retain(|cost| !cost.name.starts_with("transport.")
+                && cost.name != "draft.prefill_first_lane_taps");
+            costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
+                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks)?);
+            if rank == 0 && first_lane_tap_bytes > 0
+                && cuteafd_loader::families::mimo_v2::admission::prefill_lane_taps(
+                    lanes, args.prefill_rows, args.mtp, prefill_output) {
+                costs.additional.push(MemoryReservation { name: "draft.prefill_first_lane_taps".into(),
+                    bytes: first_lane_tap_bytes });
+            }
+            costs.workspaces = workspace_options(cfg, args, programs, ranks, rank, lanes,
+                selected_spark_ranks > 0, VOCABULARY_HEAD_WORKSPACE as u64, prefill_output,
+                opened.weight_formats.any_fp8_output())?;
+        }
+        Ok(mimo_capacity_profiles(
         &opened.checkpoint,
         cfg,
         MimoResidentOptions {
@@ -364,10 +445,13 @@ pub(super) fn preflight(
             rings: args.rings as u64,
             mark_slots,
             kv_cache: kv,
-            ranks: runtime,
+            ranks: selected_runtime,
             host_prefix_bytes: host_bytes,
         },
-    )?;
+    )?)
+    };
+    let spark_profiles = profiles_for(spark_ranks)?;
+    let no_spark_profiles = if spark_ranks == 0 { spark_profiles.clone() } else { profiles_for(0)? };
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
         small_card_headroom: true,
@@ -378,13 +462,7 @@ pub(super) fn preflight(
         pool_tokens: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         ..CapacityPolicy::default()
     };
-    let report = reservation_report(&profiles.steady, &memory, policy)?;
-    tracing::info!(reservations = %report, "MiMo steady allocation contract after module preload, before weight loads");
-    for (loading, &sample) in profiles.loading.iter().zip(&memory) {
-        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, sample,
-            &loading.reservations, small_card_headroom_bytes(sample.total_bytes))
-            .with_context(|| format!("MiMo target-loading admission; steady contract {report}"))?;
-    }
+    let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
     for sample in &memory {
@@ -392,10 +470,37 @@ pub(super) fn preflight(
             sample.total_bytes - cuteafd_core::serving_capacity::admission_ceiling(sample.total_bytes, 97,
                 small_card_headroom_bytes(sample.total_bytes))?);
     }
-    let mut capacity = resolve_capacity_with_startup_peaks(policy, &profiles.steady, &memory,
-        &[(memory[0].device, intake_probe_bytes)]).with_context(|| {
-        format!("MiMo steady admission; complete per-GPU reservation contract {report}")
-    })?;
+    use cuteafd_loader::placement::{Baseline, families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity}};
+    let inputs = MimoInputs {
+        cfg, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
+        gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
+        headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
+        context: args.max_context as u64, requested_pool: policy.pool_tokens,
+        onboard: args.onboard, experts: expert_costs, expert_workspace, tp2_workspace,
+        rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
+    };
+    let solution = solve_working_set(&inputs, &no_spark_profiles.steady)
+        .with_context(|| format!("MiMo shared placement; configured-Spark reservation contract {report}"))?;
+    let selected = inputs.selected(&no_spark_profiles.steady, &solution.working_set);
+    let profiles = if solution.working_set.spark_ranks == 0 { &no_spark_profiles } else { &spark_profiles };
+    let intake_probe_bytes = selected.startup_probe_bytes;
+    for (rank, costs) in post_kv_loading_additional.iter_mut().enumerate() {
+        costs.retain(|cost| !cost.name.starts_with("transport."));
+        costs.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
+            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0)?);
+    }
+    let report = reservation_report(&profiles.steady, &memory, policy)?;
+    tracing::info!(reservations = %report, working_set = ?solution.working_set,
+        "MiMo selected allocation contract after module preload, before weight loads");
+    for (loading, &sample) in profiles.loading.iter().zip(&memory) {
+        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, sample,
+            &loading.reservations, small_card_headroom_bytes(sample.total_bytes))
+            .with_context(|| format!("MiMo target-loading admission; steady contract {report}"))?;
+    }
+    let placement = solution.placement;
+    let mut capacity = resolved_capacity(&selected, &solution.request, &placement,
+        u32::try_from(concurrency)?, u32::try_from(args.rings)?)?;
+    tracing::info!(placement = %placement.summary(), "MiMo shared admission solve");
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
@@ -425,7 +530,7 @@ pub(super) fn preflight(
     let local_expert_budget = capacity.devices[0]
         .reservations
         .iter()
-        .filter(|reservation| reservation.name.starts_with("experts.local_"))
+        .filter(|reservation| reservation.name.starts_with("experts."))
         .try_fold(0u64, |bytes, reservation| {
             bytes.checked_add(reservation.bytes)
         })
@@ -463,6 +568,7 @@ pub(super) fn preflight(
         graph_bound_bytes,
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
+        placement, expert_directory, working_set: solution.working_set,
     })
 }
 
@@ -601,7 +707,7 @@ fn workspace_options(
 > {
     let _ = head_workspace_bytes;
     cuteafd_loader::families::mimo_v2::admission::workspace_options(cfg, ranks, rank,
-        args.prefill_rows, args.max_context, transport_lanes, spark, args.kv_cache.into(), args.mtp,
+        args.prefill_rows, args.max_context, transport_lanes, spark, args.expert_input.into(), args.kv_cache.into(), args.mtp,
         prefill_output, fp8_output, |name| Ok(programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0)))
 }
 
@@ -1058,10 +1164,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes, 2048);
-        assert!(peer
-            .iter()
-            .all(|n| n.starts_with("mimop2_") && !n.contains("router")));
-        assert!(peer.iter().all(|n| n.ends_with("m4096")));
+        assert!(peer.iter().any(|n| n == "mimop_router_scores"));
+        assert!(peer.iter().all(|n| n == "mimop_router_scores"
+            || (n.starts_with("mimop2_") && n.ends_with("m4096"))));
     }
 
     #[test]

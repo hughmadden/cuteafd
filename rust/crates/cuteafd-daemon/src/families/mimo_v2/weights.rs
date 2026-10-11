@@ -686,7 +686,7 @@ impl<'a> MimoLoader<'a> {
 
     /// One decoder block, one share per rank over `ranks` GPUs: rank `r` holds
     /// its heads' qkv rows, sinks and o_proj columns and its slice of the dense
-    /// MLP's intermediate; every rank the norms; rank 0 the router.
+    /// MLP's intermediate; every rank the norms and router replica.
     fn block(&self, cfg: &MimoV2Config, p: &str, attention: MimoAttention, dense: bool, post: &str, ranks: usize)
         -> Result<Vec<MimoLayer<'a>>> {
         let layer = p;
@@ -757,12 +757,15 @@ impl<'a> MimoLoader<'a> {
             let expected = if cfg.router_fp32 { DType::F32 } else { DType::Bf16 };
             ensure!(self.tensor(&router)?.meta.dtype == expected,
                 "{router}: selected program requires {expected:?} router weights");
-            if !cfg.router_fp32 {
-                ops[0].insert("w_router", self.one(&router)?);
-            } else {
-                ops[0].insert("w_hilo", self.router_hilo(&router)?);
+            for (rank, map) in ops.iter_mut().enumerate() {
+                let (key, weight) = if cfg.router_fp32 {
+                    ("w_hilo", self.on_rank(rank, |_| self.router_hilo(&router))?)
+                } else {
+                    ("w_router", self.on_rank(rank, |_| self.one(&router))?)
+                };
+                map.insert(key, weight);
             }
-            ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
+            small(&mut ops, "gate.bias", &format!("{p}.mlp.gate.e_score_correction_bias"), false)?;
         }
         Ok(ops.into_iter().map(|operands| MimoLayer { attention, dense, split: ranks > 1, operands }).collect())
     }

@@ -295,11 +295,7 @@ pub fn workspace_scratch(
     let family = cfg.program_family()?;
     let split_family = cfg.head_split(ranks)?.program_family()?;
     let lead = rank == 0;
-    let mut scratch = if lead {
-        query(&format!("{family}_router_scores"))?
-    } else {
-        0
-    };
+    let mut scratch = query(&format!("{family}_router_scores"))?;
     let families: &[&str] = match (ranks, lead) {
         (1, _) => &[family],
         (_, true) => &[family, split_family],
@@ -359,12 +355,12 @@ pub fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
 }
 
 pub fn workspace_options(cfg: &MimoV2Config, ranks: usize, rank: usize, rows: usize,
-    context: usize, lanes: usize, spark: bool, kv: MimoKvCache, mtp: usize,
+    context: usize, lanes: usize, spark: bool, expert_input: super::MimoExpertInput, kv: MimoKvCache, mtp: usize,
     output: MimoPrefillOutput, fp8_output: bool,
     mut query: impl FnMut(&str) -> Result<u64>) -> Result<Vec<(String, super::MimoWorkspaceOptions)>> {
     workspace_shapes(rows, rank == 0, spark, lanes, output, mtp).into_iter()
         .map(|(name, decode, rows, with_head)| Ok((name.into(), super::MimoWorkspaceOptions {
-            rows: rows as u64, decode, lead: rank == 0, with_head, spark: spark && rank == 0,
+            rows: rows as u64, decode, lead: rank == 0, with_head, spark: spark && rank == 0, expert_input,
             max_context: context as u64, pool_pages: 0, kv_cache: kv,
             attention: attention_workspace_geometry(rank, ranks, decode, true), prefill_output: output,
             native_scratch_bytes: workspace_scratch(cfg, ranks, rank, decode, kv, fp8_output, &mut query)?,

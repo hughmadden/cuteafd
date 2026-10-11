@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import ctypes
+import shutil
 
 import pytest
 
@@ -128,6 +130,102 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
     source = TOOL.read_text()
     assert '"capacities": capacity_scratch(programs)' in source
     assert "kPrograms[i].scratch > *bytes" in source
+
+
+@pytest.mark.parametrize("geometry", [
+    "mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
+    "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
+    "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
+])
+def test_bridge_shares_aot_handles_and_device_optins_until_last_rank(tmp_path, geometry):
+    compiler = shutil.which("c++")
+    assert compiler, "CPU package regression requires a C++ compiler"
+    (tmp_path / "cuda_runtime.h").write_text("""
+#pragma once
+using cudaLibrary_t = void*;
+using cudaError_t = int;
+constexpr int cudaSuccess = 0, cudaErrorInvalidValue = 1;
+extern "C" int cudaGetDevice(int*);
+extern "C" int cudaLibraryUnload(void*);
+""")
+    stem = f"mock_{geometry}"
+    (tmp_path / f"{stem}.h").write_text(f"""
+#pragma once
+#include <set>
+#include <cstdint>
+static int device = 0, initialized = 0, unloaded = 0, fail_device = -1;
+static uintptr_t serial = 0;
+static void* kernel_library = nullptr;
+static std::set<std::pair<void*, int>> optins;
+extern "C" int cudaGetDevice(int* out) {{ *out = device; return 0; }}
+extern "C" int cudaLibraryUnload(void*) {{ ++unloaded; return 0; }}
+extern "C" void mock_device(int value) {{ device = value; }}
+extern "C" void mock_fail(int value) {{ fail_device = value; }}
+extern "C" int mock_initialized() {{ return initialized; }}
+extern "C" int mock_unloaded() {{ return unloaded; }}
+static void _mlir_cuteafd_{stem}_cuda_init(void** args) {{
+  auto* library = *static_cast<void***>(args[0]);
+  *library = reinterpret_cast<void*>(++serial);
+  ++initialized;
+  *static_cast<int*>(args[1]) = 0;
+}}
+static void _mlir_cuteafd_{stem}_cuda_load_to_device(void** args) {{
+  auto library = **static_cast<void***>(args[0]);
+  int rank = *static_cast<int*>(args[1]);
+  kernel_library = library;
+  if (rank == fail_device) {{ *static_cast<int*>(args[2]) = 1; return; }}
+  optins.emplace(library, rank);
+  *static_cast<int*>(args[2]) = 0;
+}}
+static void mock_launch(void** args, int) {{
+  *static_cast<int*>(args[13]) = optins.count({{kernel_library, device}}) ? 0 : 1;
+}}
+""")
+    source = package_tool.bridge_source(
+        [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch"}],
+        [1, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
+    (tmp_path / "bridge.cc").write_text(source)
+    library = tmp_path / "bridge.so"
+    compiled = subprocess.run([compiler, "-shared", "-fPIC", "-std=c++17", "-pthread",
+                               f"-I{tmp_path}", str(tmp_path / "bridge.cc"), "-o", str(library)],
+                              text=True, capture_output=True, timeout=30)
+    assert compiled.returncode == 0, compiled.stderr
+    lib = ctypes.CDLL(str(library))
+    lib.cuteafd_fp8moe_destroy.argtypes = [ctypes.c_void_p]
+    lib.cuteafd_fp8moe_launch.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
+    contexts = []
+    for rank in (0, 1):
+        lib.mock_device(rank)
+        context = ctypes.c_void_p()
+        assert lib.cuteafd_fp8moe_create(ctypes.byref(context)) == 0
+        contexts.append(context)
+    assert lib.mock_initialized() == 1
+    pointers = (ctypes.c_void_p * 11)(*([1] * 11))
+    for rank in (0, 1):
+        lib.mock_device(rank)
+        assert lib.cuteafd_fp8moe_launch(contexts[rank], 80, pointers, 80, None) == 0
+    lib.cuteafd_fp8moe_destroy(contexts[0])
+    assert lib.mock_unloaded() == 0
+    lib.mock_fail(2)
+    lib.mock_device(2)
+    failed = ctypes.c_void_p()
+    assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 1
+    assert not failed.value and lib.mock_unloaded() == 0
+    lib.mock_device(1)
+    assert lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None) == 0
+    lib.cuteafd_fp8moe_destroy(contexts[1])
+    assert lib.mock_unloaded() == 1
+    lib.mock_device(2)
+    assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 1
+    assert lib.mock_unloaded() == 2
+    lib.mock_fail(-1)
+    lib.mock_device(0)
+    assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 0
+    assert lib.mock_initialized() == 3
+    assert lib.cuteafd_fp8moe_launch(failed, 80, pointers, 80, None) == 0
+    lib.cuteafd_fp8moe_destroy(failed)
+    assert lib.mock_unloaded() == 3
 
 
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION, weights="fp8"):

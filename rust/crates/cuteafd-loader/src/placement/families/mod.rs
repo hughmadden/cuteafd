@@ -9,6 +9,7 @@
 pub mod deepseek_v4;
 pub mod glm5;
 pub mod qwen4;
+pub mod mimo_v2;
 
 use super::{AttentionPlacement, ExecutorModes, FfnMode, LayerMode};
 

@@ -335,6 +335,7 @@ mod tests {
                                     lead: rank == 0,
                                     with_head: rank == 0,
                                     spark: rank == 0,
+                                    expert_input: super::super::MimoExpertInput::Fp8,
                                     max_context: 32768,
                                     pool_pages: 0,
                                     kv_cache: MimoKvCache::Int8,

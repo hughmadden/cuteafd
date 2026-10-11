@@ -230,6 +230,16 @@ impl NativeLibrary {
         Ok(us)
     }
 
+    /// Loads every runtime-registered native kernel on the current device.
+    /// CuTe cudaLibrary programs still require their explicit AOT load path.
+    pub fn tp2_native_initialize(&self) -> Result<()> {
+        type F = unsafe extern "C" fn() -> i32;
+        // SAFETY: initialization takes no pointers and launches no device work.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_tp2_native_initialize")?() };
+        ensure!(status == 0, "loading TP2 native kernels failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Loads the exchange kernels on the current device (before any wait is
     /// queued there; see `cuteafd_peer_exchange_initialize`).
     pub fn peer_exchange_initialize(&self) -> Result<()> {

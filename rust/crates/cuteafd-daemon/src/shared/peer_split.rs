@@ -185,6 +185,13 @@ impl<'a> PeerExchange<'a> {
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, ranks[0].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
+                // Lazy native module loading may synchronize behind an unmatched
+                // peer wait. Force every registered helper before any wait exists.
+                let started = std::time::Instant::now();
+                library.tp2_native_initialize()?;
+                tracing::info!(device = ranks[rank].device,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "TP2 native kernels loaded before peer waits");
                 library.peer_exchange_initialize()?;
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
                     let allocation = DeviceAllocation::new(library, bytes.max(256))?;

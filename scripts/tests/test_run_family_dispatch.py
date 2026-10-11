@@ -173,7 +173,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready"; '
+                                    'case "$*" in *"docker logs"*) echo "worker ready"; echo "worker bootstrap ready"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
@@ -267,6 +267,22 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     assert f"--max-sequences {16 if embedding == 'host' else 8}" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 0" in launch
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mimo_worker_selection_handshake_is_opt_in_on_both_ends(tmp_path, enabled):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(
+        tmp_path, config, "test/mimo",
+        "SPARK_COUNT=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1" if enabled else "0"})
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    coordinator = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert ("--placement-handshake" in worker) == enabled
+    assert ("--placement-handshake" in coordinator) == enabled
+    if enabled:
+        assert "worker bootstrap ready" in result.stderr
 
 
 @pytest.mark.parametrize("embedding", ["host", "gpu"])
@@ -1757,8 +1773,30 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_t
     assert f"--concurrency {effective}" in preflight
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
-    if warm:
-        assert "--context-tokens 131072" in preflight
+    assert "--context-tokens 131072" in preflight
+    assert "--prefill-rows 4096" in preflight
+    assert "--expert-input fp8" in preflight
+
+
+@pytest.mark.parametrize("ingress", ["fp8", "bf16", "bf16-decode"])
+def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, ingress):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 2,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=25%\nSPARK_COUNT=2\n"
+            "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\n"
+            "MAX_CONTEXT_TOKENS=262144\nDECODE_GRAPHS=on\nFULL_PREFILL_LOGITS=on\n")
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert f"--expert-input {ingress}" in preflight and f"--expert-input {ingress}" in launch
+    assert "--rtx-expert-layers 25%" in preflight and "--onboard 25%" in launch
+    assert "--context-tokens 262144" in preflight and "--max-context 262144" in launch
+    assert "--mimo-decode-graphs" in preflight and "--decode-graphs true" in launch
+    assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
 
 
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])

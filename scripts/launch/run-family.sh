@@ -216,6 +216,11 @@ layer_args="--first-layer $first_layer"
 spark_worker_env=""
 # Options only the Spark expert workers take.
 spark_worker_args=""
+placement_handshake=0
+if [[ "$family" == mimo_v2 && "${CUTEAFD_PLACEMENT_HANDSHAKE:-0}" == 1 ]]; then
+  placement_handshake=1
+  layer_args+=" --placement-handshake"
+fi
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
@@ -485,14 +490,21 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
-# RTX_EXPERT_LAYERS (DeepSeek V4 and GLM 5.3): unset is uniformly pool-first
+# RTX_EXPERT_LAYERS (DeepSeek V4, GLM 5.3 and MiMo): unset is uniformly pool-first
 # auto; max is the explicit experts-first policy leaving at least a 262K pool.
 # N, N% or all fix the RTX-resident routed layers, then the KV pool fills the
 # remaining budget up to its target (refused below its floor). 0 leaves the
 # backbone experts on the Sparks. With two RTX every onboard mode uses TP2
 # halves; GPU1 whole-layer expert ranges are no longer supported.
-if [[ $serve == serve-dsv4 || $serve == serve-glm ]]; then
+if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
+  onboard_flag=--rtx-expert-layers
+  fixed_onboard_flag=--local-expert-layers
+  [[ $serve != serve-glm ]] || fixed_onboard_flag=--rtx-expert-layers
+  if [[ $serve == serve-mimo ]]; then
+    onboard_flag=--onboard
+    fixed_onboard_flag=--onboard
+  fi
   case "$(get RTX_EXPERT_PEER off)" in
     on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
     off) ;;
@@ -500,15 +512,14 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm ]]; then
   esac
   case "$local_layers" in
     "") ;;
-    auto|all|max) family_args+=(--rtx-expert-layers "$local_layers") ;;
+    auto|all|max) family_args+=("$onboard_flag" "$local_layers") ;;
     *%)
       percent="${local_layers%\%}"
       [[ "$percent" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="$percent" 'BEGIN { exit !(p <= 100) }' ||
         { echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2; }
-      family_args+=(--rtx-expert-layers "$local_layers") ;;
+      family_args+=("$onboard_flag" "$local_layers") ;;
     *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2 ;;
-    *) if [[ $serve == serve-glm ]]; then family_args+=(--rtx-expert-layers "$local_layers");
-       else family_args+=(--local-expert-layers "$local_layers"); fi ;;
+    *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
@@ -1037,12 +1048,17 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
-      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
+      --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
+      --prefill-rows 4096 --expert-input "${expert_input:-fp8}")
+    [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
+    [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
+    [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
     if [[ "$(get MIMO_PREFIX_DRAFT off)" == on ]]; then
-      plan_draft_args+=(--mimo-prefix-draft --context-tokens "$(get MAX_CONTEXT_TOKENS 131072)")
+      plan_draft_args+=(--mimo-prefix-draft)
     fi
   fi
   # GLM 5.3 Flash: the counts serve-glmf allocates for the keys a launch sets (unset keys keep
@@ -1270,9 +1286,11 @@ done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
-  # Expert readiness follows synchronous encoder startup in the same process.
+  # A placement worker waits for the coordinator solve after media admission.
+  ready_marker='worker ready'
+  ((placement_handshake == 0)) || ready_marker='worker bootstrap ready'
   ready_deadline=$((SECONDS + 900))
-  until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q 'worker ready'"; do
+  until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q '$ready_marker'"; do
     ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }
     ssh "$host" "docker ps -q -f name=cuteafd-spark-expert-$host-$port | grep -q ." ||
       { echo "$host expert worker exited:" >&2; ssh "$host" "docker logs --tail 20 cuteafd-spark-expert-$host-$port" >&2; exit 1; }
@@ -1304,6 +1322,7 @@ fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
+((placement_handshake == 0 || ranks == 0)) || peer_args+=(--placement-handshake)
 # The in-server benchmark keeps its history (SQLite) on the host; the image
 # name labels its reports.
 bench_dir="$HOME/.cache/cuteafd/bench"

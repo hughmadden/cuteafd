@@ -277,6 +277,17 @@ endif()
 if(CUTEAFD_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # Extract the real undocumented registration ABI; upgrades must match our
+  # forwarding static_assert rather than silently corrupting registrations.
+  file(READ "${CUDAToolkit_INCLUDE_DIRS}/crt/host_runtime.h" CUTEAFD_CUDA_HOST_RUNTIME)
+  string(REGEX MATCH "extern void CUDARTAPI __cudaRegisterFunction\\([^;]*;"
+    CUTEAFD_CUDA_REGISTRATION_ABI "${CUTEAFD_CUDA_HOST_RUNTIME}")
+  if(NOT CUTEAFD_CUDA_REGISTRATION_ABI)
+    message(FATAL_ERROR "Cannot attest the CUDA registration ABI for TP2 startup")
+  endif()
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cuteafd_cuda_registration_abi.h"
+    "#pragma once\n#include <cuda_runtime.h>\nextern \"C\" {\n${CUTEAFD_CUDA_REGISTRATION_ABI}\n}\n")
+  list(APPEND CUTEAFD_NATIVE_SOURCES shared/src/tp2_kernel_inventory.cc)
   list(APPEND CUTEAFD_NATIVE_SOURCES
     shared/cuda/expert_pack.cu
     shared/cuda/exl3_wire.cu
@@ -389,6 +400,10 @@ if(CUTEAFD_ENABLE_AUDIO_AOT)
   include(cmake/shared/audio.cmake)
 endif()
 add_library(cuteafd_native SHARED ${CUTEAFD_NATIVE_SOURCES})
+if(CUTEAFD_ENABLE_CUDA)
+  target_include_directories(cuteafd_native PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_options(cuteafd_native PRIVATE "-Wl,--wrap=__cudaRegisterFunction")
+endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT)
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_AUDIO_AOT_SM=${CUTEAFD_AUDIO_CAPABILITY})
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_AUDIO_DIR}")
