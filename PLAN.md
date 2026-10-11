@@ -1785,6 +1785,20 @@ Evidence: `~/.cache/cuteafd/builds/v41-tp3/hardware/perf-native-min/measurements
 NVFP4 correctness is independently qualified against release TP4; perf
 panel KL is informational and must not replace that qualification gate.
 
+V4.1 EXL3 `diffbot/DeepSeek-V4.1-Flash-EXL3-2.0bpw-2x-RTX-PRO-6000`
+(revision `28b7ab71`, 2026-10-12): fidelity **FAIL due to the uncalibrated
+checkpoint**, not an engine defect. The publication uses greedy MCG trellis
+search at beam 16 for routed experts only. Whole-model Quick KL is 0.3003
+with local40 and 0.3053 with local8 plus genuine remote TP4. An independent
+CPU official-reference forward with EXL3-dequantized experts on the legacy
+256-token prefix (192 scored positions) reproduces root KL: 0.659690 versus
+engine 0.638246 (+3.36%), per-position correlation 0.987669. Its 15 argmax
+disagreements have median top1/top2 margin 0.174255 nat; all 15 engine
+choices are in the reference top3. The engine reproduces the quantized
+model; retain the checkpoint fidelity FAIL and TP3/TP4 layout support.
+EXL3 TP6 remains refused pending genuine remote qualification; TP4 stays
+the serving default. Evidence: `~/.cache/cuteafd/builds/v41-tp3/independent-exl3-cpu-256/{result,argmax-confirmation}.json`.
+
 TJ: two key items, both urgent right after v2.0.0.
 1. **Multi-GPU coordinator placement and memory management for every family.**
    One shared design replaces today's per-family patchwork:
