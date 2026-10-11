@@ -189,11 +189,11 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3', 'set together or omitted together'),
             ('SPARK_COUNT=3\nSPARK_EP=1', 'set together or omitted together'),
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'SPARK_TP must be 2, 3, 4, or 6'),
+            ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto',
              'requires EXPERT_FORMAT=native'),
-            ('SPARK_COUNT=5', 'SPARK_COUNT must be 0, 2, 3, 4, or 6'),
+            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
         ]:
             with self.subTest(settings=settings):
                 result = self.config(settings)
@@ -225,12 +225,12 @@ release_stop_wip_containers
                 candidate['variants'][0][field] = value
                 self.assertEqual(check(candidate).returncode, 2)
         self.assertEqual(check(dict(base, compute=[12, 0])).returncode, 2)
-        # Compact admission only exists for the compact degrees TP2 and TP3.
+        # Whole-width variant admission includes TP6 but not padded TP4.
         rejected = subprocess.run(['bash', '-euc',
             'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants 256 k23 4',
             'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
-        self.assertIn('supports TP2 or TP3', rejected.stderr)
+        self.assertIn('supports TP2, TP3 or TP6', rejected.stderr)
         # A TP3 layout never passes the TP2 shim and vice versa.
         shim = subprocess.run(['bash', '-euc',
             'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants 256 k23',

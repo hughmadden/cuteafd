@@ -257,14 +257,14 @@ impl Default for PlanOptions {
 
 impl PlanOptions {
     /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1, 2, 3, 4 or 6; 0 is the local-only
+    /// transport does not run (it runs 1 through 8; 0 is the local-only
     /// placement) and empty budgets.
     pub fn validate(&self) -> Result<(), PlanError> {
         if let ExpertPlacement::Sparks { ranks } = self.placement {
             if !experts::TRANSPORT_WORLDS.contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1, 2, 3, 4 or 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -662,6 +662,11 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
+            // New generic counts require nonempty H128 ownership; a 16-row
+            // NVFP4 fallback remains valid only for previously calibrated layouts.
+            if matches!(ranks, 1 | 5 | 7 | 8) && (i % 128 != 0 || i / 128 < ranks) {
+                return None;
+            }
             experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget_bytes as f64);
@@ -674,7 +679,15 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
-                if !contract.spark_worlds.contains(&ranks) || share(ranks).is_none() {
+                if share(ranks).is_none() {
+                    report.placement_supported = false;
+                    report.fits = false;
+                    report.hints.push(Hint {
+                        what: format!("geometry-invalid: {} intermediate {} cannot give each of {ranks} Spark ranks a nonempty whole-{} row slice",
+                            contract.package, intermediate.unwrap_or(0), if matches!(ranks, 1 | 5 | 7 | 8) { 128 } else { contract.block }),
+                        how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
+                    });
+                } else if !contract.spark_worlds.contains(&ranks) {
                     report.placement_supported = false;
                     report.hints.push(Hint {
                         what: format!("no {} layout for {ranks} Spark ranks (this build packages {:?}{})",

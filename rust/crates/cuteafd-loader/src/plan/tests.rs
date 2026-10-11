@@ -104,6 +104,63 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    for nvfp4 in [false, true] {
+        let mut tensors = Vec::new();
+        for projection in ["w1", "w2", "w3"] {
+            let (n, k) = if projection == "w2" { (5120, 2304) } else { (2304, 5120) };
+            let prefix = format!("layers.0.ffn.experts.0.{projection}");
+            if nvfp4 {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                    t(&format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                    t(&format!("{prefix}.weight_scale_2"), "F32", &[]),
+                    t(&format!("{prefix}.input_scale"), "F32", &[]),
+                ]);
+            } else {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "I8", &[n, k / 2]),
+                    t(&format!("{prefix}.scale"), "F8_E8M0", &[n, k / 32]),
+                ]);
+            }
+        }
+        let dir = snapshot(v41_config(), &tensors);
+        for (ranks, gpus) in [(3, 1), (6, 2)] {
+            let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                pool_tokens: Some(2_097_152), ..Default::default()
+            }), ..sparks(ranks) };
+            let report = plan(dir.path(), &options).unwrap();
+            let memory = report.memory_layout.as_ref().unwrap();
+            let experts = report.experts.as_ref().unwrap();
+            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            let packed = |tp: u64| {
+                let width = (2304 / tp).div_ceil(128) * 128;
+                if nvfp4 { 384 * (3 * 5120 * width * 9 / 16 + 16) }
+                else { 384 * 5120 * width * 51 / 32 }
+            };
+            for device in &memory.devices {
+                match device.kind {
+                    DeviceKind::Spark => {
+                        assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64));
+                        let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+                        assert_eq!(rings.bytes, layout::v41_spark_ring_allowance(
+                            "deepseek_v41", options.layout.as_ref().unwrap().spark_capacity_rows, 0, nvfp4,
+                        ));
+                    }
+                    DeviceKind::Rtx => {
+                        let local = device.items.iter().find(|item| item.group == "resident routed layers").unwrap();
+                        assert_eq!(local.bytes, packed(gpus as u64));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
     let dir = snapshot(
         v41_config(),
@@ -972,17 +1029,94 @@ fn spark_rank_options_follow_transport_and_packages() {
     let qwen = qwen_snapshot(4);
     let dsv41 = snapshot(v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
         t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
-    for ranks in 0..=8 {
+    for ranks in 0..=9 {
         let options = sparks(ranks);
-        if !matches!(ranks, 0 | 1 | 2 | 3 | 4 | 6) {
+        if ranks > 8 {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
         }
         // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
-        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, !matches!(ranks, 1 | 3), "mimo {ranks}");
-        assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, ranks != 6, "qwen {ranks}");
-        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, !matches!(ranks, 0 | 1), "v41 {ranks}");
+        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, matches!(ranks, 0 | 2 | 4 | 6), "mimo {ranks}");
+        assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
+        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
+    }
+}
+
+#[test]
+fn qwen_empty_h128_spark_ranks_are_geometry_invalid_not_fit() {
+    let qwen = qwen_snapshot(4);
+    for ranks in [6, 7, 8] {
+        let options = sparks(ranks);
+        let report = plan(qwen.path(), &options).unwrap();
+        assert!(!report.fits && !report.placement_supported && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+    // A missing TP5 package is distinct from invalid geometry: all five
+    // ranks own one H128 block, even before its hardware gate qualifies it.
+    let report = plan(qwen.path(), &sparks(5)).unwrap();
+    assert!(report.fits);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")));
+}
+
+#[test]
+fn exl3_tp6_geometry_remains_supported_for_v41_glm_and_flash() {
+    for (mut config, prefix, hidden, intermediate) in [
+        (v41_config(), "layers.0.ffn.experts.0.w1", 5120, 2304),
+        (glm5_config(), "model.layers.1.mlp.experts.0.gate_proj", 6144, 2048),
+        (glm5_flash_config(2), "model.language_model.layers.1.mlp.experts.0.gate_proj", 4096, 2048),
+    ] {
+        config["quantization_config"] = exl3_compact(4);
+        // The GLM solver validates resident headers independently of expert geometry.
+        let mut tensors = if hidden == 6144 { glm5_tensors(|_, _, _| Vec::new()) } else { Vec::new() };
+        let mut projections = Vec::new();
+        if prefix.starts_with("layers.") {
+            tensors.extend(exl3(prefix, intermediate, hidden, 4));
+            projections.push((prefix.to_string(), 4, hidden, intermediate));
+        } else {
+            let stem = prefix.strip_suffix("0.gate_proj").unwrap();
+            let count = if hidden == 6144 { 256 } else { 288 };
+            for expert in 0..count {
+                for (projection, n, k) in [("gate_proj", intermediate, hidden), ("up_proj", intermediate, hidden),
+                    ("down_proj", hidden, intermediate)] {
+                    let name = format!("{stem}{expert}.{projection}");
+                    tensors.extend(exl3(&name, n, k, 4));
+                    projections.push((name, 4, k, n));
+                }
+            }
+        }
+        let dir = snapshot(config, &tensors);
+        write_quantize_config(dir.path(), &exl3_manifest(&exl3_compact(4), &projections));
+        let report = plan(dir.path(), &sparks(6)).unwrap();
+        assert!(report.placement_supported && report.fits && report.executable(), "{}", render(&report));
+        assert!(report.experts.as_ref().unwrap().spark_worlds.contains(&6));
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+}
+
+#[test]
+fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
+    let mut config = qwen4_config(1);
+    config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16});
+    let mut tensors = Vec::new();
+    for expert in 0..512 {
+        for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+            let prefix = format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}");
+            tensors.extend([
+                t(format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                t(format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                t(format!("{prefix}.weight_scale_2"), "F32", &[]),
+                t(format!("{prefix}.input_scale"), "F32", &[]),
+            ]);
+        }
+    }
+    let dir = snapshot(config, &tensors);
+    let legacy = plan(dir.path(), &sparks(6)).unwrap();
+    assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
+    for ranks in [7, 8] {
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert!(!report.placement_supported && !report.fits && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
     }
 }
 

@@ -242,7 +242,7 @@ release_exl3_package_identity() {
 # before any service change. TP2 is the default degree.
 release_validate_exl3_compact_variants() {
   local capacity="$1" family="$2" tp="${3:-2}"
-  [[ "$tp" == 2 || "$tp" == 3 ]] || release_die "compact EXL3 variant admission supports TP2 or TP3, got TP$tp"
+  [[ "$tp" == 2 || "$tp" == 3 || "$tp" == 6 ]] || release_die "EXL3 variant admission supports TP2, TP3 or TP6, got TP$tp"
   local width=$((2304 / tp))
   [[ "$family" =~ ^k([23])([34])$ && ( "$family" == k23 || "$family" == k34 ) ]] || release_die "cannot resolve compact EXL3 package bit tiers"
   local low="${BASH_REMATCH[1]}" high="${BASH_REMATCH[2]}"
@@ -468,7 +468,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -481,11 +481,13 @@ release_known_key() {
 # unless SPARK_HOSTS is set; legacy SPARK_<rank>_* configurations remain verbatim.
 release_spark_host_rows() {
   local csv="$1" count="$2" mode="${3:-launch}" host index rank=0 seen=,
+  local key configured_host lane_a lane_b
   local -a hosts
-  [[ "$csv" =~ ^[a-z]+(,[a-z]+)*$ ]] || release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
+  [[ "$csv" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+    release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
-    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
+    [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
       release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
   fi
   for host in "${hosts[@]}"; do
@@ -494,7 +496,22 @@ release_spark_host_rows() {
     case "$host" in
       ostrich) index=1 ;; dodo) index=2 ;; emu) index=3 ;;
       kiwi) index=4 ;; rhea) index=5 ;; moa) index=6 ;;
-      *) release_die "SPARK_HOSTS names unknown Spark pool host $host" ;;
+      *)
+        lane_a= lane_b=
+        for index in {0..7}; do
+          key="SPARK_${index}_HOST"
+          configured_host="${!key:-}"
+          if [[ "$configured_host" == "$host" ]]; then
+            key="SPARK_${index}_LANE_A"; lane_a="${!key:-}"
+            key="SPARK_${index}_LANE_B"; lane_b="${!key:-}"
+            break
+          fi
+        done
+        [[ -n "$lane_a" ]] ||
+          release_die "SPARK_HOSTS names unknown Spark pool host $host; configure SPARK_<rank>_HOST and LANE_A for this custom host"
+        printf '%s %s %s %s\n' "$rank" "$host" "$lane_a" "$lane_b"
+        rank=$((rank + 1))
+        continue ;;
     esac
     printf '%s %s 10.55.0.%s 10.55.1.%s\n' "$rank" "$host" "$index" "$index"
     rank=$((rank + 1))
@@ -867,7 +884,8 @@ release_load_config() {
             release_die "SPARK_COUNT=6 requires explicit SPARK_TP and SPARK_EP, or EXPERT_FORMAT=exl3 for the implicit EXL3 TP6 split"
         fi
         ;;
-      *) release_die "SPARK_COUNT must be 0, 2, 3, 4, or 6" ;;
+      1|5|7|8) [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=$SPARK_COUNT is incompatible with EXL3_PAIRED_TP4" ;;
+      *) release_die "SPARK_COUNT must be in 0..8" ;;
     esac
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
@@ -998,8 +1016,7 @@ release_resolve_local_model_revision() {
 # site through this predicate.
 release_spark_compact_active() {
   case "$SPARK_COUNT" in
-    2) return 0 ;;
-    3) [[ -z "$SPARK_TP" && -z "$SPARK_EP" ]] ;;
+    2|3) [[ -z "$SPARK_TP" && -z "$SPARK_EP" ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1060,6 +1077,34 @@ release_spark_values() {
 # tp_rank = rank % TP.
 # ---------------------------------------------------------------------------
 
+# Release and WIP must advertise the same compiled extra Spark roles. TP4 is
+# built separately; keep the qualified default until new roles have exports.
+release_spark_tp_roles_default() {
+  printf '%s\n' 'tp2;tp3;tp6'
+}
+
+release_spark_tp_roles_canonical() {
+  local raw="$1" source_name="${2:-CUTEAFD_RELEASE_SPARK_TP_ROLES}"
+  local entry prior
+  local -a parts=() selected=()
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" != *";;"* && "$raw" != ";"* && "$raw" != *";" && "$raw" != *$'\n'* ]] ||
+    release_die "$source_name is not a ';'-separated role list: $raw"
+  IFS=';' read -ra parts <<<"$raw"
+  for entry in "${parts[@]}"; do
+    case "$entry" in
+      tp2|tp3|tp6) ;;
+      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
+    esac
+    for prior in ${selected[@]+"${selected[@]}"}; do
+      [[ "$prior" != "$entry" ]] ||
+        release_die "$source_name lists $entry more than once"
+    done
+    selected+=("$entry")
+  done
+  printf '%s\n' "${selected[@]}" | sort | paste -sd';' -
+}
+
 release_spark_topology_explicit() {
   [[ -n "$SPARK_TP" || -n "$SPARK_EP" ]]
 }
@@ -1097,8 +1142,8 @@ release_spark_rank_map() {
 
 release_validate_spark_topology() {
   case "$SPARK_TP" in
-    ""|2|3|4|6) ;;
-    *) release_die "SPARK_TP must be 2, 3, 4, or 6" ;;
+    ""|[1-8]) ;;
+    *) release_die "SPARK_TP must be in 1..8" ;;
   esac
   case "$SPARK_EP" in
     ""|1|2|3) ;;
@@ -1108,8 +1153,8 @@ release_validate_spark_topology() {
     release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
   release_spark_topology_explicit || return 0
 
-  [[ "$SPARK_COUNT" == 3 || "$SPARK_COUNT" == 4 || "$SPARK_COUNT" == 6 ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT=3, 4 or 6"
+  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
+    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$EXL3_PAIRED_TP4" == off ]] ||
@@ -1119,8 +1164,8 @@ release_validate_spark_topology() {
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
     release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
   case "${SPARK_TP}x${SPARK_EP}" in
-    3x1|2x2|3x2|2x3|4x1|6x1) ;;
-    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP3EP1, TP2EP2, TP3EP2, TP2EP3, TP4EP1, TP6EP1" ;;
+    [1-8]x1|2x2|3x2|2x3) ;;
+    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP1..TP8 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
   esac
 }
 
@@ -1500,14 +1545,15 @@ CONTAINER
 
 # Build availability is independent of the four-rank runtime topology.
 release_select_build_hosts() {
-  local requested="${1:-}" host configured found prior name
+  local requested="${1:-}" host configured found prior name rank
   local -a configured_hosts=()
   if [[ -n "${SPARK_COUNT:-}" ]]; then
     mapfile -t configured_hosts < <(release_spark_values HOST)
   else
     # Callers that have not loaded a configuration may still set the host keys
     # directly; fall back to the bounded rank keys and keep only filled ones.
-    for name in SPARK_0_HOST SPARK_1_HOST SPARK_2_HOST SPARK_3_HOST SPARK_4_HOST SPARK_5_HOST; do
+    for ((rank = 0; rank < 8; rank++)); do
+      name="SPARK_${rank}_HOST"
       [[ -n "${!name:-}" ]] && configured_hosts+=("${!name}")
     done
   fi
@@ -1556,7 +1602,20 @@ release_spark_first_layer() {
 # (1,804,861,440 * TP4/TP = 7,219,445,760 / TP). They are weight arithmetic only
 # and do not include workspace, staging or runtime headroom.
 release_spark_layer_bytes() {
-  case "$1" in
+  local tp="$1" format="${2:-native}"
+  if [[ "$format" == nvfp4 ]]; then
+    local intermediate stored fc1_rows down_scale_cols
+    case "$tp" in 3|4|6) ;; *) release_die "NVFP4 Spark weights require TP3, TP4 or TP6" ;; esac
+    intermediate=$((2304 / tp))
+    stored=$(((intermediate + 127) / 128 * 128))
+    fc1_rows=$(((2 * stored + 127) / 128 * 128))
+    down_scale_cols=$(((stored / 16 + 3) / 4 * 4))
+    # Mirror Nvfp4Side::plane_sizes plus its four per-expert FP32 vectors.
+    printf '%s\n' "$((384 * (3 * 5120 * stored / 2 + fc1_rows * 320 + 5120 * down_scale_cols + 16)))"
+    return
+  fi
+  [[ "$format" == native ]] || release_die "unsupported Spark weight format: $format"
+  case "$tp" in
     2) printf '%s\n' 3609722880 ;;
     3) printf '%s\n' 2406481920 ;;
     4) printf '%s\n' 2005401600 ;;
@@ -1575,8 +1634,8 @@ release_spark_remote_layers() {
 }
 
 release_spark_remote_weight_bytes() {
-  local first_layer="$1" tp="$2"
-  printf '%s\n' "$(($(release_spark_remote_layers "$first_layer") * $(release_spark_layer_bytes "$tp")))"
+  local first_layer="$1" tp="$2" format="${3:-native}"
+  printf '%s\n' "$(($(release_spark_remote_layers "$first_layer") * $(release_spark_layer_bytes "$tp" "$format")))"
 }
 
 # Weight-only admission for the resolved dynamic RTX/Spark boundary.
@@ -1587,10 +1646,10 @@ release_spark_remote_weight_bytes() {
 # service reports them at startup. run.sh prints the residual and labels it
 # explicitly. Weight-only overflow is a hard failure before any service change.
 release_validate_spark_weight_admission() {
-  local first_layer="$1" tp="$2" budget="$3" remote_layers weight margin
+  local first_layer="$1" tp="$2" budget="$3" format="${4:-native}" remote_layers weight margin
   [[ "$budget" =~ ^[1-9][0-9]*$ ]] || release_die "Spark device budget must be a positive integer"
   remote_layers="$(release_spark_remote_layers "$first_layer")"
-  weight="$(release_spark_remote_weight_bytes "$first_layer" "$tp")"
+  weight="$(release_spark_remote_weight_bytes "$first_layer" "$tp" "$format")"
   ((weight <= budget)) ||
     release_die "Spark TP${tp} weight-only admission fails: ${remote_layers} remote layers need ${weight} B > ${budget} B budget (lower the RTX boundary first layer)"
   margin=$((budget - weight))
