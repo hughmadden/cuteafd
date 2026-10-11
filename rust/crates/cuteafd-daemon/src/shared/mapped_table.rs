@@ -15,7 +15,6 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::{GatherPool, HotRowCache, MappedTable, PendingGather, TablePrefetcher, TableStatsSnapshot};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,15 +47,6 @@ pub(crate) struct MappedTableArgs {
     /// prefill chunk).
     #[arg(long = "table-prefetch", default_value_t = true, action = clap::ArgAction::Set)]
     pub prefetch: bool,
-    /// Read the whole table into the page cache in the background after
-    /// startup (not pinned; the kernel may evict it). Serving starts at once;
-    /// gathers that fault before the warm-up reaches their rows read on demand.
-    #[arg(long = "table-warm", default_value_t = true, action = clap::ArgAction::Set)]
-    pub warm: bool,
-    /// Warm-up read rate in MiB/s (0: unpaced); paced so startup weight
-    /// streaming and demand faults keep most of the disk.
-    #[arg(long = "table-warm-mib-s", default_value_t = 1024)]
-    pub warm_mib_s: u64,
 }
 
 struct RingSlot<'a> {
@@ -167,16 +157,6 @@ pub(crate) struct MappedTableDevice<'a> {
     prefetcher: Option<TablePrefetcher>,
     ring: RefCell<PinnedRowRing<'a>>,
     logged: Cell<TableStatsSnapshot>,
-    warm: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
-}
-
-impl Drop for MappedTableDevice<'_> {
-    fn drop(&mut self) {
-        if let Some((stop, worker)) = self.warm.take() {
-            stop.store(true, Ordering::Relaxed);
-            let _ = worker.join();
-        }
-    }
 }
 
 impl<'a> MappedTableDevice<'a> {
@@ -193,23 +173,6 @@ impl<'a> MappedTableDevice<'a> {
             None
         };
         let table = Arc::new(table);
-        let warm = if args.warm {
-            let stop = Arc::new(AtomicBool::new(false));
-            let (reader, stopping) = (table.clone(), stop.clone());
-            let rate = (args.warm_mib_s > 0).then_some(args.warm_mib_s << 20);
-            let worker = std::thread::Builder::new().name(format!("{name}-warm")).spawn(move || {
-                let started = Instant::now();
-                match reader.warm(&stopping, rate) {
-                    Ok(bytes) => tracing::info!(table = name, gib = bytes as f64 / (1u64 << 30) as f64,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        stopped = stopping.load(Ordering::Relaxed), "mapped table warm"),
-                    Err(error) => tracing::warn!(table = name, %error, "mapped table warm-up failed"),
-                }
-            })?;
-            Some((stop, worker))
-        } else {
-            None
-        };
         Ok(Self {
             name,
             pool: Arc::new(GatherPool::new(&format!("{name}-gather"), args.threads)?),
@@ -218,7 +181,6 @@ impl<'a> MappedTableDevice<'a> {
             ring: RefCell::new(PinnedRowRing::new(library, max_rows * row_bytes, 2)?),
             logged: Cell::new(table.stats().snapshot()),
             table,
-            warm,
         })
     }
 

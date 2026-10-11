@@ -213,32 +213,6 @@ impl MappedRows {
         Ok(())
     }
 
-    /// Read `len` mapped bytes from `start` into the page cache and map them
-    /// (no later faults): async read-ahead in [`WARM_ADVICE_BYTES`] pieces (one
-    /// large WILLNEED is capped by the kernel's read-ahead window), then
-    /// `MADV_POPULATE_READ`, which waits for them. Without POPULATE_READ
-    /// (Linux < 5.14) the read-ahead alone is issued.
-    fn warm_range(&self, start: usize, len: usize) -> Result<()> {
-        let end = (start + len).min(self.mapped_len);
-        let mut at = start;
-        while at < end {
-            let piece = WARM_ADVICE_BYTES.min(end - at);
-            // SAFETY: at..at+piece lies inside this mapping.
-            if unsafe { libc::madvise(self.base.as_ptr().add(at).cast(), piece, libc::MADV_WILLNEED) } != 0 {
-                return Err(os_error("warming checkpoint rows"));
-            }
-            at += piece;
-        }
-        // SAFETY: start..end lies inside this read-only mapping; populating reads only.
-        if unsafe { libc::madvise(self.base.as_ptr().add(start).cast(), end - start, libc::MADV_POPULATE_READ) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINVAL) {
-                return Err(MappedTableError::Io { context: "populating checkpoint rows".into(), source: error });
-            }
-        }
-        Ok(())
-    }
-
     /// Advise only the deduplicated pages touched by this batch, with a hard page budget.
     ///
     /// WILLNEED starts OS read-ahead but does not guarantee residency or completion;
@@ -267,11 +241,6 @@ impl Drop for MappedRows {
         }
     }
 }
-
-/// Read-ahead advice size while warming (larger advice is truncated).
-const WARM_ADVICE_BYTES: usize = 128 << 10;
-/// One warming window: bounded in-flight reads per warming thread.
-const WARM_WINDOW_BYTES: usize = 8 << 20;
 
 /// Where one part of a table lives: an absolute byte offset inside a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,37 +693,6 @@ impl MappedTable {
         let weak = Arc::downgrade(&self.stats);
         registry.retain(|(_, stats)| !stats.ptr_eq(&weak));
         registry.push((name.into(), weak));
-    }
-
-    /// Reads the whole table into the page cache and maps it, window by
-    /// window, until done or `stop` is set; returns the bytes warmed. For
-    /// tables that fit in RAM beside everything else: it turns later gathers'
-    /// major faults into hits without pinning memory (the kernel may still
-    /// evict the pages under pressure). Run it on a background thread.
-    /// `bytes_per_second` paces the reads so demand reads (other weights,
-    /// this table's own gathers) keep most of the device's bandwidth.
-    pub fn warm(&self, stop: &AtomicBool, bytes_per_second: Option<u64>) -> Result<u64> {
-        let started = Instant::now();
-        let mut warmed = 0u64;
-        for part in &self.parts {
-            let mut at = part.data_offset / part.page_bytes * part.page_bytes;
-            while at < part.mapped_len {
-                if stop.load(Ordering::Relaxed) {
-                    return Ok(warmed);
-                }
-                let len = WARM_WINDOW_BYTES.min(part.mapped_len - at);
-                part.warm_range(at, len)?;
-                warmed += len as u64;
-                at += len;
-                if let Some(rate) = bytes_per_second.filter(|&rate| rate > 0) {
-                    let due = Duration::from_secs_f64(warmed as f64 / rate as f64);
-                    if let Some(wait) = due.checked_sub(started.elapsed()) {
-                        thread::sleep(wait);
-                    }
-                }
-            }
-        }
-        Ok(warmed)
     }
 
     /// Advise the deduplicated pages a batch touches, with a hard page budget

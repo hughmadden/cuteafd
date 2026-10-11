@@ -686,24 +686,6 @@ fn spawned_gathers_complete_into_caller_storage() -> TestResult {
 }
 
 #[test]
-fn warm_reads_every_part_and_stops_on_request() -> TestResult {
-    let (_dir, parts) = parted([3, 3, 2])?;
-    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    // Each part's mapping starts at its page; part 2 shares b's page with part 1.
-    let total = table.warm(&AtomicBool::new(false), None)?;
-    assert!(total >= 8 * 4);
-    assert_eq!(table.warm(&AtomicBool::new(true), None)?, 0);
-    // Pacing: the whole table at twice its size per second takes about half a second.
-    let started = Instant::now();
-    assert_eq!(table.warm(&AtomicBool::new(false), Some(2 * total))?, total);
-    assert!(started.elapsed() >= Duration::from_millis(400));
-    let mut out = [0; 4];
-    table.gather_into(&[7], &mut out)?;
-    assert_eq!(out, [7; 4]);
-    Ok(())
-}
-
-#[test]
 #[ignore = "Warm/cold backend latency distributions; release-mode CPU characterization"]
 fn mapped_backend_latency_measurement() -> TestResult {
     let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
