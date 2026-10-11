@@ -815,7 +815,7 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', 'both', '--config', str(state / ('build-' + name + '.config'))]
         if arm['build_lock_mode'] == 'legacy-full-build':
             print('# legacy arm: GPU lock held for the full build')
-            build_cmd = ['flock', '-w', '1800', str(Path.home() / '.cache/cuteafd/gpu1.lock'), *build_cmd]
+            build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
         print('# build locking ' + name + ': ' + arm['build_lock_mode'])
         # Seed on an out-of-pool Spark; stage the sealed slot to the whole union.
         union = {h for card in cards for h in card.get('sparks', [])}

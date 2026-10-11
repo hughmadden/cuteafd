@@ -59,7 +59,8 @@ def test_lock_contention_times_out_without_export_or_cleanup(tmp_path, held):
         fcntl.flock(handle, fcntl.LOCK_EX)
         result = run_export(tmp_path)
     assert result.returncode != 0
-    assert f'timed out waiting for {held}.lock' in result.stderr
+    # The fair queue (scripts/hw/hwlock.py) waits for every lock at once.
+    assert 'timed out waiting for a fair turn on sparks.lock and gpu1.lock' in result.stderr
     assert not (tmp_path / 'cleanup.log').exists()
 
 

@@ -191,7 +191,7 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
     cards.build_arms(['base=old'], arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
     assert 'legacy arm: GPU lock held for the full build' in text
-    assert 'gpu1.lock' in text and 'flock -w 1800' in text
+    assert 'hwlock.py --locks gpu1 --wait 1800' in text
     assert arms['base']['build_lock_mode'] == 'legacy-full-build'
     assert 'source-base' in text and 'cp ' not in text
 
