@@ -253,6 +253,7 @@ enum StepLogits {
 }
 
 pub(crate) struct GlmEngine<'a> {
+    pub(crate) spark_bf16: bool,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -359,7 +360,7 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { quantize_grid, device, peer: None, exchange: None, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
-            lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            lanes: RefCell::new(Vec::new()), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
@@ -567,7 +568,7 @@ impl<'a> GlmEngine<'a> {
             route_weights: self.alloc(lead_only(t * self.cfg.topk * 4))?,
             wire: self.alloc(lead_only(t * (h + h / 32)))?,
             shared: self.alloc(t * h * 2)?,
-            router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + h + h / 32)))?),
+            router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 })))?),
             ids: self.alloc(t * 4)?,
             select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
@@ -1323,6 +1324,7 @@ impl<'a> GlmEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
+        if self.spark_bf16 { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
         self.run("glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
@@ -1367,7 +1369,7 @@ impl<'a> GlmEngine<'a> {
     /// request with [`Self::moe_send`].
     fn moe_stage(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
         let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
         let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
@@ -1382,7 +1384,7 @@ impl<'a> GlmEngine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -1397,7 +1399,7 @@ impl<'a> GlmEngine<'a> {
         let timer = std::time::Instant::now();
         let request = {
             let staging = w.router_host.borrow();
-            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode)?
+            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16)?
         };
         self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         let post = std::time::Instant::now();
@@ -1415,7 +1417,8 @@ impl<'a> GlmEngine<'a> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let ranks = lane.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let staged_bytes = t * topk * 8 + t * (h + h / 32);
+        let bf16 = self.spark_bf16;
+        let staged_bytes = t * topk * 8 + t * (if bf16 { h * 2 } else { h + h / 32 });
         let staged = w.router_host.borrow().buffer;
         ensure!(staged_bytes <= staged.bytes, "lane wave exceeds its staging");
         // The address crosses to the lane thread as an integer; see the SAFETY note below.
@@ -1426,7 +1429,7 @@ impl<'a> GlmEngine<'a> {
             // writes it until this lane's next stage, which follows the wait
             // for this wave.
             let staged = unsafe { std::slice::from_raw_parts(staged as *const u8, staged_bytes) };
-            expert_request(staged, index, t, h, topk, false)
+            expert_request(staged, index, t, h, topk, false, bf16)
         });
         lane.submit(t, build)
     }
@@ -1835,10 +1838,10 @@ pub(crate) fn configured_lanes() -> usize {
 /// The expert request of `t` staged rows: expert ids (U32) and gate
 /// weights (F32) `[t, topk]`, then the FP8 wire rows, as `moe_stage` lays
 /// them out in the pinned router staging.
-fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool)
+fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool, bf16: bool)
     -> Result<ExpertProtocolV2Request> {
     let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-    let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+    let (route_bytes, wire_bytes) = (t * topk * 4, t * (if bf16 { h * 2 } else { h + h / 32 }));
     ensure!(staged.len() >= 2 * route_bytes + wire_bytes, "staged routes and wire rows are short");
     let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
     let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
@@ -1847,7 +1850,7 @@ fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, 
     let mut wire = vec![0u8; wire_bytes];
     copy_parallel(&mut wire, &staged[2 * route_bytes..2 * route_bytes + wire_bytes]);
     let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-        ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
             token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,

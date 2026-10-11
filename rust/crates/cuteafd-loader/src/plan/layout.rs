@@ -299,7 +299,8 @@ pub struct FamilyCosts {
 }
 
 
-/// Exact V4.1 worker rings; other families retain their qualified allowances.
+/// Compatibility query for the dedicated V4.1 worker. Generic planning uses
+/// the selected working set's explicit SparkIoBytes instead of allowances.
 pub fn v41_spark_ring_allowance(family: &str, capacity: u64, calibrated: u64, bf16: bool) -> u64 {
     if family != "deepseek_v41" { return calibrated; }
     let exact = u32::try_from(capacity).ok().and_then(|capacity|
@@ -308,6 +309,100 @@ pub fn v41_spark_ring_allowance(family: &str, capacity: u64, calibrated: u64, bf
     exact.map_or(u64::MAX, |bytes| bytes as u64)
 }
 
+
+fn spark_ring_geometry(family: &str, lanes: u64) -> crate::placement::SparkRingGeometry {
+    let endpoints = match family {
+        "deepseek_v41" | "deepseek_v4" => 2,
+        "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
+        "glm5_flash" | "mimo_v2" => lanes as usize,
+        "qwen4" => 1,
+        _ => 0,
+    };
+    crate::placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096, endpoints }
+}
+
+/// Split the old combined wave allowance into its non-I/O residual and the
+/// selected rank's explicit allocations. BF16 replaces input bytes; it is not
+/// a second wire buffer or an RTX/world-size side subtraction.
+fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placement::SparkWorkingSet,
+    geometry: cuteafd_core::ExpertGeometry, capacity: u32, bf16: bool,
+    rings: crate::placement::SparkRingGeometry, wave_allowance: u64)
+    -> Result<(), crate::placement::PlacementError> {
+    let rank = device.index as usize;
+    let io = working.rank_io(rank, geometry, capacity, bf16, rings)?;
+    let legacy = working.rank_io(rank, geometry, capacity, false, rings)?;
+    let legacy_io = legacy.intake.checked_add(legacy.host_exchange)
+        .and_then(|bytes| bytes.checked_add(legacy.row_indices))
+        .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
+    device.items.retain(|item| !matches!(item.group.as_str(), "expert waves" | "expert intake"
+        | "host expert exchange" | "expert row indices" | "rdma rings"));
+    if working.selected_ranks().contains(&rank) {
+        device.items.push(Item::new(Category::Workspace, "expert waves", "non-I/O residual",
+            wave_allowance.saturating_sub(legacy_io), Basis::Calibrated));
+        device.items.push(Item::new(Category::Workspace, "expert intake", if bf16 { "BF16" } else { "FP8 K32" },
+            io.intake, Basis::Formula));
+        device.items.push(Item::new(Category::Workspace, "host expert exchange", "", io.host_exchange, Basis::Formula));
+        device.items.push(Item::new(Category::Workspace, "expert row indices", "", io.row_indices, Basis::Formula));
+        device.items.push(Item::new(Category::Transport, "rdma rings", "", io.mapped_rings, Basis::Formula));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod selected_spark_io_tests {
+    use super::*;
+    use cuteafd_core::ExpertGeometry;
+    use crate::placement::SparkWorkingSet;
+
+    #[test]
+    fn selected_rank_rings_fix_legacy_undercharges_for_every_wire_format() {
+        for (family, geometry, lanes, expected) in [
+            ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_FLASH, 2, 821428224),
+            ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
+            ("glm5", ExpertGeometry::GLM5, 3, 2459697152),
+            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
+        ] {
+            let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+                prefill_lanes: lanes, ..Default::default() };
+            let rings = spark_ring_geometry(family, lanes);
+            let io = working.rank_io(0, geometry, 4096, false, rings).unwrap();
+            assert_eq!(io.mapped_rings, expected);
+            assert!(io.mapped_rings > family_costs(family).spark_ring_bytes);
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+            charge_spark_io(&mut device, &working, geometry, 4096, false, rings,
+                family_costs(family).spark_workspace_bytes).unwrap();
+            assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
+        }
+    }
+
+    #[test]
+    fn bf16_replaces_selected_rank_intake_and_empty_selection_has_no_io() {
+        for (family, geometry, lanes) in [("deepseek_v41", ExpertGeometry::DEEPSEEK_V41, 1),
+            ("glm5", ExpertGeometry::GLM5, 3), ("glm5_flash", ExpertGeometry::GLM5_FLASH, 2),
+            ("qwen4", ExpertGeometry::QWEN4, 1)] {
+            let mut working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+                prefill_lanes: lanes, ..Default::default() };
+            let rings = spark_ring_geometry(family, lanes);
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 5,
+                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+            let wave = family_costs(family).spark_workspace_bytes;
+            charge_spark_io(&mut device, &working, geometry, 4096, false, rings, wave).unwrap();
+            let wire = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
+            charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
+            let bf16 = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
+            assert_eq!(bf16 - wire, 4096 * (geometry.hidden as u64 - geometry.hidden as u64 / 32));
+            assert_eq!(device.items.iter().filter(|item| item.group == "rdma rings").count(), 1);
+            working.spark_layers.clear();
+            charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
+            assert!(device.items.is_empty());
+        }
+        let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
+        assert_eq!(spark_ring_geometry("glm5", glm).endpoints, 4);
+        assert_eq!(spark_ring_geometry("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)).endpoints, 1);
+    }
+}
 
 const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
@@ -932,6 +1027,33 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
+    let spark_geometry = model.spec().moe.as_ref().map(|moe| cuteafd_core::ExpertGeometry {
+        hidden: model.spec().hidden as u32, experts: moe.experts as u32,
+        topk: moe.top_k as u32, intermediate: moe.intermediate as u32,
+        layers: model.spec().layers.len() as u32,
+    });
+    let spark_format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
+        .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
+    let spark_bf16 = spark_format.to_ascii_lowercase().contains("nvfp4");
+    let spark_lanes = match family {
+        "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
+            glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
+        "glm5_flash" => if std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "1") { 1 } else { glmf_lanes },
+        "mimo_v2" => crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()
+            .and_then(|cfg| cfg.program_family().ok()).and_then(|id|
+                crate::families::mimo_v2::admission::resolve_transport_lanes(true, id,
+                    std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok().as_deref()).ok()).unwrap_or(0) as u64,
+        "deepseek_v4" => 2,
+        _ => 1,
+    };
+    let mut spark_working = crate::placement::SparkWorkingSet {
+        rtx_layers: (0..local_layers).collect(),
+        spark_layers: if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
+            ((if family == "deepseek_v41" { local_layers } else { 0 })..model.spec().layers.len()).collect()
+        } else { Vec::new() },
+        spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 },
+        prefill_lanes: spark_lanes,
+    };
     let mut spark_devices = Vec::new();
     // Spark ranks.
     if let ExpertPlacement::Sparks { ranks } = report.placement {
@@ -968,14 +1090,17 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 device.capacity_bytes += 13 * GIB;
                 device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", costs.spark_host_bytes, allowance_basis));
             }
-            let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
-                .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
-            let bf16_ingress = format.contains("NVFP4") || format.contains("nvfp4");
-            device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
-            let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
-            device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, allowance_basis));
-            device.items.push(Item::new(Category::Transport, "rdma rings", "", v41_spark_ring_allowance(family, options.spark_capacity_rows, costs.spark_ring_bytes, bf16_ingress),
-                if family == "deepseek_v41" { Basis::Formula } else { allowance_basis }));
+            device.items.push(Item::new(Category::Experts, "routed_expert", spark_format.clone(), stored, Basis::Exact));
+            let io = spark_geometry.ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
+                .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
+                    .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
+                    .and_then(|capacity| charge_spark_io(&mut device, &spark_working, geometry, capacity,
+                        spark_bf16, spark_ring_geometry(family, spark_working.prefill_lanes),
+                        costs.spark_workspace_bytes * options.spark_capacity_rows / 4096)));
+            if let Err(error) = io {
+                report.placement_supported = false;
+                notes.push(format!("Spark rank {rank} I/O admission: {error}"));
+            }
             device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, allowance_basis));
             spark_devices.push(device);
         }
@@ -1046,6 +1171,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
             Ok((placement, working)) => {
+                spark_working = working.spark.clone();
                 if working.spark.spark_layers.is_empty() { spark_devices.clear(); }
                 notes.push(format!("GLM selected working set: {} Spark layers, {} ranks, {} prefill lanes",
                     working.spark.spark_layers.len(), working.spark.spark_ranks, working.spark.prefill_lanes));
@@ -1334,6 +1460,24 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
+    if family == "deepseek_v41" {
+        spark_working.rtx_layers = (0..local_layers).collect();
+        spark_working.spark_layers = (local_layers..model.spec().layers.len()).collect();
+    }
+    // Reapply after family admission has selected its executable suffix and
+    // lane count. Rank-local I/O never belongs to the coordinator KV budget.
+    for device in &mut spark_devices {
+        let io = spark_geometry.ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
+            .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
+                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
+                .and_then(|capacity| charge_spark_io(device, &spark_working, geometry, capacity,
+                    spark_bf16, spark_ring_geometry(family, spark_working.prefill_lanes),
+                    costs.spark_workspace_bytes * options.spark_capacity_rows / 4096)));
+        if let Err(error) = io {
+            report.placement_supported = false;
+            notes.push(format!("{} I/O admission: {error}", device.name()));
+        }
+    }
     if report.encoder.is_none() {
         resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options, &mut notes);
     }

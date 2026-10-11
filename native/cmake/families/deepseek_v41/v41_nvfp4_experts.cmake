@@ -28,15 +28,6 @@ if(NOT "${CUTEAFD_V41_NVFP4_OUTPUT_SHARDS}" MATCHES "^(0|1|2|4|5|8|10|20|40)$")
   message(FATAL_ERROR "CUTEAFD_V41_NVFP4_OUTPUT_SHARDS must be 0 or a positive divisor of 40")
 endif()
 set(CUTEAFD_V41_NVFP4_INCLUDE_DIRS)
-# Quantize each token's activation once with a shared scale and fan it out to
-# every routed expert instead of re-quantizing the identical BF16 row per route.
-# The host publishes a uniform FC1 activation scale to match (v41_experts/nvfp4.rs).
-option(CUTEAFD_V41_NVFP4_SHARE_INPUT "Export NVFP4 experts with shared-input activation quantization" OFF)
-if(CUTEAFD_V41_NVFP4_SHARE_INPUT)
-  set(CUTEAFD_V41_NVFP4_SHARE_INPUT_ARG "--share-input")
-else()
-  set(CUTEAFD_V41_NVFP4_SHARE_INPUT_ARG "")
-endif()
 list(JOIN CUTEAFD_V41_NVFP4_CAPACITIES "," CUTEAFD_V41_NVFP4_CAPACITY_ARG)
 option(CUTEAFD_V41_NVFP4_PAD_INTERMEDIATE "Zero-pad NVFP4 shards to avoid transposed FC1" ON)
 set(CUTEAFD_V41_NVFP4_PAD_ARG "")
@@ -63,7 +54,6 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
       --rows "${CUTEAFD_V41_NVFP4_CAPACITY_ARG}"
       --tile-m "${CUTEAFD_V41_NVFP4_TILE_M}"
       --output-shards "${CUTEAFD_V41_NVFP4_OUTPUT_SHARDS}"
-      ${CUTEAFD_V41_NVFP4_SHARE_INPUT_ARG}
       ${CUTEAFD_V41_NVFP4_PAD_ARG}
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${nvfp4_dir}/v41_expert_variants.h"

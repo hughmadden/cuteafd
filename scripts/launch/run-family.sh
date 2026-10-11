@@ -963,6 +963,32 @@ if [[ "$ranks" == 0 ]]; then
     *) echo "SPARK_COUNT=0 (local experts) serves GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
   esac
 fi
+# Match persistent connections owned by the selected family's transport, not
+# the Spark world size. Forward the resolved lane policy to the coordinator.
+lane_env_args=()
+case "$family" in
+  deepseek_v4) rdma_endpoints=2 ;;
+  glm5)
+    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
+    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
+    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes")
+    rdma_endpoints=$((1 + (selected_lanes > 1 ? selected_lanes : 0))) ;;
+  glm5_flash)
+    rdma_endpoints="${prefill_lanes:-2}"
+    if [[ "${CUTEAFD_GLMF_PREFILL_LANES:-}" == 1 ]]; then rdma_endpoints=1; fi
+    [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES") ;;
+  qwen4) rdma_endpoints=1 ;;
+  mimo_v2)
+    hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
+    selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
+    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_MIMO_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
+    lane_env_args+=(-e "CUTEAFD_MIMO_PREFILL_LANES=$selected_lanes")
+    rdma_endpoints="$selected_lanes"
+    # BF16-decode fits the wider FP8 prefill ring; only full BF16 changes
+    # the maximum ingress frame. NVFP4 is detected by the worker itself.
+    [[ "$expert_input" != bf16 ]] || spark_worker_args+=" --bf16-ingress" ;;
+  *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
+esac
 # Check every selected image before --restart or checkpoint reads. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
@@ -1044,7 +1070,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
     plan_draft_args+=(--decode-rows 128)
   fi
   [[ "$family" != qwen4 ]] || plan_draft_args+=(--kv-cache "$kv_format")
-  plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -1236,7 +1262,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args$spark_worker_args \
+    --rank $rank --world $ranks --rdma-endpoints $rdma_endpoints --capacity 4096 --device-budget-bytes $budget $layer_args$spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
 done
 wait
@@ -1350,7 +1376,7 @@ done
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \

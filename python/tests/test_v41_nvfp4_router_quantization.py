@@ -69,10 +69,15 @@ def test_static_nvfp4_rejects_invalid_scale(scale):
         nvfp4_quantize_static_bytes([1.0] * 16, scale)
 
 
-def test_nvfp4_scale_option_reaches_both_roles():
-    source = (ROOT / "run.sh").read_text()
-    assert 'V41_NVFP4_INPUT_SCALE=${V41_NVFP4_INPUT_SCALE:-shared_max}' in source
-    assert 'V41_NVFP4_INPUT_SCALE=${23:-shared_max}' in source
-    assert '"${V41_NVFP4_INPUT_SCALE:-shared_max}" "${dspark_draft_limit:-auto}"' in source
-    common = (ROOT / "scripts/lib/release-common.sh").read_text()
-    assert "PROBE_DUMP_ROOT|V41_NVFP4_INPUT_SCALE) return 0" in common
+def test_nvfp4_calibration_has_no_runtime_or_export_switch():
+    for path in ["run.sh", "scripts/lib/release-common.sh",
+                 "rust/crates/cuteafd-daemon/src/shared/experts/layer/nvfp4.rs"]:
+        source = (ROOT / path).read_text()
+        assert "V41_NVFP4_INPUT_SCALE" not in source
+        assert "SharedMax" not in source
+    exporter = (ROOT / "python/tools/aot/export_b12x_v41_nvfp4_aot.py").read_text()
+    assert "--share-input" not in exporter
+    assert "nvfp4_share_input=False" in exporter
+    assert "share_input_across_experts=False" in exporter
+    cmake = (ROOT / "native/cmake/families/deepseek_v41/v41_nvfp4_experts.cmake").read_text()
+    assert "CUTEAFD_V41_NVFP4_SHARE_INPUT" not in cmake

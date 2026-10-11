@@ -100,7 +100,7 @@
   ],
   "worker_argv": [
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",
@@ -123,7 +123,7 @@
       "0.0.0.0:29441"
     ],
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",
@@ -146,7 +146,7 @@
       "0.0.0.0:29441"
     ],
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",
@@ -169,7 +169,7 @@
       "0.0.0.0:29441"
     ],
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",
@@ -192,7 +192,7 @@
       "0.0.0.0:29441"
     ],
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",
@@ -215,7 +215,7 @@
       "0.0.0.0:29441"
     ],
     [
-      "expertd-native",
+      "expertd-native", "--rdma-endpoints", "2",
       "--snapshot",
       "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
       "--native-lib",

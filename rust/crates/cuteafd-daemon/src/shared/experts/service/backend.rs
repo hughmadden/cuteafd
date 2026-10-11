@@ -60,7 +60,7 @@ impl<'a> Weights<'a> {
                 config.exl3_schedule,
             )?),
             Self::Fp8(experts) => {
-                ensure!(Fp8Worker::workspace_bytes(config.capacity as usize) <= remaining,
+                ensure!(fp8_worker_workspace(config)? <= remaining,
                     "FP8 worker workspace exceeds the device budget");
                 Execution::Fp8(Fp8Worker::new(library, experts.clone(), config.capacity)?)
             }
@@ -158,6 +158,16 @@ mod admission_tests {
     }
 }
 
+fn fp8_worker_workspace(config: &NativeExpertServiceConfig) -> Result<usize> {
+    if config.bf16_ingress {
+        let io = super::selected_spark_io(config, cuteafd_core::expert_geometry(),
+            super::worker_ring_geometry(config)?)?;
+        Ok(usize::try_from(io.intake).context("BF16 worker intake exceeds address space")?)
+    } else {
+        Ok(Fp8Worker::workspace_bytes(config.capacity as usize))
+    }
+}
+
 /// The checkpoint's own FP8 experts (E4M3 + FP32 128x128 block scales) for
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
@@ -196,7 +206,7 @@ pub(super) fn load_fp8<'a>(
         );
     }
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
-    let workspace = Fp8Worker::workspace_bytes(config.capacity as usize);
+    let workspace = fp8_worker_workspace(config)?;
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
     tracing::info!(rank = config.rank, world = config.world, first_layer = layers.start, layer_count = layers.len(),
         package = %directory.display(), "FP8 Spark residency plan");

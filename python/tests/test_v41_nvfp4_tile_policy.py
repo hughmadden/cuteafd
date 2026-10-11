@@ -67,12 +67,15 @@ def test_export_rejects_invalid_shards_before_gpu_import(exporter, monkeypatch, 
 
 @pytest.mark.parametrize("requested", [None, 16, 32, 64, 128])
 @pytest.mark.parametrize("shards", [0, 1, 5])
-def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requested, shards):
+@pytest.mark.parametrize("role,role_id", [("rtx_tp2", 3),
+                                        ("spark_tp3", 6), ("spark_tp6", 7)])
+@pytest.mark.parametrize("physical_sms", [188, 170])
+def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requested, shards, role, role_id, physical_sms):
     dtype = NS(itemsize=2)
     torch = NS(bfloat16=dtype, int32="int32", device=lambda *args: "cuda",
                cuda=NS(init=Mock(), current_device=lambda: 0,
-                       get_device_properties=lambda _: NS(major=12, minor=0,
-                           name="mock GPU", multi_processor_count=100)))
+                       get_device_properties=lambda _: NS(major=12, minor=int(role.startswith("spark")),
+                           name="mock GPU", multi_processor_count=physical_sms)))
     monkeypatch.setitem(sys.modules, "torch", torch)
     configs, resolved, compiled_tiles, compiled_shards = [], [], [], []
 
@@ -92,6 +95,8 @@ def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requ
     def get_kernel(*args, **kwargs):
         compiled_tiles.append(kwargs["planned_tile_m"])
         compiled_shards.append(kwargs["nvfp4_output_shards"])
+        assert kwargs["share_input_across_experts"] is False
+        assert kwargs["mac_override"] == (48 if role.startswith("spark") else 188)
         def export_to_c(output, label, symbol):
             (Path(output) / f"{label}.h").write_text(
                 f"void _mlir_{symbol}(void **args, int32_t num_args);\n"
@@ -109,8 +114,14 @@ def test_export_uses_resolved_scratch_tile(exporter, monkeypatch, tmp_path, requ
     monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe", NS(_impl=moe))
     monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe._tuning",
                         NS(MoeDecodeConfig=lambda **kwargs: NS(**kwargs)))
-    exporter.export(tmp_path, "rtx_tp2", [1, 80, 256, 4096], requested, output_shards=shards)
+    exporter.export(tmp_path, role, [1, 80, 256, 4096], requested, output_shards=shards)
     manifest = json.loads((tmp_path / "v41_nvfp4_experts.json").read_text())
+    assert manifest["role"] == role
+    assert manifest["share_input"] is False
+    header = (tmp_path / "v41_expert_variants.h").read_text()
+    assert f"{{2,{role_id},384,5120," in header
+    assert f"#define CUTEAFD_V41_SMS {48 if role.startswith('spark') else 188}" in header
+    assert all(config.nvfp4_share_input is False for config in configs)
     assert [config.dynamic_tile_m for config in configs] == [requested] * 4
     assert compiled_tiles == resolved == [16, 32, 64, 128]
     expected_shards = [0] * 4 if shards == 0 else [shards, 1, 1, 1]

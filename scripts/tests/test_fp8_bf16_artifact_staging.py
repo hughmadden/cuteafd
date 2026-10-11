@@ -101,7 +101,7 @@ def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry,
     assert f'PROFILES={profiles}' in result.stderr
 
 
-def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
+def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION, weights="fp8"):
     layout = "tp4" if role == "spark" else "tp1"
     library = path / layout / "libcuteafd_fp8moe.so"
     library.parent.mkdir(parents=True)
@@ -111,7 +111,7 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
         "sparkinfer_revision": revision,
         "compute": [12, 1],
         "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
-                             "weights": "fp8", "hidden": 4096, "experts": 256, "top_k": 8,
+                             "weights": weights, "hidden": 4096, "experts": 256, "top_k": 8,
                              "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
         "files": {str(library.relative_to(path)): {
             "bytes": library.stat().st_size, "sha256": hashlib.sha256(library.read_bytes()).hexdigest()}},
@@ -130,10 +130,9 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
     (built / "source").symlink_to(REPO, target_is_directory=True)
     wire = "wire" if role == "expert" else "bf16"
     owner = "spark" if role == "expert" else "coordinator"
-    for name in ("fp8-mimo", "fp8-glm-nvfp4", "fp8-glm-nvfp4a4"):
-        write_package(native / name, input_kind=wire, role=owner)
-    for name in ("fp8-qwen4-nvfp4", "fp8-qwen4-nvfp4a4"):
-        write_package(native / name, input_kind=wire, role=owner)
+    write_package(native / "fp8-mimo", input_kind=wire, role=owner)
+    for name in ("fp8-glm-nvfp4", "fp8-glm-nvfp4a4", "fp8-qwen4-nvfp4", "fp8-qwen4-nvfp4a4"):
+        write_package(native / name, input_kind="bf16", role=owner, weights="nvfp4")
     if role == "coordinator":
         write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
@@ -150,6 +149,22 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
                                  "expert_families": families, "bf16_families": requested},
                             timeout=30)
     return result, output / "fp8"
+
+
+@pytest.mark.parametrize("role", ["spark", "coordinator"])
+def test_nvfp4_primary_input_is_bf16_only(role):
+    assert package_tool.input_kind(role, "nvfp4") == "bf16"
+    assert package_tool.input_kind(role, "nvfp4", "bf16") == "bf16"
+    with pytest.raises(ValueError, match="NVFP4 requires BF16"):
+        package_tool.input_kind(role, "nvfp4", "wire")
+    for weights in ("fp8", "mxfp4"):
+        assert package_tool.input_kind(role, weights) == ("wire" if role == "spark" else "bf16")
+
+
+def test_legacy_nvfp4_wire_artifact_cannot_be_staged(tmp_path):
+    legacy = write_package(tmp_path / "legacy", weights="nvfp4")
+    with pytest.raises(ValueError, match="NVFP4 requires BF16"):
+        package_tool.verify(legacy)
 
 
 @pytest.mark.parametrize("role", ["coordinator", "expert"])

@@ -289,7 +289,7 @@ def test_nvfp4_manifest_requires_exact_export_and_bf16_input(tmp_path: Path, rol
         if artifact.suffix in (".o", ".h"):
             (nvfp4_dir / artifact.name).write_bytes(artifact.read_bytes())
     payload = json.loads(native_path.read_text())
-    payload.update(quant_mode="nvfp4", input_format="bf16")
+    payload.update(quant_mode="nvfp4", input_format="bf16", share_input=False)
     path = nvfp4_dir / "v41_nvfp4_experts.json"
     path.write_text(json.dumps(payload))
     library = tmp_path / "libcuteafd_native.so"
@@ -306,6 +306,12 @@ def test_nvfp4_manifest_requires_exact_export_and_bf16_input(tmp_path: Path, rol
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     assert result.returncode == 2
     assert "BF16 fabric input" in result.stderr
+    payload["input_format"] = "bf16"
+    payload["share_input"] = True
+    path.write_text(json.dumps(payload))
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2
+    assert "per-expert input calibration" in result.stderr
 
 
 def test_manifest_writer_rejects_an_unknown_role_before_touching_files(

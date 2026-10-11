@@ -352,6 +352,8 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes)?;
+        engine.spark_bf16 = self.catalog.fp8().is_some_and(|tensors|
+            tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
@@ -411,13 +413,14 @@ impl Opened {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
             }).collect();
             let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
-                h as u32, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                    else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                 (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
                     row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
                     source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
                     route_count: topk as u32,
                 }).collect(),
-                routes, vec![0; rows * (h + h / 32)])?;
+                routes, vec![0; rows * (if engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };

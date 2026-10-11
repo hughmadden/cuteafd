@@ -622,6 +622,8 @@ impl NativeLibrary {
             1 => b"cuteafd_v41_nvfp4_expert_shared_input",
             2 => b"cuteafd_v41_nvfp4_local_expert_shared_input",
             3 => b"cuteafd_v41_nvfp4_tp2_expert_shared_input",
+            4 => b"cuteafd_v41_nvfp4_spark_tp3_expert_shared_input",
+            5 => b"cuteafd_v41_nvfp4_spark_tp6_expert_shared_input",
             _ => anyhow::bail!("unsupported NVFP4 role {role}"),
         };
         let name = family_symbol(name)?;

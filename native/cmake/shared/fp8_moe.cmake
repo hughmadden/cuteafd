@@ -93,7 +93,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
     COMMENT "Building exact FP8 expert package fp8-${geometry} (${CUTEAFD_FP8_MOE_ROLE})"
     VERBATIM)
   list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${package}/manifest.json")
-  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES)
+  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES AND NOT entry MATCHES ":nvfp4")
     set(bf16_package "${package}-bf16")
     add_custom_command(
       OUTPUT "${bf16_package}/manifest.json"

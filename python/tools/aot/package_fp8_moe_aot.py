@@ -81,6 +81,16 @@ ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
 # experts take the BF16 activations directly (no input quantization at all).
 ROLE_INPUT = {"spark": "wire", "coordinator": "bf16"}
+
+
+def input_kind(role: str, weights: str, requested: str | None = None) -> str:
+    """NVFP4 quantizes the original BF16 row once with each expert's scale."""
+    if weights == "nvfp4":
+        if requested not in (None, "bf16"):
+            raise ValueError("NVFP4 requires BF16 input; FP8 K32 wire loses calibrated numerics")
+        return "bf16"
+    return requested or ROLE_INPUT[role]
+
 LIBRARY = "libcuteafd_fp8moe.so"
 POINTERS = 11
 INFO_WORDS = 16
@@ -328,7 +338,7 @@ def build(args: argparse.Namespace) -> None:
             widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
-    wire = (args.input or ROLE_INPUT[args.role]) == "wire"
+    wire = input_kind(args.role, base.weights, args.input) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -404,6 +414,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         raise ValueError(f"{package}: no {layout} layout (built: {sorted(layouts)})")
     for name in ([layout] if layout is not None else layouts):
         info = layouts[name]
+        if info.get("weights") == "nvfp4" and info.get("input") != "bf16":
+            raise ValueError(f"{package}/{name}: NVFP4 requires BF16 input")
         if input_kind is not None and info.get("input") != input_kind:
             raise ValueError(f"{package}/{name}: input {info.get('input')} differs from {input_kind}")
         if min_capacity is not None and not any(c["capacity"] >= min_capacity for c in info["capacities"]):
@@ -439,7 +451,7 @@ def main() -> None:
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "
                         "own width (no zero padding; the worker prefers them when every width is present)")
     create.add_argument("--input", choices=("wire", "bf16"),
-                        help="expert input rows (default: wire for spark, bf16 for coordinator)")
+                        help="expert input rows (NVFP4: bf16; otherwise wire for spark, bf16 for coordinator)")
     create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")
     create.add_argument("--build-dir", type=Path, required=True)
     create.add_argument("--output", type=Path, required=True)

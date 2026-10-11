@@ -65,9 +65,10 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         capacity: args.capacity,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
+        rdma_endpoints: args.rdma_endpoints as usize,
         topology,
         native_spark_tp2: false,
-        bf16_ingress: false,
+        bf16_ingress: args.bf16_ingress,
         encoder,
         audio_encoder,
     };
@@ -95,6 +96,8 @@ pub(crate) struct NativeExpertServiceConfig {
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
+    /// Explicit selected-family connection geometry, never inferred from a different family.
+    pub rdma_endpoints: usize,
     /// Explicit replicated `TP×EP` topology; `None` keeps the legacy world 2/4
     /// behavior (EXL3 compact may still select a TP2 RTX pair).
     pub topology: Option<SparkTopology>,
@@ -308,6 +311,7 @@ fn spark_ring_bytes(
     spark_ring_bytes_for_ingress(capacity, max_frame_bytes, depth, slot_bytes, alignment, endpoints, false)
 }
 
+#[cfg(test)]
 fn spark_ring_bytes_for_ingress(capacity: u32, max_frame_bytes: usize, depth: usize,
     slot_bytes: usize, alignment: usize, endpoints: usize, bf16: bool) -> Result<usize> {
     ensure!((1..=8).contains(&depth), "verbs-host ring depth must be in 1..=8");
@@ -325,44 +329,35 @@ fn spark_ring_bytes_for_ingress(capacity: u32, max_frame_bytes: usize, depth: us
         slot_bytes, alignment, endpoints, bf16).context("registered ring span overflow")
 }
 
-/// The Spark worker always opens exactly two persistent endpoints (decode and
-/// prefill); that is the count the admission model reserves. The obsolete
-/// `CUTEAFD_SPARK_RDMA_ENDPOINTS` knob is rejected unless it names that value, so
-/// a stale launch cannot silently under-reserve the mapped rings.
-fn parse_rdma_endpoints(value: Option<&str>) -> Result<usize> {
-    match value.map(str::trim) {
-        None => Ok(2),
-        Some("2") => {
-            tracing::warn!(
-                "CUTEAFD_SPARK_RDMA_ENDPOINTS is obsolete; the Spark worker always opens two persistent endpoints"
-            );
-            Ok(2)
-        }
-        Some(other) => anyhow::bail!(
-            "CUTEAFD_SPARK_RDMA_ENDPOINTS={other} is obsolete and unsupported; the Spark worker \
-             requires exactly 2 persistent endpoints (decode and prefill)"
-        ),
-    }
+fn selected_spark_io(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry,
+    rings: cuteafd_loader::placement::SparkRingGeometry) -> Result<cuteafd_loader::placement::SparkIoBytes> {
+    let working = cuteafd_loader::placement::SparkWorkingSet {
+        spark_layers: vec![config.first_layer], spark_ranks: config.world,
+        prefill_lanes: 1, ..Default::default()
+    };
+    ensure!(working.selected_ranks().contains(&config.rank), "Spark worker rank is not selected");
+    Ok(working.rank_io(config.rank, geometry, config.capacity, config.bf16_ingress, rings)?)
 }
 
-/// Ring bytes for this worker's configured topology and frame budget. The
-/// decode and prefill lanes each open one persistent endpoint.
+fn worker_ring_geometry(config: &NativeExpertServiceConfig)
+    -> Result<cuteafd_loader::placement::SparkRingGeometry> {
+    ensure!(config.rdma_endpoints > 0, "Spark ring geometry requires nonzero --rdma-endpoints");
+    Ok(cuteafd_loader::placement::SparkRingGeometry {
+        max_frame_bytes: config.max_frame_bytes,
+        depth: env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", 8)?,
+        slot_bytes: env_usize("CUTEAFD_VERBS_HOST_RING_SLOT_BYTES", 8 << 20)?,
+        endpoints: config.rdma_endpoints,
+        alignment: cuteafd_transport::verbs_host_capabilities().preferred_alignment,
+    })
+}
+
+/// Ring bytes for this worker's explicit selected topology and frame budget.
 fn spark_transport_bytes(config: &NativeExpertServiceConfig) -> Result<usize> {
-    let depth = env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", 8)?;
-    let slot_bytes = env_usize("CUTEAFD_VERBS_HOST_RING_SLOT_BYTES", 8 << 20)?;
-    let requested = std::env::var("CUTEAFD_SPARK_RDMA_ENDPOINTS").ok();
-    let endpoints = parse_rdma_endpoints(requested.as_deref())?;
-    let alignment = cuteafd_transport::verbs_host_capabilities().preferred_alignment;
-    let bytes = spark_ring_bytes_for_ingress(
-        config.capacity,
-        config.max_frame_bytes,
-        depth,
-        slot_bytes,
-        alignment,
-        endpoints,
-        config.bf16_ingress,
-    )?;
-    validate_v41_ring_charge(config, cuteafd_core::expert_geometry(), depth, slot_bytes, bytes)?;
+    let rings = worker_ring_geometry(config)?;
+    let bytes = usize::try_from(selected_spark_io(config, cuteafd_core::expert_geometry(),
+        rings)?.mapped_rings)?;
+    validate_v41_ring_charge(config, cuteafd_core::expert_geometry(), rings.depth,
+        rings.slot_bytes, bytes)?;
     Ok(bytes)
 }
 
@@ -380,9 +375,9 @@ fn validate_v41_ring_charge(config: &NativeExpertServiceConfig, geometry: cuteaf
 
 fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry)
     -> Result<Arc<cuteafd_transport::RingBudget>> {
-    // Topology changes expert ownership, not the two V4.1 transport owners.
-    let limit = if geometry.family() == Some("v41") { spark_transport_bytes(config)? }
-        else { usize::MAX };
+    let rings = worker_ring_geometry(config)?;
+    let limit = usize::try_from(selected_spark_io(config, geometry, rings)?.mapped_rings)?;
+    validate_v41_ring_charge(config, geometry, rings.depth, rings.slot_bytes, limit)?;
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
@@ -402,8 +397,11 @@ fn spark_admission_budget(
     read_scratch: usize,
     workspace: usize,
 ) -> Result<SparkAdmissionBudget> {
-    let exchange = HostExpertExchange::bytes_for(config.capacity)?;
-    let row_indices = config.capacity as usize * 4;
+    let (exchange, row_indices) = if config.bf16_ingress {
+        let io = selected_spark_io(config, cuteafd_core::expert_geometry(),
+            worker_ring_geometry(config)?)?;
+        (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)
+    } else { (HostExpertExchange::bytes_for(config.capacity)?, config.capacity as usize * 4) };
     let rings = spark_transport_bytes(config)?;
     let headroom = spark_runtime_headroom()?;
     // The loader's pinned buffers and read scratch live only for one layer load;
@@ -504,6 +502,7 @@ mod tests {
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
+            rdma_endpoints: 2,
             topology,
             native_spark_tp2: false,
             bf16_ingress: false,
@@ -818,19 +817,63 @@ mod tests {
         }
     }
 
-    /// The obsolete endpoint override is gone: exactly two endpoints (decode and
-    /// prefill) are always reserved, and a stale non-2 value fails closed.
     #[test]
-    fn endpoint_count_is_fixed_at_two_and_stale_overrides_are_rejected() {
-        assert_eq!(parse_rdma_endpoints(None).unwrap(), 2);
-        assert_eq!(parse_rdma_endpoints(Some("2")).unwrap(), 2);
-        assert_eq!(parse_rdma_endpoints(Some(" 2 ")).unwrap(), 2);
-        for obsolete in ["1", "0", "3", "16", "x", ""] {
-            assert!(
-                parse_rdma_endpoints(Some(obsolete)).is_err(),
-                "{obsolete:?} must be rejected"
-            );
+    fn spark_io_equals_actual_transport_allocation_for_every_family() {
+        use cuteafd_core::ExpertGeometry as G;
+        use cuteafd_loader::placement::{SparkRingGeometry, SparkWorkingSet};
+        let cases = [(G::DEEPSEEK_V41, 2), (G::DEEPSEEK_V4_FLASH, 2),
+            (G::DEEPSEEK_V4_PRO, 2), (G::GLM5, 4), (G::GLM5_FLASH, 2),
+            (G::QWEN4, 1), (G::MIMO_V2_FLASH, 2), (G::MIMO_V26_PRO, 3)];
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+            prefill_lanes: 3, ..SparkWorkingSet::default() };
+        for (geometry, endpoints) in cases {
+            for bf16 in [false, true] {
+                for capacity in [1, 1024, 2048, 4096] {
+                    for depth in [1, 4, 8] {
+                        let rings = SparkRingGeometry { max_frame_bytes: 64 << 20, depth,
+                            slot_bytes: 8 << 20, alignment: 4096, endpoints };
+                        let (request, response) = cuteafd_transport::protocol_v2::compact_expert_wire_bytes(
+                            geometry, capacity, bf16).unwrap();
+                        let actual = cuteafd_transport::verbs_host_persistent_ring_bytes(
+                            rings.max_frame_bytes, request, response, rings.slot_bytes,
+                            rings.alignment, rings.depth).unwrap() * endpoints;
+                        let planned = working.rank_io(0, geometry, capacity, bf16, rings)
+                            .unwrap().mapped_rings;
+                        assert_eq!(planned, actual as u64,
+                            "geometry={geometry:?} bf16={bf16} capacity={capacity} depth={depth} endpoints={endpoints}");
+                        if geometry == G::GLM5 && bf16 && capacity == 4096 && depth == 8 {
+                            assert_eq!(actual, 3_239_837_696);
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn generic_ring_budget_uses_explicit_endpoints_for_every_format() {
+        let mut config = config(4, 0, None);
+        config.capacity = 4096;
+        for geometry in [cuteafd_core::ExpertGeometry::GLM5,
+            cuteafd_core::ExpertGeometry::GLM5_FLASH, cuteafd_core::ExpertGeometry::QWEN4] {
+            for bf16 in [false, true] {
+                config.bf16_ingress = bf16;
+                let mut previous = 0;
+                for endpoints in [1, 2, 4] {
+                    config.rdma_endpoints = endpoints;
+                    let rings = worker_ring_geometry(&config).unwrap();
+                    let expected = selected_spark_io(&config, geometry, rings).unwrap().mapped_rings as usize;
+                    let budget = worker_ring_budget(&config, geometry).unwrap();
+                    assert_eq!(budget.limit(), expected);
+                    assert!(expected < usize::MAX);
+                    if previous > 0 { assert_eq!(expected, 2 * previous); }
+                    previous = expected;
+                    assert!(budget.reserve(expected + 1).is_err());
+                }
+            }
+        }
+        config.rdma_endpoints = 0;
+        assert!(worker_ring_geometry(&config).is_err());
     }
 
     /// The runtime ring budget equals the two-endpoint allowance that admission

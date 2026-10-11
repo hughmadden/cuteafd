@@ -1089,8 +1089,8 @@ fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
 /// with the DSA index cache `with_engine` resolved (a head split keeps `keys`).
-fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
-    engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache, spark_bf16: bool) -> engine::StepSettings {
+    engine::StepSettings { spark_bf16, kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
         max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
         decode_rows: args.decode_rows }
@@ -1474,7 +1474,7 @@ impl Opened {
                 args.prefill_lanes
             } else { 1 };
             let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
-                &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
+                &model.layers, experts.as_ref(), step_settings(args, index_cache, self.fp8().is_some_and(|tensors| tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4))), args.prefill_rows, lanes)?;
             // The caches this engine builds: records per token, the sequences' state and marks, and
             // the speculative records follow the index cache, and a BF16 KDA state halves the state
             // per sequence and each mark the arena holds. The replay records and commit tables hold the
@@ -1533,7 +1533,7 @@ impl Opened {
             // logits, their exact union replaces the allowance.
             let spark = args.peers.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-                step_settings(args, index_cache)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
+                step_settings(args, index_cache, self.fp8().is_some_and(|tensors| tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4))).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
             let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
             // Each rank's exact workspaces plus the measured code still to load before ready
             // (`placement::inventory::LOADED_CODE`, which holds the workspaces' untracked runtime
@@ -1606,6 +1606,9 @@ impl Opened {
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records)?;
+        engine.spark_bf16 = self.fp8().is_some_and(|tensors|
+            tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
@@ -1760,7 +1763,7 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows)?;
+        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, self.fp8().is_some_and(|tensors| tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4))?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());

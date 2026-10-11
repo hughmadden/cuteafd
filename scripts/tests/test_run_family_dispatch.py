@@ -310,6 +310,43 @@ def test_qwen_invalid_kv_format_fails_before_launch(tmp_path):
     assert "serve-qwen4 --snapshot" not in result.stderr
 
 
+@pytest.mark.parametrize("config,keys,env,endpoints", [
+    ({"model_type": "deepseek_v4"}, "", {}, 2),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
+    ({"model_type": "glm5_next"}, "", {}, 2),
+    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {}, 4),
+    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {"CUTEAFD_GLMF_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "qwen4_exp"}, "", {}, 1),
+    ({"model_type": "mimo_v2_flash"}, "", {}, 2),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {"CUTEAFD_MIMO_PREFILL_LANES": "4"}, 4),
+])
+def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, config, keys, env, endpoints):
+    dense_layers = config.get("first_k_dense_replace", 0)
+    fixture = {"num_hidden_layers": 4, "layer_types": ["linear_attention"] * 4,
+        "mlp_layer_types": ["dense"] * dense_layers + ["sparse"] * (4 - dense_layers), **config}
+    result = _family_launch_result(tmp_path, fixture, "test/model",
+        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n" + keys,
+        extra_env=env)
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert workers
+    assert all(f"--rdma-endpoints {endpoints}" in line for line in workers)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert all(f"{name}={value}" in launch for name, value in env.items())
+
+
+@pytest.mark.parametrize("mode,wide", [("fp8", False), ("bf16", True), ("bf16-decode", False)])
+def test_only_wide_optional_bf16_changes_worker_ring_admission(tmp_path, mode, wide):
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 4}, "test/model",
+        f"EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nEXPERT_INPUT={mode}\n")
+    assert result.returncode == 0, result.stderr
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert ("--bf16-ingress" in worker) == wide
+
+
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
     result = _family_launch_result(tmp_path, config, "test/model",

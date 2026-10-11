@@ -291,6 +291,8 @@ impl<'a> Fp8Experts<'a> {
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
             && info.slice == tensors.rank_width(tp, rank, slicing)?,
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
+        ensure!(tensors.format() != ExpertFormat::Nvfp4 || !info.wire_input,
+            "NVFP4 experts require a BF16-input package; rebuild {}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
         let primary_scratch = module.scratch_bytes(top)?;
@@ -348,7 +350,9 @@ impl<'a> Fp8Experts<'a> {
     /// As `run`, with `rows` BF16 `[rows, H]` input rows.
     pub unsafe fn run_bf16(&self, index: usize, rows: usize, input: *mut c_void, ids: *mut c_void,
         weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
-        let module = self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?;
+        let module = if !self.wire_input() { &self.module } else {
+            self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
+        };
         self.run_with(module, index, rows, input, ids, weights, out, stream)
     }
 

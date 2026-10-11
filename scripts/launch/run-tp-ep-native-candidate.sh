@@ -511,6 +511,7 @@ expert_argv() {
     --native-lib "$spark_native_lib"
     --rank "$rank"
     --world "$spark_world"
+    --rdma-endpoints 2
     --spark-tp "$spark_tp"
     --spark-ep "$spark_ep"
     --capacity "$expert_capacity"
