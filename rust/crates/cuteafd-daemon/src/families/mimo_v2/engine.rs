@@ -644,15 +644,14 @@ impl<'a> MimoEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `MimoLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>, spark: bool) -> Result<()> {
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>, prefill_lanes: usize) -> Result<()> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("transport/peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
         let library = self.library;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], cuteafd_loader::families::mimo_v2::admission::peer_slots(super::admission::transport_lanes(
-                spark, &self.cfg)?),
+            RankDevice { device, stream }], cuteafd_loader::families::mimo_v2::admission::peer_slots(prefill_lanes),
             rows * self.cfg.hidden * 2)?;
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);

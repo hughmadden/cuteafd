@@ -939,8 +939,7 @@ impl Opened {
             }
             if let Some((device, stream)) = peer_stream {
                 engine.attach_peer(device, stream, shares.pop().context("head-split shares")?,
-                    !args.skip_experts && !args.local_experts && args.peers.is_some()
-                        && self.cfg.dense.iter().take(layers).any(|&dense| !dense))?;
+                    usize::try_from(preflight.working_set.prefill_lanes)?)?;
             }
             engine.mtp = mtp;
             if let Some(dir) = &draft_dir {
@@ -960,11 +959,10 @@ impl Opened {
             }
             let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
             engine.expert_input = args.expert_input;
-            let remote_layers = if args.skip_experts || args.expert_window.is_some() { moe_layers.clone() }
-                else { moe_layers.iter().copied().filter(|&layer|
-                    preflight.placement.layers[layer].experts == cuteafd_loader::placement::ExpertHome::Spark)
-                    .collect::<Vec<_>>() };
-            if let Some(experts) = self.experts(args, &remote_layers, preflight.local_expert_budget)? {
+            let remote_layers = if args.skip_experts || args.expert_window.is_some() { &moe_layers }
+                else { &preflight.working_set.spark_layers };
+            if let Some(experts) = self.experts(args, remote_layers, preflight.local_expert_budget,
+                usize::try_from(preflight.working_set.prefill_lanes)?)? {
                 engine.set_experts(experts);
             }
             if let Some(tp2) = preflight.placement.tp2 {
@@ -1063,7 +1061,7 @@ pub(super) fn body_after_shutdown<T>(result: Result<T>, submission_failed: bool,
 impl Opened {
     /// The routed-expert source for `moe_layers`: Spark ranks (`--peers`,
     /// warmed with a full-capacity request) or the local TP1 package.
-    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize)
+    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize, lanes: usize)
         -> Result<Option<engine::Experts<'s>>> {
         let selected_peers = args.peers.as_deref().map(|peers| peers.split(',')
             .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()).transpose()?;
@@ -1119,7 +1117,7 @@ impl Opened {
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
         // 1 keeps it serial):
         // one more transport per earlier row lane.
-        let lanes = admission::transport_lanes(true, &self.cfg)?;
+        ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
         let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

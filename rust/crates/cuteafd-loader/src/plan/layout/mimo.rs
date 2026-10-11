@@ -296,21 +296,12 @@ pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptio
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>) -> Result<crate::placement::Placement> {
     let profiles = profile(checkpoint, options, devices.len(), spark_ranks, rows, concurrency, context, manifest)?;
+    let no_spark = if spark_ranks == 0 { profiles.clone() }
+        else { profile(checkpoint, options, devices.len(), 0, rows, concurrency, context, manifest)? };
     let probe = spark_intake_probe_bytes(spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
-    for (rank, device) in devices.iter_mut().enumerate() {
-        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(headroom_bytes(
-            options.rtx_bytes[rank], rank == 0 && probe > 0).max(options.headroom_bytes));
-    }
-    for (device, rank) in devices.iter_mut().zip(&profiles.steady.devices) {
+    for device in devices.iter_mut() {
         device.items.retain(|i| matches!(i.category, Category::Tables | Category::Reserved | Category::Runtime)
             || i.group.starts_with("vision") || i.group.starts_with("audio"));
-        for cost in &rank.reservations {
-            let name = cost.name.as_str();
-            let category = reservation_category(name);
-            let group = match name { "state.active_rings" => "state", "prefix.exact_mark_arena" => "marks", "prefix.dflash_context_marks" => "DFlash context marks",
-                "prefix.dflash_valid_floor_transfer" => "DFlash valid-floor transfer", _ => name };
-            device.items.push(Item::new(category, group, "", cost.bytes, Basis::Formula));
-        }
     }
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let ranks = devices.len();
@@ -322,16 +313,39 @@ pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptio
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers, kv: MimoKvCache::Int8, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
-                loaded_bytes: device.used_bytes().saturating_sub(profiles.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum()) })).collect(),
+                loaded_bytes: device.used_bytes() })).collect(),
         headroom_floor: options.headroom_bytes, spark_ranks, startup_probe_bytes: probe,
         context, requested_pool: options.pool_tokens, onboard,
         experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64,
     };
-    let request = crate::placement::families::mimo_v2::request(&inputs)?;
-    let placement = crate::placement::solve(&request)?;
-    let unit = profiles.steady.pool_unit_rows;
+    let solution = match crate::placement::families::mimo_v2::solve_working_set(&inputs, &no_spark.steady) {
+        Ok(solution) => solution,
+        Err(error) => {
+            // Failed plans still name the full fixed contract, not fictitious
+            // free space left by returning before its storage was described.
+            for (rank, (device, costs)) in devices.iter_mut().zip(&profiles.steady.devices).enumerate() {
+                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(headroom_bytes(
+                    options.rtx_bytes[rank], rank == 0 && probe > 0).max(options.headroom_bytes));
+                for cost in &costs.reservations {
+                    device.items.push(Item::new(reservation_category(&cost.name),
+                        crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
+                }
+            }
+            return Err(error.into());
+        }
+    };
+    let selected = inputs.selected(&no_spark.steady, &solution.working_set);
+    let placement = solution.placement;
+    for (rank, (device, costs)) in devices.iter_mut().zip(&selected.profile.devices).enumerate() {
+        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(solution.request.inventory.gpus[rank].headroom_bytes);
+        for cost in &costs.reservations {
+            device.items.push(Item::new(reservation_category(&cost.name),
+                crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
+        }
+    }
+    let unit = selected.profile.pool_unit_rows;
     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0)?;
-    for ((device, rank), storage) in devices.iter_mut().zip(&profiles.steady.devices).zip(&cache.ranks) {
+    for ((device, rank), storage) in devices.iter_mut().zip(&selected.profile.devices).zip(&cache.ranks) {
         let units = placement.pool_tokens / unit;
         let kv_unit = storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes;
         device.items.push(Item::new(Category::Kv, "records", "", units * kv_unit, Basis::Formula));
@@ -339,7 +353,7 @@ pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptio
         device.kv_tokens = placement.pool_tokens;
     }
     for (rank, device) in devices.iter_mut().enumerate() {
-        device.items.extend(crate::placement::families::mimo_v2::expert_items(&inputs, &placement, rank)?);
+        device.items.extend(crate::placement::families::mimo_v2::expert_items(&selected, &placement, rank)?);
     }
     Ok(placement)
 }
@@ -470,8 +484,8 @@ mod tests {
 
     #[test]
     fn planner_equals_runtime_mimo() {
-        use crate::placement::{Baseline, ExpertHome, Onboard, solve};
-        use crate::placement::families::mimo_v2::{MimoInputs, request, resolved_capacity};
+        use crate::placement::{Baseline, ExpertHome, Onboard};
+        use crate::placement::families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity};
         // Measured Pro min/max post-module inventories from the 2026-10-09
         // MOPD smoke logs. Reused physical inventory for Flash, not a Flash
         // ready measurement. Exported BF16 scratch is SM188/170-identical.
@@ -513,8 +527,15 @@ mod tests {
                     headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
                     context, requested_pool: opts.pool_tokens, onboard, experts, expert_workspace,
                     tp2_workspace, rows: 4096, lanes: lanes as u64 };
-                let runtime_request = request(&inputs).unwrap();
-                let runtime = solve(&runtime_request).unwrap();
+                let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
+                let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
+                let selected = inputs.selected(&no_spark.steady, &solution.working_set);
+                let runtime_request = &solution.request;
+                let runtime = &solution.placement;
+                assert_eq!(solution.working_set.spark_ranks, sparks);
+                assert_eq!(solution.working_set.spark_layers,
+                    runtime.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                        (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>());
                 if ranks == 1 {
                     let cost = runtime_request.layers.iter().find_map(|layer| layer.experts).unwrap();
                     assert!(cost.whole.resident > 0 && !cost.tp2, "single RTX offers whole TP1 experts");
@@ -527,14 +548,14 @@ mod tests {
                         assert!(remaining < cost.whole.resident, "Pro min cannot fit one TP1 layer even with zero scratch");
                     }
                 }
-                let capacity = resolved_capacity(&inputs, &runtime_request, &runtime, 16, 16).unwrap();
+                let capacity = resolved_capacity(&selected, runtime_request, runtime, 16, 16).unwrap();
                 let mut devices = totals.iter().enumerate().map(|(rank, &total)| DeviceLayout {
                     kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, kv_tokens: 0,
                     items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
                         baseline[rank], Basis::Calibrated)],
                 }).collect::<Vec<_>>();
                 let planned = apply(&checkpoint, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
-                assert_eq!(planned, runtime, "pro={pro}, ranks={ranks}");
+                assert_eq!(&planned, runtime, "pro={pro}, ranks={ranks}");
                 assert_eq!(planned.pool_tokens, 2 << 20);
                 assert_eq!(capacity.active_max_context_sequences, 8);
                 for rank in 0..ranks {
@@ -564,12 +585,13 @@ mod tests {
                 // and cannot charge routes/arena that runtime never allocates.
                 let fallback = MimoInputs { requested_pool: None, onboard: Onboard::Auto,
                     expert_workspace: 0, tp2_workspace: [0; 2], ..inputs };
-                let fallback_request = request(&fallback).unwrap();
-                let fallback_placement = solve(&fallback_request).unwrap();
-                assert_eq!(fallback_request.pool.ceiling, 2 << 20);
-                assert_eq!(fallback_placement.pool_tokens, 2 << 20);
-                assert_eq!(fallback_placement.onboard_layers, 0);
-                assert!(crate::placement::families::mimo_v2::expert_items(&fallback, &fallback_placement, 0).unwrap().is_empty());
+                let fallback_solution = solve_working_set(&fallback, &no_spark.steady).unwrap();
+                let fallback_selected = fallback.selected(&no_spark.steady, &fallback_solution.working_set);
+                assert_eq!(fallback_solution.request.pool.ceiling, 2 << 20);
+                assert_eq!(fallback_solution.placement.pool_tokens, 2 << 20);
+                assert_eq!(fallback_solution.placement.onboard_layers, 0);
+                assert!(crate::placement::families::mimo_v2::expert_items(&fallback_selected,
+                    &fallback_solution.placement, 0).unwrap().is_empty());
             }
         }
     }

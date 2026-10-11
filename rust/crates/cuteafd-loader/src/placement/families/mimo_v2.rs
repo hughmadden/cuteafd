@@ -6,6 +6,7 @@ use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use cuteafd_core::serving_capacity::{CapacityProfile, MemoryReservation, ResolvedCapacity, ResolvedDeviceCapacity};
 
+#[derive(Clone)]
 pub struct MimoInputs<'a> {
     pub cfg: &'a MimoV2Config,
     pub profile: &'a CapacityProfile,
@@ -27,6 +28,105 @@ pub struct MimoInputs<'a> {
     pub tp2_workspace: [u64; 2],
     pub rows: u64,
     pub lanes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoWorkingSet {
+    pub spark_layers: Vec<usize>,
+    pub spark_ranks: usize,
+    pub prefill_lanes: u64,
+}
+
+pub struct MimoSolution {
+    pub request: PlacementRequest,
+    pub placement: Placement,
+    pub working_set: MimoWorkingSet,
+}
+
+impl<'a> MimoInputs<'a> {
+    pub fn selected<'b>(&'b self, no_spark: &'b CapacityProfile, working_set: &MimoWorkingSet) -> MimoInputs<'b> {
+        MimoInputs { profile: if working_set.spark_ranks == 0 { no_spark } else { self.profile },
+            spark_ranks: working_set.spark_ranks, lanes: working_set.prefill_lanes,
+            startup_probe_bytes: if working_set.spark_ranks == 0 { 0 } else { self.startup_probe_bytes },
+            ..self.clone() }
+    }
+}
+
+/// Evaluate each contiguous RTX prefix with the fixed storage its Spark suffix
+/// actually executes. Nothing is refunded after admission or recomputed by workers.
+pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
+    -> Result<MimoSolution, CacheGeometryError> {
+    let routed = inputs.experts.iter().enumerate().filter_map(|(layer, cost)| cost.map(|_| layer))
+        .collect::<Vec<_>>();
+    let counts = match inputs.onboard.layers(routed.len()) {
+        Some(n) => vec![n],
+        None if inputs.spark_ranks == 0 => vec![routed.len()],
+        None => (0..=routed.len()).collect(),
+    };
+    let mut best: Option<MimoSolution> = None;
+    let mut failure = None;
+    for n in counts {
+        if n > 0 && inputs.expert_workspace == 0 && inputs.tp2_workspace.iter().all(|&bytes| bytes == 0) {
+            if failure.is_none() {
+                failure = Some(PlacementError::Inventory("MiMo local experts need a matching BF16-input package").into());
+            }
+            continue;
+        }
+        let spark_layers = routed[n..].to_vec();
+        if !spark_layers.is_empty() && inputs.spark_ranks == 0 {
+            failure = Some(PlacementError::SparkFree { layers: routed.len(), placed: n }.into());
+            continue;
+        }
+        let remote = !spark_layers.is_empty();
+        let working_set = MimoWorkingSet { spark_layers,
+            spark_ranks: if remote { inputs.spark_ranks } else { 0 },
+            prefill_lanes: if remote { inputs.lanes } else { 1 } };
+        let selected = inputs.selected(no_spark, &working_set);
+        let result = (|| {
+            let mut request = request(&selected)?;
+            request.onboard = Onboard::Layers(n);
+            match inputs.onboard {
+                Onboard::Auto if inputs.spark_ranks > 0 => {
+                    request.pool.ceiling = request.pool.target;
+                    // Spark Auto may clamp serving context to a smaller pool;
+                    // fixed candidates must not introduce a new context floor.
+                    if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
+                }
+                Onboard::ExpertsFirst { pool_floor } => {
+                    request.pool.floor = request.pool.floor.max(request.pool.requested.unwrap_or(pool_floor));
+                    request.pool.ceiling = request.pool.target;
+                    // Preserve the shared solver's remote zero-prefix fallback
+                    // when context is larger than the experts-first floor.
+                    if remote && n == 0 && request.pool.requested.is_none() {
+                        request.pool.floor = pool_floor;
+                    }
+                }
+                _ => {}
+            }
+            let placement = solve(&request)?;
+            let actual = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
+            if actual != working_set.spark_layers || placement.onboard_layers != n {
+                return Err(PlacementError::Inventory("MiMo solved prefix disagrees with its working set").into());
+            }
+            Ok::<_, CacheGeometryError>(MimoSolution { request, placement, working_set })
+        })();
+        match result {
+            Ok(candidate) => {
+                let score = |solution: &MimoSolution| match inputs.onboard {
+                    Onboard::ExpertsFirst { .. } => (solution.placement.onboard_layers as u64,
+                        solution.placement.pool_tokens),
+                    _ => (solution.placement.pool_tokens.min(solution.request.pool.target),
+                        solution.placement.onboard_layers as u64),
+                };
+                if best.as_ref().is_none_or(|current| score(&candidate) > score(current)) {
+                    best = Some(candidate);
+                }
+            }
+            Err(error) => if failure.is_none() { failure = Some(error); },
+        }
+    }
+    best.ok_or_else(|| failure.unwrap_or_else(|| PlacementError::Inventory("MiMo has no feasible working set").into()))
 }
 
 /// Exact native weight/scale bytes, shared with the allocation path.
@@ -107,6 +207,82 @@ mod tests {
         }
         assert_eq!(cuteafd_core::memory_layout::Category::of_scope("peer-split"), Category::Transport);
     }
+    #[test]
+    fn selected_spark_working_set_drives_every_fixed_demand_and_policy() {
+        use cuteafd_core::serving_capacity::{ContextLimits, DeviceCosts};
+        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
+        cfg.layers = 4;
+        cfg.dense = vec![true, false, false, false];
+        cfg.attention = vec![MimoAttention::Full; 4];
+        for ranks in [1, 2] {
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let profile = |spark| CapacityProfile {
+                context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
+                pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
+                devices: cache.ranks.iter().enumerate().map(|(rank, storage)| DeviceCosts {
+                    device: rank as u32, pool_unit_bytes: storage.persistent_unit_bytes + 256,
+                    reservations: vec![MemoryReservation { name: if spark { "transport.spark_intake_planes" }
+                        else { "workspace.local" }.into(), bytes: if spark { 2 << 30 } else { 1 << 30 } }],
+                }).collect(),
+            };
+            let spark = profile(true);
+            let local = profile(false);
+            let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
+                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
+            let inputs = MimoInputs { cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
+                mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
+                headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
+                requested_pool: Some(2 << 20), onboard: Onboard::Auto,
+                experts: vec![None, Some(cost), Some(cost), Some(cost)], expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
+                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+            let all = solve_working_set(&inputs, &local).unwrap();
+            assert_eq!(all.placement.onboard_layers, 3);
+            assert_eq!(all.working_set, MimoWorkingSet { spark_layers: vec![], spark_ranks: 0, prefill_lanes: 1 });
+            assert_eq!(all.request.fixed[0].group, "workspace.local");
+            assert_eq!(all.request.inventory.gpus[0].headroom_bytes, headroom_bytes(96 << 30, false));
+            let tight = MimoInputs { gpus: all.placement.items.iter().enumerate().map(|(rank, items)|
+                (96 << 30, Baseline::Measured { free_bytes: items.iter().map(|item| item.bytes).sum::<u64>()
+                    + all.request.inventory.gpus[rank].headroom_bytes + (512 << 20) })).collect(), ..inputs.clone() };
+            assert_eq!(solve_working_set(&tight, &local).unwrap().placement.onboard_layers, 3,
+                "the local-only branch fits without charging unused configured Spark storage");
+            let mut overcharged = request(&tight).unwrap();
+            overcharged.onboard = Onboard::Layers(3);
+            assert!(solve(&overcharged).is_err(), "configured-peer costs would incorrectly reject all-local");
+            let selected = inputs.selected(&local, &all.working_set);
+            assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
+                .reservations[0].name, "workspace.local");
+            for onboard in [Onboard::Layers(2), Onboard::Fraction(2.0 / 3.0)] {
+                let partial = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
+                assert_eq!(partial.working_set.spark_layers, vec![3]);
+                assert_eq!((partial.working_set.spark_ranks, partial.working_set.prefill_lanes), (6, 3));
+                assert_eq!(partial.request.fixed[0].group, "transport.spark_intake_planes");
+                assert_eq!(partial.request.inventory.gpus[0].headroom_bytes, (96u64 << 30)
+                    - (96u64 << 30) * 97 / 100 + (64 << 20));
+            }
+            for onboard in [Onboard::Layers(3), Onboard::Fraction(1.0), Onboard::ExpertsFirst { pool_floor: 262144 }] {
+                let result = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
+                assert_eq!(result.placement.onboard_layers, 3);
+                assert_eq!(result.working_set.spark_ranks, 0);
+            }
+            let fallback = solve_working_set(&MimoInputs { expert_workspace: 0, tp2_workspace: [0; 2],
+                requested_pool: None, ..inputs.clone() }, &local).unwrap();
+            assert_eq!(fallback.placement.onboard_layers, 0);
+            assert_eq!(fallback.working_set.spark_layers, vec![1, 2, 3]);
+            assert_eq!(fallback.placement.pool_tokens, 2 << 20);
+            let constrained = MimoInputs { context: 1 << 20, requested_pool: None,
+                expert_workspace: 0, tp2_workspace: [0; 2],
+                gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 5 << 30 }); ranks], ..inputs.clone() };
+            let shrunk = solve_working_set(&constrained, &local).unwrap();
+            assert!(shrunk.placement.pool_tokens < constrained.context);
+            assert!(shrunk.placement.pool_tokens > 0);
+            assert_eq!(shrunk.request.pool.floor, 0);
+            assert!(solve_working_set(&MimoInputs { requested_pool: Some(1 << 20),
+                ..constrained }, &local).is_err(), "an explicit remote pool must never shrink");
+            assert!(solve_working_set(&MimoInputs { spark_ranks: 0, onboard: Onboard::Layers(2),
+                ..inputs.clone() }, &local).is_err());
+        }
+    }
+
     #[test]
     fn implicit_missing_explicit_and_malformed_package_contract() {
         let dir = tempfile::tempdir().unwrap();
