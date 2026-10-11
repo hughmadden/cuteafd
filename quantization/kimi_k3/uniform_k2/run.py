@@ -675,12 +675,26 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--publish-only", action="store_true")
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
     source = KimiK3Source(args.source_snapshot)
     plan = source_plan(source, args.tokens, args.export)
     print(canonical(plan), flush=True)
     if args.plan_only:
+        return
+    if args.publish_only:
+        with exclusive_run(args.root):
+            if json.loads((args.root / "plan.json").read_text()) != plan:
+                raise ValueError("publication recovery plan identity differs")
+            complete = json.loads((args.root / "quantization-complete.json").read_text())
+            if complete["identity"] != plan["identity"]:
+                raise ValueError("publication requires a verified complete quantization")
+            progress = Progress(args.root)
+            progress.emit("publication_started", layer=92)
+            revision = publish(args.export, args.root, plan["publication_repo"])
+            progress.state["status"] = "complete"
+            progress.emit("complete", layer=92, revision=revision, **complete["summary"])
         return
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -701,6 +715,14 @@ def main():
             if shutil.disk_usage(args.root).free < plan["required_free_bytes"]:
                 raise OSError("insufficient root NVMe space for output and rolling banks")
             atomic_json(plan_path, plan)
+        complete_path = args.root / "quantization-complete.json"
+        if complete_path.exists():
+            complete = json.loads(complete_path.read_text())
+            if complete["identity"] != plan["identity"]:
+                raise ValueError("completed quantization identity differs")
+            progress.state["status"] = "quantized"
+            progress.emit("quantization_complete", layer=92, **complete["summary"])
+            return
         boundary = RollingBoundary(args.root / "frontier", plan["identity"])
         if args.resume:
             boundary.current(checksum=True)
@@ -757,14 +779,14 @@ def main():
             for path in args.root.glob("layers/*/projections/layer-error-summary.json"):
                 shutil.copyfile(path, evidence_dir / f"layer-{path.parents[1].name}.json")
             progress.emit("export_verified", layer=92, **summary)
+            atomic_json(args.root / "quantization-complete.json", dict(identity=plan["identity"],
+                        summary=summary, time=utc_now()))
+            shutil.rmtree(boundary.root)
             if args.publish:
                 revision = publish(args.export, args.root, plan["publication_repo"])
                 progress.emit("published", revision=revision, repo=plan["publication_repo"])
-            progress.state["status"] = "complete"
-            progress.emit("complete", layer=92, **summary)
-            # Publication and local snapshot are durable. No activation state
-            # is needed for publication-only recovery or inference integration.
-            shutil.rmtree(boundary.root)
+            progress.state["status"] = "complete" if args.publish else "quantized"
+            progress.emit("complete" if args.publish else "quantization_complete", layer=92, **summary)
         except BaseException as error:
             progress.state.update(status="failed", error=repr(error))
             # Do not let an exhausted-memory guard hide the original exception.

@@ -38,6 +38,10 @@ def main():
             atomic_json(args.supervise.with_name(args.supervise.stem + "-process.json"),
                         dict(pid=process.pid, supervisor_pid=os.getpid(), started=now()))
             result = process.wait()
+            if result == 0 and launch.get("publication_command"):
+                publication_environment = dict(launch["environment"], CUDA_VISIBLE_DEVICES="")
+                result = subprocess.call(launch["publication_command"], cwd=REPO, env=publication_environment,
+                                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         atomic_json(args.supervise.with_name(args.supervise.stem + "-exit.json"),
                     dict(returncode=result, finished=now()))
         sys.exit(result)
@@ -63,8 +67,10 @@ def main():
                "--export", str(args.export.expanduser().resolve())]
     if args.resume:
         command.append("--resume")
-    if args.publish:
-        command.append("--publish")
+    publication_command = (["timeout", "--signal=TERM", "7d", *command, "--resume", "--publish-only"]
+                           if args.publish else None)
+    # GPU ownership ends when the quantizer process exits. Uploading runs in a
+    # separate process with no CUDA device visible and no hardware lock held.
     hardware_lock = Path.home() / ".cache/cuteafd/gpu1.lock"
     hardware_lock.parent.mkdir(parents=True, exist_ok=True)
     command = ["flock", "--wait", "60", str(hardware_lock), "timeout", "--signal=TERM", "30d", *command]
@@ -80,7 +86,8 @@ def main():
                        OMP_NUM_THREADS="8", MKL_NUM_THREADS="8", OPENBLAS_NUM_THREADS="8")
     attempt = str(time.time_ns())
     path = attempts / f"{attempt}.json"
-    atomic_json(path, dict(schema="cuteafd-local-quant-launch-v1", command=command, environment=environment,
+    atomic_json(path, dict(schema="cuteafd-local-quant-launch-v1", command=command, publication_command=publication_command,
+                          environment=environment,
                           log=str(attempts / f"{attempt}.log"), created=now(), resume=args.resume, publish=args.publish))
     supervisor_command = [str(REPO / ".venv/bin/python"), str(Path(__file__).resolve()),
                           "--source-snapshot", str(args.source_snapshot), "--tokens", str(args.tokens),
