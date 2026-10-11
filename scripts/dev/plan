@@ -57,10 +57,12 @@ def trust(repository, item):
     review = bool(edited and edited > accepted_at)
     if item['kind'] == 'pr':
         target = ((item.get('headRef') or {}).get('target') or {})
-        # GitHub can omit pushedDate (deleted refs / older commits). Fail closed:
-        # updatedAt can over-flag comments, but never silently bless a new head.
-        pushed = stamp(target.get('pushedDate') or item.get('updatedAt'))
-        review = review or bool(pushed and pushed > accepted_at)
+        # A force-push to an old commit retains that commit's old pushedDate.
+        # updatedAt also flags comments; that false re-review is safer than
+        # silently blessing an altered head (or a deleted ref with no date).
+        changes = [stamp(value) for value in (target.get('pushedDate'),
+                   item.get('updatedAt'), item.get('lastEditedAt')) if value]
+        review = review or bool(changes and max(changes) > accepted_at)
     return True, review
 
 

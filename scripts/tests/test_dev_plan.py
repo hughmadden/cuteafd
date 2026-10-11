@@ -114,6 +114,14 @@ def test_missing_push_time_uses_conservative_updated_time(fake_gh):
     assert '(re-review)' in result.stdout
 
 
+def test_force_push_to_old_commit_still_flags_updated_pr(fake_gh):
+    fixture = data(kind='pr', pushed='2026-10-01T00:00:00Z')
+    fixture['item']['updatedAt'] = '2026-10-03T00:00:00Z'
+    result = fake_gh(fixture, 'list', '--prs')
+    assert result.returncode == 0, result.stderr
+    assert '(re-review)' in result.stdout
+
+
 def test_removed_then_reaccepted_by_other_does_not_keep_trust(fake_gh):
     fixture = data()
     event = fixture['timeline'][0][0]
