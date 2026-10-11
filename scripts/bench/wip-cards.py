@@ -871,7 +871,8 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
                     if result.returncode:
                         raise ValueError('build failed: ' + name)
                 else:
-                    run(cmd)
+                    # Recursive submodule checkout of a fresh worktree outlasts run()'s 120 s.
+                    subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=1800)
         if dry:
             print('# identical build scopes ' + json.dumps(scopes, sort_keys=True))
 
