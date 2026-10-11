@@ -156,6 +156,14 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     simulated = values.pop('BENCH_SIMULATED', '') or 'sim5090' in entry['name'] or 'sim-5090' in entry['name']
     values.pop('BENCH_HARDWARE_CLASS', None)
     values.update(overrides)
+    ring_expectation = values.pop('BENCH_EXPECT_GLM_RING', None)
+    if ring_expectation is not None:
+        observer = entry.get('observer')
+        if not observer or not observer.get('argv'):
+            raise ValueError('BENCH_EXPECT_GLM_RING requires an observer')
+        if probes & {'memory', 'console'}:
+            raise ValueError('BENCH_EXPECT_GLM_RING requires its own observer, not a probe replacement')
+        observer['argv'] = ['env', 'BENCH_EXPECT_GLM_RING=' + ring_expectation, *observer['argv']]
     if 'CUTEAFD_API_KEY' in values:
         raise ValueError('inline API keys are forbidden')
     # The sanitized base also removes publication-only keys from original configs.
@@ -838,6 +846,7 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         values.pop('SPARK_HOSTS', None)
         values.pop('BENCH_SIMULATED', None)
         values.pop('BENCH_HARDWARE_CLASS', None)
+        values.pop('BENCH_EXPECT_GLM_RING', None)
         values.pop('COORDINATOR_GPUS', None)
         values.pop('COORDINATOR_GPU_UUID', None)
         values.pop('COORDINATOR_GPU_PCI_BUS_ID', None)

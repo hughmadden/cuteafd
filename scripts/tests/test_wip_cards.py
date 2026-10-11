@@ -41,6 +41,36 @@ def test_matrix_private_key_and_complete_lanes(entry, tmp_path):
     assert job['simulated']
 
 
+@pytest.mark.parametrize('source', ['config', 'set', 'override'])
+def test_glm_ring_expectation_is_observer_only(entry, tmp_path, source):
+    entry['observer'] = dict(argv=['python3', 'ring-observer.py'], timeout_s=300)
+    overrides = {}
+    if source == 'config':
+        with Path(entry['config']).open('a') as stream:
+            stream.write('BENCH_EXPECT_GLM_RING=on\n')
+    elif source == 'set':
+        entry['set']['BENCH_EXPECT_GLM_RING'] = 'on'
+    else:
+        overrides['BENCH_EXPECT_GLM_RING'] = 'on'
+    job = cards.generate(entry, 'candidate', dict(instance='ring-test', slot='s'),
+                         tmp_path, tmp_path / 'key', overrides, set(), None, 1)
+    generated = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert 'BENCH_EXPECT_GLM_RING' not in generated['set']
+    assert 'BENCH_EXPECT_GLM_RING' not in Path(generated['config']).read_text()
+    assert generated['observer']['argv'] == ['env', 'BENCH_EXPECT_GLM_RING=on', 'python3', 'ring-observer.py']
+    assert entry['observer']['argv'] == ['python3', 'ring-observer.py']
+
+
+def test_glm_ring_expectation_requires_preserved_observer(entry, tmp_path):
+    entry['set']['BENCH_EXPECT_GLM_RING'] = 'on'
+    with pytest.raises(ValueError, match='requires an observer'):
+        make(entry, tmp_path)
+    entry['observer'] = dict(argv=['python3', 'ring-observer.py'])
+    with pytest.raises(ValueError, match='probe replacement'):
+        cards.generate(entry, 'candidate', dict(instance='ring-test', slot='s'),
+                       tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+
+
 def test_key_file_created_private_and_never_printed(tmp_path, entry, monkeypatch, capsys):
     kit = tmp_path / 'kit'
     kit.mkdir()
