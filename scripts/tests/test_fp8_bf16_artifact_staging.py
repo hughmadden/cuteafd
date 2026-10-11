@@ -106,6 +106,8 @@ def test_coordinator_exports_tp2_for_every_routed_weight_format():
                     package_tool.NVFP4_ROLE_LAYOUTS):
         assert layouts["coordinator"] == ("tp1", "tp2")
     assert package_tool.ROLE_INPUT["coordinator"] == "bf16"
+    # Unequal coordinator slices must not pass through Spark's default filter.
+    assert 'elif args.role == "spark" and not args.layouts' in TOOL.read_text()
     cmake = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     assert 'set(exact_slices "--exact-slices")' in cmake
 

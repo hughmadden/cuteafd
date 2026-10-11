@@ -398,7 +398,8 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         policy: LayerPolicy { default: DUAL_WHOLE.to_vec(), by_kind: Vec::new() },
         hops: HopSpec { row_bytes: a.cfg.hc_width() as u64 * 2, rows: a.prefill_rows.max(64), lanes: 1,
             entry_gpu: 0, head_gpu: 0 },
-        executor: ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true },
+        executor: ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true,
+            attention: AttentionPlacement::Heads },
     })
 }
 
@@ -507,7 +508,8 @@ mod tests {
         req.inventory.gpus = vec![req.inventory.gpus[0]; 2];
         req.inventory.peer_access = true;
         req.attention_placement = Some(AttentionPlacement::Layers);
-        req.executor = ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true };
+        req.executor = ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true,
+            attention: AttentionPlacement::Heads };
         req.policy.default = DUAL_WHOLE.to_vec();
         req.fixed.clear();
         req.pool_overhead = vec![0; 2];

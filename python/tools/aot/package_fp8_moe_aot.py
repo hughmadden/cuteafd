@@ -316,7 +316,7 @@ def build(args: argparse.Namespace) -> None:
     # whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none), and
     # TP6 of any intermediate of at least six blocks: uneven whole blocks
     # zero-padded to the widest (2048: 3, 3, 3, 3, 2, 2 blocks stored as 384).
-    elif not args.layouts and not getattr(args, "all_spark_counts", False):
+    elif args.role == "spark" and not args.layouts and not getattr(args, "all_spark_counts", False):
         def servable(tp: int) -> bool:
             blocks = base.intermediate // 128
             return base.intermediate % (128 * tp) == 0 or (tp == 6 and blocks >= 6)
