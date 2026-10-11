@@ -8,6 +8,7 @@
 //! from the executor's real limits.
 pub mod deepseek_v4;
 pub mod glm5;
+pub mod glm5_flash;
 pub mod qwen4;
 
 use super::{ExecutorModes, FfnMode, LayerMode};
