@@ -10,7 +10,7 @@
 //!   and tp2, a tp1 coordinator package.
 //! - NVFP4 (ModelOpt) through the same programs (`glmf:nvfp4`, `qwen4:nvfp4`,
 //!   `glm:nvfp4`): Spark tp4, tp2, tp3 and tp6 in whole 16-value blocks, a tp1
-//!   coordinator package.
+//!   coordinator package. GLM Flash also qualifies exact-H128 TP5.
 //! - EXL3 (`python/tools/aot/package_exl3_aot.py`): Spark worlds 4, 2, 3, and
 //!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
@@ -143,7 +143,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     }
     let packaged = if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
-        else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) }
+        else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
         else if mxfp4 { if family == "mimof" { matches!(world, 2 | 4) } else { matches!(world, 2 | 6) } }
         else { matches!(world, 2 | 4 | 6) && (intermediate % (128 * world) == 0 || world == 6) };
     if !packaged {
@@ -228,13 +228,44 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_nvfp4_tp5_requires_exact_width_packages() {
+        use crate::formats::fp8_experts::Slicing;
+        for package in ["glmf:nvfp4", "glmf:nvfp4a4"] {
+            let recipe = spark_recipe(package, 2048, 5).unwrap();
+            assert_eq!(spark_worlds(package, 2048), [2, 3, 4, 5, 6]);
+            assert_eq!(recipe.slicing, Slicing::Blocks(128));
+            assert_eq!(recipe.widths, [512, 384, 384, 384, 384]);
+            assert_eq!(recipe.required_layouts, ["tp5-w512", "tp5-w384"]);
+            let root = tempfile::tempdir().unwrap();
+            for layout in ["tp5", "tp5-w512"] {
+                let directory = root.path().join(layout);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("libcuteafd_fp8moe.so"), b"fixture").unwrap();
+            }
+            assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(128), 512),
+                Err(InstalledSparkRecipeRefusal::MissingArtifact(_))));
+            let directory = root.path().join("tp5-w384");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("libcuteafd_fp8moe.so"), b"fixture").unwrap();
+            assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(128), 512).is_ok());
+            assert!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(128), 384).is_ok());
+            assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Padded, 512),
+                Err(InstalledSparkRecipeRefusal::PaddedExactMismatch)));
+        }
+        for package in ["glm:nvfp4", "qwen4:nvfp4", "qwen4:nvfp4a4", "glmf:exl3-k34", "glmf:fp8"] {
+            assert!(matches!(spark_recipe(package, 2048, 5), Err(SparkRecipeRefusal::MissingPackage { .. })));
+        }
+    }
+
+    #[test]
     fn recipe_worlds_keep_family_and_format_qualification_separate() {
         for intermediate in [640, 2048, 2304, 3072] {
             for package in ["mimo:fp8", "mimof:fp8", "mimop:fp8", "glm:nvfp4",
                 "glmf:nvfp4a4", "glm:exl3-k34", "glmf:exl3-k34", "v41:mxfp4",
                 "dsv4f:exl3-k23", "dsv4p:exl3-k23", "qwen4:exl3-k45", "qwen4:nvfp4"] {
                 let worlds = spark_worlds(package, intermediate);
-                assert!(!worlds.iter().any(|world| matches!(world, 5 | 7 | 8)));
+                assert!(!worlds.iter().any(|world| matches!(world, 7 | 8)));
+                assert_eq!(worlds.contains(&5), package == "glmf:nvfp4a4");
                 for world in worlds {
                     let recipe = spark_recipe(package, intermediate, world).unwrap();
                     assert_eq!(recipe.widths.len(), world);

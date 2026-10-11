@@ -547,7 +547,7 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     assert_eq!(component(&report, Component::DenseFfn).status, Status::Ready, "{}", render(&report));
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
-        ("glmf:nvfp4", 16, &[2, 3, 4, 6][..]));
+        ("glmf:nvfp4", 16, &[2, 3, 4, 5, 6][..]));
     assert!(contract.local.is_ok());
     assert!(report.executable(), "{}", render(&report));
     assert!(render(&report).contains("quant      modelopt 0.47 (hf_quant_config.json) NVFP4: every Linear NVFP4 g16"),
@@ -558,6 +558,10 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
     assert_eq!(tensors.rank_range(3, 2).unwrap(), (1376, 672));
+    let report_tp5 = plan(dir.path(), &sparks(5)).unwrap();
+    assert!(report_tp5.executable(), "{}", render(&report_tp5));
+    assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
+    assert!((report_tp5.spark_rank_share - 512.0 / 2048.0).abs() < 1e-9);
     // Metadata that excludes the experts contradicts their NVFP4 tensors.
     let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4", "group_size": 16,
         "exclude_modules": ["model.language_model.layers.1.mlp.experts*"]}});
