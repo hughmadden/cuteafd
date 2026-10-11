@@ -17,6 +17,10 @@ them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
 CMD that takes the locks itself (an older smoke binary, a driver script): once
 it is our turn the locks are left for CMD, and our ticket stays live until CMD
 exits, so later ticket holders still wait behind it.
+
+--preflight runs a bounded shell check before enqueue and after grant, while
+locks are still held even in --gate mode. Failure or timeout exits 78 without
+running CMD; --preflight-timeout defaults to 300 seconds per check.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ import contextlib
 import fcntl
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -111,11 +116,37 @@ def _try_flocks(locks: list[str]) -> list | None:
     return held
 
 
+class PreflightFailed(Exception):
+    pass
+
+
+def check_preflight(command, timeout):
+    if not command:
+        return
+    proc = subprocess.Popen(command, shell=True, start_new_session=True)
+    try:
+        code = proc.wait(timeout=timeout)
+    except BaseException as error:
+        # The shell may have forked a harness; kill the entire check, not just sh.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise PreflightFailed('preflight timed out') from error
+        raise
+    if code:
+        raise PreflightFailed(f'preflight failed (exit {code})')
+
+
 @contextlib.contextmanager
-def hold(names, wait: float, label: str = '', gate: bool = False):
+def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str = '',
+         preflight_timeout: float = 300):
     """Hold `names` (canonical order) for the body; FIFO against other tickets.
     With `gate`, release the flocks at our turn and keep the ticket instead."""
     locks = canonical(names)
+    check_preflight(preflight, preflight_timeout)
     queue = _queue()
     seq, path, ticket = _take_ticket(queue, locks)
     deadline = time.monotonic() + wait
@@ -133,6 +164,14 @@ def hold(names, wait: float, label: str = '', gate: bool = False):
                 announced = True
             time.sleep(POLL_S)
     except BaseException:
+        path.unlink(missing_ok=True)
+        ticket.close()
+        raise
+    try:
+        check_preflight(preflight, preflight_timeout)
+    except BaseException:
+        for handle in held:
+            handle.close()
         path.unlink(missing_ok=True)
         ticket.close()
         raise
@@ -158,19 +197,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--locks', required=True, help='comma list of ' + ', '.join(ORDER))
     parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)))
+    parser.add_argument('--preflight', default='', help='shell command checked before enqueue and at grant')
+    parser.add_argument('--preflight-timeout', type=float, default=300, help='timeout per preflight in seconds (default 300)')
     parser.add_argument('--gate', action='store_true', help='CMD takes the locks itself; keep only our turn')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
     if not cmd:
         parser.error('missing command')
+    if not 0 < args.preflight_timeout < float('inf'):
+        parser.error('--preflight-timeout must be finite and positive')
     try:
         locks = canonical(args.locks.split(','))
-        with hold(locks, args.wait, ' '.join(cmd[:2]), gate=args.gate):
+        with hold(locks, args.wait, ' '.join(cmd[:2]), gate=args.gate,
+                  preflight=args.preflight, preflight_timeout=args.preflight_timeout):
             env = dict(os.environ)
             if not args.gate:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
             return subprocess.run(cmd, env=env).returncode
+    except PreflightFailed as error:
+        print(f'hwlock: {error}', file=sys.stderr)
+        return 78
     except TimeoutError as error:
         print(f'hwlock: {error}', file=sys.stderr)
         return 75

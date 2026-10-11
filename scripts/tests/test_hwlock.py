@@ -35,6 +35,67 @@ def wait_for(path, timeout=10):
     return float(path.read_text())
 
 
+@pytest.mark.parametrize('gate', [False, True])
+def test_preflight_fails_before_ticket(lockdir, gate):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1',
+                             '--preflight', 'exit 9', *(['--gate'] if gate else []),
+                             '--', 'true'], env=env, capture_output=True, text=True)
+    assert result.returncode == 78
+    assert 'hwlock: preflight failed (exit 9)' in result.stderr
+    assert not (lockdir / 'hwq').exists()
+
+
+@pytest.mark.parametrize('gate', [False, True])
+def test_preflight_fails_at_grant_releasing_ticket_and_locks(lockdir, gate):
+    count = lockdir / 'checks'
+    marker = lockdir / 'command-ran'
+    code = (f'import pathlib,sys; p=pathlib.Path({str(count)!r}); '
+            'n=int(p.read_text()) if p.exists() else 0; p.write_text(str(n+1)); '
+            'sys.exit(0 if n == 0 else 11)')
+    import shlex
+    preflight = shlex.join([sys.executable, '-c', code])
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu0,gpu1',
+                             '--preflight', preflight, *(['--gate'] if gate else []),
+                             '--', 'touch', str(marker)], env=env, capture_output=True, text=True)
+    assert result.returncode == 78
+    assert 'hwlock: preflight failed (exit 11)' in result.stderr
+    assert count.read_text() == '2' and not marker.exists()
+    assert not list((lockdir / 'hwq').glob('*.ticket'))
+    held = hwlock._try_flocks(['gpu0', 'gpu1'])
+    assert held is not None
+    for handle in held:
+        handle.close()
+
+
+@pytest.mark.parametrize('gate', [False, True])
+def test_preflight_timeout_at_grant_kills_process_group_and_releases_locks(lockdir, gate):
+    import shlex
+    count, childpid = lockdir / 'checks', lockdir / 'child.pid'
+    child_code = f'import pathlib,time,os; pathlib.Path({str(childpid)!r}).write_text(str(os.getpid())); time.sleep(60)'
+    code = (f'import pathlib,subprocess,sys,time; p=pathlib.Path({str(count)!r}); '
+            'n=int(p.read_text()) if p.exists() else 0; p.write_text(str(n+1)); '
+            'sys.exit(0) if n == 0 else None; '
+            f'subprocess.Popen([{sys.executable!r}, "-c", {child_code!r}]); time.sleep(60)')
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1',
+                             '--preflight', shlex.join([sys.executable, '-c', code]),
+                             '--preflight-timeout', '0.5', *(['--gate'] if gate else []),
+                             '--', 'true'], env={**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 78 and 'hwlock: preflight timed out' in result.stderr
+    assert count.read_text() == '2'
+    assert not list((lockdir / 'hwq').glob('*.ticket'))
+    held = hwlock._try_flocks(['gpu1'])
+    assert held is not None
+    for handle in held:
+        handle.close()
+    child = Path('/proc') / childpid.read_text()
+    # An orphaned child can remain a zombie until the host reaps it, not running.
+    if child.exists():
+        assert '\nState:\tZ' in (child / 'status').read_text()
+
+
 def test_canonical_order_and_unknown_locks():
     assert hwlock.canonical(['gpu1', 'sparks.lock', 'gpu0']) == ['sparks', 'gpu0', 'gpu1']
     with pytest.raises(ValueError):

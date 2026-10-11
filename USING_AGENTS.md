@@ -69,8 +69,8 @@ but bounded engineering still goes to Sol.
   body with `usage_limit_reached` and `resets_in_seconds` in days is the
   subscription's weekly limit: every agent on that subscription stops at
   its next call. Relaunch each on the other subscription as a fresh agent
-  with a resume note pointing at its STATUS.md (its background jobs keep
-  running and must not be duplicated). Keep a shared
+  with a resume note pointing at its PR (`pr-sync pull` restores STATUS.md;
+  its background jobs keep running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
 - **Stop the original before relaunching.** An agent hit by `usage_limit_reached` can keep running
   for a while (some of its calls still complete). Stop it explicitly and confirm its worktree is
@@ -139,7 +139,8 @@ The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
 1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
-   outside the repo (the preamble covers this).
+   outside the repo (the preamble covers this). Name the PR/issue number and
+   the preflight command (`hwlock.py --preflight`) for any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
    the `PLAN.md` item, what was already tried. Point at earlier reports
    rather than restating them.
@@ -191,8 +192,8 @@ Agent(subagent_type="general-purpose",
 - Keep briefs as files, as in the plain path: write
   `~/.cache/cuteafd/builds/codex-runs/<name>.md` and make the prompt
   "read the preamble, the wave's hardware allocation file and `<name>.md`,
-  keep `builds/<name>/STATUS.md` current". The brief then survives a
-  restart, a resume note can be appended to it, and either launch path can
+  keep the PR body current with `scripts/dev/pr-sync push`". The brief survives
+  a restart, a resume note can be appended to it, and either launch path can
   run it. For a parallel wave, one shared allocation file says which locks
   and hosts each agent owns (e.g. one agent on `gpu1.lock` + a single
   Spark, the rest queued on the shared pool).
@@ -247,6 +248,11 @@ DeepSeek and MiMo are not available in this environment.
 
 ## Running agents
 
+- Workers update current state with `scripts/dev/pr-sync push` at checkpoints
+  and post verdicts/seals with `pr-sync comment`. The PR body is authoritative;
+  `pr-sync pull` restores a local STATUS.md. Only message the coordinator for
+  a merge-ready SHA, verdict, decision or blocker. Stacked PRs target their
+  parent branch; the coordinator comments rather than rewriting worker bodies.
 - **One agent per task.** Never start a second agent on a task that is still
   running (`codex-launch.sh` refuses to). A duplicate finds the first one's
   worktree, backs off, and reports an "ownership" question instead of
@@ -261,11 +267,11 @@ DeepSeek and MiMo are not available in this environment.
   its completion. The orchestrator likewise waits for completion
   notifications; don't poll logs in between, peek only when TJ asks.
 - **Before a Claude Code restart or a usage-limit reset,** have every agent
-  checkpoint: commit and push WIP, and write
-  `~/.cache/cuteafd/builds/<task>/STATUS.md` (branch, head, what's measured,
-  jobs in flight with their re-run commands, next steps). After the restart,
-  resume each from its STATUS.md. Background shells and their completion
-  watchers die with the session, so finished jobs must be collected by hand.
+  checkpoint: commit and push WIP, then `scripts/dev/pr-sync push` the PR
+  body (branch, head, gates, exact result-collection commands, evidence paths,
+  next steps). After the restart, `pr-sync pull` and resume from the PR.
+  Background shells and their completion watchers die with the session, so
+  finished jobs must be collected by hand.
 - A session limit stops every agent at once; resume each with a short note.
 
 ### Known Codex behavior
@@ -352,7 +358,8 @@ duplicating it. Record the lesson in the table below.
 | 4-hour device-mode hang | Watchdogs and per-step timeouts |
 | Disk full at 1.4 TB of builds | Clean build output at task end |
 | `sudo python …` flagged | Sudo the real command directly |
-| Restart lost agents' watchers | STATUS.md checkpoints before restarts |
+| Restart lost agents' watchers | PR-body checkpoints before restarts; `pr-sync pull` on resume |
+| Five hardware slots lost to harness setup mistakes (2026-10-11/12) | `hwlock.py --preflight` re-checks at enqueue and at grant |
 | 8 Opus agents, 60% weekly in a day | Sol for bounded work; Claude orchestrates and judges |
 | Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
 | Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
