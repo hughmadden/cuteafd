@@ -439,6 +439,11 @@ impl Opened {
 
     fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void)
         -> Result<Option<engine::Experts<'s>>> {
+        if args.mtp > 0 && layers == self.cfg.layers
+            && self.checkpoint.module_numerics("mtp.layers.0.mlp.experts.0.gate_proj")?
+                == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
+            tracing::warn!("Qwen MTP experts: deviation from declared W8A8, kernel pending; existing FP8 expert path retained");
+        }
         if args.shared_only {
             tracing::warn!("--shared-only: routed experts are skipped (outputs do not match the model)");
             return Ok(Some(engine::Experts::SharedOnly));

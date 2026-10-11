@@ -5,12 +5,11 @@
 # (RTX local / MTP layers), tp4, tp2 and tp6 in the SM121 Spark build. The daemon
 # resolves <libdir>/fp8/fp8-FAMILY/tp<world>; the artifact scripts install
 # the packages there. FAMILY:nvfp4 entries (glm, glmf, qwen4) build
-# fp8-FAMILY-nvfp4/ the same way for NVIDIA ModelOpt NVFP4 releases (W4A16:
-# packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
-# exporter geometry FAMILY_nvfp4); FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/,
-# whose large-row steps run W4A4 (activations quantized with the checkpoint's
-# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). A FAMILY:nvfp4
-# entry builds both, since the daemon serves W4A4 by default. glmfdense:nvfp4[a4]
+# fp8-FAMILY-nvfp4/ as a compatibility name for NVIDIA ModelOpt W4A4.
+# FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/, the runtime's required package:
+# every row count quantizes original BF16 inputs with each expert's calibrated
+# input_scale and uses block-scaled FP4 MMAs. No NVFP4 W4A16 serving mode exists.
+# A FAMILY:nvfp4 entry builds both naming aliases. glmfdense:nvfp4[a4]
 # is GLM 5.3 Flash's NVFP4 dense MLP (one always-selected expert, coordinator tp1).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
@@ -56,7 +55,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
     message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|mimof|glm|glmf|qwen4):fp8 (mimof/mimop: MXFP4 weights) \
-or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
+or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts)")
   endif()
   # Spark packages also carry exact layouts (tp<n>-w<width>: ranks own whole
   # 128-row blocks without zero padding; the worker prefers them).

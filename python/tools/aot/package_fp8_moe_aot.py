@@ -4,8 +4,8 @@
 The checkpoint's E4M3 experts with FP32 128x128 block scales (or MXFP4
 experts, ``mimop``: packed E2M1 + UE8M0 per 32; or NVIDIA ModelOpt NVFP4
 experts, ``<family>_nvfp4`` into ``fp8-<family>-nvfp4``: packed E2M1 + E4M3
-per 16 + an FP32 alpha per expert, W4A16 on the grouped GEMV at every row
-count) run as
+per 16 + FP32 per-expert weight and activation calibration, W4A4 from original
+BF16 inputs at every row count) run as
 ``b12x.integration.cuteafd.fp8_moe`` programs (route ``auto``: grouped GEMV
 up to 1024 live rows (MXFP4 on GB10: 640) and the expert-stationary streaming
 GEMMs above on GB10 (spark packages, wire input; MXFP4 gate/up by
@@ -27,7 +27,7 @@ Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
         words: [0] ABI 1 (E4M3 + FP32 128x128 scales), 2 (MXFP4: packed E2M1 +
         UE8M0 per 32) or 3 (NVFP4: packed E2M1 + E4M3 per 16, each scale operand
         followed by the experts' FP32 weight_scale_2 and input_scale) or 4 (NVFP4,
-        W4A4 stream route above the GEMV: the checkpoint's static input_scale
+        W4A4 stream route at every row count: the checkpoint's static input_scale
         quantizes the activations, block-scaled FP4 MMAs); packed FP4 slices are
         zero-padded to a 128-aligned width, [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),

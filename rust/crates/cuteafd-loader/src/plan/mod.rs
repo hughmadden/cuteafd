@@ -173,6 +173,12 @@ pub struct PlanReport {
     /// The checkpoint's ModelOpt quantization metadata (hf_quant_config.json /
     /// config.json), summarized; every weight was checked against it.
     pub quantization: Option<String>,
+    /// Checkpoint declarations, before optional measured precision optimizations.
+    pub module_numerics: BTreeMap<String, checkpoint::ModuleNumerics>,
+    /// Effective launcher defaults, not claims about overrides on a running server.
+    pub precision_optimizations: Vec<String>,
+    /// Named deviations that still need a native arithmetic kernel.
+    pub numerics_deviations: Vec<String>,
     pub runtime: Option<RuntimeStatus>,
     /// Why the family's runtime refuses this configuration, when it does.
     pub config_error: Option<String>,
@@ -295,6 +301,40 @@ fn owner_for(component: Component) -> Owner {
     }
 }
 
+fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
+    let mut active = Vec::new();
+    match family {
+        "glm5" => {
+            if std::env::var("CUTEAFD_GLM_BF16").as_deref() != Ok("native") {
+                active.push("attention, indexer and shared experts: load-time FP8 block weights (existing default; CUTEAFD_GLM_BF16=native disables)".into());
+            }
+            if !options.layout.as_ref().is_some_and(|layout| layout.glm5_drafter_disabled || layout.glm5_draft_bf16) {
+                active.push("external drafter: FP8 weights (existing launcher default)".into());
+            }
+        }
+        "glm5_flash" => {
+            let repr = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
+            active.push("MLA and shared experts: FP8 block weights; W8A8 prefill (existing launcher default)".into());
+            if repr.kda_fp8 { active.push("KDA projections: row-K128 FP8 weights (existing launcher default)".into()); }
+            if repr.fp8_head { active.push("head: row-K128 FP8 weights (existing launcher default)".into()); }
+            if !options.layout.as_ref().is_some_and(|layout| layout.glmf_drafter_disabled) {
+                active.push("external drafter: FP8 weights and W8A8 draft linear (existing launcher default)".into());
+            }
+        }
+        "qwen4" => active.push("target/MTP shared head: FP8 weights (existing launcher default; attention projections remain checkpoint precision)".into()),
+        _ => {}
+    }
+    active
+}
+
+fn numerics_deviations(family: &str, modules: &BTreeMap<String, checkpoint::ModuleNumerics>) -> Vec<String> {
+    if family == "qwen4" && modules.iter().any(|(name, numerics)|
+        name.starts_with("mtp.layers.") && name.contains(".mlp.experts.")
+            && *numerics == checkpoint::ModuleNumerics::W8A8) {
+        vec!["Qwen MTP experts: deviation from declared W8A8, kernel pending; existing FP8 expert path retained (both-projection dynamic K128 W8A8 is a named follow-up)".into()]
+    } else { Vec::new() }
+}
+
 pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     options.validate()?;
     let checkpoint = Checkpoint::open(snapshot)
@@ -312,6 +352,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         family: None,
         architectures: checkpoint.architectures(),
         quantization: None,
+        module_numerics: checkpoint.declared_module_numerics()?,
+        precision_optimizations: Vec::new(),
+        numerics_deviations: Vec::new(),
         runtime: None,
         config_error: None,
         spec: None,
@@ -365,6 +408,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    report.precision_optimizations = precision_optimizations(family.id(), options);
+    report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
         let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split);
@@ -818,6 +863,15 @@ pub fn render(report: &PlanReport) -> String {
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
     if let Some(quantization) = &report.quantization {
         let _ = writeln!(out, "quant      {quantization}");
+    }
+    for (module, numerics) in &report.module_numerics {
+        let _ = writeln!(out, "numerics   {module}: {numerics:?} (checkpoint declaration)");
+    }
+    for optimization in &report.precision_optimizations {
+        let _ = writeln!(out, "precision  {optimization}");
+    }
+    for deviation in &report.numerics_deviations {
+        let _ = writeln!(out, "deviation  {deviation}");
     }
     match (&report.family, &report.spec) {
         (Some(family), Some(spec)) => {

@@ -233,6 +233,28 @@ impl Fp8ExpertTensors {
                 && catalog.tensors.contains_key(&format!("{first}_scale_2"));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
+        let checkpoint = crate::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+        for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
+            use crate::plan::checkpoint::ModuleNumerics;
+            let numerics = checkpoint.module_numerics(name)?;
+            let nvfp4 = catalog.tensors.contains_key(&format!("{name}_scale_2"));
+            match numerics {
+                ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
+                ModuleNumerics::W8A8 => {
+                    ensure!(!nvfp4, "{name}: declared W8A8 cannot execute as W4A4");
+                    let qwen = checkpoint.model_type() == Some("qwen4_exp")
+                        || checkpoint.text_config().get("model_type").and_then(serde_json::Value::as_str)
+                            == Some("qwen4_exp_text");
+                    ensure!(qwen && name.starts_with("mtp.layers."),
+                        "{name}: declared expert W8A8 needs a both-projection native kernel");
+                    // Qwen MTP is an explicitly reported, temporary deviation.
+                }
+                ModuleNumerics::CheckpointPrecision | ModuleNumerics::W8CheckpointActivations => {
+                    ensure!(!nvfp4 || checkpoint.quantization().is_none(),
+                        "{name}: NVFP4 storage disagrees with declared {numerics:?}");
+                }
+            }
+        }
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(first_layer, 0, projection)?;
@@ -603,6 +625,7 @@ mod tests {
         use crate::plan::testing::{t, write_safetensors};
         for nvfp4 in [false, true] {
             let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
             let shape = RoutedExpertShape { layers: 2, first_layer: 0, experts: 1, topk: 1,
                 hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
             let mut map = BTreeMap::new();

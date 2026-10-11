@@ -5,6 +5,28 @@ use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[test]
+fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
+    use checkpoint::ModuleNumerics;
+    let modules = BTreeMap::from([("mtp.layers.0.mlp.experts.0.down_proj".into(), ModuleNumerics::W8A8)]);
+    let deviations = numerics_deviations("qwen4", &modules);
+    assert_eq!(deviations.len(), 1);
+    assert!(deviations[0].contains("deviation from declared W8A8, kernel pending"));
+    assert!(numerics_deviations("glm5", &modules).is_empty());
+    assert!(numerics_deviations("qwen4", &BTreeMap::new()).is_empty());
+    let options = PlanOptions::default();
+    assert!(precision_optimizations("qwen4", &options).iter().any(|text| text.contains("shared head")));
+    let defaults = precision_optimizations("glm5_flash", &options);
+    assert!(defaults.iter().any(|text| text.contains("KDA")));
+    assert!(defaults.iter().any(|text| text.contains("head:")));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+            kda_fp8: false, fp8_head: false, output_shard: false },
+        glmf_drafter_disabled: true, ..Default::default() }), ..Default::default() };
+    let overridden = precision_optimizations("glm5_flash", &options);
+    assert!(!overridden.iter().any(|text| text.contains("KDA") || text.contains("head:") || text.contains("drafter:")));
+}
+
 fn snapshot(config: Value, tensors: &[Tensor]) -> tempfile::TempDir {
     snapshot_tp(config, tensors, None)
 }
@@ -1518,13 +1540,37 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         }), ..sparks(ranks) };
         let mut value = serde_json::to_value(plan(dir.path(), &options).unwrap()).unwrap();
         value["snapshot"] = json!("<fixture>");
+        let fields = value.as_object_mut().unwrap();
+        assert_eq!(fields.shift_remove("module_numerics"), Some(json!({})));
+        assert_eq!(fields.shift_remove("numerics_deviations"), Some(json!([])));
+        let precision = fields.shift_remove("precision_optimizations").unwrap();
+        assert_eq!(precision, serde_json::to_value(precision_optimizations("glm5_flash", &options)).unwrap());
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
     let expected: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
-    assert_eq!(actual, expected);
+    // Exact Spark I/O admission intentionally replaces the historical calibrated
+    // wave/ring allowance. Validate that delta before isolating it from this
+    // coordinator startup-inventory snapshot.
     let mut legacy = actual;
+    for (name, report) in legacy.as_object_mut().unwrap() {
+        let devices = report["memory_layout"]["devices"].as_array_mut().unwrap();
+        for (index, device) in devices.iter_mut().enumerate() {
+            if device["kind"] != json!("spark") { continue; }
+            assert_eq!(device["items"], json!([
+                {"category":"experts", "group":"routed_expert", "format":"", "bytes":0, "basis":"exact"},
+                {"category":"runtime", "group":"context+modules", "format":"", "bytes":536870912u64, "basis":"calibrated"},
+                {"category":"workspace", "group":"expert waves", "format":"non-I/O residual", "bytes":516344381u64, "basis":"calibrated"},
+                {"category":"workspace", "group":"expert intake", "format":"FP8 K32", "bytes":51118080u64, "basis":"formula"},
+                {"category":"workspace", "group":"host expert exchange", "format":"", "bytes":33816576u64, "basis":"formula"},
+                {"category":"workspace", "group":"expert row indices", "format":"", "bytes":16384u64, "basis":"formula"},
+                {"category":"transport", "group":"rdma rings", "format":"", "bytes":823001088u64, "basis":"formula"}
+            ]));
+            device["items"] = expected[name]["memory_layout"]["devices"][index]["items"].clone();
+        }
+    }
+    assert_eq!(legacy, expected);
     for report in legacy.as_object_mut().unwrap().values_mut() {
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();

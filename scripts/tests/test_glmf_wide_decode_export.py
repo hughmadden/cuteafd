@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -81,6 +81,16 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
         assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
             "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
+
+
+def test_glm_declared_static_w8a8_exports_decode_and_prefill(exporter):
+    for make in (exporter.glm_programs, exporter.glm_head_split_programs):
+        programs = make(GEOMETRY, 64, 4096, 1048576)
+        calls = {stem: (params, thunk()[3]) for stem, _, params, thunk in programs}
+        for rows in (64, 4096):
+            params, kwargs = calls[f"ffn_i12288_pt_m{rows}"]
+            expected = {"inter": 12288, "max_rows": rows, "fp8_only": "prefill", "tensor_scales": True}
+            assert params == kwargs == expected
 
 
 def test_wide_index_uses_clamped_extent(exporter):

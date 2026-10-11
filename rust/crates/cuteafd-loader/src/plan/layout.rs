@@ -875,7 +875,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         } else {
             crate::placement::inventory::dense_package_scratch(
                 &crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()),
-                "glmfdense", rows, true)
+                "glmfdense", rows)
         };
         if let Some(scratch) = scratch {
             devices[0].items.push(Item::new(Category::Weights, "dense NVFP4 package arenas", "",

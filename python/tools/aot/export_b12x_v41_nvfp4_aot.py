@@ -141,12 +141,6 @@ def export(
             f"{role} NVFP4 exports require SM{capability[0]}{capability[1]}, "
             f"got {properties.major}{properties.minor}"
         )
-    # Exports describe architectural capacity, not the compiling card.
-    # The native launcher clamps this cooperative grid to the live SM count.
-    export_sms = 188 if capability == (12, 0) else 48
-    export_clusters = export_sms if max_active_clusters is None else max_active_clusters
-    if type(export_clusters) is not int or not 0 < export_clusters <= 2 * export_sms:
-        raise ValueError("max_active_clusters exceeds the architectural cooperative grid bound")
     device = torch.device("cuda", torch.cuda.current_device())
     workspace_sms = 188 if capability == (12, 0) else 48
     # The dynamic kernel takes its cooperative grid as a runtime scalar.
@@ -250,17 +244,10 @@ def export(
             planned_tile_m=plan.execution.tile_m,
             deterministic_output=True,
             swiglu_limit=10,
-<<<<<<< HEAD
             mac_override=launch_clusters,
             nvfp4_output_shards=output_shards if route_mode == "direct" or output_shards == 0 else 1,
         )
         if not 0 < clusters <= 2 * workspace_sms:
-=======
-            mac_override=export_clusters,
-            nvfp4_output_shards=output_shards if route_mode == "direct" or output_shards == 0 else 1,
-        )
-        if not 0 < clusters <= 2 * export_sms:
->>>>>>> 1caf1792 (Honor NVFP4 expert calibration and charge selected Spark rings)
             raise ValueError(f"invalid NVFP4 cooperative launch grid: {clusters}")
         label = f"v41_nvfp4_{role}_m{requested_rows}"
         symbol = "cuteafd_" + label
