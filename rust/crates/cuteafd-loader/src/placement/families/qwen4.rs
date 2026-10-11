@@ -284,7 +284,10 @@ pub fn dual_projection_load_staging(cfg: &crate::families::qwen4::Qwen4Config, l
 }
 
 /// PLE backing and its device scale follow the owning whole-width layer.
-/// Host-preloaded and mapped tables retain only the scale on the GPU.
+/// `device_backing` is explicit caller opt-in, never a solver-selected tier:
+/// the default is mapped with prefetch, not device or host-preloaded residency.
+/// Host-preloaded and mapped tables retain only the scale on the GPU; mapped
+/// gather staging is already charged by the step workspaces.
 pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize,
     resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
     device_backing: bool) -> anyhow::Result<Vec<Vec<LayerExtraDemand>>> {

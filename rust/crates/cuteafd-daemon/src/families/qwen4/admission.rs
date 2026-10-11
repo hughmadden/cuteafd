@@ -206,6 +206,87 @@ mod tests {
     }
 
     #[test]
+    fn large_ple_default_stays_mapped_and_charges_only_rows_and_scale() -> anyhow::Result<()> {
+        use clap::Parser;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::families::qwen4::{resident::Qwen4CheckpointResident, Qwen4Config, Qwen4KvCache};
+        use cuteafd_loader::placement::{families::qwen4, Baseline, GpuBudget, Onboard};
+        use crate::shared::mapped_table::TablePlacement;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            engine: super::super::EngineArgs,
+        }
+        let argv = ["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so"];
+        let args = Cli::try_parse_from(argv)?.engine;
+        assert_eq!(args.table_placement, TablePlacement::Mapped);
+        assert!(args.table.prefetch);
+        let mut config = cuteafd_loader::plan::testing::qwen4_config(48);
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([24]);
+        config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
+        config["text_config"]["ngram_size"] = serde_json::json!(3);
+        config["text_config"]["heads_per_ngram"] = serde_json::json!(8);
+        let cfg = Qwen4Config::from_hf(&config)?;
+        // The BF16 table is about 95.4 GiB; headers alone must not promote it.
+        let resident = Qwen4CheckpointResident {
+            ple_table_bytes: (954 * (1u64 << 30)).div_ceil(10), ple_row_bytes: 160 * 2,
+            ..Default::default()
+        };
+        let extra = qwen4::dual_ple_demands(&cfg, 48, &resident, args.table_placement == TablePlacement::Device)?;
+        let weights = vec![100 << 20; 48];
+        let experts = vec![None; 48];
+        // Also leave enough room for the entire table: available capacity is
+        // never permission to change the user's mapped residency selection.
+        for capacity in [96u64 << 30, 192u64 << 30] {
+            for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
+                let mut inputs = qwen4::QwenDualInputs {
+                    admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false,
+                        kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
+                        slots: 16, mark_bytes: 0, full_prefill_logits: 0,
+                        ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
+                    gpus: [GpuBudget { capacity_bytes: capacity, headroom_bytes: 3 << 30,
+                        baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],
+                    layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
+                    fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
+                    max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard,
+                    startup_graph_modes: None,
+                };
+                let mapped = qwen4::dual_request(&inputs, [0; 2])?;
+                assert!(mapped.movables.is_empty());
+                inputs.admission.ple = None;
+                let direct = qwen4::dual_request(&inputs, [0; 2])?;
+                for (group, rows) in [("decode step", 64), ("prefill step", 4096)] {
+                    for gpu in 0..2 {
+                        let bytes = |req: &cuteafd_loader::placement::PlacementRequest| req.fixed.iter()
+                            .find(|d| d.gpu == gpu && d.group == group).unwrap().bytes;
+                        assert_eq!(bytes(&mapped) - bytes(&direct),
+                            rows * cfg.ple_rows() as u64 * (8 + resident.ple_row_bytes));
+                    }
+                }
+                let planned = cuteafd_loader::placement::solve(&mapped)?;
+                let mut measured = mapped.clone();
+                for gpu in &mut measured.inventory.gpus {
+                    gpu.baseline = Baseline::Measured { free_bytes: capacity };
+                }
+                assert_eq!(planned, cuteafd_loader::placement::solve(&measured)?);
+                assert_eq!(planned.pool_tokens, 2 << 20);
+                assert_eq!(planned.items.iter().flatten().filter(|i| i.category == Category::Tables)
+                    .map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(), vec![("PLE scale", 256)]);
+                assert!(!planned.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
+            }
+        }
+        // Whole-table storage is available only through an explicit CLI choice.
+        for (name, placement) in [("device", TablePlacement::Device), ("host-preload", TablePlacement::HostPreload)] {
+            let opt_in = Cli::try_parse_from(argv.into_iter().chain(["--table-placement", name]))?.engine;
+            assert_eq!(opt_in.table_placement, placement);
+            let demand = qwen4::dual_ple_demands(&cfg, 48, &resident, placement == TablePlacement::Device)?;
+            assert_eq!(demand[23].iter().map(|d| d.bytes).sum::<u64>(),
+                256 + if placement == TablePlacement::Device { resident.ple_table_bytes } else { 0 });
+        }
+        Ok(())
+    }
+
+    #[test]
     fn dual_weight_headers_match_selected_operands_before_cuda() -> anyhow::Result<()> {
         use clap::Parser;
         use cuteafd_loader::plan::testing;
