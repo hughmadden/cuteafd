@@ -427,8 +427,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         spark_host_bytes: 13 * GIB,
     };
     match family {
-            ..generic
-        },
         // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split). Without a program manifest,
         // one GPU's step workspaces: decode and two lanes of 4,096 rows over shared temporaries
         // (`serving_capacity::glmf_step_workspaces` of the 5090 export, 2.68 GiB).
