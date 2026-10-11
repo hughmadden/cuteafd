@@ -127,6 +127,7 @@ pub struct Programs<'a> {
     load: LoadFn,
     launch: LaunchFn,
     programs: HashMap<String, (u32, ProgramSpec)>,
+    card_specs: HashMap<String, [ProgramSpec; 2]>,
     capacities: ProgramCapacities,
 }
 
@@ -157,7 +158,7 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Programs { library: self, load, launch, programs, capacities: ProgramCapacities::default() })
+        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default() })
     }
 }
 
@@ -174,7 +175,11 @@ impl<'a> Programs<'a> {
             path
         };
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let manifest: serde_json::Value = serde_json::from_str(&text)?;
+        let mut manifest: serde_json::Value = serde_json::from_str(&text)?;
+        if manifest["programs"].as_array().is_some_and(|programs| programs.iter().any(|p| p.get("card_plans").is_some())) {
+            cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
+                self.library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
+        }
         self.capacities = ProgramCapacities::from_manifest(&manifest)?;
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
         ensure!(entries.len() == self.programs.len(), "manifest lists {} programs, the library {}",
@@ -190,6 +195,17 @@ impl<'a> Programs<'a> {
             spec.capacity_rows = entry["capacity_rows"].as_u64().unwrap_or(0) as u32;
             if let Some(scratch) = entry["scratch_bytes_at_capacity"].as_object() {
                 spec.scratch = scratch.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect();
+            }
+            if let Some(plans) = entry["card_plans"].as_array() {
+                let mut specs = [spec.clone(), spec.clone()];
+                for (index, sms) in [170, 188].into_iter().enumerate() {
+                    let plan = plans.iter().find(|p| p["sm_count"].as_u64() == Some(sms))
+                        .context("validated card plan disappeared")?;
+                    specs[index].scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
+                        .iter().map(|(k, v)| Ok((k.clone(), v.as_u64().context("card scratch bytes")?)))
+                        .collect::<Result<_>>()?;
+                }
+                self.card_specs.insert(name.to_string(), specs);
             }
         }
         Ok(self)
@@ -214,6 +230,8 @@ impl<'a> Programs<'a> {
             }
             // SAFETY: loading reads the static table and loads a CUDA library.
             let status = unsafe { (self.load)(*index) };
+            ensure!(status != -12001,
+                "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
             ensure!(status == 0, "loading {name} failed with CUDA status {status}");
             loaded += 1;
         }
@@ -225,6 +243,11 @@ impl<'a> Programs<'a> {
     }
 
     pub fn spec(&self, name: &str) -> Result<&ProgramSpec> {
+        if let Some(specs) = self.card_specs.get(name) {
+            let sms = self.library.sm_count()?;
+            ensure!(sms > 0, "runtime SM count must be positive");
+            return Ok(&specs[usize::from(sms >= 188)]);
+        }
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
     }
 
@@ -245,7 +268,10 @@ impl<'a> Programs<'a> {
         // SAFETY: loading reads the program table and loads a CUDA library on
         // the caller's current device.
         let status = unsafe { (self.load)(*index) };
+        ensure!(status != -12001,
+            "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
         ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+        let spec = self.spec(name)?;
         Ok(Program { programs: self, index: *index, spec })
     }
 

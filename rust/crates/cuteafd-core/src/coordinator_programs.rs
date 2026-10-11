@@ -91,9 +91,80 @@ impl std::fmt::Display for MissingCoordinatorProgram {
 
 impl std::error::Error for MissingCoordinatorProgram {}
 
+/// Select the same 170/188-SM program recipe as native load, before admission.
+/// The retained plans allow another device to select its own scratch envelope.
+pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
+    let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
+    for program in programs {
+        if program.get("card_plans").is_none() { continue; }
+        let name = program["name"].as_str().unwrap_or("<unnamed>").to_string();
+        let invalid = || CardPlanError { name: name.clone() };
+        let plans = program["card_plans"].as_array().ok_or_else(invalid)?;
+        if sms == 0 || plans.len() != 2 { return Err(invalid()); }
+        let selected_sms = if sms >= 188 { 188 } else { 170 };
+        let mut selected = None;
+        for expected in [170, 188] {
+            let matching: Vec<_> = plans.iter().filter(|p| p["sm_count"].as_u64() == Some(expected)).collect();
+            if matching.len() != 1 { return Err(invalid()); }
+            let plan = matching[0];
+            let scratch = plan["scratch_bytes_at_capacity"].as_object().ok_or_else(invalid)?;
+            if scratch.values().any(|v| v.as_u64().is_none()) || !plan["geometry"].is_object() {
+                return Err(invalid());
+            }
+            if expected == selected_sms { selected = Some(plan.clone()); }
+        }
+        let plan = selected.ok_or_else(invalid)?;
+        program["scratch_bytes_at_capacity"] = plan["scratch_bytes_at_capacity"].clone();
+        program["geometry"] = plan["geometry"].clone();
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("program {name} has an invalid 170/188-SM card-plan contract")]
+pub struct CardPlanError {
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dual_manifest() -> serde_json::Value {
+        serde_json::json!({"programs": [{"name": "dsv4p_sparse_mla_decode_c128_m64",
+            "scratch_bytes_at_capacity": {"scratch": 1094778880}, "geometry": {},
+            "card_plans": [
+                {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 1094778880}, "geometry": {"num_splits": 130}},
+                {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 8421376}, "geometry": {"num_splits": 1}}
+            ]}, {"name": "dsv4p_wo", "scratch_bytes_at_capacity": {"scratch": 9}}]})
+    }
+
+    #[test]
+    fn card_plan_scratch_tracks_native_selection_without_losing_the_other_plan() {
+        let mut manifest = dual_manifest();
+        for (sms, bytes, splits) in [(188, 8421376, 1), (170, 1094778880, 130), (188, 8421376, 1)] {
+            select_card_plans(&mut manifest, sms).unwrap();
+            assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"], bytes);
+            assert_eq!(manifest["programs"][0]["geometry"]["num_splits"], splits);
+            assert_eq!(manifest["programs"][1]["scratch_bytes_at_capacity"]["scratch"], 9);
+        }
+    }
+
+    #[test]
+    fn malformed_card_plans_fail_closed_instead_of_using_the_capacity_envelope() {
+        for defect in 0..5 {
+            let mut manifest = dual_manifest();
+            match defect {
+                0 => manifest["programs"][0]["card_plans"] = serde_json::json!([]),
+                1 => manifest["programs"][0]["card_plans"][1]["sm_count"] = 170.into(),
+                2 => manifest["programs"][0]["card_plans"][1]["scratch_bytes_at_capacity"]["scratch"] = (-1).into(),
+                3 => manifest["programs"][0]["card_plans"][1]["geometry"] = serde_json::Value::Null,
+                _ => {},
+            }
+            let error = select_card_plans(&mut manifest, if defect == 4 { 0 } else { 188 }).unwrap_err();
+            assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        }
+    }
 
     #[test]
     fn v41_serving_rows_cover_live_chunks_and_decoder_replay() {

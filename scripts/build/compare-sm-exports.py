@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -90,6 +91,23 @@ def jobs(scope):
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
+    result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
+                   ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", "2,3"])
+                  for geometry in EXL3_GEOMETRIES)
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
+                           ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
+        result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
+                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits]))
+    result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", geometry, "--context-split-only"])
+                  for geometry in ("flash", "pro", "glm", "glmf"))
+    result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
+                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                  for geometry in EXL3_GEOMETRIES)
+    result.extend([
+        ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
+        ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
+    ])
     return result
 
 
@@ -120,23 +138,39 @@ def export_routed(extra, output):
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
 
+@contextmanager
+def cpu_trellis_luts(modules, cpu_device):
+    # Each tier module binds the helper independently. The LUT is a runtime
+    # buffer, not a compiler input; retain its values without initializing CUDA.
+    originals = [(module, module._trellis256_execution_lut) for module in modules]
+    try:
+        for module, original in originals:
+            module._trellis256_execution_lut = lambda device, codebook, original=original: original(cpu_device, codebook)
+        yield
+    finally:
+        for module, original in originals:
+            module._trellis256_execution_lut = original
+
+
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
+    import torch
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
+    with cpu_trellis_luts((mixed_trellis, mixed_trellis4), torch.device("cpu")):
+        _export_exl3(extra, output)
+
+
+def _export_exl3(extra, output):
     import package_exl3_aot as package
     from export_b12x_exl3_aot import export
-    import torch
-    from b12x.moe._shared.kernels.w4a16 import mixed_trellis
-    original_lut = mixed_trellis._trellis256_execution_lut
-    # The LUT is a runtime buffer created after compilation, not a compiler input.
-    # Keep its exact values on CPU; the offline worker still forbids CUDA allocation.
-    mixed_trellis._trellis256_execution_lut = lambda device, codebook: original_lut(torch.device("cpu"), codebook)
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
+    bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
     for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
         for rows in capacities:
             options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
             block = package.route_block(geometry, rows)
-            if package.warp_specialized(geometry, "coordinator", width, rows):
+            if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
                 block = 64
                 options["warp_specialized"] = True
                 if package.wire_input(geometry, "coordinator", width, rows):
@@ -149,12 +183,25 @@ def export_exl3(extra, output):
                 tile = package.ws_tile(geometry, "coordinator", width, rows)
                 if tile is not None:
                     options["tile"] = tile
-            elif package.fused_input_rotation(geometry, "coordinator", width, rows):
+            elif len(bits) == 2 and package.fused_input_rotation(geometry, "coordinator", width, rows):
                 options["fused_input_rotation"] = True
-            elif package.token_major_rotation(geometry, rows):
+            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
                 options["token_major_rotation"] = True
             options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
-            export(output / profile / f"m{rows}", width, experts, rows, (3, 4), "auto", topk, dtype, **options)
+            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
+
+
+def export_exl3_routes(extra, output):
+    """Cover every production route-block/capacity pair without linking its bridge."""
+    import package_exl3_aot as package
+    from export_b12x_exl3_routes_aot import export
+    geometry = extra[extra.index("--geometry") + 1]
+    capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
+    _, width, experts, topk, _, _ = package.profiles_for_role("coordinator", geometry)[0]
+    for rows in capacities:
+        block = (64 if package.warp_specialized(geometry, "coordinator", width, rows)
+                 else package.route_block(geometry, rows))
+        export(output / f"m{rows}", rows, experts, topk, block)
 
 
 def worker(payload):
@@ -188,9 +235,26 @@ def worker(payload):
         export_routed(payload["args"], output)
     elif payload["exporter"] == "package_exl3_aot.py":
         export_exl3(payload["args"], output)
+    elif payload["exporter"] == "export_b12x_exl3_routes_aot.py":
+        export_exl3_routes(payload["args"], output)
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
-        runpy.run_path(str(path), run_name="__main__")
+        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py"):
+            # Standalone exporters initialize a one-SM offline target themselves.
+            # Retain this worker's synthetic target so the comparison is meaningful.
+            from b12x._lib import compile_pool
+            def retain_target(ordinal, capability, *_):
+                if ordinal != 0 or capability != (12, 0):
+                    raise ValueError("standalone exporter changed the comparison target")
+            compile_pool._initialize_worker = retain_target
+            try:
+                runpy.run_path(str(path), run_name="__main__")
+            finally:
+                compile_pool._initialize_worker = _initialize_worker
+        else:
+            runpy.run_path(str(path), run_name="__main__")
+    if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
+        raise RuntimeError("exporter changed the synthetic SM count")
     if torch.cuda.is_initialized():
         raise RuntimeError("SM comparison initialized CUDA")
     (Path(payload["output"]) / "comparison-plans.json").write_text(json.dumps(plans, indent=2) + "\n")

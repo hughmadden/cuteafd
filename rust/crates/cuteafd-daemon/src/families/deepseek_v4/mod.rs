@@ -241,8 +241,10 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
     let cfg = DeepseekV4Config::read(&args.snapshot, 1)?;
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    let manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)
+    let mut manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)
         .with_context(|| format!("reading {}", args.manifest.display()))?)?;
+    cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
+        library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
     Ok(Loaded { snapshot: args.snapshot.clone(), catalog, library, cfg, family, manifest })
 }
 
