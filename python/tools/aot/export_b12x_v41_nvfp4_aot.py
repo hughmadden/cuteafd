@@ -145,6 +145,12 @@ def export(
             f"got {properties.major}{properties.minor}"
         )
     device = torch.device("cuda", torch.cuda.current_device())
+    workspace_sms = 188 if capability == (12, 0) else 48
+    # The dynamic kernel takes its cooperative grid as a runtime scalar.
+    # Reserve the architecture capacity, retaining explicit tuning overrides.
+    launch_clusters = workspace_sms if max_active_clusters is None else max_active_clusters
+    if type(launch_clusters) is not int or not 0 < launch_clusters <= 2 * workspace_sms:
+        raise ValueError(f"invalid NVFP4 cooperative launch capacity: {launch_clusters}")
     weight_plan = moe.plan_b12x_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
@@ -243,10 +249,10 @@ def export(
             planned_tile_m=plan.execution.tile_m,
             deterministic_output=True,
             swiglu_limit=10,
-            mac_override=max_active_clusters,
+            mac_override=launch_clusters,
             nvfp4_output_shards=output_shards if route_mode == "direct" or output_shards == 0 else 1,
         )
-        if not 0 < clusters <= 2 * properties.multi_processor_count:
+        if not 0 < clusters <= 2 * workspace_sms:
             raise ValueError(f"invalid NVFP4 cooperative launch grid: {clusters}")
         label = f"v41_nvfp4_{role}_m{requested_rows}"
         symbol = "cuteafd_" + label
@@ -388,7 +394,7 @@ def export(
                 "#pragma once",
                 *includes,
                 f"#define CUTEAFD_V41_CC_MINOR {properties.minor}",
-                f"#define CUTEAFD_V41_SMS {properties.multi_processor_count}",
+                f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
@@ -422,7 +428,7 @@ def main() -> None:
         "--max-active-clusters",
         type=int,
         default=None,
-        help="positive cooperative grid override; unset uses measured kernel occupancy",
+        help="positive cooperative grid override; unset reserves the architecture SM capacity",
     )
     parser.add_argument("--output-shards", type=int, default=1,
                         help="experimental output shards: 0 adapts direct/grouped routing; positive divisors of 40 split direct routing")
