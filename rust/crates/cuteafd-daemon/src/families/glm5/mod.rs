@@ -343,8 +343,8 @@ impl Opened {
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits };
         let (placement, working) = glm::solve_working_set(&inputs, [0; 2], None)?;
-        let prefill_lanes = usize::try_from(working.prefill_lanes)?;
-        let selected_peers = if working.spark_ranks > 0 { args.peers.as_deref() } else { None };
+        let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
+        let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
@@ -405,7 +405,7 @@ impl Opened {
         // request otherwise pays seconds of connection setup.
         let (rows, h, topk, experts, layer) =
             (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts,
-                working.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
+                working.spark.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
         let warm = move || -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,

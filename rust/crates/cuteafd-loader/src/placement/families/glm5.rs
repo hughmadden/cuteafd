@@ -257,10 +257,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
 /// Storage allocated for the selected Spark suffix, rather than configured peers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlmWorkingSet {
-    pub rtx_layers: Vec<usize>,
-    pub spark_layers: Vec<usize>,
-    pub spark_ranks: usize,
-    pub prefill_lanes: u64,
+    pub spark: SparkWorkingSet,
+    /// Family-local TP2 payload/backend costs for this selected branch.
     pub tp2_workspace: [u64; 2],
 }
 
@@ -282,8 +280,11 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
             matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect();
         let spark_layers = placed.layers.iter().enumerate().filter_map(|(layer, home)|
             (home.experts == ExpertHome::Spark).then_some(layer)).collect();
-        Ok((placed, GlmWorkingSet { rtx_layers, spark_layers, spark_ranks: branch.spark_ranks,
-            prefill_lanes: branch.prefill_lanes, tp2_workspace }))
+        Ok((placed, GlmWorkingSet {
+            spark: SparkWorkingSet { rtx_layers, spark_layers, spark_ranks: branch.spark_ranks,
+                prefill_lanes: branch.prefill_lanes },
+            tp2_workspace,
+        }))
     };
     if inputs.spark_ranks == 0 || routed == 0 {
         let mut branch = inputs.clone();
@@ -320,7 +321,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         match run(&branch, cap, floor) {
             Ok((placed, working)) => {
                 let expected = (inputs.cfg.first_moe_layer + n..inputs.layers).collect::<Vec<_>>();
-                if working.spark_layers != expected || placed.onboard_layers != n {
+                if working.spark.spark_layers != expected || placed.onboard_layers != n {
                     return Err(PlacementError::Inventory("GLM selected Spark set disagrees with solved homes"));
                 }
                 let score = match inputs.onboard {
@@ -725,10 +726,13 @@ mod tests {
             let serial = [64 << 20; 2];
             let (p, working) = solve_working_set(&planned, serial, None).unwrap();
             assert_eq!(p.onboard_layers, routed);
-            assert_eq!(working.spark_ranks, 0);
-            assert_eq!(working.prefill_lanes, 1);
+            assert_eq!(working.spark.spark_ranks, 0);
+            assert_eq!(working.spark.prefill_lanes, 1);
             assert_eq!(working.tp2_workspace, serial);
-            assert!(working.spark_layers.is_empty());
+            assert!(working.spark.spark_layers.is_empty());
+            assert!(working.spark.selected_ranks().is_empty());
+            assert!(working.spark.includes(WorkingSetComponent::RtxExperts));
+            assert!(!working.spark.includes(WorkingSetComponent::SparkExperts));
             assert!(p.items[0].iter().all(|item| item.group != "Spark intake planes"));
             let mut measured = planned.clone();
             for (capacity, baseline) in &mut measured.gpus {
@@ -744,10 +748,13 @@ mod tests {
             let (p, working) = solve_working_set(&input, [64 << 20; 2], None).unwrap();
             let n = onboard.layers(routed).unwrap();
             assert_eq!(p.onboard_layers, n);
-            assert_eq!(working.spark_layers, (cfg.first_moe_layer + n..cfg.layers).collect::<Vec<_>>());
-            assert_eq!(working.spark_ranks, 4);
-            assert_eq!(working.prefill_lanes, 3);
-            assert_eq!(working.rtx_layers, (cfg.first_moe_layer..cfg.first_moe_layer + n).collect::<Vec<_>>());
+            assert_eq!(working.spark.spark_layers, (cfg.first_moe_layer + n..cfg.layers).collect::<Vec<_>>());
+            assert_eq!(working.spark.spark_ranks, 4);
+            assert_eq!(working.spark.prefill_lanes, 3);
+            assert_eq!(working.spark.rtx_layers, (cfg.first_moe_layer..cfg.first_moe_layer + n).collect::<Vec<_>>());
+            assert_eq!(working.spark.selected_ranks(), 0..4);
+            assert_eq!(working.spark.includes(WorkingSetComponent::RtxExperts), n > 0);
+            assert!(working.spark.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(working.tp2_workspace, if n == 0 { [0; 2] } else { input.tp2_workspace });
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
             assert_eq!(intake.bytes, 4 * 4 * 4096 * 6144 * 2);
@@ -761,7 +768,7 @@ mod tests {
         input.requested_pool = Some(65536);
         input.onboard = Onboard::Layers(0);
         let without_rtx = solve_working_set(&input, [64 << 20; 2], None).unwrap();
-        assert!(without_rtx.1.rtx_layers.is_empty());
+        assert!(without_rtx.1.spark.rtx_layers.is_empty());
         assert_eq!(without_rtx.1.tp2_workspace, [0; 2]);
         let request = request(&input).unwrap();
         assert_eq!(request.tp2_workspace, [0; 2]);
@@ -778,8 +785,8 @@ mod tests {
         input.tp2_workspace = [128 << 20; 2];
         for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
         let all_local = solve_working_set(&input, [64 << 20; 2], None).unwrap();
-        assert!(all_local.1.spark_layers.is_empty());
-        assert_eq!(all_local.1.prefill_lanes, 1);
+        assert!(all_local.1.spark.spark_layers.is_empty());
+        assert_eq!(all_local.1.spark.prefill_lanes, 1);
         assert_eq!(all_local.1.tp2_workspace, [64 << 20; 2]);
         input.spark_ranks = 0;
         input.prefill_lanes = 1;
@@ -801,8 +808,8 @@ mod tests {
         let serial = [64 << 20; 2];
         let (placed, working) = solve_working_set(&input, serial, None).unwrap();
         assert_eq!(placed.onboard_layers, cfg.layers - cfg.first_moe_layer);
-        assert!(working.spark_layers.is_empty());
-        assert_eq!(working.prefill_lanes, 1);
+        assert!(working.spark.spark_layers.is_empty());
+        assert_eq!(working.spark.prefill_lanes, 1);
         let with_peers = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
         assert!(placed.pool_tokens > solve_working_set(&with_peers, serial, None).unwrap().0.pool_tokens,
             "pool-first must compare each branch's own costs, not take configured peer costs");
@@ -814,9 +821,9 @@ mod tests {
         input.spark_ranks = 4;
         input.prefill_lanes = 3;
         let (dense, working) = solve_working_set(&input, serial, None).unwrap();
-        assert!(working.rtx_layers.is_empty() && working.spark_layers.is_empty());
-        assert_eq!(working.spark_ranks, 0);
-        assert_eq!(working.prefill_lanes, 1);
+        assert!(working.spark.rtx_layers.is_empty() && working.spark.spark_layers.is_empty());
+        assert_eq!(working.spark.spark_ranks, 0);
+        assert_eq!(working.spark.prefill_lanes, 1);
         assert_eq!(working.tp2_workspace, [0; 2]);
         assert_eq!(dense.pool_tokens, 2 << 20);
     }
@@ -845,7 +852,7 @@ mod tests {
         }
         let (placed, working) = solve_working_set(&input, serial, None).unwrap();
         assert!(placed.onboard_layers < routed, "max must not select an all-local branch below 256K");
-        assert_eq!(working.spark_ranks, 4);
+        assert_eq!(working.spark.spark_ranks, 4);
         assert!(placed.pool_tokens >= 65536);
         input.spark_ranks = 0;
         input.prefill_lanes = 1;
@@ -863,7 +870,7 @@ mod tests {
         let serial = [64 << 20; 2];
         let (auto, working) = solve_working_set(&input, serial, None).unwrap();
         assert_eq!(auto.onboard_layers, 0);
-        assert_eq!(working.spark_ranks, 4);
+        assert_eq!(working.spark.spark_ranks, 4);
         assert_eq!(auto.pool_tokens, solve(&request(&input).unwrap()).unwrap().pool_tokens);
         input.onboard = Onboard::ExpertsFirst { pool_floor: 262144 };
         let (max, _) = solve_working_set(&input, serial, None).unwrap();
@@ -1202,15 +1209,15 @@ mod tests {
                     assert_eq!(p.pool_tokens, 65536);
                     assert!(p.expert_ranges.iter().all(|range| range.layers == 0));
                     if onboard == Onboard::Layers(0) {
-                        assert!(pw.rtx_layers.is_empty());
-                        assert_eq!(pw.spark_layers, vec![1]);
+                        assert!(pw.spark.rtx_layers.is_empty());
+                        assert_eq!(pw.spark.spark_layers, vec![1]);
                         assert_eq!(pw.tp2_workspace, [0; 2]);
-                        assert_eq!((pw.spark_ranks, pw.prefill_lanes), (4, 3));
+                        assert_eq!((pw.spark.spark_ranks, pw.spark.prefill_lanes), (4, 3));
                     } else {
-                        assert_eq!(pw.rtx_layers, vec![1]);
-                        assert!(pw.spark_layers.is_empty());
+                        assert_eq!(pw.spark.rtx_layers, vec![1]);
+                        assert!(pw.spark.spark_layers.is_empty());
                         assert_eq!(pw.tp2_workspace, serial);
-                        assert_eq!((pw.spark_ranks, pw.prefill_lanes), (0, 1));
+                        assert_eq!((pw.spark.spark_ranks, pw.spark.prefill_lanes), (0, 1));
                         assert_eq!(p.tp2.unwrap().layers, 1);
                     }
                 }
