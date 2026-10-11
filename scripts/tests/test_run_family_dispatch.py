@@ -177,7 +177,8 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "0..working.spark_ranks" in planner and "selected.filter(|working| working.spark_ranks > 0)" in planner
     loader = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash.rs").read_text()
     request = loader.split("pub fn request_for_working_set(", 1)[1].split("/// Exact header-only", 1)[0]
-    assert "working.includes(row.component)" in request
+    assert "working.demands(&fixed).cloned().collect()" in request
+    assert "SparkWorkingSet as GlmfWorkingSet" in loader
     assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]

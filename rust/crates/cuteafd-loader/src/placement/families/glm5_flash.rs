@@ -108,20 +108,8 @@ pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u6
     Ok(MovableDemands { placement_gpu: 1, demands })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GlmfComponent { Always, RtxExperts, SparkExperts }
-
-#[derive(Debug, Clone)]
-pub struct GlmfBufferDemand {
-    pub component: GlmfComponent,
-    pub demand: Demand,
-}
-
-impl GlmfBufferDemand {
-    pub fn new(component: GlmfComponent, gpu: u8, category: Category, group: &str, bytes: u64, basis: Basis) -> Self {
-        Self { component, demand: Demand::new(gpu, category, group, bytes, basis) }
-    }
-}
+pub use crate::placement::{ComponentDemand as GlmfBufferDemand, SparkWorkingSet as GlmfWorkingSet,
+    WorkingSetComponent as GlmfComponent};
 
 /// Shared attention/head temporaries remain allocated when every expert is remote.
 /// Both callers use the exact base plus optional RTX-buffer delta.
@@ -245,7 +233,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     }
     let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
     fixed.extend(workspace.iter().cloned());
-    let fixed = fixed.into_iter().filter(|row| working.includes(row.component)).map(|row| row.demand).collect();
+    let fixed = working.demands(&fixed).cloned().collect();
     Ok(PlacementRequest {
         attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
         inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
@@ -341,16 +329,13 @@ pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: 
     Ok(scratch.max(sibling) + if tp == 2 { rows * shape.hidden as u64 * 2 } else { 0 })
 }
 
-/// Resources allocated by the selected Spark set, not by configured peer presence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GlmfWorkingSet {
-    pub rtx_layers: Vec<usize>,
-    pub spark_layers: Vec<usize>,
-    pub spark_ranks: usize,
-    pub prefill_lanes: u64,
+/// Family-specific canonical selection and solved-home validation over the shared set.
+trait GlmfWorkingSetExt: Sized {
+    fn candidate(i: &GlmfInputs<'_>, n: usize) -> Result<Self, PlacementError>;
+    fn validate(&self, placed: &Placement) -> Result<(), PlacementError>;
 }
 
-impl GlmfWorkingSet {
+impl GlmfWorkingSetExt for GlmfWorkingSet {
     fn candidate(i: &GlmfInputs<'_>, n: usize) -> Result<Self, PlacementError> {
         let dense = i.cfg.dense.get(..i.layers).ok_or(PlacementError::Inventory("GLM Flash layer inventory"))?;
         let routed: Vec<_> = dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer)).collect();
@@ -361,14 +346,6 @@ impl GlmfWorkingSet {
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
         Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks,
             prefill_lanes: if spark_ranks == 0 { 1 } else { i.prefill_lanes } })
-    }
-
-    pub fn includes(&self, component: GlmfComponent) -> bool {
-        match component {
-            GlmfComponent::Always => true,
-            GlmfComponent::RtxExperts => !self.rtx_layers.is_empty(),
-            GlmfComponent::SparkExperts => !self.spark_layers.is_empty(),
-        }
     }
 
     fn validate(&self, placed: &Placement) -> Result<(), PlacementError> {
@@ -688,8 +665,14 @@ mod tests {
             }
         }
         for n in [0, 1, 3] {
-            let working = GlmfWorkingSet::candidate(&input, n).unwrap();
+            let working: crate::placement::SparkWorkingSet = GlmfWorkingSet::candidate(&input, n).unwrap();
             let request = request_for_working_set(&input, &working).unwrap();
+            assert_eq!(working.selected_ranks().count(), if n == input.experts.len() { 0 } else { input.spark_ranks });
+            let rows = cache::glmf_expert_rows(input.prefill_rows, input.decode_rows) as u32;
+            let pinned = working.coordinator_staging(cuteafd_core::ExpertGeometry::GLM5_FLASH, rows, false).unwrap();
+            assert_eq!(pinned, if n == input.experts.len() { 0 } else {
+                input.prefill_lanes * u64::from(rows) * (input.cfg.hidden as u64 * 33 / 32 + input.cfg.topk as u64 * 8)
+            });
             for (component, group) in [(GlmfComponent::RtxExperts, "RTX test buffer"),
                 (GlmfComponent::SparkExperts, "Spark test buffer")] {
                 assert_eq!(request.fixed.iter().any(|d| d.group == group), working.includes(component));
