@@ -104,8 +104,11 @@ def test_unsafe_or_non_nvme_persistent_path_falls_back(tmp_path, kind, device):
     # A symlinked cache root must not bypass admission; its separate mount is unsafe.
     (tmp_path / "bin/findmnt").write_text(
         '#!/usr/bin/env python3\nimport json,sys\n'
-        f'kind={kind!r} if "/.cache/cuteafd/" in " ".join(sys.argv) else "ext4"\n'
-        f'device={device!r} if "/.cache/cuteafd/" in " ".join(sys.argv) else "nvme0n1p2"\n'
+        # Match the fixture HOME's cache, not any path that merely contains
+        # .cache/cuteafd (pytest's basetemp may live under the real one).
+        f'cache={env["HOME"] + "/.cache/cuteafd/"!r}\n'
+        f'kind={kind!r} if cache in " ".join(sys.argv) else "ext4"\n'
+        f'device={device!r} if cache in " ".join(sys.argv) else "nvme0n1p2"\n'
         'print(json.dumps({"filesystems":[{"source":"/dev/"+device,"fstype":kind,"options":"rw"}]}))\n')
     # findmnt checks an existing parent, so create the candidates first.
     for name in ("cargo-home/x86_64/registry", "cargo-home/x86_64/git", "jit/abcd/x86_64",
