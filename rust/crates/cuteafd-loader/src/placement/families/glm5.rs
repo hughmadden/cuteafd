@@ -569,6 +569,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     let whole = Bytes2 { resident: resident(1, 0)?, staging: 0 };
     let halves = [resident(2, 0)?, resident(2, 1)?];
     let experts = (shape.first_layer..selected_layers).map(|layer| -> anyhow::Result<ExpertCost> {
+        tensors.validate_layer(layer)?;
         let mut half = halves.map(|resident| Bytes2 { resident, staging: 0 });
         for suffix in ["weight", "e_score_correction_bias"] {
             half[1].resident += catalog.tensor(&format!("model.layers.{layer}.mlp.gate.{suffix}"))?
@@ -968,12 +969,8 @@ mod tests {
         assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
     }
 
-    fn nvfp4_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {
-        use crate::plan::testing::{glm5_config, glm5_tensors, nvfp4, write_snapshot};
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = glm5_config();
-        config["quantization_config"] = serde_json::json!({"quant_method":"modelopt", "quant_algo":"NVFP4",
-            "config_groups":{"group_0":{"weights":{"num_bits":4,"type":"float","group_size":16}}}});
+    fn nvfp4_checkpoint_tensors() -> Vec<crate::plan::testing::Tensor> {
+        use crate::plan::testing::{glm5_tensors, nvfp4};
         let mut tensors = glm5_tensors(nvfp4);
         for expert in 1..256 {
             for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
@@ -981,6 +978,16 @@ mod tests {
                 tensors.extend(nvfp4(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k));
             }
         }
+        tensors
+    }
+
+    fn nvfp4_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {
+        use crate::plan::testing::{glm5_config, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = glm5_config();
+        config["quantization_config"] = serde_json::json!({"quant_method":"modelopt", "quant_algo":"NVFP4",
+            "config_groups":{"group_0":{"weights":{"num_bits":4,"type":"float","group_size":16}}}});
+        let tensors = nvfp4_checkpoint_tensors();
         let snapshot = dir.path().join("snapshot");
         write_snapshot(&snapshot, &config, &tensors, None);
         let catalog = crate::read_expert_catalog(&snapshot).unwrap();
@@ -1034,6 +1041,28 @@ mod tests {
         let fallback = local_inventory_selected(&catalog, &manifest, 2, 64, 1, false, true).unwrap();
         assert_eq!(fallback.format, GlmLocalFormat::Nvfp4 { w4a4: false });
         assert!(fallback.package.ends_with("fp8-glm-nvfp4/tp2"));
+    }
+
+    #[test]
+    fn nvfp4_inventory_validates_every_selected_expert_header() {
+        use crate::plan::testing::{t, write_snapshot};
+        let (_dir, catalog, manifest) = nvfp4_fixture();
+        let config = crate::plan::checkpoint::read_json(&catalog.snapshot().join("config.json")).unwrap();
+        let snapshot = catalog.snapshot().to_path_buf();
+        let input = "model.layers.1.mlp.experts.255.up_proj.input_scale";
+        let down = "model.layers.1.mlp.experts.255.down_proj.weight_scale";
+        for (name, replacement) in [(input, None), (input, Some(t(input, "BF16", &[]))),
+            (down, Some(t(down, "F8_E4M3", &[6144, 1])))] {
+            let mut tensors = nvfp4_checkpoint_tensors();
+            let index = tensors.iter().position(|(n, ..)| n == name).unwrap();
+            if let Some(replacement) = replacement { tensors[index] = replacement; }
+            else { tensors.remove(index); }
+            write_snapshot(&snapshot, &config, &tensors, None);
+            // The first gate still establishes NVFP4; the later expert must not escape admission validation.
+            let catalog = crate::read_expert_catalog(&snapshot).unwrap();
+            let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+            assert!(format!("{error:#}").contains(name), "{name}: {error:#}");
+        }
     }
 
     #[test]
