@@ -96,6 +96,33 @@ def test_preflight_timeout_at_grant_kills_process_group_and_releases_locks(lockd
         assert '\nState:\tZ' in (child / 'status').read_text()
 
 
+@pytest.mark.parametrize('exit_code', [0, 12])
+def test_preflight_exit_kills_remaining_helpers_before_releasing_locks(lockdir, exit_code):
+    import shlex
+    count, childpid = lockdir / 'checks', lockdir / 'child.pid'
+    code = (f'import pathlib,subprocess,sys; p=pathlib.Path({str(count)!r}); '
+            'n=int(p.read_text()) if p.exists() else 0; p.write_text(str(n+1)); '
+            'sys.exit(0) if n == 0 else None; '
+            f'child=subprocess.Popen([{sys.executable!r}, "-c", "import time; time.sleep(60)"], '
+            'stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '
+            f'pathlib.Path({str(childpid)!r}).write_text(str(child.pid)); sys.exit({exit_code})')
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1',
+                             '--preflight', shlex.join([sys.executable, '-c', code]), '--', 'true'],
+                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == (78 if exit_code else 0)
+    if exit_code:
+        assert 'preflight failed (exit 12)' in result.stderr
+    assert not list((lockdir / 'hwq').glob('*.ticket'))
+    child = Path('/proc') / childpid.read_text()
+    if child.exists():
+        assert '\nState:\tZ' in (child / 'status').read_text()
+    held = hwlock._try_flocks(['gpu1'])
+    assert held is not None
+    for handle in held:
+        handle.close()
+
+
 def test_canonical_order_and_unknown_locks():
     assert hwlock.canonical(['gpu1', 'sparks.lock', 'gpu0']) == ['sparks', 'gpu0', 'gpu1']
     with pytest.raises(ValueError):

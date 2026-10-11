@@ -136,6 +136,11 @@ def check_preflight(command, timeout):
         if isinstance(error, subprocess.TimeoutExpired):
             raise PreflightFailed('preflight timed out') from error
         raise
+    # Preflights must not leave helpers on the hardware, even on success.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     if code:
         raise PreflightFailed(f'preflight failed (exit {code})')
 
