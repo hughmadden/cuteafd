@@ -1538,7 +1538,8 @@ impl<'a> GlmEngine<'a> {
         // The head split's second GPU: each lane's embedded rows (its tables went with rank
         // 0's), then every lane's layer-0 attention (rank 1 runs a unit ahead of the host).
         if let Some(peers) = &peer_workspaces {
-            for (lane, w) in workspaces.iter().enumerate() {
+            // Only this step's lanes (the workspace list keeps every lane ever used).
+            for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
                 let w1 = peers.get(lane)?;
                 self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes_of_lane(lane))?;
             }
