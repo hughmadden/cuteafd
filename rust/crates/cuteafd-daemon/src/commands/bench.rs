@@ -180,11 +180,9 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             default: None, source: "cli".into() });
     }
     let requested = std::env::var("CUTEAFD_ATTENTION_PLACEMENT").unwrap_or_else(|_| "auto".into());
-    let requested = cuteafd_loader::placement::attention::parse(&requested).map_err(anyhow::Error::msg)?;
+    // Reject an unrunnable placement before loading CUDA or starting workers.
+    let mode = attention_mode(family, sub, &requested)?;
     let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
-    // K0 has no new executor: reject before loading CUDA or starting workers.
-    let peer = sub.try_get_one::<u32>("rtx_gpus").ok().flatten().is_some_and(|&gpus| gpus == 2);
-    let mode = executor.check_attention(requested, if peer { 2 } else { 1 }, peer)?;
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings());
@@ -193,10 +191,40 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     Ok(())
 }
 
+/// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
+/// are generic serve's `--rtx-gpus 2` or a family's `--split-device`.
+fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
+    -> Result<cuteafd_loader::placement::AttentionPlacement> {
+    let requested = cuteafd_loader::placement::attention::parse(requested).map_err(anyhow::Error::msg)?;
+    let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    let peer = sub.try_get_one::<u32>("rtx_gpus").ok().flatten().is_some_and(|&gpus| gpus == 2)
+        || sub.try_get_one::<i32>("split_device").ok().flatten().is_some();
+    Ok(executor.check_attention(requested, if peer { 2 } else { 1 }, peer)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn a_split_device_admits_two_gpu_attention_placements() {
+        use cuteafd_loader::placement::AttentionPlacement::{Context, Heads};
+        let serve = |extra: &[&str]| {
+            let argv = ["cuteafd", "serve-glm", "--snapshot", "/s", "--native-lib", "/l"].into_iter()
+                .chain(extra.iter().copied()).collect::<Vec<_>>();
+            crate::cli::Cli::command().try_get_matches_from(argv).unwrap()
+        };
+        let split = serve(&["--split-device", "1"]);
+        let (_, sub) = split.subcommand().unwrap();
+        assert_eq!(attention_mode("glm5", sub, "context").unwrap(), Context);
+        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Context);
+        assert_eq!(attention_mode("glm5", sub, "heads").unwrap(), Heads);
+        let one = serve(&[]);
+        let (_, sub) = one.subcommand().unwrap();
+        assert!(attention_mode("glm5", sub, "context").is_err());
+        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Heads);
+    }
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
