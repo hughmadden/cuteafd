@@ -1721,7 +1721,10 @@ impl<'a> GlmEngine<'a> {
     /// identical under heads, each GPU's own under context ([`Self::rank_tables`]).
     fn step_tables(&self, units: &[(&Workspace<'_>, Option<&Workspace<'_>>, &StepTables)], pages: &[Vec<u32>])
         -> Result<Vec<[StepTables; 2]>> {
-        for rank in 0..self.ranks() {
+        // Rank 1 always drains first (as the head split always did); under context rank 0 too:
+        // its queued gather and commit kernels read the per-step lists rewritten here.
+        let drained = if self.context.is_some() { 0..self.ranks() } else { 1..self.ranks() };
+        for rank in drained {
             // SAFETY: the engine owns both streams; nothing queued reads these tables after this.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
         }
