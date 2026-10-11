@@ -1749,6 +1749,42 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 
 ## Release v3 scope (decided 2026-10-09)
 
+### V4.1 Spark TP3 is a fit-minimum option (2026-10-11)
+
+Keep TP4 as the serving default wherever four Sparks fit; TP3 is a
+three-Spark fit-minimum option, not a speed default. TP3 eliminates TP4's
+576-to-640 row padding, but each rank owns one third rather than one quarter
+of the expert, increasing per-rank logical expert traffic by 33%.
+
+Native MXFP4, one RTX PRO 6000, 100G Spark links (one selected rail), raptor
+400G, 2M admitted KV, C16, prefill2048, auto-local8, dSpark adaptive,
+vision-spark/audio-auto/prefix20: three warmed matched-prompt pairs at the
+same sealed `tp36fix` build, ordered TP4/TP3, TP3/TP4, TP4/TP3. Both arms use
+coordinator runtime `f67f71da`, Spark daemon `d6694d9c`, fork `8c211189`.
+
+| Metric | Pair 1 TP4 -> TP3 | Pair 2 TP4 -> TP3 | Pair 3 TP4 -> TP3 | Median paired TP3/TP4 |
+| --- | --- | --- | --- | --- |
+| C1 code tok/s | 136.37 -> 103.86 | 136.48 -> 124.07 | 124.23 -> 115.81 | 0.9091 |
+| C8 aggregate tok/s | 331.12 -> 259.03 | 388.83 -> 274.62 | 347.04 -> 276.36 | 0.7823 |
+| C16 aggregate tok/s | 384.26 -> 316.88 | 453.88 -> 337.59 | 452.51 -> 327.03 | 0.7438 |
+| 8K prefill tok/s | 6541.53 -> 6552.47 | 6530.27 -> 6466.19 | 6555.15 -> 6331.78 | 0.9902 |
+| Server readiness s | 50.161 -> 51.367 | 49.596 -> 51.266 | 48.990 -> 51.469 | 1.0337 |
+
+Resident expert bytes per Spark are 64,172,851,200 (TP4) versus
+77,007,421,440 (TP3), exact planner/runtime equality in all six launches.
+Median readiness per aggregate resident decimal GB is 0.193213 versus
+0.222345 s/GB; the denominator excludes coordinator weights and workspaces.
+Both arms admit 2,097,152 tokens; physical capacity rounds to 2,125,824 with
+prefix reservations, global pool 1,891,983,360 B and cache 1,936,487,936 B.
+Ring admission is 1,024,851,968 B/rank, observed high-water 512,491,520 B.
+Cache exactness passes; speculation reports the project's accepted INFO
+status; Quick fidelity and fabric checks pass. Neither wide paired median
+is within 3%, so the full-policy control is not triggered. TP3's lower decode
+speed is expected rank traffic, not a kernel correctness regression.
+Evidence: `~/.cache/cuteafd/builds/v41-tp3/hardware/perf-native-min/measurements.json`.
+NVFP4 correctness is independently qualified against release TP4; perf
+panel KL is informational and must not replace that qualification gate.
+
 TJ: two key items, both urgent right after v2.0.0.
 1. **Multi-GPU coordinator placement and memory management for every family.**
    One shared design replaces today's per-family patchwork:
