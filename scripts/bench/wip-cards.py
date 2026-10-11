@@ -855,8 +855,10 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
             print(shlex.join(cmd))
             if not dry:
                 if cmd[0] == 'flock':
-                    # A refused probe means another job holds the seed Spark.
-                    run(['flock', '-n', str(Path.home() / f'.cache/cuteafd/{seed}.lock'), 'true'])
+                    # Wait (not fail) while another job's export holds the seed Spark; wip.sh
+                    # takes the lock itself for the native phase, so release it at once.
+                    run(['flock', '-w', os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'),
+                         str(Path.home() / f'.cache/cuteafd/{seed}.lock'), 'true'])
                     for host in ('raptor', *HOSTS):
                         marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
                         mark = ['python3', '-c', marker]
