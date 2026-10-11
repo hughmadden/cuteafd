@@ -788,7 +788,9 @@ def build_scopes(cards):
                     # Two RTX cards run the head-split programs (mimof2/mimop2).
                     wanted = {tag, tag + '2'} if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2 else {tag}
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
+    spark_scopes = {scope for scope in scopes if not scope.startswith('glmfdense:')}
+    env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)))
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
     return env
 
 

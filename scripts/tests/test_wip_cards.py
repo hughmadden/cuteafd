@@ -162,9 +162,18 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
     nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
              {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
-    families = set(cards.build_scopes(nvfp4)['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
-    assert {'glm:nvfp4', 'glmf:nvfp4', 'glmfdense:nvfp4'} <= families
+    scopes = cards.build_scopes(nvfp4)
+    families = set(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    coordinator = set(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';'))
+    assert {'glm:nvfp4', 'glmf:nvfp4'} <= families
+    assert 'glmfdense:nvfp4' not in families
+    assert coordinator == families | {'glmfdense:nvfp4'}
     assert 'glm:fp8' not in families and 'glmf:fp8' not in families
+    wip = (cards.REPO / 'wip.sh').read_text()
+    coordinator_leg = wip.split('build_coordinator() {', 1)[1].split('build_expert() (', 1)[0]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}' in coordinator_leg
+    expert_leg = wip.split('build_expert() (', 1)[1]
+    assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES' not in expert_leg
 
 
 @pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])
