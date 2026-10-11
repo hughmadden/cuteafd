@@ -85,7 +85,7 @@ pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 index-key width, independent of the K/V record format.
 pub(crate) const INDEX_DIM: usize = 128;
-const MAX_RANKS: usize = 6;
+const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 const HC: usize = 4;
 /// Tokens per QSA index block, and blocks per pool-cache page.
 pub(crate) const BLOCK: usize = 4;
