@@ -6179,6 +6179,33 @@ Ideas TJ wants kept for later; not v2 work.
   (`builds/draft-policy-review/REPORT.md`) is an input; its deterministic
   cohort mode and cross-lane contention pricing stay here, after v3.
 
+## v3 follow-ups found in gates (2026-10-11)
+
+- **Encoder placement in the solve.** On V4.1 NVFP4 TP3, 1 RTX, the planner
+  decides the vision tower before onboarding local layers and keeps that
+  verdict: the tower needs 4,003,895,360 B with margin, pre-onboarding
+  headroom is 3,340,082,217 B, final auto-local-8 headroom is
+  23,724,448,809 B. The launcher forces local 0. Place the encoder as a
+  solver item beside local layers and the pool, so plan and launcher agree.
+  Evidence: `builds/v41-tp3/hardware/nvfp4-tp3-vision-finding.json`.
+- **GLM 5.3 `context` C1.** It is 0.965x `heads` because extra kernels cost
+  about 65 us per layer, not the exchanges. Fuse the q push into the producer
+  and overlap own-head partials with the peer push. Stop at C1 >= `heads` or
+  a measured floor.
+- **Qwen NVFP4 FP8-KV decode.** It runs 0.93 (C1) / 0.91 (C8) of BF16 KV;
+  EXL3 is 0.97-0.99. The cause is unknown; attention explains about 2%.
+- **GLM Flash fresh C1.** Shared drafting is 0.971 of the old policy over
+  six pairs.
+- **Qwen TP5 sharding bug.** Same-harness EXL3 logits, TP5 against TP4: mean
+  KL 0.076, top-1 agreement 54/64, divergence from row 0 (KL 0.012). A correct
+  sharding should differ only in reduction order (about 1e-4). The CPU reducer
+  arithmetic and slice offsets pass, so the cause is Qwen-specific TP5 plumbing
+  shared by both formats. NVFP4 also fails the 1,500-row W4A4 reference at TP5
+  (normalized max 0.33-0.58 against TP4's 0.014). TP5 stays refused for Qwen.
+- **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
+- **DSH dashboard model gate** is unverified: the automation could not find
+  the composer iframe.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
