@@ -81,9 +81,30 @@ impl Checkpoint {
         super::files::open_role(snapshot, super::files::ReadRole::Coordinator { local_experts, speculator })
     }
 
-    /// Reads only the index and configuration. Presence never depends on headers.
+    /// Reads the index/configuration plus scale-free declared-A4 weight headers
+    /// to distinguish unquantized modules from incomplete packed storage.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
-        Self::open_filtered(snapshot, None, |_| false)
+        let mut checkpoint = Self::open_filtered(snapshot, None, |_| false)?;
+        let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
+        for (name, shard) in &checkpoint.weight_map {
+            let Some(module) = name.strip_suffix(".weight") else { continue };
+            if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
+                && ["weight_scale", "weight_scale_2", "input_scale"].iter()
+                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
+                unscaled.entry(shard.clone()).or_default().insert(name.clone());
+            }
+        }
+        // Only anomalous unscaled declarations need headers; group by shard so
+        // the many BF16 nextn experts do not reopen the same header per module.
+        for (shard, names) in unscaled {
+            for meta in read_safetensors_metadata(&snapshot.join(&shard))? {
+                if names.contains(&meta.name) {
+                    checkpoint.tensors.push(CheckpointTensor { shard:shard.clone(), meta });
+                }
+            }
+        }
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        Ok(checkpoint)
     }
 
     /// A runtime role declares the tensors it reads before any shard is opened.
@@ -196,6 +217,42 @@ impl Checkpoint {
     /// Select each module's declared arithmetic. Ignore rules take precedence;
     /// class-wide Linear rules apply only to linear weights, not arbitrary tensors.
     pub fn module_numerics(&self, module: &str) -> Result<ModuleNumerics> {
+        let stem = module.strip_suffix(".weight").unwrap_or(module);
+        let weight = format!("{stem}.weight");
+        let dtype = self.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&weight))
+            .ok().map(|at| self.tensors[at].meta.dtype.clone());
+        match dtype {
+            Some(dtype) => self.module_numerics_with_header(stem, dtype),
+            None => self.declared_numerics(stem),
+        }
+    }
+
+    /// Complete unquantized BF16 headers override an overbroad ModelOpt declaration;
+    /// partial quantization is never treated as an unquantized checkpoint module.
+    pub fn module_numerics_with_header(&self, module: &str, dtype: cuteafd_core::DType) -> Result<ModuleNumerics> {
+        let module = module.strip_suffix(".weight").unwrap_or(module);
+        let declared = self.declared_numerics(module)?;
+        if declared != ModuleNumerics::W4A4 { return Ok(declared); }
+        let scales = ["weight_scale", "weight_scale_2", "input_scale"]
+            .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
+        if dtype == cuteafd_core::DType::Bf16 && scales.iter().all(|present| !present) {
+            static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<(PathBuf, String)>>> = std::sync::OnceLock::new();
+            let mut warned = WARNED.get_or_init(Default::default).lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint numerics warning registry poisoned"))?;
+            if warned.insert((self.snapshot.clone(), module.to_owned())) {
+                tracing::warn!(module, "quantization config/header disagreement: declared W4A4 but BF16 header has no quantization scales; preserving checkpoint precision");
+            }
+            return Ok(ModuleNumerics::CheckpointPrecision);
+        }
+        for (suffix, present) in ["weight_scale", "weight_scale_2", "input_scale"].into_iter().zip(scales) {
+            ensure!(present, "{module}.{suffix}: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?}); missing scale tensor");
+        }
+        ensure!(matches!(dtype, cuteafd_core::DType::U8 | cuteafd_core::DType::I8),
+            "{module}.weight: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?})");
+        Ok(declared)
+    }
+
+    fn declared_numerics(&self, module: &str) -> Result<ModuleNumerics> {
         let module = module.strip_suffix(".weight").unwrap_or(module);
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
@@ -442,6 +499,38 @@ mod sliced_tests {
     }
 
     #[test]
+    fn glmf_nextn_bf16_header_preserves_precision_but_partial_nvfp4_fails() {
+        // NVIDIA GLM-5.3-Flash-NVFP4 layer 45 is BF16 [2048,4096],
+        // absent from both ignore lists despite the class-wide Linear declaration.
+        let stem = "model.language_model.layers.45.mlp.experts.65.gate_proj";
+        let mut checkpoint = Checkpoint { snapshot:PathBuf::new(), config:Value::Null,
+            quantize_config:None, weight_map:BTreeMap::new(), tensors:Vec::new(),
+            missing_shards:Vec::new(), shard_bytes:0 };
+        checkpoint.config = json!({"text_config":{"num_hidden_layers":45,"num_nextn_predict_layers":1},
+            "quantization_config":{"quant_method":"modelopt","quant_algo":"NVFP4",
+                "ignore":["model.language_model.layers.44.self_attn*"],
+                "config_groups":{"group_0":{"targets":["Linear"],
+                    "weights":{"num_bits":4,"group_size":16},
+                    "input_activations":{"num_bits":4,"group_size":16}}}}});
+        checkpoint.tensors = vec![CheckpointTensor { shard:"model-00002-of-00033.safetensors".into(),
+            meta: crate::SafetensorsTensorMetadata { name:format!("{stem}.weight"), dtype:cuteafd_core::DType::Bf16,
+                shape:vec![2048,4096], byte_offset:0, byte_length:2048*4096*2 } }];
+        checkpoint.weight_map.clear();
+        assert_eq!(checkpoint.module_numerics(stem).unwrap(), ModuleNumerics::CheckpointPrecision);
+        checkpoint.tensors[0].meta.dtype = cuteafd_core::DType::U8;
+        checkpoint.tensors[0].meta.shape = vec![2048,2048];
+        assert!(checkpoint.module_numerics(stem).unwrap_err().to_string().contains("partial or invalid"));
+        checkpoint.tensors[0].meta.dtype = cuteafd_core::DType::Bf16;
+        checkpoint.weight_map.insert(format!("{stem}.weight_scale"), "scales.safetensors".into());
+        assert!(checkpoint.module_numerics(stem).is_err());
+        checkpoint.tensors[0].meta.dtype = cuteafd_core::DType::U8;
+        for suffix in ["weight_scale", "weight_scale_2", "input_scale"] {
+            checkpoint.weight_map.insert(format!("{stem}.{suffix}"), "scales.safetensors".into());
+        }
+        assert_eq!(checkpoint.module_numerics(stem).unwrap(), ModuleNumerics::W4A4);
+    }
+
+    #[test]
     fn nested_declared_numerics_control_bf16_ingress() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
@@ -482,6 +571,13 @@ mod sliced_tests {
             assert_eq!(checkpoint.module_numerics(preserved).unwrap(), ModuleNumerics::CheckpointPrecision, "{model}");
             if let Some(module) = a8 {
                 assert_eq!(checkpoint.module_numerics(module).unwrap(), ModuleNumerics::W8A8, "{model}");
+            }
+            if model == "GLM-5.3-Flash-NVFP4" {
+                let nextn = "model.language_model.layers.45.mlp.experts.65.gate_proj";
+                assert_eq!(checkpoint.module_numerics(nextn).unwrap(), ModuleNumerics::CheckpointPrecision);
+                let header = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{nextn}.weight")).unwrap();
+                assert_eq!(header.meta.dtype, cuteafd_core::DType::Bf16);
+                assert_eq!(header.meta.shape, [2048,4096]);
             }
             assert!(checkpoint.spark_input_is_bf16(), "{model}");
             let numerics = checkpoint.declared_module_numerics().unwrap();

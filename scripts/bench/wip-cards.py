@@ -755,11 +755,13 @@ def cleanup(arms, task, dry):
 
 
 def build_scopes(cards):
-    scopes, roles, env = set(), set(), {}
+    scopes, roles, counts, env = set(), set(), set(), {}
     for card in cards:
         family = card.get('family')
         values = {**config(card['config']), **card.get('set', {})}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+        if count and family in ('glm5', 'glm5_flash', 'mimo_v2', 'qwen4'):
+            counts.add(str(int(values.get('SPARK_TP', count))))
         if family == 'deepseek_v41' and count in (2, 3, 6):
             roles.add('tp' + str(count))
         if family == 'deepseek_v4':
@@ -776,8 +778,11 @@ def build_scopes(cards):
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
                 # (fp8_moe.cmake), as the release image ships them.
-                scopes.add(tag + (':nvfp4' if tag == 'qwen4' or 'nvfp4' in card['name'] else ':fp8'))
-                if fam == 'glm5_flash' and 'nvfp4' in card['name']:
+                checkpoint_id = values.get('MODEL_ID', values.get('MODEL', ''))
+                nvfp4 = any('nvfp4' in str(value).lower() for value in
+                            (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
+                scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
+                if fam == 'glm5_flash' and nvfp4:
                     scopes.add('glmfdense:nvfp4')
                 if 'exl3' in card['name'] or 'tr3' in card['name']:
                     scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
@@ -789,7 +794,8 @@ def build_scopes(cards):
                     wanted = {tag, tag + '2'} if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2 else {tag}
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
     spark_scopes = {scope for scope in scopes if not scope.startswith('glmfdense:')}
-    env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)))
+    env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
+               CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts, key=int)))
     env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
     return env
 
@@ -861,8 +867,9 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
                 if cmd[0] == 'flock':
                     # Wait (not fail) while another job's export holds the seed Spark; wip.sh
                     # takes the lock itself for the native phase, so release it at once.
-                    run(['flock', '-w', os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'),
-                         str(Path.home() / f'.cache/cuteafd/{seed}.lock'), 'true'])
+                    seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
+                    subprocess.run(['flock', '-w', str(seed_wait), str(Path.home() / f'.cache/cuteafd/{seed}.lock'), 'true'],
+                                   check=True, timeout=seed_wait + 60)
                     for host in ('raptor', *HOSTS):
                         marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
                         mark = ['python3', '-c', marker]
@@ -875,7 +882,7 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
                     if result.returncode:
                         raise ValueError('build failed: ' + name)
                 else:
-                    run(cmd)
+                    subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=1800)
         if dry:
             print('# identical build scopes ' + json.dumps(scopes, sort_keys=True))
 

@@ -1176,8 +1176,9 @@ mod tests {
             else { tensors.remove(index); }
             write_snapshot(&snapshot, &config, &tensors, None);
             // The first gate still establishes NVFP4; the later expert must not escape admission validation.
-            let catalog = crate::read_expert_catalog(&snapshot).unwrap();
-            let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+            let error = crate::read_expert_catalog(&snapshot)
+                .and_then(|catalog| local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true))
+                .unwrap_err();
             assert!(format!("{error:#}").contains(name), "{name}: {error:#}");
         }
     }

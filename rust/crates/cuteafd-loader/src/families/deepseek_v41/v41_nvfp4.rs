@@ -222,14 +222,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = nvfp4_config();
         let module = "layers.0.ffn.experts.0.w1";
-        crate::plan::testing::write_snapshot(dir.path(), &config,
-            &[crate::plan::testing::t(format!("{module}.weight"), "U8", &[1])], None);
+        crate::plan::testing::write_snapshot(dir.path(), &config, &[
+            crate::plan::testing::t(format!("{module}.weight"), "U8", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale"), "F8_E4M3", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale_2"), "F32", &[1]),
+            crate::plan::testing::t(format!("{module}.input_scale"), "F32", &[1]),
+        ], None);
         assert!(read_v41_nvfp4_contract(dir.path()).unwrap().is_some());
         config["quantization_config"]["config_groups"]["ignored"] = serde_json::json!({
             "targets":[module], "weights":{"num_bits":8}, "input_activations":{"num_bits":8}
         });
-        crate::plan::testing::write_snapshot(dir.path(), &config,
-            &[crate::plan::testing::t(format!("{module}.weight"), "U8", &[1])], None);
+        crate::plan::testing::write_snapshot(dir.path(), &config, &[
+            crate::plan::testing::t(format!("{module}.weight"), "U8", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale"), "F8_E4M3", &[1]),
+            crate::plan::testing::t(format!("{module}.weight_scale_2"), "F32", &[1]),
+            crate::plan::testing::t(format!("{module}.input_scale"), "F32", &[1]),
+        ], None);
         assert!(read_v41_nvfp4_contract(dir.path()).unwrap_err().to_string().contains("conflicting quantization groups"));
     }
 
