@@ -6292,3 +6292,60 @@ Ideas TJ wants kept for later; not v2 work.
   explicit, reads never replicate silently.
 - Fork changes go to `sparkinfer-glmrt` master and `GPTQModel` main first,
   then bump pin + tree lock here.
+
+## Kimi K3 uniform EXL3 K2 (Oliver, 2026-10-12)
+
+User-authorized isolated quantization on branch `quant/kimi-k3`, using only
+Oliver's RTX PRO 6000 Blackwell Max-Q and root NVMe. Raptor and Sparks are
+busy and must not participate. Python environment is this checkout's `.venv`,
+managed with uv. Fork development and upstream merge go directly to GPTQModel
+`main`; publish the completed artifact as `wrldsuksgo2mars/Kimi-K3-EXL3-K2`.
+
+Recipe implementation: `quantization/kimi_k3/uniform_k2/`. Uniform K2 MCG,
+seed 787, sigma 0.025, automatic output scales, routed w1/w3/w2 only in all
+92 MoE layers (247,296 projections). Preserve the first dense layer, attention,
+routers, latent projections/norm, shared experts and all native vision assets.
+Read original compressed-tensors MXFP4 weights directly, decode one matrix at
+a time into the current GPU block, and never materialize the full model in RAM.
+The checkpoint decoder supplies KDA/MLA, SiTU and AttnRes math; unused HF4 model
+wrappers are excluded when importing decoder primitives under HF5.
+
+The public agentic panel is usable without repair, pinned at
+`875ff1d3786bf4346ee7ff52ea5e3f1f698f5902`. Use all 1,426 calibration prompts
+once in published order, batch one, no padding/truncation/packing. The native
+segmented Kimi renderer uses thinking=true and thinking_effort=max. The exact
+Kimi stream has 1,201,086 tokens, lengths 567–1,966. Screening is calibration
+derived; heldout is separate. Dataset/source/token hashes live in the local
+prepared-input manifest. Never substitute another model's token IDs.
+
+Capture raw FP32 XTX. Cold experts use adjacent router ranks 17–32 in rank-major
+then corpus-row order, followed by missing-count times identity to reach 1,024
+effective rows. Each projection independently finalizes a raw Hessian copy,
+making partial-expert recovery reproduce its signs and serialized payload.
+Down Hessians use serialized and reconstructed K2 gate/up weights and native
+SiTU rounding. Propagate each complete K2 layer before calibrating its successor.
+
+Run root: `~/.cache/cuteafd/quantization/kimi-k3-exl3-k2/`; export:
+`~/.cache/huggingface/cuteafd-exports/Kimi-K3-EXL3-K2/`. Keep sources, logs,
+receipts and results outside Git. `plan.json` binds source/code/packages, corpus,
+recipe and export path. `frontier/current.json` is the durable retirement barrier
+for both prefix_sum and the complete residual bank. A partial successor cannot
+retire its predecessor. Also bound the current layer's attention and route spool;
+retire committed-layer transients after shard and successor commitments, including
+when resuming after an interruption between commitment and cleanup.
+
+Use `launch.py --source-snapshot PATH --tokens PATH --root PATH --export PATH
+--publish` for a detached complete run. Its supervisor retains per-attempt logs
+and exit records, takes only Oliver's local gpu1.lock with a timeout, and runs
+quantization, structural verification and resumable Hub upload. On failure,
+diagnose first and explicitly relaunch with `--resume`; changed numerical code
+requires a reviewed recovery identity. No automatic restart or serving container.
+Status: `status.json`, `events.jsonl`, `latest-attempt.json`, `attempts/`.
+After stable progress, check every 30 minutes and report layer and measured ETA.
+
+Verification before publication includes exact decoder boundary comparison,
+projection resume reproducibility, finite calibrated metrics, every K2 tensor's
+shape/dtype, complete inventory, byte-preserving native tensor assembly and Hub
+LFS checksums. Export standard EXL3 tensor_storage metadata and per-layer errors.
+Full-model generation and serving qualification are separate work; do not claim
+them from projection or structural checks.
