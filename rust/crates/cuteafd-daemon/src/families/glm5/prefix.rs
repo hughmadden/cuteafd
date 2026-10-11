@@ -11,14 +11,18 @@
 //! With `--prefix-partial on` a request that shares only part of a snapshot resumes at its last
 //! common page boundary (`ReuseRule::paged`): the shared rows are the snapshot's own bytes, so
 //! this is exact too. The DFlash2 drafter is not captured: a restored sequence drafts cold
-//! with `valid_from` at the restore point. Under a head split both GPUs hold identical copies
-//! of the latent and index pages (the replicated MLA projection and indexer write them): tail
-//! copies run on each GPU's stream, and the host tier is off.
+//! with `valid_from` at the restore point. Under a `heads` split both GPUs hold identical
+//! copies of the latent and index pages (the replicated MLA projection and indexer write
+//! them): tail copies run on each GPU's stream, and the host tier is off. Under `context`
+//! (K3) each page lives once, page id `i` on GPU `i & 1` at local page `i >> 1`
+//! ([`PageOwners::Parity`]): tail copies run on the owner, and the host tier stores each page
+//! once from its owner through a copy engine with both GPUs' pools registered.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
 use anyhow::Result;
-use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
+use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
+    TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
@@ -44,8 +48,26 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
         Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)? })
     }
 
+    /// Host bytes of one page: one rank's layers (every GPU's are identical under heads, and
+    /// under context a page lives on one GPU).
     pub fn page_bytes(&self) -> usize {
-        self.paged.iter().map(|(_, _, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
+        self.paged.iter().filter(|(rank, _, _)| *rank == 0)
+            .map(|(_, _, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
+    }
+
+    /// Whether pages are partitioned by parity (context attention).
+    fn parity(&self) -> bool {
+        self.engine.context_kv()
+    }
+
+    /// The GPU holding page `page`'s rows and its local page there.
+    fn locate(&self, page: u32) -> (usize, usize) {
+        if self.parity() { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
+    }
+
+    /// Every pool allocation (both GPUs'), for the host tier's copy engine routing.
+    pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
+        self.paged.iter().flat_map(|&(_, records, index)| std::iter::once(records).chain(index)).collect()
     }
 
     /// A copy between two views on rank `rank`'s GPU.
@@ -71,7 +93,7 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
             draft_bytes: 0,
             rule: if self.partial { ReuseRule::paged(PAGE_ROWS) } else { ReuseRule::EXACT },
             mark_store: MarkStore::Arena,
-            page_owners: Default::default(),
+            page_owners: if self.parity() { PageOwners::Parity } else { PageOwners::Uniform },
         }
     }
 
@@ -96,9 +118,14 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        let (from, to, rows) = (copy.from as usize, copy.to as usize, copy.rows);
+        let (rows, owner) = (copy.rows, copy.owner.map(usize::from));
+        let ((from_rank, from), (to_rank, to)) = (self.locate(copy.from), self.locate(copy.to));
+        if from_rank != to_rank || owner.is_some_and(|o| o != from_rank) || owner.is_some() != self.parity() {
+            return Err(format!("tail copy {copy:?} crosses GPUs").into());
+        }
         let record_page = PAGE_ROWS * RECORD_BYTES;
-        for &(rank, records, index) in &self.paged {
+        // Under heads every GPU holds the page; under context only its owner does.
+        for &(rank, records, index) in self.paged.iter().filter(|(rank, _, _)| owner.is_none_or(|o| o == *rank)) {
             self.copy(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
                 view(records, from * record_page, rows * RECORD_BYTES)?)?;
             if let Some(index) = index {
@@ -118,11 +145,15 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
         Ok(())
     }
 
+    fn page_device(&self, page: u32) -> Option<u8> {
+        self.parity().then_some((page & 1) as u8)
+    }
+
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        let page = page as usize;
+        let (owner, page) = self.locate(page);
         let record_page = PAGE_ROWS * RECORD_BYTES;
         let mut out = Vec::new();
-        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| *rank == 0) {
+        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| *rank == owner) {
             out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
             if let Some(index) = index {
                 out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
@@ -199,8 +230,9 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
     let mut out = Vec::new();
     let record_page = PAGE_ROWS * RECORD_BYTES;
     for (p, &page) in placement.pages.iter().enumerate().take(len.div_ceil(PAGE_ROWS)) {
-        let (page, rows) = (page as usize, (len - p * PAGE_ROWS).min(PAGE_ROWS));
-        for &(_, records, index) in &family.paged {
+        let rows = (len - p * PAGE_ROWS).min(PAGE_ROWS);
+        let (owner, page) = family.locate(page);
+        for &(_, records, index) in family.paged.iter().filter(|(rank, _, _)| !family.parity() || *rank == owner) {
             out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * record_page) as u64,
                 rows * RECORD_BYTES, records)?);
             if let Some(index) = index {
@@ -235,7 +267,7 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let embed = &tokens[..n];
     let family = GlmPrefix::new(engine, false)?;
-    let mut allocator = PageAllocator::new(engine.pages);
+    let mut allocator = PageAllocator::new(engine);
     let err = |e: BoxError| anyhow::anyhow!("{e}");
     let (mut identical, mut states_identical, mut last) = (0, 0, None);
     for _ in 0..repeat.max(1) {

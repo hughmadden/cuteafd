@@ -398,13 +398,19 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On)?;
     let template = engine.paged_buffers().first().map(|b| b.0).context("GLM has no layers")?;
-    // The pinned host tier copies through one GPU's copy engine; a head split keeps its
-    // (replicated) pages on both GPUs, so it keeps device-resident snapshots only.
-    let host = if engine.ranks() > 1 {
+    // The pinned host tier: one GPU's pages, or under context each page from its owner
+    // (both GPUs' pools registered, so every copy runs on its owner's copy streams). A heads
+    // split keeps replicated pages on both GPUs and stays device-resident.
+    let host = if engine.ranks() > 1 && !engine.context_kv() {
         if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
-            tracing::warn!("GLM head split: the prefix cache's host tier is off (device-resident snapshots only)");
+            tracing::warn!("GLM heads split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
+    } else if engine.ranks() > 1 {
+        // SAFETY of the registration: the engine (and its pools) outlives the cache, which
+        // `schedule` drops first.
+        args.host_config(family.layout(), engine.max_context)?.map(|config|
+            CudaCopyEngine::registered(engine.library, &family.buffers()).map(|copy| (config, copy))).transpose()?
     } else {
         args.host_tier(engine.library, template, family.layout(), engine.max_context)?
     };
