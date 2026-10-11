@@ -311,6 +311,40 @@ mod tests {
     }
 
     #[test]
+    fn mimo_tp2_native_first_use_must_precede_eager_peer_lookahead() {
+        use crate::shared::peer_split::order::host::{check_host, HostSchedule};
+        for preloaded in [false, true] {
+            let mut schedule = HostSchedule::default();
+            if preloaded {
+                for rank in 0..2 { schedule.sync(rank, "native helpers loaded at startup"); }
+            }
+            schedule.push(0, "main", DIRECT, "embedded residual");
+            schedule.wait(1, "main", DIRECT, "embedded residual");
+            for rank in [1, 0] {
+                schedule.push(rank, "main", slot(0, false), "layer 0 attention partial");
+                schedule.wait(rank, "main", slot(0, false), "layer 0 attention sum");
+            }
+            schedule.push(1, "main", slot(0, true), "layer 0 peer dense partial");
+            schedule.wait(1, "main", slot(0, true), "layer 0 lead dense partial");
+            // peer_layer(1) is queued before rank 0's layer 0 FFN push.
+            schedule.push(1, "main", slot(1, false), "layer 1 peer attention partial");
+            schedule.wait(1, "main", slot(1, false), "layer 1 lead attention partial");
+            if !preloaded { schedule.sync(1, "lazy native router first use"); }
+            schedule.push(0, "main", slot(0, true), "layer 0 lead dense partial");
+            schedule.wait(0, "main", slot(0, true), "layer 0 peer dense partial");
+            schedule.push(0, "main", slot(1, false), "layer 1 lead attention partial");
+            schedule.wait(0, "main", slot(1, false), "layer 1 peer attention partial");
+            assert_eq!(check(&schedule.streams()), Ok(()));
+            if preloaded { assert_eq!(check_host(&schedule), Ok(())); }
+            else {
+                let blocked = check_host(&schedule).unwrap_err();
+                assert_eq!(blocked.sync, "lazy native router first use");
+                assert_eq!(blocked.blocked[1].as_deref(), Some("layer 0 lead dense partial"));
+            }
+        }
+    }
+
+    #[test]
     fn mimo_tp2_cross_exchange_order_drains_eager_lanes_decode_and_repeated_steps() {
         for homes in [vec![Home::Dense, Home::Tp2, Home::Tp2, Home::Spark, Home::Spark],
             vec![Home::Dense, Home::Tp2, Home::Tp2], vec![Home::Dense, Home::Spark]] {
