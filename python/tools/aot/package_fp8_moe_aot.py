@@ -72,10 +72,10 @@ os.environ.setdefault("B12X_COMPILE_DISK_CACHE", "0")
 os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
-ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1",)}
-MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1",)}
+ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1", "tp2")}
+MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
 # NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
-NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1",)}
+NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
 ABI = {"fp8": 1, "mxfp4": 2, "nvfp4": 3, "nvfp4a4": 4}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -321,6 +321,8 @@ def build(args: argparse.Namespace) -> None:
         if args.layouts:
             raise SystemExit("--all-spark-counts and --layouts are mutually exclusive")
         layouts = spark_layouts(base.intermediate)
+    if args.geometry.startswith("glmfdense") and not args.layouts:
+        layouts = ["tp1"]  # One always-selected dense expert is not an RTX TP2 backend.
     if args.exact_slices:
         # Exact layouts beside each padded TP layout whose ranks would store padding.
         for layout in list(layouts):
