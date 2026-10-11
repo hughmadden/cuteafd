@@ -5,7 +5,7 @@ use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     checkpoint: &super::super::Checkpoint, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
-    rows: u64, sequences: u64, context: u64) -> MemoryLayout {
+    rows: u64, sequences: u64, context: u64, weight_budget: u64) -> MemoryLayout {
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -122,13 +122,38 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
-        glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
+        let (placed, _, working) = glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
-            available.is_some()).map(|(placed, _, working)| {
-                notes.push(format!("selected Spark ranks {}, prefill lanes {}, layers {:?}",
-                    working.spark_ranks, working.prefill_lanes, working.spark_layers));
-                (placed, working)
-            }).map_err(Into::into)
+            available.is_some())?;
+        if spark_ranks == 0 {
+            let mut weights: Vec<_> = inputs.resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
+                .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))).collect::<anyhow::Result<_>>()?;
+            if ranks == 2 {
+                weights[1] = weights[1].checked_add(router)
+                    .ok_or_else(|| anyhow::anyhow!("GLM Flash router replica overflow"))?;
+            }
+            for ((layer, _), cost) in cfg.dense.iter().enumerate().filter(|(_, dense)| !**dense).zip(&inputs.experts) {
+                for (rank, bytes) in weights.iter_mut().enumerate() {
+                    let resident = match placed.layers[layer].experts {
+                        placement::ExpertHome::RtxTp2 => cost.half[rank].resident,
+                        placement::ExpertHome::RtxWhole { gpu } if gpu as usize == rank => cost.whole.resident,
+                        _ => 0,
+                    };
+                    *bytes = bytes.checked_add(resident)
+                        .ok_or_else(|| anyhow::anyhow!("GLM Flash routed weight overflow"))?;
+                }
+            }
+            for (rank, bytes) in weights.into_iter().enumerate().filter(|(_, bytes)| *bytes > weight_budget) {
+                report.fits = false;
+                report.hints.push(super::super::Hint {
+                    what: format!("rtx{rank} resident weights need {bytes} bytes, over the {weight_budget} byte weight budget"),
+                    how: "Raise --coordinator-weight-budget-gib or use Spark experts.".into(),
+                });
+            }
+        }
+        notes.push(format!("selected Spark ranks {}, prefill lanes {}, layers {:?}",
+            working.spark_ranks, working.prefill_lanes, working.spark_layers));
+        Ok((placed, working))
     })();
     let mut selected = None;
     match admitted {

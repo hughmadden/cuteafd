@@ -436,6 +436,11 @@ mod draft_prefix_tests {
 /// Lays out `report` (a `plan` of the checkpoint) on the inventory.
 pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
     options: &LayoutOptions) -> MemoryLayout {
+    layout_with_weight_budget(report, model, checkpoint, options, u64::MAX)
+}
+
+pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn super::FamilyModel,
+    checkpoint: &super::Checkpoint, options: &LayoutOptions, weight_budget: u64) -> MemoryLayout {
     let family_name = report.family.clone().unwrap_or_else(|| "unknown".into());
     let family = family_name.as_str();
     let discovered_native_layers = match model.spec().speculator.as_ref() {
@@ -465,7 +470,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     if family == "glm5_flash" {
-        return glm5_flash::layout(report, model, checkpoint, options, workspace_manifest.as_ref(), prefill_rows, concurrency, context_tokens);
+        return glm5_flash::layout(report, model, checkpoint, options, workspace_manifest.as_ref(),
+            prefill_rows, concurrency, context_tokens, weight_budget);
     }
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);

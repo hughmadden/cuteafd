@@ -530,7 +530,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
-        let memory = layout::layout(&mut report, model.as_ref(), &checkpoint, layout_options);
+        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, layout_options,
+            options.coordinator_budget_bytes);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -572,7 +573,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         // A tensor-only inventory does not request an external speculation checkpoint.
         let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
             spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true, ..Default::default() };
-        let _ = layout::layout(&mut report, model.as_ref(), &checkpoint, &inventory);
+        let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &inventory,
+            options.coordinator_budget_bytes);
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -706,6 +708,9 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                         how: format!("{advice}."),
                     });
                 }
+                // GLM Flash's selected solver ledger checks the full resident layout,
+                // including TP2 halves; source bytes on one GPU are not its admission.
+                Ok(_) if spec.family == "glm5_flash" && options.layout.is_some() => {}
                 Ok(_) => {
                     let need = (rtx + routed) as f64;
                     if need > coordinator {

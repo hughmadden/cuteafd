@@ -1136,7 +1136,14 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let config = glm5_flash_config(4);
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
-    let dir = snapshot(config, &glm5_flash_tensors(&glm5_flash_config(4)));
+    let mut tensors = glm5_flash_tensors(&config);
+    // Weight-only admission sums checkpoint headers; include every expert as the solver does.
+    let expert_zero: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".mlp.experts.0.")).cloned().collect();
+    for expert in 1..cfg.experts {
+        tensors.extend(expert_zero.iter().map(|(name, dtype, shape)|
+            (name.replace(".mlp.experts.0.", &format!(".mlp.experts.{expert}.")), *dtype, shape.clone())));
+    }
+    let dir = snapshot(config, &tensors);
     let share = dir.path().join("share");
     let package = dir.path().join("lib/fp8/fp8-glmf");
     std::fs::create_dir_all(&share).unwrap();
@@ -1205,6 +1212,33 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert_eq!(request.inventory.spark_ranks, working.spark_ranks);
         assert_eq!(request.hops.lanes, working.prefill_lanes);
         if expected_rtx == 0 { assert_eq!(request.tp2_workspace, [0; 2]); }
+        if peers == 0 {
+            let rank_weights: Vec<_> = input.resident.iter().enumerate().map(|(rank, resident)|
+                resident.embedding + resident.weights + if rank == 1 { input.router_replica_bytes } else { 0 }
+                    + input.experts.iter().map(|cost| cost.half[rank].resident).sum::<u64>()).collect();
+            let budget = rank_weights.iter().copied().max().unwrap() + (1 << 20);
+            let local = PlanOptions { coordinator_budget_bytes: budget, ..options.clone() };
+            let fitted = plan(dir.path(), &local).unwrap();
+            assert!(fitted.executable(), "{}", render(&fitted));
+            assert!(!fitted.hints.iter().any(|hint| hint.what.contains("local-only placement needs")));
+            let weight_rejected = plan(dir.path(), &PlanOptions {
+                coordinator_budget_bytes: budget - (2 << 20), ..local.clone()
+            }).unwrap();
+            assert!(!weight_rejected.fits && !weight_rejected.executable());
+            assert!(weight_rejected.hints.iter().any(|hint| hint.what.contains("resident weights need")));
+            let weight_only = plan(dir.path(), &PlanOptions { layout: None, ..local.clone() }).unwrap();
+            assert!(!weight_only.fits && !weight_only.executable());
+            assert!(weight_only.hints.iter().any(|hint| hint.what.contains("local-only placement needs")));
+            let mut strict = local;
+            strict.layout.as_mut().unwrap().pool_tokens = Some(1 << 40);
+            let rejected = plan(dir.path(), &strict).unwrap();
+            assert!(!rejected.placement_supported && !rejected.executable());
+            assert_eq!(rejected.memory_layout.unwrap().pool_tokens, 0);
+            strict.layout.as_mut().unwrap().rtx_bytes.truncate(1);
+            strict.layout.as_mut().unwrap().pool_tokens = Some(2 << 20);
+            let single = plan(dir.path(), &strict).unwrap();
+            assert!(!single.placement_supported && !single.executable());
+        }
         let memory = report.memory_layout.unwrap();
         assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count(), working.spark_ranks);
         for rank in 0..2 {
