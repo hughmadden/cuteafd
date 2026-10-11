@@ -1067,7 +1067,8 @@ fn exl3_tp6_geometry_remains_supported_for_v41_glm_and_flash() {
         (glm5_flash_config(2), "model.language_model.layers.1.mlp.experts.0.gate_proj", 4096, 2048),
     ] {
         config["quantization_config"] = exl3_compact(4);
-        let mut tensors = Vec::new();
+        // The GLM solver validates resident headers independently of expert geometry.
+        let mut tensors = if hidden == 6144 { glm5_tensors(|_, _, _| Vec::new()) } else { Vec::new() };
         let mut projections = Vec::new();
         if prefix.starts_with("layers.") {
             tensors.extend(exl3(prefix, intermediate, hidden, 4));
