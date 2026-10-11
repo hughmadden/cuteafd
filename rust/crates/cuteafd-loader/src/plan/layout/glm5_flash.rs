@@ -95,13 +95,18 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 options.draft_sequences.max(sequences).min(options.draft_context_slots.unwrap_or(sequences.max(8))) as usize,
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2)?
         };
+        let local_tp2_exl3 = ranks == 2 && spark_ranks == 0 && catalog.exl3().is_some();
         let mut baselines = Vec::new();
         for rank in 0..ranks {
             let total = options.rtx_bytes[rank];
             let arch = placement::ArchContext::coordinator(total, None);
-            let code = placement::loaded_code("glmf", if catalog.exl3().is_some() { "exl3" } else { "fp8" }, ranks == 2, rank as u8)
+            let code = placement::loaded_code("glmf", if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" }, ranks == 2, rank as u8)
                 .map_or_else(|| planned_context(manifest, &if ranks == 2 { vec!["glmf".into(), "glmf2".into()] } else { vec!["glmf".into()] }, total), |c| arch.context_bytes + c.bytes);
-            devices[rank].items.push(Item::new(Category::Runtime, "context+modules", "", code, Basis::Calibrated));
+            if local_tp2_exl3 {
+                devices[rank].items.extend(placement::inventory::glmf_local_tp2_runtime_items(rank));
+            } else {
+                devices[rank].items.push(Item::new(Category::Runtime, "context+modules", "", code, Basis::Calibrated));
+            }
             baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes: 0 }));
         }
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256, spark_ranks == 0).target;
@@ -112,7 +117,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
-        let inputs = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,

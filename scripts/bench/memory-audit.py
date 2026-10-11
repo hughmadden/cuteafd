@@ -216,8 +216,32 @@ def strict_ready_ledger(path):
     return {str(device["device"]): device["categories"] for device in summarize(ready)["devices"]}
 
 
+def startup_plan(path):
+    """Use the exact serving admission, never reconstruct CLI flags externally."""
+    found = []
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            line = ANSI.sub("", line)
+            if "GLM Flash startup plan" not in line or "plan=" not in line:
+                continue
+            try:
+                value, _ = json.JSONDecoder().raw_decode(line.split("plan=", 1)[1])
+                found.append(value["memory_layout"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                raise ValueError("invalid serving startup plan")
+    if len(found) != 1:
+        raise ValueError("expected exactly one serving startup plan")
+    return found[0]
+
+
 def ready_gate(args):
-    plan = json.load(open(args.compare))["memory_layout"] if args.compare else None
+    own_plan = getattr(args, "startup_plan", False)
+    try:
+        plan = startup_plan(args.logs[0]) if own_plan and len(args.logs) == 1 else (
+            json.load(open(args.compare))["memory_layout"] if args.compare else None)
+    except ValueError as error:
+        print(f"invalid serving startup plan: {error}", file=sys.stderr)
+        return 2
     if plan is None:
         print("--ready needs --compare PLAN", file=sys.stderr)
         return 2
@@ -274,6 +298,8 @@ def main():
     parser.add_argument("--sequence", type=int)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--compare", help="`cuteafd plan --layout --json` output to compare against")
+    parser.add_argument("--startup-plan", action="store_true",
+                        help="compare against the serving admission logged in the same single startup log")
     parser.add_argument("--device-map", default="rtx0=0,rtx1=1",
                         help="planner device=ledger device pairs for the logs given (e.g. spark0=0)")
     parser.add_argument("--ready", action="store_true",

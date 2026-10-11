@@ -76,6 +76,27 @@ impl RuntimeInventory {
     }
 }
 
+/// Opt-in startup attribution only; never sample on the request hot path.
+pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &str) -> Result<()> {
+    if std::env::var("CUTEAFD_STARTUP_MEMORY_PROBE").as_deref() != Ok("1") { return Ok(()); }
+    let current = library.cuda_get_device()?;
+    let result = (|| -> Result<()> {
+        for &device in devices {
+            library.cuda_set_device(device)?;
+            let (free, total) = library.cuda_physical_memory_info()?;
+            let tracked = cuteafd_ffi::memory_ledger::snapshot()
+                .total(cuteafd_ffi::memory_ledger::Space::Device, device);
+            tracing::info!(target: "cuteafd::placement", probe = %serde_json::json!({
+                "stage": stage, "device": device, "free": free, "total": total,
+                "tracked": tracked, "untracked": total.saturating_sub(free).saturating_sub(tracked)
+            }), "startup memory probe");
+        }
+        Ok(())
+    })();
+    library.cuda_set_device(current)?;
+    result
+}
+
 /// Native code still to arrive on `device` (coordinator `rank` of a `split`
 /// layout) before ready ([`cuteafd_loader::placement::LoadedCode::pending`]):
 /// the measured loaded code of `program_family` with `experts` less what the

@@ -97,6 +97,21 @@ def test_strict_ready_uses_one_snapshot_not_later_tracked_allocations(tmp_path):
     assert run(log, plan, strict=True) == 1
 
 
+def test_startup_plan_uses_serving_admission_and_rejects_missing_duplicate(tmp_path):
+    log = tmp_path / "serve.log"
+    line = "INFO placement: GLM Flash startup plan plan=" + json.dumps({"memory_layout": {
+        "devices": [{"kind": "rtx", "index": 0, "items": [item("runtime", "graphs", 100)]}]},
+        "speculation": True, "graph_shapes": 280, "graphs": [12880, 12600]}) + "\n"
+    log.write_text(line + tagged_ready())
+    assert memory_audit.startup_plan(log)["devices"][0]["items"][0]["bytes"] == 100 * MIB
+    log.write_text(tagged_ready())
+    with pytest.raises(ValueError, match="exactly one"):
+        memory_audit.startup_plan(log)
+    log.write_text(line + line + tagged_ready())
+    with pytest.raises(ValueError, match="exactly one"):
+        memory_audit.startup_plan(log)
+
+
 def test_strict_ready_rejects_missing_tag_or_requested_device(tmp_path):
     log, plan = write(tmp_path, [])
     assert run(log, plan, strict=True) == 1

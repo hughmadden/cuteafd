@@ -12,6 +12,8 @@ pub struct GlmfInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     /// Code not present at the baseline sample: LoadedCode minus already-sampled code, per rank.
     pub pending_code: Vec<u64>,
+    /// Measured native EXL3 TP2 program/package path, not the legacy Spark graph path.
+    pub local_tp2_exl3: bool,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
     pub prefill_lanes: u64,
@@ -463,6 +465,9 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
             trial.graphs = graph_cache.entry((context, candidate as usize)).or_insert_with(||
                 startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
                     i.speculation, i.gpus.len(), i.decode_rows as usize, sms)).clone();
+            if i.local_tp2_exl3 && working.spark_ranks == 0 {
+                calibrate_local_tp2_graphs(&mut trial.graphs);
+            }
         }
         let mut req = request_for_working_set(&trial, working)?;
         req.pool.target = req.pool.target.max(target).min(candidate);
@@ -491,6 +496,19 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
     GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
 }
 
+/// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
+/// Preserve the separate admission-growth margin; only the ready executable charge changes.
+pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
+    if graphs.ranks.len() != 2 || graphs.lifetime != Lifetime::Startup { return; }
+    for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
+        let (bytes, count) = [(2_074_083_328u64, 12_880u64), (2_004_877_312, 12_600)][rank];
+        let measured = (graph.executables as u128 * bytes as u128).div_ceil(count as u128) as u64;
+        graph.margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
+            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
+        graph.bytes = measured + graph.margin;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,7 +524,7 @@ mod tests {
             cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
-                loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], headroom_bytes: 1 << 30,
+                loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
             spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
             index: cache::GlmfIndexCache::Keys, kda_state_bytes: 4, shared_replay: false,
@@ -521,6 +539,43 @@ mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
             drafter_scratch: vec![0; ranks], requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+        }
+    }
+
+    #[test]
+    fn copy_window_startup_graphs_match_serving_inventory() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        // No external drafter still captures speculative graphs for default copy windows.
+        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        assert_eq!(copy.shapes, 280);
+        assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
+        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [2_082_618_720, 2_131_554_600]);
+        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
+        assert_eq!(plain.shapes, 112);
+        assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
+    }
+
+    #[test]
+    fn local_tp2_runtime_and_graphs_equal_staged_ready() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        calibrate_local_tp2_graphs(&mut graphs);
+        for (rank, (baseline, ready)) in [(1_027_511_116u64, 3_101_594_444u64),
+            (900_673_356, 2_905_550_668)].into_iter().enumerate() {
+            let items = inventory::glmf_local_tp2_runtime_items(rank);
+            assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), baseline);
+            assert_eq!(baseline + graphs.at_ready(rank), ready);
+            let code = loaded_code("glmf", "exl3-tp2-local", true, rank as u8).unwrap();
+            assert_eq!(inventory::ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
+            let sampled = [598_999_040, 609_484_800][rank];
+            assert_eq!(sampled + code.pending(sampled, 586_416_128), baseline);
+            assert!(graphs.growth(rank) >= 64 << 20);
         }
     }
 

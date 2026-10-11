@@ -1112,8 +1112,11 @@ impl Opened {
             programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS))?;
             Ok(())
         })?;
+        let local_tp2_exl3 = split && args.peers.is_none() && !args.skip_experts
+            && self.experts.as_ref().is_some_and(|c| c.exl3().is_some());
+        let code_package = if local_tp2_exl3 { "exl3-tp2-local" } else { "*" };
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", "*"))
+            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package))
             .collect::<Result<Vec<_>>>()?;
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -1179,7 +1182,7 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { cfg: &self.cfg, layers,
+        let inputs = admission::GlmfInputs { cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.baselines(&[]), pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
@@ -1195,6 +1198,18 @@ impl Opened {
         ensure!(placement.movables.iter().all(|(_, gpu)| *gpu == 0), "GPU1 drafter executor not installed");
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
             prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers, "GLM Flash admission before weights");
+        let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
+            let mut items = items.clone();
+            items.push(cuteafd_core::memory_layout::Item::new(
+                cuteafd_core::memory_layout::Category::Runtime, "sampled context+modules", "",
+                gpu.context_bytes, cuteafd_core::memory_layout::Basis::Calibrated));
+            serde_json::json!({"kind": "rtx", "index": rank, "device": gpu.device, "items": items})
+        }).collect();
+        tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
+            "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
+            "graph_shapes": graphs.shapes, "graphs": graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
+            "speculation": speculation, "sequences": sequences,
+        }), "GLM Flash startup plan");
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
         Ok((placement, graphs, working))
     }
@@ -1208,6 +1223,9 @@ impl Opened {
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
         // each admitted GPU reserves its part of every mark (a lone GPU, the whole mark), as the prefix
         // cache then allocates.
+        let probe_devices: Vec<_> = std::iter::once(args.device).chain(args.split_device).collect();
+        let probe = |stage| crate::shared::inventory::startup_probe(&self.library, &probe_devices, stage);
+        probe("contexts-before-peer")?;
         let mut resolved = args.clone();
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
@@ -1216,6 +1234,7 @@ impl Opened {
             resolved.kda_output_shard = false;
             resolved.kda_prefill_expanded = false;
         }
+        probe("peer-enabled")?;
         let args = &resolved;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
@@ -1282,6 +1301,7 @@ impl Opened {
         let (loaded, skipped) = programs.load_matching(|name| glmf_startup_program(name, args.split_device.is_some(),
             args.decode_rows > engine::DECODE_ROWS))?;
         tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
+        probe("lead-programs")?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
         // (`glmf2`) in this build.
@@ -1324,6 +1344,7 @@ impl Opened {
                 .collect() };
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context)?;
+        probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
         let args = &selected_args;
@@ -1354,6 +1375,7 @@ impl Opened {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                 loader.model(&self.cfg, layers)
             })?;
+        probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
@@ -1415,6 +1437,7 @@ impl Opened {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
         }
+        probe("peer-exchanges")?;
         engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
@@ -1446,7 +1469,9 @@ impl Opened {
                 Fp8MoeTp2::load_pair(devices, tensors, &package, range, args.expert_rows(), budgets)?
                     .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
             };
+            probe("expert-packages")?;
             engine.install_tp2(ranks)?;
+            probe("route-exchange")?;
         }
         // Spark links remain available for every layer whose admitted home is Spark.
         let spark = !spark_layers.is_empty();
@@ -1481,10 +1506,13 @@ impl Opened {
         if let Some(workspaces) = early_workspaces { engine.install_workspaces(workspaces)?; }
         if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        probe("workspaces")?;
         engine.prime_tp2()?;
+        probe("expert-prime")?;
         if engine.has_tp2() {
             let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, engine.drafter.is_some()));
             engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
+            probe("graph-capture")?;
             engine.check_admitted_graphs(&admitted_graphs)?;
             engine.check_tp2_routes()?;
         }
