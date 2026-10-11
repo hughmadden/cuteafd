@@ -65,9 +65,11 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
         if self.parity() { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
     }
 
-    /// Every pool allocation (both GPUs'), for the host tier's copy engine routing.
+    /// Every allocation the host tier copies (both GPUs' pools and the stand-in tail), for the
+    /// copy engine's routing by owning device.
     pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.paged.iter().flat_map(|&(_, records, index)| std::iter::once(records).chain(index)).collect()
+        self.paged.iter().flat_map(|&(_, records, index)| std::iter::once(records).chain(index))
+            .chain(std::iter::once(self.scratch.buffer)).collect()
     }
 
     /// A copy between two views on rank `rank`'s GPU.
