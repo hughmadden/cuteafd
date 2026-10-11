@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import sys
 import subprocess
 from pathlib import Path
 
@@ -60,9 +61,19 @@ def validate_public(text, directory):
                     raise ValueError('refusing text containing a task API key')
 
 
+# GitHub rejects bodies over 65,536 characters; past the soft size, move
+# history into comments as the branch is next touched (no forced rewrite).
+BODY_HARD_BYTES = 60000
+BODY_SOFT_BYTES = 8192
+
+
 def validate_body(text, directory):
-    if len(text.encode('utf-8')) > 4096:
-        raise ValueError('PR body exceeds 4096 bytes')
+    size = len(text.encode('utf-8'))
+    if size > BODY_HARD_BYTES:
+        raise ValueError(f'PR body exceeds {BODY_HARD_BYTES} bytes; move history into comments')
+    if size > BODY_SOFT_BYTES:
+        print(f'pr-sync: body is {size} bytes (soft limit {BODY_SOFT_BYTES}); '
+              'trim history into comments when convenient', file=sys.stderr)
     # Fenced examples do not count as actual state sections.
     headings = []
     fenced = False

@@ -14,10 +14,13 @@ spec.loader.exec_module(common)
 BODY = '\n'.join('## ' + section + '\nPending.\n' for section in common.SECTIONS)
 
 
-def test_size_cap_is_utf8_bytes(tmp_path):
+def test_size_soft_warns_and_hard_cap_is_utf8_bytes(tmp_path, capsys):
     common.validate_body(BODY, tmp_path)
-    with pytest.raises(ValueError, match='4096'):
-        common.validate_body(BODY + 'é' * 2048, tmp_path)
+    assert capsys.readouterr().err == ''
+    common.validate_body(BODY + 'é' * 4096, tmp_path)
+    assert 'soft limit' in capsys.readouterr().err
+    with pytest.raises(ValueError, match=str(common.BODY_HARD_BYTES)):
+        common.validate_body(BODY + 'é' * (common.BODY_HARD_BYTES // 2), tmp_path)
 
 
 @pytest.mark.parametrize('section', common.SECTIONS)

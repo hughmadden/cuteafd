@@ -290,7 +290,8 @@ before → after tables with conditions.
   subjects; performance commits carry the measurement table. No attribution trailers.
 
 Branches, PRs and issues: any branch pushed but not merged by session end gets
-a draft PR (`scripts/dev/pr-sync init`). Its body is current state (≤4 KB);
+a draft PR (`scripts/dev/pr-sync init`). Its body is current state (aim for a few KB;
+older bodies shrink as they are next touched);
 history goes in append-only comments. Only the branch owner writes the body;
 the coordinator comments. Deferred work and hard bugs without a branch are
 issues with a milestone; small fixes need neither. Stacked PRs target their
