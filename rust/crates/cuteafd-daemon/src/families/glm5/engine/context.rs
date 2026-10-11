@@ -66,24 +66,45 @@ pub(super) struct GlmContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical pages one staging view holds: the compiled extent's.
     staging_pages: usize,
-    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)`.
-    partial: [[String; 2]; 2],
+    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)` by row cap.
+    partial: [[Vec<(usize, String)>; 2]; 2],
     /// `lse_combine2`'s sink operand (unused without a sink; GLM 5.3 has none).
     sink: [Dev<'a>; 2],
 }
 
-/// The `glm_sparse_mla_partial_h{begin}_s{N}_m64` variant this GPU runs: the
-/// exporter's plan for its SM count (`device_sm_counts`), else the one variant.
-fn partial_program(manifest: &serde_json::Value, begin: usize, sms: usize) -> Result<String> {
+/// The `glm_sparse_mla_partial_h{begin}_s{N}_m64` variants this GPU runs, as (row cap, program)
+/// ascending: the exporter's split plan per (SM count, row cap) (`row_caps`; a variant without
+/// it serves the full decode rows of its `device_sm_counts`), else the one variant. A step of
+/// `t` rows runs the smallest cap >= `t` ([`pick`]): a few verify rows plan more splits.
+fn partial_programs(manifest: &serde_json::Value, begin: usize, sms: usize) -> Result<Vec<(usize, String)>> {
     let programs = manifest["programs"].as_array().context("program manifest")?;
     let prefix = format!("glm_sparse_mla_partial_h{begin}_s");
     let variants: Vec<&serde_json::Value> = programs.iter()
         .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with("_m64"))).collect();
-    let planned = variants.iter().find(|p| p["params"]["device_sm_counts"].as_array()
-        .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))));
-    let only = (variants.len() == 1).then(|| &variants[0]);
-    planned.or(only).and_then(|p| p["name"].as_str()).map(str::to_string)
-        .with_context(|| format!("no {prefix}*_m64 variant planned for {sms} SMs"))
+    let full = DECODE_ROWS;
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for p in &variants {
+        let name = p["name"].as_str().context("program name")?.to_string();
+        let caps: Vec<usize> = match p["params"]["row_caps"].get(sms.to_string()) {
+            Some(caps) => caps.as_array().context("row caps")?.iter().filter_map(|c| c.as_u64().map(|c| c as usize)).collect(),
+            None if p["params"]["device_sm_counts"].as_array()
+                .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))) => vec![full],
+            None => Vec::new(),
+        };
+        out.extend(caps.into_iter().map(|cap| (cap, name.clone())));
+    }
+    if out.is_empty() && variants.len() == 1 {
+        out.push((full, variants[0]["name"].as_str().context("program name")?.to_string()));
+    }
+    out.sort();
+    out.dedup_by_key(|(cap, _)| *cap);
+    ensure!(out.last().is_some_and(|(cap, _)| *cap >= full), "no {prefix}*_m64 variant planned for {sms} SMs at {full} rows");
+    Ok(out)
+}
+
+/// The variant of `partials` (ascending caps) a step of `rows` rows runs.
+fn pick(partials: &[(usize, String)], rows: usize) -> &str {
+    partials.iter().find(|(cap, _)| *cap >= rows).or(partials.last()).map_or("", |(_, name)| name.as_str())
 }
 
 /// A view of `bytes` at `offset` inside `dev`.
@@ -106,12 +127,12 @@ impl<'a> GlmContextSplit<'a> {
         ensure!(exchange.heads() == cfg.heads / 2 && exchange.topk() == cfg.index_topk, "context exchange geometry");
         let staging_pages = extent.div_ceil(PAGE_ROWS);
         let list = context_workspace(cfg, extent as u64, rows, lanes, context);
-        let mut partial = [[String::new(), String::new()], [String::new(), String::new()]];
-        let rank = |rank: usize, partial: &mut [String; 2]| -> Result<(ContextRank<'a>, Dev<'a>)> {
+        let mut partial: [[Vec<(usize, String)>; 2]; 2] = Default::default();
+        let rank = |rank: usize, partial: &mut [Vec<(usize, String)>; 2]| -> Result<(ContextRank<'a>, Dev<'a>)> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
                 for (slot, begin) in partial.iter_mut().zip([0, cfg.heads / 2]) {
-                    *slot = partial_program(manifest, begin, sms)?;
+                    *slot = partial_programs(manifest, begin, sms)?;
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
                 let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
@@ -231,7 +252,7 @@ impl<'a> GlmEngine<'a> {
         let query = exchange.wait_query(rank, s)?;
         let partial = |heads: usize, out: &Dev<'_>| -> Result<(*mut c_void, *mut c_void)> {
             let lse = view(out, DECODE_ROWS * half_heads * 512 * 2, t * half_heads * 4)?.ptr;
-            self.run_on(rank, &split.partial[rank][heads], &[("q", query), ("cache", kv.buffer.ptr),
+            self.run_on(rank, pick(&split.partial[rank][heads], t), &[("q", query), ("cache", kv.buffer.ptr),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
                 ("extra_cache", kv.buffer.ptr), ("extra_indices", w.indices.buffer.ptr),
                 ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
@@ -375,6 +396,29 @@ mod tests {
     /// A parity pool's ids for logical pages `0..n` (page `j` of parity `j % 2`).
     fn ids(n: usize, base: u32) -> Vec<u32> {
         (0..n as u32).map(|j| 2 * (base + j) + (j & 1)).collect()
+    }
+
+    #[test]
+    fn partial_variants_follow_the_split_plan_per_sm_count_and_row_cap() {
+        let manifest = serde_json::json!({"programs": [
+            {"name": "glm_sparse_mla_partial_h0_s1_m64", "params": {"device_sm_counts": [170], "row_caps": {"170": [64]}}},
+            {"name": "glm_sparse_mla_partial_h0_s4_m64", "params": {"device_sm_counts": [188], "row_caps": {"188": [64]}}},
+            {"name": "glm_sparse_mla_partial_h0_s8_m64", "params": {"device_sm_counts": [170], "row_caps": {"170": [8]}}},
+            {"name": "glm_sparse_mla_partial_h0_s11_m64", "params": {"device_sm_counts": [188], "row_caps": {"188": [8]}}},
+            {"name": "glm_sparse_mla_partial_h0_s32_m64", "params": {"device_sm_counts": [170, 188],
+                "row_caps": {"170": [1], "188": [1]}}},
+            {"name": "glm_sparse_mla_partial_h32_s4_m64", "params": {"device_sm_counts": [188]}}]});
+        let at188 = partial_programs(&manifest, 0, 188).unwrap();
+        assert_eq!(at188, [(1, "glm_sparse_mla_partial_h0_s32_m64".to_string()),
+            (8, "glm_sparse_mla_partial_h0_s11_m64".to_string()), (64, "glm_sparse_mla_partial_h0_s4_m64".to_string())]);
+        assert_eq!([1, 2, 8, 9, 64].map(|rows| pick(&at188, rows)), ["glm_sparse_mla_partial_h0_s32_m64",
+            "glm_sparse_mla_partial_h0_s11_m64", "glm_sparse_mla_partial_h0_s11_m64",
+            "glm_sparse_mla_partial_h0_s4_m64", "glm_sparse_mla_partial_h0_s4_m64"]);
+        assert_eq!(pick(&partial_programs(&manifest, 0, 170).unwrap(), 4), "glm_sparse_mla_partial_h0_s8_m64");
+        // A manifest before row caps: its SM count's variant serves every row count.
+        assert_eq!(partial_programs(&manifest, 32, 188).unwrap(), [(64, "glm_sparse_mla_partial_h32_s4_m64".to_string())]);
+        assert!(partial_programs(&manifest, 32, 170).is_ok(), "the one variant serves an unplanned SM count");
+        assert!(partial_programs(&serde_json::json!({"programs": []}), 0, 188).is_err());
     }
 
     #[test]
