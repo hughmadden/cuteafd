@@ -6205,12 +6205,19 @@ Ideas TJ wants kept for later; not v2 work.
 - **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
 - **DSH dashboard model gate** is unverified: the automation could not find
   the composer iframe.
-- **Mapped engram/PLE gathers over io_uring (TJ).** Today `Mapped` faults rows
-  through the page cache on host threads, with advisory prefetch. Submit each
-  step's known row set (and the next prefill chunk's) as batched io_uring
-  reads into a pinned staging ring, keeping page-cache hits.
+- **Qualify the mapped-table io_uring backends (TJ).** They already exist
+  in the shared `cuteafd-loader` `MappedTable` (6b2a47bf, 10-07), used by
+  V4.1 engram and Qwen PLE: `mmap` (default), `uring` and `mincore-routed`
+  (mincore residency check, resident rows copied, misses as concurrent
+  io_uring reads), with hit/miss, byte and 7-tier miss-latency stats in the
+  console and bench. CPU cold-page witness, mmap -> mincore-routed: 3,072
+  rows 197 -> 4.6 ms. Warm pages: equal. What is missing is the
+  identical-config hardware A/B that the code requires before a default
+  change: V4.1 (engram on raptor) and Qwen (95 GiB BF16 PLE), cold and warm
+  page cache, C1/C16 and readiness. Flip the default if it is no worse warm.
+  The 10-01 mapped-tables campaign predates these backends.
   `HostPreload` (whole table in pinned RAM) and `Device` stay opt-in and are
-  never auto-selected for tables this size: Qwen's BF16 PLE is 95.4 GiB.
+  never auto-selected for tables this size.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
