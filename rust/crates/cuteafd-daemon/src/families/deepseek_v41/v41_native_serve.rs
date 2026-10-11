@@ -7,7 +7,7 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
-use scores::TokenScores;
+use scores::RetainedScores;
 mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
@@ -148,6 +148,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
+    ensure!((0.0..1.0).contains(&args.decode_share), "--decode-share must be in [0, 1)");
     args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
@@ -771,111 +772,12 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     job: &NativeRequest,
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     hold: &mut dyn FnMut() -> Result<()>,
-) -> Result<TokenScores> {
-    use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
-    let end = tokens.len() as u64;
-    let cached = requests.cache().committed_end(lease)? as usize;
-    let stage = requests.cache().stage(lease)?;
-    let replay = stage == CacheStage::EncoderReplay;
-    if cached > 0 && stage == CacheStage::Full {
-        return prefill_continuation(
-            lib,
-            runtime,
-            pass,
-            requests,
-            transport,
-            lease,
-            &tokens[cached..],
-            chunk_rows,
-            job,
-            draft,
-            hold,
-        );
-    }
-    let mut suffix = pass.new_suffix(lib, end)?;
-    if replay {
-        let start = requests.cache().history_end(lease)? as usize;
-        ensure!(
-            cached - start <= 128,
-            "encoder prefix replay exceeds one window"
-        );
-        for chunk in tokens[start..cached].chunks(chunk_rows) {
-            ensure!(!job.events.is_closed(), "client disconnected");
-            prefill_hold(hold);
-            let mut batch = requests.prepare(&[RequestTokens {
-                lease,
-                tokens: chunk,
-                image_mask: None,
-                kind: ExpertV2SourceKind::Prefill,
-            }])?;
-            let result = (|| -> Result<()> {
-                runtime.block_on(unsafe {
-                    pass.encoder_part(requests, &mut batch, transport, &mut suffix)
-                })?;
-                ensure!(!job.events.is_closed(), "client disconnected");
-                runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, None, chunk.len() as u32))
-            })();
-            if result.is_err() {
-                pass.discard(&mut batch)?;
-            }
-            result?;
-        }
-    } else if stage == CacheStage::Full {
-        requests.begin_encoder(lease, end)?;
-    }
-    let mut chunks = tokens[cached..].chunks(chunk_rows);
-    // Keep the ordinary path for short prompts; pair full chunks first otherwise.
-    if chunks.len() == 1 {
-        let chunk = chunks.next().expect("one chunk");
-        ensure!(!job.events.is_closed(), "client disconnected");
-        prefill_hold(hold);
-        let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
-            image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        let started = Instant::now();
-        let result = (|| -> Result<()> {
-            runtime.block_on(unsafe { pass.encoder_part(requests, &mut batch, transport, &mut suffix) })?;
-            ensure!(!job.events.is_closed(), "client disconnected");
-            runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, None, chunk.len() as u32))
-        })();
-        if result.is_err() { pass.discard(&mut batch)?; }
-        result?;
-        console::totals::prefill(chunk.len());
-        console::Prefill::done(console::PrefillKind::Single, 0, 0, 1, chunk.len(), started);
-        tracing::debug!(target: "cuteafd::timing", rows=chunk.len(), total_us=started.elapsed().as_micros() as u64, "target encoder step");
-    }
-    if chunks.len() != 0 {
-        let chunks: Vec<_> = chunks.collect();
-        let started = Instant::now();
-        // The hold must reach every chunk the stream dispatches; both lanes share one
-        // `&dyn Fn` hook, so the mutable callback goes through a RefCell (calls are
-        // synchronous, single-threaded, never nested).
-        let hold = std::cell::RefCell::new(&mut *hold);
-        let before_chunk = || -> Result<()> {
-            prefill_hold(&mut *hold.borrow_mut());
-            Ok(())
-        };
-        runtime.block_on(unsafe { pass.execute_encoder_stream_held(other, requests, lease, &chunks,
-            [transport, other_transport], &mut suffix, &|| !job.events.is_closed(), &before_chunk) })?;
-        tracing::debug!(target: "cuteafd::timing", rows=tokens.len(),
-            total_us=started.elapsed().as_micros() as u64, "target encoder stream");
-    }
-    ensure!(!job.events.is_closed(), "client disconnected");
-    let start = requests.begin_decoder_replay(lease)?;
-    let rows = (end - start) as u32;
-    let mut batch = requests.prepare_replay(&[CacheWork { lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
-    let started = Instant::now();
-    let result = (|| -> Result<TokenScores> {
-        let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
-            transport, &[rows as usize - 1], Some(&suffix)) })?;
-        let scores = TokenScores::new(scores::VOCAB, bytes)?;
-        ensure!(!job.events.is_closed(), "client disconnected");
-        runtime.block_on(pass.commit_prefill(requests, &mut batch, draft, rows))?;
-        Ok(scores)
-    })();
-    if result.is_err() { pass.discard(&mut batch)?; }
-    console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
-    tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
-    result
+) -> Result<RetainedScores> {
+    use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
+    let mut times = V41PrefillTimes::default();
+    let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
+        other_transport, lease, tokens, chunk_rows, job, draft, hold, times: &mut times };
+    crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
 }
 
 /// A benchmark probe's teacher-forced scoring pass finished: the request
@@ -978,7 +880,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
         for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
-            probe.row(step.start + j + 1, &TokenScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+            probe.row(step.start + j + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
         }
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
@@ -1050,7 +952,7 @@ mod scoring_tests {
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,
-    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<TokenScores> {
+    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<RetainedScores> {
     ensure!(!tokens.is_empty(), "prefix continuation has no uncached rows");
     let mut anchor = None;
     let count = tokens.len().div_ceil(chunk_rows);
@@ -1060,10 +962,10 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         let started = Instant::now();
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        let result = (|| -> Result<TokenScores> {
+        let result = (|| -> Result<RetainedScores> {
             let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
                 &[chunk.len() - 1], None) })?;
-            let scores = TokenScores::new(scores::VOCAB, bytes)?;
+            let scores = RetainedScores::new(scores::VOCAB, bytes)?;
             ensure!(!job.events.is_closed(), "client disconnected");
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)
