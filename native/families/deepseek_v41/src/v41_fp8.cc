@@ -23,6 +23,7 @@ struct Variant {
   uint32_t split_slices;
   uint32_t groups;
   uint64_t grouped_output_offset;
+  uint32_t plan_sms = 0;
   int device = -1;
   int device_sms = 0;
 };
@@ -41,11 +42,13 @@ int device_slot(int device) {
   for (int slot=0; slot<2; ++slot) if (owner_device[slot] < 0) { owner_device[slot]=device; return slot; }
   return -1;
 }
-Variant* capacity(int rows, int k, int n, int slot=0) {
+Variant* capacity(int rows, int k, int n, int slot=0, int sms=188) {
   auto* table = slot == 0 ? variants : peer_variants;
+  const uint32_t plan_sms = sms >= 188 ? 188 : 170;
   for (size_t i=0; i<sizeof(variants)/sizeof(variants[0]); ++i) {
     auto& v=table[i];
-    if (int(v.info.capacity_rows)==rows && int(v.info.input_dim)==k && int(v.info.output_dim)==n) return &v;
+    if (int(v.info.capacity_rows)==rows && int(v.info.input_dim)==k && int(v.info.output_dim)==n &&
+        (!v.plan_sms || v.plan_sms == plan_sms)) return &v;
   }
   return nullptr;
 }
@@ -91,7 +94,12 @@ extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*, uint16_t*, in
 extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*, uint16_t*, int32_t, int32_t, int32_t, void*);
 extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*, uint64_t, float*, void*);
 extern "C" int32_t cuteafd_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out) {
-  auto* v = capacity(rows, k, n); if (!v || !out) return cudaErrorInvalidValue;
+  if (!out) return cudaErrorInvalidValue;
+  int device = -1, sms = 0;
+  auto status = cudaGetDevice(&device); if (status) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
+  if (sms <= 0) return cudaErrorInvalidDevice;
+  auto* v = capacity(rows, k, n, 0, sms); if (!v) return cudaErrorInvalidValue;
   *out = v->info; return 0;
 }
 extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
@@ -102,15 +110,16 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != 0) return reject_device(device, major, minor, sms);
+  if (major != 12 || minor != 0 || sms <= 0) return reject_device(device, major, minor, sms);
   std::lock_guard<std::mutex> lock(mutex);
   const int slot=device_slot(device);
   if (slot<0) return cudaErrorInvalidDevice;
-  v=capacity(rows,k,n,slot);
+  v=capacity(rows,k,n,slot,sms);
+  if (!v) return cudaErrorInvalidValue;
   if (v->device >= 0) {
     if (v->device != device) return cudaErrorInvalidDevice;
   } else {
-    auto* modules = capacity(rows,k,n);
+    auto* modules = capacity(rows,k,n,0,sms);
     const bool existing = modules->gemm.library != nullptr;
     int result = load(modules->quant, device);
     if (!result) result = load(modules->gemm, device);

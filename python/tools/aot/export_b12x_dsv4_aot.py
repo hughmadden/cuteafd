@@ -128,10 +128,10 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             out.append((f"sparse_mla_{route}_{kind}_m{rows}", "sparse_mla",
                         {"route": route, "max_rows": rows, "indexed_width": width,
                          "indexed_page_rows": page_rows},
-                        lambda route=route, rows=rows, width=width, page_rows=page_rows:
+                        lambda route=route, rows=rows, width=width, page_rows=page_rows, sm_count=None:
                             mla.compile_dsv4_sparse_mla_aot(
                                 g, route=route, max_rows=rows, indexed_width=width,
-                                indexed_page_rows=page_rows)))
+                                indexed_page_rows=page_rows, sm_count=sm_count)))
     return out
 
 
@@ -200,7 +200,8 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(
                         g, max_rows=rows, max_pages=index_pages, mode=mode)))
         out.append((f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
-                    lambda mode=mode, rows=rows: mla.compile_glm_sparse_mla_aot(g, route=mode, max_rows=rows)))
+                    lambda mode=mode, rows=rows, sm_count=None: mla.compile_glm_sparse_mla_aot(
+                        g, route=mode, max_rows=rows, sm_count=sm_count)))
     return out
 
 
@@ -322,8 +323,9 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only=m)),
             (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
-             lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r,
-                                      name="glmf_sparse_mla", fp32_partials=m == "decode")),
+             lambda m=mode, r=rows, sm_count=None: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r,
+                                      name="glmf_sparse_mla", fp32_partials=m == "decode",
+                                      sm_count=sm_count)),
         ]
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
@@ -390,8 +392,8 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
         # partials of 33 chunks per row and head in a 554,729,472-byte scratch. On 188 SMs the
         # planner's own plan is one split, so the option changes no object there.
         (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "full_launch_splits": 1},
-         lambda: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
-                                                fp32_partials=True, full_launch_splits=1)),
+         lambda sm_count=None: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
+                                                fp32_partials=True, full_launch_splits=1, sm_count=sm_count)),
     ]
     for inter in (g.moe_inter, g.dense_inter):
         out.append((f"ffn_i{inter}_m{r}", "ffn", {"max_rows": r, "inter": inter, "fp8_only": "decode"},
@@ -688,37 +690,47 @@ def main() -> None:
         if selected is not None and suffix not in selected:
             continue
         stem = f"{family}_{suffix}"
-        with exportable_compilation():
-            program = thunk()
-        validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
-        minimum_sms = program_minimum_sms(stem, program.geometry)
-        program.export_to_c(str(output), stem, "cuteafd_" + stem)
-        header = output / f"{stem}.h"
-        checked = validate_exported_header(program, header, "cuteafd_" + stem)
-        abi = program.abi
-        kinds = "".join(SCALAR_KINDS[kind] for _, kind in abi["scalars"])
-        if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
-            raise ValueError(f"{stem}: header argument count disagrees with the ABI")
+        # Card-specific split/merge plans retain their numerics and matching
+        # scratch layouts. Native load selects once, before graph capture.
+        plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
+        plans, scratch, modules = [], {}, []
         capacity = int(params.get("max_rows", args.prefill_rows))
+        abi = None
+        minimum_sms = 0
+        for sms in plan_sms:
+            label = stem if sms is None else f"{stem}_sm{sms}"
+            with exportable_compilation():
+                program = thunk() if sms is None else thunk(sm_count=sms)
+            validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
+            minimum_sms = max(minimum_sms, program_minimum_sms(stem, program.geometry))
+            if abi is not None and program.abi != abi:
+                raise ValueError(f"{stem}: card plans disagree on their ABI")
+            abi = program.abi
+            kinds = "".join(SCALAR_KINDS[kind] for _, kind in abi["scalars"])
+            program.export_to_c(str(output), label, "cuteafd_" + label)
+            checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+            if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
+                raise ValueError(f"{label}: header argument count disagrees with the ABI")
+            plan_scratch = program.scratch_bytes(capacity)
+            for key, size in plan_scratch.items():
+                scratch[key] = max(scratch.get(key, 0), size)
+            plans.append({"sm_count": sms, "label": label, "geometry": dict(program.geometry),
+                          "scratch_bytes_at_capacity": plan_scratch, "entry": checked["symbol"],
+                          "object_sha256": hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()})
+            includes.append(f'#include "{label}.h"')
+            modules.append(f'_mlir_cuteafd_{label}_cuda_init, _mlir_cuteafd_{label}_cuda_load_to_device, {checked["symbol"]}')
         manifest["programs"].append({
-            "name": stem,
-            "family": family,
-            "op": op,
-            "params": params,
-            "geometry": dict(program.geometry),
+            "name": stem, "family": family, "op": op, "params": params,
+            "geometry": plans[-1]["geometry"],
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
             "scalars": [dict(zip(("name", "type"), s)) for s in abi["scalars"]],
-            "scratch_bytes_at_capacity": program.scratch_bytes(capacity),
-            "capacity_rows": capacity,
-            "entry": checked["symbol"],
-            "object_sha256": hashlib.sha256((output / f"{stem}.o").read_bytes()).hexdigest(),
+            "scratch_bytes_at_capacity": scratch, "capacity_rows": capacity,
+            **({"card_plans": plans} if len(plans) > 1 else
+               {"entry": plans[0]["entry"], "object_sha256": plans[0]["object_sha256"]}),
         })
-        includes.append(f'#include "{stem}.h"')
-        entries.append(
-            f'{{"{stem}", _mlir_cuteafd_{stem}_cuda_init, _mlir_cuteafd_{stem}_cuda_load_to_device, '
-            f'{checked["symbol"]}, {len(abi["pointers"])}, "{kinds}", {minimum_sms}}}'
-        )
-        print(f"exported {stem}: {len(abi['pointers'])} pointers, scalars '{kinds}'", flush=True)
+        extra = ", " + modules[1] if len(modules) > 1 else ""
+        entries.append(f'{{"{stem}", {modules[0]}, {len(abi["pointers"])}, "{kinds}", {minimum_sms}{extra}}}')
+        print(f"exported {stem}: {len(abi['pointers'])} pointers, scalars '{kinds}', plans {plan_sms}", flush=True)
     if not entries:
         raise SystemExit("no programs selected")
     (output / "dsv4_programs.h").write_text("\n".join([

@@ -458,7 +458,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // V4 always loads all checkpoint stages and their caches; --dspark only
     // changes expert residency and whether the scheduler drafts with them.
     let cache_native_layers = if family == "deepseek_v4" { discovered_native_layers } else { native_layers };
-    let workspace_manifest = options.workspace_manifest.as_deref().or_else(|| {
+    let mut workspace_manifest = options.workspace_manifest.as_deref().or_else(|| {
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)
     }).and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -501,6 +501,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {context_tokens} tokens (checkpoint {checkpoint_context})"),
         format!("attention placement {}", report.attention_placement)];
+    if let Some(manifest) = workspace_manifest.as_mut() {
+        let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+            "sm_120", options.rtx_bytes[0]).sms);
+        if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(manifest, sms) {
+            report.placement_supported = false;
+            notes.push(error.to_string());
+        }
+    }
     let reference_gpu = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
         && native_layers > 0 && options.local_expert_layers.is_none();
     let package = report.experts.as_ref().map(|e| e.package.as_str());

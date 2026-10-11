@@ -20,8 +20,13 @@ struct Program {
   uint32_t pointers;
   const char* kinds;
   uint32_t minimum_sms;
+  ModuleFn initialize_sm188 = nullptr;
+  ModuleFn load_sm188 = nullptr;
+  LaunchFn launch_sm188 = nullptr;
   cudaLibrary_t library = nullptr;
-  bool loaded[kMaxDevices] = {};
+  cudaLibrary_t library_sm188 = nullptr;
+  // Zero is unloaded; 1/2 retain the selected 170/188-SM plan before capture.
+  uint8_t loaded[kMaxDevices] = {};
 };
 Program programs[] = {CUTEAFD_DSV4_PROGRAMS};
 constexpr uint32_t kCount = sizeof(programs) / sizeof(programs[0]);
@@ -55,30 +60,33 @@ extern "C" int32_t cuteafd_dsv4_program_load(uint32_t index) {
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
   if (status != cudaSuccess) return status;
   if (major != 12 || minor != CUTEAFD_DSV4_CC_MINOR) return cudaErrorNoKernelImageForDevice;
-  if (program->minimum_sms) {
-    int sms = 0;
+  int sms = 0;
+  if (program->minimum_sms || program->launch_sm188) {
     status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
     if (status != cudaSuccess) return status;
-    if (sms <= 0 || static_cast<uint32_t>(sms) < program->minimum_sms)
+    if (sms <= 0) return cudaErrorInvalidDevice;
+    if (static_cast<uint32_t>(sms) < program->minimum_sms)
       return CUTEAFD_DSV4_ERROR_INSUFFICIENT_RESIDENT_SMS;
   }
+  const bool use_sm188 = program->launch_sm188 && sms >= 188;
   std::lock_guard<std::mutex> lock(load_mutex);
   if (program->loaded[device]) return cudaSuccess;
-  auto* library = &program->library;
-  if (!program->library) {
+  auto* storage = use_sm188 ? &program->library_sm188 : &program->library;
+  auto* library = storage;
+  if (!*storage) {
     void* init_args[] = {&library, &status};
-    program->initialize(init_args);
+    (use_sm188 ? program->initialize_sm188 : program->initialize)(init_args);
     if (status != cudaSuccess) {
-      if (program->library) cudaLibraryUnload(program->library);
-      program->library = nullptr;
+      if (*storage) cudaLibraryUnload(*storage);
+      *storage = nullptr;
       return status;
     }
   }
   int32_t device_id = device;
   void* load_args[] = {&library, &device_id, &status};
-  program->load(load_args);
+  (use_sm188 ? program->load_sm188 : program->load)(load_args);
   if (status != cudaSuccess) return status;
-  program->loaded[device] = true;
+  program->loaded[device] = use_sm188 ? 2 : 1;
   return cudaSuccess;
 }
 
@@ -119,6 +127,7 @@ extern "C" int32_t cuteafd_dsv4_program_launch(uint32_t index, void* const* poin
   int32_t result = 0;
   arguments[count++] = &stream;
   arguments[count++] = &result;
-  program->launch(arguments, static_cast<int32_t>(count));
+  (program->loaded[device] == 2 ? program->launch_sm188 : program->launch)(
+      arguments, static_cast<int32_t>(count));
   return result;
 }
