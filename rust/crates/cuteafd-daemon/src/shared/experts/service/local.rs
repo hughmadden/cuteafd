@@ -38,8 +38,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
     let geometry = catalog.routed_experts().geometry()?;
-    config.bf16_ingress |= catalog.nvfp4().is_some() || catalog.fp8().is_some_and(|tensors|
-        tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+    config.bf16_ingress |= inventory.spark_input_is_bf16();
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {

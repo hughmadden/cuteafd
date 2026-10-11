@@ -352,8 +352,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes)?;
-        engine.spark_bf16 = self.catalog.fp8().is_some_and(|tensors|
-            tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+        engine.spark_bf16 = cuteafd_loader::plan::Checkpoint::inventory(&self.snapshot)?.spark_input_is_bf16();
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;

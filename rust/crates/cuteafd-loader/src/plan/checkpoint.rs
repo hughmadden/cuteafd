@@ -173,6 +173,23 @@ impl Checkpoint {
         self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
     }
 
+    /// Native NVFP4 experts quantize original BF16 activations on the worker.
+    /// Use the complete index, never a role's local expert/MTP header subset.
+    pub fn spark_input_is_bf16(&self) -> bool {
+        let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
+        self.tensor_names().any(|name| {
+            let Some(stem) = name.strip_suffix(".input_scale") else { return false };
+            if !stem.contains(".experts.") || !self.contains_tensor(&format!("{stem}.weight_scale_2")) {
+                return false;
+            }
+            let parts: Vec<_> = stem.split('.').collect();
+            if parts.iter().any(|part| matches!(*part, "mtp" | "nextn")) { return false; }
+            let layer = parts.iter().position(|part| *part == "layers")
+                .and_then(|at| parts.get(at + 1)).and_then(|value| value.parse::<usize>().ok());
+            layer.is_some_and(|layer| layers.is_none_or(|count| layer < count))
+        })
+    }
+
     /// Explicit requirements also reject tensors absent from the index itself.
     pub fn open_required(snapshot: &Path, role: &str, names: &BTreeSet<String>) -> Result<Self> {
         let inventory = Self::inventory(snapshot)?;
@@ -260,6 +277,38 @@ mod sliced_tests {
     use super::*;
     use crate::plan::testing::{t, write_safetensors};
     use serde_json::json;
+
+    #[test]
+    fn spark_input_agrees_between_coordinator_and_worker_for_every_family_and_format() {
+        for prefix in ["layers.0.ffn", "model.layers.0.mlp", "model.language_model.layers.0.mlp"] {
+            for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "qwen4", "mimo_v2"] {
+                for format in ["nvfp4", "mxfp4", "fp8", "exl3", "bf16"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&json!({
+                        "model_type": family, "num_hidden_layers": 1
+                    })).unwrap()).unwrap();
+                    let mut tensors = vec![t("lm_head.weight", "BF16", &[2]),
+                        t(format!("{prefix}.experts.0.w1.weight"), "U8", &[2])];
+                    if format == "nvfp4" {
+                        tensors.extend([t(format!("{prefix}.experts.0.w1.input_scale"), "F32", &[1]),
+                            t(format!("{prefix}.experts.0.w1.weight_scale_2"), "F32", &[1])]);
+                    }
+                    // Dense NVFP4 and a differently quantized MTP never select the backbone wire.
+                    for stem in ["model.layers.0.mlp.gate_proj", "model.layers.1.mlp.experts.0.w1",
+                        "model.mtp.layers.0.mlp.experts.0.w1", "mtp.0.ffn.experts.0.w1"] {
+                        tensors.extend([t(format!("{stem}.input_scale"), "F32", &[1]),
+                            t(format!("{stem}.weight_scale_2"), "F32", &[1])]);
+                    }
+                    write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+                    let coordinator = Checkpoint::open_for_role(dir.path(), "coordinator", |name| name == "lm_head.weight").unwrap();
+                    let worker = Checkpoint::inventory(dir.path()).unwrap();
+                    assert_eq!(coordinator.tensors.len(), 1);
+                    assert_eq!(coordinator.spark_input_is_bf16(), format == "nvfp4", "{family}/{format}/{prefix}");
+                    assert_eq!(coordinator.spark_input_is_bf16(), worker.spark_input_is_bf16());
+                }
+            }
+        }
+    }
 
     #[test]
     fn role_headers_and_index_presence_are_independent() {

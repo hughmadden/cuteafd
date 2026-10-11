@@ -1034,7 +1034,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     });
     let spark_format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
         .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
-    let spark_bf16 = spark_format.to_ascii_lowercase().contains("nvfp4");
+    let spark_bf16 = checkpoint.spark_input_is_bf16();
     let spark_lanes = match family {
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },

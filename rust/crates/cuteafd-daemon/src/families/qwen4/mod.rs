@@ -420,8 +420,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
-        engine.spark_bf16 = self.fp8().is_some_and(|tensors|
-            tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+        engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
