@@ -1064,9 +1064,9 @@ fn qwen_empty_h128_spark_ranks_are_geometry_invalid_not_fit() {
 }
 
 #[test]
-fn exl3_tp6_geometry_remains_supported_for_v41_glm_and_flash() {
+fn exl3_tp6_geometry_remains_supported_for_glm_and_flash() {
+    // V4.1 EXL3 TP6 stays refused until it qualifies on remote experts (c7fb59ce).
     for (mut config, prefix, hidden, intermediate) in [
-        (v41_config(), "layers.0.ffn.experts.0.w1", 5120, 2304),
         (glm5_config(), "model.layers.1.mlp.experts.0.gate_proj", 6144, 2048),
         (glm5_flash_config(2), "model.language_model.layers.1.mlp.experts.0.gate_proj", 4096, 2048),
     ] {
