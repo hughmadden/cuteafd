@@ -373,6 +373,24 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {value}" in launch
 
 
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
+    keys = "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\n"
+    if value is not None:
+        keys += f"RTX_EXPERT_LAYERS={value}\n"
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm5_next", "num_hidden_layers": 2,
+        "mlp_layer_types": ["sparse"] * 2,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"],
+    }, "test/glmf", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if value is None:
+        assert "--rtx-expert-layers" not in launch
+    else:
+        assert f"--rtx-expert-layers {value}" in launch
+
+
 @pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
 def test_glm53_rejects_invalid_tp2_expert_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {
