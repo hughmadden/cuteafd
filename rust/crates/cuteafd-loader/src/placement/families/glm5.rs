@@ -432,6 +432,51 @@ fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
     extra
 }
 
+fn native_layer_resident(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors,
+    ranks: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing) -> anyhow::Result<u64> {
+    use crate::formats::fp8_experts::Fp8Projection;
+    Fp8Projection::ALL.iter().try_fold(0u64, |sum, &projection| {
+        let (weights, _) = tensors.slice_bytes_with(projection, ranks, rank, slicing)?;
+        let weights = tensors.shape().experts.checked_mul(weights)
+            .ok_or_else(|| anyhow::anyhow!("GLM expert weights overflow"))?.max(FLOOR as usize) as u64;
+        let scales = tensors.scale_region_bytes_with(projection, ranks, rank, slicing)?
+            .max(FLOOR as usize) as u64;
+        sum.checked_add(weights).and_then(|n| n.checked_add(scales))
+            .ok_or_else(|| anyhow::anyhow!("GLM expert resident storage overflow"))
+    })
+}
+
+/// Physical Spark weight arenas for the selected routed suffix. The caller
+/// supplies the qualified package's actual slicing, not a proportional tensor
+/// share or an assumption based on the configured peer count.
+pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize],
+    ranks: usize, slicing: crate::formats::fp8_experts::Slicing) -> anyhow::Result<Vec<u64>> {
+    use crate::formats::fp8_experts::{ExpertFormat, Slicing};
+    if layers.is_empty() {
+        anyhow::ensure!(ranks == 0, "GLM empty Spark suffix must select zero ranks");
+        return Ok(Vec::new());
+    }
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(matches!(ranks, 2 | 3 | 4 | 6) && shape.hidden == 6144
+        && shape.intermediate == 2048 && shape.experts == 256 && shape.topk == 8
+        && shape.layers > shape.first_layer && layers.last() == Some(&(shape.layers - 1))
+        && layers.iter().all(|&layer| (shape.first_layer..shape.layers).contains(&layer))
+        && layers.windows(2).all(|w| w[0] + 1 == w[1]), "GLM Spark rank/selected-suffix geometry");
+    if let Some(exl3) = catalog.exl3() {
+        anyhow::ensure!(slicing == Slicing::Blocks(128), "GLM EXL3 needs disjoint whole-128-row Spark slices");
+        return (0..ranks).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
+            let arena = exl3.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?
+                .device_arena_layout()?.1 as u64;
+            sum.checked_add(arena).ok_or_else(|| anyhow::anyhow!("GLM Spark EXL3 residency overflow"))
+        })).collect();
+    }
+    let tensors = catalog.fp8().filter(|t| matches!(t.format(), ExpertFormat::Fp8Block128 | ExpertFormat::Nvfp4))
+        .ok_or_else(|| anyhow::anyhow!("GLM Spark inventory needs EXL3, FP8 or native NVFP4 headers"))?;
+    for &layer in layers { tensors.validate_layer(layer)?; }
+    (0..ranks).map(|rank| native_layer_resident(tensors, ranks, rank, slicing)?
+        .checked_mul(layers.len() as u64).ok_or_else(|| anyhow::anyhow!("GLM Spark residency overflow"))).collect()
+}
+
 pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool) -> anyhow::Result<LocalInventory> {
     local_inventory_selected(catalog, manifest, selected_layers, rows, lanes, exchange_f32,
@@ -506,7 +551,7 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
 fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
     -> anyhow::Result<LocalInventory> {
-    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    use crate::formats::fp8_experts::{ExpertFormat, Slicing};
     let tensors = catalog.fp8().filter(|t| t.format() == ExpertFormat::Nvfp4)
         .ok_or_else(|| anyhow::anyhow!("GLM RTX TP2 needs EXL3 or native ModelOpt NVFP4 expert tensors"))?;
     anyhow::ensure!(!exchange_f32,
@@ -558,14 +603,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     anyhow::ensure!(library.is_file(), "GLM TP2 missing binary {}", library.display());
     let backend_workspace = scratch.checked_add(max_rows * shape.hidden as u64 * 2)
         .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 workspace overflow"))?;
-    let resident = |tp, rank| -> anyhow::Result<u64> {
-        Fp8Projection::ALL.iter().try_fold(0u64, |sum, &projection| {
-            let (weights, _) = tensors.slice_bytes_with(projection, tp, rank, Slicing::Blocks(128))?;
-            Ok(sum + (shape.experts * weights).max(FLOOR as usize) as u64
-                + tensors.scale_region_bytes_with(projection, tp, rank, Slicing::Blocks(128))?
-                    .max(FLOOR as usize) as u64)
-        })
-    };
+    let resident = |tp, rank| native_layer_resident(tensors, tp, rank, Slicing::Blocks(128));
     let whole = Bytes2 { resident: resident(1, 0)?, staging: 0 };
     let halves = [resident(2, 0)?, resident(2, 1)?];
     let experts = (shape.first_layer..selected_layers).map(|layer| -> anyhow::Result<ExpertCost> {
@@ -1011,6 +1049,82 @@ mod tests {
             std::fs::write(package.join("tp2/libcuteafd_fp8moe.so"), b"").unwrap();
         }
         (dir, catalog, manifest)
+    }
+
+    fn extend_routed_fixture(catalog: &crate::OfficialV41Catalog, mut tensors: Vec<crate::plan::testing::Tensor>)
+        -> crate::OfficialV41Catalog {
+        let mut config = crate::plan::checkpoint::read_json(&catalog.snapshot().join("config.json")).unwrap();
+        config["num_hidden_layers"] = serde_json::json!(4);
+        config["indexer_types"] = serde_json::json!(["full", "shared", "shared", "shared"]);
+        config["mlp_layer_types"] = serde_json::json!(["dense", "sparse", "sparse", "sparse"]);
+        let routed: Vec<_> = tensors.iter().filter(|(name, ..)| name.starts_with("model.layers.1."))
+            .cloned().collect();
+        for layer in 2..4 {
+            tensors.extend(routed.iter().cloned().map(|(name, dtype, shape)|
+                (name.replacen("model.layers.1.", &format!("model.layers.{layer}."), 1), dtype, shape)));
+        }
+        crate::plan::testing::write_snapshot(catalog.snapshot(), &config, &tensors, None);
+        crate::read_expert_catalog(catalog.snapshot()).unwrap()
+    }
+
+    #[test]
+    fn spark_nvfp4_residency_charges_selected_suffix_and_replicated_scalars() {
+        use crate::formats::fp8_experts::Slicing;
+        let (_dir, catalog, _manifest) = nvfp4_fixture();
+        let catalog = extend_routed_fixture(&catalog, nvfp4_checkpoint_tensors());
+        let scalars = 3 * 256 * 8;
+        let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
+        for ranks in [2, 3, 4, 6] {
+            for slicing in [Slicing::Blocks(128), Slicing::Padded] {
+                let whole_suffix = spark_resident_bytes(&catalog, &[1, 2, 3], ranks, slicing).unwrap();
+                let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, slicing).unwrap();
+                for rank in 0..ranks {
+                    let width = catalog.fp8().unwrap().rank_width(ranks, rank, slicing).unwrap() as u64;
+                    assert_eq!(selected[rank], 2 * bytes(width));
+                    assert_eq!(whole_suffix[rank], 3 * bytes(width));
+                }
+            }
+        }
+        let exact = spark_resident_bytes(&catalog, &[3], 6, Slicing::Blocks(128)).unwrap();
+        let padded = spark_resident_bytes(&catalog, &[3], 6, Slicing::Padded).unwrap();
+        assert_eq!(exact, [bytes(384), bytes(384), bytes(384), bytes(384), bytes(256), bytes(256)]);
+        assert_eq!(padded, vec![bytes(384); 6]);
+        // Per-expert alpha/input scales replicate; they must not shrink with the slice.
+        assert_ne!(exact[0] * 2, exact[4] * 3);
+        assert_eq!(exact.iter().sum::<u64>(), bytes(2048) + 5 * scalars);
+        assert!(spark_resident_bytes(&catalog, &[], 0, Slicing::Padded).unwrap().is_empty());
+        for (layers, ranks) in [(vec![], 4), (vec![1], 4), (vec![3, 2], 4),
+            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 5), (vec![4], 4)] {
+            assert!(spark_resident_bytes(&catalog, &layers, ranks, Slicing::Padded).is_err());
+        }
+    }
+
+    #[test]
+    fn spark_exl3_residency_uses_selected_layer_arenas_not_checkpoint_shares() {
+        use crate::formats::fp8_experts::Slicing;
+        use crate::plan::testing::{exl3, glm5_tensors};
+        let (_dir, catalog, _manifest) = local_fixture();
+        let mut tensors = glm5_tensors(|name, n, k| exl3(name, n, k, 4));
+        for expert in 1..256 {
+            for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
+                ("down_proj", 6144, 2048)] {
+                tensors.extend(exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+            }
+        }
+        let catalog = extend_routed_fixture(&catalog, tensors);
+        for ranks in [2, 3, 4, 6] {
+            let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, Slicing::Blocks(128)).unwrap();
+            for (rank, &bytes) in selected.iter().enumerate() {
+                let expected: u64 = [2, 3].into_iter().map(|layer|
+                    catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)
+                        .unwrap().device_arena_layout().unwrap().1 as u64).sum();
+                assert_eq!(bytes, expected);
+                assert_eq!(bytes % (2 << 20), 0);
+            }
+            assert_eq!(spark_resident_bytes(&catalog, &[3], ranks, Slicing::Blocks(128)).unwrap(),
+                selected.iter().map(|bytes| bytes / 2).collect::<Vec<_>>());
+        }
+        assert!(spark_resident_bytes(&catalog, &[2, 3], 6, Slicing::Padded).is_err());
     }
 
     #[test]
