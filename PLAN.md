@@ -6205,6 +6205,12 @@ Ideas TJ wants kept for later; not v2 work.
 - **NVFP4 TP3 vision placement** is the same bug as the encoder item above.
 - **DSH dashboard model gate** is unverified: the automation could not find
   the composer iframe.
+- **Mapped engram/PLE gathers over io_uring (TJ).** Today `Mapped` faults rows
+  through the page cache on host threads, with advisory prefetch. Submit each
+  step's known row set (and the next prefill chunk's) as batched io_uring
+  reads into a pinned staging ring, keeping page-cache hits.
+  `HostPreload` (whole table in pinned RAM) and `Device` stay opt-in and are
+  never auto-selected for tables this size: Qwen's BF16 PLE is 95.4 GiB.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
