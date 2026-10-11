@@ -414,7 +414,12 @@ impl Locks {
         // A deep shared queue can hold the pool for hours; CUTEAFD_SMOKE_LOCK_WAIT_S raises the bound.
         let wait = std::env::var("CUTEAFD_SMOKE_LOCK_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
         let deadline = Instant::now() + Duration::from_secs(wait);
-        let wanted: Vec<&'static str> = ordered.iter().copied().filter(|n| !self.held.contains_key(n)).collect();
+        // A parent `hwlock.py` already holding a lock for us names it here; taking it
+        // again would deadlock on our own parent.
+        let parent: Vec<String> = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default()
+            .split(',').filter(|s| !s.is_empty()).map(|s| format!("{}.lock", s.trim_end_matches(".lock"))).collect();
+        let wanted: Vec<&'static str> = ordered.iter().copied()
+            .filter(|n| !self.held.contains_key(n) && !parent.iter().any(|p| p == n)).collect();
         if wanted.is_empty() {
             return Ok(true);
         }

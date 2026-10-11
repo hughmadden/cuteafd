@@ -84,3 +84,26 @@ def test_timeout_exits_75_without_holding_anything(lockdir):
     assert result.returncode == 75
     assert busy.wait(timeout=30) == 0
     assert not list((lockdir / 'hwq').glob('*.ticket'))
+
+
+def test_hold_mode_exports_held_locks_and_gate_mode_leaves_them_free(lockdir):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    shown = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1,gpu0', '--', 'sh', '-c', 'echo $CUTEAFD_HW_LOCKS_HELD'],
+                           env=env, capture_output=True, text=True)
+    assert shown.stdout.strip() == 'gpu0,gpu1'
+    # --gate: the child can take the flock itself (no deadlock on our own parent).
+    child = f'import fcntl; f=open({str(lockdir / "gpu1.lock")!r},"a"); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)'
+    gated = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--gate', '--', sys.executable, '-c', child],
+                           env=env, capture_output=True, text=True)
+    assert gated.returncode == 0, gated.stderr
+
+
+def test_gate_ticket_keeps_later_waiters_behind_the_running_command(lockdir):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    first = subprocess.Popen([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--gate', '--', sys.executable, '-c',
+                              f'import time,pathlib; pathlib.Path({str(lockdir / "first")!r}).write_text(str(time.time())); time.sleep(1.0)'],
+                             env=env, stderr=subprocess.DEVNULL)
+    wait_for(lockdir / 'first')
+    second = spawn(lockdir, 'gpu1', 0.05, lockdir / 'second')
+    assert first.wait(timeout=30) == 0 and second.wait(timeout=30) == 0
+    assert wait_for(lockdir / 'second') - wait_for(lockdir / 'first') >= 0.9

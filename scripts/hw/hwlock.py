@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fair (first come, first served) acquisition of the cluster hardware locks.
 
-  scripts/hw/hwlock.py --locks sparks,gpu0,gpu1 [--wait SECONDS] -- CMD ARGS...
+  scripts/hw/hwlock.py --locks sparks,gpu0,gpu1 [--wait SECONDS] [--gate] -- CMD ARGS...
 
 Each request takes a numbered ticket in ~/.cache/cuteafd/hwq and holds an
 exclusive flock on it while it waits; a ticket whose flock is free belongs to a
@@ -10,8 +10,13 @@ ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
 order (sparks, gpu0, gpu1, rhea, moa), so callers that still use plain flock
-stay excluded (they are just not queued fairly). Locks are held while CMD runs
-and released when it exits. Exit 75 when the wait expires.
+stay excluded (they are just not queued fairly). Exit 75 when the wait expires.
+
+Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
+them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
+CMD that takes the locks itself (an older smoke binary, a driver script): once
+it is our turn the locks are left for CMD, and our ticket stays live until CMD
+exits, so later ticket holders still wait behind it.
 """
 from __future__ import annotations
 
@@ -107,8 +112,9 @@ def _try_flocks(locks: list[str]) -> list | None:
 
 
 @contextlib.contextmanager
-def hold(names, wait: float, label: str = ''):
-    """Hold `names` (canonical order) for the body; FIFO against other tickets."""
+def hold(names, wait: float, label: str = '', gate: bool = False):
+    """Hold `names` (canonical order) for the body; FIFO against other tickets.
+    With `gate`, release the flocks at our turn and keep the ticket instead."""
     locks = canonical(names)
     queue = _queue()
     seq, path, ticket = _take_ticket(queue, locks)
@@ -126,8 +132,16 @@ def hold(names, wait: float, label: str = ''):
                 print(f'hwlock: ticket {seq} queued for {",".join(locks)} {label}'.rstrip(), file=sys.stderr)
                 announced = True
             time.sleep(POLL_S)
-    finally:
-        # Once the flocks are held they exclude everyone; the ticket only orders waiters.
+    except BaseException:
+        path.unlink(missing_ok=True)
+        ticket.close()
+        raise
+    if gate:
+        for handle in held:
+            handle.close()
+        held = []
+    else:
+        # The flocks now exclude everyone; the ticket only ordered the waiters.
         path.unlink(missing_ok=True)
         ticket.close()
     try:
@@ -135,20 +149,28 @@ def hold(names, wait: float, label: str = ''):
     finally:
         for handle in held:
             handle.close()
+        if gate:
+            path.unlink(missing_ok=True)
+            ticket.close()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--locks', required=True, help='comma list of ' + ', '.join(ORDER))
     parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)))
+    parser.add_argument('--gate', action='store_true', help='CMD takes the locks itself; keep only our turn')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
     if not cmd:
         parser.error('missing command')
     try:
-        with hold(args.locks.split(','), args.wait, ' '.join(cmd[:2])):
-            return subprocess.run(cmd).returncode
+        locks = canonical(args.locks.split(','))
+        with hold(locks, args.wait, ' '.join(cmd[:2]), gate=args.gate):
+            env = dict(os.environ)
+            if not args.gate:
+                env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
+            return subprocess.run(cmd, env=env).returncode
     except TimeoutError as error:
         print(f'hwlock: {error}', file=sys.stderr)
         return 75
