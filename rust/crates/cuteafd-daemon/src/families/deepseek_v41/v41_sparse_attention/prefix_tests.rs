@@ -196,8 +196,8 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
 #[test]
 fn compact_wave_budget_preserves_full_geometry() -> Result<()> {
     for capacity in [1,48,80,4096] {
-        let scratch=V41SparseAttention::split_scratch_bytes(capacity.min(48),10)?;
-        let descriptors=V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?;
+        let scratch=V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS),10)?;
+        let descriptors=V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?;
         assert_eq!(SparseAttentionWave::device_bytes(capacity)?,capacity*131160+scratch+descriptors);
         assert_eq!(CompactSparseAttentionWave::device_bytes(capacity)?,capacity*(65536+88)+scratch/2+descriptors);
     }

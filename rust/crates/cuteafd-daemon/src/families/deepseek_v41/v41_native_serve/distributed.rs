@@ -264,8 +264,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 )?,
             )?,
             PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?)?,
-            DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], if args.dspark_draft_limit > 5 { 64 } else { 48 },
-                DistributedTargetHead::device_bytes(if args.dspark_draft_limit > 5 { 64 } else { 48 }, 64640)?)?,
+            DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
+                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?)?,
             devices[1]
                 .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?))?,
             Duration::from_secs(120),
@@ -273,7 +273,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     };
     let mut pass = make_pass(capacity).context("constructing first distributed target lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
-    if args.dspark && args.dspark_draft_limit > 5 { pass.reserve_sparse_decode_rows(64)?; }
     memory_checkpoint("first target lane")?;
     // Both lanes also produce source 20 from every encoder row on GPU1, so
     // backbone/query and producer buffers retain full prefill capacity there.
@@ -282,7 +281,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // TP2 expert workspaces remain full capacity on both GPUs and lanes.
     let mut second = make_pass(80).context("constructing second distributed target lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
-    if args.dspark && args.dspark_draft_limit > 5 { second.reserve_sparse_decode_rows(64)?; }
     memory_checkpoint("second target lane")?;
     let draft_weights = if args.dspark {
         let width=if args.dspark_draft_limit>5 {7} else {5};

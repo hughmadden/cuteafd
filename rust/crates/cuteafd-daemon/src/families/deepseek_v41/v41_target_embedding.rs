@@ -71,7 +71,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             image_features: DeviceAllocation::new(library, capacity * 10240)?,
             image_indices: DeviceAllocation::new(library, capacity * 4)?,
             capacity,
-            graphs: RowGraphs::new(library, "target_embedding", 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1)),
+            graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS),
             tokens: Vec::with_capacity(capacity),
             positions: Vec::with_capacity(capacity),
             ready: false,

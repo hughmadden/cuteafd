@@ -1445,7 +1445,7 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
 
 fn bound_inputs(inputs: &mut [Vec<u32>]) {
     let mut lengths: Vec<_> = inputs.iter().map(|input| input.len() - 1).collect();
-    crate::shared::draft::resource::trim_budget(&mut lengths, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1));
+    crate::shared::draft::resource::trim_budget(&mut lengths, cuteafd_core::V41_VERIFY_ROWS);
     for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length + 1); }
 }
 
@@ -2157,6 +2157,17 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn verifier_budget_preserves_anchors_and_admits_copy_tails() {
+        let mut inputs = vec![vec![10; 38]; 16];
+        bound_inputs(&mut inputs);
+        assert_eq!(inputs.iter().map(Vec::len).sum::<usize>(), cuteafd_core::V41_VERIFY_ROWS);
+        assert!(inputs.iter().all(|input| !input.is_empty()));
+        let mut solo = vec![vec![10; 38]];
+        bound_inputs(&mut solo);
+        assert_eq!(solo[0].len(), 38);
+    }
 
     /// Position-sensitive logits so different absolute indices and rows differ.
     fn rows(count: usize) -> Vec<u8> {

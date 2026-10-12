@@ -107,7 +107,7 @@ impl<'a> BackboneSharedWeights<'a> {
             result: DeviceAllocation::new(self.library, capacity as usize * 10240)?,
             layer: self.layer,
             capacity,
-            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             weights: self,
             ready: None,
             origin: None,

@@ -111,7 +111,7 @@ impl<'a> IndexQueryWeights<'a> {
             scales: DeviceAllocation::new(self.library, rows * 128)?,
             head_weights: DeviceAllocation::new(self.library, rows * 64)?,
             capacity,
-            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
             pending: None,
             origin: None,

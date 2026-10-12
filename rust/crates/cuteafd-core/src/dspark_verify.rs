@@ -2,6 +2,9 @@
 //! Neural width is independent of the target verifier row budget.
 pub const MAX_DSPARK_PROPOSALS: usize = 7;
 
+/// Total target rows per V4.1 verifier lane, including all request anchors.
+pub const V41_VERIFY_ROWS: usize = 64;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct GreedyVerification {
     /// Input rows to publish, including the anchor. A correction/bonus token

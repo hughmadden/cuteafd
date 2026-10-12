@@ -200,7 +200,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
         let drafted_requests = round.drafted_requests;
-        let selection = policy.select_drafted_within(shared, &candidates, width, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1), drafted_requests)?;
+        let selection = policy.select_drafted_within(shared, &candidates, width, cuteafd_core::V41_VERIFY_ROWS, drafted_requests)?;
         Ok(match selection {
             Some(selection) => {
                 tracing::debug!(target: "cuteafd::draft_policy", lane, shared,
