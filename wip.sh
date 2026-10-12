@@ -886,12 +886,20 @@ build_coordinator() {
   # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
   # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
   # the GPU export, reuse and staging hold none.
-  local rust_status=0
-  if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
-    "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust || rust_status=$?
-  else
-    "${coordinator_build[@]}" rust || rust_status=$?
-  fi
+  local rust_status=0 attempt
+  # One retry: a coordinator Rust exec has twice reported 127 although the phase
+  # inside the container completed (open issue). The phase is idempotent and a
+  # retry over a fresh Cargo target takes seconds; a real compile error fails twice.
+  for attempt in 1 2; do
+    rust_status=0
+    if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+      "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust || rust_status=$?
+    else
+      "${coordinator_build[@]}" rust || rust_status=$?
+    fi
+    ((rust_status != 0 && attempt == 1)) || break
+    echo "WIP coordinator Rust phase exited $rust_status; retrying once" >&2
+  done
   ((rust_status == 0)) || release_die "coordinator WIP Rust phase failed (exit $rust_status)"
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
   if [[ "${wip_export_locks:-off}" != on ]]; then
@@ -983,13 +991,25 @@ case "$wip_build_roles" in
   coordinator) build_coordinator ;;
   expert) build_expert ;;
   both)
-    build_coordinator &
+    # The coordinator leg records its own exit status: a `wait` that returns
+    # early (seen when the Spark leg finished first) must not be read as the
+    # leg's result while it is still running.
+    coordinator_status_file="$(mktemp "${TMPDIR:-/tmp}/wip-coordinator-status.XXXXXXXX")"
+    ( set +e; ( build_coordinator ); printf '%s\n' "$?" >"$coordinator_status_file" ) &
     coordinator_build_pid=$!
+    wip_wait_coordinator() {
+      local status
+      wait "$coordinator_build_pid" 2>/dev/null || true
+      while kill -0 "$coordinator_build_pid" 2>/dev/null; do sleep 2; done
+      status="$(cat "$coordinator_status_file" 2>/dev/null || true)"
+      rm -f "$coordinator_status_file"
+      [[ "$status" == 0 ]] || { echo "coordinator WIP leg exited ${status:-without a status}" >&2; return 1; }
+    }
     if ! build_expert; then
-      wait "$coordinator_build_pid" || true
+      wip_wait_coordinator || true
       release_die "Spark WIP build failed"
     fi
-    wait "$coordinator_build_pid" || release_die "coordinator WIP build failed"
+    wip_wait_coordinator || release_die "coordinator WIP build failed"
     ;;
   none) echo "WIP slot $slot: every role reused; nothing to build" ;;
 esac
