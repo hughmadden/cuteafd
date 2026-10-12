@@ -201,6 +201,67 @@ fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestRe
 }
 
 #[test]
+fn all_backends_gather_identical_random_cold_and_warm_rows() -> TestResult {
+    let page = page_bytes()?;
+    let width = page + 13;
+    let counts = [67, 71];
+    let total: usize = counts.iter().sum();
+    let payload: Vec<_> = (0..total * width).map(|i| ((i * 17 + i / width) % 251) as u8).collect();
+    let dir = tempfile::tempdir_in(std::env::var_os("TMPDIR").map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_dir()?))?;
+    let mut parts = Vec::new();
+    let mut first = 0;
+    for (index, &count) in counts.iter().enumerate() {
+        let path = dir.path().join(format!("part-{index}"));
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(&[0; 17])?;
+        file.write_all(&payload[first * width..(first + count) * width])?;
+        file.sync_all()?;
+        parts.push(TablePart { path, offset: 17, rows: count as u64 });
+        first += count;
+    }
+    let mut random = 0x1234_5678_u64;
+    let mut rows = vec![0, 66, 67, 137, 67, 0];
+    for _ in 0..250 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        rows.push(random % total as u64);
+    }
+    let slots: Vec<_> = (0..rows.len()).rev().collect();
+    let mut expected = vec![0; rows.len() * width];
+    for (&row, &slot) in rows.iter().zip(&slots) {
+        expected[slot * width..(slot + 1) * width]
+            .copy_from_slice(&payload[row as usize * width..(row as usize + 1) * width]);
+    }
+    for backend in [TableBackend::Mmap, TableBackend::MincoreRouted, TableBackend::Uring] {
+        // SAFETY: the test owns immutable shards until this table is dropped.
+        let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
+        table.select_backend(backend);
+        if table.backend() != backend {
+            assert!(std::env::var_os("CUTEAFD_REQUIRE_URING").is_none(),
+                "required backend {backend:?} unavailable");
+            eprintln!("SKIP {backend:?} parity: kernel/seccomp disallows io_uring");
+            continue;
+        }
+        // Previous mappings are dropped before eviction, so mincore certifies cold rows.
+        for part in &table.parts { assert_eq!(uring::dontneed(part), 0); }
+        assert!(table.residency(&rows, false)?.iter().all(|&resident| !resident));
+        let mut cold = vec![0xa5; expected.len()];
+        table.gather_slots(&rows, &slots, &mut cold)?;
+        assert_eq!(cold, expected, "cold {backend:?}");
+        assert_eq!(table.backend(), backend, "runtime fallback is not qualification");
+        assert!(table.residency(&rows, false)?.iter().all(|&resident| resident));
+        let mut warm = vec![0x5a; expected.len()];
+        table.gather_slots(&rows, &slots, &mut warm)?;
+        assert_eq!(warm, expected, "warm {backend:?}");
+        assert_eq!(warm, cold);
+        assert_eq!(table.backend(), backend);
+    }
+    Ok(())
+}
+
+#[test]
 fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
     // /tmp is often tmpfs (which cannot evict clean file pages). Cargo's
     // current working directory is the disk-backed workspace on our hosts.
