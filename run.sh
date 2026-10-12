@@ -651,6 +651,13 @@ done
 
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
+trace_args=()
+if [[ -n "${SPECULATION_TRACE:-}" ]]; then
+  [[ "$SPECULATION_TRACE" == /* ]] || release_die 'SPECULATION_TRACE must be an absolute path'
+  mkdir -p "$(dirname "$SPECULATION_TRACE")"
+  trace_args+=(-v "$(dirname "$SPECULATION_TRACE"):$(dirname "$SPECULATION_TRACE")"
+    -e "CUTEAFD_SPECULATION_TRACE=$SPECULATION_TRACE")
+fi
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || release_die 'Graph census requires a WIP build'
@@ -773,7 +780,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
-  "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${graph_census_args[@]}" \
+  "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null

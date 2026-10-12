@@ -142,7 +142,6 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
 /// Opt-in complete observation capture, including dSpark head evidence. The
 /// selector-only ConfidencePolicy trace does not cover that serving path.
 fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
-    use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     static TRACE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
     let Some(trace) = TRACE.get_or_init(|| {
@@ -152,6 +151,26 @@ fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
             Err(error) => { tracing::warn!(%error, "draft round trace open failed"); None }
         }
     }) else { return };
+    let geometry = policy.geometry();
+    if record.routes.layers() != geometry.layers.len()
+        || record.routes.flat().len() != geometry.layers.len() * record.routes.rows() * usize::from(geometry.topk) {
+        return;
+    }
+    let value = round_trace_value(policy, record);
+    if let Ok(mut trace) = trace.lock() {
+        if let Err(error) = write_round_trace(&mut *trace, &value) {
+            tracing::warn!(%error, "draft round trace failed");
+        }
+    }
+}
+
+fn write_round_trace(writer: &mut impl std::io::Write, value: &serde_json::Value) -> std::io::Result<()> {
+    writeln!(writer, "{value}")?;
+    // Static writers are not dropped at process exit; retain every completed round.
+    writer.flush()
+}
+
+fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_json::Value {
     let geometry = policy.geometry();
     let rows = record.routes.rows();
     let topk = usize::from(geometry.topk);
@@ -170,10 +189,11 @@ fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
         let calibrated = raw.map(|confidence| policy.probabilities(cuteafd_core::DraftCandidate { id: request.id, confidence }));
         serde_json::json!({"id": request.id, "chosen_rows": policy.selected_rows(request.id), "verified_rows": request.rows,
             "accepted_rows": request.accepted, "source": format!("{:?}", request.source),
+            "censor": request.censor.map(|reason| format!("{reason:?}")),
             "raw_confidence": raw, "calibrated_confidence": calibrated})
     }).collect();
     let fit = policy.cost_snapshot(record.shared, record.requests.len());
-    let value = serde_json::json!({"type": "draft_round", "round": policy.stats().rounds,
+    serde_json::json!({"type": "draft_round", "round": policy.stats().rounds,
         "shared": record.shared, "requests": requests, "rows": rows, "routes": routes,
         "route_layout": [geometry.layers.len(), rows, topk],
         "geometry": geometry.layers.iter().map(|l| serde_json::json!({"class": l.class,
@@ -183,10 +203,7 @@ fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
         "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
         "predicted_us": record.predicted, "row_knots": fit.row_knots,
         "layer_row_slopes": fit.layer_row_slopes, "round_row_slopes": fit.round_row_slopes,
-        "layer_row_identified": fit.layer_row_identified, "round_row_identified": fit.round_row_identified});
-    if let Ok(mut trace) = trace.lock() {
-        if let Err(error) = writeln!(trace, "{value}") { tracing::warn!(%error, "draft round trace failed"); }
-    }
+        "layer_row_identified": fit.layer_row_identified, "round_row_identified": fit.round_row_identified})
 }
 
 /// What a lane carries from its draft pass and length selection to the
@@ -318,6 +335,68 @@ mod tests {
         assert_eq!(fit.round[3], 160.);
         assert_eq!(fit.draft[4], 160.);
         assert_eq!(policy.stats().emitted_requests, 320);
+    }
+
+    #[test]
+    fn round_trace_captures_head_routes_grouped_bytes_and_calibrated_probabilities() {
+        use cuteafd_core::{DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 2, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 4, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()], regimes: 1 };
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let p = [0.9; 5];
+        let candidates = [DraftCandidate { id: 1, confidence: &p }];
+        for _ in 0..160 {
+            let requests = [request(1, 6, 4, DraftSource::Neural, Some(Evidence::Head(&p)), None)];
+            let routes = routes(6);
+            observe(&mut policy, &RoundRecord { shared: false, requests: &requests, routes: &routes,
+                layer_us: &[Some(100.), Some(100.)], times: RoundTimes { total_us: 800, draft_us: Some(200) },
+                draft: Some(DraftPass { width: 5, requests: Some(1) }), predicted: None }).unwrap();
+        }
+        let selection = policy.select_drafted_within(false, &candidates, 5, 6, 1).unwrap().unwrap();
+        let requests = [request(1, 3, 2, DraftSource::Neural, Some(Evidence::Head(&p)), Some(Censor::Eos))];
+        let routes = routes(3);
+        let value = round_trace_value(&policy, &RoundRecord { shared: false, ..record(&requests, &routes,
+            Some(DraftPass { width: 5, requests: Some(1) })) });
+        assert_eq!(value["type"], "draft_round");
+        assert_eq!(value["route_layout"], serde_json::json!([2, 3, 2]));
+        assert_eq!(value["routes"], serde_json::json!(routes.flat()));
+        assert_eq!(value["megabytes"], serde_json::json!([4., 4.]));
+        let request = &value["requests"][0];
+        assert_eq!(request["raw_confidence"], serde_json::json!(p));
+        assert_eq!(request["calibrated_confidence"], serde_json::json!(policy.probabilities(candidates[0])));
+        assert_eq!(request["chosen_rows"], selection.lengths[0] + 1);
+        assert_eq!(request["verified_rows"], 3);
+        assert_eq!(request["accepted_rows"], 2);
+        assert_eq!(request["censor"], "Eos");
+        assert_eq!(value["layer_row_slopes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["row_knots"].as_array().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn round_trace_flushes_each_completed_record() {
+        struct Writer { bytes: Vec<u8>, flushed: bool }
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.flushed = true; Ok(()) }
+        }
+        let mut writer = Writer { bytes: Vec::new(), flushed: false };
+        let value = serde_json::json!({"type": "draft_round"});
+        write_round_trace(&mut writer, &value).unwrap();
+        assert!(writer.flushed);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(), value);
+        struct BrokenFlush;
+        impl std::io::Write for BrokenFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { Ok(bytes.len()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "trace sink closed"))
+            }
+        }
+        assert_eq!(write_round_trace(&mut BrokenFlush, &value).unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
