@@ -702,3 +702,44 @@ def test_release_arm_checks_local_and_remote_images(monkeypatch):
     assert calls[0] == ['docker', 'image', 'inspect', 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0']
     assert calls[1][:4] == ['ssh', '-o', 'BatchMode=yes', 'kiwi']
     assert 'cuteafd-spark-expert:v2.0.0' in calls[1][-1]
+
+
+def _sealed_slot(root, slot='s', role='coordinator', instance='inst'):
+    import hashlib
+    p = root / 'slots' / slot / role
+    (p / 'workspace/.cuteafd-wip').mkdir(parents=True)
+    (p / 'SOURCE_SHA256SUMS').write_text('source\n')
+    (p / 'workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS').write_text('artifacts\n')
+    meta = json.dumps(dict(slot=slot, role=role, wip_instance=instance,
+        source_manifest_sha256=hashlib.sha256(b'source\n').hexdigest(),
+        artifact_manifest_sha256=hashlib.sha256(b'artifacts\n').hexdigest())).encode()
+    (p / 'META.json').write_bytes(meta)
+    (p / 'FINGERPRINT').write_text(hashlib.sha256(meta).hexdigest() + '\n')
+    return p
+
+
+def test_slot_check_reads_host_root_without_any_container(tmp_path, monkeypatch):
+    # A build stops its WIP containers; the seal check reads the bind-mounted
+    # root on the host and never execs, starts or needs a container.
+    root = tmp_path / 'wip-inst'
+    slot = _sealed_slot(root)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    log = tmp_path / 'docker.log'
+    (bin_dir / 'docker').write_text(f'#!/bin/sh\necho "$@" >> {log}\nexit 1\n')
+    (bin_dir / 'docker').chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    arm = dict(instance='serving', wip_instance='inst', slot='s', root=str(root))
+    meta = json.loads(cards.slot_check(arm, 'raptor'))
+    assert meta['seal_source'] == 'host:' + str(slot)
+    assert not log.exists()
+    # Without a recorded root: the stopped container's /wip mount, inspected only.
+    arm.pop('root')
+    (bin_dir / 'docker').write_text(f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = inspect ] && echo {root}\n')
+    meta = json.loads(cards.slot_check(arm, 'raptor'))
+    assert meta['seal_source'] == 'host:' + str(slot)
+    assert all(line.startswith('inspect ') for line in log.read_text().splitlines())
+    # Integrity checks are unchanged: a tampered artifact manifest is refused.
+    (slot / 'workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS').write_text('changed\n')
+    with pytest.raises(ValueError, match='raptor: missing or unsealed WIP slot serving:s: .*ARTIFACT_SHA256SUMS seal mismatch'):
+        cards.slot_check(arm, 'raptor')

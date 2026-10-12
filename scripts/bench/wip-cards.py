@@ -687,22 +687,46 @@ def slot_check(arm, host):
     instance = arm.get('wip_instance', arm['instance'])
     container = ('cuteafd-coordinator-wip-' if host == 'raptor' else 'cuteafd-spark-expert-wip-') + instance
     role = 'coordinator' if host == 'raptor' else 'spark-expert'
-    program = '''import hashlib,json,pathlib,sys
-p=pathlib.Path('/wip/slots')/sys.argv[1]/sys.argv[2]
-meta=(p/'META.json').read_bytes()
-assert hashlib.sha256(meta).hexdigest()==(p/'FINGERPRINT').read_text().strip(), 'META seal mismatch'
-m=json.loads(meta)
-assert m['slot']==sys.argv[1] and m['role']==sys.argv[2] and m['wip_instance']==sys.argv[3], 'slot identity mismatch'
-for relative,key in [('SOURCE_SHA256SUMS','source_manifest_sha256'),('workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS','artifact_manifest_sha256')]:
-    assert hashlib.sha256((p/relative).read_bytes()).hexdigest()==m[key], relative+' seal mismatch'
-m['seal_sha256']=hashlib.sha256(meta).hexdigest()
-print(json.dumps(m))
-'''
-    cmd = ['docker', 'exec', container, 'python3', '-c', program, arm['slot'], role, instance]
+    # Reads the sealed slot from the host side of the /wip bind mount: builds stop
+    # their WIP containers, and a check must never start one. The root is the
+    # task's own build root, else the (possibly stopped) container's /wip mount
+    # source, else the default WIP_ROOT layout. Only a legacy root slot the host
+    # user cannot read falls back to exec in an already running container.
+    root = arm.get('root') or '-'
+    cmd = ['python3', '-c', SLOT_SEAL_CHECK, arm['slot'], role, instance, container, root]
     try:
         return run(cmd if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]).stdout
     except subprocess.SubprocessError as error:
-        raise ValueError(f'{host}: missing or unsealed WIP slot {arm["instance"]}:{arm["slot"]}: {getattr(error, "stderr", str(error))}') from None
+        detail = (getattr(error, 'stderr', None) or str(error)).strip().splitlines()
+        raise ValueError(f'{host}: missing or unsealed WIP slot {arm["instance"]}:{arm["slot"]}: {detail[-1] if detail else error}') from None
+
+
+SLOT_SEAL_CHECK = '''import hashlib,json,pathlib,subprocess,sys
+slot,role,instance,container,root=sys.argv[1:6]
+def check(p,read):
+    meta=read(p/'META.json')
+    assert hashlib.sha256(meta).hexdigest()==read(p/'FINGERPRINT').decode().strip(), 'META seal mismatch'
+    m=json.loads(meta)
+    assert m['slot']==slot and m['role']==role and m['wip_instance']==instance, 'slot identity mismatch'
+    for relative,key in [('SOURCE_SHA256SUMS','source_manifest_sha256'),('workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS','artifact_manifest_sha256')]:
+        assert hashlib.sha256(read(p/relative)).hexdigest()==m[key], relative+' seal mismatch'
+    m['seal_sha256']=hashlib.sha256(meta).hexdigest()
+    return m
+if root=='-':
+    found=subprocess.run(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}',container],capture_output=True,text=True)
+    root=found.stdout.strip() if found.returncode==0 and found.stdout.strip() else str(pathlib.Path.home()/'.cache/cuteafd/builds'/('wip-'+instance))
+host=pathlib.Path(root)/'slots'/slot/role
+try:
+    m=check(host,lambda path: path.read_bytes())
+    m['seal_source']='host:'+str(host)
+except PermissionError:
+    state=subprocess.run(['docker','inspect','-f','{{.State.Running}}',container],capture_output=True,text=True).stdout.strip()
+    if state!='true':
+        raise
+    m=check(pathlib.Path('/wip/slots')/slot/role,lambda path: subprocess.run(['docker','exec',container,'cat',str(path)],check=True,capture_output=True).stdout)
+    m['seal_source']='exec:'+container
+print(json.dumps(m))
+'''
 
 
 def cleanup_script(arm, task):
