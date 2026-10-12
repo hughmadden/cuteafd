@@ -2967,6 +2967,8 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
+    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
+
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
         if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }

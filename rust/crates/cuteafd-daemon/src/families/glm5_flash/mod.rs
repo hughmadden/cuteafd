@@ -901,6 +901,13 @@ pub(crate) struct GoldenArgs {
     /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
+    /// Run --replay-check through serving's captured graphs and padded row buckets,
+    /// N may include copy-extension rows beyond the neural draft window.
+    #[arg(long, requires = "replay_check")]
+    pub replay_production: bool,
+    /// Replay a one-request speculation JSONL trace round by round against serial decode.
+    #[arg(long, requires = "replay_production")]
+    pub replay_trace: Option<PathBuf>,
     /// Require byte-exact real-row logits for speculative masked decode padding 3->4, 9->16, 17->32 and 33->64.
     #[arg(long)]
     pub padding_check: bool,
@@ -965,6 +972,35 @@ pub(crate) struct GoldenArgs {
     /// host sampling.
     #[arg(long)]
     pub token_check: Option<usize>,
+}
+
+#[cfg(test)]
+mod replay_cli_tests {
+    use super::GoldenArgs;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        args: GoldenArgs,
+    }
+
+    #[test]
+    fn production_replay_requires_a_replay_width() {
+        let base = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden"];
+        assert!(Parse::try_parse_from(base.into_iter().chain(["--replay-production"])).is_err());
+        let parsed = Parse::try_parse_from(base.into_iter()
+            .chain(["--replay-production", "--replay-check", "3"])).unwrap();
+        assert!(parsed.args.replay_production);
+        assert_eq!(parsed.args.replay_check, Some(3));
+        let eager = Parse::try_parse_from(base.into_iter().chain(["--replay-check", "9"])).unwrap();
+        assert!(!eager.args.replay_production);
+        assert_eq!(eager.args.replay_check, Some(9));
+        assert!(Parse::try_parse_from(base.into_iter().chain(["--replay-check", "9", "--replay-trace", "/trace"])).is_err());
+        let trace = Parse::try_parse_from(base.into_iter().chain(["--replay-check", "9", "--replay-production",
+            "--replay-trace", "/trace"])).unwrap();
+        assert_eq!(trace.args.replay_trace.as_deref(), Some(std::path::Path::new("/trace")));
+    }
 }
 
 /// Option combinations rejected before any checkpoint or native work.
@@ -1768,6 +1804,10 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
+    if args.replay_production {
+        // Capture speculative buckets even when this fixed-token diagnostic has no drafter.
+        args.engine.serving_graph_policy = Some((16, true));
+    }
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
     // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
     args.engine.mark_arena = if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena {

@@ -462,11 +462,161 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct ReplayRound {
+    round: u64,
+    spec: bool,
+    request_ids: Vec<u64>,
+    starts: Vec<usize>,
+    verify_tokens: Vec<Vec<u32>>,
+    committed_tokens: Vec<Vec<u32>>,
+    neural_tokens: Vec<Option<Vec<u32>>>,
+    finished: Vec<bool>,
+}
+
+fn parse_replay_rounds(text: &str, vocab: usize, decode_rows: usize) -> Result<Vec<ReplayRound>> {
+    let mut rounds = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let round: ReplayRound = serde_json::from_str(line).context("invalid speculation replay trace")?;
+        ensure!(round.request_ids.len() == 1 && round.starts.len() == 1 && round.verify_tokens.len() == 1
+            && round.committed_tokens.len() == 1 && round.neural_tokens.len() == 1 && round.finished.len() == 1,
+            "round {}: replay trace needs exactly one request", round.round);
+        let (input, emitted) = (&round.verify_tokens[0], &round.committed_tokens[0]);
+        ensure!(!input.is_empty() && input.len() <= decode_rows && !emitted.is_empty() && emitted.len() <= input.len(),
+            "round {}: invalid verify/commit width", round.round);
+        ensure!(input.iter().chain(emitted).all(|&id| (id as usize) < vocab),
+            "round {}: token outside vocabulary", round.round);
+        ensure!(input[1..emitted.len()] == emitted[..emitted.len() - 1],
+            "round {}: accepted inputs do not match emissions", round.round);
+        rounds.push(round);
+    }
+    ensure!(!rounds.is_empty(), "empty speculation replay trace");
+    Ok(rounds)
+}
+
+/// The target, selector, commit and drafter context lifecycle from a cold single-request trace.
+fn replay_rounds(engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
+    path: &std::path::Path) -> Result<()> {
+    use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
+    use cuteafd_core::TargetSamplingParams;
+    let rounds = parse_replay_rounds(&std::fs::read_to_string(path)?, engine.cfg.vocab_size, engine.decode_rows)?;
+    ensure!(engine.production_replay_ready() && engine.slots >= 2, "trace replay needs production graphs and two slots");
+    let capacity = rounds.iter().map(|r| r.starts[0].checked_add(r.verify_tokens[0].len())
+        .context("trace position overflow")).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap().max(prefill);
+    ensure!(capacity <= engine.max_context, "trace exceeds admitted context");
+    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut target = allocator.admit(capacity)?;
+    let mut serial = allocator.admit(capacity)?;
+    let prompt_logits = prefill_with_taps(engine, &mut target, &sequence[..prefill], 0)?;
+    let serial_prompt = engine.prefill(&mut serial, &sequence[..prefill], None)?
+        .context("serial replay prefill needs every layer")?;
+    finite_logits(&prompt_logits)?;
+    finite_logits(&serial_prompt)?;
+    ensure!(exact_logits(&prompt_logits, &serial_prompt)
+        && argmax(&prompt_logits) == rounds[0].verify_tokens[0][0],
+        "trace replay prompt logits or initial anchor diverged");
+    let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
+    let mut selector = TokenSelector::new(engine.library, SelectPlacement::Device, engine.cfg.vocab_size,
+        engine.decode_rows)?;
+    let vocab = engine.cfg.vocab_size;
+    let request = rounds[0].request_ids[0];
+    let mut anchor = argmax(&prompt_logits);
+    for round in rounds {
+        ensure!(round.request_ids[0] == request && round.starts[0] == target.len,
+            "round {}: request or position changed (expected {})", round.round, target.len);
+        let (input, emitted) = (&round.verify_tokens[0], &round.committed_tokens[0]);
+        ensure!(input[0] == anchor, "round {}: anchor does not continue the preceding emission", round.round);
+        let start = target.len;
+        if round.neural_tokens[0].is_some() {
+            let drafter = engine.drafter.as_ref().context("neural trace replay needs --draft")?;
+            let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor: input[0], position: start, valid_from: 0 }],
+                &engine.embedding, engine.draft_head())?.remove(0);
+            println!("round {}: neural proposal matches trace {}", round.round,
+                round.neural_tokens[0].as_ref().is_some_and(|tokens| *tokens == draft.tokens));
+        }
+        let logits = engine.verify_device(&mut [(&mut target, input.len())], input, round.spec)?
+            .context("trace replay needs every layer")?;
+        let mut batch = SelectBatch::default();
+        batch.push_sequence(TargetSamplingParams::greedy(), None, input, start as u64 + 1)?;
+        let selected = selector.select(&logits, &batch)?;
+        let actual = logits.to_host(engine.library)?;
+        finite_logits(&actual)?;
+        let keep = emitted.len();
+        let sampler_exact = selected.len() >= keep && selected.iter().take(keep).zip(actual.chunks_exact(vocab))
+            .all(|(selected, row)| selected.as_ref().is_ok_and(|s| s.token == argmax(row)));
+        ensure!(sampler_exact, "round {}: selector differs from downloaded logits", round.round);
+        // Finished cold requests release without commit/update, but their emitted logits still gate.
+        let committed = if round.finished[0] {
+            None
+        } else {
+            if round.spec { engine.commit(&[(target.slot, 0, keep)])?; }
+            target.len = start + keep;
+            target.kda_len = target.len;
+            let committed = engine.slot_state(target.slot)?;
+            if let Some(drafter) = &engine.drafter {
+                drafter.update(&(0..keep).map(|r| ContextRow { tap_row: r, slot: 0, position: start + r })
+                    .collect::<Vec<_>>())?;
+            }
+            ensure!(engine.slot_state(target.slot)? == committed,
+                "round {}: drafter context update changed target state", round.round);
+            Some(committed)
+        };
+        let mut expected = Vec::new();
+        for &token in &input[..keep] {
+            expected.extend(engine.verify_device(&mut [(&mut serial, 1)], &[token], false)?
+                .context("serial replay needs every layer")?.to_host(engine.library)?);
+        }
+        finite_logits(&expected)?;
+        let logit_exact = exact_logits(&actual[..keep * vocab], &expected);
+        let state_exact = match &committed {
+            Some(state) => *state == engine.slot_state(serial.slot)?,
+            None => true,
+        };
+        let paged_exact = round.finished[0] || super::prefix::paged_rows(&family, &target, target.len)?
+            == super::prefix::paged_rows(&family, &serial, serial.len)?;
+        let first = actual[..keep * vocab].iter().zip(&expected).position(|(a,b)| a.to_bits() != b.to_bits());
+        let emissions_exact = expected.chunks_exact(vocab).map(argmax).eq(emitted.iter().copied());
+        println!("round {}: start {start}, live {}, bucket {}, keep {keep}: logits exact {logit_exact}, \
+            first differing (row,vocab) {:?}; state exact {state_exact}; MLA exact {paged_exact}; \
+            selector exact {sampler_exact}; recorded emissions exact {emissions_exact}", round.round, input.len(),
+            engine.serving_decode_rows(input.len(), round.spec), first.map(|i| (i / vocab, i % vocab)));
+        ensure!(logit_exact && state_exact && paged_exact && sampler_exact && emissions_exact,
+            "round {}: first serving replay divergence", round.round);
+        if round.finished[0] {
+            println!("round {}: finished cold frontier; persistent state and MLA comparison skipped", round.round);
+            break;
+        }
+        anchor = *emitted.last().unwrap();
+    }
+    Ok(())
+}
+
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
     let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
+    if let Some(path) = &args.replay_trace {
+        return replay_rounds(engine, &sequence, prefill, path);
+    }
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
+    ensure!(!args.replay_production || engine.production_replay_ready(),
+        "--replay-production needs captured startup decode graphs");
+    let verify = |placement: &mut GlmfPlacement, count, input: &[u32], spec| -> Result<Vec<f32>> {
+        let logits = if args.replay_production {
+            engine.verify_device(&mut [(placement, count)], input, spec)?
+                .map(|logits| logits.to_host(engine.library)).transpose()?
+        } else if spec {
+            engine.verify_spec(&mut [(placement, count)], input)?
+        } else {
+            engine.verify(&mut [(placement, count)], input, None)?
+        };
+        logits.context("replay check needs every layer")
+    };
+    if args.replay_production {
+        println!("production replay: live rows {rows}, captured bucket {}; \
+            expert policy uses live rows, copy-extension rows use the same keep boundary",
+            engine.serving_decode_rows(rows, true));
+    }
     let embed = &sequence[prefill..prefill + rows];
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
     let kda_layers = engine.weights.layers.iter()
@@ -481,19 +631,18 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         Ok(placement)
     };
     let max_logit = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let mut production_exact = true;
     for keep in 1..=rows {
         let mut serial = fresh()?;
         let mut serial_logits = Vec::new();
         for j in 0..keep {
-            if let Some(l) = engine.verify(&mut [(&mut serial, 1)], &embed[j..j + 1], None)? {
-                serial_logits.push(l);
-            }
+            serial_logits.push(verify(&mut serial, 1, &embed[j..j + 1], false)?);
         }
         let mut spec = fresh()?;
         let start = spec.len;
         let initial = engine.slot_state(spec.slot)?;
         finite_state(&initial, recurrent_bytes, element)?;
-        let logits = engine.verify_spec(&mut [(&mut spec, rows)], embed)?.context("replay check needs every layer")?;
+        let logits = verify(&mut spec, rows, embed, true)?;
         finite_logits(&logits)?;
         ensure!(engine.slot_state(spec.slot)? == initial, "{rows}-row speculative verify changed uncommitted KDA state");
         engine.commit(&[(spec.slot, 0, keep)])?;
@@ -511,6 +660,36 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         println!("keep {keep}/{rows}: speculative verify + commit vs {keep} serial steps: {differ} state bytes differ \
             (max |delta| {worst:.3e}); kept-row logits max |delta| {logit:.3e}, mean KL(serial || verify) \
             {kl:.6} nat (geometry diagnostic)");
+        if args.replay_production {
+            let mut eager = fresh()?;
+            let eager_initial = engine.slot_state(eager.slot)?;
+            let eager_logits = engine.verify_spec(&mut [(&mut eager, rows)], embed)?
+                .context("replay check needs every layer")?;
+            finite_logits(&eager_logits)?;
+            ensure!(engine.slot_state(eager.slot)? == eager_initial,
+                "eager speculative verify changed uncommitted KDA state");
+            engine.commit(&[(eager.slot, 0, keep)])?;
+            eager.len = start + keep;
+            eager.kda_len = eager.len;
+            let eager_state = engine.slot_state(eager.slot)?;
+            finite_state(&eager_state, recurrent_bytes, element)?;
+            let (state_bytes, worst) = state_delta(&eager_state, &retained, recurrent_bytes, element);
+            let first_state = eager_state.iter().zip(&retained).position(|(a, b)| a != b);
+            let first_logit = eager_logits.iter().zip(&logits).position(|(a, b)| a.to_bits() != b.to_bits());
+            let eager_paged = super::prefix::paged_rows(&family, &eager, eager.len)?;
+            let production_paged = super::prefix::paged_rows(&family, &spec, spec.len)?;
+            let paged_exact = eager_paged == production_paged;
+            let first_paged = eager_paged.iter().zip(&production_paged).position(|(a, b)| a != b);
+            let bucket = engine.serving_decode_rows(rows, true);
+            println!("keep {keep}/{rows}: eager {rows} vs production bucket {bucket}: logits exact {}, \
+                first differing (row, vocab) {:?}, max |delta| {:.3e}; committed KDA/conv/index-tail \
+                state {state_bytes} bytes differ (first byte {first_state:?}, recurrent max |delta| \
+                {worst:.3e}); committed MLA exact {paged_exact}, first byte {first_paged:?}",
+                exact_logits(&eager_logits, &logits), first_logit.map(|i| (i / vocab, i % vocab)),
+                max_logit(&eager_logits, &logits));
+            production_exact &= exact_logits(&eager_logits, &logits) && eager_state == retained && paged_exact;
+            allocator.borrow_mut().release(eager);
+        }
         // Keep the execution geometry fixed. A later rejected token may change
         // neither an earlier logit nor the committed recurrent/paged state.
         let mut changed = embed.to_vec();
@@ -518,8 +697,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
             *token = (*token + 1) % engine.cfg.vocab_size as u32;
         }
         let mut alternate = fresh()?;
-        let alternate_logits = engine.verify_spec(&mut [(&mut alternate, rows)], &changed)?
-            .context("replay check needs every layer")?;
+        let alternate_logits = verify(&mut alternate, rows, &changed, true)?;
         finite_logits(&alternate_logits)?;
         engine.commit(&[(alternate.slot, 0, keep)])?;
         alternate.len = start + keep;
@@ -536,8 +714,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
             "keep {keep}/{rows}: rejected suffix changed committed MLA cache rows");
         if keep == rows {
             let mut plain = fresh()?;
-            let plain_logits = engine.verify(&mut [(&mut plain, rows)], embed, None)?
-                .context("replay check needs every layer")?;
+            let plain_logits = verify(&mut plain, rows, embed, false)?;
             finite_logits(&plain_logits)?;
             let plain_state = engine.slot_state(plain.slot)?;
             finite_state(&plain_state, recurrent_bytes, element)?;
@@ -546,11 +723,31 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
                 differ (max |delta| {worst:.3e})");
             ensure!(differ == 0 && exact_logits(&plain_logits, &logits),
                 "full {rows}-row replay commit differs from plain verify (same geometry)");
+            let plain_paged = super::prefix::paged_rows(&family, &plain, plain.len)?;
+            ensure!(plain_paged == super::prefix::paged_rows(&family, &spec, spec.len)?,
+                "full {rows}-row replay commit differs from plain MLA cache rows");
             allocator.borrow_mut().release(plain);
+            if args.replay_production {
+                let mut eager_plain = fresh()?;
+                let eager_logits = engine.verify(&mut [(&mut eager_plain, rows)], embed, None)?
+                    .context("replay check needs every layer")?;
+                finite_logits(&eager_logits)?;
+                let eager_state = engine.slot_state(eager_plain.slot)?;
+                finite_state(&eager_state, recurrent_bytes, element)?;
+                let eager_paged = super::prefix::paged_rows(&family, &eager_plain, eager_plain.len)?;
+                let state_bytes = state_delta(&eager_state, &plain_state, recurrent_bytes, element).0;
+                println!("plain {rows}: eager vs production bucket {}: logits exact {}, max |delta| {:.3e}; \
+                    committed state {state_bytes} bytes differ; MLA exact {}",
+                    engine.serving_decode_rows(rows, false), exact_logits(&eager_logits, &plain_logits),
+                    max_logit(&eager_logits, &plain_logits), eager_paged == plain_paged);
+                production_exact &= exact_logits(&eager_logits, &plain_logits)
+                    && eager_state == plain_state && eager_paged == plain_paged;
+                allocator.borrow_mut().release(eager_plain);
+            }
         }
         let next = [sequence.get(prefill + keep).copied().unwrap_or(embed[keep - 1])];
-        let a = engine.verify(&mut [(&mut spec, 1)], &next, None)?.context("replay check needs every layer")?;
-        let b = engine.verify(&mut [(&mut alternate, 1)], &next, None)?.context("replay check needs every layer")?;
+        let a = verify(&mut spec, 1, &next, false)?;
+        let b = verify(&mut alternate, 1, &next, false)?;
         finite_logits(&a)?;
         finite_logits(&b)?;
         let (a_state, b_state) = (engine.slot_state(spec.slot)?, engine.slot_state(alternate.slot)?);
@@ -565,6 +762,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         allocator.borrow_mut().release(spec);
         allocator.borrow_mut().release(alternate);
     }
+    ensure!(production_exact, "eager {rows}-row verification differs from production padding; see per-keep diagnostics");
     // Cost: plain N-row verify vs speculative verify + commit, same position.
     let mut placement = fresh()?;
     let backup = fresh()?;
@@ -579,14 +777,11 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
             // finish before measuring a step from the same recurrent state.
             unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
             let timer = Instant::now();
+            verify(&mut placement, rows, embed, spec)?;
             if spec {
-                engine.verify_spec(&mut [(&mut placement, rows)], embed)?;
                 engine.commit(&[(placement.slot, 0, rows)])?;
-                // SAFETY: the engine owns this stream.
-                unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
-            } else {
-                engine.verify(&mut [(&mut placement, rows)], embed, None)?;
             }
+            engine.synchronize()?;
             times.push(timer.elapsed().as_secs_f64());
         }
         times.sort_by(f64::total_cmp);
@@ -613,6 +808,23 @@ mod tests {
         // --decode-rows 128: up to 128 rows (`--replay-check 128`), with the 64-row default prefill.
         assert_eq!(super::replay_bounds(400, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
         assert!(super::replay_bounds(400, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
+    }
+
+    #[test]
+    fn replay_round_trace_checks_commit_and_request_geometry() {
+        let round = serde_json::json!({"round": 1, "spec": true, "request_ids": [9], "starts": [53],
+            "verify_tokens": [[2, 3, 4]], "committed_tokens": [[3, 7]], "neural_tokens": [[3, 4]],
+            "finished": [false]});
+        let parsed = super::parse_replay_rounds(&round.to_string(), 8, 4).unwrap();
+        assert_eq!(parsed[0].starts, [53]);
+        for (key, value) in [("committed_tokens", serde_json::json!([[5, 7]])),
+            ("request_ids", serde_json::json!([9, 10])), ("verify_tokens", serde_json::json!([[2, 3, 8]])),
+            ("committed_tokens", serde_json::json!([[]]))] {
+            let mut bad = round.clone();
+            bad[key] = value;
+            assert!(super::parse_replay_rounds(&bad.to_string(), 8, 4).is_err(), "{key}");
+        }
+        assert!(super::parse_replay_rounds("", 8, 4).is_err());
     }
 
     #[test]

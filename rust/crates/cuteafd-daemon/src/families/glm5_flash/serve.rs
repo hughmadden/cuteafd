@@ -47,6 +47,7 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use std::path::PathBuf;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -918,6 +919,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
+    let mut trace = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_GLMF_TRACE")
+        .map(|(var, path)| {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)
+                .with_context(|| format!("{var}: opening speculation trace {path}"))
+        }).transpose()?;
+    let mut trace_round = 0u64;
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
     // Per request window: verify steps, and host seconds drafting, verifying
@@ -1363,6 +1371,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 planned[i] = planned[i].min(kept);
             }
         }
+        let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)| {
+            let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
+                d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
+            serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})
+        }).collect::<Vec<_>>());
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let plan_us = console::us(plan_timer);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
@@ -1410,7 +1423,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // Per request: rows executed, accepted inputs and why verification stopped short of a miss.
         let mut verified: Vec<(usize, usize, Option<crate::shared::draft::evidence::Censor>)> =
             vec![(0, 0, None); active.len()];
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts.iter().copied()).enumerate()
             .map(|(i, ((request, rows), start))| {
             if let Some(error) = poisoned[i].take() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
@@ -1486,6 +1499,26 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }).collect();
             let times = round_clock.observe();
             shared.observe(engine, &requests, times, drafted_width, predicted);
+        }
+        if let Some(trace) = &mut trace {
+            trace_round += 1;
+            let line = serde_json::json!({
+                "round": trace_round, "spec": spec,
+                "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+                "starts": starts,
+                "prompt_ids": active.iter().zip(&starts).map(|(a, &start)|
+                    (a.counts[0] == 1).then(|| a.history[..start].to_vec())).collect::<Vec<_>>(),
+                "lengths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+                "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+                "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
+                "copy_windows": copy_windows,
+                "verify_tokens": sequences,
+                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
+                "finished": finished,
+            });
+            if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
+                tracing::warn!(%error, "GLM Flash speculation trace write failed");
+            }
         }
         for (i, request) in active.iter().enumerate() {
             let proposal = &sequences[i][1..];
