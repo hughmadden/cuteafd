@@ -23,7 +23,7 @@ impl SharedPolicy {
             resource::DraftEvidence::Head(head) => head.len(),
         };
         if width > 0 && prior.len() == width {
-            prior.extend(std::iter::repeat_n(resource::TAIL_PRIOR, extension.min(COPY_EXTENSION)));
+            prior.extend((0..extension.min(COPY_EXTENSION)).map(resource::tail_prior));
         }
         prior
     }
@@ -43,7 +43,7 @@ mod tests {
             for extension in [0, 1, COPY_EXTENSION, COPY_EXTENSION + 1] {
                 let prior = shared.prior(&history, &resource::DraftEvidence::Head(&head), extension);
                 assert_eq!(prior.len(), width + extension.min(COPY_EXTENSION));
-                assert!(prior[width..].iter().all(|&p| p == resource::TAIL_PRIOR));
+                assert!(prior[width..].iter().enumerate().all(|(i, &p)| p == resource::tail_prior(i)));
                 assert_eq!(shared.policy.geometry().max_positions, width + COPY_EXTENSION);
             }
             assert!(shared.prior(&history, &resource::DraftEvidence::Head(&[]), 32).is_empty());

@@ -456,6 +456,57 @@ release_trim() {
   printf '%s' "$value"
 }
 
+# Evaluate on the host that starts the container: Spark and coordinator UIDs
+# can differ. Keep caches writable and checkpoint mounts outside root's home.
+# Self-contained so remote launchers can send this function to the worker host.
+release_serving_docker_args() {
+  local user group primary_group
+  local -a groups=()
+  user="$(id -un)"
+  primary_group="$(id -g)"
+  read -ra groups <<<"$(id -G)"
+  RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
+    -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
+    -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+  # Docker's numeric --user otherwise drops groups used by host access checks.
+  for group in "${groups[@]}"; do
+    [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
+  done
+}
+
+# Fail before serving when legacy root-owned outputs cannot be updated. Check
+# directory descendants, or only a --file target and its parent (not siblings),
+# without changing modes/owners. Shipped to worker shells; no repo dependencies.
+release_require_writable_state() {
+  python3 - "$@" <<'PYSTATE'
+import os
+from pathlib import Path
+import sys
+values = sys.argv[1:]
+file_only = bool(values and values[0] == '--file')
+if file_only:
+    values = values[1:]
+for value in values:
+    root = Path(value)
+    paths = [root, root.parent] if file_only else [root]
+    if root.is_dir() and not file_only:
+        def denied(error):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {error.filename}; migrate legacy ownership before launching')
+        for directory, dirs, files in os.walk(root, onerror=denied):
+            paths.extend(Path(directory) / name for name in dirs + files)
+    for path in paths:
+        if not path.exists() and not path.is_symlink():
+            continue
+        mode = os.W_OK | (os.X_OK if path.is_dir() else 0)
+        if not os.access(path, mode):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {path}; migrate legacy ownership before launching')
+PYSTATE
+}
+
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, on the coordinator and on every Spark worker:
 #   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
@@ -517,7 +568,7 @@ release_known_key() {
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
     PROFILE|PROFILE_DIR) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -701,7 +752,6 @@ release_load_config() {
   TP2_OUTPUT_PROJECTION=off
   TP2_DSPARK_EXPERTS=off
   DSPARK_DRAFT_POLICY=adaptive
-  V41_COPY_DRAFTS=off
   RTX_EXPERT_LAYERS=auto
   RTX_GPUS=auto
   COORDINATOR_GPU=0

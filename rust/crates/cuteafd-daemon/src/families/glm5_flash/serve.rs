@@ -4,8 +4,8 @@
 //! drafts after each sequence's next token on the GPU and verifies as many
 //! drafts as the shared resource-priced draft policy (`cuteafd_core::
 //! draft_policy` through `draft_binding`) finds worthwhile under one row
-//! budget; a copy window that agrees with the whole draft extends it past the
-//! drafter's horizon (copy windows stand alone without a drafter).
+//! budget; a copy window anchored to its confident leading positions extends the
+//! drafter's confident horizon; copies never stand alone without a drafter.
 //!
 //! KDA layers advance recurrent state that a rejected draft cannot simply
 //! drop, so a step that verifies drafts runs speculatively
@@ -51,9 +51,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Most copy-window draft tokens verified per sequence and step.
-const COPY_DRAFT: usize = 7;
-
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
@@ -73,9 +70,6 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// Decode one token per step (no copy-window drafts).
-    #[arg(long)]
-    pub no_copy_drafts: bool,
     /// With --draft: verify exactly this many DFlash2 drafts per step
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
@@ -124,12 +118,9 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Speculation and admission settings: copy-window draft cap (0 disables), a fixed DFlash2 draft
-/// count replacing the adaptive policy, the verify-row policy and its chain cut, and packed
-/// admission prefill.
+/// Fixed neural count, verify-row policy and chain cut, and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    copy: usize,
     fixed: Option<usize>,
     verify: VerifyPolicy,
     tau: f64,
@@ -168,7 +159,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     anyhow::ensure!(args.spec_tau > 0.0 && args.spec_tau <= 1.0, "--spec-tau must be in (0, 1], got {}", args.spec_tau);
-    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
+    let policy = Policy { fixed: args.draft_fixed,
         verify: args.verify_policy, tau: args.spec_tau, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id));
@@ -209,7 +200,6 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
-    let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = match (args.draft_fixed, args.verify_policy) {
         (Some(n), _) => format!("fixed {n}"),
         (None, VerifyPolicy::Chain) => format!("chain tau {}", args.spec_tau),
@@ -218,12 +208,8 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
     let drafter = args.engine.draft.as_deref()
         .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
         .transpose()?;
-    layout.speculator = match (drafter, args.no_copy_drafts) {
-        (Some(name), _) => Some(console::Speculator { name: name.into(), positions: 8, policy: policy + copy }),
-        (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
-            policy: "adaptive length".into() }),
-        (None, true) => None,
-    };
+    layout.speculator = drafter.map(|name| console::Speculator { name: name.into(), positions: 8,
+        policy: policy + " · confident copy continuation" });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -246,7 +232,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
-    args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some() || policy.copy > 0));
+    args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some()));
     let lanes = max_sequences.min(DECODE_ROWS);
     // Without entries no mark is taken: pool marks keep no unit back and need no room in the pool.
     let marks = args.prefix_marks.with_entries(prefix.prefix_cache_entries);
@@ -344,20 +330,13 @@ struct Active<'a> {
     history: Vec<u32>,
     keys: MediaKeys,
     _media: RequestMedia,
-    /// Current copy-draft length (halved after a fully rejected draft,
-    /// doubled after a fully accepted one) and steps left before drafting
-    /// resumes once it reached zero.
-    draft_limit: usize,
-    draft_pause: usize,
     /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
     slot: Option<usize>,
     drafts: DraftHistory,
-    copy_drafts: DraftHistory,
     /// Hash of `history` (identical sequences share it).
     digest: u64,
-    /// Steps, DFlash2 drafts verified/accepted, copy drafts verified/accepted,
-    /// and actual neural drafter forward calls for this sequence.
-    counts: [usize; 6],
+    /// Steps, proposals verified/accepted, and actual neural forward calls.
+    counts: [usize; 4],
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmfPlacement,
     /// First position the DFlash2 drafter's context holds for this sequence
@@ -388,11 +367,11 @@ struct SharedPolicy {
 
 impl SharedPolicy {
     fn new(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path, drafter: &super::dspark::Drafter<'_>,
-        ranks: Option<usize>, copy: bool) -> Result<Self> {
+        ranks: Option<usize>) -> Result<Self> {
         let source = opened.experts.as_ref();
         let homes = super::draft_binding::homes(&engine.cfg.dense[..engine.weights.layers.len()], source, snapshot,
             ranks)?;
-        let extension = if copy { super::draft_binding::COPY_EXTENSION } else { 0 };
+        let extension = super::draft_binding::COPY_EXTENSION;
         let geometry = super::draft_binding::geometry(&homes, engine.cfg.experts, engine.cfg.topk, engine.verify_rows,
             drafter.drafts(), extension)?;
         let classes: Vec<_> = homes.iter().map(|home| match home {
@@ -426,7 +405,7 @@ impl SharedPolicy {
         let mut prior = super::draft_binding::prior(&self.prior, history, &evidence);
         // A short or invalid prior has no window for a copy to extend.
         if prior.len() == draft.tokens.len() {
-            prior.extend(std::iter::repeat_n(super::draft_binding::TAIL_PRIOR, extension));
+            prior.extend((0..extension).map(super::draft_binding::tail_prior));
         }
         prior
     }
@@ -674,25 +653,6 @@ mod media_tests {
     }
 }
 
-/// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
-/// earlier; proposes up to `limit` tokens that followed its latest earlier
-/// occurrence (a copy window). Exact: the verify step accepts only tokens the
-/// model itself produces.
-pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
-    let len = history.len();
-    for n in (4..=8).rev() {
-        if len <= n {
-            continue;
-        }
-        let tail = &history[len - n..];
-        if let Some(start) = (0..len - n).rev().find(|&i| &history[i..i + n] == tail) {
-            let from = start + n;
-            return history[from..(from + limit).min(len)].to_vec();
-        }
-    }
-    Vec::new()
-}
-
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
 /// its marks in pool units or in the mark arena `arena`, sized by its rule over the engine's own
 /// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
@@ -929,7 +889,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // cost verify policy; a fixed count and the chain cut keep their own.
     let mut shared = match drafter {
         Some(drafter) if policy.fixed.is_none() && policy.verify == VerifyPolicy::Cost =>
-            Some(SharedPolicy::new(engine, opened, snapshot, drafter, ranks, policy.copy > 0)?),
+            Some(SharedPolicy::new(engine, opened, snapshot, drafter, ranks)?),
         _ => None,
     };
     let mut active: Vec<Active<'_>> = Vec::new();
@@ -1211,12 +1171,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         history: p.tokens,
                         keys: p.keys,
                         _media: p.media,
-                        draft_limit: policy.copy,
-                        draft_pause: 0,
                         slot,
                         drafts: DraftHistory::default(),
-                        copy_drafts: DraftHistory::default(),
-                        counts: [0; 6],
+                        counts: [0; 4],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
@@ -1293,7 +1250,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     .take(drafter.max_batch_sequences())
                     .collect();
                 for &(i, _) in &seqs {
-                    active[i].counts[5] += 1;
+                    active[i].counts[3] += 1;
                 }
                 let draft_seqs: Vec<DraftSeq> = seqs.iter().map(|(_, s)| *s).collect();
                 let drafts = round_clock.draft(|| drafter.draft_device(&draft_seqs, &engine.embedding,
@@ -1315,23 +1272,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         };
         draft_s += timer.elapsed().as_secs_f64();
         let plan_timer = Instant::now();
-        // Under the shared policy an agreed copy window extends the drafter's window (PLAN "Copies extend
-        // the neural draft"): its continuation past the window, within the request's room.
-        let extensions: Vec<Vec<u32>> = match (&shared, policy.copy > 0) {
-            (Some(_), true) => active.iter().zip(&drafted).zip(&limits).map(|((a, draft), &limit)| draft.as_ref()
-                .filter(|_| a.job.sampling.is_greedy() && limit > 0).map_or(Vec::new(), |d| {
-                    let room = super::draft_binding::COPY_EXTENSION.min(limit.saturating_sub(d.tokens.len()));
-                    let copy = copy_drafts(&a.history, d.tokens.len() + room);
-                    crate::shared::draft::copy::copy_extension(&d.tokens, &copy).to_vec()
-                })).collect(),
-            _ => vec![Vec::new(); active.len()],
-        };
-        // The shared policy's per-request `p0` (its own prior; Platt runs inside the policy).
-        let shared_priors: Vec<Vec<f64>> = match &shared {
-            Some(shared) => active.iter().zip(&drafted).zip(&extensions).map(|((a, draft), extension)| draft.as_ref()
-                .map_or(Vec::new(), |d| shared.prior(&a.drafts, d, extension.len()))).collect(),
-            None => Vec::new(),
-        };
+        // Calibrated leading agreement anchors a copy within this request's room.
+        let mut shared_priors: Vec<Vec<f64>> = active.iter().zip(&drafted).map(|(a, draft)|
+            match (&shared, draft) {
+                (Some(shared), Some(d)) => shared.prior(&a.drafts, d, 0),
+                _ => Vec::new(),
+            }).collect();
+        let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut shared_priors)
+            .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
+                (Some(shared), Some(d)) if policy.fixed.is_none() =>
+                    super::draft_binding::copy_continuation(&shared.policy, a.ticket.id(), &a.history,
+                        &d.tokens, prior, limit, a.job.sampling.is_greedy()),
+                _ => None,
+            }).collect();
         let mut predicted = None;
         let mut planned = match (policy.verify, policy.fixed, shared.as_mut()) {
             // The chain cut on the drafter's own probabilities.
@@ -1355,39 +1308,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             // A fixed count within each sequence's room.
             (_, Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
                 .map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
-            // No drafter: copy windows alone (below).
+            // No neural drafter means no speculative proposal.
             (VerifyPolicy::Cost, None, None) => vec![0; active.len()],
         };
         skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
-        // Each sequence verifies its next token, then its DFlash2 drafts, or
-        // a copy-window draft when it agrees with them and runs longer.
-        let mut used_copy = vec![false; active.len()];
-        // Under the shared policy a copy only ever extends an agreed neural draft: no draft, no copy.
-        let shared_active_plan = shared.is_some();
-        let mut sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
-            if a.draft_pause > 0 {
-                a.draft_pause -= 1;
-                if a.draft_pause == 0 {
-                    a.draft_limit = 1;
-                }
-            }
-            let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
-            let dflash: &[u32] = &full[..planned[i].min(full.len())];
-            let draft = if shared_active_plan {
-                // The drafter's window, then the agreed copy's continuation the selection kept.
-                let extended = planned[i].saturating_sub(full.len());
-                dflash.iter().chain(&extensions[i][..extended.min(extensions[i].len())]).copied().collect()
-            } else {
-                // `emit` already appended `next` to the history.
-                let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
-                let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
-                if copy.len() > dflash.len() && agrees {
-                    used_copy[i] = true;
-                    copy
-                } else {
-                    dflash.to_vec()
-                }
-            };
+        // A history continuation never competes with or replaces the confident prefix.
+        let mut sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
+            let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
+            let proposal = copies[i].as_ref().map_or(full, |c| c.tokens.as_slice());
+            let draft = proposal.iter().take(planned[i]).copied();
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
             // Drafts the grammar rejects could never be kept: verify none of them.
             if let Some(state) = a.constraint.as_ref() {
@@ -1398,20 +1327,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         if policy.verify == VerifyPolicy::Chain {
             // The step under the verify budget: the least likely drafts across sequences go first (a
             // copy-window token the drafter also proposed keeps the drafter's probability).
-            let probs: Vec<Vec<f32>> = sequences.iter().zip(&drafted).zip(&used_copy).map(|((rows, draft), &copy)| {
-                let probs = draft.as_ref().map(draft_probs).unwrap_or_default();
-                if copy {
-                    verify::copy_probs(&rows[1..], draft.as_ref().map_or(&[][..], |d| &d.tokens), &probs)
-                } else {
-                    probs
-                }
-            }).collect();
+            let probs: Vec<Vec<f32>> = drafted.iter().map(|draft|
+                draft.as_ref().map(draft_probs).unwrap_or_default()).collect();
             let drafts: Vec<usize> = sequences.iter().map(|rows| rows.len() - 1).collect();
             for (i, kept) in verify::budget(&probs, &drafts, verify_rows).into_iter().enumerate() {
                 sequences[i].truncate(kept + 1);
-                if !used_copy[i] {
-                    planned[i] = planned[i].min(kept);
-                }
+                planned[i] = planned[i].min(kept);
             }
         }
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
@@ -1503,29 +1424,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             offset += rows.len();
             let (drafted, accepted) = (rows.len() - 1, committed - 1);
             request.counts[0] += 1;
-            if used_copy[i] {
-                request.copy_drafts.observe(drafted.min(accepted + usize::from(!finished)), accepted);
-                request.counts[3] += drafted;
-                request.counts[4] += accepted;
-            } else {
-                request.counts[1] += drafted;
-                request.counts[2] += accepted;
-            }
-            // The request's own outcomes, censored at a finish on an agreeing token.
-            if planned[i] > 0 && !used_copy[i] {
-                request.drafts.observe(drafted.min(accepted + usize::from(!finished)), accepted);
-            }
-            // Adapt the copy-draft length to how much of it the model reproduced.
-            if used_copy[i] || drafter.is_none() {
-                if drafted > 0 && accepted == 0 {
-                    request.draft_limit /= 2;
-                    if request.draft_limit == 0 {
-                        request.draft_pause = 8;
-                    }
-                } else if drafted > 0 && accepted == drafted {
-                    request.draft_limit = (request.draft_limit * 2).clamp(1, policy.copy.max(1));
-                }
-            }
+            request.counts[1] += drafted;
+            request.counts[2] += accepted;
+            let neural = drafted.min(copies[i].as_ref().map_or(drafted_width, |c| c.neural));
+            request.drafts.observe(neural.min(accepted + usize::from(verified[i].2.is_none())), accepted.min(neural));
             finished
         }).collect();
         verify_stats.output_tokens += active.iter().zip(&before)
@@ -1547,9 +1449,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         if let Some(shared) = shared.as_mut() {
             let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
                 let (rows, accepted, censor) = verified[i];
-                let draft = drafted[i].as_ref().filter(|_| !used_copy[i] && rows > 1);
+                let draft = drafted[i].as_ref().filter(|_| rows > 1);
                 super::draft_binding::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
-                    source: if used_copy[i] { DraftSource::Copy } else if draft.is_some() { DraftSource::Neural }
+                    source: if draft.is_some() { DraftSource::Neural }
                         else { DraftSource::Undrafted },
                     prior: draft.map(|_| shared_priors[i].as_slice()),
                     features: draft.filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()), censor }
@@ -1558,7 +1460,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             shared.observe(engine, &requests, times, drafted_width, predicted);
         }
         for (i, request) in active.iter().enumerate() {
-            let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
+            let proposal = &sequences[i][1..];
             tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
                 request.constraint.is_some(), finished[i]);
         }
@@ -1580,10 +1482,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-            let [steps_seen, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
+            let [steps_seen, dflash, dflash_ok, draft_calls] = request.counts;
             let graphs = engine.graph_stats();
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok, draft_calls,
+                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, draft_calls,
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
                 graph_captures = graphs.stats.captures, graph_recaptures = graphs.stats.recaptures,
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,

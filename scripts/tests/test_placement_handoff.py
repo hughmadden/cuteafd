@@ -13,8 +13,8 @@ import json,os,sys,shlex
 from pathlib import Path
 args=sys.argv[1:]; tool=Path(sys.argv[0]).name
 # SSH receives a shell command string; decode its quoted worker argv.
-if tool=='ssh' and args and args[-1].startswith('bash -s -- '):
- args=args[:-1]+shlex.split(args[-1])
+if tool=='ssh' and args and 'bash -s -- ' in args[-1]:
+ args=args[:-1]+shlex.split(args[-1][args[-1].rindex('bash -s -- '):])
 with open(os.environ['EVENTS'],'a') as f:f.write(json.dumps([tool,args])+'\n')
 if tool=='docker':
  if args[0]=='inspect':print('running')

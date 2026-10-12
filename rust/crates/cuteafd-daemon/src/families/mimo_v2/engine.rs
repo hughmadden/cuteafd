@@ -469,6 +469,7 @@ pub(crate) struct MimoEngine<'a> {
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
+    draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     /// `CUTEAFD_MIMO_WAVE_TIMING=1`: one line per Spark wave with its host
     /// phases (diagnostics; read once at construction).
     wave_timing: bool,
@@ -584,7 +585,7 @@ impl<'a> MimoEngine<'a> {
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]),
+            profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
@@ -607,6 +608,63 @@ impl<'a> MimoEngine<'a> {
         };
         let attention = layers[layer].attention;
         (attention, kv[layer].buffer, self.record_bytes(&layers[layer]))
+    }
+
+    /// Arm after graph warmup; only explicit verify rounds record signals.
+    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
+        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
+        *self.draft_probe.borrow_mut() = Some(crate::shared::draft::probe::RoundProbe::new(
+            self.library, dense, self.cfg.topk, DECODE_ROWS)?);
+        Ok(())
+    }
+
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+
+    pub(crate) fn probe_end(&self) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
+    }
+
+    /// Read only after the verifier's normal stream synchronization.
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let (routes, times) = probe.as_mut()?.finish()?;
+        Some(observe(routes, &times))
+    }
+
+    pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
+        use crate::shared::draft::resource::{self, LayerHome};
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        let tensors = catalog.fp8().context("MiMo routed expert format")?;
+        let ranks = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => transport.borrow().world_size(),
+            _ => 1,
+        };
+        self.weights.layers.iter().enumerate().map(|(index, layer)| {
+            if layer.dense { return Ok(LayerHome::Dense); }
+            let local = self.tp2_layer(index) || self.rtx_local_layer(index)
+                || !matches!(self.experts, Some(Experts::Spark { .. }));
+            let tp = if self.tp2_layer(index) { 2 } else if local { 1 } else { ranks };
+            let bytes = resource::fp8_slice_bytes(tensors, tp)?;
+            Ok(if local { LayerHome::Local { slice_bytes: bytes } } else { LayerHome::Remote { slice_bytes: bytes } })
+        }).collect()
+    }
+
+    fn probe_mark(&self, index: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            // SAFETY: the clock and stream belong to rank zero and outlive this round.
+            unsafe { probe.mark(index, self.stream) };
+        }
+    }
+
+    fn probe_ring(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
+            // SAFETY: called outside graph capture after the router; normal round sync precedes reading.
+            unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.stream)?; }
+        }
+        Ok(())
     }
 
     /// Strong allocation ownership for host snapshot DMA, independent of this
@@ -1578,6 +1636,7 @@ impl<'a> MimoEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
+            self.probe_mark(index);
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
@@ -1693,18 +1752,20 @@ impl<'a> MimoEngine<'a> {
                 // Spark wait or routed package launch in this layer.
                 if index < layers.len() { self.peer_segment(index, w1, tables, t, launch)?; }
             }
-            if last || !launch || layers[index].dense {
-                continue;
-            }
+            if last || !launch { continue; }
+            if layers[index].dense { self.probe_mark(index); continue; }
+            if self.tp2_layer(index) { self.probe_ring(w, index, t)?; }
             if self.tp2_layer(index) {
                 self.tp2_experts(0, index, 0, w, t)?;
                 let peer = w1.context("MiMo TP2 decode workspace")?;
                 self.tp2_experts(1, index, 0, peer, t)?;
                 if index + 1 == layers.len() { self.tp2_post(1, index, 0, peer, t)?; }
+                self.probe_mark(index);
                 continue;
             }
             if self.rtx_local_layer(index) {
                 self.moe_run(w, index, t, true)?;
+                self.probe_mark(index);
                 continue;
             }
             match self.experts.as_ref() {
@@ -1718,6 +1779,7 @@ impl<'a> MimoEngine<'a> {
                 None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
             crate::shared::console::layer_mark(index);
+            self.probe_mark(index);
         }
         Ok(())
     }
@@ -2511,6 +2573,7 @@ impl<'a> MimoEngine<'a> {
         let bytes = t * self.cfg.hidden * 2;
         if self.tp2_layer(index) {
             self.moe_front(w, layer, t, true)?;
+            self.probe_ring(w, index, t)?;
             return self.tp2_experts(0, index, 0, w, t);
         }
         if self.rtx_local_layer(index) {
@@ -2581,6 +2644,7 @@ impl<'a> MimoEngine<'a> {
     /// their sum into `delta`.
     fn moe_run(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
+        self.probe_ring(w, index, t)?;
         if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(index).is_ok()) {
             // SAFETY: admitted BF16 input, routes and output are live on the
             // rank stream; local package output is copied directly into delta.
@@ -2686,6 +2750,9 @@ impl<'a> MimoEngine<'a> {
         self.profile.borrow_mut()[0] += gpu_wait;
         let built = std::time::Instant::now();
         let staged = staging.bytes();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(index, &staged[..route_bytes]);
+        }
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),

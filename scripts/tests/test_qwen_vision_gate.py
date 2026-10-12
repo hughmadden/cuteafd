@@ -178,7 +178,7 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
     timer = serve[serve.index("        let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("cost.observe_verify(")
+    assert timer.index("verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &verify_stats);") == 2
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
@@ -186,13 +186,16 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
 
 
-def test_copy_trim_is_opt_in_and_precedes_verify_width_and_selection():
+def test_shared_copy_extensions_precede_grammar_and_verify_width():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
     trim = serve[serve.index("        let mut sequences: Vec<Vec<u32>>"):serve.index("        let starts: Vec<usize>")]
-    assert trim.index("state.truncate_proposal") < trim.index("trim_copy_rows(&mut sequences, limit)")
-    assert trim.index("trim_copy_rows(&mut sequences, limit)") < trim.index("let spec = sequences.iter().any")
-    assert "if matches!(drafts, Drafts::Copy)" in trim
+    assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
+    assert "Drafts::Copy" not in serve
+    copy = serve.index("resource::copy_continuation(")
+    select = serve.index("resource::select_drafted(", copy)
+    substitute = serve.index("*proposal = copy.tokens;", select)
+    assert copy < select < substitute < serve.index("let mut sequences: Vec<Vec<u32>>")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route

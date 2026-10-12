@@ -249,7 +249,6 @@ mod tests {
         let output = find("max-output");
         assert_eq!(output.source, "default");
         assert!(!output.differs());
-        let copy = find("no-copy-drafts");
-        assert_eq!((copy.value.as_deref(), copy.default.as_deref()), (Some("false"), Some("false")));
+        assert!(!context.settings.iter().any(|s| s.name == "no-copy-drafts"));
     }
 }

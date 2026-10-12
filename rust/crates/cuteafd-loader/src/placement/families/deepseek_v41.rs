@@ -1,6 +1,25 @@
 //! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
 use super::super::*;
 
+/// Growth beyond the calibrated 48-row serving lanes. Keep verifier storage
+/// independent of prefill rows and neural width; both target lanes retain it.
+pub fn verify_workspace_growth(gpus: usize, rank: usize) -> u64 {
+    assert!((1..=2).contains(&gpus) && rank < gpus);
+    let extra_rows = cuteafd_core::V41_VERIFY_ROWS.saturating_sub(48) as u64;
+    let sampler_row = 64 + 64 + 2 * 129280u64.div_ceil(32) * 4
+        + 2048 * 4 + 256 * (4 + 8) + 32;
+    let normalization_row = 40960 + 16 + 10240 + 10240;
+    let head_row = if gpus == 1 {
+        normalization_row + 129280 * 4 + 8 + sampler_row
+    } else {
+        10240 + 64640 * 4 + if rank == 0 { 8 } else {
+            24 + normalization_row + 129280 * 4 + sampler_row
+        }
+    };
+    let sparse_row = 10 * 64 * 514 * 4 + 120;
+    2 * extra_rows * (head_row + sparse_row)
+}
+
 /// All weights, lanes, graphs and prefix state are charged in the inventory's
 /// baseline. Pool units include private tails supplied by the caller as fixed.
 pub fn request(

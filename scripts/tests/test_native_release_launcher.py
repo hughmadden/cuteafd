@@ -13,6 +13,108 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_serving_state_refuses_unwritable_files_and_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / 'profile'
+            nested.mkdir()
+            trace = nested / 'trace.jsonl'
+            trace.write_text('{}\n')
+            command = ['bash', '-c',
+                'source scripts/lib/release-common.sh; release_require_writable_state "$1"',
+                'test', str(root)]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path, mode in [(trace, 0o400), (nested, 0o500)]:
+                original = path.stat().st_mode & 0o777
+                path.chmod(mode)
+                try:
+                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('serving state is not writable by uid', result.stderr)
+                    self.assertIn(str(path), result.stderr)
+                    self.assertIn('migrate legacy ownership before launching', result.stderr)
+                    self.assertEqual(path.stat().st_mode & 0o777, mode)
+                finally:
+                    path.chmod(original)
+
+    def test_trace_admission_checks_target_not_unrelated_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sibling = root / 'unrelated'
+            sibling.mkdir()
+            sibling.chmod(0o500)
+            trace = root / 'trace.jsonl'
+            command = ['bash', '-c',
+                'source scripts/lib/release-common.sh; release_require_writable_state --file "$1"',
+                'test', str(trace)]
+            try:
+                for existing in [False, True]:
+                    if existing:
+                        trace.write_text('{}\n')
+                        trace.chmod(0o600)
+                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                trace.chmod(0o400)
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(trace), result.stderr)
+                self.assertEqual(trace.stat().st_mode & 0o777, 0o400)
+                trace.chmod(0o600)
+                root.chmod(0o500)
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(root), result.stderr)
+            finally:
+                root.chmod(0o700)
+                sibling.chmod(0o700)
+        for launcher, target in [('run.sh', '$SPECULATION_TRACE'),
+                                 ('scripts/launch/run-family.sh', '$trace')]:
+            self.assertIn(f'release_require_writable_state --file "{target}"',
+                          (ROOT / launcher).read_text())
+
+    def test_v41_placement_uses_writable_serving_home(self) -> None:
+        source = (ROOT / 'run.sh').read_text()
+        self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
+        self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
+
+    def test_serving_identity_is_evaluated_on_each_host(self) -> None:
+        for uid, gid, user in [('1000', '1000', 'tj'), ('1001', '1002', 'spark user')]:
+            result = subprocess.run(['bash', '-c', '''
+set -euo pipefail
+source scripts/lib/release-common.sh
+id() { case "$1" in -u) printf '%s' "$TEST_UID" ;; -g) printf '%s' "$TEST_GID" ;; -G) printf '%s 44 107' "$TEST_GID" ;; -un) printf '%s' "$TEST_USER" ;; esac; }
+export -f id
+export -f release_serving_docker_args
+bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}"'
+'''], cwd=ROOT, capture_output=True,
+                env={**os.environ, 'TEST_UID': uid, 'TEST_GID': gid, 'TEST_USER': user})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.decode().rstrip('\0').split('\0')
+            self.assertEqual(args[:2], ['--user', f'{uid}:{gid}'])
+            pairs = list(zip(args[2::2], args[3::2]))
+            self.assertEqual([value for flag, value in pairs if flag == '--group-add'], ['44', '107'])
+            env = dict(value.split('=', 1) for flag, value in pairs if flag == '-e')
+            self.assertEqual(env['USER'], user)
+            self.assertEqual(env['LOGNAME'], user)
+            self.assertEqual(env['HF_HOME'], '/hf')
+            self.assertEqual(env['CUTEAFD_BENCH_DIR'], '/run/cuteafd/bench')
+            for key in ['HOME', 'TORCH_EXTENSIONS_DIR', 'XDG_CACHE_HOME',
+                        'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR']:
+                self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
+
+    def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state)', source)
+            self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
+            self.assertNotIn('/root/', source)
+            self.assertNotIn('-e USER=tj', source)
+            self.assertIn(':/run/cuteafd/bench', source)
+            self.assertIn(':/run/cuteafd/usage', source)
+        v41 = (ROOT / 'run.sh').read_text().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
+        self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))
         result = subprocess.run(['bash', '-c',
@@ -138,7 +240,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                     environment.pop('SPECULATION_TRACE', None)
                     if value is not None:
                         environment['SPECULATION_TRACE'] = value
-                    harness = 'set -euo pipefail\nrelease_die() { exit 2; }\n'
+                    harness = f'set -euo pipefail\nsource {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}\n'
                     result = subprocess.run(['bash', '-c', harness + block +
                         '\nprintf "%s\\0" before "${trace_args[@]}" after'], env=environment, capture_output=True)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)

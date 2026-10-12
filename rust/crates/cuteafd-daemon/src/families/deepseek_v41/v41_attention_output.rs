@@ -118,7 +118,7 @@ impl<'a> AttentionOutputWeights<'a> {
             position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
             capacity,
-            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
             ready: None,
             origin: None,
         };

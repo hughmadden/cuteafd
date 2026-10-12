@@ -439,6 +439,31 @@ subprocess.run=lambda *a,**kw: (_ for _ in ()).throw(RuntimeError('must not remo
     assert root.exists()
 
 
+def test_cleanup_leaves_another_instances_legacy_slot_registration(tmp_path):
+    # The legacy wip-slots/<slot>.json is shared by every instance using that
+    # slot name; cleaning one instance must neither remove nor refuse on it.
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    root.mkdir(parents=True)
+    (root / '.wip-card-owner.json').write_text(json.dumps(dict(task='task', instance='test')))
+    slots = home / '.cache/cuteafd/wip-slots'
+    slots.mkdir(parents=True)
+    (slots / 's.json').write_text(json.dumps(dict(wip_instance='other', slot='s')))
+    (slots / 'test').mkdir()
+    (slots / 'test' / 's.json').write_text(json.dumps(dict(wip_instance='test', slot='s')))
+    script = cards.cleanup_script(dict(instance='test', slot='s'), 'task')
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    result = subprocess.run([sys.executable, '-c', prefix + script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert (slots / 's.json').exists() and not (slots / 'test' / 's.json').exists() and not root.exists()
+    # A foreign entry in the instance's own registration is still refused.
+    root.mkdir(parents=True)
+    (root / '.wip-card-owner.json').write_text(json.dumps(dict(task='task', instance='test')))
+    (slots / 'test' / 's.json').write_text(json.dumps(dict(wip_instance='other', slot='s')))
+    result = subprocess.run([sys.executable, '-c', prefix + script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
+    assert result.returncode and 'refusing foreign registration' in result.stderr
+
+
 def test_summary_medians_paired_not_ratio_of_medians():
     rows = [dict(card='c', arm=arm, repeat=i, status='pass', simulated=False, C1=v) for i, values in enumerate(((10, 20), (100, 110), (20, 40)), 1) for arm, v in zip(('base', 'candidate'), values)]
     medians, paired = cards.summary_math(rows, ['base', 'candidate'])

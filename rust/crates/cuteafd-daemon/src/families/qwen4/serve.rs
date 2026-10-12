@@ -1,8 +1,8 @@
 //! OpenAI-compatible API over the Qwen 3.8 Flash Next engine: continuous
 //! batching with one prefill per admitted request and one decode-shaped step
-//! for every active sequence, verifying drafts: the native MTP layer's
-//! (`--mtp N`, drafts per sequence planned by `mtp_policy`) or copy-window
-//! drafts from the sequence's own history.
+//! for every active sequence, verifying native MTP drafts (`--mtp N`) under
+//! the shared resource policy. History copies only extend a fully agreeing
+//! neural window.
 //!
 //! Verify-by-replay: a step that verifies drafts runs speculatively (GDN and
 //! PLE record each row's replay inputs and keep their state); the accepted
@@ -33,7 +33,8 @@ use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaRead
 use crate::shared::probe;
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
-use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
+use crate::shared::draft_policy::DraftHistory;
+use crate::shared::draft::{resource, clock::RoundClock, evidence::{Censor, DraftSource}};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
@@ -47,8 +48,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Most copy-window draft tokens verified per sequence and step.
-const COPY_DRAFT: usize = 7;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -64,9 +63,6 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
-    /// Decode one token per step (no copy-window drafts; ignored with --mtp).
-    #[arg(long)]
-    pub no_copy_drafts: bool,
     /// With --mtp: verify exactly --mtp drafts per sequence where room allows
     /// instead of the adaptive plan.
     #[arg(long)]
@@ -121,11 +117,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
         Drafts::Mtp { depth: engine_args.mtp.min(DECODE_ROWS - 1), fixed: args.mtp_fixed }
-    } else if args.no_copy_drafts {
-        Drafts::None
-    } else {
-        Drafts::Copy
-    };
+    } else { Drafts::None };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, drafts, &eos)));
     let vision = args.vision;
@@ -166,8 +158,6 @@ fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) ->
     layout.eos = eos.to_vec();
     layout.speculator = match drafts {
         Drafts::None => None,
-        Drafts::Copy => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
-            policy: "adaptive length".into() }),
         Drafts::Mtp { depth, fixed } => Some(console::Speculator { name: "MTP".into(), positions: depth,
             policy: if fixed { format!("fixed {depth}") } else { format!("adaptive ≤ {depth}") } }),
     };
@@ -188,7 +178,6 @@ fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) ->
 #[derive(Debug, Clone, Copy)]
 enum Drafts {
     None,
-    Copy,
     /// Up to `depth` MTP drafts per sequence (all of them with `fixed`).
     Mtp { depth: usize, fixed: bool },
 }
@@ -264,18 +253,12 @@ struct Active<'a> {
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
     keyed_history: Vec<u32>,
-    /// Current copy-draft length (halved after a fully rejected draft,
-    /// doubled after a fully accepted one) and steps left before drafting
-    /// resumes once it reached zero.
-    draft_limit: usize,
-    draft_pause: usize,
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: Qwen4Placement,
     /// MTP stash rows and recent draft outcomes; cycles in a row planned
     /// without drafts (a probe draft follows eight).
     mtp: MtpSeq,
     outcomes: DraftHistory,
-    copy_outcomes: DraftHistory,
     idle: usize,
     /// Drafts proposed and accepted, verify cycles.
     proposed: usize,
@@ -364,26 +347,7 @@ impl Active<'_> {
     }
 }
 
-/// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
-/// earlier; proposes up to `limit` tokens that followed its latest earlier
-/// occurrence (a copy window). Exact: the verify step accepts only tokens the
-/// model itself produces.
-fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
-    let len = history.len();
-    for n in (4..=8).rev() {
-        if len <= n {
-            continue;
-        }
-        let tail = &history[len - n..];
-        if let Some(start) = (0..len - n).rev().find(|&i| &history[i..i + n] == tail) {
-            let from = start + n;
-            return history[from..(from + limit).min(len)].to_vec();
-        }
-    }
-    Vec::new()
-}
-
-/// Remove only proposal suffixes, distributing trims across the longest sequences.
+/// Diagnostic row trimming preserves every anchor and each proposal's prefix.
 pub(crate) fn trim_copy_rows(sequences: &mut [Vec<u32>], limit: usize) {
     let mut rows: usize = sequences.iter().map(Vec::len).sum();
     while rows > limit {
@@ -522,6 +486,28 @@ impl VerifyStats {
 #[cfg(test)]
 mod verify_tests {
     #[test]
+    fn shared_draft_binding_preserves_config_geometry_and_history_prior() {
+        use crate::shared::draft::resource::{self, LayerHome};
+        use crate::shared::draft_policy::DraftHistory;
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(4)).unwrap();
+        let homes: Vec<_> = (0..cfg.layers).map(|index| if index < 2 {
+            LayerHome::Local { slice_bytes: 4096. }
+        } else { LayerHome::Remote { slice_bytes: 8192. } }).collect();
+        let geometry = resource::geometry(&homes, cfg.experts, cfg.topk, super::DECODE_ROWS, 3,
+            crate::shared::draft::copy::COPY_EXTENSION).unwrap();
+        assert_eq!((geometry.layers.len(), usize::from(geometry.experts), usize::from(geometry.topk)),
+            (cfg.layers, cfg.experts, cfg.topk));
+        assert_eq!((geometry.max_requests, geometry.widths.clone(), geometry.max_positions),
+            (super::DECODE_ROWS, vec![3], 35));
+        assert!(geometry.layers.iter().all(|layer| layer.class.is_some()));
+        let mut history = DraftHistory::default();
+        history.observe(3, 2);
+        let priors = super::super::mtp_policy::acceptance(&[&history], &[3]);
+        assert_eq!(priors[0], history.pooled(3, std::iter::empty::<&DraftHistory>()));
+    }
+
+    #[test]
     fn copy_trim_retains_mandatory_tokens_and_proposal_prefixes() {
         for sequences in 1..=16 {
             for extra in 0..=64-sequences {
@@ -564,7 +550,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
     if let Ok(mut stats) = stats.lock() {
-        *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
+        *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         probe::graph_capture_stats(&mut stats);
@@ -595,10 +581,13 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let mut verify_stats = VerifyStats::default();
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let mtp = matches!(drafts, Drafts::Mtp { .. });
-    let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
-    let mut calibration = Calibration::default();
-    let copy_policy = crate::shared::draft_policy::enabled("CUTEAFD_COPY_DRAFT_POLICY");
-    tracing::info!(copy_policy, "shared Qwen copy policy experiment; existing MTP online calibration unchanged");
+    let width = match drafts { Drafts::Mtp { depth, .. } => depth, Drafts::None => 0 };
+    let mut shared = if width > 0 {
+        let geometry = resource::geometry(&engine.draft_homes(snapshot)?, engine.cfg.experts, engine.cfg.topk,
+            DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION)?;
+        engine.arm_draft_probe()?;
+        Some(cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?)
+    } else { None };
     let mut trace = Trace::open()?;
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let config = &opened.checkpoint.config;
@@ -926,11 +915,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     let mut request = Active {
                         keyed_history: p.keys.tokens().to_vec(),
                         history: p.tokens,
-                        draft_limit: COPY_DRAFT,
-                        draft_pause: 0,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, mtp: p.seq,
-                        outcomes: DraftHistory::default(), copy_outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
+                        outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
                     };
@@ -973,32 +960,32 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let cycle = Instant::now();
         let mut tally = console::Step::begin(0);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        let mut rates: Vec<Vec<f64>> = Vec::new();
         let mut neural_confidence: Vec<Vec<f64>> = vec![Vec::new(); active.len()];
+        let mut round_clock = RoundClock::at(cycle);
+        let mut drafted_width = 0;
+        let mut drafted_requests = 0;
+        let mut predicted = None;
         let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
-        let room = (DECODE_ROWS / active.len()).max(1) - 1;
+        let room = DECODE_ROWS.saturating_sub(active.len());
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         let mut proposals: Vec<Vec<u32>> = match drafts {
             Drafts::None => vec![Vec::new(); active.len()],
-            Drafts::Copy => active.iter_mut().zip(&limits).map(|(a, &limit)| {
-                if a.draft_pause > 0 {
-                    a.draft_pause -= 1;
-                    if a.draft_pause == 0 {
-                        a.draft_limit = 1;
-                    }
-                }
-                // `emit` already appended `next` to the history.
-                copy_drafts(&a.history, limit.min(a.draft_limit))
-            }).collect(),
             Drafts::Mtp { depth, fixed } => {
                 let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
                 let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
-                let confidence;
-                (rates, confidence) = mtp_policy::acceptance(&histories, &limits, &calibration);
-                neural_confidence = confidence.clone();
-                let mut depths = mtp_policy::plan(&confidence, fixed.then_some(depth), &cost);
+                neural_confidence = mtp_policy::acceptance(&histories, &limits);
+                for (a, prior) in active.iter().zip(&mut neural_confidence) {
+                    if a.mtp.pending.is_empty() { prior.clear(); }
+                }
+                let shared = shared.as_mut().expect("MTP has a shared policy");
+                let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
+                    resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
+                let selection = resource::select_drafted(shared, &candidates, depth, DECODE_ROWS,
+                    neural_confidence.iter().filter(|p| !p.is_empty()).count());
+                predicted = selection.predicted;
+                let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
                 for ((a, d), &limit) in active.iter_mut().zip(depths.iter_mut()).zip(&limits) {
                     // A sequence planned without drafts for a while probes one.
                     a.idle = if *d == 0 { a.idle + 1 } else { 0 };
@@ -1012,39 +999,44 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     }
                 }
                 let pending: usize = active.iter().map(|a| a.mtp.pending.len()).sum();
+                if resource::trim_budget(&mut depths, DECODE_ROWS) { predicted = None; }
                 let rows: usize = depths.iter().map(|d| d + 1).sum();
                 if depths.iter().any(|&d| d > 0) || pending + rows > DECODE_ROWS / 2 {
-                    let steps = timing.steps;
-                    let timer = Instant::now();
                     let mut seqs: Vec<DraftSeq<'_>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
                         placement: &a.placement, seq: &mut a.mtp, depth }).collect();
-                    let proposals = speculate::draft(engine, &mut seqs, &mut timing)?;
-                    if depths.iter().any(|&d| d > 0) {
-                        cost.observe_chain(active.len(), timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
-                    }
+                    drafted_requests = depths.iter().filter(|&&n| n > 0).count();
+                    drafted_width = depths.iter().copied().max().unwrap_or(0);
+                    let proposals = round_clock.draft(|| speculate::draft(engine, &mut seqs, &mut timing))?;
                     proposals
                 } else {
                     vec![Vec::new(); active.len()]
                 }
             }
         };
-        let mut used_copy = vec![matches!(drafts, Drafts::Copy); active.len()];
-        if copy_policy && !matches!(drafts, Drafts::None) {
-            let copies: Vec<_> = if matches!(drafts, Drafts::Copy) { std::mem::take(&mut proposals) }
-                else { active.iter().zip(&limits).map(|(a, &limit)| if a.job.sampling.is_greedy() {
-                    copy_drafts(&a.history, limit.min(COPY_DRAFT))
-                } else { Vec::new() }).collect() };
-            if proposals.is_empty() { proposals = vec![Vec::new(); active.len()]; }
-            let copy_rates: Vec<_> = active.iter().zip(&copies).map(|(a, copy)| a.copy_outcomes.conditional(copy.len())).collect();
-            let inputs: Vec<_> = active.iter().enumerate().map(|(i, a)| crate::shared::draft_policy::CopyInput {
-                key: (a.placement.len, i as u64), neural: &proposals[i], confidence: &neural_confidence[i],
-                copy: &copies[i], copy_confidence: &copy_rates[i],
+        let trace_neural = trace.as_ref().map(|_| proposals.clone());
+        let trace_copy = trace.as_ref().map(|_| active.iter().zip(&proposals).map(|(a, p)|
+            crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))
+            .collect::<Vec<_>>());
+        let mut neural_lengths: Vec<_> = proposals.iter().map(Vec::len).collect();
+        let copies: Vec<_> = active.iter().zip(&proposals).zip(&limits).zip(&mut neural_confidence)
+            .map(|(((a, proposal), &limit), prior)| {
+                prior.truncate(proposal.len());
+                shared.as_ref().filter(|_| !matches!(drafts, Drafts::Mtp { fixed: true, .. }))
+                    .and_then(|shared| resource::copy_continuation(shared, a.ticket.id(), &a.history,
+                        proposal, prior, limit, a.job.sampling.is_greedy()))
             }).collect();
-            let (lengths, used) = crate::shared::draft_policy::compete_copies(&inputs,
-                timing.steps > steps_before, timing.steps - steps_before, &cost);
-            used_copy = used;
-            for i in 0..proposals.len() {
-                if used_copy[i] { proposals[i] = copies[i][..lengths[i]].to_vec(); }
+        if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Mtp { fixed: true, .. })) {
+            let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
+                resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
+            let selection = resource::select_drafted(shared, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
+            predicted = selection.predicted;
+            for (((proposal, copy), neural), length) in proposals.iter_mut().zip(copies)
+                .zip(&mut neural_lengths).zip(selection.lengths) {
+                if let Some(copy) = copy {
+                    *neural = copy.neural;
+                    *proposal = copy.tokens;
+                }
+                proposal.truncate(length);
             }
         }
         let mut sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
@@ -1056,11 +1048,6 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             Ok(rows)
         }).collect::<Result<_>>()?;
         let diagnostic = active.iter().any(|a| a.job.probe.is_some());
-        if matches!(drafts, Drafts::Copy) {
-            let rows = sequences.iter().map(Vec::len).sum();
-            let limit = engine.copy_verify_row_limit(rows, sequences.len(), diagnostic);
-            trim_copy_rows(&mut sequences, limit);
-        }
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let spec = sequences.iter().any(|rows| rows.len() > 1);
         let draft_us = console::us(cycle);
@@ -1071,6 +1058,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
         steps += 1;
         let timer = Instant::now();
+        engine.probe_begin(tokens.len());
         let step = if diagnostic {
             engine.verify_device_ungraphed(&mut rows, spec)
         } else {
@@ -1085,17 +1073,16 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
                 Ok((selector.select(&logits, &batch)?, logits))
             });
+        engine.probe_end();
         let elapsed = timer.elapsed().as_secs_f64();
         verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic), spec, 1e3 * elapsed);
         verify_s += elapsed;
-        let shape = Shape::plain(tokens.len(), sequences.len());
-        let predicted_ms = cost.verify_ms(shape);
-        cost.observe_verify(shape, 1e3 * elapsed);
         let (selected, logits) = match step {
             Ok(step) => step,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
+                    if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(&family, &mut cache, &mut free_slots, &request.placement);
                 }
@@ -1107,15 +1094,19 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let mut kept = Vec::with_capacity(active.len());
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let emit_timer = Instant::now();
+        let mut outcomes = vec![(0usize, 1usize, Some(Censor::Cancelled)); active.len()];
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
             .map(|(index, ((request, rows), &start))| {
             if let Some(error) = poisoned[index].take() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                outcomes[index] = (rows.len(), 1, Some(Censor::Cancelled));
+                kept.push(None);
                 offset += rows.len();
                 return true;
             }
             let mut finished = false;
             let mut last = None;
+            let mut cancelled = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
@@ -1142,6 +1133,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     Err(error) => {
                         let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
+                        cancelled = true;
                         break;
                     }
                 }
@@ -1153,23 +1145,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             request.cycles += 1;
             request.proposed += drafted;
             request.accepted += accepted;
-            if used_copy[index] {
-                request.copy_outcomes.observe(drafted.min(accepted + usize::from(!finished)), accepted);
-            }
-            if matches!(drafts, Drafts::Mtp { .. }) && !used_copy[index] {
-                let observed = if copy_policy { drafted.min(accepted + usize::from(!finished)) } else { drafted };
-                request.outcomes.observe(observed, accepted);
-                if let Some(rates) = rates.get(index) {
-                    calibration.observe_outcome(rates, observed, accepted);
-                }
-            } else if drafted > 0 && accepted == 0 {
-                request.draft_limit /= 2;
-                if request.draft_limit == 0 {
-                    request.draft_pause = 8;
-                }
-            } else if drafted > 0 && accepted == drafted {
-                request.draft_limit = (request.draft_limit * 2).clamp(1, COPY_DRAFT);
-            }
+            let censor = if cancelled { Some(Censor::Cancelled) } else {
+                resource::finish_censor(finished, accepted + 1, rows, last.map(|(_, token)| token), &request.job.stop_token_ids) };
+            outcomes[index] = (rows.len(), accepted + 1, censor);
+            let neural = drafted.min(neural_lengths[index]);
+            request.outcomes.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
             // A turn snapshot captures the state at the kept length: commit it too.
             kept.push(if !finished || request.turn.is_some() { last } else { None });
             finished
@@ -1187,6 +1167,20 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         speculate::accept(engine, &mut verified, spec, mtp)?;
         drop(verified);
         let commit_us = console::us(commit_timer);
+        if let Some(shared) = shared.as_mut() {
+            let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
+                let (rows, accepted, censor) = outcomes[i];
+                resource::Verified { id: a.ticket.id(), rows, accepted,
+                    source: if rows > 1 { DraftSource::Neural } else { DraftSource::Undrafted },
+                    prior: Some(neural_confidence[i].as_slice()), features: None, censor }
+            }).collect();
+            let times = round_clock.observe();
+            if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(shared,
+                &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+                tracing::debug!(%error, "Qwen draft round not observed");
+            }
+            resource::publish(shared, shared.stats().rounds, 0, None);
+        }
         for (i, request) in active.iter().enumerate() {
             tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],
                 request.constraint.is_some(), finished[i]);
@@ -1209,14 +1203,19 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
                 "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
                 "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-                "predicted_ms": predicted_ms, "fit": cost.fitted(active.len()), "rates": rates,
-                "calibration": calibration.fitted()}));
+                "neural_tokens": trace_neural,
+                "copy_windows": trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                    serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
+                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
+                "predicted_us": predicted, "rates": neural_confidence,
+                "draft_policy": resource::snapshot()}));
         }
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
             }
             let mut request = active.remove(index);
+            if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;

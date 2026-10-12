@@ -56,6 +56,25 @@ impl RoundRoutes {
         self.filled[layer] = true;
         Ok(())
     }
+    /// Copy an already validated owner probe's u16 layer without widening it.
+    pub fn push_narrow(&mut self, layer: usize, ids: &[u16]) -> Result<(), RouteError> {
+        self.slot(layer, ids.len())?.copy_from_slice(ids);
+        self.filled[layer] = true;
+        Ok(())
+    }
+    /// As [`push`](Self::push), from little-endian u32 pinned staging bytes.
+    pub fn push_bytes(&mut self, layer: usize, bytes: &[u8], mask: u32) -> Result<(), RouteError> {
+        if bytes.len() % 4 != 0 {
+            return Err(RouteError::Extent { layer, found: bytes.len(), expected: self.rows * self.topk * 4 });
+        }
+        let slot = self.slot(layer, bytes.len() / 4)?;
+        for (out, word) in slot.iter_mut().zip(bytes.chunks_exact(4)) {
+            let id = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            *out = narrow(id & mask)?;
+        }
+        self.filled[layer] = true;
+        Ok(())
+    }
     /// As [`push`](Self::push), from `[row][slot]` arrays of `K == topk` ids.
     pub fn push_rows<const K: usize>(&mut self, layer: usize, rows: &[[u32; K]], mask: u32)
         -> Result<(), RouteError> {
@@ -105,6 +124,21 @@ fn narrow(id: u32) -> Result<u16, RouteError> { u16::try_from(id).map_err(|_| Ro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_and_narrow_routes_match_wide_routes() {
+        let mut routes = RoundRoutes::new(2, 2);
+        routes.begin(2);
+        let bytes: Vec<_> = [1u32, 2, 512 | 3, 4].into_iter().flat_map(u32::to_le_bytes).collect();
+        routes.push_bytes(0, &bytes, 511).unwrap();
+        routes.push_narrow(1, &[5, 6, 7, 8]).unwrap();
+        routes.complete().unwrap();
+        assert_eq!(routes.flat(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(routes.push_bytes(0, &[0; 3], u32::MAX), Err(RouteError::Extent { .. })));
+        assert!(matches!(routes.push_narrow(1, &[0; 3]), Err(RouteError::Extent { .. })));
+        let bytes: Vec<_> = [70_000u32, 1, 2, 3].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(routes.push_bytes(0, &bytes, u32::MAX), Err(RouteError::Id(70_000)));
+    }
 
     #[test]
     fn layer_major_ids_with_flags_masked() {

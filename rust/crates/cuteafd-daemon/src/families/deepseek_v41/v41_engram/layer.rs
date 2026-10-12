@@ -145,7 +145,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             residual: DeviceAllocation::new(weights.library, output_bytes)?,
             embeddings: DeviceAllocation::new(weights.library, capacity * 24 * 512)?,
             text_mask: DeviceAllocation::new(weights.library, capacity)?,
-            graphs: RowGraphs::new(weights.library, "engram", 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1)),
+            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS),
             projected: DeviceAllocation::new(weights.library, projected_bytes)?,
             scratch: DeviceAllocation::new(weights.library, scratch_bytes)?,
             alpha: DeviceAllocation::new(weights.library, 4)?,

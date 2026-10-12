@@ -588,7 +588,7 @@ mod sampling_budget_tests {
             let expected = param + arena + scratch + arena + histogram + rank + rows + rows
                 + rows + rows + capacity * 8 + rows + rows;
             assert_eq!(TargetSamplingWave::device_bytes(capacity, SAMPLING_VOCAB), expected);
-            // Pinned call sites: the production capacities are 48 and 64.
+            // Production head lanes use V41_VERIFY_ROWS, not neural width.
         }
         // The documented §11.1 total at capacity 80 is ~4.2 MiB; the arena is
         // allocated twice (device + top-k bitmap), the histogram once, and the

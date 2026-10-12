@@ -1,5 +1,9 @@
-//! Greedy verification of an already emitted anchor and up to seven draft tokens.
+//! Greedy verification of an emitted anchor and a lane-admitted draft prefix.
+//! Neural width is independent of the target verifier row budget.
 pub const MAX_DSPARK_PROPOSALS: usize = 7;
+
+/// Total target rows per V4.1 verifier lane, including all request anchors.
+pub const V41_VERIFY_ROWS: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct GreedyVerification {
@@ -21,8 +25,8 @@ pub fn verify_dspark_greedy(
     eos: u32,
     remaining: usize,
 ) -> Result<GreedyVerification, &'static str> {
-    if inputs.is_empty() || inputs.len() > MAX_DSPARK_PROPOSALS + 1 || inputs.len() != target_next.len() {
-        return Err("verification requires one to eight corresponding target rows");
+    if inputs.is_empty() || inputs.len() != target_next.len() {
+        return Err("verification requires nonempty corresponding target rows");
     }
     if remaining == 0 || inputs[0] == eos {
         return Err("completed request cannot verify another anchor");
@@ -81,8 +85,24 @@ mod tests {
             assert_eq!(result.emitted, target[..=eos_position]);
             assert!(result.eos);
         }
-        assert!(verify_dspark_greedy(&[10; 9], &[11; 9], 1, 100).is_err());
+        assert!(verify_dspark_greedy(&[10; 9], &[11; 9], 1, 100).is_ok());
     }
+    #[test]
+    fn long_copy_tails_correct_at_every_position() {
+        let inputs: Vec<_> = (10..48).collect();
+        let full: Vec<_> = (11..49).collect();
+        for mismatch in 0..inputs.len() {
+            let mut target = full.clone();
+            target[mismatch] = 99;
+            let result = verify_dspark_greedy(&inputs, &target, 1, 100).unwrap();
+            assert_eq!(result.accepted_inputs as usize, mismatch + 1);
+            assert_eq!(result.emitted, target[..=mismatch]);
+        }
+        let result = verify_dspark_greedy(&inputs, &full, 1, 100).unwrap();
+        assert_eq!(result.accepted_inputs as usize, inputs.len());
+        assert_eq!(result.emitted, full);
+    }
+
     #[test]
     fn greedy_prefix_correction_bonus_and_stopping() {
         let inputs = [10, 11, 12, 13, 14, 15];

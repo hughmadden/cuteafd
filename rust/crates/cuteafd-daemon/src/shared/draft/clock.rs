@@ -102,14 +102,30 @@ impl<'a> LayerClock<'a> {
         unsafe { self.library.cuda_event_elapsed_ms(self.entry, self.events[layer]) }
             .ok().map(|ms| f64::from(ms) * 1e3)
     }
-    /// Device µs of `layer` from the previous layer's mark on this clock.
+    /// Device µs from this layer's owner entry, or its previous layer's mark.
     pub fn layer_us(&self, layer: usize) -> Option<f64> {
-        layer.checked_sub(1).and_then(|previous| self.between(previous, layer))
+        match layer_start(&self.recorded, self.entry_layer, layer)? {
+            LayerStart::Entry => self.since_entry(layer),
+            LayerStart::Previous(previous) => self.between(previous, layer),
+        }
     }
-    /// Every layer's device µs on a single-clock pass (layer 0 is `None`).
+    /// Every recorded layer's device µs; an owner cut uses its entry event.
     pub fn read(&self) -> Vec<Option<f64>> {
         (0..self.layers()).map(|layer| self.layer_us(layer)).collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerStart {
+    Entry,
+    Previous(usize),
+}
+
+fn layer_start(recorded: &[bool], entry_layer: Option<usize>, layer: usize) -> Option<LayerStart> {
+    if !*recorded.get(layer)? { return None; }
+    if entry_layer == Some(layer) { return Some(LayerStart::Entry); }
+    let previous = layer.checked_sub(1)?;
+    recorded[previous].then_some(LayerStart::Previous(previous))
 }
 
 impl Drop for LayerClock<'_> {
@@ -119,6 +135,32 @@ impl Drop for LayerClock<'_> {
             if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
                 tracing::error!(%error, "destroying layer timing event");
             }
+        }
+    }
+}
+
+/// Aggregate host-only probe/policy work without per-round logging or switches.
+#[derive(Clone, Copy)]
+pub(crate) enum HostStage { Routes, Observe, Select, Publish }
+
+pub(crate) struct HostSpan { stage: HostStage, start: Instant }
+
+impl HostSpan {
+    pub(crate) fn new(stage: HostStage) -> Self { Self { stage, start: Instant::now() } }
+}
+
+impl Drop for HostSpan {
+    fn drop(&mut self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SAMPLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        static MICROS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let index = self.stage as usize;
+        let micros = self.start.elapsed().as_micros() as u64;
+        let total = MICROS[index].fetch_add(micros, Ordering::Relaxed) + micros;
+        let samples = SAMPLES[index].fetch_add(1, Ordering::Relaxed) + 1;
+        if samples % 64 == 0 {
+            let stage = match self.stage { HostStage::Routes => "routes", HostStage::Observe => "observe", HostStage::Select => "select", HostStage::Publish => "publish" };
+            tracing::info!(stage, samples, mean_us = total as f64 / samples as f64, "draft policy host timing");
         }
     }
 }
@@ -162,6 +204,29 @@ pub(crate) struct RoundTimes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_cut_uses_entry_then_same_owner_boundaries() {
+        let peer = [false, false, true, true];
+        assert_eq!(layer_start(&peer, Some(2), 2), Some(LayerStart::Entry));
+        assert_eq!(layer_start(&peer, Some(2), 3), Some(LayerStart::Previous(2)));
+        assert_eq!(layer_start(&peer, None, 2), None);
+        assert_eq!(layer_start(&peer, Some(2), 1), None);
+        assert_eq!(layer_start(&peer, Some(2), 4), None);
+        // An explicit arrival takes precedence even if an old-owner mark exists.
+        assert_eq!(layer_start(&[true; 4], Some(2), 2), Some(LayerStart::Entry));
+        assert_eq!(layer_start(&[false; 4], Some(2), 2), None);
+    }
+
+    #[test]
+    fn single_owner_clock_boundaries_are_unchanged() {
+        let recorded = [true; 4];
+        assert_eq!(layer_start(&recorded, None, 0), None);
+        for layer in 1..4 {
+            assert_eq!(layer_start(&recorded, None, layer), Some(LayerStart::Previous(layer - 1)));
+        }
+        assert_eq!(layer_start(&[true, false, true], None, 2), None);
+    }
 
     #[test]
     fn round_clock_brackets_the_draft_call_alone() {

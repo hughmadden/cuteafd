@@ -8,7 +8,6 @@ mod distributed;
 mod placement;
 pub(crate) mod scores;
 use scores::RetainedScores;
-mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
 use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
@@ -407,7 +406,7 @@ fn worker(
         TargetHeadWeights::device_bytes(&catalog)?,
         16 * 1024 * 1024,
     )?;
-    let head = head_weights.wave(&vocabulary, if args.dspark_draft_limit > 5 { 64 } else { 48 }, TargetHeadWave::device_bytes(if args.dspark_draft_limit > 5 { 64 } else { 48 })?)?;
+    let head = head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
     if small_card { memory::startup_phase(&lib, "v41/weights:head", device_total)?; }
     let mut pass = TargetPass::new(
@@ -444,14 +443,10 @@ fn worker(
         EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?,
         [EngramGate::new(&engram_weights[0], rows, 1024 * 1024 * 1024)?,
          EngramGate::new(&engram_weights[1], rows, 1024 * 1024 * 1024)?],
-        head_weights.wave(&vocabulary, if args.dspark_draft_limit > 5 { 64 } else { 48 }, TargetHeadWave::device_bytes(if args.dspark_draft_limit > 5 { 64 } else { 48 })?)?,
+        head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?,
         crate::families::deepseek_v41::v41_target_pass::TargetTapWave::new(&lib, rows, crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?)?,
         Duration::from_secs(120),
     )?;
-    if args.dspark && args.dspark_draft_limit > 5 {
-        pass.reserve_sparse_decode_rows(64)?;
-        prefill_pass.reserve_sparse_decode_rows(64)?;
-    }
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
     if small_card { memory::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;

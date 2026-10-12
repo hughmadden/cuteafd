@@ -54,7 +54,6 @@ pub(crate) struct RoundProbe<'a> {
     pending: bool,
     /// The first route error of the round; the round is then not observed.
     error: Option<RouteError>,
-    scratch: Vec<u32>,
 }
 
 impl<'a> RoundProbe<'a> {
@@ -66,7 +65,7 @@ impl<'a> RoundProbe<'a> {
         Ok(Self { clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
             check: std::env::var("CUTEAFD_GLMF_ROUTE_RING_CHECK").is_ok_and(|v| v == "1"),
-            ring_check: RingCheck::default(), active: false, pending: false, error: None, scratch: Vec::new() })
+            ring_check: RingCheck::default(), active: false, pending: false, error: None })
     }
 
     /// Start a verify step of `rows` rows.
@@ -104,12 +103,21 @@ impl<'a> RoundProbe<'a> {
         }
     }
 
+    /// Mark the first layer after an owner cut using this device's own event.
+    ///
+    /// # Safety
+    /// `stream` is live on this probe's device and ordered after the input transfer.
+    pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
+        if self.active {
+            // SAFETY: the caller guarantees the event and stream ownership/order.
+            unsafe { self.clock.mark_entry(layer, stream, false); }
+        }
+    }
+
     /// A Spark layer's staged ids: `rows * topk` little-endian u32 in row order.
     pub fn staged(&mut self, layer: usize, bytes: &[u8]) {
         if !self.active || self.error.is_some() { return; }
-        self.scratch.clear();
-        self.scratch.extend(bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
-        match self.routes.push(layer, &self.scratch, ROUTE_MASK) {
+        match self.routes.push_bytes(layer, bytes, ROUTE_MASK) {
             Ok(()) => self.staged[layer] = true,
             Err(error) => self.error = Some(error),
         }
@@ -143,6 +151,7 @@ impl<'a> RoundProbe<'a> {
     /// routes (checking it against the staging where both exist) and read the
     /// layer clock. `None` when the round's routes are incomplete or invalid.
     pub fn finish(&mut self) -> Option<(&RoundRoutes, Vec<Option<f64>>)> {
+        let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
         if self.error.is_none() {
@@ -168,17 +177,17 @@ fn settle(routes: &mut RoundRoutes, ring: &[u8], capacity: usize, topk: usize, r
     let words = routes.rows() * topk;
     for layer in (0..ringed.len()).filter(|&layer| ringed[layer]) {
         let offset = layer * capacity * topk * 4;
-        let ids: Vec<u32> = ring[offset..offset + words * 4].chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let bytes = &ring[offset..offset + words * 4];
         if staged[layer] {
             check.layers += 1;
             let start = layer * words;
-            if routes.flat()[start..start + words].iter().zip(&ids).any(|(&s, &r)| u32::from(s) != r) {
+            if routes.flat()[start..start + words].iter().zip(bytes.chunks_exact(4))
+                .any(|(&s, w)| u32::from(s) != u32::from_le_bytes([w[0], w[1], w[2], w[3]])) {
                 check.mismatched += 1;
                 tracing::warn!(layer, rows = routes.rows(), "GLM Flash route ring differs from the staged Spark ids");
             }
         } else {
-            routes.push(layer, &ids, ROUTE_MASK)?;
+            routes.push_bytes(layer, bytes, ROUTE_MASK)?;
         }
     }
     Ok(())

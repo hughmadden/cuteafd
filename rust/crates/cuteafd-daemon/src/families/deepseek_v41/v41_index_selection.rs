@@ -238,7 +238,7 @@ impl<'a> IndexSelectionWave<'a> {
             return Ok(true);
         } else { self.restart()?; }
         if let Some((_, old)) = self.graph.take() {
-            if fixed_limit.is_none() && old[1] > 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1) {
+            if fixed_limit.is_none() && old[1] > cuteafd_core::V41_VERIFY_ROWS {
                 self.graphs.retire(&old);
             }
         }

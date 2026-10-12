@@ -1023,11 +1023,13 @@ for name in names:
 overlay=home/'.cache/cuteafd/wip-run'/INSTANCE/SLOT
 if overlay.is_symlink(): raise RuntimeError('refusing overlay symlink')
 if overlay.exists(): shutil.rmtree(overlay)
-for registration in [home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json'),home/'.cache/cuteafd/wip-slots'/(SLOT+'.json')]:
+for registration, shared in [(home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json'), False),(home/'.cache/cuteafd/wip-slots'/(SLOT+'.json'), True)]:
     if registration.exists():
         data=json.loads(registration.read_text())
         if data.get('wip_instance')==INSTANCE and data.get('slot')==SLOT: registration.unlink()
-        else: raise RuntimeError('refusing foreign registration '+str(registration))
+        # The legacy slot-name file is shared by every instance using that slot
+        # name; another instance's entry there is not ours to remove or refuse.
+        elif not shared: raise RuntimeError('refusing foreign registration '+str(registration))
 if root.is_symlink(): raise RuntimeError('refusing root symlink')
 shutil.rmtree(root)
 for path in [root,overlay,home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json')]:

@@ -11,8 +11,6 @@ use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
 use super::console;
-use super::copy_drafts;
-use crate::shared::speculation::copy::{self as copy_search, LatestWindow};
 use crate::shared::draft::clock::RoundClock;
 
 #[cfg(test)]
@@ -33,7 +31,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
-        tokens: tokens.to_vec(), image_keys, next_after_commit: None, copy: None };
+        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
@@ -79,8 +77,6 @@ pub(super) struct Active<'a> {
     tokens: Vec<u32>,
     image_keys: ImageKeys,
     next_after_commit: Option<RetainedScores>,
-    /// Copy windows over `tokens`; `None` when copy drafting is off.
-    copy: Option<LatestWindow>,
 }
 impl Active<'_> {
     fn id(&self) -> u64 { self.ticket.id() }
@@ -202,7 +198,6 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "host_cache_config": prefixes.host_config(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
-        "copy_drafts": copy_drafts::stats(),
         "admission": kv_waiter.stats(),
         "media": media.stats(),
         "totals": console::totals::snapshot(),
@@ -270,8 +265,6 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
-    let copy_windows = draft.is_some() && copy_drafts::enabled();
-    tracing::info!(copy_drafts=copy_windows, window=copy_search::WINDOW, "copy-window drafting");
     let result = (|| -> Result<()> {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -507,7 +500,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     return Ok((Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
                         lease, job, decoder, anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false,
                         failed: false, tokens: prompt, image_keys, next_after_commit: None,
-                        copy: copy_windows.then(LatestWindow::default) }, true));
+                        }, true));
                 }
                 P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
@@ -530,7 +523,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 Ok((Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
                     lease, job, decoder, anchor, generated: 0, buffered: 0,
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
-                    copy: copy_windows.then(LatestWindow::default) }, false))
+                    }, false))
             })();
             match result {
                 Ok((request, true)) => {
@@ -1450,39 +1443,29 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
     requests.prepare(&work)
 }
 
-/// Copy-window verify inputs for one lane round, in member order:
-/// `[anchor, copied...]` for a greedy request whose history ends in eight
-/// tokens it has seen before, else `None` and dSpark drafts it. A sampled
-/// request never copies: its draw leaves copied text more often, and a copy
-/// that fails costs the request dSpark's drafts for that round. A copy takes
-/// the same grammar truncation as dSpark drafts; one cut below two tokens goes
-/// to dSpark.
-fn copy_inputs(active: &mut [Option<Active<'_>>], members: &[usize], max_drafts: usize)
-    -> Result<Vec<Option<Vec<u32>>>> {
-    members.iter().map(|&slot| {
-        let request = active[slot].as_mut().unwrap();
-        if !request.job.sampling.is_greedy() || crate::shared::probe::no_speculation(&request.job.probe) { return Ok(None); }
-        let cap = copy_search::cap(request.job.max_tokens - request.generated, max_drafts);
-        let Some(copied) = request.copy.as_mut().and_then(|copy| copy.propose(&request.tokens, cap))
-            else { return Ok(None) };
-        let mut input = Vec::with_capacity(copied.len() + 1);
-        input.push(request.anchor);
-        input.extend(copied);
-        if let Some(constraint) = &request.constraint { constraint.truncate_proposal(&mut input)?; }
-        Ok((input.len() > copy_search::MIN_DRAFTS).then_some(input))
-    }).collect()
+fn bound_inputs(inputs: &mut [Vec<u32>]) {
+    let mut lengths: Vec<_> = inputs.iter().map(|input| input.len() - 1).collect();
+    crate::shared::draft::resource::trim_budget(&mut lengths, cuteafd_core::V41_VERIFY_ROWS);
+    for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length + 1); }
 }
 
-/// Count each copy the round verified, and back off a request whose copy
-/// accepted nothing.
-fn finish_copies(active: &mut [Option<Active<'_>>], members: &[usize], copied: &[bool],
-    inputs: &[Vec<u32>], accepted: &[u32]) {
-    for (((&slot, &copied), input), &accepted) in members.iter().zip(copied).zip(inputs).zip(accepted) {
-        if !copied { continue; }
-        let drafts = accepted.saturating_sub(1) as usize;
-        copy_drafts::record_round(input.len() - 1, drafts);
-        if let Some(copy) = active[slot].as_mut().and_then(|request| request.copy.as_mut()) { copy.observe(drafts); }
+/// Preserve the confident neural prefix before grammar and resource-priced truncation.
+fn extend_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, active: &[Option<Active<'_>>],
+    members: &[usize], inputs: &mut [Vec<u32>]) -> Result<()> {
+    for (&slot, input) in members.iter().zip(inputs) {
+        let request = active[slot].as_ref().unwrap();
+        let room = (request.job.max_tokens - request.generated).saturating_sub(1)
+            .min(input.len() - 1 + crate::shared::draft::copy::COPY_EXTENSION);
+        if input.len() <= 1 { continue; }
+        let Some(calibrated) = draft.calibrated_confidence(request.id(), input.len() - 1)? else { continue; };
+        if let Some(copy) = crate::shared::draft::copy::continuation(&request.tokens, &input[1..], &calibrated,
+            room, request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe)) {
+            draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;
+            input.truncate(1);
+            input.extend(copy.tokens);
+        }
     }
+    Ok(())
 }
 
 fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
@@ -1503,17 +1486,11 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // console's draft stage) still spans copy lookup and length selection.
     let mut clock = RoundClock::at(started);
     let draft_start = Instant::now();
-    let copies = copy_inputs(active, members, draft.as_deref().map_or(0, |d| d.max_verify_rows() - 1))?;
-    let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
-    let drafting: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| !**copied).map(|(seed, _)| *seed).collect();
-    if let Some(draft) = draft.as_deref_mut().filter(|_| copied.contains(&true)) {
-        let ids: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| **copied).map(|(seed, _)| seed.0).collect();
-        draft.skip_copied(lane, &ids, !drafting.is_empty())?;
-    }
-    let drafted = if drafting.is_empty() { Vec::new() }
-        else if let Some(draft) = draft.as_deref_mut() { clock.draft(|| draft.propose(lib, lane, &drafting))? }
-        else { drafting.iter().map(|r| vec![r.1]).collect() };
-    let mut inputs = copy_search::merge(copies, drafted)?;
+    let mut inputs = if let Some(draft) = draft.as_deref_mut() {
+        clock.draft(|| draft.propose(lib, lane, &seeds))?
+    } else { seeds.iter().map(|r| vec![r.1]).collect() };
+    if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
+    let copied = vec![false; members.len()];
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
@@ -1530,6 +1507,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             }
         }
     }
+    bound_inputs(&mut inputs);
     let draft_us = draft_start.elapsed().as_micros() as u64;
     let prepare_start = Instant::now();
     let mut batch = Some(prepare_decode_lane(requests, active, members, &inputs, speculative)?);
@@ -1572,7 +1550,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
             Some(&round), retain_enabled)?;
-        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
@@ -1614,7 +1591,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
-        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
@@ -2183,6 +2159,17 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn verifier_budget_preserves_anchors_and_admits_copy_tails() {
+        let mut inputs = vec![vec![10; 38]; 16];
+        bound_inputs(&mut inputs);
+        assert_eq!(inputs.iter().map(Vec::len).sum::<usize>(), cuteafd_core::V41_VERIFY_ROWS);
+        assert!(inputs.iter().all(|input| !input.is_empty()));
+        let mut solo = vec![vec![10; 38]];
+        bound_inputs(&mut solo);
+        assert_eq!(solo[0].len(), 38);
+    }
 
     /// Position-sensitive logits so different absolute indices and rows differ.
     fn rows(count: usize) -> Vec<u8> {
