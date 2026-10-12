@@ -138,7 +138,9 @@ PY
   export KACHE_CACHE_DIR="$cache" KACHE_BUILD_SCRIPT_CACHE=0 KACHE_OUT_DIR_ALIAS=0
   export KACHE_VERIFY_RESTORES=always
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"
-  rmdir "$CUTEAFD_KACHE_WARNING_DIR" 2>/dev/null || true
+  # Each build starts cached: an earlier build's fallback (the directory holds
+  # its first-failure record, so rmdir alone never cleared it) must not persist.
+  rm -rf "$CUTEAFD_KACHE_WARNING_DIR" 2>/dev/null || true
   export RUSTC_WRAPPER="$launcher" CC_KNOWN_WRAPPER_CUSTOM=compiler-cache
   # kache restores and plain-retry fallbacks leave rustc's incremental
   # dep-graph/query-cache partial ("missing incremental ... paths"), which
@@ -277,15 +279,22 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exec "$@"
   fi
   # Preserve genuine compiler errors, but never let an optional cache break a build.
+  [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]] || exec "$@"
   status=0
-  if [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]]; then
-    timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-300}" "$CUTEAFD_KACHE_ACTIVE" "$@" && exit 0
-    status=$?
+  timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-300}" "$CUTEAFD_KACHE_ACTIVE" "$@" && exit 0
+  status=$?
+  # Retry plain. A compile that also fails plain is the compiler's own error
+  # (e.g. proc-macro2's procmacro2_build_probe, which fails by design on stable
+  # rustc), not a cache fault: keep caching for the rest of the build. Only a
+  # timeout, or a kache failure that the plain compiler does not reproduce,
+  # disables it.
+  plain=0
+  "$@" || plain=$?
+  if [[ "$status" == 124 || "$status" == 137 || "$plain" == 0 ]] &&
+     mkdir "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" 2>/dev/null; then
+    # Record why caching stopped: 124/137 is the timeout, anything else kache.
+    printf 'exit %s (plain %s): %s\n' "$status" "$plain" "$*" > "$CUTEAFD_KACHE_WARNING_DIR/first-failure" 2>/dev/null || true
+    printf 'warning: cuteafd kache invocation failed or timed out (exit %s); continuing with plain compiler\n' "$status" >&2
   fi
-  if [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]] && mkdir "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" 2>/dev/null; then
-    # Record why caching stopped: 124/137 is the timeout, anything else kache or the compiler.
-    printf 'exit %s: %s\n' "$status" "$*" > "$CUTEAFD_KACHE_WARNING_DIR/first-failure" 2>/dev/null || true
-    printf 'warning: cuteafd kache invocation failed or timed out (exit %s); retrying with plain compiler\n' "$status" >&2
-  fi
-  exec "$@"
+  exit "$plain"
 fi

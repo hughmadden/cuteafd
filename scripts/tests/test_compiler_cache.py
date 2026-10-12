@@ -215,7 +215,30 @@ def test_compiler_errors_are_not_hidden(tmp_path):
     result = run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
                                 "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
                        'if "$RUSTC_WRAPPER" /bin/false; then exit 99; fi')
-    assert result.stderr.count("warning:") == 1
+    # The plain compiler fails too: its error, not a cache fault.
+    assert result.stderr.count("warning:") == 0
+
+
+def test_expected_compile_failure_keeps_cache_enabled(tmp_path):
+    """proc-macro2's build probe fails by design on stable rustc; a failure the plain
+    compiler reproduces must not disable kache for the rest of the build."""
+    binary = tmp_path / "kache"
+    binary.write_text('#!/bin/sh\nif [ "$1" = --version ]; then exit 0; fi\nexec "$@"\n')
+    binary.chmod(0o755)
+    result = run_setup(tmp_path, {"CUTEAFD_KACHE": str(binary),
+                                "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")},
+                       'if "$RUSTC_WRAPPER" /bin/false; then exit 99; fi; '
+                       'test ! -e "$CUTEAFD_KACHE_WARNING_DIR"; "$RUSTC_WRAPPER" /bin/true')
+    assert result.stderr == ""
+
+
+def test_stale_fallback_record_is_cleared_per_build(tmp_path):
+    warned = tmp_path / "build/compiler-cache/warned"
+    warned.mkdir(parents=True)
+    (warned / "first-failure").write_text("exit 1: old\n")
+    run_setup(tmp_path, {"CUTEAFD_KACHE": fake_kache(tmp_path),
+                         "CUTEAFD_KACHE_CACHE_DIR": str(tmp_path / "cache")}, 'true')
+    assert not warned.exists()
 
 
 def test_cmake_opt_out_clears_persisted_cache_launcher(tmp_path):

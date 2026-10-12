@@ -1170,7 +1170,11 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         arm['root'] = str(root)
         arm['build_revision'] = revision
         arm['build_lock_mode'] = build_lock_mode(revision)
-        build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', 'both', '--config', str(state / ('build-' + name + '.config'))]
+        # 0-Spark cards only (#90): a coordinator-only slot, no Spark stage or seed turn.
+        spark_cards = [card for card in cards if int({**config(card['config']), **card.get('set', {})}.get('SPARK_COUNT', len(card.get('sparks', [])))) > 0]
+        build_role = 'both' if spark_cards else 'coordinator'
+        arm['build_role'] = build_role
+        build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', build_role, '--config', str(state / ('build-' + name + '.config'))]
         if arm['build_lock_mode'] == 'legacy-full-build':
             print('# legacy arm: GPU lock held for the full build')
             build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
@@ -1201,9 +1205,24 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
             idx = HOSTS.index(host) + 1
             values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{idx}', f'SPARK_{i}_LANE_B': f'10.55.1.{idx}'})
         build_config.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
+        # Only the submodules a WIP build reads, from the local module stores
+        # (scripts/build/wip-source-checkout.sh, verified against the tree locks).
+        checkout = REPO / 'scripts/build/wip-source-checkout.sh'
+        if checkout.is_file():
+            prepare = [['bash', str(checkout), str(REPO), revision, str(source)]]
+        else:
+            prepare = [['git', '-C', str(REPO), 'worktree', 'add', '--detach', str(source), revision],
+                       ['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive']]
+        if not dry and (source / '.git').exists():
+            # A rerun of this task (e.g. after a failed build) reuses the checkout of the same commit.
+            head = run(['git', '-C', str(source), 'rev-parse', 'HEAD']).stdout.strip()
+            wanted = run(['git', '-C', str(REPO), 'rev-parse', revision + '^{commit}']).stdout.strip()
+            dirty = run(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).stdout.strip()
+            if head != wanted or dirty:
+                raise ValueError(f'{source} holds {head[:12]}{" (dirty)" if dirty else ""}, not {revision}; remove it or use a new --task')
+            prepare = []
         commands = [
-            ['git', '-C', str(REPO), 'worktree', 'add', '--detach', str(source), revision],
-            ['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive'],
+            *prepare,
             [sys.executable, str(REPO / 'scripts/build/assert-build-filesystem.py'), str(root), str(source)],
             ['flock', '-w', '1800', str(Path.home() / '.cache/cuteafd/build.lock'), *build_cmd],
         ]
@@ -1211,13 +1230,14 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
             print(shlex.join(cmd))
             if not dry:
                 if cmd[0] == 'flock':
-                    # Wait (not fail) while another job's export holds the seed Spark; wip.sh
-                    # takes the lock itself for the native phase, so release it at once.
-                    seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
-                    # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
-                    subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
-                                    '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    for host in ('raptor', *HOSTS):
+                    if build_role == 'both':
+                        # Wait (not fail) while another job's export holds the seed Spark; wip.sh
+                        # takes the lock itself for the native phase, so release it at once.
+                        seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
+                        # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
+                        subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
+                                        '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
+                    for host in (('raptor', *HOSTS) if build_role == 'both' else ('raptor',)):
                         marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
                         mark = ['python3', '-c', marker]
                         run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])

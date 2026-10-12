@@ -459,8 +459,9 @@ def test_pool_precheck_and_red_square():
 def _wip_function(name, end):
     text = (ROOT / 'wip.sh').read_text()
     start = text.index(name)
+    helpers = text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_coordinator() {')]
     return text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3] + \
-        text[start:text.index(end, start)]
+        helpers + text[start:text.index(end, start)]
 
 
 def _trace_tools(tmp_path, extra=None):
@@ -481,7 +482,7 @@ def _trace_tools(tmp_path, extra=None):
 
 
 def test_spark_native_phase_holds_one_fair_turn_without_locking_cargo(tmp_path):
-    function = _wip_function('build_expert() (', '\ncase "$role" in')
+    function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
@@ -509,7 +510,7 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 
 
 def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
-    function = _wip_function('build_coordinator() {', '\nbuild_expert() (')
+    function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
     setup = f'''set -euo pipefail
