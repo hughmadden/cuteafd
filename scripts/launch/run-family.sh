@@ -977,31 +977,9 @@ case "$family" in
     [[ "$expert_input" != bf16 ]] || spark_worker_args+=" --bf16-ingress" ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
-# Check every selected image before --restart or checkpoint reads. The worker's
-# resident admission validates the sibling for its full 4096-row workspace even
-# when only decode requests use BF16, so this preflight requires the same coverage.
-if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
-  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
-  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
-  case "$store_dtype" in
-    fp8) expert_geometry=mimo ;;
-    mxfp4)
-      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
-      case "$hidden" in
-        4096) expert_geometry=mimof ;;
-        6144) expert_geometry=mimop ;;
-        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
-      esac ;;
-    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
-  esac
-  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
-  for ((rank = 0; rank < ranks; rank++)); do
-    host="$(get "SPARK_${rank}_HOST")"
-    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
-      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
-      exit 2
-    fi
-  done
+if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
+  echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2
+  exit 2
 fi
 # Resolve the count and cold placement before starting or removing containers.
 # Media off still requires the shared expert and memory admission.
@@ -1095,6 +1073,32 @@ audio_encoder_hash=""
     export SPARK_COUNT="$selected_ranks"
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
+# Check the admitted count's images before --restart or weight loading. The worker's
+# resident admission validates the sibling for its full 4096-row workspace even
+# when only decode requests use BF16, so this preflight requires the same coverage.
+if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
+  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  case "$store_dtype" in
+    fp8) expert_geometry=mimo ;;
+    mxfp4)
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      case "$hidden" in
+        4096) expert_geometry=mimof ;;
+        6144) expert_geometry=mimop ;;
+        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
+      esac ;;
+    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
+  esac
+  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
+      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
+      exit 2
+    fi
+  done
+fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
