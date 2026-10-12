@@ -82,3 +82,41 @@ def test_build_slot_refuses_a_missing_lock_directory(tmp_path):
     result = subprocess.run(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'true'], capture_output=True, text=True,
                             env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path / 'locks')})
     assert result.returncode == 0 and (tmp_path / 'locks/build.lock').exists()
+
+
+def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    ran = ('C16 V4.1 geometry, medians: select 937.1 us, choose_width 1603.7 us, observe 56.8 us, total 2597.6 us\n'
+           'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n')
+    calls = _fake(monkeypatch, [(0, 'built'), (0, ran)])
+    envs = []
+    original = gate.run_logged
+    def run_logged(cmd, log_path, env, cwd, timeout):
+        envs.append(env)
+        return original(cmd, log_path, env, cwd, timeout)
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    result = gate.benches(ROOT, tmp_path, ARGS, {})
+    assert result['status'] == 'pass' and result['passed'] == 1
+    assert result['medians']['draft_policy_bench'] == {'select': 937.1, 'choose_width': 1603.7, 'observe': 56.8}
+    assert '--release' in calls[0] and '--ignored' in calls[1]
+    assert envs[1]['CUTEAFD_POLICY_BENCH_MAX_US'] == '1200'
+    record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
+    assert 'select 937 us' in gate.render(record)
+    over = 'medians: select 1500.0 us, choose_width 2500.0 us, observe 57.0 us\nselect median 1500.0 us exceeds 1200 us\n' \
+           'test result: FAILED. 0 passed; 1 failed; 0 ignored\n'
+    _fake(monkeypatch, [(0, 'built'), (101, over)])
+    result = gate.benches(ROOT, tmp_path, ARGS, {})
+    assert result['status'] == 'failed' and result['failing'] == ['draft_policy_bench']
+    assert result['medians']['draft_policy_bench']['select'] == 1500.
+    _fake(monkeypatch, [(0, 'built'), (0, 'running 0 tests\n')])
+    assert gate.benches(ROOT, tmp_path, ARGS, {})['status'] == 'failed'
+
+
+def test_benches_flag_runs_only_the_bench_suite(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(gate, 'prepare', lambda source, root: None)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
+    for name in ('cargo', 'scripts', 'benches'):
+        monkeypatch.setattr(gate, name, lambda s, r, a, e, n=name: seen.append(n) or {'suite': n, 'status': 'pass'})
+    args = SimpleNamespace(**{**vars(ARGS), 'cargo': False, 'scripts': False, 'benches': True})
+    assert gate.gate(ROOT, tmp_path, args)['status'] == 'pass' and seen == ['benches']

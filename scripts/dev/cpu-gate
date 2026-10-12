@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """One CPU gate for a checkout: cargo workspace tests and the script suite.
 
-  scripts/dev/cpu-gate --task NAME [--cargo] [--scripts] [--skip-live-planners] [--base REV]
+  scripts/dev/cpu-gate --task NAME [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV]
 
-With neither --cargo nor --scripts both run. Everything lives under
+With none of --cargo, --scripts, --benches the first two run. --benches runs
+the release host-cost bounds (BENCHES: the draft policy's select median at the
+V4.1 C16 geometry under CUTEAFD_POLICY_BENCH_MAX_US) as their own suite,
+recording each bench's medians. Everything lives under
 ~/.cache/cuteafd/builds/NAME (asserted build filesystem): the Cargo target
 (target-cpu-gate, plain rustc, kept apart from kache targets), TMPDIR and
 pytest's basetemp. Submodules are initialized at their pinned commits first.
@@ -43,6 +46,10 @@ CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
 PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
 PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
+# Release benches with a bound: (crate, test target, environment).
+BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
+BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
+BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
 
 
 def log(message):
@@ -127,6 +134,53 @@ def cargo(source, root, args, env):
     return result
 
 
+def benches(source, root, args, env):
+    """Release-mode bound checks: each bench passes only when its test ran and passed."""
+    target = root / 'target-cpu-gate-release'
+    checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': env.get('CARGO_BUILD_JOBS', '16')}
+    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
+        env.pop(key, None)
+    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[])
+    build_s = test_s = 0.
+    for crate, test, bounds in BENCHES:
+        log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
+        build_log = root / f'logs/bench-{test}-build.log'
+        code, seconds = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--release', '--locked',
+                                    '-p', crate, '--test', test, '--no-run'], build_log, env, source / 'rust',
+                                   args.cargo_build_timeout)
+        build_s += seconds
+        if code:
+            result['failed'] += 1
+            result['failing'].append(test)
+            result.setdefault('errors', []).append(f'{test}: compile exit {code}')
+            continue
+        test_log = root / f'logs/bench-{test}.log'
+        code, seconds = run_logged(['cargo', 'test', '--release', '--locked', '-p', crate, '--test', test, '--',
+                                    '--ignored', '--nocapture', '--test-threads', '1'], test_log, {**env, **bounds},
+                                   source / 'rust', args.cargo_timeout)
+        test_s += seconds
+        text = test_log.read_text(errors='replace')
+        totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(text)]
+        ran = sum(t[0] for t in totals)
+        medians = BENCH_MEDIANS.findall(text)
+        if medians:
+            result['medians'][test] = {name: float(value) for name, value in BENCH_VALUE.findall(medians[-1])}
+        result['logs'].append(str(test_log))
+        if code == 0 and ran > 0 and not any(t[1] for t in totals):
+            result['passed'] += 1
+        else:
+            result['failed'] += 1
+            result['failing'].append(test)
+            result.setdefault('errors', []).append(f'{test}: ' + ('timed out' if code == 124 else 'did not run' if not ran
+                                                                 else f'bound exceeded or failed (exit {code})'))
+    result.update(build_s=round(build_s), test_s=round(test_s), bounds={t: b for _, t, b in BENCHES},
+                  status='pass' if result['passed'] == len(BENCHES) else 'failed')
+    if result['status'] == 'failed':
+        result['error'] = '; '.join(result.get('errors', []))
+    return result
+
+
 def scripts(source, root, args, env):
     python = python_for(source)
     test_log = root / 'logs/pytest.log'
@@ -160,6 +214,8 @@ def gate(source, root, args):
         suites.append(cargo(source, root, args, env))
     if args.scripts:
         suites.append(scripts(source, root, args, env))
+    if args.benches:
+        suites.append(benches(source, root, args, env))
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     return dict(source=str(source), head=head, dirty=dirty, suites=suites,
@@ -175,6 +231,8 @@ def render(record):
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+        for test, values in suite.get('medians', {}).items():
+            note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
                      f"{suite.get('build_s', 0) + suite.get('test_s', 0)} | {note} |")
     for suite in record['suites']:
@@ -191,6 +249,7 @@ def main():
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
+    parser.add_argument('--benches', action='store_true', help='release host-cost bounds (BENCHES), recorded as their own suite')
     parser.add_argument('--skip-live-planners', action='store_true', help='skip the live-inventory V4 planner tests (recorded)')
     parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
     parser.add_argument('--source', type=Path, default=REPO, help='checkout to gate (default: this one)')
@@ -200,7 +259,7 @@ def main():
     args = parser.parse_args()
     if not NAME.fullmatch(args.task):
         parser.error('--task must be a plain name')
-    if not (args.cargo or args.scripts):
+    if not (args.cargo or args.scripts or args.benches):
         args.cargo = args.scripts = True
     root = BUILDS / args.task
     root.mkdir(parents=True, exist_ok=True)
