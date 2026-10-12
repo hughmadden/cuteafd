@@ -874,7 +874,9 @@ mod tests {
         }
         let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
         assert_eq!(owned, 1_835_700_096);
-        assert_eq!(scratch, [30_491_648, 28_394_496]);
+        // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
+        let row_max_bytes = 128 * 80 * 4;
+        assert_eq!(scratch, [30_491_648 + row_max_bytes, 28_394_496 + row_max_bytes]);
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_bytes = owned;
@@ -883,13 +885,33 @@ mod tests {
         assert_eq!(req.movables[0].allowed, [0]);
         assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
             c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
-            [(0, 0, Category::Workspace, 30_491_648, Basis::Formula),
-             (1, 1, Category::Workspace, 28_394_496, Basis::Formula)]);
+            [(0, 0, Category::Workspace, 30_491_648 + row_max_bytes, Basis::Formula),
+             (1, 1, Category::Workspace, 28_394_496 + row_max_bytes, Basis::Formula)]);
         let actual = solve(&req).unwrap();
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
         assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
-        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash fp8-linear scratch").unwrap().bytes, 30_491_648);
+        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash fp8-linear scratch").unwrap().bytes,
+            30_491_648 + row_max_bytes);
         assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash fp8-linear scratch"));
+        let mut previous = req.clone();
+        for candidate in &mut previous.movables[0].conditional {
+            candidate.demands[0].bytes -= row_max_bytes;
+        }
+        let before = solve(&previous).unwrap();
+        assert_eq!(actual.pool_tokens, before.pool_tokens);
+        assert_eq!(actual.layers, before.layers);
+        let charged = |placed: &Placement, rank: usize| placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
+        assert_eq!(charged(&actual, 0) - charged(&before, 0), row_max_bytes);
+        assert_eq!(charged(&actual, 1), charged(&before, 1));
+        // At a full GPU0 budget, only one rounded KV allocation unit is lost.
+        previous.movables[0].allowed = vec![0];
+        previous.inventory.gpus[0].headroom_bytes += previous.inventory.gpus[0].available() - charged(&before, 0);
+        let mut constrained = previous.clone();
+        constrained.movables[0].conditional[0].demands[0].bytes += row_max_bytes;
+        let before = solve(&previous).unwrap();
+        let after = solve(&constrained).unwrap();
+        assert_eq!(before.pool_tokens - after.pool_tokens, req.pool.unit_rows);
+        assert_eq!(before.layers, after.layers);
         // Splitting the ledger categories must not change the old GPU0 total or pool/layer decision.
         input.drafter_bytes += input.drafter_scratch[0];
         input.drafter_scratch.fill(0);

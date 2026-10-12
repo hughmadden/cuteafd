@@ -328,7 +328,8 @@ mod tests {
         let layout = GlmDraftRuntimeLayout::new(g,GlmDraftRepresentation::Fp8Only,capacity,2048).unwrap();
         let (arenas,scratch) = draft_workspace_bytes(g,capacity,8,true,188,2).unwrap();
         assert_eq!(layout.weights.resident_bytes().unwrap() + arenas, 1_835_700_096);
-        assert_eq!(scratch,30_491_648);
+        // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
+        assert_eq!(scratch,30_491_648 + 128 * 80 * 4);
         let mut invalid = g; invalid.conv_group = 0;
         assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2).is_err());
     }
