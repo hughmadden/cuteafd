@@ -44,6 +44,7 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => {
                 let mut execution = weights[0].execution(config.capacity, remaining)?;
                 execution.install_native_group(config.native_group()?)?;
+                execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)
             }
             Self::Exl3(weights) => Execution::Exl3(Exl3Worker::new(

@@ -246,6 +246,10 @@ impl<'a> BackboneRequest<'a> {
         validate_canonical(&request.header, max_rows,
             |i| Ok(request.rows[i].clone()), |i| Ok(request.routes[i].clone()))
     }
+    /// Protocol correlation identity shared by all ranks of this exchange.
+    pub fn request_id(&self) -> u64 {
+        self.view.header.request_id
+    }
     pub fn rows(&self) -> u32 {
         self.view.header.row_count
     }
@@ -671,6 +675,7 @@ mod tests {
         let owned = request(16).with_debug_checksum();
         let frame = owned.encode().unwrap();
         let native = BackboneRequest::parse(&frame, 16).unwrap();
+        assert_eq!(native.request_id(), owned.header.request_id);
         let (mut ids, mut weights) = (vec![-1; 100], vec![-1.; 100]);
         native.copy_routes_into(&mut ids, &mut weights).unwrap();
         for (i, route) in owned.routes.iter().enumerate() {

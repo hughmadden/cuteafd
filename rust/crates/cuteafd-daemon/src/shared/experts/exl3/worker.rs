@@ -113,6 +113,7 @@ pub(crate) struct Exl3Worker<'a> {
     stream: LoadStream<'a>,
     // Opt-in diagnostics: allocate events once; the default path never records them.
     timing: Option<[crate::shared::memory::device::Event<'a>; 2]>,
+    worker_timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
     executions: Vec<Exl3Execution<'a>>,
     row_policy: Exl3RowPolicy,
     capacity: usize,
@@ -280,6 +281,7 @@ impl<'a> Exl3Worker<'a> {
             row_policy,
             stream,
             timing,
+            worker_timing: super::super::execution::timing::WorkerTiming::from_env(library, rank)?,
             executions,
             capacity: capacity as usize,
             inputs,
@@ -447,6 +449,10 @@ impl<'a> Exl3Worker<'a> {
             .iter_mut()
             .find(|e| e.capacity() >= required)
             .context("missing preloaded EXL3 worker capacity")?;
+        // SAFETY: worker events and stream stay live through the existing completion below.
+        if let Some(timing) = &self.worker_timing {
+            unsafe { timing.record(0, self.stream.raw)?; }
+        }
         let output = unsafe {
             if self.ownership_words > 0 {
                 let ownership = CuteafdDeviceBuffer {
@@ -476,6 +482,10 @@ impl<'a> Exl3Worker<'a> {
         if let Some([_, end]) = &self.timing {
             unsafe { self.library.cuda_event_record(end.raw, self.stream.raw)?; }
         }
+        // SAFETY: expert work precedes this event on the owned stream.
+        if let Some(timing) = &self.worker_timing {
+            unsafe { timing.record(1, self.stream.raw)?; }
+        }
         match self.host_path {
             // Poll instead of sleeping in the driver: a blocking synchronize
             // returned about 8 us after the GPU finished (nsys of a GB10
@@ -485,6 +495,10 @@ impl<'a> Exl3Worker<'a> {
                 std::hint::spin_loop();
             },
             HostPath::Blocking => unsafe { self.library.cuda_stream_synchronize(self.stream.raw)? },
+        }
+        if let Some(timing) = &mut self.worker_timing {
+            // SAFETY: the existing worker completion finished both event records.
+            unsafe { timing.publish(request.request_id(), request.layer(), request.rows(), executor_id, "exl3")?; }
         }
         let completed_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if destination.is_none() {
