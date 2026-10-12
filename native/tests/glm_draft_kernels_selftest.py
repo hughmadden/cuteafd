@@ -106,6 +106,18 @@ def head_check(lib, args):
     torch.manual_seed(53)
     vocab, width = args.head_shape
     rows_all = max(24, max(args.head_rows))
+    if args.head_input:
+        inputs = []
+        for path in args.head_input:
+            data = bytearray(open(path, "rb").read())
+            assert len(data) > 0 and len(data) % (width * 2) == 0, (path, len(data), width)
+            inputs.append(torch.frombuffer(data, dtype=torch.bfloat16).view(-1, width))
+        x = torch.cat(inputs).cuda()
+        rows_all = x.shape[0]
+        assert 8 <= rows_all <= 1024 and rows_all >= max(args.head_rows), rows_all
+    else:
+        x = (torch.randn(rows_all, width, device="cuda") * torch.linspace(
+            0.5, 2.0, rows_all, device="cuda")[:, None]).bfloat16()
     weight = read_head(args.head, vocab, width) if args.head else (
         torch.randn(vocab, width, device="cuda") * 0.02).bfloat16()
     weight_bytes = weight.numel() * weight.element_size()
@@ -113,9 +125,6 @@ def head_check(lib, args):
     handle = P()
     assert lib.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), width, rows_all, vocab,
                                                     C.byref(handle)) == 0
-    # Final-norm-like rows: unit RMS with a per-row scale.
-    x = (torch.randn(rows_all, width, device="cuda") * torch.linspace(
-        0.5, 2.0, rows_all, device="cuda")[:, None]).bfloat16()
     out = {name: torch.empty(rows_all, vocab, device="cuda") for name in ("pedantic", "tensor", "few")}
 
     def launch(name, rows):
@@ -134,19 +143,22 @@ def head_check(lib, args):
         for name in out:
             launch(name, rows_all)
         torch.cuda.synchronize()
-        # FP64 reference for 8 rows, in vocabulary chunks.
-        ref = torch.cat([x[:8].double() @ weight[v:v + 16384].double().T
+        # Real inputs qualify every row; synthetic smoke retains its eight-row FP64 gate.
+        reference_rows = rows_all if args.head_input else 8
+        ref = torch.cat([x[:reference_rows].double() @ weight[v:v + 16384].double().T
                          for v in range(0, vocab, 16384)], dim=1)
         scale = ref.abs().amax().item()
         reference_top = top16(ref)
         for name in out:
-            err = (out[name][:8].double() - ref).abs().amax().item() / scale
-            print(f"head: {name} max |error| / max |logit| over 8 rows: {err:.2e}")
+            err = (out[name][:reference_rows].double() - ref).abs().amax().item() / scale
+            print(f"head: {name} max |error| / max |logit| over {reference_rows} rows: {err:.2e}")
             assert err < (1e-3 if name == "tensor" else 1e-5), (name, err)
-            candidate = top16(out[name][:8])
+            candidate = top16(out[name][:reference_rows])
             print(f"head: {name} against FP64: top-1 "
                   f"{100 * (candidate[:, 0] == reference_top[:, 0]).float().mean().item():.2f}%, "
                   f"top-16 in order {100 * (candidate == reference_top).all(dim=1).float().mean().item():.2f}%")
+            if args.head_input:
+                assert torch.equal(candidate, reference_top), ("actual-input top16 versus FP64", name)
         baseline = top16(out["pedantic"])
         for name in ("tensor", "few"):
             candidate = top16(out[name])
@@ -156,7 +168,9 @@ def head_check(lib, args):
                            for r in range(rows_all)) / rows_all
             print(f"head: {name} against pedantic over {rows_all} rows: top-1 {100 * same_first:.2f}%, "
                   f"top-16 set {100 * same_set:.2f}%, top-16 in order {100 * same_top:.2f}%")
-            if name == "tensor":
+            if args.head_input:
+                assert torch.equal(baseline, candidate), ("actual-input top16 versus pedantic", name)
+            elif name == "tensor":
                 assert same_first >= 0.95
 
         # Exercise the serving selector on 8-row blocks, excluding each anchor.
@@ -344,6 +358,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
     parser.add_argument("--head", help="checkpoint shard holding lm_head.weight (default: a synthetic head)")
+    parser.add_argument("--head-input", action="append", help="actual BF16 final-norm row dump; may repeat")
     parser.add_argument("--head-shape", nargs=2, type=int, metavar=("VOCAB", "WIDTH"),
                         default=DEFAULT_HEAD_SHAPE, help="expected BF16 head dimensions")
     parser.add_argument("--head-rows", default="8,16,24,32,64,96,128", help="comma-separated row counts, at most 128")

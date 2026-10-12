@@ -1047,6 +1047,7 @@ impl<'a> GlmDrafter<'a> {
             l.cuda_stream_synchronize(s)?;
         }
         self.timing.publish_completed()?;
+        self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
         let mut tokens = vec![0u8; drafted * 4];
         let mut features = vec![0u8; drafted * 16];

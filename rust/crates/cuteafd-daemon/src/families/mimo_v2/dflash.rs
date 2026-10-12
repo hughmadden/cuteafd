@@ -766,6 +766,7 @@ impl<'a> MimoDrafter<'a> {
             l.cuda_stream_synchronize(s)?;
         }
         self.timing.publish_completed()?;
+        self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let confidence_span = self.timing.host_span();
         let drafted = s_count * c.drafts();
         let mut unary = vec![0u8; drafted * 64];

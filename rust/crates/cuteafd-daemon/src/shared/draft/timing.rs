@@ -1,5 +1,5 @@
 //! Opt-in drafter spans, read only after an existing stream-completion barrier.
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::{cell::RefCell, ffi::c_void, io::Write, time::Instant};
 
@@ -62,6 +62,8 @@ struct State<'a> {
     device: i32,
     family: &'static str,
     output: Option<std::io::BufWriter<std::fs::File>>,
+    directory: Option<std::path::PathBuf>,
+    dumped: std::collections::BTreeMap<usize, usize>,
 }
 
 fn enabled(value: Option<&str>) -> bool {
@@ -85,6 +87,14 @@ fn safe_name(value: &str) -> String {
     }
 }
 
+fn dump_round(dumped: &std::collections::BTreeMap<usize, usize>, rows: usize) -> Option<usize> {
+    if !(1..=128).contains(&rows) || (!dumped.contains_key(&rows) && dumped.len() >= 4) {
+        return None;
+    }
+    let round = dumped.get(&rows).copied().unwrap_or(0);
+    (round < 3).then_some(round)
+}
+
 pub(crate) struct DraftTiming<'a>(Option<RefCell<State<'a>>>);
 impl<'a> DraftTiming<'a> {
     pub(crate) fn from_env(library: &'a NativeLibrary, family: &'static str) -> Result<Self> {
@@ -97,10 +107,12 @@ impl<'a> DraftTiming<'a> {
                 .unwrap_or_else(|_| "unknown".into()),
         );
         let device = library.cuda_get_device()?;
-        let output = std::env::var_os("CUTEAFD_PROFILE_DIR")
+        let directory = std::env::var_os("CUTEAFD_PROFILE_DIR").map(std::path::PathBuf::from);
+        let output = directory
+            .as_ref()
             .map(|directory| {
-                let path = std::path::Path::new(&directory)
-                    .join(format!("draft-timing-{host}-{family}-gpu{device}.jsonl"));
+                let path =
+                    directory.join(format!("draft-timing-{host}-{family}-gpu{device}.jsonl"));
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -117,6 +129,8 @@ impl<'a> DraftTiming<'a> {
             device,
             family,
             output,
+            directory,
+            dumped: std::collections::BTreeMap::new(),
         }))))
     }
 
@@ -310,6 +324,44 @@ impl<'a> DraftTiming<'a> {
         Ok(())
     }
 
+    /// Diagnostic input only: call after the existing drain while final-norm
+    /// storage is still pinned. Limit both shapes and rounds to keep dumps small.
+    pub(crate) fn dump_head_input(
+        &self,
+        buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+        rows: usize,
+        width: usize,
+    ) -> Result<()> {
+        let Some(state) = &self.0 else { return Ok(()) };
+        let mut state = state.borrow_mut();
+        let Some(directory) = &state.directory else {
+            return Ok(());
+        };
+        let Some(round) = dump_round(&state.dumped, rows) else {
+            return Ok(());
+        };
+        let bytes = rows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(2))
+            .context("draft timing head input extent overflow")?;
+        ensure!(
+            bytes <= buffer.bytes,
+            "draft timing head input exceeds admitted storage"
+        );
+        let path = directory.join(format!(
+            "draft-head-{}-{}-gpu{}-rows{rows}-round{round}.bf16",
+            state.host, state.family, state.device
+        ));
+        let mut input = vec![0u8; bytes];
+        state.library.copy_d2h(
+            &mut input,
+            cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer },
+        )?;
+        std::fs::write(path, input)?;
+        state.dumped.insert(rows, round + 1);
+        Ok(())
+    }
+
     pub(crate) fn host_span(&self) -> Option<Instant> {
         self.0.as_ref().map(|_| Instant::now())
     }
@@ -338,6 +390,21 @@ impl<'a> DraftTiming<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_inputs_bound_shapes_rows_and_rounds() {
+        let mut dumped = std::collections::BTreeMap::new();
+        assert_eq!(super::dump_round(&dumped, 0), None);
+        assert_eq!(super::dump_round(&dumped, 129), None);
+        for rows in [8, 16, 64, 128] {
+            for round in 0..3 {
+                assert_eq!(super::dump_round(&dumped, rows), Some(round));
+                dumped.insert(rows, round + 1);
+            }
+            assert_eq!(super::dump_round(&dumped, rows), None);
+        }
+        assert_eq!(super::dump_round(&dumped, 32), None);
+    }
+
     #[test]
     fn timing_is_explicit_and_file_names_stay_local() {
         assert!(super::enabled(Some("1")));
