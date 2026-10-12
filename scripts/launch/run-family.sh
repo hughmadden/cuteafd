@@ -386,7 +386,7 @@ fi
 if [[ $family == mimo_v2 ]]; then
   [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
   [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
-  [[ "$(get MIMO_COPY_WINDOWS off)" != on ]] || family_args+=(--mimo-copy-windows)
+  [[ -z "$(get MIMO_COPY_WINDOWS)" ]] || { echo "MIMO_COPY_WINDOWS was removed: copies only extend agreeing neural drafts; delete the key" >&2; exit 2; }
   [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
@@ -451,14 +451,11 @@ if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ ]]; then
   fi
   family_args+=(--pool-tokens "$pool")
 fi
-# GLM 5.3 has only agreement extensions, priced by its shared neural policy.
-if [[ $family == glm5 && -n "$(get COPY_DRAFTS)" ]]; then
-  echo "COPY_DRAFTS was removed for GLM 5.3: copies only extend agreeing neural drafts; delete the key" >&2
-  exit 2
-fi
-if [[ "$(get COPY_DRAFTS on)" == off ]]; then
-  [[ $serve != serve-dsv4 ]] || { echo "COPY_DRAFTS applies to GLM, MiMo and Qwen checkpoints" >&2; exit 2; }
-  family_args+=(--no-copy-drafts)
+if [[ -n "$(get COPY_DRAFTS)" || -n "$(get COPY_DRAFT_POLICY)" ]]; then
+  label="$family"; [[ $family != glm5 ]] || label="GLM 5.3"
+  for removed in COPY_DRAFTS COPY_DRAFT_POLICY; do
+    [[ -z "$(get "$removed")" ]] || { echo "$removed was removed for $label: copies only extend agreeing neural drafts; delete the key" >&2; exit 2; }
+  done
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
@@ -553,7 +550,7 @@ fi
 # the family variables, which are set too for one release.
 trace_args=()
 # Experimental shared policy changes stay off until emitted-throughput gates pass.
-for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE COPY_DRAFT_POLICY; do
+for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE; do
   if [[ $family == glm5 && -n "$(get "$policy_key")" ]]; then
     echo "$policy_key was removed for GLM 5.3: it always runs the shared draft policy; delete the key" >&2
     exit 2

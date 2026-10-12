@@ -98,7 +98,7 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));
+        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);
         bank.enable_small_shapes();Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,

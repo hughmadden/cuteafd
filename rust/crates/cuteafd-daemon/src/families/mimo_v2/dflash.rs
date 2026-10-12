@@ -361,7 +361,7 @@ impl<'a> MimoDrafter<'a> {
             MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
         };
         let numerics = format!("{storage}-{rows}-{head}-{:?}-r1", self.confidence_scales).to_ascii_lowercase();
-        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
+        crate::shared::draft_confidence::ConfidencePolicy::load_prior(&self.confidence_directory,
             format!("mimo_v2/dflash/{numerics}"))
     }
 

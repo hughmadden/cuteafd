@@ -166,7 +166,7 @@ fn quant(snapshot: &Path, spark_ranks: usize) -> Vec<QuantGroup> {
 }
 
 /// The speculator the options select.
-fn speculator(family: Option<&str>, settings: &[Setting]) -> Option<String> {
+fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
     let truthy = |names: &[&str]| setting(settings, names).is_some_and(|v| v == "true");
     let number = |names: &[&str]| setting(settings, names).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     if truthy(&["dspark"]) {
@@ -183,9 +183,6 @@ fn speculator(family: Option<&str>, settings: &[Setting]) -> Option<String> {
     let mtp = number(&["mtp"]);
     if mtp > 0 {
         return Some(format!("MTP ×{mtp}"));
-    }
-    if matches!(family, Some("glm5" | "glm5_flash" | "qwen4")) && !truthy(&["no-copy-drafts"]) {
-        return Some("copy-window drafts".into());
     }
     None
 }
@@ -292,7 +289,7 @@ mod tests {
         assert_eq!(speculator(Some("glm5_flash"), &[s("draft",
             "/hf/models--RedHatAI--GLM-5.3-Flash-speculator.dspark-preview/snapshots/1972f1f0", None, "cli")]).as_deref(),
             Some("dSpark (1972f1f0)"));
-        assert_eq!(speculator(Some("qwen4"), &[s("no-copy-drafts", "true", Some("false"), "cli")]), None);
+        assert_eq!(speculator(Some("qwen4"), &[]), None);
         assert_eq!(speculator(Some("mimo_v2"), &[]), None);
     }
 

@@ -29,9 +29,9 @@
 //! equal quota; the selection gives each row to the draft that pays most.
 //!
 //! **Copy extension** (D3, PLAN "Copies extend the neural draft"): when a copy
-//! window from the request's own history agrees with the drafter over its
-//! whole window, the copy's continuation past the window becomes further
-//! draft positions, `TAIL_PRIOR` raw, calibrated per position by the policy
+//! window from the request's own history agrees with the confident leading
+//! positions (at least three, seven anchored tokens), its continuation replaces
+//! low-confidence positions using a decaying raw prior, calibrated by the policy
 //! and blended with the request's own outcomes there; the policy prices them
 //! with the resource model like any other row.
 //!
@@ -59,8 +59,7 @@ const GROUP_ROWS: u8 = 16;
 const MAX_POSITIONS: usize = 16;
 /// Most copy positions appended past the drafter's window.
 pub(crate) use crate::shared::draft::copy::COPY_EXTENSION;
-/// Raw acceptance of an agreed copy's continuation before calibration.
-pub(crate) const TAIL_PRIOR: f64 = 0.9;
+pub(crate) use crate::shared::draft::copy::tail_prior;
 /// Drafts per request until the policy engages: about the C1 optimum of the
 /// D2 cards (3-5 at the measured acceptance), never the minimal one.
 const COLD_DRAFTS: usize = 4;
@@ -84,6 +83,24 @@ fn spark_class() -> ResourceClass {
 /// A lone warm DFlash2 sequence keeps `START_DRAFTS` unless the selection
 /// beats them by this ratio.
 const REFERENCE_MARGIN: f64 = 1.02;
+
+/// Fixed diagnostic counts still share the verifier budget, anchors included.
+pub(crate) fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
+    let mut rows = lengths.len() + lengths.iter().sum::<usize>();
+    let trimmed = rows > budget;
+    while rows > budget {
+        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
+        lengths[index] -= 1;
+        rows -= 1;
+    }
+    trimmed
+}
+
+/// A terminal bonus can still reject a draft; only agreeing stops censor it.
+pub(crate) fn finish_censor(finished: bool, committed: usize, rows: &[u32], last: Option<u32>, stops: &[u32]) -> Option<Censor> {
+    if !finished || rows.get(committed).is_some_and(|next| Some(*next) != last) { return None; }
+    Some(if last.is_some_and(|token| stops.contains(&token)) { Censor::Eos } else { Censor::OutputLimit })
+}
 
 /// Where a layer's routed experts run and what one device reads per expert.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -213,6 +230,18 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
             crate::families::glm5::dflash_policy::head_confidence(history, &head[..head.len().min(MAX_POSITIONS)]),
         (Prior::Head, DraftEvidence::Selector(features)) => history.conditional(features.len().min(MAX_POSITIONS)),
     }
+}
+
+/// Qualify a history continuation using this policy's calibrated probabilities.
+/// Copied positions use the shared raw tail prior instead of neural evidence.
+pub(crate) fn copy_continuation(policy: &DraftPolicy, id: u64, history: &[u32], drafted: &[u32],
+    prior: &mut Vec<f64>, room: usize, greedy: bool) -> Option<crate::shared::draft::copy::Continuation> {
+    prior.truncate(drafted.len());
+    let calibrated = policy.probabilities(DraftCandidate { id, confidence: prior });
+    let continuation = crate::shared::draft::copy::continuation(history, drafted, &calibrated, room, greedy)?;
+    prior.truncate(continuation.neural);
+    prior.extend((0..continuation.tokens.len() - continuation.neural).map(crate::shared::draft::copy::tail_prior));
+    Some(continuation)
 }
 
 /// One active sequence's inputs to the round's selection.
@@ -463,6 +492,31 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
 mod tests {
     use super::*;
 
+    #[test]
+    fn terminal_censorship_preserves_a_real_mismatch() {
+        let rows = [10, 11, 12, 13];
+        assert_eq!(finish_censor(false, 2, &rows, Some(12), &[12]), None);
+        assert_eq!(finish_censor(true, 2, &rows, Some(99), &[99]), None);
+        assert_eq!(finish_censor(true, 2, &rows, Some(12), &[12]), Some(Censor::Eos));
+        assert_eq!(finish_censor(true, 2, &rows, Some(12), &[]), Some(Censor::OutputLimit));
+        assert_eq!(finish_censor(true, 4, &rows, Some(99), &[99]), Some(Censor::Eos));
+    }
+
+    #[test]
+    fn lane_budget_preserves_anchors_and_prefixes_with_full_tails() {
+        for count in 1..=8 {
+            let mut lengths = vec![7 + COPY_EXTENSION; count];
+            trim_budget(&mut lengths, 64);
+            assert!(count + lengths.iter().sum::<usize>() <= 64);
+            assert!(lengths.iter().all(|&n| n <= 7 + COPY_EXTENSION));
+            if count == 1 { assert_eq!(lengths, [39]); }
+        }
+        let mut mixed = [0, 37, 0, 39];
+        trim_budget(&mut mixed, 64);
+        assert_eq!((mixed[0], mixed[2]), (0, 0));
+        assert_eq!(mixed.iter().sum::<usize>() + mixed.len(), 64);
+    }
+
     fn homes(spark: bool) -> Vec<LayerHome> {
         (0..45).map(|layer| match layer {
             0..3 => LayerHome::Dense,
@@ -655,6 +709,22 @@ mod tests {
         let tight = select(&mut policy, &candidates, 7, 5);
         assert_eq!((tight.lengths.iter().sum::<usize>(), tight.lengths[1]), (2, 0), "{:?}", tight.lengths);
         assert!(tight.predicted.is_some());
+    }
+
+    #[test]
+    fn copied_positions_replace_neural_evidence_with_decaying_priors() {
+        let policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, COPY_EXTENSION).unwrap(), seed()).unwrap();
+        let neural = [20, 21, 22, 23, 24, 25, 26];
+        let mut history = vec![1, 2, 3, 4, 20, 21, 22];
+        history.extend(50..100);
+        history.extend([1, 2, 3, 4]);
+        let mut prior = vec![0.99, 0.99, 0.99, 0.01, 0.01, 0.01, 0.01];
+        let copy = copy_continuation(&policy, 1, &history, &neural, &mut prior, 39, true).unwrap();
+        assert_eq!(copy.neural, 3);
+        assert_eq!(&copy.tokens[..4], &[20, 21, 22, 50]);
+        assert_eq!(prior.len(), copy.tokens.len());
+        assert_eq!(&prior[..3], &[0.99; 3]);
+        assert_eq!(&prior[3..8], &[0.95, 0.9, 0.65, 0.3, 0.2]);
     }
 
     #[test]

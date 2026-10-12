@@ -785,14 +785,16 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         };
         phases[0] += timer.elapsed().as_secs_f64();
         let timer = Instant::now();
-        let extensions: Vec<_> = active.iter().zip(&drafted).zip(&limits).map(|((a, draft), &limit)|
-            draft.as_ref().map_or(Vec::new(), |d| crate::shared::draft::copy::extension(
-                &a.history, &d.tokens, limit, a.job.sampling.is_greedy()))).collect();
-        let priors: Vec<_> = active.iter().zip(&drafted).zip(&extensions).map(|((a, draft), extension)|
-            match (&shared, draft) {
-                (Some(shared), Some(d)) => shared.prior(&a.drafts,
-                    &resource::DraftEvidence::Selector(&d.features), extension.len()),
-                _ => Vec::new(),
+        let mut priors: Vec<_> = active.iter().zip(&drafted).map(|(a, draft)| match (&shared, draft) {
+            (Some(shared), Some(d)) => shared.prior(&a.drafts,
+                &resource::DraftEvidence::Selector(&d.features), 0),
+            _ => Vec::new(),
+        }).collect();
+        let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
+            .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
+                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy,
+                    a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
+                _ => None,
             }).collect();
         let mut predicted = None;
         let mut planned = match (policy.fixed, shared.as_mut()) {
@@ -809,8 +811,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         };
         if trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
         let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
-            let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
-            let draft = full.iter().chain(&extensions[i]).take(planned[i]).copied();
+            let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
+                .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
+            let draft = full.iter().take(planned[i]).copied();
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
             if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
             Ok(rows)
@@ -912,7 +915,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             request.counts[1] += drafted;
             request.counts[2] += accepted;
             if planned[i] > 0 {
-                request.drafts.observe(drafted.min(accepted + usize::from(censor.is_none())), accepted);
+                let neural = drafted.min(copies[i].as_ref().map_or_else(
+                    || draft_list[i].as_ref().map_or(0, |d| d.tokens.len()), |c| c.neural));
+                request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
             }
             if let Some(trace) = trace_ref.as_mut() {
                 if let Err(error) = trace.cycle(request.id, *start, rows.len(), committed, planned[i], false,

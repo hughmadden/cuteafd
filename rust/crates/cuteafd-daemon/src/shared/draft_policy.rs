@@ -543,60 +543,6 @@ pub(crate) fn allocate(groups: &[Group], base: Base, drafter: Drafter, cost: &Cy
     best
 }
 
-/// A sequence's already-produced neural prefix and independently calibrated copy.
-pub(crate) struct CopyInput<'a> {
-    pub key: (usize, u64),
-    pub neural: &'a [u32],
-    pub confidence: &'a [f64],
-    pub copy: &'a [u32],
-    pub copy_confidence: &'a [f64],
-}
-
-/// Competes copy prefixes with the already-produced neural plan. Draft work
-/// is sunk for this round: both choices pay it. Identical sequences share
-/// rows only while their selected proposals also match, as in verification.
-pub(crate) fn compete_copies(inputs: &[CopyInput<'_>], drafting: bool, chain: usize, cost: &CycleCost)
-    -> (Vec<usize>, Vec<bool>) {
-    let mut lengths: Vec<_> = inputs.iter().map(|input| input.neural.len()).collect();
-    let mut used = vec![false; inputs.len()];
-    let score = |lengths: &[usize], used: &[bool]| {
-        let mut rows = 0;
-        let mut expected = inputs.len() as f64;
-        let mut distinct = std::collections::HashSet::new();
-        for ((input, &length), &copy) in inputs.iter().zip(lengths).zip(used) {
-            let (tokens, confidence) = if copy { (input.copy, input.copy_confidence) }
-                else { (input.neural, input.confidence) };
-            rows += 1 + length;
-            distinct.insert((input.key, &tokens[..length]));
-            let mut survival = 1.0;
-            for &rate in &confidence[..length] {
-                survival *= rate.clamp(0.0, 1.0);
-                expected += survival;
-            }
-        }
-        let shape = Shape { rows, distinct: distinct.iter().map(|(_, tokens)| 1 + tokens.len()).sum(),
-            sequences: inputs.len() };
-        expected / cost.cycle_ms(shape, chain, drafting)
-    };
-    let mut best = score(&lengths, &used);
-    for (i, input) in inputs.iter().enumerate() {
-        let original_length = lengths[i];
-        let mut winner = None;
-        used[i] = true;
-        for length in 1..=input.copy.len() {
-            lengths[i] = length;
-            let candidate = score(&lengths, &used);
-            if candidate > best * (1.0 + 1e-9) {
-                best = candidate;
-                winner = Some(length);
-            }
-        }
-        used[i] = winner.is_some();
-        lengths[i] = winner.unwrap_or(original_length);
-    }
-    (lengths, used)
-}
-
 /// Longest run of steps without a draft step after plans that verified none.
 const MAX_DRAFT_SKIP: usize = 8;
 
@@ -887,48 +833,6 @@ mod tests {
         let (lengths, _) = allocate(&[group(0.6, 7, 4)], Base::default(), Drafter::Block, &cost);
         let (alone, _) = allocate(&[group(0.6, 7, 1)], Base::default(), Drafter::Block, &cost);
         assert!(lengths[0] >= alone[0], "{lengths:?} {alone:?}");
-    }
-
-    #[test]
-    fn copy_prefix_competes_on_emissions_per_cycle_ms() {
-        let cost = CycleCost::new(&TABLE, 64).drafts(5.0, 0.0, 0.3);
-        let neural = [group(0.8, 7, 1)];
-        let (plan, _) = allocate(&neural, Base::default(), Drafter::Block, &cost);
-        let tokens = [1; 7];
-        let run = |rate| compete_copies(&[CopyInput { key: (0, 0), neural: &tokens[..plan[0]],
-            confidence: &neural[0].confidence, copy: &tokens, copy_confidence: &[rate; 7] }], true, 0, &cost);
-        let (bad, used) = run(0.1);
-        assert_eq!(bad, plan);
-        assert_eq!(used, vec![false]);
-        let (good, used) = run(0.98);
-        assert_eq!(used, vec![true]);
-        assert_eq!(good, vec![7]);
-        assert_eq!(run(0.8).1, vec![false]);
-        // Poor copies must also lose when their extra rows tax a busy batch.
-        let batch = vec![group(0.9, 7, 1); 16];
-        let (plan, _) = allocate(&batch, Base::default(), Drafter::Block, &cost);
-        let inputs: Vec<_> = plan.iter().enumerate().map(|(i, &n)| CopyInput {
-            key: (0, i as u64), neural: &tokens[..n], confidence: &[0.9; 7],
-            copy: &tokens, copy_confidence: &[0.1; 7],
-        }).collect();
-        assert!(compete_copies(&inputs, true, 0, &cost).1.iter().all(|used| !used));
-    }
-
-    #[test]
-    fn copy_comparison_deduplicates_only_matching_selected_tokens() {
-        let cost = CycleCost::new(&TABLE, 64).drafts(5.0, 0.0, 0.3);
-        let neural = [1; 7];
-        let different = [2; 7];
-        let compare = |copy: &[u32]| compete_copies(&[
-            CopyInput { key: (17, 23), neural: &neural, confidence: &[0.8; 7],
-                copy, copy_confidence: &[0.81; 7] },
-            CopyInput { key: (17, 23), neural: &neural, confidence: &[0.8; 7],
-                copy: &[], copy_confidence: &[] },
-        ], true, 0, &cost);
-        // A slightly better matching proposal retains shared verify rows.
-        assert_eq!(compare(&neural), (vec![7, 7], vec![true, false]));
-        // Changing its tokens splits the group and costs more than it emits.
-        assert_eq!(compare(&different), (vec![7, 7], vec![false, false]));
     }
 
     #[test]

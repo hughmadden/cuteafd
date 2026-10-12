@@ -1,7 +1,7 @@
 //! Captured shapes per backbone layer, sharing the containing lane's buffers.
 use anyhow::{ensure, Result};
 
-const MAX_DECODE_ROWS: u32 = 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1);
+pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
 pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,6,16,24,32,40,43,48";
 static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();

@@ -104,6 +104,17 @@ impl<'a> RoundProbe<'a> {
         }
     }
 
+    /// Mark the first layer after an owner cut using this device's own event.
+    ///
+    /// # Safety
+    /// `stream` is live on this probe's device and ordered after the input transfer.
+    pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
+        if self.active {
+            // SAFETY: the caller guarantees the event and stream ownership/order.
+            unsafe { self.clock.mark_entry(layer, stream, false); }
+        }
+    }
+
     /// A Spark layer's staged ids: `rows * topk` little-endian u32 in row order.
     pub fn staged(&mut self, layer: usize, bytes: &[u8]) {
         if !self.active || self.error.is_some() { return; }

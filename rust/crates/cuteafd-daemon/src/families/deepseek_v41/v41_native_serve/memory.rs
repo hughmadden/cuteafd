@@ -156,7 +156,7 @@ pub(super) fn admit_startup(lib: &cuteafd_ffi::NativeLibrary,
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
-    let head_rows = if args.dspark_draft_limit > 5 { 64 } else { 48 };
+    let head_rows = cuteafd_core::V41_VERIFY_ROWS;
     let mut owners: Vec<(&str, usize)> = vec![
         ("backbone weights/load bound", BackboneLaneWeights::device_bytes(lib, catalog)?),
         ("cache producer weights", CacheProducerWeights::device_bytes(lib, catalog)?),
@@ -203,11 +203,6 @@ pub(super) fn admit_startup(lib: &cuteafd_ffi::NativeLibrary,
         loading_peaks.push(("dSpark loading", before_draft.checked_add(weights)
             .and_then(|n| n.checked_add(staging)).context("dSpark phase overflow")?));
         owners.extend([("dSpark weights", weights), ("dSpark lanes/windows", runtime)]);
-        if args.dspark_draft_limit > 5 {
-            let sparse = cuteafd_ffi::V41SparseAttention::split_scratch_bytes(64, 10)? / 64 * 64
-                + cuteafd_ffi::V41SparseAttention::batch_descriptor_bytes(64)?;
-            owners.push(("K7 sparse replacement peak", sparse * 2));
-        }
     }
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
@@ -480,6 +475,51 @@ impl PoolPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verifier_extent_matches_heads_sparse_admission_and_planner() -> Result<()> {
+        use crate::families::deepseek_v41::v41_target_head::{TargetHeadWave, distributed_target::DistributedTargetHead};
+        use crate::families::deepseek_v41::graph_policy;
+        let rows = cuteafd_core::V41_VERIFY_ROWS;
+        assert_eq!(rows, 64);
+        assert_eq!(graph_policy::MAX_DECODE_ROWS as usize, rows);
+        assert_eq!(cuteafd_core::MAX_DSPARK_PROPOSALS, 7);
+        assert!(graph_policy::profile_fixed_shapes(32usize << 30, Some("1,6,64"))?.is_some());
+        assert!(graph_policy::profile_fixed_shapes(32usize << 30, Some("1,6,65")).is_err());
+        let sparse_growth = cuteafd_ffi::V41SparseAttention::split_scratch_bytes(rows, 10)?
+            + cuteafd_ffi::V41SparseAttention::batch_descriptor_bytes(rows)?
+            - cuteafd_ffi::V41SparseAttention::split_scratch_bytes(48, 10)?
+            - cuteafd_ffi::V41SparseAttention::batch_descriptor_bytes(48)?;
+        let single = 2 * (TargetHeadWave::device_bytes(rows)? - TargetHeadWave::device_bytes(48)? + sparse_growth);
+        assert_eq!(single as u64, cuteafd_loader::placement::families::deepseek_v41::verify_workspace_growth(1, 0));
+        let wide = DistributedTargetHead::device_bytes(rows, 64640)?;
+        let narrow = DistributedTargetHead::device_bytes(48, 64640)?;
+        for rank in 0..2 {
+            assert_eq!((2 * (wide[rank] - narrow[rank] + sparse_growth)) as u64,
+                cuteafd_loader::placement::families::deepseek_v41::verify_workspace_growth(2, rank));
+        }
+        Ok(())
+    }
+
+
+    #[test]
+    fn verifier_workspace_growth_barely_moves_the_kv_pool() -> Result<()> {
+        let total = 96usize << 30;
+        let free = 48usize << 30;
+        let growth = cuteafd_loader::placement::families::deepseek_v41::verify_workspace_growth(1, 0) as usize;
+        let default = PoolPlan::new(16, 1_048_576, 20, 0, None, None, free, total)?;
+        let expanded = PoolPlan::new(16, 1_048_576, 20, 0, None, None, free - growth, total)?;
+        assert_eq!(expanded.pages, default.pages);
+        let reservation = Some(Reservation::Bytes(ByteSize(total)));
+        let before = PoolPlan::new(16, 1_048_576, 20, 0, None, reservation, free, total)?;
+        let after = PoolPlan::new(16, 1_048_576, 20, 0, None, reservation, free - growth, total)?;
+        assert!(before.global_bytes >= after.global_bytes);
+        let lost = before.global_bytes - after.global_bytes;
+        assert!(lost <= growth + GROUP_BYTES);
+        assert!(lost * 1000 < before.global_bytes * 2, "KV pool loss must stay below 0.2%");
+        eprintln!("verifier48->64 workspace +{growth} bytes; default KV unchanged; memory-filled KV -{lost} bytes");
+        Ok(())
+    }
+
     #[test]
     fn planner_is_opt_in_and_explicit_pool_sizes_remain_strict() -> Result<()> {
         use clap::{Args, FromArgMatches};

@@ -839,6 +839,10 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         } else { 0 };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace + intake,
             if v4_workspace.is_some() { Basis::Formula } else { allowance_basis }));
+        if family == "deepseek_v41" {
+            device.items.push(Item::new(Category::Workspace, "verifier lane growth", "48 to 64 rows",
+                crate::placement::families::deepseek_v41::verify_workspace_growth(gpus_now, index), Basis::Formula));
+        }
         if options.full_prefill_logits && index == 0 {
             device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
                 full_prefill_logits_bytes_with_lanes(family, prefill_rows, model.spec().vocab as u64,

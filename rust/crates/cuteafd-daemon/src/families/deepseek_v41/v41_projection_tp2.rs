@@ -83,7 +83,7 @@ impl<'w,'a> Rank<'w,'a> {
         let alpha=Allocation::new(device,16)?;
         let initialized=device.run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) });
         let drained=stream.drain();initialized.and(drained)?;
-        let mut graphs=LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));graphs.enable_small_shapes();
+        let mut graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);graphs.enable_small_shapes();
         Ok(Self { graphs,weights,stream,plan,copy:device.run(||device.library.v41_peer_copy())?,
             input:Allocation::new(device,capacity as usize*k*2)?,
             output:Allocation::new(device,capacity as usize*n)?,scratch,alpha })
@@ -170,7 +170,7 @@ impl<'w,'a> Wave<'w,'a> {
             device.run(||device.library.cuda_enable_peer(peer.id))?;
         }
         let devices=[a.device,b.device];let (_,n)=a.kind.geometry();
-        let mut gather_graphs=LayerGraphs::new(a.device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));gather_graphs.enable_small_shapes();
+        let mut gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32);gather_graphs.enable_small_shapes();
         Ok(Self { gather_graphs,ranks:[Rank::new(weights[0],capacity)?,Rank::new(weights[1],capacity)?],
             output:Allocation::new(devices[owner],capacity as usize*n*2)?,
             peer_done:Event::new(devices[1-owner])?,

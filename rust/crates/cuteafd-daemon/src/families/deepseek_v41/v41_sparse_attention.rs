@@ -114,8 +114,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             (1..=4096).contains(&capacity) && matches!(HEADS,32|64),
             "invalid sparse attention capacity"
         );
-        Ok(capacity * (HEADS*2048+88) + V41SparseAttention::split_scratch_bytes(capacity.min(48), 10)?/64*HEADS
-            + V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?)
+        Ok(capacity * (HEADS*2048+88) + V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS
+            + V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?)
     }
     pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
         ensure!(
@@ -132,16 +132,16 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             output: DeviceAllocation::new(library, capacity * (HEADS*1024))?,
             split_scratch: DeviceAllocation::new(
                 library,
-                V41SparseAttention::split_scratch_bytes(capacity.min(48), 10)?/64*HEADS,
+                V41SparseAttention::split_scratch_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS), 10)?/64*HEADS,
             )?,
-            descriptors: DeviceAllocation::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?)?,
-            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?, 40)?,
+            descriptors: DeviceAllocation::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?)?,
+            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(cuteafd_core::V41_VERIFY_ROWS))?, 40)?,
             replay_begins: DeviceAllocation::new(library, capacity * 8)?,
             metadata: DeviceAllocation::new(library, capacity * 80)?,
             staging: LayerStaging::new(library, capacity * 80, 40)?,
             replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
             capacity,
-            batch_rows: capacity.min(48),
+            batch_rows: capacity.min(cuteafd_core::V41_VERIFY_ROWS),
             graphs: GraphBank::new(None),
             graph_limit: 1,
             warmed_kernels: 0,
@@ -149,9 +149,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         })
     }
     /// Reserve wider decode batching before any execution and before KV sizing.
-    /// K5 retains its original allocation; K7 pays only for the extra 16 rows.
+    /// Serving allocates the full verifier extent regardless of neural width.
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
-        ensure!(rows > 0 && rows <= self.capacity && rows <= 64,
+        ensure!(rows > 0 && rows <= self.capacity && rows <= cuteafd_core::V41_VERIFY_ROWS,
             "invalid sparse decode reservation");
         ensure!(self.cold.is_none() && self.graphs.len() == 0,
             "sparse decode reservation requires an unused wave");
