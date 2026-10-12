@@ -675,11 +675,18 @@ release_load_config() {
   CONCURRENCY=16
   PREFIX_CACHE_ENTRIES=20
   PREFILL_BATCH_TOKENS=2048
+  RELEASE_PREFILL_EXPLICIT=0
   SPARK_DEVICE_BUDGET_BYTES=107374182400
   SPARK_REDUCTION_MIN_ROWS=16
   SPARKINFER_EXL3=disable
   EXL3_PAIRED_TP4=off
-  SPARK_COUNT=4
+  if [[ -z "${_release_count_env_saved:-}" ]]; then
+    _release_count_env="${SPARK_COUNT-}" _release_hosts_env="${SPARK_HOSTS-}"
+    _release_count_env_saved=1
+  fi
+  local count_env="$_release_count_env" hosts_env="$_release_hosts_env"
+  SPARK_COUNT=
+  RELEASE_SPARK_COUNT_EXPLICIT=0
   SPARK_HOSTS=
   # Optional explicit replicated expert-group topology. Absent means the legacy
   # geometry (TP = SPARK_COUNT, EP = 1). See docs/tp-ep-configuration.md.
@@ -699,7 +706,7 @@ release_load_config() {
   local wip_env="${WIP_INSTANCE-}" wip_root_env="${WIP_ROOT-}"
   WIP_ROOT=
   WIP_INSTANCE=
-  for release_i in 0 1 2 3 4 5; do
+  for release_i in {0..7}; do
     printf -v "SPARK_${release_i}_HOST" '%s' ""
     printf -v "SPARK_${release_i}_LANE_A" '%s' ""
     printf -v "SPARK_${release_i}_LANE_B" '%s' ""
@@ -721,6 +728,10 @@ release_load_config() {
       release_die "unquoted whitespace is not allowed for $key"
     fi
     printf -v "$key" '%s' "$value"
+    [[ "$key" != PREFILL_BATCH_TOKENS || -z "$value" ]] || RELEASE_PREFILL_EXPLICIT=1
+    if [[ ( "$key" == SPARK_COUNT || "$key" == SPARK_HOSTS ) && -n "$value" ]]; then
+      RELEASE_SPARK_COUNT_EXPLICIT=1
+    fi
     [[ "$key" != MODEL_ID ]] || model_id_explicit=1
     [[ "$key" != MODEL_REVISION ]] || model_revision_explicit=1
   done <"$config"
@@ -730,6 +741,24 @@ release_load_config() {
   release_validate_wip_root
   release_validate_wip_instance
 
+  [[ -z "$count_env" ]] || SPARK_COUNT="$count_env"
+  [[ -z "$hosts_env" ]] || SPARK_HOSTS="$hosts_env"
+  [[ -z "$SPARK_COUNT$SPARK_HOSTS" ]] || RELEASE_SPARK_COUNT_EXPLICIT=1
+  RELEASE_AVAILABLE_SPARKS=0
+  for release_i in {0..7}; do
+    local host_key="SPARK_${release_i}_HOST"
+    [[ -n "${!host_key:-}" ]] || break
+    RELEASE_AVAILABLE_SPARKS=$((RELEASE_AVAILABLE_SPARKS + 1))
+  done
+  if [[ -z "$SPARK_COUNT" ]]; then
+    if [[ -n "$SPARK_HOSTS" ]]; then
+      local -a count_hosts
+      IFS=, read -r -a count_hosts <<<"$SPARK_HOSTS"
+      SPARK_COUNT="${#count_hosts[@]}"
+    else
+      SPARK_COUNT="$RELEASE_AVAILABLE_SPARKS"
+    fi
+  fi
   if [[ -n "$SPARK_HOSTS" ]]; then
     local host_rows rank host lane_a lane_b
     host_rows="$(release_spark_host_rows "$SPARK_HOSTS" "$SPARK_COUNT" "$mode")" || return 2
@@ -845,42 +874,7 @@ release_load_config() {
   if [[ "$mode" == launch ]]; then
     release_validate_spark_topology
 
-    case "$SPARK_COUNT" in
-      0)
-        [[ "$RTX_EXPERT_LAYERS" == 40 ]] || release_die "SPARK_COUNT=0 requires RTX_EXPERT_LAYERS=40 (every routed layer must fit the RTX layout)"
-        [[ "$RTX_GPUS" != 1 ]] || release_die "SPARK_COUNT=0 requires two RTX GPUs"
-        ;;
-      2) release_validate_compact_spark ;;
-      3)
-        # Three ranks are either the implicit compact EXL3 TP3 layout (no
-        # SPARK_TP/SPARK_EP keys) or the explicit native TP3EP1 topology (both
-        # keys, one unreplicated group of three ranks; geometry already
-        # validated by release_validate_spark_topology). A native checkpoint
-        # without explicit keys is never compact.
-        if release_spark_compact_active; then
-          release_validate_compact_spark
-        elif [[ "$EXPERT_FORMAT" == exl3 ]]; then
-          release_die "SPARK_COUNT=3 with EXPERT_FORMAT=exl3 is the implicit compact TP3 layout and takes no SPARK_TP/SPARK_EP keys"
-        else
-          release_spark_topology_explicit ||
-            release_die "SPARK_COUNT=3 requires EXPERT_FORMAT=exl3 (implicit compact TP3) or explicit SPARK_TP=3 and SPARK_EP=1 (native TP3EP1)"
-        fi
-        ;;
-      4) ;;
-      6)
-        # Six Sparks are a native explicit topology (pure TP6=6x1 or
-        # replicated), or the implicit EXL3 TP6 split of DeepSeek V4 Pro (no
-        # SPARK_TP/SPARK_EP keys).
-        if [[ "$EXPERT_FORMAT" == exl3 && -z "$SPARK_TP" && -z "$SPARK_EP" ]]; then
-          [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=6 is incompatible with EXL3_PAIRED_TP4"
-        else
-          release_spark_topology_explicit ||
-            release_die "SPARK_COUNT=6 requires explicit SPARK_TP and SPARK_EP, or EXPERT_FORMAT=exl3 for the implicit EXL3 TP6 split"
-        fi
-        ;;
-      1|5|7|8) [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=$SPARK_COUNT is incompatible with EXL3_PAIRED_TP4" ;;
-      *) release_die "SPARK_COUNT must be in 0..8" ;;
-    esac
+    [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
     for ((release_i = 0; release_i < spark_required; release_i++)); do
@@ -1017,30 +1011,7 @@ release_spark_compact_active() {
 
 release_validate_compact_spark() {
   release_spark_compact_active || return 0
-  [[ "$EXPERT_FORMAT" == exl3 ]] || release_die "SPARK_COUNT=$SPARK_COUNT requires EXPERT_FORMAT=exl3"
-  [[ "$RTX_GPUS" != 2 ]] || release_die "SPARK_COUNT=$SPARK_COUNT requires a single RTX GPU"
   [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=$SPARK_COUNT is incompatible with EXL3_PAIRED_TP4"
-  MEMORY_RESERVATION="${MEMORY_RESERVATION:-32GiB}"
-  KV_POOL_SIZE="${KV_POOL_SIZE:-2GiB}"
-  PREFILL_BATCH_TOKENS="${PREFILL_BATCH_TOKENS:-256}"
-  [[ "$PREFILL_BATCH_TOKENS" =~ ^[1-9][0-9]*$ ]] &&
-    ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
-    release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
-  if ((PREFILL_BATCH_TOKENS > 256)); then
-    echo "cuteafd release: compact Spark TP$SPARK_COUNT caps PREFILL_BATCH_TOKENS=$PREFILL_BATCH_TOKENS to 256 to fit the 32GiB ceiling" >&2
-    PREFILL_BATCH_TOKENS=256
-  fi
-  python3 - "$MEMORY_RESERVATION" <<'PY' || release_die "SPARK_COUNT=$SPARK_COUNT requires a positive absolute MEMORY_RESERVATION no greater than 32GiB (percentages are not allowed)"
-import re
-import sys
-from decimal import Decimal
-match = re.fullmatch(r'([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)', sys.argv[1])
-if not match:
-    sys.exit(1)
-scale = {'B': 1, 'MB': 10**6, 'GB': 10**9, 'MiB': 2**20, 'GiB': 2**30}
-size = Decimal(match[1]) * scale[match[2]]
-sys.exit(0 if 1 <= size <= 32 * 2**30 else 1)
-PY
 }
 
 # Historical name kept for the ignored runs/ harnesses: it delegates to the
@@ -1186,7 +1157,7 @@ release_validate_verbs_device_map() {
       release_die "invalid CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
     ip="${entry%%=*}"
     dev="${entry#*=}"
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n "$dev" ]] ||
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$dev" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
       release_die "invalid CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
     for prior in ${seen_ips[@]+"${seen_ips[@]}"}; do
       [[ "$ip" != "$prior" ]] ||

@@ -99,21 +99,21 @@ class TopologyConfigTest(unittest.TestCase):
             "if release_spark_topology_explicit; then echo explicit; else echo legacy; fi",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["4", "", "", "4", "1", "legacy"])
+        self.assertEqual(result.stdout.splitlines(), ["6", "", "", "6", "1", "legacy"])
         self.assertEqual(CONFIG.read_bytes(), before)
         self.assertNotIn("SPARK_TP=", CONFIG.read_text())
         self.assertNotIn("SPARK_EP=", CONFIG.read_text())
 
     def test_approved_topologies_resolve_rank_map(self) -> None:
         cases = {
-            "SPARK_TP=2\nSPARK_EP=2\n": ["0 0 0", "1 0 1", "2 1 0", "3 1 1"],
+            "SPARK_COUNT=4\nSPARK_TP=2\nSPARK_EP=2\n": ["0 0 0", "1 0 1", "2 1 0", "3 1 1"],
             "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=2\nRTX_GPUS=1\n" + SIX_HOSTS: [
                 "0 0 0", "1 0 1", "2 0 2", "3 1 0", "4 1 1", "5 1 2",
             ],
             "SPARK_COUNT=6\nSPARK_TP=2\nSPARK_EP=3\n" + SIX_HOSTS: [
                 "0 0 0", "1 0 1", "2 1 0", "3 1 1", "4 2 0", "5 2 1",
             ],
-            "SPARK_TP=4\nSPARK_EP=1\n": ["0 0 0", "1 0 1", "2 0 2", "3 0 3"],
+            "SPARK_COUNT=4\nSPARK_TP=4\nSPARK_EP=1\n": ["0 0 0", "1 0 1", "2 0 2", "3 0 3"],
             # Pure unreplicated TP6: one group, six disjoint intermediate shards.
             "SPARK_COUNT=6\nSPARK_TP=6\nSPARK_EP=1\n" + SIX_HOSTS: [
                 "0 0 0", "1 0 1", "2 0 2", "3 0 3", "4 0 4", "5 0 5",
@@ -168,7 +168,6 @@ class TopologyConfigTest(unittest.TestCase):
             "SPARK_TP=2\n": "set together or omitted together",
             "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=3\n" + SIX_HOSTS: "must equal SPARK_COUNT",
             "SPARK_COUNT=4\nSPARK_TP=3\nSPARK_EP=2\n": "must equal SPARK_COUNT",
-            "SPARK_COUNT=6\n" + SIX_HOSTS: "SPARK_COUNT=6 requires explicit",
         }
         for overlay, message in cases.items():
             with self.subTest(overlay=overlay):
@@ -180,8 +179,8 @@ class TopologyConfigTest(unittest.TestCase):
         # The Spark TP/EP degree must not hardcode the RTX layout. Both RTX
         # counts parse; the launcher rejects an infeasible combination with the
         # resolved weight budget instead.
-        for overlay in ("SPARK_TP=2\nSPARK_EP=2\nRTX_GPUS=1\n",
-                        "SPARK_TP=2\nSPARK_EP=2\nRTX_GPUS=2\n",
+        for overlay in ("SPARK_COUNT=4\nSPARK_TP=2\nSPARK_EP=2\nRTX_GPUS=1\n",
+                        "SPARK_COUNT=4\nSPARK_TP=2\nSPARK_EP=2\nRTX_GPUS=2\n",
                         "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=2\nRTX_GPUS=2\n" + SIX_HOSTS,
                         "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=2\nRTX_GPUS=1\n" + SIX_HOSTS):
             with self.subTest(overlay=overlay):
@@ -203,7 +202,7 @@ class TopologyConfigTest(unittest.TestCase):
             ("SPARKINFER_EXL3=auto\n", "requires SPARKINFER_EXL3=disable"),
         ):
             with self.subTest(overlay=overlay):
-                result = load("SPARK_TP=2\nSPARK_EP=2\n" + overlay, "true")
+                result = load("SPARK_COUNT=4\nSPARK_TP=2\nSPARK_EP=2\n" + overlay, "true")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
 
@@ -345,11 +344,9 @@ class ExampleConfigTest(unittest.TestCase):
             self.assertIn("SPARK_5_LANE_B=10.55.1.6", text)
             self.assertNotIn("REPLACE-ME", text)
             self.assertNotIn("192.0.2.", text)
-        # The default config keeps the shipped four-rank serving selection; it
-        # names the connected fifth/sixth hosts so cleanup can reach them, but
-        # must not select them for launch.
+        # Unspecified count selects every configured host.
         default = CONFIG.read_text()
-        self.assertIn("SPARK_COUNT=4", default)
+        self.assertNotRegex(default, r"(?m)^SPARK_COUNT=")
         self.assertNotIn("SPARK_TP=", default)
 
     def test_two_rtx_tp2ep2_example_is_opt_in_and_bound_to_real_hosts(self) -> None:

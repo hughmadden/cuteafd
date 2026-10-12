@@ -1,6 +1,6 @@
 //! `cuteafd plan`: inspect a checkpoint and report what this build can serve.
 use anyhow::{Context, Result};
-use cuteafd_loader::plan::{budget_bytes, plan, plan_preferred, render, ExpertPlacement, PlanError, PlanOptions};
+use cuteafd_loader::plan::{budget_bytes, plan, plan_spark_count, render, ExpertPlacement, PlanError, PlanOptions};
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
         audio: args.audio,
-        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
+        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
             .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
@@ -87,7 +87,31 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     Ok(options)
 }
 
+fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
+    layout.prefix_slots = args.prefix_slots.or(Some(if args.prefix_cache_entries == 0 {
+        0
+    } else { 2 * args.prefix_cache_entries + 2 }));
+    // Workers must cover both prefill and the 256-row replay bucket.
+    layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
+        else if args.prefill_rows <= 256 { 256 }
+        else if args.prefill_rows <= 1024 { 1024 }
+        else { 4096 };
+}
+
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    if args.config.is_some() {
+        let cfg = launch_config(args.config.as_deref())?;
+        args.available_sparks = (0..8).take_while(|rank|
+            cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
+        if args.spark_ranks.is_none() {
+            let count = cfg.get("SPARK_COUNT").filter(|v| !v.is_empty())
+                .map(|v| v.parse::<usize>().context("SPARK_COUNT")).transpose()?;
+            let hosts = spark_hosts_count(&cfg)?;
+            anyhow::ensure!(count.zip(hosts).is_none_or(|(count, hosts)| count == hosts),
+                "SPARK_HOSTS must name exactly SPARK_COUNT hosts");
+            args.spark_ranks = count.or(hosts);
+        }
+    }
     if args.files || args.fetch || args.role.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
         if args.revision.is_none() && !PathBuf::from(&args.model).is_dir() {
@@ -121,20 +145,17 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if let Some(layout) = &mut options.layout {
         let config = std::fs::File::open(snapshot.join("config.json")).ok()
             .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
-        if config.as_ref().and_then(|value| value.get("model_type"))
-            .and_then(serde_json::Value::as_str) == Some("deepseek_v41") {
-            // Match run.sh's supported worker capacities without changing other families.
-            layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
-                else if args.prefill_rows <= 80 { 80 }
-                else if args.prefill_rows <= 256 { 256 }
-                else if args.prefill_rows <= 1024 { 1024 }
-                else { 4096 };
-        }
+        let v41 = config.as_ref().is_some_and(|value| {
+            value.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41")
+                || value.get("architectures").and_then(serde_json::Value::as_array)
+                    .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"))
+        });
+        if v41 { v41_layout(layout, &args); }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
         let args = file_args(args, &snapshot)?;
-        let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4));
+        let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
         let parse = |name: &str| {
             anyhow::ensure!(!(args.no_speculator && name == "drafter"), "--no-speculator conflicts with drafter role");
             ReadRole::parse(name, placement,
@@ -206,8 +227,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
-        else { plan_preferred(&snapshot, &options)? };
+    let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
+    if args.json {
+        if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
+        if let Some(selection) = &report.prefill_selection { eprintln!("{selection}"); }
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -217,7 +241,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
     }
     if args.require_ready && !report.executable() {
-        anyhow::bail!("{} is not servable by this build", args.model);
+        anyhow::bail!("{} is not servable by this build: {}", args.model,
+            report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; "));
     }
     Ok(())
 }
@@ -230,6 +255,20 @@ fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTr
         (!key.is_empty() && key.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'))
             .then(|| (key.to_owned(), value.to_owned()))
     }).collect())
+}
+
+fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>> {
+    let Some(hosts) = cfg.get("SPARK_HOSTS").filter(|value| !value.is_empty()) else { return Ok(None) };
+    let configured: std::collections::BTreeSet<&str> = (0..8)
+        .filter_map(|rank| cfg.get(&format!("SPARK_{rank}_HOST")).map(String::as_str)).collect();
+    let pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"];
+    let mut seen = std::collections::BTreeSet::new();
+    for host in hosts.split(',') {
+        anyhow::ensure!(!host.is_empty() && host == host.trim(), "SPARK_HOSTS contains an empty or whitespace host");
+        anyhow::ensure!(seen.insert(host), "SPARK_HOSTS contains duplicate host {host}");
+        anyhow::ensure!(configured.contains(host) || pool.contains(&host), "SPARK_HOSTS names unknown Spark pool host {host}");
+    }
+    Ok(Some(seen.len()))
 }
 
 /// Resolve the release defaults or the launcher's plain KEY=VALUE config.
@@ -550,6 +589,7 @@ mod tests {
             revision: None,
             hf_home: None,
             spark_ranks: Some(spark_ranks),
+            available_sparks: 6,
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
@@ -882,6 +922,34 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let error = options(&PlanArgs { coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
+        }
+    }
+
+    #[test]
+    fn v41_prefix_and_worker_layout_match_launch_arguments() {
+        let mut args = args(std::path::Path::new("/not-read"), 4, false);
+        let mut layout = cuteafd_loader::plan::layout::LayoutOptions::default();
+        for (entries, slots) in [(0, 0), (1, 4), (20, 42), (128, 258)] {
+            args.prefix_cache_entries = entries;
+            for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
+                args.prefill_rows = rows;
+                v41_layout(&mut layout, &args);
+                assert_eq!(layout.prefix_slots, Some(slots));
+                assert_eq!(layout.spark_capacity_rows, capacity);
+            }
+        }
+        args.prefix_slots = Some(8);
+        v41_layout(&mut layout, &args);
+        assert_eq!(layout.prefix_slots, Some(8));
+    }
+
+    #[test]
+    fn explicit_spark_hosts_are_validated_before_planning() {
+        let cfg = |hosts: &str| std::collections::BTreeMap::from([
+            ("SPARK_HOSTS".into(), hosts.into()), ("SPARK_0_HOST".into(), "custom".into())]);
+        assert_eq!(spark_hosts_count(&cfg("ostrich,custom")).unwrap(), Some(2));
+        for hosts in ["ostrich,ostrich", "ostrich,", ",ostrich", "ostrich, emu", "unknown"] {
+            assert!(spark_hosts_count(&cfg(hosts)).is_err(), "{hosts}");
         }
     }
 

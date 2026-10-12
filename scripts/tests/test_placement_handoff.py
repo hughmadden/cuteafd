@@ -96,7 +96,7 @@ wip_layout=
 wip_slot=
 '''
             if encoder is not None:
-                setup+='\nVISION=auto\n'
+                setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
             setup+=f'\nRTX_EXPERT_LAYERS={local_layers}\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
             # Legacy geometry: release_spark_tp defaults to SPARK_COUNT and
             # release_spark_ep to 1 when no explicit topology is configured.
@@ -157,7 +157,7 @@ wip_slot=
             rtx_expert_layers=20,spark_first_layer=20),encoder=encoder)
         self.assertEqual(result.returncode,0,result.stderr)
         plans=[args for tool,args in events if tool=='docker' and 'plan' in args]
-        self.assertEqual(len(plans),1)
+        self.assertEqual(len(plans),0)
         coordinator=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
         self.assertEqual(coordinator[coordinator.index('--vision-peers')+1],'10.55.0.3:19541')
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)

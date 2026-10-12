@@ -25,7 +25,17 @@ class NativeReleaseLauncherTest(unittest.TestCase):
             self.assertEqual(capacity, next(rows for rows in [256, 1024, 4096] if rows >= max(chunk, 256, 128)))
         source = (ROOT / 'run.sh').read_text()
         self.assertIn('expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")"', source)
-        self.assertIn('--prefill-rows "$expert_capacity"', source)
+        self.assertIn('--prefill-rows "$count_prefill"', source)
+        self.assertIn('encoder_plan="$count_plan"', source)
+        self.assertNotIn('--prefill-rows "$expert_capacity"', source)
+
+    def test_count_fallback_precedes_bf16_package_preflight(self) -> None:
+        source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+        selection = source.index('selected_ranks="')
+        reexec = source.index('exec bash "$repo_root/scripts/launch/run-family.sh"', selection)
+        package = source.index('printf -v preflight_command')
+        self.assertLess(reexec, package)
+        self.assertLess(package, source.index('if [[ "$restart" == 1 ]];'))
 
     def test_v41_capacity_registry_rejects_invalid_chunks_and_syntax_drift(self) -> None:
         registry = Path('rust/crates/cuteafd-core/src/coordinator_programs.rs')

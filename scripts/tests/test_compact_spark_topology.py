@@ -20,33 +20,38 @@ class CompactSparkTopologyTest(unittest.TestCase):
                 'source scripts/lib/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)
 
-    def test_compact_defaults_and_absolute_ceiling(self):
-        base = 'SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto'
-        for value, success in [('', True), ('32GiB', True), ('31GiB', True),
-                               ('34359738368B', True), ('32768MiB', True),
-                               ('34359738369B', False), ('0GiB', False),
-                               ('32.000001GiB', False), ('50%', False)]:
-            with self.subTest(value=value):
-                result = self.config(base + '\nMEMORY_RESERVATION=' + value)
-                self.assertEqual(result.returncode, 0 if success else 2, result.stderr)
-                if success:
-                    self.assertEqual(result.stdout.splitlines(), [value or '32GiB', '2GiB'])
-        result = self.config(base + '\nKV_POOL_SIZE=1GiB')
-        self.assertEqual(result.stdout.splitlines(), ['32GiB', '1GiB'])
-        for settings in ['SPARK_COUNT=2', base + '\nRTX_GPUS=2',
-                         base + '\nEXL3_PAIRED_TP4=on']:
-            self.assertEqual(self.config(settings).returncode, 2)
+    def test_blank_count_remains_implicit_across_config_reloads(self):
+        result = self.config('SPARK_COUNT=\nSPARK_HOSTS=',
+            'release_load_config "$1"; printf "%s %s\\n" "$SPARK_COUNT" "$RELEASE_SPARK_COUNT_EXPLICIT"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '6 0')
 
-    def test_compact_prefill_cap_is_logged_and_preserves_smaller_requests(self):
-        base = 'SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto'
-        for requested in (80, 128, 256, 2048, 4096):
-            result = self.config(base + f'\nPREFILL_BATCH_TOKENS={requested}',
-                                 'printf "%s" "$PREFILL_BATCH_TOKENS"')
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, str(min(requested, 256)))
-            self.assertEqual('caps PREFILL_BATCH_TOKENS' in result.stderr, requested > 256)
-        result = self.config('', 'printf "%s" "$PREFILL_BATCH_TOKENS"')
-        self.assertEqual(result.stdout, '2048')
+    def test_prefill_explicitness_survives_config_reload(self):
+        command = ('release_load_config "$1"; printf "%s %s\\n" '
+                   '"$PREFILL_BATCH_TOKENS" "$RELEASE_PREFILL_EXPLICIT"')
+        implicit = self.config('', command)
+        self.assertEqual(implicit.returncode, 0, implicit.stderr)
+        self.assertEqual(implicit.stdout.strip(), '2048 0')
+        explicit = self.config('PREFILL_BATCH_TOKENS=1024', command)
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(explicit.stdout.strip(), '1024 1')
+
+    def test_count_does_not_set_memory_or_prefill_profiles(self):
+        for count in (2, 3, 4, 6):
+            for reservation in ('', '31GiB', '80GiB', '50%'):
+                result = self.config(f'SPARK_COUNT={count}\nMEMORY_RESERVATION={reservation}',
+                    'printf "%s\\n" "$MEMORY_RESERVATION" "$KV_POOL_SIZE" "$PREFILL_BATCH_TOKENS"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [reservation, '', '2048'])
+
+    def test_prefill_requests_are_preserved_at_every_count(self):
+        for count in (2, 3, 4, 6):
+            for requested in (80, 128, 256, 2048, 4096):
+                result = self.config(f'SPARK_COUNT={count}\nPREFILL_BATCH_TOKENS={requested}',
+                                     'printf "%s" "$PREFILL_BATCH_TOKENS"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, str(requested))
+                self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
 
     def test_only_active_hosts_and_rails_are_required(self):
         result = self.config('SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n'
@@ -130,38 +135,12 @@ release_stop_wip_containers
     NATIVE3 = ('SPARK_COUNT=3\nEXPERT_FORMAT=native\nSPARKINFER_EXL3=disable\n'
                'SPARK_TP=3\nSPARK_EP=1')
 
-    def test_compact_tp3_defaults_ceiling_and_prefill_cap(self):
-        for value, success in [('', True), ('32GiB', True), ('31GiB', True),
-                               ('34359738369B', False), ('50%', False)]:
-            with self.subTest(value=value):
-                result = self.config(self.COMPACT3 + '\nMEMORY_RESERVATION=' + value)
-                self.assertEqual(result.returncode, 0 if success else 2, result.stderr)
-                if success:
-                    self.assertEqual(result.stdout.splitlines(), [value or '32GiB', '2GiB'])
-        # A too-large prefill is clamped with a TP3-named note; smaller stands.
-        result = self.config(self.COMPACT3 + '\nPREFILL_BATCH_TOKENS=2048',
-                             'printf "%s" "$PREFILL_BATCH_TOKENS"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, '256')
-        self.assertIn('compact Spark TP3 caps PREFILL_BATCH_TOKENS=2048', result.stderr)
-        result = self.config(self.COMPACT3 + '\nPREFILL_BATCH_TOKENS=128',
-                             'printf "%s" "$PREFILL_BATCH_TOKENS"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, '128')
-        self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
-        # Two-rank behavior is unchanged.
-        result = self.config('SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto',
-                             'printf "%s\\n" "$MEMORY_RESERVATION" "$KV_POOL_SIZE"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ['32GiB', '2GiB'])
-
-    def test_compact_tp3_rejects_wrong_format_single_rtx_and_paired(self):
-        for settings in ['SPARK_COUNT=3',                       # native without keys
-                         self.COMPACT3 + '\nRTX_GPUS=2',        # compact is one-RTX only
-                         self.COMPACT3 + '\nEXL3_PAIRED_TP4=on' # disjoint packages only
-                         ]:
-            with self.subTest(settings=settings):
-                self.assertEqual(self.config(settings).returncode, 2, settings)
+    def test_implicit_counts_only_reject_paired_tp4_packages(self):
+        for count in (2, 3):
+            for settings in (f'SPARK_COUNT={count}', f'SPARK_COUNT={count}\nRTX_GPUS=2'):
+                self.assertEqual(self.config(settings).returncode, 0)
+            self.assertEqual(self.config(f'SPARK_COUNT={count}\nEXL3_PAIRED_TP4=on',
+                'release_validate_compact_spark').returncode, 2)
 
     def test_explicit_native_tp3ep1_bypasses_every_compact_rule(self):
         # The bypass must hold for MEMORY_RESERVATION, KV, prefill and the

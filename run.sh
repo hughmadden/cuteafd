@@ -21,8 +21,9 @@ FULL_PREFILL_LOGITS=on (off by default) admits probe-only all-row prefill logits
 at launch for these five families (--full-prefill-logits in the daemon). Fidelity
 score_path=prefill requires this option; ordinary serving still uses last-row logits.
 The CPU planner counts this workspace with plan --layout --full-prefill-logits.
-SPARK_COUNT=2 or SPARK_COUNT=3 (compact EXL3, no SPARK_TP/SPARK_EP keys)
-requires EXL3 on one RTX, with a hard 32GiB GPU ceiling.
+Unspecified Spark count uses all configured hosts, or warns once and selects
+its widest executable count. SPARK_COUNT or SPARK_HOSTS is exact: the planner
+honors it or refuses with a reason and the counts that work, on every card size.
 An optional expert-group topology is selected in the configuration with
 SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
 the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
@@ -145,6 +146,7 @@ fi
 
 release_load_config "$config"
 for name in "${!overrides[@]}"; do printf -v "$name" '%s' "${overrides[$name]}"; done
+[[ -z "${overrides[PREFILL_BATCH_TOKENS]:-}" ]] || RELEASE_PREFILL_EXPLICIT=1
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 case "$attention_placement" in
@@ -220,20 +222,13 @@ release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
 profile_mib="$(nvidia-smi --id="$RELEASE_COORDINATOR_GPU_UUID" --query-gpu=memory.total --format=csv,noheader,nounits)"
 profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$COORDINATOR_GPU_BUDGET_GIB")"
-if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib" && ! release_spark_compact_active; then
-  explicit_profile_key() { [[ -n "${overrides[$1]:-}" ]] || grep -qE "^${1}=.+" "$config"; }
-  explicit_profile_key PREFILL_BATCH_TOKENS || PREFILL_BATCH_TOKENS=1024
-  explicit_profile_key MEMORY_RESERVATION || MEMORY_RESERVATION=97%
-  explicit_profile_key EMBEDDING || EMBEDDING=host
-  [[ "$RTX_EXPERT_LAYERS" != auto ]] || RTX_EXPERT_LAYERS=0
-  ((PREFILL_BATCH_TOKENS <= 1024)) || release_die "32 GB V4.1 cannot admit capacity 4096 with vision/dSpark; set PREFILL_BATCH_TOKENS=1024 (256 for pool-first)"
-  echo "V4.1 32 GB profile: logical GPU ${profile_gib} GiB, prefill=$PREFILL_BATCH_TOKENS reservation=$MEMORY_RESERVATION RTX layers=$RTX_EXPERT_LAYERS embedding=$EMBEDDING (explicit overrides retained)" >&2
+if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
+  if [[ -z "${overrides[EMBEDDING]:-}" ]] && ! grep -Eq '^[[:space:]]*EMBEDDING[[:space:]]*=[[:space:]]*[^#[:space:]]' "$config"; then
+    EMBEDDING=host
+  fi
 fi
 snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_REVISION"
 model_is_exl3="$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")"
-if release_spark_compact_active; then
-  [[ "$model_is_exl3" == true ]] || release_die "SPARK_COUNT=$SPARK_COUNT requires an EXL3 checkpoint"
-fi
 # Multi-family EXL3 images ship exl3-kXX packages per decoder-tier family.
 # The deployed checkpoint's resident tiers are [floor(bits), floor(bits)+1]
 # for both raw integer-bit publications and staged fractional-bit snapshots.
@@ -295,15 +290,7 @@ gpu_selection_mode="$RTX_GPUS"
 if [[ "$gpu_selection_mode" == auto ]] && python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
   gpu_selection_mode=1
 fi
-# Auto must not turn the compact topology into a two-RTX launch.
-# The Spark TP/EP degree does NOT select the RTX layout: RTX_GPUS (auto or an
-# explicit 1/2) decides, and an infeasible combination is rejected below by the
-# resolved weight budget instead of a topology-to-layout hardcode.
 compact_selection_args=()
-if release_spark_compact_active; then
-  gpu_selection_mode=1
-  compact_selection_args+=(--compact-spark)
-fi
 gpu_selection="$(python3 "$repo_root/scripts/launch/select-release-gpus.py" \
   --mode "$gpu_selection_mode" \
   --minimum-expert-layers "$minimum_expert_layers" \
@@ -316,9 +303,6 @@ gpu_selection="$(python3 "$repo_root/scripts/launch/select-release-gpus.py" \
   --expert-format "$expert_format" \
   "${compact_selection_args[@]}" "${reclaim_args[@]}")"
 RELEASE_RTX_GPUS="$(jq -r '.count' <<<"$gpu_selection")"
-if release_spark_compact_active; then
-  ((RELEASE_RTX_GPUS == 1)) || release_die "SPARK_COUNT=$SPARK_COUNT requires one selected RTX GPU"
-fi
 ((SPARK_COUNT != 0 || RELEASE_RTX_GPUS == 2)) || release_die "SPARK_COUNT=0 requires two selected RTX GPUs"
 if release_tp2_enabled; then
   ((RELEASE_RTX_GPUS == 2)) || release_die "TP2 options require two selected RTX GPUs; use --rtx-gpus 2"
@@ -370,6 +354,46 @@ else
   [[ -n "$engine_commit" && "$engine_commit" != '<no value>' ]] || release_die "coordinator image has no engine revision"
   [[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
 fi
+
+# Select and admit the count before touching any serving container or Spark.
+count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS")
+((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
+count_mounts=(-v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro")
+if [[ -n "$wip_layout" ]]; then
+  count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
+    -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
+fi
+count_pool="${POOL_TOKENS:-auto}"; [[ "$count_pool" != auto ]] || count_pool=0
+count_command=()
+[[ -n "$wip_layout" ]] || count_command=(cuteafd)
+[[ "$RTX_EXPERT_LAYERS" == auto ]] || count_args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
+count_args+=(--embedding-placement "$EMBEDDING")
+count_prefill=0
+((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
+[[ "$DSPARK" != off ]] || count_args+=(--native-mtp-layers 0)
+count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
+  "${count_command[@]}" plan "/root/.cache/huggingface/$snapshot_rel" --vision "$VISION" --audio off \
+  --json --layout --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
+  --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
+  --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
+  --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
+  --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
+selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
+if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
+  [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
+fi
+SPARK_COUNT="$selected_count"
+PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
+# Native non-TP4 counts require the explicit ownership transport contract.
+if [[ "$model_is_exl3" != true && "$SPARK_COUNT" != 4 && "$SPARK_COUNT" != 0 && "$topology_explicit" == 0 ]]; then
+  SPARK_TP="$SPARK_COUNT" SPARK_EP=1
+fi
+release_validate_spark_topology
+topology_explicit=0; release_spark_topology_explicit && topology_explicit=1
+spark_tp="$(release_spark_tp)"; spark_ep="$(release_spark_ep)"
+spark_tp_roles_required=""
+if ((topology_explicit)) && [[ "$spark_tp" != 4 ]]; then spark_tp_roles_required="tp$spark_tp"; fi
+[[ -n "$POOL_TOKENS" || -n "$KV_POOL_SIZE" ]] || POOL_TOKENS=auto
 
 expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
   release_die "cannot resolve expert row capacity"
@@ -663,19 +687,14 @@ if [[ -n "$wip_layout" ]]; then
   )
 fi
 
-# Resolve the cold tower against the full Spark expert reservation. Never trade
-# expert capacity for vision; auto falls back to RTX when no Spark has room.
+# Reuse the admitted count, shape and expert placement for the cold tower.
+# Never re-plan a different local prefix or emit a second selection diagnostic.
 encoder_rank=-1
 encoder_hash=
 encoder_port=$((EXPERT_PORT + 100))
 vision_args=()
 if [[ "$VISION" != off ]]; then
-  encoder_plan="$(docker run --rm --network host "${wip_mount_args[@]}" \
-    -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" \
-    "$COORDINATOR_DOCKER_INFERENCE" cuteafd --vision "$VISION" --audio off plan \
-    "/root/.cache/huggingface/$snapshot_rel" --json --layout --rtx "$RELEASE_RTX_GPUS" \
-    --spark-ranks "$SPARK_COUNT" --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")" \
-    --local-expert-layers 0 --prefill-rows "$expert_capacity" --concurrency "$CONCURRENCY")"
+  encoder_plan="$count_plan"
   encoder_kind="$(jq -r '.encoder.kind.kind // "off"' <<<"$encoder_plan")"
   encoder_hash="$(jq -r '.encoder_plan_hash' <<<"$encoder_plan")"
   case "$encoder_kind" in

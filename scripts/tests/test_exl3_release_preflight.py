@@ -36,6 +36,12 @@ if tool == 'docker':
             print('fixture-engine' if 'org.opencontainers.image.revision' in ' '.join(args)
                   else os.environ['MOCK_REVISION'])
         sys.exit(0)
+    if args[:1] == ['run'] and 'plan' in args:
+        assert '--gpus' not in args and '--network' in args
+        rows = int(args[args.index('--prefill-rows') + 1])
+        print(json.dumps({'spark_ranks': int(args[args.index('--spark-ranks') + 1]),
+                          'prefill_rows': rows or 1024}))
+        sys.exit(0)
     if args[:1] == ['run'] and '--entrypoint' in args:
         entry = args[args.index('--entrypoint') + 1]
         assert '--gpus' not in args and '--network' in args
@@ -103,7 +109,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                 if tool == 'docker':
                     self.assertTrue(args == ['info'] or args[:2] in
                                     (['image', 'inspect'], ['container', 'inspect']) or
-                                    (args[0] == 'run' and '--entrypoint' in args), (host, args))
+                                    (args[0] == 'run' and ('--entrypoint' in args or 'plan' in args)), (host, args))
             return result, calls
 
     def test_instance_namespaces_the_coordinator_container(self):
@@ -122,16 +128,16 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                 result, calls = self.launch(paired=paired)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('Spark EXL3 package: ' + ('paired:' if paired else 'disjoint:'), result.stdout)
-                self.assertEqual(sum(tool == 'docker' and args[0] == 'run' for tool, _, args in calls), 4)
+                self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 4)
 
     def test_compact_two_rank_dry_run_selects_only_two_hosts(self):
         result, calls = self.launch(spark_count=2, paired=False, rtx_gpus='auto')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Spark ranks: 2; hosts: ostrich,dodo', result.stdout)
         self.assertIn('Spark peers: 10.55.0.1:19441,10.55.0.2:19441\n', result.stdout)
-        self.assertIn('memory reservation: 32GiB', result.stdout)
+        self.assertNotIn('memory reservation: 32GiB', result.stdout)
         self.assertEqual({host for _, host, _ in calls if host}, {'ostrich', 'dodo'})
-        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' for tool, _, args in calls), 2)
+        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 2)
         four, _ = self.launch(paired=False)
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
@@ -140,45 +146,41 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         result, calls = self.launch(spark_count=6, paired=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Spark ranks: 6;', result.stdout)
-        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' for tool, _, args in calls), 6)
+        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls), 6)
         for kwargs, message in [({'legacy': True}, 'lacks required TP6'),
                                 ({'paired': True}, 'requires disjoint EXL3 packages')]:
             result, _ = self.launch(spark_count=6, **{'paired': False, **kwargs})
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(message, result.stderr)
 
-    def test_compact_prefill_cli_override_cannot_restore_large_capacity(self):
-        for requested, expected in [('4096', '256'), ('80', '80')]:
+    def test_spark_count_preserves_prefill_cli_override(self):
+        for requested, expected, capacity in [('4096', '4096', '4096'), ('80', '80', '256')]:
             result, _ = self.launch(spark_count=2, paired=False,
                                     extra=('--prefill-batch-tokens', requested))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f'prefill batch tokens: {expected}; expert capacity: 256', result.stdout)
-        four, _ = self.launch(paired=False)
-        self.assertIn('prefill batch tokens: 2048; expert capacity: 4096', four.stdout)
+            self.assertIn(f'prefill batch tokens: {expected}; expert capacity: {capacity}', result.stdout)
+        four, calls = self.launch(paired=False)
+        self.assertIn('prefill batch tokens: 1024; expert capacity: 1024', four.stdout)
+        plan = next(args for tool, _, args in calls if tool == 'docker' and 'plan' in args)
+        self.assertEqual(plan[plan.index('--prefill-rows') + 1], '0')
 
     def test_compact_accepts_nominal_32gib_board_with_smaller_usable_total(self):
         result, _ = self.launch(spark_count=2, paired=False, gpu_mib=32607)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('memory reservation: 32GiB', result.stdout)
+        self.assertNotIn('memory reservation: 32GiB', result.stdout)
 
     def test_compact_legacy_disjoint_package_rejected_before_restart(self):
         result, _ = self.launch(spark_count=2, paired=False, legacy=True, mismatch=True)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('lacks required TP2', result.stderr)
 
-    def test_compact_rejects_incompatible_layout_model_and_ceiling(self):
-        for kwargs, message in [
-            ({'paired': True}, 'requires disjoint EXL3 packages'),
-            ({'exl3': False, 'paired': False}, 'requires an EXL3 checkpoint'),
-            ({'rtx_gpus': '2'}, 'requires a single RTX GPU'),
-            ({'reservation': '33GiB'}, 'no greater than 32GiB'),
-            ({'reservation': '90%'}, 'percentages are not allowed'),
-            ({'extra': ('--memory-reservation', '40GiB')}, 'no greater than 32GiB'),
-        ]:
-            with self.subTest(kwargs=kwargs):
-                result, _ = self.launch(spark_count=2, **kwargs)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn(message, result.stderr)
+    def test_two_rank_packages_reject_only_incompatible_package_layout(self):
+        result, _ = self.launch(spark_count=2, paired=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('requires disjoint EXL3 packages', result.stderr)
+        for reservation in ('33GiB', '90%'):
+            result, _ = self.launch(spark_count=2, paired=False, reservation=reservation)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_mismatch_rejects_restart_before_stopping_services(self):
         result, _ = self.launch(mismatch=True)
@@ -188,7 +190,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
     def test_full_model_skips_exl3_package_reads(self):
         result, calls = self.launch(exl3=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(any(tool == 'docker' and args[0] == 'run' for tool, _, args in calls))
+        self.assertFalse(any(tool == 'docker' and args[0] == 'run' and 'plan' not in args for tool, _, args in calls))
 
 
 if __name__ == '__main__':

@@ -122,29 +122,8 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         args.peers.len(),
         "serve-native",
     )?;
-    // The legacy compact profile is the non-topology, EXL3 path with either two
-    // or three Spark peers: one RTX, a hard 32 GiB device ceiling and no
-    // paired TP4 artifacts. An explicit topology carries its own rank count and
-    // is never compact.
-    let compact = legacy_compact(topology, args.peers.len());
-    ensure!(
-        topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
-        "two, three, four or six Spark peers required for the legacy non-topology layout; \
-         an explicit --spark-tp/--spark-ep topology carries its own rank count"
-    );
-    ensure!(
-        matches!(args.peers.len(), 4 | 6) || topology.is_some() || (args.rtx_gpus == 1 && !args.exl3_paired_tp4),
-        "two or three Spark peers require the single-RTX, non-paired EXL3 profile"
-    );
-    if compact {
-        ensure!(args.pool_tokens.is_none(), "planner pool admission is not qualified for the compact 32 GiB profile");
-        compact_budget(&mut args.memory_reservation, &mut args.kv_pool_size)?;
-        if args.prefill_batch_tokens > 256 {
-            tracing::info!(requested=args.prefill_batch_tokens, effective=256,
-                "compact 32 GiB profile limits prefill workspace capacity");
-            args.prefill_batch_tokens = 256;
-        }
-    }
+    ensure!(topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
+        "unsupported V4.1 Spark count {}; supported counts: 2, 3, 4, 6", args.peers.len());
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
@@ -194,65 +173,9 @@ fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
         .context("prefill batch must be in 80..=4096")
 }
 
-fn admit_small_card_capacity(total: usize, batch: u32) -> Result<()> {
-    ensure!(total > 32usize << 30 || prefill_capacity(batch)? <= 1024,
-        "32 GB V4.1 capacity 4096 cannot fit with vision/dSpark; set --prefill-batch-tokens 1024 (256 for pool-first)");
-    Ok(())
-}
-
 #[cfg(test)]
 mod prefill_capacity_tests {
-    use super::{legacy_compact, prefill_capacity, compact_budget, memory};
-
-    /// One predicate drives the whole compact profile: the 32 GiB absolute
-    /// ceiling, the prefill workspace clamp, the reservation headroom cap and the
-    /// final residency check. It must cover the implicit two- and three-rank EXL3
-    /// groups and nothing else — an explicit TP3EP1 native launch is not compact.
-    #[test]
-    fn compact_profile_covers_implicit_two_and_three_peers_only() {
-        let tp3ep1 = cuteafd_transport::expert::SparkTopology::new(3, 1).unwrap();
-        for (topology, peers, expected) in [
-            (None, 2, true),
-            (None, 3, true),
-            (None, 4, false),
-            (None, 6, false),
-            (Some(tp3ep1), 3, false),
-            (Some(tp3ep1), 2, false),
-        ] {
-            assert_eq!(
-                legacy_compact(topology, peers),
-                expected,
-                "topology {topology:?} with {peers} Spark peers"
-            );
-        }
-    }
-
-    #[test]
-    fn compact_budget_is_absolute_including_headroom() {
-        let (mut reservation, mut kv) = (None, None);
-        compact_budget(&mut reservation, &mut kv).unwrap();
-        assert!(matches!(reservation, Some(memory::Reservation::Bytes(memory::ByteSize(n))) if n == 32usize << 30));
-        assert_eq!(kv.unwrap().0, 2usize << 30);
-        for invalid in ["33GiB", "100%", "32%"] {
-            assert!(compact_budget(&mut Some(invalid.parse().unwrap()), &mut None).is_err());
-        }
-        let mut kv = Some(memory::ByteSize(1usize << 30));
-        compact_budget(&mut Some("31GiB".parse().unwrap()), &mut kv).unwrap();
-        assert_eq!(kv.unwrap().0, 1usize << 30);
-    }
-
-    #[test]
-    fn small_card_refuses_large_capacity_before_allocation() {
-        for batch in [80, 256, 1024] { assert!(super::admit_small_card_capacity(32usize << 30, batch).is_ok()); }
-        for total in [32usize << 30, (31.8 * (1u64 << 30) as f64) as usize] {
-            for batch in [1025, 2048, 4096] {
-                let reason = super::admit_small_card_capacity(total, batch).unwrap_err().to_string();
-                assert!(reason.contains("capacity 4096"), "{reason}");
-                assert!(reason.contains("--prefill-batch-tokens 1024 (256 for pool-first)"), "{reason}");
-            }
-        }
-        assert!(super::admit_small_card_capacity(96usize << 30, 4096).is_ok());
-    }
+    use super::prefill_capacity;
 
     #[test]
     fn intermediate_batches_use_covering_preallocated_capacity() {
@@ -274,34 +197,11 @@ mod prefill_capacity_tests {
     }
 }
 
-// Compact is a real total-device ceiling, including the planner's 2 GiB
-// runtime headroom. Bound KV explicitly so it cannot consume the entire
-// ceiling before bottom-up expert placement runs.
-fn compact_budget(reservation: &mut Option<memory::Reservation>, kv: &mut Option<memory::ByteSize>) -> Result<()> {
-    let ceiling = 32usize << 30;
-    match reservation {
-        None => *reservation = Some(memory::Reservation::Bytes(memory::ByteSize(ceiling))),
-        Some(memory::Reservation::Bytes(bytes)) => ensure!(bytes.0 <= ceiling, "compact EXL3 requires a total device budget at most 32 GiB including headroom"),
-        Some(memory::Reservation::Percent(_)) => anyhow::bail!("compact EXL3 requires an absolute device budget at most 32 GiB, not a percentage"),
-    }
-    if kv.is_none() { *kv = Some(memory::ByteSize(2usize << 30)); }
-    Ok(())
-}
-
 /// Protocol-v2 per-chunk transport diagnostics. Resolved once here so the RDMA
 /// progress/poll path never reaches the process environment; the value is only
 /// meaningful for a launch, so a start-time read is sufficient.
 pub(crate) fn protocol_v2_timing() -> bool {
     cuteafd_transport::protocol_v2_timing_from_env()
-}
-
-/// True for the legacy compact profile: the non-topology launch with an
-/// implicit two- or three-rank EXL3 Spark group. Kept in one place because the
-/// 32 GiB device ceiling, the prefill workspace clamp and the reservation
-/// headroom cap all belong to exactly this profile; an explicit topology (any
-/// native layout, including `TP3EP1`) is never compact.
-fn legacy_compact(topology: Option<cuteafd_transport::expert::SparkTopology>, peers: usize) -> bool {
-    topology.is_none() && matches!(peers, 2 | 3)
 }
 
 fn spark_transport(
@@ -391,11 +291,6 @@ fn worker(
             super::graph_policy::set_fixed_shapes(shapes)?;
         }
     }
-    if small_card && !legacy_compact(None, args.peers.len()) {
-        admit_small_card_capacity(device_total, args.prefill_batch_tokens)?;
-        if args.rtx_expert_layers == memory::LocalLayers::Auto { args.rtx_expert_layers = memory::LocalLayers::Count(0); }
-        tracing::info!(device_total, prefill=args.prefill_batch_tokens, "selected V4.1 32 GB all-remote profile; explicit pool/reservation overrides retained");
-    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
@@ -432,9 +327,7 @@ fn worker(
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
     let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
-    if small_card && !legacy_compact(topology, args.peers.len()) {
-        memory::admit_small_card_startup(&lib, &catalog, &args)?;
-    }
+    memory::admit_startup(&lib, &catalog, &args)?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     if small_card { memory::startup_phase(&lib, "v41/startup", device_total)?; }
@@ -612,19 +505,29 @@ fn worker(
     if small_card { memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
     // Size after vision, both lanes, transports and optional draft allocations are live.
     let (free, total) = if small_card { memory::measured_pool_memory(&lib)? } else { lib.cuda_memory_info()? };
-    // A nominal 32 GiB card can expose slightly less memory to CUDA. The
-    // compact ceiling may become smaller, never larger, on that hardware.
-    // This cap belongs to the legacy two- or three-peer EXL3 compact profile
-    // only; an explicit TP3EP1 native topology is not compact.
-    let compact = legacy_compact(topology, args.peers.len());
-    let reservation = if compact {
-        match args.memory_reservation {
-            Some(memory::Reservation::Bytes(memory::ByteSize(bytes))) =>
-                Some(memory::Reservation::Bytes(memory::ByteSize(bytes.min(total)))),
-            other => other,
+    let reservation = args.memory_reservation;
+    // Exact local placement is admitted before the automatic pool consumes its
+    // space. Use the same header-derived resident/workspace/staging bound as
+    // the post-pool loader; automatic placement remains pool-first.
+    let fixed_local_peak = if let memory::LocalLayers::Count(count) = args.rtx_expert_layers {
+        if count == 0 { 0 } else {
+            use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave, exl3::Exl3Weights};
+            let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
+            let workspace = if catalog.exl3().is_some() { LocalExpertWave::exl3_device_bytes(&directory, aot_capacity)? }
+                else { LocalExpertWave::device_bytes_for(&lib, aot_capacity, catalog.nvfp4().is_some())? };
+            let budgets = (0..count).map(|layer| {
+                let selection = ExpertLayer::BackboneFull { layer };
+                if catalog.exl3().is_some() { Exl3Weights::plan(&catalog, selection) }
+                else { ExpertWeights::plan(&lib, &catalog, selection) }
+            }).collect::<Result<Vec<_>>>()?;
+            let resident = budgets.iter().try_fold(0usize, |sum, budget| sum.checked_add(budget.resident_bytes).context("local resident overflow"))?;
+            resident.checked_add(workspace.checked_mul(2).context("local workspace overflow")?)
+                .and_then(|bytes| bytes.checked_add(budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)))
+                .context("local loading peak overflow")?
         }
-    } else { args.memory_reservation };
-    args.kv_pool_size = memory::planned_pool_size(&args, &[(free, total)])?;
+    } else { 0 };
+    let pool_free = free.checked_sub(fixed_local_peak).context("exact local expert placement leaves no pool memory")?;
+    args.kv_pool_size = memory::planned_pool_size(&args, &[(pool_free, total)])?;
     let pool = memory::PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
         args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
     tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
@@ -722,10 +625,6 @@ fn worker(
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
-    if compact {
-        ensure!(occupied.checked_add(memory::RUNTIME_HEADROOM).is_some_and(|n| n <= pool.reservation_bytes),
-            "compact residency {occupied} bytes plus runtime headroom exceeds {} byte device ceiling", pool.reservation_bytes);
-    }
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
     if small_card { memory::startup_phase(&lib, "v41/local-experts", device_total)?; }
     crate::shared::memory_report::release_load_staging(&lib);

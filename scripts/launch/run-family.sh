@@ -6,6 +6,7 @@
 # snapshot's config.json (scripts/lib/checkpoint-family.py), or --family.
 # Containers use run.sh's names, so ./stop.sh stops them.
 set -euo pipefail
+launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 config="$repo_root/cuteafd.config"
@@ -32,6 +33,8 @@ while IFS='=' read -r key value; do
   release_known_key "$key" || release_die "unknown configuration key: $key"
   cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
+[[ -z "${SPARK_COUNT:-}" ]] || cfg[SPARK_COUNT]="$SPARK_COUNT"
+[[ -z "${SPARK_HOSTS:-}" ]] || cfg[SPARK_HOSTS]="$SPARK_HOSTS"
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 vision="$(get VISION auto)"
@@ -99,14 +102,21 @@ esac
 # the encoder plan below; DeepSeek V4 and GLM 5.3 have no tower, so auto starts
 # none and serves text only.
 # Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
+release_validate_verbs_device_map
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
-# EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
-# their weights plus serving reservations on the selected GPU. SPARK_COUNT is
-# the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
-ranks="$(get SPARK_COUNT 4)"
-configured_ranks="$ranks"
+# An explicit count or host list is exact. Unspecified means the entire inventory.
+available_sparks=0
+for rank in {0..7}; do
+  [[ -n "$(get "SPARK_${rank}_HOST")" ]] || break
+  available_sparks=$((available_sparks + 1))
+done
+count_explicit=0
+[[ -z "$(get SPARK_COUNT)$(get SPARK_HOSTS)" ]] || count_explicit=1
+ranks="$(get SPARK_COUNT "$available_sparks")"
 if [[ -n "$(get SPARK_HOSTS)" ]]; then
+  IFS=, read -r -a count_hosts <<<"$(get SPARK_HOSTS)"
+  ranks="$(get SPARK_COUNT "${#count_hosts[@]}")"
   host_rows="$(release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks")" || exit 2
   while read -r rank host lane_a lane_b; do
     cfg[SPARK_${rank}_HOST]="$host"
@@ -114,10 +124,13 @@ if [[ -n "$(get SPARK_HOSTS)" ]]; then
     cfg[SPARK_${rank}_LANE_B]="$lane_b"
   done <<<"$host_rows"
 fi
+configured_ranks="$available_sparks"
 backend="$(get EXPERT_BACKEND auto)"
 case "$backend" in
   auto|spark) ;;
-  local) ranks=0 ;;
+  local)
+    ((count_explicit == 0 || ranks == 0)) || release_die "EXPERT_BACKEND=local conflicts with exact SPARK_COUNT/SPARK_HOSTS=$ranks"
+    ranks=0 ;;
   *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
 esac
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
@@ -155,6 +168,7 @@ if [[ -n "$wip_slot" ]]; then
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
+
 qwen_exl3=0
 qwen_nvfp4=0
 qwen_mtp=0
@@ -164,47 +178,6 @@ if [[ "$family" == qwen4 ]]; then
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
   qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
-fi
-if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
-  selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
-  free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
-  if [[ "$free_mib" =~ ^[0-9]+$ ]]; then
-    if [[ "$restart" == 1 ]]; then
-      # --restart will release this container's allocations after validation.
-      # Credit only its host PIDs on this GPU, never another launch's memory.
-      own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
-      if [[ -n "$own_pids" ]]; then
-        own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
-          | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
-        [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
-      fi
-    fi
-    free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
-    if [[ -n "$coordinator_budget" ]]; then
-      total_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
-      # Credit this launch's restart above, but charge other physical usage
-      # against the simulated smaller card, just as runtime admission does.
-      if [[ "$total_mib" =~ ^[0-9]+$ ]]; then
-        free_gib="$(python3 -c 'import sys; free,total,budget=map(float,sys.argv[1:]); print(max(0,min(free,budget-total+free)))' \
-          "$free_gib" "$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$total_mib")" "$coordinator_budget")"
-      else
-        free_gib=0 # No trustworthy sample: keep the Spark fallback.
-      fi
-    fi
-    pool="$(get POOL_TOKENS 32768)"
-    if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
-      # CPU-only preflight reads checkpoint headers in the selected serving image.
-      # Older images that do not qualify auto placement keep the Spark fallback.
-      preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
-        "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout \
-        --rtx 1 --coordinator-gpu-budget-gib "$free_gib" --coordinator-weight-budget-gib "$free_gib" --pool-tokens "$pool" --kv-cache "$kv_format" \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
-      if [[ "$preferred" == 0 ]]; then
-        echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
-        ranks=0
-      fi
-    fi
-  fi
 fi
 layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
@@ -1000,34 +973,12 @@ case "$family" in
     [[ "$expert_input" != bf16 ]] || spark_worker_args+=" --bf16-ingress" ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
-# Check every selected image before --restart or checkpoint reads. The worker's
-# resident admission validates the sibling for its full 4096-row workspace even
-# when only decode requests use BF16, so this preflight requires the same coverage.
-if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
-  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
-  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
-  case "$store_dtype" in
-    fp8) expert_geometry=mimo ;;
-    mxfp4)
-      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
-      case "$hidden" in
-        4096) expert_geometry=mimof ;;
-        6144) expert_geometry=mimop ;;
-        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
-      esac ;;
-    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
-  esac
-  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
-  for ((rank = 0; rank < ranks; rank++)); do
-    host="$(get "SPARK_${rank}_HOST")"
-    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
-      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
-      exit 2
-    fi
-  done
+if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
+  echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2
+  exit 2
 fi
-# Resolve cold placement before starting or removing containers. Off skips the
-# planner and tower startup entirely; text-only families keep their old path.
+# Resolve the count and cold placement before starting or removing containers.
+# Media off still requires the shared expert and memory admission.
 vision_peers=()
 encoder_ranks=()
 encoder_hash=""
@@ -1037,12 +988,22 @@ audio_encoder_port=$((port + 2))
 audio_encoder_ranks=()
 audio_peers=()
 audio_encoder_hash=""
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
-   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
-   [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="${coordinator_budget:-94.97}"
+  if [[ "$family" == qwen4 ]]; then
+    free_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
+    total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
+    if ((restart)); then
+      own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | python3 -c 'import sys; print(" ".join(x.strip() for x in sys.stdin if x.strip().isdigit()))' || true)"
+      if [[ -n "$own_pids" ]]; then
+        own_mib="$(nvidia-smi --id="$gpu" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits \
+          | python3 -c 'import csv,sys;p=set(sys.argv[1].split());print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids")"
+        free_mib=$((free_mib + own_mib))
+      fi
+    fi
+    plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
+  fi
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
@@ -1086,10 +1047,57 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
     plan_draft_args+=(--decode-rows 128)
   fi
   [[ "$family" != qwen4 ]] || plan_draft_args+=(--kv-cache "$kv_format")
+  count_args=(--available-sparks "$available_sparks")
+  if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
+  for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
+    'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
+    'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
+    key_name="${pair%%:*}"; flag="${pair#*:}"; value="$(get "$key_name")"
+    if [[ -n "$value" && "$value" != auto && " ${plan_draft_args[*]} " != *" $flag "* ]]; then
+      plan_draft_args+=("$flag" "$value")
+    fi
+  done
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
-    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout \
-    --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
-    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
+    "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
+    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+  selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
+  if ((count_explicit)) || [[ "$backend" == local ]]; then
+    [[ "$selected_ranks" == "$ranks" ]] || release_die "planner changed exact Spark count $ranks to $selected_ranks"
+  elif [[ "$selected_ranks" != "$ranks" ]]; then
+    # Re-resolve count-dependent MTP, ingress and local flags before launching.
+    export SPARK_COUNT="$selected_ranks"
+    exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
+  fi
+# Check the admitted count's images before --restart or weight loading. The worker's
+# resident admission validates the sibling for its full 4096-row workspace even
+# when only decode requests use BF16, so this preflight requires the same coverage.
+if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
+  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  case "$store_dtype" in
+    fp8) expert_geometry=mimo ;;
+    mxfp4)
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      case "$hidden" in
+        4096) expert_geometry=mimof ;;
+        6144) expert_geometry=mimop ;;
+        *) echo "EXPERT_INPUT=$expert_input has no MXFP4 MiMo package for hidden_size=$hidden" >&2; exit 2 ;;
+      esac ;;
+    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
+  esac
+  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
+      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
+      exit 2
+    fi
+  done
+fi
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
+   [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   selected="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
