@@ -13,6 +13,7 @@ pub(crate) use distributed::DistributedDsparkChain;
 
 pub(crate) struct DsparkChain<'weights, 'library> {
     stream: LoadStream<'library>,
+    timing: crate::shared::draft::timing::DraftTiming<'library>,
     /// Live draft width; storage and the maximum are fixed at load time.
     width: usize,
     maximum: usize,
@@ -110,6 +111,7 @@ impl<'library> DsparkWeights<'library> {
         let library = self.library;
         let bytes = self.stage_bytes(requests)?;
         Ok(DsparkChain {
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-dspark")?,
             width: self.draft_width,
             maximum: self.draft_width,
             stream: LoadStream {
@@ -280,6 +282,7 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue(&mut self, reads: &[WindowRead; 3], requests: usize) -> Result<()> {
+        let forward = self.timing.begin_retained("forward", "forward", None, requests * self.width, self.stream.raw)?;
         if let Some(embedding) = self.embedding {
             let output = self.inputs();
             unsafe {
@@ -312,10 +315,13 @@ impl DsparkChain<'_, '_> {
                     )?;
                 }
             }
+            let layer = self.timing.begin_retained("forward", "layer", Some(stage), requests * self.width, self.stream.raw)?;
             unsafe {
                 self.stages[stage].enqueue_on(&reads[stage], requests, self.stream.raw)?;
             }
+            self.timing.end_retained(layer, self.stream.raw)?;
         }
+        self.timing.end_retained(forward, self.stream.raw)?;
         if let Some(terminal) = &self.terminal {
             let source = self.stages[2].output_storage();
             let target = terminal.inputs();
@@ -466,7 +472,9 @@ impl DsparkChain<'_, '_> {
         let graph = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?.raw;
         let output = self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         unsafe {
+            let span = self.timing.begin("graph_forward_terminal", None, count * self.width, self.stream.raw)?;
             self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+            self.timing.end(span, self.stream.raw)?;
             let bytes = self.download.bytes_mut();
             self.stream.library.copy_d2h_async(&mut bytes[..count * (self.width + 1) * 4], output[0], self.stream.raw)?;
             self.stream.library.copy_d2h_async(&mut bytes[count * (self.width + 1) * 4..count * (2 * self.width + 1) * 4], output[2], self.stream.raw)
@@ -491,6 +499,9 @@ impl DsparkChain<'_, '_> {
             self.pending = Some(pending);
             return Ok(None);
         }
+        self.timing.publish_completed()?;
+        self.timing.publish_retained("forward", count * self.width)?;
+        self.terminal.as_ref().unwrap().publish_timing(count)?;
         pending.armed = false;
         self.ready = Some(count);
         let bytes = self.download.bytes_mut();

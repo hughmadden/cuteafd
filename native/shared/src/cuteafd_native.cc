@@ -1345,6 +1345,23 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cu
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream) {
+  if (cuda_event == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const cudaError_t err = cudaEventRecordWithFlags(reinterpret_cast<cudaEvent_t>(cuda_event),
+      reinterpret_cast<cudaStream_t>(cuda_stream), cudaEventRecordExternal);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventRecordWithFlags failed", err);
+  }
+  return ok();
+#else
+  (void)cuda_stream;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA event recording is unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event) {
   if (cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,

@@ -332,6 +332,7 @@ enum DraftInput<'r, 'e> {
 
 pub(crate) struct GlmDrafter<'a> {
     library: &'a NativeLibrary,
+    timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
     /// Ring slots (sequences with a drafter context).
@@ -635,6 +636,7 @@ impl<'a> GlmDrafter<'a> {
             confidence_directory: snapshot.into(),
             confidence_scales: scales,
             fp8_workspace,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
             head_mode: Cell::new(super::DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
@@ -786,6 +788,7 @@ impl<'a> GlmDrafter<'a> {
         let (h, kv) = (self.cfg.hidden, self.cfg.kv_width());
         let width = self.cfg.taps.len() * h;
         let s = self.stream;
+        let context_span = self.timing.begin("context", None, n, s)?;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
             self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
@@ -802,6 +805,7 @@ impl<'a> GlmDrafter<'a> {
                     self.cfg.theta, self.cfg.eps, s)?;
             }
         }
+        self.timing.end(context_span, s)?;
         Ok(())
     }
 
@@ -985,11 +989,13 @@ impl<'a> GlmDrafter<'a> {
         let (s, l) = (self.stream, self.library);
         let (eps, group, inter) = (c.eps, c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
+        let forward_span = self.timing.begin("forward", None, rows, s)?;
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
+                let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
                 self.linear(w.n.buffer.ptr, &layer.attn_conv, 0, w.dynamic.buffer.ptr,
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr, w.conv.buffer.ptr,
@@ -1019,7 +1025,10 @@ impl<'a> GlmDrafter<'a> {
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                self.timing.end(layer_span, s)?;
             }
+            self.timing.end(forward_span, s)?;
+            let head_span = self.timing.begin("head_topk", None, rows, s)?;
             match &head {
                 HeadCall::Bf16(weight) => super::launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
                     w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
@@ -1027,13 +1036,17 @@ impl<'a> GlmDrafter<'a> {
             }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+            self.timing.end(head_span, s)?;
+            let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
             self.linear(w.n.buffer.ptr, &self.projection, 0,
                 w.projected.buffer.ptr, rows, h, c.rank)?;
             l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+            self.timing.end(select_span, s)?;
             l.cuda_stream_synchronize(s)?;
         }
+        self.timing.publish_completed()?;
         let drafted = s_count * c.drafts();
         let mut tokens = vec![0u8; drafted * 4];
         let mut features = vec![0u8; drafted * 16];

@@ -126,14 +126,14 @@ def test_helper_refuses_bad_values(profile, directory, message):
 def test_family_launch_forwards_profile_to_coordinator_and_each_worker(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=transport-timing,expert-timing\nPROFILE_DIR={prof}\n')
+                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=transport-timing,expert-timing,draft-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
     workers = [line for line in lines if 'cuteafd expertd-native' in line]
     assert workers
     for line, host in [(coordinator, HOST), *[(w, 'h0') for w in workers]]:
-        for flag in ('CUTEAFD_PROTOCOL_V2_TCP_TIMING=1', 'CUTEAFD_EXPERT_TIMING=1', f'CUTEAFD_PROFILE_HOST={host}',
+        for flag in ('CUTEAFD_PROTOCOL_V2_TCP_TIMING=1', 'CUTEAFD_EXPERT_TIMING=1', 'CUTEAFD_DRAFT_TIMING=1', f'CUTEAFD_PROFILE_HOST={host}',
                      f'CUTEAFD_PROFILE_DIR={prof}', f'{prof}:{prof}'):
             assert flag in line, (flag, line)
     assert all(f'mkdir -p {prof} && release_require_writable_state {prof} && docker run' in w for w in workers)

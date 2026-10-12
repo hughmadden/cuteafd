@@ -31,6 +31,31 @@ int main() {
   gate.release.store(true, std::memory_order_release);
   check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 1);
+  void* start = nullptr;
+  void* end = nullptr;
+  void* graph = nullptr;
+  cuteafd_device_buffer_t buffer{};
+  check(cuteafd_alloc_device_buffer(1 << 20, &buffer) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_create(&start) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_create(&end) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_record_external(nullptr, pending) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  check(cuteafd_cuda_graph_begin_capture(pending) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_record_external(start, pending) == CUTEAFD_STATUS_OK);
+  check(cudaMemsetAsync(buffer.ptr, 0x5a, buffer.bytes, static_cast<cudaStream_t>(pending)) == cudaSuccess);
+  check(cuteafd_cuda_event_record_external(end, pending) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_graph_end_capture(pending, &graph) == CUTEAFD_STATUS_OK);
+  for (int replay = 0; replay < 3; ++replay) {
+    check(cuteafd_cuda_graph_launch(graph, pending) == CUTEAFD_STATUS_OK);
+    check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
+    float elapsed = -1.0f;
+    check(cuteafd_cuda_event_elapsed_ms(start, end, &elapsed) == CUTEAFD_STATUS_OK && elapsed >= 0.0f);
+    unsigned char first = 0;
+    check(cudaMemcpy(&first, buffer.ptr, 1, cudaMemcpyDeviceToHost) == cudaSuccess && first == 0x5a);
+  }
+  check(cuteafd_cuda_graph_exec_destroy(graph) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_destroy(end) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_destroy(start) == CUTEAFD_STATUS_OK);
+  check(cuteafd_free_device_buffer(&buffer) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_stream_destroy(peer) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_stream_destroy(pending) == CUTEAFD_STATUS_OK);
   std::cout << "stream query distinguishes pending and complete without joining the peer\n";

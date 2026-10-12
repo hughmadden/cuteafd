@@ -23,6 +23,7 @@ pub(crate) mod probe;
 pub(crate) mod resource;
 pub(crate) mod routes;
 pub(crate) mod runtime;
+pub(crate) mod timing;
 
 /// Apply the opt-in length rule (`CUTEAFD_DRAFT_SURVIVAL_LENGTHS`, launcher key
 /// `DRAFT_SURVIVAL_LENGTHS`): verify drafts while their calibrated survival is

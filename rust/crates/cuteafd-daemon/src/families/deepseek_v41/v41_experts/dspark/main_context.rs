@@ -13,6 +13,7 @@ pub(crate) use proposal::MainProposal;
 
 pub(crate) struct DsparkMainContext<'weights, 'library> {
     stream: LoadStream<'library>,
+    timing: crate::shared::draft::timing::DraftTiming<'library>,
     main: DsparkProjection<'weights, 'library>,
     kv: [DsparkProjection<'weights, 'library>; 3],
     ops: V41AttentionOps<'library>,
@@ -46,6 +47,7 @@ impl<'library> DsparkWeights<'library> {
                 DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(stage), capacity)?)
         };
         Ok(DsparkMainContext {
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-context")?,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
