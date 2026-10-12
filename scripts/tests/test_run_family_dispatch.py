@@ -77,7 +77,7 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
-    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE", "COPY_DRAFT_POLICY"]
+    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE"]
     keys = "".join(f"{name}={value}\n" for name in names) if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
@@ -1542,12 +1542,12 @@ def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> N
                                            ("HOST_CACHE_BYTES=16GiB\n", "16GiB")])
 def test_mimo_port_flags_preserve_explicit_host_budget(tmp_path: Path, host: str, expected: str | None) -> None:
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
-    keys = ("MIMO_HOST_CACHE=on\nMIMO_PREFIX_DRAFT=on\nMIMO_COPY_WINDOWS=on\n"
+    keys = ("MIMO_HOST_CACHE=on\nMIMO_PREFIX_DRAFT=on\n"
             "MIMO_SNAPSHOT_WAIT=on\nMIMO_PREFILL_CHUNK_S=4\nHTTP_QUEUE_DEPTH=32\nHTTP_QUEUE_WAIT_MS=1234\n") + host
     result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
-    for flag in ("--mimo-host-cache", "--mimo-prefix-draft", "--mimo-copy-windows",
+    for flag in ("--mimo-host-cache", "--mimo-prefix-draft",
                  "--mimo-snapshot-wait", "--prefill-chunk-s 4", "--http-queue-depth 32", "--http-queue-wait-ms 1234"):
         assert flag in launch
     if expected is None:
@@ -1731,7 +1731,7 @@ def test_family_config_reads_share_the_stop_key_grammar() -> None:
     for new, old in re.findall(r'\bkey ([A-Z][A-Z_0-9]+) ([A-Z][A-Z_0-9]+)', launcher):
         if new != "NEW":
             keys.update((new, old))
-    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD", "V41_COPY_DRAFTS"))
+    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD"))
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; shift; for key; do release_known_key "$key" || exit 1; done',
          "bash", str(ROOT / "scripts/lib/release-common.sh"), *sorted(keys)],

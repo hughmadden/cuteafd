@@ -8,7 +8,6 @@ mod distributed;
 mod placement;
 pub(crate) mod scores;
 use scores::RetainedScores;
-mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
 use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;

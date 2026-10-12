@@ -7,7 +7,29 @@ use crate::shared::draft::clock::RoundTimes;
 use crate::shared::draft::evidence::sigmoid;
 mod chain;
 mod policy;
-pub(crate) use policy::{snapshot as policy_snapshot, LaneRequest};
+pub(crate) use policy::LaneRequest;
+
+static TAIL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAIL_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAIL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAIL_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn policy_snapshot() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut snapshot = policy::snapshot();
+    snapshot["copy_tail"] = serde_json::json!({
+        "requests": TAIL_REQUESTS.load(Relaxed), "proposed": TAIL_PROPOSED.load(Relaxed),
+        "reached": TAIL_REACHED.load(Relaxed), "accepted": TAIL_ACCEPTED.load(Relaxed),
+    });
+    snapshot
+}
+
+fn tail_outcome(rows: usize, accepted: usize, neural: usize) -> (usize, usize, usize) {
+    let proposed = rows.saturating_sub(neural + 1);
+    let reached = if accepted <= neural { 0 } else { proposed.min(accepted - neural) };
+    let accepted = accepted.saturating_sub(neural + 1).min(proposed);
+    (proposed, reached, accepted)
+}
 pub(crate) use chain::DraftChain;
 mod distributed;
 
@@ -25,6 +47,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     draft_width: usize,
     // Downloaded whenever the length policy is bound, or for diagnostics.
     confidence_trace: std::collections::BTreeMap<u64, Vec<f32>>,
+    neural_lengths: std::collections::BTreeMap<u64, usize>,
     /// Verify every available draft instead of selecting lengths.
     fixed: bool,
     /// Online bandwidth-balance length policy, bound to the installed placement.
@@ -84,6 +107,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             draft_limit: 5,
             draft_width: weights.draft_width(),
             confidence_trace: Default::default(),
+            neural_lengths: Default::default(),
             fixed: false,
             policy: None,
             published: None,
@@ -116,7 +140,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         });
         Ok(())
     }
-    pub fn max_verify_rows(&self) -> usize { self.draft_limit + 1 }
+    pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
     pub fn set_draft_limit(&mut self, limit: u8) -> Result<()> {
         ensure!((1..=self.draft_width as u8).contains(&limit), "draft limit exceeds generated width");
         self.draft_limit = limit as usize;
@@ -139,9 +163,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
     /// Bind the policy to a V4.1 geometry. Width 5 is the drafter's trained
     /// block; a width-7 load can also draft 5 each round, chosen by the policy.
-    pub(crate) fn bind_policy(&mut self, geometry: cuteafd_core::PolicyGeometry) -> Result<()> {
+    pub(crate) fn bind_policy(&mut self, mut geometry: cuteafd_core::PolicyGeometry) -> Result<()> {
         ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
-        let seed = cuteafd_core::PolicySeed::weak(geometry.max_positions);
+        geometry.max_positions = self.draft_width + crate::shared::draft::copy::COPY_EXTENSION;
+        let seed = cuteafd_core::PolicySeed::weak(self.draft_width);
         let policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
@@ -175,7 +200,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
         let drafted_requests = round.drafted_requests;
-        let selection = policy.select_drafted_within(shared, &candidates, width, usize::MAX, drafted_requests)?;
+        let selection = policy.select_drafted_within(shared, &candidates, width, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1), drafted_requests)?;
         Ok(match selection {
             Some(selection) => {
                 tracing::debug!(target: "cuteafd::draft_policy", lane, shared,
@@ -200,6 +225,16 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// problems are logged, never fatal.
     pub fn observe_round(&mut self, lane: usize, shared: bool, routes: &[Vec<[u32; 6]>],
         layer_us: &[Option<f64>], requests: &[policy::LaneRequest], times: RoundTimes) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for request in requests {
+            if let Some(&neural) = self.neural_lengths.get(&request.id) {
+                let (proposed, reached, accepted) = tail_outcome(request.rows, request.accepted as usize, neural);
+                TAIL_REQUESTS.fetch_add(u64::from(proposed > 0), Relaxed);
+                TAIL_PROPOSED.fetch_add(proposed as u64, Relaxed);
+                TAIL_REACHED.fetch_add(reached as u64, Relaxed);
+                TAIL_ACCEPTED.fetch_add(accepted as u64, Relaxed);
+            }
+        }
         let Some(round) = self.lanes.get_mut(lane) else { return };
         let Some(policy) = &mut self.policy else { round.predicted = None; return };
         let predicted = round.predicted;
@@ -242,6 +277,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             "cannot release a request with a pending commit");
         if let Some(policy) = &mut self.policy { policy.release(id); }
         self.confidence_trace.remove(&id);
+        self.neural_lengths.remove(&id);
         let mut failure = None;
         if let Some(request) = self.requests.remove(&id) {
             for (window, lease) in self.windows.iter_mut().zip(request.leases) {
@@ -442,16 +478,14 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         result
     }
 
-    /// Copy-window drafts replace dSpark's for the `copied` requests of this lane
-    /// round, so the chain drafts only the others (no draft pass runs unless
-    /// `drafting`). Their stale confidence is cleared so neither the policy nor
-    /// the logs attribute an earlier dSpark round to this one. Like any request
-    /// that did not draft, their accepted rows still reach every window through
-    /// the batch commit, which reads the target's taps for every batch member.
-    pub fn skip_copied(&mut self, lane: usize, copied: &[u64], drafting: bool) -> Result<()> {
-        ensure!(lane < self.lanes.len(), "invalid draft lane");
-        for id in copied { self.confidence_trace.remove(id); }
-        if !drafting { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; }
+    /// Copied continuation uses the same raw prior and observation as other families.
+    pub fn extend_confidence(&mut self, id: u64, neural: usize, extra: usize) -> Result<()> {
+        let confidence = self.confidence_trace.get_mut(&id).context("missing neural draft confidence")?;
+        ensure!(neural <= confidence.len(), "neural confidence extent mismatch");
+        self.neural_lengths.insert(id, neural);
+        confidence.truncate(neural);
+        let p = crate::shared::draft::resource::TAIL_PRIOR;
+        confidence.extend(std::iter::repeat_n((p / (1. - p)).ln() as f32, extra));
         Ok(())
     }
 
@@ -498,6 +532,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         for &(id, _, _, _) in inputs {
             self.confidence_trace.remove(&id);
+        self.neural_lengths.remove(&id);
         }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
@@ -553,6 +588,16 @@ mod restored_prefix_tests {
     use crate::shared::memory::{device::Device, SnapshotStorage};
 
     #[test]
+    fn long_tail_stats_count_only_judged_positions() {
+        assert_eq!(tail_outcome(38, 1, 5), (32, 0, 0));
+        assert_eq!(tail_outcome(38, 5, 5), (32, 0, 0));
+        assert_eq!(tail_outcome(38, 6, 5), (32, 1, 0));
+        assert_eq!(tail_outcome(38, 20, 5), (32, 15, 14));
+        assert_eq!(tail_outcome(38, 38, 5), (32, 32, 32));
+        assert_eq!(tail_outcome(4, 4, 5), (0, 0, 0));
+    }
+
+    #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]
     fn native_host_draft_prefix_keeps_gpu1_owner() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
@@ -599,6 +644,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         }
         for &(id, _, _, _) in inputs {
             self.confidence_trace.remove(&id);
+        self.neural_lengths.remove(&id);
         }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();

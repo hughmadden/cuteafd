@@ -85,6 +85,24 @@ fn spark_class() -> ResourceClass {
 /// beats them by this ratio.
 const REFERENCE_MARGIN: f64 = 1.02;
 
+/// Fixed diagnostic counts still share the verifier budget, anchors included.
+pub(crate) fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
+    let mut rows = lengths.len() + lengths.iter().sum::<usize>();
+    let trimmed = rows > budget;
+    while rows > budget {
+        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
+        lengths[index] -= 1;
+        rows -= 1;
+    }
+    trimmed
+}
+
+/// A terminal bonus can still reject a draft; only agreeing stops censor it.
+pub(crate) fn finish_censor(finished: bool, committed: usize, rows: &[u32], last: Option<u32>, stops: &[u32]) -> Option<Censor> {
+    if !finished || rows.get(committed).is_some_and(|next| Some(*next) != last) { return None; }
+    Some(if last.is_some_and(|token| stops.contains(&token)) { Censor::Eos } else { Censor::OutputLimit })
+}
+
 /// Where a layer's routed experts run and what one device reads per expert.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum LayerHome {
@@ -462,6 +480,31 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_censorship_preserves_a_real_mismatch() {
+        let rows = [10, 11, 12, 13];
+        assert_eq!(finish_censor(false, 2, &rows, Some(12), &[12]), None);
+        assert_eq!(finish_censor(true, 2, &rows, Some(99), &[99]), None);
+        assert_eq!(finish_censor(true, 2, &rows, Some(12), &[12]), Some(Censor::Eos));
+        assert_eq!(finish_censor(true, 2, &rows, Some(12), &[]), Some(Censor::OutputLimit));
+        assert_eq!(finish_censor(true, 4, &rows, Some(99), &[99]), Some(Censor::Eos));
+    }
+
+    #[test]
+    fn lane_budget_preserves_anchors_and_prefixes_with_full_tails() {
+        for count in 1..=8 {
+            let mut lengths = vec![7 + COPY_EXTENSION; count];
+            trim_budget(&mut lengths, 64);
+            assert!(count + lengths.iter().sum::<usize>() <= 64);
+            assert!(lengths.iter().all(|&n| n <= 7 + COPY_EXTENSION));
+            if count == 1 { assert_eq!(lengths, [39]); }
+        }
+        let mut mixed = [0, 37, 0, 39];
+        trim_budget(&mut mixed, 64);
+        assert_eq!((mixed[0], mixed[2]), (0, 0));
+        assert_eq!(mixed.iter().sum::<usize>() + mixed.len(), 64);
+    }
 
     fn homes(spark: bool) -> Vec<LayerHome> {
         (0..45).map(|layer| match layer {

@@ -121,6 +121,12 @@ impl ConfidencePolicy {
         Self::new(key, selector)
     }
 
+    /// Frozen selector prior for adapters whose online owner is DraftPolicy.
+    pub fn load_prior(directory: &Path, key: String) -> Result<Self> {
+        let selector = Some(SelectorFit::load(directory, &key)?);
+        Ok(Self { key, selector, online: Calibration::default(), enabled: false, trace: None })
+    }
+
     /// Native MTP has history rates but no top-16 selector features.
     pub fn history(key: String) -> Result<Self> { Self::new(key, None) }
 
