@@ -138,7 +138,7 @@ pub(crate) struct Exl3Worker<'a> {
 
 impl<'a> Exl3Worker<'a> {
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
-        Exl3RowPolicy::active().capacities(capacity as usize)
+        Ok(Exl3RowPolicy::active().capacities(capacity as usize)?)
     }
 
     /// Validate every capacity before allocating or reading resident weights,

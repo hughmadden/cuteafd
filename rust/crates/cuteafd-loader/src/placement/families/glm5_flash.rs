@@ -340,7 +340,9 @@ pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: 
         let root = [parent.join("exl3").join(&stem), lib.join("exl3").join(&stem)]
             .into_iter().find(|p| p.join(format!("rtx-tp{tp}")).is_dir())
             .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp{tp} package"))?;
-        let manifests = inventory::exl3_capacities(rows).into_iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
+        let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::GLM5_FLASH)
+            .capacities(usize::try_from(rows)?)?;
+        let manifests = capacities.into_iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
             let value: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("rtx-tp{tp}/m{capacity}/v41_exl3.json")))?)?;
             anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
                 && value["intermediate"].as_u64() == Some((shape.intermediate / tp) as u64)

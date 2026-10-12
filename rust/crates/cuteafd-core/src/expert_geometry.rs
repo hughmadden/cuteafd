@@ -100,6 +100,37 @@ impl ExpertGeometry {
     }
 }
 
+/// Capacity selects the compiled reduction geometry, never the live row count.
+/// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exl3RowPolicy {
+    Nearest,
+    GlmFlashK64,
+}
+
+impl Exl3RowPolicy {
+    pub fn for_geometry(geometry: ExpertGeometry) -> Self {
+        if geometry.same_shape(&ExpertGeometry::GLM5_FLASH) { Self::GlmFlashK64 } else { Self::Nearest }
+    }
+
+    pub fn active() -> Self { Self::for_geometry(expert_geometry()) }
+
+    pub fn required_capacity(self, live_rows: usize) -> usize {
+        if self == Self::GlmFlashK64 && (2..=16).contains(&live_rows) { 80 } else { live_rows }
+    }
+
+    /// Shared by loader admission, artifact preload and runtime dispatch.
+    pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
+        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+        if !(1..=4096).contains(&max_live_rows) {
+            return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
+        }
+        let required = max_live_rows.max(self.required_capacity(max_live_rows));
+        let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
+        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
+    }
+}
+
 static GEOMETRY: OnceLock<ExpertGeometry> = OnceLock::new();
 
 /// Fixes the process geometry. Allowed once, before first use; setting the
@@ -120,6 +151,21 @@ pub fn expert_geometry() -> ExpertGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exl3_row_policy_preserves_glmf_k64_at_narrow_admission() {
+        let policy = Exl3RowPolicy::for_geometry(ExpertGeometry::GLM5_FLASH);
+        assert_eq!(policy, Exl3RowPolicy::GlmFlashK64);
+        assert!(policy.capacities(0).is_err());
+        assert!(policy.capacities(4097).is_err());
+        assert_eq!(policy.capacities(1).unwrap(), [1]);
+        for rows in 2..=16 {
+            assert_eq!(policy.required_capacity(rows), 80);
+            assert_eq!(policy.capacities(rows).unwrap(), [1, 16, 80]);
+            assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16]);
+        }
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 16, 80, 256, 1024, 4096]);
+    }
 
     #[test]
     fn v41_defaults_and_slices() {
