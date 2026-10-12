@@ -20,6 +20,14 @@ pub(crate) fn extension(history: &[u32], drafted: &[u32], room: usize, greedy: b
     copy_extension(drafted, &copy).to_vec()
 }
 
+/// Neural-prefix agreement with the same history copy considered for extension.
+/// Trace-only: independent of output room, greediness, and policy selection.
+pub(crate) fn agreement(history: &[u32], drafted: &[u32]) -> usize {
+    if drafted.is_empty() { return 0; }
+    let copy = window(history, drafted.len());
+    copy.iter().zip(drafted).take_while(|(copied, neural)| copied == neural).count()
+}
+
 /// Latest earlier occurrence of the longest matching history suffix (4-8 tokens).
 fn window(history: &[u32], limit: usize) -> Vec<u32> {
     let len = history.len();
@@ -63,6 +71,28 @@ mod tests {
             assert!(extension(&history, &neural, width + 10, false).is_empty());
             assert!(extension(&history, &[], width + 10, true).is_empty());
         }
+    }
+
+    #[test]
+    fn agreement_reports_partial_neural_prefixes() {
+        let neural = [20, 21, 22, 23, 24, 25, 26];
+        let suffix: Vec<u32> = (1..=8).collect();
+        for matched in 0..=neural.len() {
+            let mut copy = neural.to_vec();
+            if matched < copy.len() { copy[matched] = 99; }
+            let mut history = suffix.clone();
+            history.extend(copy);
+            history.extend(100..164);
+            history.extend(&suffix);
+            assert_eq!(agreement(&history, &neural), matched);
+        }
+        assert_eq!(agreement(&[], &neural), 0);
+        assert_eq!(agreement(&suffix, &neural), 0);
+        assert_eq!(agreement(&suffix, &[]), 0);
+        let mut short = suffix.clone();
+        short.extend(&neural[..3]);
+        short.extend(&suffix);
+        assert_eq!(agreement(&short, &neural), 3);
     }
 
     #[test]

@@ -1027,6 +1027,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             confidence.prior(&a.drafts, drafter.and_then(|_| draft.as_ref().map(|d| d.features.as_slice())),
                 draft.as_ref().map_or(0, |d| d.tokens.len()))
         }).collect();
+        let copy_agreement = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
+            d.as_ref().map_or(0, |d| crate::shared::draft::copy::agreement(&a.history, &d.tokens)))
+            .collect::<Vec<_>>());
         let extensions: Vec<_> = active.iter().zip(&drafted).zip(&limits).map(|((a, d), &limit)|
             d.as_ref().map_or(Vec::new(), |d| crate::shared::draft::copy::extension(
                 &a.history, &d.tokens, limit, a.job.sampling.is_greedy()))).collect();
@@ -1181,6 +1184,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
                 "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
                 "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
+                "copy_agreement": copy_agreement,
                 "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
             if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
                 tracing::warn!(%error, "MiMo speculation trace write failed");
