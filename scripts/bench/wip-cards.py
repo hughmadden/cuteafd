@@ -25,6 +25,9 @@ import urllib.request
 import zlib
 
 REPO = Path(__file__).resolve().parents[2]
+# PROFILE switches that wrap the coordinator in a profiler, and their report suffix.
+PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
+NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
@@ -215,6 +218,16 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         # the same path; Spark-side files are collected back after the run.
         values['PROFILE_DIR'] = str(dest / 'profile')
         (dest / 'profile').mkdir(exist_ok=True)
+        if 'nsys' in values['PROFILE'].split(','):
+            # The coordinator's nsys session starts paused; smoke opens it after
+            # the sweep's first warm wave and closes it (writing the report) at
+            # sweep end, or before teardown if the sweep stopped in between.
+            if not (entry.get('levels') or entry.get('prefill_lengths')):
+                raise ValueError(card + ': PROFILE=nsys captures the timed sweep; pass --levels or --prefill-lengths')
+            exec_nsys = ['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys']
+            entry['window'] = dict(
+                open=dict(argv=exec_nsys + ['start', '--session=' + NSYS_SESSION], timeout_s=120, required=True),
+                close=dict(argv=exec_nsys + ['stop', '--session=' + NSYS_SESSION], timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
     if trace:
@@ -616,7 +629,8 @@ def ledger(dest):
 
 def collect_profile(job):
     """Copies Spark-side PROFILE files back into the job's profile directory
-    (the coordinator writes there directly). Missing hosts are recorded, not fatal."""
+    (the coordinator writes there directly). Missing hosts are recorded, not fatal.
+    Profiler reports (nsys/ncu) are listed with their sizes, not read."""
     values = job['entry']['set']
     directory = values.get('PROFILE_DIR')
     if not directory:
@@ -630,6 +644,8 @@ def collect_profile(job):
         except (subprocess.SubprocessError, OSError) as error:
             result['hosts'][host] = 'failed: ' + (getattr(error, 'stderr', '') or str(error)).strip()[:200]
     result['files'] = sorted(p.name for p in Path(directory).glob('*') if p.is_file())
+    result['reports'] = [{'name': p.name, 'bytes': p.stat().st_size} for p in sorted(Path(directory).glob('*'))
+                         if p.is_file() and p.suffix in PROFILER_REPORTS.values()]
     return result
 
 
@@ -732,6 +748,9 @@ def summarize_job(job, exit_code):
     profile = collect_profile(job)
     if profile:
         row['profile'] = profile
+        for switch, suffix in PROFILER_REPORTS.items():
+            if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] for r in profile['reports']):
+                fail(row, f'PROFILE={switch} produced no {suffix} report in {profile["dir"]}', 'measurement')
     trace_path = job['entry']['set'].get('SPECULATION_TRACE')
     if trace_path and job.get('trace'):
         path = Path(trace_path)
@@ -901,6 +920,8 @@ def write_summary(state, rows, arms):
         trace_cell = (f"{trace.get('records', 0)} records" if trace.get('expected') else 'not expected') if trace else ''
         profile = r.get('profile') or {}
         profile_cell = f"{len(profile.get('files', []))} files" if profile else ''
+        if profile.get('reports'):
+            profile_cell += ': ' + ', '.join(f"{r['name']} ({r['bytes'] / 2**20:.1f} MiB)" for r in profile['reports'])
         text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(status_cell(r.get('spec')))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
     if failed:
         text += '\n## Failures\n\nlaunch = the server never served the card; quality = it served and a correctness check failed; measurement = it served and a measurement or evidence check failed; preflight = refused before hardware.\n\n'
@@ -1143,6 +1164,7 @@ def toolchain_hash(revision):
 BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING', 'COORDINATOR_GPUS',
               'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
+              'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET',
               'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
 
 
@@ -1528,7 +1550,8 @@ def main():
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
-        (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else [])
+        (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
+        (['window'] if any(job['entry'].get('window') for job in jobs) else [])
     for job in jobs[:1]:
         binary_supports(args.binary, args.repo, job, fields)
     # Everything checkable without hardware, before any queue ticket.

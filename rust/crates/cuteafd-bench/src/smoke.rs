@@ -116,6 +116,20 @@ pub struct Entry {
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<bool>,
+    /// A measurement window around the timed part of the sweep (needs levels or
+    /// prefill_lengths), e.g. a profiler's capture range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
+}
+
+/// `open` runs once after the sweep's first warm-up, just before its first
+/// timed request; `close` runs when the sweep ends (passed or failed) and again
+/// before teardown if it has not succeeded yet. Both run to completion while
+/// the server is up; a failure fails the entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Window {
+    pub open: Hook,
+    pub close: Hook,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -224,6 +238,7 @@ impl Entry {
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
             baseline: self.baseline.or(defaults.baseline),
+            window: self.window.clone().or_else(|| defaults.window.clone()),
         }
     }
 
@@ -663,6 +678,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
             bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
         }
+        if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
+            bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
+        }
         entries.push(entry);
     }
     let mut state = load_state(&paths.state);
@@ -676,9 +694,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
-                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.set);
+                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(), e.set);
         }
         return Ok(());
     }
@@ -799,6 +817,15 @@ fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
         Some(instance) => format!("cuteafd-coordinator-{instance}"),
         None => "cuteafd-coordinator".into(),
     };
+    // A launcher that labels its coordinator cuteafd.graceful-stop=1 (a process
+    // that writes output at exit, e.g. under a profiler) gets `docker stop`, with
+    // the container's own stop signal and timeout, before the forced removal.
+    let label = Command::new("docker").args(["inspect", "-f", "{{index .Config.Labels \"cuteafd.graceful-stop\"}}", &coordinator])
+        .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if label.as_deref() == Some("1") {
+        let stopped = Command::new("docker").args(["stop", &coordinator]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = writeln!(log, "graceful stop {coordinator}: {}", stopped.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
+    }
     // The coordinator's own log goes next to the entry's (failures and warnings outlive the container).
     if let Ok(path) = log_path(log) {
         if let Ok(file) = File::create(path.with_extension("coordinator.log")) {
@@ -843,6 +870,25 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     let mut observer = None;
     let mut launcher_started = false;
     let mut hook_results = BTreeMap::new();
+    // The window's state: opened and not yet closed successfully.
+    let window_open = std::cell::Cell::new(false);
+    let window_results = std::cell::RefCell::new(BTreeMap::<String, String>::new());
+    let window_hook = |kind: &str, hook: &Hook, url: &str, config: &Path| -> Result<()> {
+        let checked = HookChild::spawn(hook, url, config, &log_path, kind).and_then(|mut child| child.wait());
+        window_results.borrow_mut().insert(kind.into(), checked.as_ref().map(|_| "pass".into())
+            .unwrap_or_else(|error| format!("{error:#}")));
+        checked.with_context(|| format!("{kind} hook"))
+    };
+    let close_window = |url: &str, config: &Path| -> Result<()> {
+        match entry.window.as_ref().filter(|_| window_open.get()) {
+            Some(window) => {
+                window_hook("window-close", &window.close, url, config)?;
+                window_open.set(false);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    };
     let result = (|| -> Result<Option<Report>> {
         let config_path = write_config(entry, repo, configs, parallel)?;
         let config = read_config(&config_path)?;
@@ -907,8 +953,20 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         };
         let api_key = std::env::var("CUTEAFD_API_KEY").ok();
         let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
-        let run_sweep = || crate::sweep::run(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-            entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]));
+        let run_sweep = || -> Result<crate::sweep::Sweep> {
+            let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
+                Box::new(|| {
+                    window_open.set(true);
+                    window_hook("window-open", &window.open, &url, &config_path)
+                })
+            });
+            let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), open);
+            let closed = close_window(&url, &config_path);
+            let sweep = sweep?;
+            closed?;
+            Ok(sweep)
+        };
         if sweeping && panels.as_ref().is_some_and(Vec::is_empty) {
             let sweep = run_sweep()?;
             let dir = out_root.join("sweep-only").join(&entry.name);
@@ -943,6 +1001,17 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         Ok(Some(report))
     })();
+    // A window still open (its close failed, or the sweep stopped between the
+    // two) gets one more close while the server is still up.
+    if launcher_started && window_open.get() {
+        if let Ok(config_path) = write_config(entry, repo, configs, parallel) {
+            let url = format!("http://127.0.0.1:{}", read_config(&config_path).map(|c| entry.port(&c)).unwrap_or(8000));
+            if let Err(error) = close_window(&url, &config_path) {
+                let _ = writeln!(log, "warning: window close before teardown failed: {error:#}");
+            }
+        }
+    }
+    hook_results.extend(window_results.into_inner());
     if let Some(mut child) = observer.take() {
         let observed = child.finish();
         hook_results.insert("observer".into(), observed.as_ref().map(|_| "pass".into())
@@ -1076,6 +1145,21 @@ mod tests {
         let override_hook = Hook { argv: vec!["false".into()], ..merged.prelaunch.clone().unwrap() };
         let override_entry = Entry { prelaunch: Some(override_hook.clone()), ..original };
         assert_eq!(override_entry.merged(&defaults).prelaunch, Some(override_hook));
+    }
+
+    #[test]
+    fn window_merges_round_trips_and_absent_keeps_legacy_shape() {
+        let hook = |cmd: &str| Hook { argv: vec![cmd.into()], timeout_s: 60, required: true, cleanup: None, finish_timeout_s: None };
+        let window = Window { open: hook("open"), close: hook("close") };
+        let defaults = Entry { window: Some(window.clone()), ..Entry::default() };
+        let merged = Entry { name: "a".into(), ..Entry::default() }.merged(&defaults);
+        assert_eq!(merged.window, Some(window.clone()));
+        let value = serde_json::to_value(&merged).unwrap();
+        assert_eq!(value["window"]["open"]["argv"][0], "open");
+        let back: Entry = serde_json::from_value(value).unwrap();
+        assert_eq!(back.window, Some(window));
+        assert_ne!(back.key(), Entry { name: "a".into(), ..Entry::default() }.key());
+        assert!(serde_json::to_value(Entry::default()).unwrap().get("window").is_none());
     }
 
     #[test]

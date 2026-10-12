@@ -71,12 +71,22 @@ pub fn parse_levels(text: &str) -> Result<Vec<usize>, String> {
     Ok(levels)
 }
 
-fn measure(client: &Client, c: usize, phase: &str) -> Result<Point> {
+/// Called once, just before the sweep's first timed request (after its first
+/// untimed warm-up): `cuteafd bench smoke` opens an entry's measurement window
+/// (e.g. a profiler's capture range) there.
+pub type OnTimed<'a> = Option<Box<dyn FnOnce() -> Result<()> + 'a>>;
+
+fn timed(on_timed: &mut OnTimed) -> Result<()> {
+    on_timed.take().map_or(Ok(()), |open| open())
+}
+
+fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Result<Point> {
     let batch = || -> Vec<Result<Timed>> {
         wave(client, (0..c).map(|_| plain(&format!("[{}] {}", nonce(), CONTENT[0].1), TOKENS)).collect())
     };
     // Prime each width first: graphs, workspaces and mapped tables.
     batch().into_iter().collect::<Result<Vec<_>>>().with_context(|| format!("C{c} warm-up"))?;
+    timed(on_timed)?;
     let results = batch();
     let errors = results.iter().filter(|r| r.is_err()).count();
     let ok: Vec<Timed> = results.into_iter().filter_map(Result::ok).collect();
@@ -92,7 +102,7 @@ fn measure(client: &Client, c: usize, phase: &str) -> Result<Point> {
 /// Cold prefill at each length: fit tokens per filler word from two short
 /// requests, then per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens).
-fn prefill(client: &Client, lengths: &[u64], max_context: u64) -> Result<Vec<PrefillPoint>> {
+fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut OnTimed) -> Result<Vec<PrefillPoint>> {
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
         client.chat(plain(&format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
     };
@@ -105,6 +115,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64) -> Result<Vec<Pre
         let target = length.min(max_context.saturating_sub(64)) as f64;
         let words = ((target - intercept) / slope).max(64.0) as usize;
         ask(words, 200 + length).with_context(|| format!("{length}-token prefill warm-up"))?;
+        timed(on_timed)?;
         let chat = ask(words, 300 + length).with_context(|| format!("{length}-token prefill"))?;
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
@@ -126,19 +137,25 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64]) -> Result<Sweep> {
+    run_windowed(url, api_key, levels, post_load_c1, prefill_lengths, None)
+}
+
+/// [`run`], calling `on_timed` once just before the first timed request.
+pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64],
+    mut on_timed: OnTimed) -> Result<Sweep> {
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
     let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
     let record = client.discover().context("sweep: /v1/models")?;
     let mut sweep = Sweep::default();
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
-        sweep.prefill = prefill(&client, prefill_lengths, max_context)?;
+        sweep.prefill = prefill(&client, prefill_lengths, max_context, &mut on_timed)?;
     }
     for &c in levels {
-        sweep.points.push(measure(&client, c, "levels")?);
+        sweep.points.push(measure(&client, c, "levels", &mut on_timed)?);
     }
     if post_load_c1 {
-        sweep.points.push(measure(&client, 1, "post_load")?);
+        sweep.points.push(measure(&client, 1, "post_load", &mut on_timed)?);
     }
     Ok(sweep)
 }
@@ -162,6 +179,18 @@ mod tests {
         for bad in ["", "100", "x", "2000000"] {
             assert!(parse_lengths(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn on_timed_fires_once() {
+        let count = std::cell::Cell::new(0);
+        let mut hook: OnTimed = Some(Box::new(|| { count.set(count.get() + 1); Ok(()) }));
+        timed(&mut hook).unwrap();
+        timed(&mut hook).unwrap();
+        assert_eq!(count.get(), 1);
+        let mut failing: OnTimed = Some(Box::new(|| anyhow::bail!("refused")));
+        assert!(timed(&mut failing).is_err());
+        timed(&mut None).unwrap();
     }
 
     #[test]

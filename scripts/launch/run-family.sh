@@ -1382,10 +1382,39 @@ esac
 # GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
 gateway="$(get GATEWAY "")"
 case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo "GATEWAY must be on or off" >&2; exit 2 ;; esac
-# PROFILE / PROFILE_DIR: one profiling switch for the coordinator and every worker
-# (release_profile_docker_args in release-common.sh).
+# PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
+# every family (and on run.sh's V4.1 path), through release-common.sh:
+#   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
+#   transport-timing  CUTEAFD_PROTOCOL_V2_TCP_TIMING=1 (expert exchange timing)
+#   expert-timing     CUTEAFD_EXPERT_TIMING=1 (Spark worker expert compute timing)
+#   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
+#   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
+#                     graph nodes; no CPU sampling), collection paused until
+#                     `docker exec COORDINATOR nsys start --session=cuteafd-profile`
+#                     and written by `... nsys stop --session=cuteafd-profile` (or a
+#                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
+#                     wip-cards opens the window after the sweep's first warm wave and
+#                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
+#   ncu               the coordinator runs under `ncu`, replaying the first
+#                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
+#                     required regex PROFILE_NCU_KERNEL, collecting section set
+#                     PROFILE_NCU_SET (default full), into PROFILE_DIR/ncu-HOST.ncu-rep,
+#                     written when the coordinator stops (`docker stop`). There is
+#                     no window: the first matches are usually during readiness.
+#                     For steady-state kernels, use the native harnesses.
+# nsys and ncu wrap the coordinator only (one of them per launch); Spark workers
+# get the other switches. Both run as the host user; they need the driver's
+# RmProfilingAdminOnly=0 and no extra capabilities.
+# Every profiled container also gets CUTEAFD_PROFILE_HOST (the physical host,
+# never the container id). PROFILE_DIR=/abs/dir is created on each host, mounted
+# at the same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host
+# and rank. wip-cards owns PROFILE_DIR and copies Spark files back.
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
+release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
+  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)"
+profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
+profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 [[ -z "$(get PROFILE_DIR)" ]] || { mkdir -p "$(get PROFILE_DIR)"; release_require_writable_state "$(get PROFILE_DIR)"; }
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
@@ -1417,7 +1446,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY "$default_concurrency")" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
