@@ -303,6 +303,71 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
 }
 
 #[test]
+fn glm5_attention_auto_requires_complete_context_programs() {
+    use crate::placement::{families::glm5 as glm, AttentionPlacement};
+    let config = glm5_config();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&config).unwrap();
+    let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let mut names = Vec::new();
+    for (capacity, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+        for prefix in ["glm", "glm2"] {
+            let divisor = if prefix == "glm2" { 2 } else { 1 };
+            names.extend([format!("{prefix}_producer_{capacity}"),
+                format!("{prefix}_sparse_mla_{mode}_{capacity}"), format!("{prefix}_o_{capacity}"),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.moe_intermediate / divisor),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.dense_intermediate / divisor)]);
+        }
+        names.extend([format!("glm_index_producer_{capacity}"), format!("glm_index_topk_{mode}_{capacity}")]);
+    }
+    names.extend(glm::CONTEXT_PROGRAMS.map(str::to_string));
+    names.extend(["glm_sparse_mla_partial_h0_s1_m64", "glm_sparse_mla_partial_h32_s1_m64"].map(str::to_string));
+    let path = dir.path().join("PROGRAMS.json");
+    // Both partials and every primitive are required; no manifest must also stay heads.
+    let missing = std::iter::once(None).chain(names.iter().filter(|name|
+        glm::CONTEXT_PROGRAMS.contains(&name.as_str()) || name.starts_with("glm_sparse_mla_partial_"))
+        .map(|name| Some(name.as_str()))).chain([Some("no-manifest")]);
+    for omitted in missing {
+        let programs: Vec<_> = names.iter().filter(|name| omitted != Some(name.as_str()))
+            .map(|name| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 4096}})).collect();
+        let manifest = json!({"capacities": {"max_context": 65536}, "programs": programs});
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        for gpus in [1, 2] {
+            let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                context_tokens: 65536, pool_tokens: Some(65536), glm5_drafter_disabled: true,
+                workspace_manifest: Some(if omitted == Some("no-manifest") { dir.path().join("absent.json") }
+                    else { path.clone() }), ..Default::default()
+            }), ..sparks(4) };
+            let expected = if gpus == 2 && omitted.is_none() { AttentionPlacement::Context }
+                else { AttentionPlacement::Heads };
+            let auto = plan(dir.path(), &options).unwrap();
+            assert!(auto.executable(), "omitted {omitted:?}: {}", render(&auto));
+            assert_eq!(auto.attention_placement, expected, "omitted {omitted:?}, gpus {gpus}");
+            let explicit = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(expected), ..options.clone()
+            }).unwrap();
+            assert_eq!(auto.memory_layout, explicit.memory_layout);
+            assert_eq!(auto.placement_supported, explicit.placement_supported);
+            let context = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(AttentionPlacement::Context), ..options
+            }).unwrap();
+            if expected == AttentionPlacement::Context {
+                assert!(context.executable(), "{}", render(&context));
+            } else {
+                assert!(!context.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&context));
+                if gpus == 2 {
+                    assert!(!context.placement_supported);
+                    assert!(context.memory_layout.unwrap().notes.iter().any(|note|
+                        note.contains("cannot run layer 0 as ContextSplit")));
+                } else {
+                    assert!(context.config_error.unwrap().contains("context"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn malformed_trellis_and_scales_name_the_tensor() {
     let exl3 = |trellis: (&'static str, &'static [usize]), suh: &'static [usize], mcg: &'static [usize]| {
         detect_group("p", &[("trellis", trellis.0, trellis.1), ("suh", "F16", suh), ("svh", "F16", &[32]),
@@ -2684,21 +2749,33 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
 fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_plan_time() {
     use crate::placement::AttentionPlacement;
     let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[]),
-        snapshot(glm5_config(), &[]), snapshot(glm5_flash_config(45), &[]),
+        snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None))),
+        snapshot(glm5_flash_config(45), &[]),
         snapshot(mimo_flash_config(), &mimo_flash_tensors()), snapshot(mimo_pro_config(), &mimo_pro_tensors())];
     for dir in snapshots {
         for gpus in [1, 2] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions {
-                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus], ..Default::default()
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                workspace_manifest: Some(dir.path().join("absent.json")), glm5_drafter_disabled: true,
+                ..Default::default()
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
+            // This fixture has no context programs; GLM's build-specific default is heads.
+            let default = if gpus == 1 || auto.family.as_deref() == Some("glm5") {
+                AttentionPlacement::Heads
+            } else { executor.attention };
+            assert_eq!(auto.attention_placement, default);
+            if auto.family.as_deref() == Some("glm5") {
+                assert!(auto.memory_layout.is_some(), "{}", render(&auto));
+                assert!(auto.placement_supported, "{}", render(&auto));
+            }
             let explicit_default = plan(dir.path(), &PlanOptions {
-                attention_placement: Some(if gpus == 1 { AttentionPlacement::Heads } else { executor.attention }),
-                ..options.clone()
+                attention_placement: Some(default), ..options.clone()
             }).unwrap();
             assert_eq!(auto.memory_layout, explicit_default.memory_layout);
             assert_eq!(auto.config_error, explicit_default.config_error);
+            assert_eq!(auto.placement_supported, explicit_default.placement_supported);
             for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
                 let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
                 if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
