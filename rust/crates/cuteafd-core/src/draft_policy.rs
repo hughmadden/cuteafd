@@ -365,6 +365,7 @@ impl<const D: usize> Estimator<D> {
             }
             let Some(projection) = solve_linear(a, b) else { continue; };
             let explained: f64 = projection.iter().zip(b).map(|(x, y)| x * y).sum();
+            // At least 1% independent energy bounds variance inflation to100.
             identified[column] = 1. - explained >= 0.01;
         }
         identified
@@ -2139,11 +2140,6 @@ mod tests {
                 }
                 let requests: Vec<(u64, usize)> = live.iter()
                     .map(|r| (r.0, 1 + mix.below(wide as u64) as usize)).collect();
-                if scenario == 0 && round == 22 && std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP").is_some() {
-                    eprintln!("first changed round masks {:?}; {:?}",
-                        policy.cost.layer[policy.regime(shared)].iter().map(|e| e.identified).collect::<Vec<_>>(),
-                        policy.cost_snapshot(shared, requests.len()));
-                }
                 let width = policy.choose_width(shared, &requests);
                 transcript.word("width", width as u64);
                 let confidence: Vec<Vec<f64>> = requests.iter().zip(&live).map(|(&(_, available), r)|
@@ -2152,22 +2148,6 @@ mod tests {
                 let candidates: Vec<_> = live.iter().zip(&confidence)
                     .map(|(r, c)| DraftCandidate { id: r.0, confidence: c }).collect();
                 let ids: Vec<u64> = live.iter().map(|r| r.0).collect();
-                if scenario == 0 && round == 22 && std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP").is_some() {
-                    let mut constrained = policy.clone();
-                    let mut free = policy.clone();
-                    let regime = free.regime(shared);
-                    for e in &mut free.cost.layer[regime] {
-                        e.identified.fill(true);
-                        e.solve_with_prior([[0.; 3]; 3], e.prior_mean);
-                    }
-                    for e in &mut free.cost.round[regime] {
-                        e.identified.fill(true);
-                        e.solve_with_prior([[0.; 3]; 3], e.prior_mean);
-                    }
-                    eprintln!("same-state masked {:?}; unmasked {:?}",
-                        constrained.select(shared, &candidates, width).unwrap(),
-                        free.select(shared, &candidates, width).unwrap());
-                }
                 let lengths = match policy.select(shared, &candidates, width).unwrap() {
                     Some(selection) => {
                         for &length in &selection.lengths { transcript.word("length", length as u64); }
@@ -2314,7 +2294,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (39_221, 2_392_699_145_886_554_709));
+        assert_eq!((transcript.records, transcript.hash), (39_498, 8_580_141_267_688_736_751));
     }
 
     fn seed() -> PolicySeed {
