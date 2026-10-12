@@ -122,7 +122,8 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
     identity = shared.split("pub fn trace_identity", 1)[1].split(
         "pub fn terminal_state", 1)[0]
-    assert 'var("CUTEAFD_PEER_WAIT_DIAGNOSTICS")' in identity
+    assert 'if self.ends[0].progress.is_none()' in identity
+    assert 'var("CUTEAFD_PEER_WAIT_DIAGNOSTICS")' in shared
     for field in ["device =", "stream =", "flag_index =", "receive_state =", "abort ="]:
         assert field in identity
     assert "synchronize(" not in identity
@@ -135,15 +136,53 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
         family / "remote_dflash.rs").read_text()
 
 
-def test_remote_context_wave_drains_after_acknowledgement_before_next_target_chunk():
+def test_peer_diagnostics_keep_graph_identity_and_dump_both_rank_frontiers(tmp_path):
+    native = (ROOT / "native/shared/cuda/peer_exchange.cu").read_text()
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/peer_exchange.rs").read_text()
+    assert "template<bool Diagnostic = false>" in native
+    for kernel in ["push_signal", "push_planes", "wait_flag_abortable"]:
+        assert f"reinterpret_cast<const void*>({kernel}<true>)" in native
+        assert f"{kernel}<false><<<" in native
+    dump = native.split("__device__ void diagnostic_dump", 1)[1].split(
+        "__device__ void diagnostic_push_enter", 1)[0]
+    for field in ["d.peer_control", "d.local_control", "d.peer", "d.local",
+                  "push_issue=%llu", "wait_issue=%llu", "published=%u", "observed=%u"]:
+        assert field in dump
+    issue = shared.split("fn diagnostic(&self", 1)[1].split("pub fn terminal_state", 1)[0]
+    assert "PEER_ISSUE.fetch_add" in issue
+    assert 'seq = "device-runtime"' in issue
+    assert '"peer host issue begin"' in issue
+    assert '"peer host issue returned"' in issue
+    assert "copy_d2h" not in issue and "synchronize(" not in issue
+    for symbol in ["peer_push_signal_diagnostic", "peer_push_planes_diagnostic", "peer_wait_diagnostic"]:
+        assert symbol in shared and symbol in ffi
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    source = tmp_path / "peer-abi.cc"
+    source.write_text('''#include "cuteafd_peer_exchange.h"
+#include <cstddef>
+static_assert(sizeof(cuteafd_peer_progress_t) == 48);
+static_assert(offsetof(cuteafd_peer_progress_t, published) == 24);
+static_assert(offsetof(cuteafd_peer_diagnostic_t, issue) == 32);
+static_assert(offsetof(cuteafd_peer_diagnostic_t, rank) == 48);
+static_assert(sizeof(cuteafd_peer_diagnostic_t) == 64);
+''')
+    result = subprocess.run([compiler, "-std=c++17", "-I", str(ROOT / "native/shared/include"),
+                             "-fsyntax-only", str(source)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_remote_context_wave_keeps_baseline_order_for_diagnostic_reproduction():
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
     remote = (family / "remote_dflash.rs").read_text()
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
-    assert update.count("self.synchronize()?") == 2
+    assert update.count("self.synchronize()?") == 1
     ack = update.index("self.exchange.signal(1, TAPS)?")
-    assert ack < update.rindex("self.synchronize()?") < update.rindex("Ok(())")
-    # Per-chunk updates stay in place; retirement cannot defer ring writes
-    # until turn end or drop an intermediate context wave.
+    assert update.index("self.synchronize()?") < ack < update.rindex("Ok(())")
+    # Preserve each intermediate context wave; the failed end-update retirement
+    # is not part of the baseline-order diagnostic experiment.
     bench = (family / "speculate.rs").read_text().split(
         "draft_prefill_bench(args, &golden", 1)[1].split("fn draft_prefill_bench", 1)[0]
     assert bench.index("engine.prefill_device(") < bench.index("drafter.update(")

@@ -52,6 +52,43 @@ int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t co
 // the stream faults instead of hanging.
 int32_t cuteafd_peer_wait(const uint32_t* flag, uint32_t* recv_state, void* stream);
 
+// Opt-in peer issue diagnostics. Records belong to the exchange, one per
+// rank/slot, zeroed and retained through every captured replay. A host issue
+// identity is immutable in a graph; it is NOT the runtime device sequence.
+// Watchdog dumps are concurrent snapshots, not an atomic view of both ranks.
+typedef struct cuteafd_peer_progress {
+  uint64_t push_issue;
+  uint64_t published_issue;
+  uint64_t wait_issue;
+  uint32_t published;
+  uint32_t observed;
+  uint32_t expected;
+  uint32_t push_phase;  // 1 entered, 2 published
+  uint32_t wait_phase;  // 3 waiting, 4 received, 5 aborted
+  uint32_t reserved;
+} cuteafd_peer_progress_t;
+typedef struct cuteafd_peer_diagnostic {
+  cuteafd_peer_progress_t* local;
+  const cuteafd_peer_progress_t* peer;
+  const uint32_t* local_control;
+  const uint32_t* peer_control;
+  uint64_t issue;
+  uint64_t host_stream;
+  uint32_t rank;
+  uint32_t slot;
+  uint32_t slots;
+} cuteafd_peer_diagnostic_t;
+int32_t cuteafd_peer_diagnostic_initialize(void);
+int32_t cuteafd_peer_push_signal_diagnostic(void* destination, const void* source, uint64_t bytes,
+    uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream,
+    const cuteafd_peer_diagnostic_t* diagnostic);
+int32_t cuteafd_peer_push_planes_diagnostic(const cuteafd_peer_plane_t* planes, uint32_t count,
+    uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream,
+    const cuteafd_peer_diagnostic_t* diagnostic);
+// Null aborted selects the legacy (non-abortable) wait semantics.
+int32_t cuteafd_peer_wait_diagnostic(const uint32_t* flag, uint32_t* recv_state,
+    const uint32_t* aborted, void* stream, const cuteafd_peer_diagnostic_t* diagnostic);
+
 // Host proxy mailbox (the device-driven Spark exchange): on the stream, after
 // its earlier work (D2H copies into the pinned mailbox), write the four
 // `words` to `descriptor` and publish the next sequence to `flag` (both

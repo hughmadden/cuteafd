@@ -17,6 +17,49 @@ pub struct PeerPlane {
     pub source_pitch: u64,
 }
 
+/// Device progress record, layout-compatible with `cuteafd_peer_progress_t`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerProgress {
+    pub push_issue: u64,
+    pub published_issue: u64,
+    pub wait_issue: u64,
+    pub published: u32,
+    pub observed: u32,
+    pub expected: u32,
+    pub push_phase: u32,
+    pub wait_phase: u32,
+    pub reserved: u32,
+}
+
+/// Graph-stable identity and persistent exchange pointers for opt-in diagnostics.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PeerDiagnostic {
+    pub local: *mut PeerProgress,
+    pub peer: *const PeerProgress,
+    pub local_control: *const u32,
+    pub peer_control: *const u32,
+    pub issue: u64,
+    pub host_stream: u64,
+    pub rank: u32,
+    pub slot: u32,
+    pub slots: u32,
+}
+
+#[cfg(test)]
+mod diagnostic_abi_tests {
+    #[test]
+    fn diagnostic_layout_matches_native_header() {
+        use super::{PeerDiagnostic, PeerProgress};
+        assert_eq!(std::mem::size_of::<PeerProgress>(), 48);
+        assert_eq!(std::mem::offset_of!(PeerProgress, published), 24);
+        assert_eq!(std::mem::size_of::<PeerDiagnostic>(), 64);
+        assert_eq!(std::mem::offset_of!(PeerDiagnostic, issue), 32);
+        assert_eq!(std::mem::offset_of!(PeerDiagnostic, rank), 48);
+    }
+}
+
 /// `CUTEAFD_PEER_MAX_PLANES`.
 pub const PEER_MAX_PLANES: usize = 4;
 
@@ -69,6 +112,58 @@ impl P2pTest {
 }
 
 impl NativeLibrary {
+    /// Preload diagnostic variants before an exchange can enqueue any wait.
+    pub fn peer_diagnostic_initialize(&self) -> Result<()> {
+        type F = unsafe extern "C" fn() -> i32;
+        // SAFETY: preload only, no pointers or queued GPU work.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_diagnostic_initialize")?() };
+        ensure!(status == 0, "loading peer diagnostics failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// # Safety
+    /// As `peer_push_signal`; diagnostic controls/progress on both ranks must
+    /// remain allocated and peer-accessible until every eager/captured use drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn peer_push_signal_diagnostic(&self, destination: *mut c_void, source: *const c_void,
+        bytes: usize, flag: *mut u32, send_state: *mut u32, blocks: u32, stream: *mut c_void,
+        diagnostic: &PeerDiagnostic) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, *const c_void, u64, *mut u32, *mut u32, u32,
+            *mut c_void, *const PeerDiagnostic) -> i32;
+        // SAFETY: caller retains all device owners; native copies the descriptor into kernel arguments.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_push_signal_diagnostic")?(
+            destination, source, bytes as u64, flag, send_state, blocks, stream, diagnostic) };
+        ensure!(status == 0, "diagnostic peer push failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// # Safety
+    /// As `peer_push_planes` and `peer_push_signal_diagnostic`.
+    pub unsafe fn peer_push_planes_diagnostic(&self, planes: &[PeerPlane], flag: *mut u32,
+        send_state: *mut u32, blocks: u32, stream: *mut c_void, diagnostic: &PeerDiagnostic) -> Result<()> {
+        type F = unsafe extern "C" fn(*const PeerPlane, u32, *mut u32, *mut u32, u32,
+            *mut c_void, *const PeerDiagnostic) -> i32;
+        ensure!((1..=PEER_MAX_PLANES).contains(&planes.len()), "{} planes in one push", planes.len());
+        // SAFETY: caller retains plane/device owners; native copies all host descriptors.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_push_planes_diagnostic")?(
+            planes.as_ptr(), planes.len() as u32, flag, send_state, blocks, stream, diagnostic) };
+        ensure!(status == 0, "diagnostic peer planes failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// # Safety
+    /// As `peer_wait_abortable` (null aborted: `peer_wait`), with persistent,
+    /// peer-accessible controls/progress on both ranks through graph drainage.
+    pub unsafe fn peer_wait_diagnostic(&self, flag: *const u32, recv_state: *mut u32,
+        aborted: *const u32, stream: *mut c_void, diagnostic: &PeerDiagnostic) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u32, *mut u32, *const u32, *mut c_void, *const PeerDiagnostic) -> i32;
+        // SAFETY: caller retains words and diagnostic owners; descriptor is copied by native.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_wait_diagnostic")?(
+            flag, recv_state, aborted, stream, diagnostic) };
+        ensure!(status == 0, "diagnostic peer wait failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Optional component-fixture ABI, absent from production libraries.
     /// Streams are only compared by the shim, never dereferenced here.
     #[doc(hidden)]

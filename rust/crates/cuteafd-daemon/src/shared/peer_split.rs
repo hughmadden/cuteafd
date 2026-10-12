@@ -22,9 +22,13 @@ pub(crate) mod context;
 pub(crate) mod attention;
 pub(crate) mod hop;
 pub(crate) mod order;
+use cuteafd_ffi::peer_exchange::{PeerDiagnostic, PeerProgress};
 use cuteafd_ffi::NativeLibrary;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PEER_ISSUE: AtomicU64 = AtomicU64::new(1);
 
 /// Probe both directions before admitting or loading a two-GPU layout. Cards
 /// without peer access (including GeForce) retain the single-device path.
@@ -141,6 +145,7 @@ pub(crate) fn on_device<T>(
 struct End<'a> {
     recv: Vec<DeviceAllocation<'a>>,
     control: DeviceAllocation<'a>,
+    progress: Option<DeviceAllocation<'a>>,
 }
 
 impl End<'_> {
@@ -172,6 +177,8 @@ pub(crate) struct PeerExchange<'a> {
     ranks: [RankDevice; 2],
     ends: [End<'a>; 2],
     abort: Option<TerminalAbort<'a>>,
+    trace_name: Cell<&'static str>,
+    host_ordinals: RefCell<Vec<[[u64; 2]; 2]>>,
 }
 
 impl<'a> PeerExchange<'a> {
@@ -189,6 +196,7 @@ impl<'a> PeerExchange<'a> {
             ranks[0].device != ranks[1].device && slots > 0 && slot_bytes % 16 == 0,
             "a head split exchanges between two GPUs in 16-byte rows"
         );
+        let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, ranks[0].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
@@ -200,6 +208,7 @@ impl<'a> PeerExchange<'a> {
                     elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                     "TP2 native kernels loaded before peer waits");
                 library.peer_exchange_initialize()?;
+                if diagnostics { library.peer_diagnostic_initialize()?; }
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
                     let allocation = DeviceAllocation::new(library, bytes.max(256))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -210,6 +219,7 @@ impl<'a> PeerExchange<'a> {
                         .map(|_| zeroed(slot_bytes))
                         .collect::<Result<_>>()?,
                     control: zeroed((slots + 1) * 16)?,
+                    progress: if diagnostics { Some(zeroed((slots + 1) * std::mem::size_of::<PeerProgress>())?) } else { None },
                 })
             })
         };
@@ -218,6 +228,8 @@ impl<'a> PeerExchange<'a> {
             ranks,
             ends: [end(0)?, end(1)?],
             abort: None,
+            trace_name: Cell::new("unnamed"),
+            host_ordinals: RefCell::new(if diagnostics { vec![[[0; 2]; 2]; slots + 1] } else { Vec::new() }),
         })
     }
 
@@ -262,7 +274,8 @@ impl<'a> PeerExchange<'a> {
     /// Startup-only pointer map for failure-only CUDA watchdog messages. Do
     /// not download control words or add synchronization to the exchange path.
     pub fn trace_identity(&self, name: &'static str) {
-        if !std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1") { return }
+        self.trace_name.set(name);
+        if self.ends[0].progress.is_none() { return }
         for rank in 0..2 {
             let end = &self.ends[rank];
             for flag in 0..=end.recv.len() {
@@ -273,6 +286,38 @@ impl<'a> PeerExchange<'a> {
                     send_state = ?end.send_state(flag), receive_state = ?end.recv_state(flag),
                     abort = ?abort, "peer wait watchdog pointer map");
             }
+        }
+    }
+
+    fn diagnostic(&self, rank: usize, slot: usize, operation: &'static str) -> Option<PeerDiagnostic> {
+        let local = self.ends[rank].progress.as_ref()?;
+        let peer = self.ends[1 - rank].progress.as_ref()?;
+        let issue = PEER_ISSUE.fetch_add(1, Ordering::Relaxed);
+        let op = usize::from(operation == "wait");
+        let ordinal = {
+            let mut ordinals = self.host_ordinals.borrow_mut();
+            ordinals[slot][rank][op] += 1;
+            ordinals[slot][rank][op]
+        };
+        // Graph replay retains issue/ordinal, but advances the actual device
+        // sequence. Never label this host ordinal as a publication sequence.
+        tracing::info!(exchange = self.trace_name.get(), plane = ?self.ends[0].control.buffer.ptr,
+            rank, slot, operation, issue, host_ordinal = ordinal, seq = "device-runtime",
+            stream = ?self.stream(rank), "peer host issue begin");
+        Some(PeerDiagnostic {
+            local: local.buffer.ptr.cast(), peer: peer.buffer.ptr.cast(),
+            local_control: self.ends[rank].control.buffer.ptr.cast(),
+            peer_control: self.ends[1 - rank].control.buffer.ptr.cast(),
+            issue, host_stream: self.stream(rank) as usize as u64,
+            rank: rank as u32, slot: slot as u32, slots: (self.ends[rank].recv.len() + 1) as u32,
+        })
+    }
+
+    fn diagnostic_return(&self, diagnostic: Option<PeerDiagnostic>, result: &Result<()>) {
+        if let Some(d) = diagnostic {
+            tracing::info!(exchange = self.trace_name.get(), issue = d.issue,
+                rank = d.rank, slot = d.slot, stream = d.host_stream,
+                ok = result.is_ok(), "peer host issue returned");
         }
     }
 
@@ -482,10 +527,15 @@ impl<'a> PeerExchange<'a> {
         let flag = self.flag_index(slot)?;
         tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
+        let diagnostic = self.diagnostic(from, flag, "push");
         // SAFETY: peer access is enabled both ways (new); the source rows are final on
         // this stream and untouched until later work on it; the destination is a live
         // buffer of the other GPU that it reads only after its matching wait.
-        self.on(from, || unsafe {
+        let result = self.on(from, || unsafe {
+            if let Some(d) = &diagnostic {
+                return self.library.peer_push_signal_diagnostic(destination, source, bytes,
+                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
+            }
             self.library.peer_push_signal(
                 destination,
                 source,
@@ -495,7 +545,9 @@ impl<'a> PeerExchange<'a> {
                 0,
                 self.ranks[from].stream,
             )
-        })
+        });
+        self.diagnostic_return(diagnostic, &result);
+        result
     }
 
     /// Push strided planes on the source rank's stream, then publish one
@@ -506,12 +558,19 @@ impl<'a> PeerExchange<'a> {
         ensure!(from < 2, "peer plane source rank {from}");
         let flag = self.flag_index(slot)?;
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
+        let diagnostic = self.diagnostic(from, flag, "push_planes");
         // SAFETY: callers keep every plane live and immutable through the
         // source stream's copy; the destination reads only after its wait.
-        self.on(from, || unsafe {
+        let result = self.on(from, || unsafe {
+            if let Some(d) = &diagnostic {
+                return self.library.peer_push_planes_diagnostic(planes,
+                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
+            }
             self.library.peer_push_planes(planes,
                 Some((theirs.flag(flag), mine.send_state(flag))), 0, self.stream(from))
-        })
+        });
+        self.diagnostic_return(diagnostic, &result);
+        result
     }
 
     /// Publish completion of earlier work without copying payload bytes. This
@@ -546,9 +605,16 @@ impl<'a> PeerExchange<'a> {
         let flag = self.flag_index(slot)?;
         tracing::trace!(at, flag, "peer wait");
         let end = &self.ends[at];
+        let diagnostic = self.diagnostic(at, flag, "wait");
         // SAFETY: the flag and state are this GPU's control words; every wait is matched by a
         // push the host queues before it waits on either stream.
-        self.on(at, || unsafe {
+        let result = self.on(at, || unsafe {
+            if let Some(d) = &diagnostic {
+                let aborted = self.abort.as_ref().map_or(std::ptr::null(),
+                    |a| a.sides[at].word.buffer.ptr.cast_const().cast());
+                return self.library.peer_wait_diagnostic(end.flag(flag), end.recv_state(flag),
+                    aborted, self.stream(at), d);
+            }
             match &self.abort {
                 Some(abort) => self.library.peer_wait_abortable(
                     end.flag(flag),
@@ -562,7 +628,9 @@ impl<'a> PeerExchange<'a> {
                     self.ranks[at].stream,
                 ),
             }
-        })
+        });
+        self.diagnostic_return(diagnostic, &result);
+        result
     }
 }
 
