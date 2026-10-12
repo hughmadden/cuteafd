@@ -867,6 +867,20 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--decode-rows 128) ;;
     *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_DECODE_ROW_BUCKETS: on pads every speculative step past 16 rows to a row bucket (4-row
+  # steps to 64, 8-row steps to 128), so lazily captured decode graphs (GLM5_FLASH_GRAPH_BUDGET_MIB)
+  # hold a few row shapes. Startup graphs keep their own buckets. One GPU; off by default.
+  row_buckets="$(get GLM5_FLASH_DECODE_ROW_BUCKETS off)"
+  case "$row_buckets" in
+    ""|off) ;;
+    on)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_DECODE_ROW_BUCKETS=on pads one GPU's decode steps; serve it without a head split" >&2
+        exit 2
+      fi
+      family_args+=(--decode-row-buckets) ;;
+    *) echo "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off" >&2; exit 2 ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

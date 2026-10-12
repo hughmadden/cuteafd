@@ -109,6 +109,16 @@ pub(crate) struct EngineArgs {
     /// experts, or a coordinator GPU budget), where the step workspaces precede the KV pool.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
     pub replay_records: engine::ReplayRecords,
+    /// With lazily captured decode graphs (--graph-budget-mib), run each speculative decode or verify
+    /// step past 16 rows padded to a row bucket: whole steps of 4 rows to 64 and of 8 to 128, never
+    /// past the verify budget (127 rows on an RTX 5090 with --decode-rows 128, where 121-127 rows
+    /// run as 127). The graphs then hold 13 row shapes from 16 to 64 rows instead of 49, and 21 to
+    /// 128 instead of 113. The padded rows are masked (no KV, index or KDA state writes) and stay out
+    /// of the router and off the expert wire, as the startup graphs' are; a real row computes the
+    /// same bits padded or not (`glmf-golden --padding-check`). Steps of up to 16 rows and plain steps
+    /// keep their rows, and startup graphs keep their own buckets. One GPU.
+    #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROW_BUCKETS", default_value_t = false)]
+    pub decode_row_buckets: bool,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -438,6 +448,17 @@ mod draft_cli_tests {
         }
         assert!(check_options(&parse(&["--fp8-prefill", "none,mla"])).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
+    }
+
+    /// `--decode-row-buckets` pads one GPU's speculative steps, off by default.
+    #[test]
+    fn decode_row_buckets_are_opt_in_on_one_gpu() {
+        assert!(!parse(&[]).decode_row_buckets);
+        assert!(parse(&["--decode-row-buckets"]).decode_row_buckets);
+        check_options(&parse(&["--decode-row-buckets"])).unwrap();
+        check_options(&parse(&["--decode-row-buckets", "--decode-rows", "128", "--graph-budget-mib", "512"])).unwrap();
+        let error = check_options(&parse(&["--decode-row-buckets", "--split-device", "1"])).unwrap_err().to_string();
+        assert!(error.contains("--decode-row-buckets") && error.contains("--split-device"), "{error}");
     }
 
     /// `--replay-records shared` keeps the records in one GPU's prefill scratch.
@@ -1061,6 +1082,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
         "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
         --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(!args.decode_row_buckets || args.split_device.is_none(),
+        "--decode-row-buckets pads one GPU's decode steps: it takes no --split-device");
     ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
         "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
@@ -1593,7 +1616,7 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records)?;
+            args.kda_state, args.decode_rows, records, args.decode_row_buckets)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();
         }
