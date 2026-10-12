@@ -1030,13 +1030,17 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let copy_agreement = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
             d.as_ref().map_or(0, |d| crate::shared::draft::copy::agreement(&a.history, &d.tokens)))
             .collect::<Vec<_>>());
-        let extensions: Vec<_> = active.iter().zip(&drafted).zip(&limits).map(|((a, d), &limit)|
-            d.as_ref().map_or(Vec::new(), |d| crate::shared::draft::copy::extension(
-                &a.history, &d.tokens, limit, a.job.sampling.is_greedy()))).collect();
+        let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)|
+            crate::shared::draft::copy::trace_window(&a.history,
+                d.as_ref().map_or(0, |d| d.tokens.len() + crate::shared::draft::copy::COPY_EXTENSION)))
+            .collect::<Vec<_>>());
         let mut priors = priors;
-        for (prior, extension) in priors.iter_mut().zip(&extensions) {
-            if !prior.is_empty() { prior.extend(std::iter::repeat_n(resource::TAIL_PRIOR, extension.len())); }
-        }
+        let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
+            .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
+                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(shared,
+                    a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
+                _ => None,
+            }).collect();
         let mut predicted = None;
         let mut planned = if let Some(fixed) = policy.fixed {
             drafted.iter().zip(&limits).map(|(d, &limit)| d.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect()
@@ -1049,8 +1053,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         } else { vec![0; active.len()] };
         if resource::trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
         let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
-            let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
-            let mut rows: Vec<u32> = std::iter::once(a.next).chain(full.iter().chain(&extensions[i]).take(planned[i]).copied()).collect();
+            let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
+                .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
+            let mut rows: Vec<u32> = std::iter::once(a.next).chain(full.iter().take(planned[i]).copied()).collect();
             if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
             Ok(rows)
         }).collect::<Result<_>>()?;
@@ -1151,7 +1156,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             verified[i] = (rows.len(), committed, censor);
             request.counts[1] += proposed;
             request.counts[2] += accepted;
-            let neural = proposed.min(drafted[i].as_ref().map_or(0, |d| d.tokens.len()));
+            let neural = proposed.min(copies[i].as_ref().map_or_else(
+                || drafted[i].as_ref().map_or(0, |d| d.tokens.len()), |c| c.neural));
             request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
             finished
         }).collect();
@@ -1184,7 +1190,14 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
                 "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
                 "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
+                "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+                "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
+                "copy_windows": copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                    serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
+                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
                 "copy_agreement": copy_agreement,
+                "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
+                "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
                 "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
             if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
                 tracing::warn!(%error, "MiMo speculation trace write failed");

@@ -1449,18 +1449,20 @@ fn bound_inputs(inputs: &mut [Vec<u32>]) {
     for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length + 1); }
 }
 
-/// Extend the full neural window before grammar and resource-priced truncation.
+/// Preserve the confident neural prefix before grammar and resource-priced truncation.
 fn extend_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, active: &[Option<Active<'_>>],
     members: &[usize], inputs: &mut [Vec<u32>]) -> Result<()> {
     for (&slot, input) in members.iter().zip(inputs) {
         let request = active[slot].as_ref().unwrap();
         let room = (request.job.max_tokens - request.generated).saturating_sub(1)
             .min(input.len() - 1 + crate::shared::draft::copy::COPY_EXTENSION);
-        let extra = crate::shared::draft::copy::extension(&request.tokens, &input[1..], room,
-            request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe));
-        if !extra.is_empty() {
-            draft.extend_confidence(request.id(), input.len() - 1, extra.len())?;
-            input.extend(extra);
+        if input.len() <= 1 { continue; }
+        let Some(calibrated) = draft.calibrated_confidence(request.id(), input.len() - 1)? else { continue; };
+        if let Some(copy) = crate::shared::draft::copy::continuation(&request.tokens, &input[1..], &calibrated,
+            room, request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe)) {
+            draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;
+            input.truncate(1);
+            input.extend(copy.tokens);
         }
     }
     Ok(())

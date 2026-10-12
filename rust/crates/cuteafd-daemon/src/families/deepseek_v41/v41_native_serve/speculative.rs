@@ -478,14 +478,24 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         result
     }
 
+    pub fn calibrated_confidence(&self, id: u64, extent: usize) -> Result<Option<Vec<f64>>> {
+        let Some(policy) = self.policy.as_ref().filter(|_| !self.fixed) else { return Ok(None); };
+        let logits = self.confidence_trace.get(&id).context("missing neural draft confidence")?;
+        ensure!(extent <= logits.len(), "neural confidence extent mismatch");
+        let prior: Vec<_> = logits[..extent].iter().map(|&x| sigmoid(x)).collect();
+        Ok(Some(policy.probabilities(cuteafd_core::DraftCandidate { id, confidence: &prior })))
+    }
+
     /// Copied continuation uses the same raw prior and observation as other families.
     pub fn extend_confidence(&mut self, id: u64, neural: usize, extra: usize) -> Result<()> {
         let confidence = self.confidence_trace.get_mut(&id).context("missing neural draft confidence")?;
         ensure!(neural <= confidence.len(), "neural confidence extent mismatch");
         self.neural_lengths.insert(id, neural);
         confidence.truncate(neural);
-        let p = crate::shared::draft::resource::TAIL_PRIOR;
-        confidence.extend(std::iter::repeat_n((p / (1. - p)).ln() as f32, extra));
+        confidence.extend((0..extra).map(|i| {
+            let p = crate::shared::draft::copy::tail_prior(i);
+            (p / (1. - p)).ln() as f32
+        }));
         Ok(())
     }
 

@@ -18,16 +18,11 @@
 //!
 //! The drafter's probability of a draft is its selector's softmax over the position's 16
 //! candidates (DFlash2: the `best probability` feature, as glm53f-afd's `conf`), or a dSpark
-//! confidence head's predicted acceptance. A copy-window token the drafter also proposed keeps the
-//! drafter's probability; any other copied token counts [`COPY_TOKEN_P`].
+//! confidence head's predicted acceptance. Chain mode verifies only neural proposals.
 
 /// The default chain cut (`--spec-tau`): on GLM-5.3-Flash with DFlash2, 0.5 and 0.7 were equal or
 /// faster than 0.3 on code, prose and counting in glm53f-afd, and 0.7 verifies fewer drafts.
 pub(crate) const DEFAULT_TAU: f64 = 0.7;
-
-/// The likelihood the row budget gives a copied token the drafter did not propose (glm53f-afd's
-/// `copy::TOKEN_P`: the measured 94% for the next token of a copy backed by 8 or more tokens).
-pub(crate) const COPY_TOKEN_P: f32 = 0.94;
 
 /// Which drafts a speculative step verifies (`--verify-policy`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -107,14 +102,6 @@ pub(crate) fn budget(probs: &[Vec<f32>], drafts: &[usize], max_rows: usize) -> V
         }
     }
     out
-}
-
-/// The probabilities of a copy-window proposal: where it matches the drafter's own `drafted`
-/// tokens, the drafter's `probs`; past the first mismatch (or without a draft), [`COPY_TOKEN_P`].
-pub(crate) fn copy_probs(copy: &[u32], drafted: &[u32], probs: &[f32]) -> Vec<f32> {
-    let agree = copy.iter().zip(drafted).take_while(|(c, d)| c == d).count();
-    copy.iter().enumerate().map(|(j, _)| if j < agree { probs.get(j).copied().unwrap_or(COPY_TOKEN_P) } else {
-        COPY_TOKEN_P }).collect()
 }
 
 #[cfg(test)]
@@ -250,11 +237,4 @@ mod tests {
         assert!(narrow.iter().all(|&k| k == 3), "{narrow:?}");
     }
 
-    #[test]
-    fn copied_tokens_keep_the_drafters_probability_where_it_agrees() {
-        let probs = [0.9f32, 0.8, 0.7];
-        assert_eq!(copy_probs(&[5, 6, 7, 8], &[5, 6, 9], &probs), vec![0.9, 0.8, COPY_TOKEN_P, COPY_TOKEN_P]);
-        assert_eq!(copy_probs(&[5, 6], &[], &[]), vec![COPY_TOKEN_P; 2]);
-        assert_eq!(copy_probs(&[], &[1, 2], &probs), Vec::<f32>::new());
-    }
 }

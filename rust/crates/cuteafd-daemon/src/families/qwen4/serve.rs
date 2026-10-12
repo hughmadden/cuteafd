@@ -1013,20 +1013,29 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             }
         };
-        let neural_lengths: Vec<_> = proposals.iter().map(Vec::len).collect();
-        let extensions: Vec<_> = active.iter().zip(&proposals).zip(&limits).map(|((a, proposal), &limit)|
-            crate::shared::draft::copy::extension(&a.history, proposal, limit, a.job.sampling.is_greedy())).collect();
-        for ((prior, proposal), extension) in neural_confidence.iter_mut().zip(&proposals).zip(&extensions) {
-            prior.truncate(proposal.len());
-            if !prior.is_empty() { prior.extend(std::iter::repeat_n(resource::TAIL_PRIOR, extension.len())); }
-        }
+        let trace_neural = trace.as_ref().map(|_| proposals.clone());
+        let trace_copy = trace.as_ref().map(|_| active.iter().zip(&proposals).map(|(a, p)|
+            crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))
+            .collect::<Vec<_>>());
+        let mut neural_lengths: Vec<_> = proposals.iter().map(Vec::len).collect();
+        let copies: Vec<_> = active.iter().zip(&proposals).zip(&limits).zip(&mut neural_confidence)
+            .map(|(((a, proposal), &limit), prior)| {
+                prior.truncate(proposal.len());
+                shared.as_ref().filter(|_| !matches!(drafts, Drafts::Mtp { fixed: true, .. }))
+                    .and_then(|shared| resource::copy_continuation(shared, a.ticket.id(), &a.history,
+                        proposal, prior, limit, a.job.sampling.is_greedy()))
+            }).collect();
         if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Mtp { fixed: true, .. })) {
             let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
                 resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
             let selection = resource::select_drafted(shared, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
             predicted = selection.predicted;
-            for ((proposal, extension), length) in proposals.iter_mut().zip(extensions).zip(selection.lengths) {
-                proposal.extend(extension);
+            for (((proposal, copy), neural), length) in proposals.iter_mut().zip(copies)
+                .zip(&mut neural_lengths).zip(selection.lengths) {
+                if let Some(copy) = copy {
+                    *neural = copy.neural;
+                    *proposal = copy.tokens;
+                }
                 proposal.truncate(length);
             }
         }
@@ -1194,6 +1203,10 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
                 "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
                 "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
+                "neural_tokens": trace_neural,
+                "copy_windows": trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                    serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
+                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
                 "predicted_us": predicted, "rates": neural_confidence,
                 "draft_policy": resource::snapshot()}));
         }
