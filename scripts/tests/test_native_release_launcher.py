@@ -69,7 +69,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
     def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
         source = (ROOT / 'run.sh').read_text()
         block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
-            'release_validate_table_backend "$TABLE_BACKEND"', 1)[0]
+            'case "$EMBEDDING" in', 1)[0]
         self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
         for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
             result = subprocess.run(['bash', '-c',
@@ -80,13 +80,11 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 self.assertIn(f'deepseek_v41 cannot run attention placement {mode}', result.stderr)
                 self.assertIn('existing ranges stay unchanged', result.stderr)
 
-    def test_table_backend_preflight_and_seccomp_are_narrow(self) -> None:
-        for backend, valid in [('mmap', True), ('uring', True), ('mincore-routed', True), ('direct', False)]:
-            result = subprocess.run(['bash', '-c',
-                'source scripts/lib/release-common.sh; release_known_key TABLE_BACKEND; '
-                'release_validate_table_backend "$1"', 'test', backend],
-                cwd=ROOT, text=True, capture_output=True)
-            self.assertEqual(result.returncode == 0, valid, result.stderr)
+    def test_table_backend_selectors_are_removed_and_seccomp_is_narrow(self) -> None:
+        result = subprocess.run(['bash', '-c',
+            'source scripts/lib/release-common.sh; release_known_key TABLE_BACKEND'],
+            cwd=ROOT, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
         profile = json.loads((ROOT / 'docker/seccomp-code-bench.json').read_text())
         self.assertEqual(profile['defaultAction'], 'SCMP_ACT_ERRNO')
         allowed = {name for rule in profile['syscalls'] if rule['action'] == 'SCMP_ACT_ALLOW'
@@ -94,26 +92,13 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         self.assertTrue({'io_uring_setup', 'io_uring_enter', 'io_uring_register'} <= allowed)
         for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
             source = (ROOT / launcher).read_text()
-            self.assertIn('--table-backend', source)
-            self.assertLess(source.index('release_validate_table_backend'), source.index('docker run'))
+            self.assertNotIn('--table-backend', source)
+            self.assertNotIn('TABLE_BACKEND', source)
             self.assertIn('seccomp=$repo_root/docker/seccomp-code-bench.json', source)
 
-    def test_table_accounting_reaches_coordinator_without_changing_default(self) -> None:
+    def test_table_accounting_cannot_disable_hybrid_residency(self) -> None:
         for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
-            source = (ROOT / launcher).read_text()
-            block = 'table_env_args=()\n' + source.split('table_env_args=()\n', 1)[1].split('\n', 1)[0]
-            self.assertIn('"${table_env_args[@]}"', source)
-            for value in [None, '', 'full', 'off']:
-                with self.subTest(launcher=launcher, value=value):
-                    environment = dict(os.environ)
-                    environment.pop('CUTEAFD_TABLE_ACCOUNTING', None)
-                    if value is not None:
-                        environment['CUTEAFD_TABLE_ACCOUNTING'] = value
-                    result = subprocess.run(['bash', '-c', block + '\nprintf "%s\\n" "${table_env_args[@]}"'],
-                                            cwd=ROOT, env=environment, capture_output=True, text=True)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    expected = ['-e', f'CUTEAFD_TABLE_ACCOUNTING={value}'] if value else ['']
-                    self.assertEqual(result.stdout.splitlines(), expected)
+            self.assertNotIn('CUTEAFD_TABLE_ACCOUNTING', (ROOT / launcher).read_text())
 
     def test_matched_nonce_is_opt_in_and_default_argv_is_identical(self) -> None:
         for launcher in ['run.sh', 'scripts/launch/run-family.sh']:

@@ -1,5 +1,5 @@
 //! Device side of mapped lookup tables (`cuteafd_loader::MappedTable`): the
-//! placement option, a pinned staging ring with stream-ordered H2D uploads,
+//! gather options, a pinned staging ring with stream-ordered H2D uploads,
 //! and the gather/prefetch/stats bundle a family engine holds per table.
 //!
 //! A step's rows are known when its inputs are: `begin` gathers them on the
@@ -12,7 +12,7 @@
 //! the page cache by the table's prefetcher.
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
-use cuteafd_loader::{GatherPool, HotRowCache, MappedTable, PendingGather, TablePrefetcher, TableStatsSnapshot};
+use cuteafd_loader::{GatherPool, MappedTable, PendingGather, TablePrefetcher, TableStatsSnapshot};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -20,29 +20,12 @@ use std::time::Instant;
 
 use super::memory::HostAllocation;
 
-/// Where a large per-token lookup table lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum TablePlacement {
-    /// Memory-mapped checkpoint (page cache); each step's rows gathered on
-    /// host threads and uploaded. Startup reads only metadata.
-    Mapped,
-    /// The whole table read into pinned, device-mapped host memory at
-    /// startup; kernels read rows over PCIe.
-    #[value(alias = "host")]
-    HostPreload,
-    /// The whole table copied to GPU memory.
-    Device,
-}
-
 /// Mapped-table options a family engine takes.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct MappedTableArgs {
-    /// Host threads gathering mapped rows (and reading a preloaded table).
+    /// Host threads gathering mapped rows.
     #[arg(long = "table-threads", alias = "ple-threads", default_value_t = 16)]
     pub threads: usize,
-    /// Hot-row cache in MiB (rows that survive page-cache eviction); 0 is off.
-    #[arg(long = "table-cache-mib", default_value_t = 0)]
-    pub cache_mib: usize,
     /// Advise the page cache about rows known ahead of their step (the next
     /// prefill chunk).
     #[arg(long = "table-prefetch", default_value_t = true, action = clap::ArgAction::Set)]
@@ -147,13 +130,11 @@ pub(crate) struct PendingRows {
     decode: bool,
 }
 
-/// One mapped table with its gather pool, optional hot-row cache and
-/// prefetcher, and the staging ring that uploads each step's rows.
+/// One mapped table with its gather pool, prefetcher, and the staging ring that uploads each step's rows.
 pub(crate) struct MappedTableDevice<'a> {
     name: &'static str,
     table: Arc<MappedTable>,
     pool: Arc<GatherPool>,
-    cache: Option<Arc<HotRowCache>>,
     prefetcher: Option<TablePrefetcher>,
     ring: RefCell<PinnedRowRing<'a>>,
     logged: Cell<TableStatsSnapshot>,
@@ -176,7 +157,6 @@ impl<'a> MappedTableDevice<'a> {
         Ok(Self {
             name,
             pool: Arc::new(GatherPool::new(&format!("{name}-gather"), args.threads)?),
-            cache: HotRowCache::new(row_bytes, args.cache_mib << 20).map(Arc::new),
             prefetcher,
             ring: RefCell::new(PinnedRowRing::new(library, max_rows * row_bytes, 2)?),
             logged: Cell::new(table.stats().snapshot()),
@@ -203,7 +183,7 @@ impl<'a> MappedTableDevice<'a> {
         // SAFETY: the slot holds `bytes`; the ring hands it out again only
         // after this PendingRows is finished (its copy event) or dropped (the
         // gather waited), and nothing else touches it meanwhile.
-        let gather = unsafe { self.pool.spawn_gather(self.table.clone(), rows, host, bytes, self.cache.clone()) };
+        let gather = unsafe { self.pool.spawn_gather(self.table.clone(), rows, host, bytes) };
         Ok(PendingRows { gather: Some(gather), slot, bytes, decode })
     }
 
@@ -247,7 +227,7 @@ impl<'a> MappedTableDevice<'a> {
         tracing::info!(table = self.name, event, rows = d.rows, gathers = d.gathers, mib = d.bytes as f64 / (1 << 20) as f64,
             gather_ms = d.gather_ns as f64 / 1e6, stall_ms = d.stall_ns as f64 / 1e6, major_faults = d.major_faults,
             minor_faults = d.minor_faults, resident = d.resident_rate(), prefetch_pages = d.prefetch_pages,
-            prefetch_dropped = d.prefetch_dropped, cache_hit = d.cache_hit_rate().unwrap_or(f64::NAN),
+            prefetch_dropped = d.prefetch_dropped,
             "mapped table");
     }
 }

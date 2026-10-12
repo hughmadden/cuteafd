@@ -1271,13 +1271,12 @@ mod tests {
     }
     #[tokio::test]
     async fn stats_read_live_tables_before_first_publish_and_after_idle_batch() {
-        use cuteafd_loader::{MappedTable, RowFormat, TableBackend, TablePart};
+        use cuteafd_loader::{MappedTable, RowFormat, TablePart};
         let file = tempfile::NamedTempFile::new().unwrap();
         file.as_file().set_len(4096).unwrap();
         // SAFETY: the test owns the file and keeps its length fixed while mapped.
         let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(),
             offset: 0, rows: 4 }], RowFormat::of(cuteafd_core::DType::U8, 16).unwrap()).unwrap() };
-        table.select_backend(TableBackend::Mmap);
         let name = format!("stats-live-{}", file.path().display());
         table.name_stats(name.clone());
         for profile in [ModelProfile::default(),
@@ -1293,7 +1292,7 @@ mod tests {
                 let value: Value = serde_json::from_slice(&body).unwrap();
                 let entry = value["mapped_tables"].as_array().unwrap().iter()
                     .find(|entry| entry["name"] == name).unwrap();
-                assert_eq!(entry["backend"], "mmap");
+                assert!(matches!(entry["backend"].as_str(), Some("mincore-routed" | "mmap-fallback")));
                 assert_eq!(entry["cumulative"]["gathers"], expected);
                 assert_eq!(value["http_queue_len"], 0);
                 if cached.lock().unwrap().is_null() {

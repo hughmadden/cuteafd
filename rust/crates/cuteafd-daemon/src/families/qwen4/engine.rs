@@ -1728,7 +1728,7 @@ impl<'a> Qwen4Engine<'a> {
             page_table: self.alloc(table_rows * self.pages * 4)?,
             pool_table: self.alloc(table_rows * self.pool_pages * 4)?,
             ple_ids: self.alloc(t * self.cfg.ple_rows() * 8)?,
-            ple_rows: match self.ple.as_ref().filter(|p| p.mapped().is_some()) {
+            ple_rows: match self.ple.as_ref() {
                 Some(ple) => {
                     let n = t * self.cfg.ple_rows();
                     let local = self.alloc(n * 8)?;
@@ -1853,7 +1853,7 @@ impl<'a> Qwen4Engine<'a> {
     /// `tokens` appended after `history` (a later step's, e.g. the next
     /// prefill chunk); best effort: never blocks, failures only log.
     pub fn prefetch_ple(&self, history: &NgramHistory, tokens: &[u32]) {
-        let Some((ple, mapped)) = self.ple.as_ref().and_then(|p| p.mapped().map(|m| (p, m))) else { return };
+        let Some((ple, mapped)) = self.ple.as_ref().map(|p| (p, p.mapped())) else { return };
         let mut ids = Vec::with_capacity(tokens.len() * self.cfg.ple_rows());
         if let Err(error) = ple.hasher.hash(&mut history.clone(), tokens, &mut ids).and_then(|()| mapped.prefetch(&ids)) {
             tracing::warn!("PLE prefetch: {error:#}");
@@ -1862,7 +1862,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Logs the mapped PLE table's stats since the previous call.
     pub fn log_table_stats(&self, event: &str) {
-        if let Some(mapped) = self.ple.as_ref().and_then(|p| p.mapped()) {
+        if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
             mapped.log_interval(event);
         }
     }
@@ -2331,7 +2331,7 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.cache_lengths, &tables.cache_lengths)?;
         self.stage_table(w, &w.page_table, &tables.page_table)?;
         self.stage_table(w, &w.pool_table, &tables.pool_table)?;
-        match self.ple.as_ref().and_then(|p| p.mapped()) {
+        match self.ple.as_ref().map(|p| p.mapped()) {
             // Gathers while the layers before the PLE layer are enqueued (`finish_ple`).
             Some(mapped) => {
                 // A failed step's rows are dropped (their gather waited) first.
@@ -2421,7 +2421,7 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.cache_lengths, &tables.cache_lengths)?;
         self.stage_table(w, &w.page_table, &tables.page_table)?;
         self.stage_table(w, &w.pool_table, &tables.pool_table)?;
-        if self.ple.as_ref().and_then(|p| p.mapped()).is_none() {
+        if self.ple.as_ref().map(|p| p.mapped()).is_none() {
             self.stage_table(w, &w.ple_ids, &tables.ple_ids)?;
         }
         Ok(())
@@ -2458,7 +2458,7 @@ impl<'a> Qwen4Engine<'a> {
         let root = self.workspace_slot(0, tables.decode)?.borrow();
         let peer = self.workspace_slot(1, tables.decode)?.borrow();
         let work = [root.as_ref().context("root workspace")?, peer.as_ref().context("peer workspace")?];
-        if let Some(mapped) = self.ple.as_ref().and_then(|p| p.mapped()) {
+        if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
             drop(self.ple_pending.borrow_mut().take());
             *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
         }
@@ -2877,7 +2877,7 @@ impl<'a> Qwen4Engine<'a> {
     /// Mapped PLE table: waits for the step's rows and queues their upload
     /// (outside any graph capture, before the PLE layer's work).
     fn finish_ple(&self, w: &Workspace<'_>) -> Result<()> {
-        let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().and_then(|p| p.mapped()), &w.ple_rows) else {
+        let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().map(|p| p.mapped()), &w.ple_rows) else {
             return Ok(());
         };
         let pending = self.ple_pending.borrow_mut().take().context("the step's PLE rows were not gathered")?;
@@ -2888,15 +2888,13 @@ impl<'a> Qwen4Engine<'a> {
 
     fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Scalar, spec: bool)
         -> Result<()> {
-        let table = self.ple.as_ref().context("PLE layer without the n-gram table (--table-placement)")?;
+        let table = self.ple.as_ref().context("PLE layer without the n-gram table")?;
         let state = self.ple_state.as_ref().context("PLE conv state")?;
         let replay = self.ple_replay.as_ref().context("PLE replay record")?;
         let name = if table.fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
         // Mapped: the step's rows were gathered in id order, so identity ids read them.
-        let (ids, gathered) = match &w.ple_rows {
-            Some((gathered, local)) => (local.buffer.ptr, gathered.buffer.ptr),
-            None => (w.ple_ids.buffer.ptr, table.table),
-        };
+        let (gathered, local) = w.ple_rows.as_ref().context("PLE layer without gathered-row workspace")?;
+        let (ids, gathered) = (local.buffer.ptr, gathered.buffer.ptr);
         self.run(name, &[("streams", streams.buffer.ptr), ("ids", ids), ("table", gathered),
             ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),

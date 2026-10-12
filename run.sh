@@ -45,7 +45,6 @@ container-name characters, [A-Za-z0-9_.-], as scripts/launch/run-family.sh does.
   --pool-tokens auto|N         planner KV admission (opt-in; 0 means auto)
   --embedding-placement host|gpu  token embedding residency (default gpu)
   --kv-pool-size SIZE           exact KV/index pool, e.g. 22.5GB
-  --table-backend uring|mmap|mincore-routed     buffered mapped-table gathers (default mmap)
   --host-cache-bytes auto|SIZE  pinned RAM cache; 0 disables (default auto)
   --memory-reservation SIZE     total GPU ceiling, e.g. 90% or 80GiB
   --prefix-cache-entries N      turn and prompt retention, 0..128 (default 20)
@@ -96,7 +95,6 @@ while [[ $# -gt 0 ]]; do
     --rtx-expert-layers) overrides[RTX_EXPERT_LAYERS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --concurrency) overrides[CONCURRENCY]="${2:?$1 requires N}"; shift 2 ;;
     --host-cache-bytes) overrides[HOST_CACHE_BYTES]="${2:?$1 requires auto or SIZE}"; shift 2 ;;
-    --table-backend) overrides[TABLE_BACKEND]="${2:?$1 requires uring, mmap or mincore-routed}"; shift 2 ;;
     --embedding-placement) overrides[EMBEDDING]="${2:?$1 requires host or gpu}"; shift 2 ;;
     --pool-tokens) overrides[POOL_TOKENS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --kv-pool-size) overrides[KV_POOL_SIZE]="${2:?$1 requires SIZE}"; shift 2 ;;
@@ -134,12 +132,10 @@ done
 family="$(release_config_family "$config")"
 if [[ "$family" != deepseek_v41 ]]; then
   embedding_override="${overrides[EMBEDDING]:-}"
-  table_override="${overrides[TABLE_BACKEND]:-}"
-  unset 'overrides[EMBEDDING]' 'overrides[TABLE_BACKEND]'
+  unset 'overrides[EMBEDDING]'
   ((${#overrides[@]} == 0 && dry_run == 0)) && [[ -z "$dspark_draft_limit" ]] ||
-    release_die "$family checkpoints take --config, --restart, --wip and --embedding-placement here, plus --table-backend (the other options are DeepSeek V4.1's; see scripts/launch/run-family.sh for its config keys)"
+    release_die "$family checkpoints take --config, --restart, --wip and --embedding-placement here (the other options are DeepSeek V4.1's; see scripts/launch/run-family.sh for its config keys)"
   family_args=(--config "$config" --family "$family")
-  [[ -z "$table_override" ]] || family_args+=(--table-backend "$table_override")
   [[ -z "$embedding_override" ]] || family_args+=(--embedding-placement "$embedding_override")
   ((restart == 0)) || family_args+=(--restart)
   ((restart_all == 0)) || family_args+=(--all)
@@ -156,7 +152,6 @@ case "$attention_placement" in
   context|layers) release_die "deepseek_v41 cannot run attention placement $attention_placement: runtime solver placement not implemented; existing ranges stay unchanged" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac
-release_validate_table_backend "$TABLE_BACKEND"
 case "$EMBEDDING" in host|gpu) ;; *) release_die "EMBEDDING must be host or gpu" ;; esac
 if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid WIP slot name: $wip_slot"
@@ -540,7 +535,7 @@ else
   for lane in "${lanes[@]}"; do peer_addresses+=("$lane:$EXPERT_PORT"); done
   peers="$(IFS=,; echo "${peer_addresses[*]}")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$TABLE_BACKEND" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${V41_COPY_DRAFTS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${V41_COPY_DRAFTS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 
 if ((dry_run)); then
@@ -630,8 +625,6 @@ for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_VERBS_APP
   [[ -n "${!rdma_env_name:-}" ]] && rdma_env_args+=(-e "$rdma_env_name=${!rdma_env_name}")
 done
 
-table_env_args=()
-[[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 graph_census_args=()
@@ -732,7 +725,6 @@ case "${ENABLE_BENCH:-off}" in
 esac
 # GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
 case "${GATEWAY:-}" in on|off) args+=(--gateway "$GATEWAY") ;; "") ;; *) release_die "GATEWAY must be on or off" ;; esac
-args+=(--table-backend "$TABLE_BACKEND")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
@@ -762,7 +754,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
-  "${rdma_env_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${graph_census_args[@]}" \
+  "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${graph_census_args[@]}" \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null

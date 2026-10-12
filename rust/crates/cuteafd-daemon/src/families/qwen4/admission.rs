@@ -153,8 +153,7 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
     let mut fixed = qwen4::dual_owner0_weights(&resident,
         args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host);
     fixed.extend(qwen4::dual_projection_load_staging(cfg, layers, mtp, selected));
-    let layer_extra = qwen4::dual_ple_demands(cfg, layers, &resident,
-        args.table_placement == crate::shared::mapped_table::TablePlacement::Device)?;
+    let layer_extra = qwen4::dual_ple_demands(cfg, layers, &resident)?;
     Ok(DualWeightPlan { resident, fixed, layer_extra })
 }
 
@@ -211,7 +210,6 @@ mod tests {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::families::qwen4::{resident::Qwen4CheckpointResident, Qwen4Config, Qwen4KvCache};
         use cuteafd_loader::placement::{families::qwen4, Baseline, GpuBudget, Onboard};
-        use crate::shared::mapped_table::TablePlacement;
         #[derive(Parser)]
         struct Cli {
             #[command(flatten)]
@@ -219,7 +217,6 @@ mod tests {
         }
         let argv = ["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so"];
         let args = Cli::try_parse_from(argv)?.engine;
-        assert_eq!(args.table_placement, TablePlacement::Mapped);
         assert!(args.table.prefetch);
         let mut config = cuteafd_loader::plan::testing::qwen4_config(48);
         config["text_config"]["ple_layer_ids"] = serde_json::json!([24]);
@@ -232,11 +229,10 @@ mod tests {
             ple_table_bytes: (954 * (1u64 << 30)).div_ceil(10), ple_row_bytes: 160 * 2,
             ..Default::default()
         };
-        let extra = qwen4::dual_ple_demands(&cfg, 48, &resident, args.table_placement == TablePlacement::Device)?;
+        let extra = qwen4::dual_ple_demands(&cfg, 48, &resident)?;
         let weights = vec![100 << 20; 48];
         let experts = vec![None; 48];
-        // Also leave enough room for the entire table: available capacity is
-        // never permission to change the user's mapped residency selection.
+        // Even enough capacity for the full table must retain mapped residency.
         for capacity in [96u64 << 30, 192u64 << 30] {
             for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
                 let mut inputs = qwen4::QwenDualInputs {
@@ -275,13 +271,8 @@ mod tests {
                 assert!(!planned.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
             }
         }
-        // Whole-table storage is available only through an explicit CLI choice.
-        for (name, placement) in [("device", TablePlacement::Device), ("host-preload", TablePlacement::HostPreload)] {
-            let opt_in = Cli::try_parse_from(argv.into_iter().chain(["--table-placement", name]))?.engine;
-            assert_eq!(opt_in.table_placement, placement);
-            let demand = qwen4::dual_ple_demands(&cfg, 48, &resident, placement == TablePlacement::Device)?;
-            assert_eq!(demand[23].iter().map(|d| d.bytes).sum::<u64>(),
-                256 + if placement == TablePlacement::Device { resident.ple_table_bytes } else { 0 });
+        for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0")] {
+            assert!(Cli::try_parse_from(argv.into_iter().chain([option, value])).is_err());
         }
         Ok(())
     }
@@ -341,18 +332,12 @@ mod tests {
                 }
                 assert!(plan.fixed.iter().filter(|d| d.category != cuteafd_core::memory_layout::Category::Staging)
                     .all(|d| d.gpu == 0));
-                for placement in [crate::shared::mapped_table::TablePlacement::Device,
-                    crate::shared::mapped_table::TablePlacement::HostPreload,
-                    crate::shared::mapped_table::TablePlacement::Mapped] {
-                    args.table_placement = placement;
-                    let plan = super::dual_weights(&args, &checkpoint, &cfg, 2, false)?;
-                    assert_eq!(plan.layer_extra.len(), 2);
-                    assert!(plan.layer_extra[0].is_empty());
-                    assert_eq!(plan.layer_extra[1].iter().map(|d| d.bytes).sum::<u64>(),
-                        256 + if placement == crate::shared::mapped_table::TablePlacement::Device { 16_000 } else { 0 });
-                    assert!(plan.layer_extra[1].iter().all(|d| d.category == cuteafd_core::memory_layout::Category::Tables
-                        && d.residency == cuteafd_loader::placement::LayerResidency::Owner));
-                }
+                let plan = super::dual_weights(&args, &checkpoint, &cfg, 2, false)?;
+                assert_eq!(plan.layer_extra.len(), 2);
+                assert!(plan.layer_extra[0].is_empty());
+                assert_eq!(plan.layer_extra[1].iter().map(|d| d.bytes).sum::<u64>(), 256);
+                assert!(plan.layer_extra[1].iter().all(|d| d.category == cuteafd_core::memory_layout::Category::Tables
+                    && d.residency == cuteafd_loader::placement::LayerResidency::Owner));
             }
         }
         Ok(())

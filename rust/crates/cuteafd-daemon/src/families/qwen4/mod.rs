@@ -78,11 +78,7 @@ pub(crate) struct EngineArgs {
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
-    /// Where the PLE n-gram table lives (`mapped`: page cache, rows gathered
-    /// per step; `host-preload`: read into pinned host memory at startup).
-    #[arg(long = "table-placement", alias = "ple", value_enum,
-        default_value_t = crate::shared::mapped_table::TablePlacement::Mapped)]
-    pub table_placement: crate::shared::mapped_table::TablePlacement,
+    /// Gather and prefetch options for the mapped PLE n-gram table.
     #[command(flatten)]
     pub table: crate::shared::mapped_table::MappedTableArgs,
     /// Spark ranks in TP order (HOST:PORT,...) serving the routed experts.
@@ -383,7 +379,7 @@ impl Opened {
             "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
+                layer, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
             _ => None,
         };
         // Establish expert ownership before admission. EXL3 keeps its existing
@@ -414,7 +410,7 @@ impl Opened {
         let pool_tokens = if budget_admission {
             let source = admission::ExpertSource::selected(admitted_experts.as_ref().and_then(Option::as_ref))?;
             admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
-                manifest_json.as_ref(), ple.as_ref().filter(|p| p.mapped().is_some()).map(|p| (p.row_bytes as u64, p.fp8)),
+                manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
                 future_expert_bytes)?, source)?
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;

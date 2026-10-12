@@ -1,11 +1,10 @@
-//! Qwen 3.8 PLE n-gram rows through the mapped table (gather pool, with and
-//! without the hot-row cache) against the bytes the host preload copies
-//! (`pread` of each row from its shard): byte identity, plus timings.
+//! Qwen 3.8 PLE mapped gathers against positioned checkpoint row reads:
+//! byte identity for cold and warm pool calls, plus timings.
 //! Usage: SNAPSHOT [TOKENS].
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::qwen4::{NgramHasher, Qwen4Config};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use cuteafd_loader::{GatherPool, HotRowCache, MappedTable};
+use cuteafd_loader::{GatherPool, MappedTable};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -25,7 +24,7 @@ fn main() -> Result<()> {
     let tensors: Vec<_> = shards.iter().map(|t| (t.shard.as_str(), &t.meta)).collect();
     // SAFETY: the checkpoint snapshot is immutable while this process runs.
     let table = unsafe { MappedTable::from_tensors(snapshot, &tensors)? };
-    println!("mapped backend={} {} parts, {} rows x {} B ({:.1} GiB) in {:.3}s", table.backend(), table.part_count(), table.rows(),
+    println!("mapped {} parts, {} rows x {} B ({:.1} GiB) in {:.3}s", table.part_count(), table.rows(),
         table.row_bytes(), table.bytes() as f64 / (1u64 << 30) as f64, opened.elapsed().as_secs_f64());
     let hasher = NgramHasher::from_config(cfg.vocab_size, 20_000_000, cfg.ngram_size, cfg.heads_per_ngram, 0, 1234,
         cfg.eos);
@@ -40,7 +39,7 @@ fn main() -> Result<()> {
     hasher.hash(&mut hasher.start(), &tokens, &mut ids)?;
     let rows: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
     let row_bytes = table.row_bytes();
-    // The preload's bytes: each row read from its shard at its offset.
+    // Independent reference bytes read directly at each checkpoint row offset.
     let mut starts = Vec::new();
     let mut at = 0u64;
     for shard in &shards {
@@ -55,18 +54,17 @@ fn main() -> Result<()> {
             shards[part].meta.byte_offset + (row - starts[part]) * row_bytes as u64)?;
     }
     let pool = GatherPool::new("ple-check", 16)?;
-    let cache = HotRowCache::new(row_bytes, 64 << 20);
-    for (label, cache) in [("pool", None), ("pool+cache", cache.as_ref()), ("pool+cache warm", cache.as_ref())] {
+    for label in ["pool", "pool warm"] {
         let mut out = vec![0u8; expected.len()];
-        let report = pool.gather(&table, &rows, &mut out, cache)?;
+        let report = pool.gather(&table, &rows, &mut out)?;
         ensure!(out == expected, "{label}: gathered rows differ from the shard bytes");
-        println!("{label}: {} rows identical, {:.3} ms, {} major faults, {} cache hits", report.rows,
-            report.elapsed.as_secs_f64() * 1e3, report.major_faults, report.cache_hits);
+        println!("{label}: {} rows identical, {:.3} ms, {} major faults", report.rows,
+            report.elapsed.as_secs_f64() * 1e3, report.major_faults);
     }
     let mut out = vec![0u8; expected.len()];
     table.gather_into(&rows, &mut out)?;
     ensure!(out == expected, "gather_into rows differ from the shard bytes");
-    println!("PASS {} PLE rows of {count} tokens byte-identical (pool, cache, gather_into)", rows.len());
+    println!("PASS {} PLE rows of {count} tokens byte-identical (pool, gather_into)", rows.len());
     // Warm per-step costs at decode shapes: rows of 1, 4 and 64 tokens.
     let pool = std::sync::Arc::new(pool);
     let table = std::sync::Arc::new(table);
@@ -81,11 +79,11 @@ fn main() -> Result<()> {
             table.gather_into(batch, &mut out)?;
             inline += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
-            pool.gather(&table, batch, &mut out, None)?;
+            pool.gather(&table, batch, &mut out)?;
             pooled += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             // SAFETY: `out` outlives the wait below and nothing else touches it.
-            let pending = unsafe { pool.spawn_gather(table.clone(), batch.to_vec(), out.as_mut_ptr(), out.len(), None) };
+            let pending = unsafe { pool.spawn_gather(table.clone(), batch.to_vec(), out.as_mut_ptr(), out.len()) };
             pending.wait()?;
             spawned += t.elapsed().as_secs_f64();
         }

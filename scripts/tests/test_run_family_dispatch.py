@@ -67,8 +67,8 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert "--embedding-placement host" in result.stdout
     for backend in ("uring", "mincore-routed"):
         result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--table-backend", backend)
-        assert result.returncode == 0, result.stderr
-        assert f"--table-backend {backend}" in result.stdout
+        assert result.returncode != 0
+        assert "unknown run argument: --table-backend" in result.stderr
     # A ./wip.sh slot reaches run-family.sh, which serves it from the development images.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--wip", "s1", "--restart")
     assert result.returncode == 0, result.stderr
