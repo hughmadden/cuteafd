@@ -3,6 +3,7 @@
 Usage: python native/tests/glm_draft_kernels_selftest.py /path/to/libcuteafd_native.so
            [--head SHARD.safetensors] [--head-shape VOCAB WIDTH] [--head-only]
            [--head-rows 8,64] [--profile-head] [--quick]
+           [--mimo-forward SNAPSHOT/dflash --fp8-rows 8,64 --profile-mimo --fp8-baseline LIB]
 
 Run with Python containing CUDA PyTorch, on one GPU.
 
@@ -24,7 +25,9 @@ Run with Python containing CUDA PyTorch, on one GPU.
 """
 import argparse
 import ctypes as C
+from contextlib import nullcontext
 import json
+from pathlib import Path
 import struct
 import sys
 
@@ -393,6 +396,184 @@ def fp8_check(lib, args):
             torch.cuda.profiler.stop()
 
 
+def mimo_forward_check(lib, args):
+    """Checkpoint-weight forward census; fixed synthetic embeddings/KV, not a serving acceptance test."""
+    from safetensors import safe_open
+
+    sig = {
+        "cuteafd_glm_dflash_rmsnorm": ([P, P, P, C.c_int32, C.c_int32, C.c_float, P], C.c_int32),
+        "cuteafd_glm_dflash_silu_mul": ([P, P, C.c_int32, C.c_int32, P], C.c_int32),
+        "cuteafd_mimo_dflash_qk_rope": ([P] * 8 + [C.c_int32] * 4 + [C.c_float] * 3 + [P], C.c_int32),
+        "cuteafd_mimo_dflash_attention_workspace": ([C.c_int32] * 5, C.c_uint64),
+        "cuteafd_mimo_dflash_attention": ([P] * 11 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
+        "cuteafd_mimo_dflash_add_norm": ([P] * 4 + [C.c_int32] * 2 + [C.c_float, P], C.c_int32),
+    }
+    baseline = bind(args.fp8_baseline) if args.fp8_baseline else None
+    for native in (lib, baseline):
+        if native is not None:
+            for name, (types, ret) in sig.items():
+                getattr(native, name).argtypes, getattr(native, name).restype = types, ret
+    directory = Path(args.mimo_forward)
+    cfg = json.loads((directory / "config.json").read_text())
+    h, inter = cfg["hidden_size"], cfg["intermediate_size"]
+    heads, kv_heads, dim = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
+    block, ring = cfg["block_size"], cfg["sliding_window"]
+    eps, theta = cfg["rms_norm_eps"], cfg["rope_theta"]
+    rope_dim = int(dim * cfg.get("partial_rotary_factor", 1.0))
+    v_scale = cfg["dflash_config"].get("attention_value_scale", 1.0)
+    assert dim == 128 and ring == 1024 and not cfg.get("is_causal", False), cfg
+    assert all(rows % block == 0 for rows in args.fp8_rows), (args.fp8_rows, block)
+    assert 0 <= args.mimo_context <= ring, args.mimo_context
+    max_rows = max(args.fp8_rows)
+    stream = torch.cuda.current_stream().cuda_stream
+    torch.manual_seed(26)
+    shapes = [(h, (heads + 2 * kv_heads) * dim), (heads * dim, h), (h, 2 * inter), (inter, h)]
+
+    def pack(weight, k, n):
+        assert weight.dtype == torch.bfloat16 and list(weight.shape) == [n, k], weight.shape
+        packed = torch.empty(n * k, device="cuda", dtype=torch.uint8)
+        scale = torch.empty(n * k // 128, device="cuda")
+        assert lib.cuteafd_fp8_w8a16_pack(weight.data_ptr(), packed.data_ptr(), scale.data_ptr(),
+                                        n, k, args.mimo_scale_rule, stream) == 0
+        torch.cuda.synchronize()
+        return packed, scale
+
+    layers = []
+    with safe_open(directory / "dflash_draft_model.safetensors", framework="pt", device="cpu") as checkpoint:
+        def tensor(name):
+            result = checkpoint.get_tensor(name)
+            assert result.dtype == torch.bfloat16, (name, result.dtype)
+            return result.cuda()
+
+        final_norm = tensor("norm.weight")
+        for index in range(cfg["num_hidden_layers"]):
+            p = f"layers.{index}"
+            a = f"{p}.self_attn"
+            matrices = [torch.cat([tensor(f"{a}.{name}_proj.weight") for name in ("q", "k", "v")]),
+                        tensor(f"{a}.o_proj.weight"),
+                        torch.cat([tensor(f"{p}.mlp.{name}_proj.weight") for name in ("gate", "up")]),
+                        tensor(f"{p}.mlp.down_proj.weight")]
+            weights = [pack(weight, k, n) for weight, (k, n) in zip(matrices, shapes)]
+            del matrices
+            layers.append(dict(weights=weights, input_norm=tensor(f"{p}.input_layernorm.weight"),
+                post_norm=tensor(f"{p}.post_attention_layernorm.weight"), q_norm=tensor(f"{a}.q_norm.weight"),
+                k_norm=tensor(f"{a}.k_norm.weight"),
+                sinks=tensor(f"{a}.attention_sink_bias") if cfg["dflash_config"].get("attention_sink_bias") else None,
+                k_ring=(torch.randn(max_rows // block, ring, kv_heads, dim, device="cuda") * 0.1).bfloat16(),
+                v_ring=(torch.randn(max_rows // block, ring, kv_heads, dim, device="cuda") * 0.1).bfloat16()))
+    seed = (torch.randn(max_rows, h, device="cuda") * 0.2).bfloat16()
+
+    def bank(native):
+        buffers = {name: torch.empty(max_rows, width, device="cuda", dtype=torch.bfloat16)
+                   for name, width in (("h", h), ("n", h), ("qkv", shapes[0][1]), ("q", heads * dim),
+                                       ("k", kv_heads * dim), ("v", kv_heads * dim), ("attn", heads * dim),
+                                       ("delta", h), ("gate_up", 2 * inter), ("act", inter))}
+        buffers["scratch"] = torch.empty(max(native.cuteafd_fp8_linear_workspace(max_rows, k, n, 0)
+                                               for k, n in shapes), device="cuda", dtype=torch.uint8)
+        buffers["attention"] = torch.empty(native.cuteafd_mimo_dflash_attention_workspace(
+            max_rows // block, heads, kv_heads, block, ring + block), device="cuda", dtype=torch.uint8)
+        return buffers
+
+    candidate = bank(lib)
+    reference = bank(baseline) if baseline else None
+
+    tables = {rows: {
+        "slots": torch.arange(rows // block, device="cuda", dtype=torch.int32),
+        "lengths": torch.full((rows // block,), args.mimo_context, device="cuda", dtype=torch.int32),
+        "ends": torch.full((rows // block,), args.mimo_context, device="cuda", dtype=torch.int32),
+        "positions": torch.arange(args.mimo_context, args.mimo_context + block,
+                                  device="cuda", dtype=torch.int64).repeat(rows // block),
+    } for rows in args.fp8_rows}
+
+    def run(native, buffers, rows, labels=False):
+        table = tables[rows]
+        ptr = lambda name: buffers[name].data_ptr()
+        buffers["h"][:rows].copy_(seed[:rows])
+        assert native.cuteafd_glm_dflash_rmsnorm(ptr("h"), layers[0]["input_norm"].data_ptr(), ptr("n"),
+                                                rows, h, eps, stream) == 0
+        for index, layer in enumerate(layers):
+            with torch.cuda.nvtx.range(f"mimo/layer{index}/rows{rows}") if labels else nullcontext():
+                def linear(which, source, target):
+                    k, n = shapes[which]
+                    packed, scale = layer["weights"][which]
+                    assert native.cuteafd_fp8_linear(ptr(source), packed.data_ptr(), scale.data_ptr(), ptr(target),
+                        0, rows, k, n, 0, ptr("scratch"), buffers["scratch"].numel(), stream) == 0
+
+                linear(0, "n", "qkv")
+                assert native.cuteafd_mimo_dflash_qk_rope(ptr("qkv"), layer["q_norm"].data_ptr(),
+                    layer["k_norm"].data_ptr(), table["positions"].data_ptr(), None, ptr("q"), ptr("k"), ptr("v"),
+                    rows, heads, kv_heads, rope_dim, theta, eps, v_scale, stream) == 0
+                assert native.cuteafd_mimo_dflash_attention(ptr("q"), ptr("k"), ptr("v"),
+                    layer["k_ring"].data_ptr(), layer["v_ring"].data_ptr(), table["slots"].data_ptr(),
+                    table["lengths"].data_ptr(), table["ends"].data_ptr(),
+                    layer["sinks"].data_ptr() if layer["sinks"] is not None else None, ptr("attn"), ptr("attention"),
+                    rows // block, block, heads, kv_heads, ring, ring + block, ring, dim ** -0.5, stream) == 0
+                linear(1, "attn", "delta")
+                assert native.cuteafd_mimo_dflash_add_norm(ptr("h"), ptr("delta"), layer["post_norm"].data_ptr(),
+                                                          ptr("n"), rows, h, eps, stream) == 0
+                linear(2, "n", "gate_up")
+                assert native.cuteafd_glm_dflash_silu_mul(ptr("gate_up"), ptr("act"), rows, inter, stream) == 0
+                linear(3, "act", "delta")
+                next_norm = layers[index + 1]["input_norm"] if index + 1 < len(layers) else final_norm
+                assert native.cuteafd_mimo_dflash_add_norm(ptr("h"), ptr("delta"), next_norm.data_ptr(), ptr("n"),
+                                                          rows, h, eps, stream) == 0
+
+    head_weight = read_head(args.head, cfg["vocab_size"], h) if args.head else None
+    if head_weight is not None:
+        head_workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
+        head_handle = P()
+        assert lib.cuteafd_vocabulary_head_create_vocab(head_workspace.data_ptr(), head_workspace.numel(),
+            h, max_rows, cfg["vocab_size"], C.byref(head_handle)) == 0
+        head_logits = torch.empty(max_rows, cfg["vocab_size"], device="cuda")
+        head_unary = torch.empty(max_rows // block * (block - 1), 16, device="cuda")
+        head_candidates = torch.empty_like(head_unary, dtype=torch.int32)
+        top_workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(head_unary.shape[0]),
+                                    device="cuda", dtype=torch.uint8)
+
+        def tokens(buffers, rows):
+            assert lib.cuteafd_vocabulary_head_launch_width(head_handle, buffers["n"].data_ptr(),
+                head_weight.data_ptr(), head_logits.data_ptr(), rows, stream) == 0
+            assert lib.cuteafd_glm_dflash_topk(head_logits.data_ptr(), head_unary.data_ptr(),
+                head_candidates.data_ptr(), top_workspace.data_ptr(), rows // block, block, block - 1,
+                cfg["vocab_size"], stream) == 0
+            return head_candidates[:rows // block * (block - 1)].clone()
+
+    try:
+        for rows in args.fp8_rows:
+            run(lib, candidate, rows)
+            if baseline:
+                run(baseline, reference, rows)
+                torch.cuda.synchronize()
+                for name in ("h", "n", "qkv", "attn", "gate_up", "act"):
+                    assert torch.equal(candidate[name][:rows], reference[name][:rows]), ("forward bits", rows, name)
+                print(f"mimo forward rows={rows}: checkpoint-weight fixed synthetic-input baseline bits passed")
+                if head_weight is not None:
+                    actual, expected = tokens(candidate, rows), tokens(reference, rows)
+                    torch.cuda.synchronize()
+                    assert torch.equal(actual, expected), ("fixed native draft top16", rows)
+                    print(f"mimo forward rows={rows}: fixed synthetic-input draft tokens/top16 bit-identical")
+            elapsed = timed(lambda: run(lib, candidate, rows), 5 if args.quick else 20)
+            print(f"mimo forward rows={rows} context={args.mimo_context} median_ms={elapsed:.6f}")
+            if baseline:
+                base_ms = timed(lambda: run(baseline, reference, rows), 5 if args.quick else 20)
+                print(f"mimo forward baseline rows={rows} median_ms={base_ms:.6f} speedup={base_ms / elapsed:.4f}")
+        if args.profile_mimo:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            try:
+                for rows in args.fp8_rows:
+                    with torch.cuda.nvtx.range(f"mimo/forward/rows{rows}"):
+                        run(lib, candidate, rows, labels=True)
+                torch.cuda.synchronize()
+            finally:
+                torch.cuda.profiler.stop()
+
+    finally:
+        torch.cuda.synchronize()
+        if head_weight is not None:
+            assert lib.cuteafd_v41_markov_destroy(head_handle) == 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
@@ -408,6 +589,11 @@ def main():
     parser.add_argument("--fp8-rows", default="8,16,32,64,128", help="comma-separated profiling row counts")
     parser.add_argument("--profile-fp8", action="store_true",
                         help="one NVTX-labelled projection shot after checks; use with --skip-head")
+    parser.add_argument("--mimo-forward", help="MiMo dflash directory; run its forward instead of separate head/FP8 checks")
+    parser.add_argument("--mimo-context", type=int, default=1024, help="fixed synthetic ring context length")
+    parser.add_argument("--mimo-scale-rule", type=int, choices=(0, 1, 2), default=0,
+                        help="FP8 weight scale rule: 0 amax (MiMo default), 1 pow2, 2 best")
+    parser.add_argument("--profile-mimo", action="store_true", help="NVTX-labelled native forward after checks")
     parser.add_argument("--quick", action="store_true", help="three GEMM shapes, fewer timing runs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--skip-head", action="store_true")
@@ -437,12 +623,19 @@ def main():
     if args.fp8_shapes and any(len(shape) != 2 or shape[0] < 128 or shape[0] % 128 or
                               shape[1] < 16 or shape[1] % 16 for shape in args.fp8_shapes):
         parser.error("--fp8-shapes requires K multiples of 128 and N multiples of 16")
+    if args.profile_mimo and not args.mimo_forward:
+        parser.error("--profile-mimo requires --mimo-forward")
+    if args.mimo_forward and (args.profile_fp8 or args.profile_head or args.head_only):
+        parser.error("--mimo-forward has its own profile range and cannot run separate head/FP8 checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
-    if not args.skip_head:
-        head_check(lib, args)
-    if not args.head_only:
-        fp8_check(lib, args)
+    if args.mimo_forward:
+        mimo_forward_check(lib, args)
+    else:
+        if not args.skip_head:
+            head_check(lib, args)
+        if not args.head_only:
+            fp8_check(lib, args)
     print("glm draft kernels: all checks passed")
 
 
