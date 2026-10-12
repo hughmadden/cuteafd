@@ -388,9 +388,10 @@ def test_spark_native_phase_holds_lock_without_locking_cargo(tmp_path):
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
-    setup = '''set -euo pipefail
-sync_seed_source() { :; }
-release_die() { exit 2; }
+    setup = f'''set -euo pipefail
+repo_root={str(ROOT)!r}
+sync_seed_source() {{ :; }}
+release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
