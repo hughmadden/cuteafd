@@ -97,6 +97,9 @@ pub struct Entry {
     /// Optional argv hooks, run only while smoke owns this card's locks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck: Option<Hook>,
+    /// Bounded setup after acquiring hardware locks, before the launcher starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelaunch: Option<Hook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observer: Option<Hook>,
 }
@@ -201,6 +204,7 @@ impl Entry {
             exclusive: self.exclusive.or(defaults.exclusive),
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
             precheck: self.precheck.clone().or_else(|| defaults.precheck.clone()),
+            prelaunch: self.prelaunch.clone().or_else(|| defaults.prelaunch.clone()),
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
         }
     }
@@ -781,8 +785,17 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let mut command = Command::new(repo.join("run.sh"));
         command.arg("--config").arg(&config_path).arg("--restart").args(entry.run_args.clone().unwrap_or_default())
             .current_dir(repo).stdout(log.try_clone()?).stderr(log.try_clone()?);
-        let launch = Instant::now();
         let url = format!("http://127.0.0.1:{port}");
+        if let Some(hook) = &entry.prelaunch {
+            let checked = (|| -> Result<()> {
+                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "prelaunch")?;
+                child.wait()
+            })();
+            hook_results.insert("prelaunch".into(), checked.as_ref().map(|_| "pass".into())
+                .unwrap_or_else(|error| format!("{error:#}")));
+            checked.context("prelaunch hook failed before launcher")?;
+        }
+        let launch = Instant::now();
         if let Some(hook) = &entry.observer {
             match HookChild::spawn(hook, &url, &config_path, &log_path, "observer") {
                 Ok(child) => observer = Some(child),
@@ -948,6 +961,21 @@ mod tests {
         assert_eq!(entry.merged(&Entry::default()), entry);
         let outcome = Outcome::default();
         assert!(serde_json::to_value(outcome).unwrap().get("hooks").is_none());
+    }
+
+    #[test]
+    fn prelaunch_hook_merges_and_changes_resume_key() {
+        let hook = Hook { argv: vec!["true".into()], timeout_s: 2, required: true,
+            cleanup: None, finish_timeout_s: None };
+        let original = entry("table", &[1], &[], 8000);
+        let defaults = Entry { prelaunch: Some(hook.clone()), ..Entry::default() };
+        let merged = original.merged(&defaults);
+        assert_eq!(merged.prelaunch, Some(hook));
+        assert_ne!(original.key(), merged.key());
+        assert_eq!(serde_json::from_value::<Entry>(serde_json::to_value(&merged).unwrap()).unwrap(), merged);
+        let override_hook = Hook { argv: vec!["false".into()], ..merged.prelaunch.clone().unwrap() };
+        let override_entry = Entry { prelaunch: Some(override_hook.clone()), ..original };
+        assert_eq!(override_entry.merged(&defaults).prelaunch, Some(override_hook));
     }
 
     #[test]
