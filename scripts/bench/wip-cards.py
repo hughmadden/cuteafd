@@ -776,7 +776,11 @@ def summarize_job(job, exit_code):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None, requests=matched_requests(dest), state=str(dest))
-        if not row['requests']:
+        # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
+        # token hash above is what matches their requests.
+        prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
+            and job['entry'].get('profile') == 'panels:'
+        if not row['requests'] and not prefill_only:
             fail(row, 'matched prompts produced no per-request console rounds')
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)

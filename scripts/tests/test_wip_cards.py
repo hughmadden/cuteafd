@@ -395,6 +395,22 @@ def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
     assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
 
 
+def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
+    # #72: a prefill-only sweep (max_tokens 1) emits no decode rounds; its pairs
+    # match by prompt token hash alone.
+    def job(entry):
+        state = tmp_path / entry['name']
+        (state / 'smoke' / 'logs').mkdir(parents=True)
+        (state / 'smoke' / 'logs' / 'x.coordinator.log').write_text('prompt_token_hash="73b4ebf8f4958775"\n')
+        (state / 'reports' / entry['name']).mkdir(parents=True)
+        (state / 'reports' / entry['name'] / 'sweep.json').write_text(json.dumps({'points': [], 'prefill': []}))
+        return dict(card='c', arm='a', repeat=1, simulated=False, state=str(state), nonce_seed='s', entry=entry)
+    prefill = cards.summarize_job(job(dict(name='p', profile='panels:', prefill_lengths=[8192], set={}, sparks=[])), 0)
+    assert prefill['status'] == 'pass' and prefill['first_prompt_token_hash'] == '73b4ebf8f4958775'
+    decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
+    assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+
+
 def test_cleanup_foreign_root_refused(tmp_path, monkeypatch):
     home = tmp_path / 'home'
     root = home / '.cache/cuteafd/builds/wip-test'
