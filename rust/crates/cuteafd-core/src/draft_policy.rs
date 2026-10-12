@@ -12,13 +12,13 @@
 //!
 //! Time is priced from the resources that are actually consumed:
 //!
-//! * per timed layer, `alpha + beta * rows + (1 / bandwidth) * megabytes`,
+//! * per timed layer, `alpha + row_curve(rows) + (1 / bandwidth) * megabytes`,
 //!   where megabytes is the routed-expert weight traffic of that layer. The
 //!   traffic is `slice_bytes * sum_e ceil(routes_e / group_rows)`: grouped
 //!   slice kernels read each expert's slice once per row group. Each layer
 //!   belongs to one resource class (for example coordinator RTX or Spark),
 //!   fitted separately;
-//! * per round, a residual `A + B * rows + C * requests` for everything else
+//! * per round, a residual `A + row_curve(rows) + C * requests` for everything else
 //!   (embedding and untimed layers, vocabulary head, sampling, commit);
 //! * per draft pass, `D + E * requests + wide * (F + G * requests)`.
 //!
@@ -493,6 +493,80 @@ pub struct DraftCostSnapshot {
     pub draft_pooled: [f64; 4],
     pub draft_identified: [bool; 4],
     pub layers_identified: Vec<[bool; 3]>,
+    pub row_knots: [f64; ROW_SEGMENTS],
+    pub layer_row_slopes: Vec<[f64; ROW_SEGMENTS]>,
+    pub layer_row_identified: Vec<[bool; ROW_SEGMENTS]>,
+    pub round_row_slopes: [f64; ROW_SEGMENTS],
+    pub round_row_identified: [bool; ROW_SEGMENTS],
+}
+
+/// Capped ramps integrate independent nonnegative slopes. Observations in each
+/// segment and its neighbors identify its slope; wide traffic cannot erase
+/// narrow costs. Neighbor overlap excites slopes even in two-row segments.
+const ROW_SEGMENTS: usize = 10;
+const ROW_KNOTS: [f64; ROW_SEGMENTS] = [0., 2., 4., 8., 16., 32., 64., 128., 256., 512.];
+
+#[derive(Clone, Debug)]
+struct RowEstimator {
+    base: Estimator<3>,
+    segments: [Estimator<3>; ROW_SEGMENTS],
+    theta: [f64; 3],
+    local_theta: [f64; 3],
+    identified: [bool; 3],
+    samples: u64,
+    scale: f64,
+}
+
+impl RowEstimator {
+    fn new(decay: f64, prior: [f64; 3], precision: [f64; 3]) -> Self {
+        let base = Estimator::new(decay, [prior[0], 0., prior[2]], precision);
+        Self { base, segments: std::array::from_fn(|_| Estimator::new(decay, prior, precision)),
+            theta: prior, local_theta: prior, identified: [false; 3], samples: 0, scale: 0. }
+    }
+    fn row_us(&self, rows: f64) -> f64 {
+        (0..ROW_SEGMENTS).map(|i| {
+            let end = ROW_KNOTS.get(i + 1).copied().unwrap_or(f64::INFINITY);
+            (rows.min(end) - ROW_KNOTS[i]).max(0.) * self.segments[i].theta[1]
+        }).sum()
+    }
+    fn marginal(&self, rows: f64) -> f64 { self.row_us(rows + 1.) - self.row_us(rows) }
+    fn predict(&self, x: &[f64; 3]) -> f64 {
+        self.base.theta[0] * x[0] + self.row_us(x[1]) + self.base.theta[2] * x[2]
+    }
+    fn refresh(&mut self) {
+        self.theta = [self.base.theta[0], self.segments[0].theta[1], self.base.theta[2]];
+        self.local_theta = [self.base.local_theta[0], self.segments[0].local_theta[1], self.base.local_theta[2]];
+        self.identified = [self.base.identified[0], self.segments[0].identified[1], self.base.identified[2]];
+        self.samples = self.base.samples;
+        self.scale = self.base.scale;
+    }
+    fn observe(&mut self, x: [f64; 3], elapsed: f64) {
+        if !elapsed.is_finite() || elapsed < 0. || x.iter().any(|v| !v.is_finite()) { return; }
+        for i in 0..ROW_SEGMENTS {
+            let near_start = ROW_KNOTS[i.saturating_sub(1)];
+            let near_end = ROW_KNOTS.get(i + 2).copied().unwrap_or(f64::INFINITY);
+            if x[1] > near_start && x[1] <= near_end {
+                self.segments[i].observe(x, elapsed);
+            }
+        }
+        self.base.observe([x[0], 0., x[2]], (elapsed - self.row_us(x[1])).max(0.));
+        self.refresh();
+    }
+    fn shrink_to(&mut self, pooled: &Self) {
+        self.base.shrink_to(&pooled.base);
+        for (local, pool) in self.segments.iter_mut().zip(&pooled.segments) { local.shrink_to(pool); }
+        self.refresh();
+    }
+    #[cfg(test)]
+    fn unmask(&mut self) {
+        for e in &mut self.segments {
+            e.identified.fill(true);
+            e.solve_with_prior([[0.; 3]; 3], e.prior_mean);
+        }
+        self.base.identified.fill(true);
+        self.base.solve_with_prior([[0.; 3]; 3], self.base.prior_mean);
+        self.refresh();
+    }
 }
 
 /// Megabytes of expert traffic per resource class.
@@ -501,13 +575,13 @@ type ClassBytes = [f64; MAX_RESOURCE_CLASSES];
 #[derive(Clone, Debug)]
 struct CostModel {
     /// [regime][class], x = [1, rows, MB].
-    layer: Vec<Vec<Estimator<3>>>,
+    layer: Vec<Vec<RowEstimator>>,
     /// [regime][concurrency], x = [1, rows, requests]; excludes the draft pass.
-    round: Vec<Vec<Estimator<3>>>,
+    round: Vec<Vec<RowEstimator>>,
     /// [regime][concurrency] draft pass, x = [1, requests, wide, wide * requests].
     draft: Vec<Vec<Estimator<4>>>,
     /// All-concurrency residual fits provide evidence-centred bucket priors.
-    pooled_round: Vec<Estimator<3>>,
+    pooled_round: Vec<RowEstimator>,
     pooled_draft: Vec<Estimator<4>>,
     /// [regime][concurrency][narrow, wide] draft passes observed.
     draft_samples: Vec<Vec<[u64; 2]>>,
@@ -519,9 +593,9 @@ impl CostModel {
     fn new(geometry: &PolicyGeometry, priced: &[Priced], seed: &PolicySeed) -> Self {
         let n0 = PRIOR_SAMPLES;
         let layer: Vec<_> = geometry.classes.iter()
-            .map(|class| Estimator::new(0.998, class.prior, class.prior_precision)).collect();
+            .map(|class| RowEstimator::new(0.998, class.prior, class.prior_precision)).collect();
         let n = seed.samples;
-        let round = Estimator::new(0.98, seed.round, [n, n * 16., n * 4.]);
+        let round = RowEstimator::new(0.98, seed.round, [n, n * 16., n * 4.]);
         let draft = Estimator::new(0.98, [seed.draft[0], seed.draft[1], 400., 50.], [n, n * 4., n0, n0 * 16.]);
         Self {
             layer: vec![layer; geometry.regimes],
@@ -556,7 +630,7 @@ impl CostModel {
         for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
             let layers = self.layers_in[class] as f64;
-            total += layers * (theta[0] + theta[1] * rows) + theta[2] * megabytes[class];
+            total += layers * (theta[0] + self.layer[regime][class].row_us(rows)) + theta[2] * megabytes[class];
         }
         total
     }
@@ -570,16 +644,16 @@ impl CostModel {
         self.draft_samples[regime][bucket].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
     }
     /// Marginal µs of one more row plus `megabytes` of new weight traffic.
-    fn marginal(&self, regime: usize, bucket: usize, megabytes: ClassBytes) -> f64 {
-        let mut total = self.round[regime][bucket].theta[1];
+    fn marginal(&self, regime: usize, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
+        let mut total = self.round[regime][bucket].marginal(rows);
         for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
-            total += self.layers_in[class] as f64 * theta[1] + theta[2] * megabytes[class];
+            total += self.layers_in[class] as f64 * self.layer[regime][class].marginal(rows) + theta[2] * megabytes[class];
         }
         total
     }
     fn snapshot(&self, regime: usize, bucket: usize) -> DraftCostSnapshot {
-        let pack = |e: &Estimator<3>| [e.theta[0], e.theta[1], e.theta[2], e.samples as f64, e.scale];
+        let pack = |e: &RowEstimator| [e.theta[0], e.theta[1], e.theta[2], e.samples as f64, e.scale];
         let draft = &self.draft[regime][bucket];
         DraftCostSnapshot {
             layers: self.layer[regime].iter().map(pack).collect(),
@@ -592,6 +666,11 @@ impl CostModel {
             draft_pooled: self.pooled_draft[regime].theta,
             draft_identified: draft.identified,
             layers_identified: self.layer[regime].iter().map(|e| e.identified).collect(),
+            row_knots: ROW_KNOTS,
+            layer_row_slopes: self.layer[regime].iter().map(|e| std::array::from_fn(|i| e.segments[i].theta[1])).collect(),
+            layer_row_identified: self.layer[regime].iter().map(|e| std::array::from_fn(|i| e.segments[i].identified[1])).collect(),
+            round_row_slopes: std::array::from_fn(|i| self.round[regime][bucket].segments[i].theta[1]),
+            round_row_identified: std::array::from_fn(|i| self.round[regime][bucket].segments[i].identified[1]),
         }
     }
 }
@@ -743,6 +822,7 @@ pub struct DraftPolicy {
     action_age: BTreeMap<(usize, usize, usize), u64>,
     /// Outstanding extent per request; independent lanes may share a regime.
     selected_requests: BTreeMap<u64, usize>,
+    selected_rows: BTreeMap<u64, usize>,
     /// Eligibility is recorded by selection, but skips age only on observation.
     selected_draft_room: BTreeMap<u64, bool>,
     skipped: BTreeMap<u64, u64>,
@@ -772,6 +852,7 @@ impl DraftPolicy {
             engaged: vec![vec![false; CONCURRENCY_BUCKETS]; geometry.regimes],
             since_width: vec![vec![[0; 2]; CONCURRENCY_BUCKETS]; geometry.regimes],
             selected_requests: BTreeMap::new(),
+            selected_rows: BTreeMap::new(),
             selected_draft_room: BTreeMap::new(), skipped: BTreeMap::new(),
             pooled: [Platt::new(); 2],
             action_age: BTreeMap::new(),
@@ -835,6 +916,7 @@ impl DraftPolicy {
     pub fn release(&mut self, id: u64) {
         self.history.remove(&id);
         self.selected_requests.remove(&id);
+        self.selected_rows.remove(&id);
         self.selected_draft_room.remove(&id);
         self.skipped.remove(&id);
         self.recent.remove(&id);
@@ -870,6 +952,9 @@ impl DraftPolicy {
             .map(|(position, &p)| self.request_probability(candidate.id, position, self.calibrated(position, p)))
             .collect()
     }
+
+    /// Last chosen verifier extent before grammar/output censoring, for traces.
+    pub fn selected_rows(&self, id: u64) -> Option<usize> { self.selected_rows.get(&id).copied() }
 
     /// Predicted lane µs for explicit lengths after a draft of `width`, if the
     /// fit is usable.
@@ -999,6 +1084,7 @@ impl DraftPolicy {
         let selection = self.select_core(regime, &ids, &cumulative, draft, max_rows, true);
         for (c, &length) in candidates.iter().zip(&selection.lengths) {
             self.selected_requests.insert(c.id, candidates.len());
+            self.selected_rows.insert(c.id, length + 1);
             // Empty proposals preserve an intentional pre-draft skip. A
             // selected row later censored by grammar must not age as a skip.
             if !c.confidence.is_empty() {
@@ -1150,7 +1236,7 @@ impl DraftPolicy {
                 if next > cumulative[index].len() { continue; }
                 let delta = self.peek_row(id, next);
                 let candidate_expected = expected + cumulative[index][next - 1];
-                let marginal = self.cost.marginal(regime, draft_concurrency_bucket(ids.len()), delta);
+                let marginal = self.cost.marginal(regime, draft_concurrency_bucket(ids.len()), rows as f64, delta);
                 let candidate_time = time + marginal.max(1.);
                 evaluated += 1;
                 if choice.is_none_or(|(_, e, t)| candidate_expected / candidate_time > e / t) {
@@ -1255,7 +1341,10 @@ impl DraftPolicy {
         if round.predicted_us.is_some() && round.requests.iter().any(|r| self.selected_requests.get(&r.id) != Some(&round.requests.len())) {
             return Err(DraftPolicyError::RequestExtent);
         }
-        for r in round.requests { self.selected_requests.remove(&r.id); }
+        for r in round.requests {
+            self.selected_requests.remove(&r.id);
+            self.selected_rows.remove(&r.id);
+        }
         let bucket = draft_concurrency_bucket(round.requests.len());
         let requests = round.requests.len() as f64;
         let drafted_requests = round.drafted_requests.unwrap_or(round.requests.len());
@@ -1748,6 +1837,26 @@ mod tests {
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, drafted_requests: None, wide: width > 5 }).unwrap();
         *token += accepted as u64;
+    }
+
+    #[test]
+    fn wide_plateau_preserves_narrow_row_marginals() {
+        let mut fit = RowEstimator::new(0.98, [100., 15., 4.], [0.01; 3]);
+        for n in 0..2400 {
+            let rows = 1. + (n % 8) as f64;
+            let mb = 10. + ((n / 8) % 7) as f64 * 10.;
+            fit.observe([1., rows, mb], 200. + 25. * rows.min(8.) + 4. * mb);
+        }
+        let before = fit.marginal(4.);
+        for n in 0..4800 {
+            let rows = 32. + (n % 97) as f64;
+            let mb = 10. + ((n / 97) % 7) as f64 * 10.;
+            fit.observe([1., rows, mb], 200. + 25. * rows.min(8.) + 4. * mb);
+        }
+        assert!((before - 25.).abs() < 5., "fresh slope {before}");
+        assert!((fit.marginal(4.) - 25.).abs() < 5., "narrow slope {}", fit.marginal(4.));
+        assert_eq!(fit.marginal(4.), before, "wide observations cannot update narrow segments");
+        assert!(fit.marginal(64.) < 2., "wide slope {}", fit.marginal(64.));
     }
 
     #[test]
@@ -2251,15 +2360,13 @@ mod tests {
         for fits in &mut unmasked.cost.layer {
             for fit in fits {
                 masked += fit.identified.iter().filter(|&&v| !v).count();
-                fit.identified.fill(true);
-                fit.solve_with_prior([[0.; 3]; 3], fit.prior_mean);
+                fit.unmask();
             }
         }
         for fits in &mut unmasked.cost.round {
             for fit in fits {
                 masked += fit.identified.iter().filter(|&&v| !v).count();
-                fit.identified.fill(true);
-                fit.solve_with_prior([[0.; 3]; 3], fit.prior_mean);
+                fit.unmask();
             }
         }
         assert!(masked > 0);

@@ -425,7 +425,9 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
             "round_local": fit.round_local, "round_pooled": fit.round_pooled,
             "round_identified": fit.round_identified, "draft_local": fit.draft_local,
             "draft_pooled": fit.draft_pooled, "draft_identified": fit.draft_identified,
-            "layers_identified": fit.layers_identified})
+            "layers_identified": fit.layers_identified, "row_knots": fit.row_knots,
+                    "layer_row_slopes": fit.layer_row_slopes, "layer_row_identified": fit.layer_row_identified,
+                    "round_row_slopes": fit.round_row_slopes, "round_row_identified": fit.round_row_identified})
     }).collect();
     let value = serde_json::json!({
         "mode": "shared",

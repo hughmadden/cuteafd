@@ -135,7 +135,58 @@ fn confidence<'a>(request: &RoundRequest<'a>) -> Option<&'a [f64]> {
 /// Feed one completed round to the policy.
 pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Result<(), ObserveError> {
     let observation = build(record, policy.widths()[0])?;
+    trace_round(policy, record);
     Ok(policy.observe(observation.view())?)
+}
+
+/// Opt-in complete observation capture, including dSpark head evidence. The
+/// selector-only ConfidencePolicy trace does not cover that serving path.
+fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static TRACE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    let Some(trace) = TRACE.get_or_init(|| {
+        let (_, path) = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_DRAFT_CONFIDENCE_TRACE")?;
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => Some(Mutex::new(std::io::BufWriter::new(file))),
+            Err(error) => { tracing::warn!(%error, "draft round trace open failed"); None }
+        }
+    }) else { return };
+    let geometry = policy.geometry();
+    let rows = record.routes.rows();
+    let topk = usize::from(geometry.topk);
+    let routes = record.routes.flat();
+    let megabytes: Vec<_> = geometry.layers.iter().enumerate().map(|(layer, resource)| {
+        if resource.class.is_none() { return 0.; }
+        let mut counts = vec![0usize; usize::from(geometry.experts)];
+        for &expert in &routes[layer * rows * topk..(layer + 1) * rows * topk] {
+            if let Some(count) = counts.get_mut(usize::from(expert)) { *count += 1; }
+        }
+        counts.into_iter().map(|n| n.div_ceil(usize::from(resource.group_rows)) as f64).sum::<f64>()
+            * resource.slice_bytes / 1e6
+    }).collect();
+    let requests: Vec<_> = record.requests.iter().map(|request| {
+        let raw = request.evidence.and_then(|e| e.prior());
+        let calibrated = raw.map(|confidence| policy.probabilities(cuteafd_core::DraftCandidate { id: request.id, confidence }));
+        serde_json::json!({"id": request.id, "chosen_rows": policy.selected_rows(request.id), "verified_rows": request.rows,
+            "accepted_rows": request.accepted, "source": format!("{:?}", request.source),
+            "raw_confidence": raw, "calibrated_confidence": calibrated})
+    }).collect();
+    let fit = policy.cost_snapshot(record.shared, record.requests.len());
+    let value = serde_json::json!({"type": "draft_round", "round": policy.stats().rounds,
+        "shared": record.shared, "requests": requests, "rows": rows, "routes": routes,
+        "route_layout": [geometry.layers.len(), rows, topk],
+        "geometry": geometry.layers.iter().map(|l| serde_json::json!({"class": l.class,
+            "slice_bytes": l.slice_bytes, "group_rows": l.group_rows, "timed": l.timed})).collect::<Vec<_>>(),
+        "megabytes": megabytes, "layer_us": record.layer_us,
+        "total_us": record.times.total_us, "draft_us": record.times.draft_us,
+        "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
+        "predicted_us": record.predicted, "row_knots": fit.row_knots,
+        "layer_row_slopes": fit.layer_row_slopes, "round_row_slopes": fit.round_row_slopes,
+        "layer_row_identified": fit.layer_row_identified, "round_row_identified": fit.round_row_identified});
+    if let Ok(mut trace) = trace.lock() {
+        if let Err(error) = writeln!(trace, "{value}") { tracing::warn!(%error, "draft round trace failed"); }
+    }
 }
 
 /// What a lane carries from its draft pass and length selection to the

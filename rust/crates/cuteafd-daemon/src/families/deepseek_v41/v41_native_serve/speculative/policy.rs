@@ -175,7 +175,9 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
                     "round_local": fit.round_local, "round_pooled": fit.round_pooled,
                     "round_identified": fit.round_identified, "draft_local": fit.draft_local,
                     "draft_pooled": fit.draft_pooled, "draft_identified": fit.draft_identified,
-                    "layers_identified": fit.layers_identified})
+                    "layers_identified": fit.layers_identified, "row_knots": fit.row_knots,
+                    "layer_row_slopes": fit.layer_row_slopes, "layer_row_identified": fit.layer_row_identified,
+                    "round_row_slopes": fit.round_row_slopes, "round_row_identified": fit.round_row_identified})
             }).collect::<Vec<_>>()),
             "layers": classes,
             "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
