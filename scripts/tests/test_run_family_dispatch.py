@@ -1127,6 +1127,33 @@ def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROW_BUCKETS=off\n", False),
+                                             ("GLM5_FLASH_DECODE_ROW_BUCKETS=on\n", True),
+                                             ("GLM5_FLASH_DECODE_ROW_BUCKETS=on\nGLM5_FLASH_DECODE_ROWS=128\n"
+                                              "GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", True)])
+def test_glmf_decode_row_buckets_are_forwarded_only_when_on(tmp_path, keys, forwarded):
+    """GLM5_FLASH_DECODE_ROW_BUCKETS=on reaches the coordinator as --decode-row-buckets; off, the
+    default, passes nothing; no Spark worker sees it."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert ("--decode-row-buckets" in launch) == forwarded and launch.count("--decode-row-buckets") == int(forwarded)
+    assert not any("--decode-row-buckets" in line for line in lines if "cuteafd expertd-native" in line)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROW_BUCKETS=on\n", "without a head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROW_BUCKETS=fine\n", "GLM5_FLASH_DECODE_ROW_BUCKETS must be on or off"),
+])
+def test_glmf_decode_row_buckets_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()

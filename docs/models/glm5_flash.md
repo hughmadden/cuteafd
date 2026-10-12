@@ -102,6 +102,17 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   --decode-rows)`, so prefill lanes narrower than 128 rows still take a
   127-row verify step through the experts. The launcher passes the decode
   rows to the encoder placement plan as well as to serving.
+- Decode row buckets: `GLM5_FLASH_DECODE_ROW_BUCKETS=on`
+  (`--decode-row-buckets`, opt-in, one GPU) pads every lazily captured
+  speculative step past 16 rows to a row bucket: whole steps of 4 rows to 64
+  and of 8 to 128, never past the verify budget. Lazily captured decode graphs
+  (`GLM5_FLASH_GRAPH_BUDGET_MIB`) key a step by its rows, so 16 sequences with
+  0-3 drafts each capture a graph set for every row count from 16 to 64 (49
+  shapes; 113 to 128 rows); with the buckets they hold 13 (21). The padded
+  rows are masked and stay out of the router and off the expert wire, as the
+  startup graphs' are, and a real row computes the same bits padded or not
+  (`glmf-golden --padding-check`). No device bytes; startup graphs keep their
+  own buckets and set.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`). Marks live in a
   device arena of 2C + 2 marks (147.6 MB each with an FP32 state), which both
