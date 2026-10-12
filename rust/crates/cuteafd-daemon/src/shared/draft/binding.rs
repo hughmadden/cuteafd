@@ -12,9 +12,8 @@
 //! - a censored request's evidence stops at its accepted prefix, so the
 //!   position the verifier never judged is not booked as a miss;
 //! - a round with any copy keeps no prediction (the policy did not select its
-//!   shape); a mixed draft pass with an explicit batch extent still teaches
-//!   its actual drafter cost. Unmigrated adapters without an extent omit that
-//!   sample and remove its time from the round total.
+//!   shape), and a draft pass beside a copy covered only some requests, so it
+//!   gives no draft-cost sample and its time leaves the round total.
 use super::clock::RoundTimes;
 use super::evidence::{Censor, DraftSource, Evidence};
 use super::routes::{RoundRoutes, RouteError};
@@ -51,8 +50,6 @@ pub(crate) struct RoundRequest<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DraftPass {
     pub width: usize,
-    /// Actual drafter batch extent; None preserves an unmigrated adapter's pricing.
-    pub requests: Option<usize>,
 }
 
 /// Everything one completed lane round reports.
@@ -79,7 +76,6 @@ pub(crate) struct Observation<'a> {
     layer_us: Vec<Option<f64>>,
     total_us: f64,
     draft_us: f64,
-    drafted_requests: Option<usize>,
     wide: bool,
     predicted_us: Option<f64>,
 }
@@ -88,7 +84,7 @@ impl Observation<'_> {
     pub fn view(&self) -> DraftRoundObservation<'_> {
         DraftRoundObservation { shared: self.shared, requests: &self.requests, routes: self.routes,
             layer_us: &self.layer_us, total_us: self.total_us, predicted_us: self.predicted_us,
-            draft_us: self.draft_us, drafted_requests: self.drafted_requests, wide: self.wide }
+            draft_us: self.draft_us, wide: self.wide }
     }
 }
 
@@ -109,14 +105,12 @@ pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result
     let copied = record.requests.iter().any(|request| request.source == DraftSource::Copy);
     let total = record.times.total_us;
     let draft = record.times.draft_us.unwrap_or(0);
-    let extent_known = record.draft.is_some_and(|pass| pass.requests.is_some());
-    let (total_us, draft_us) = match (record.draft.is_some(), copied && !extent_known) {
+    let (total_us, draft_us) = match (record.draft.is_some(), copied) {
         (true, false) => (total as f64, draft as f64),
         (true, true) => (total.saturating_sub(draft) as f64, f64::NAN),
         (false, _) => (total as f64, f64::NAN),
     };
     Ok(Observation { shared: record.shared, requests, routes: record.routes.flat(), layer_us, total_us, draft_us,
-        drafted_requests: record.draft.and_then(|pass| pass.requests),
         wide: record.draft.is_some_and(|pass| pass.width > native_width),
         predicted_us: if copied { None } else { record.predicted } })
 }
@@ -144,8 +138,6 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
 pub(crate) struct LaneRound {
     /// Width drafted this round (0: no draft pass ran).
     pub width: usize,
-    /// Actual sequences passed to the drafter, before grammar truncation.
-    pub drafted_requests: usize,
     /// The last selection saw an active peer lane.
     pub shared: bool,
     /// The policy's prediction for the selected shape, awaiting observation.
@@ -156,7 +148,7 @@ pub(crate) struct LaneRound {
 
 impl LaneRound {
     pub fn new(layers: usize, topk: usize) -> Self {
-        Self { width: 0, drafted_requests: 0, shared: false, predicted: None, routes: RoundRoutes::new(layers, topk) }
+        Self { width: 0, shared: false, predicted: None, routes: RoundRoutes::new(layers, topk) }
     }
 }
 
@@ -185,11 +177,9 @@ mod tests {
         let requests = [request(1, 4, 2, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(2, 1, 1, DraftSource::Undrafted, None, None)];
         let routes = routes(5);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 7, requests: Some(1) })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 7 })), 5).unwrap();
         let view = built.view();
         assert_eq!((view.total_us, view.draft_us, view.wide, view.predicted_us), (5_000., 1_200., true, Some(4_000.)));
-        assert_eq!(view.drafted_requests, Some(1));
-        assert_eq!(view.requests.len(), 2);
         assert_eq!(view.layer_us, [None, Some(10.)]);
         assert_eq!((view.requests[0].confidence, view.requests[1].confidence), (Some(&p[..]), None));
         assert_eq!(view.routes.len(), 2 * 5 * 2);
@@ -204,26 +194,11 @@ mod tests {
         let requests = [request(1, 3, 2, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(2, 4, 4, DraftSource::Copy, Some(Evidence::Head(&p)), None)];
         let routes = routes(7);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: None })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5 })), 5).unwrap();
         let view = built.view();
         assert_eq!((view.total_us, view.predicted_us, view.wide), (3_800., None, false));
         assert!(view.draft_us.is_nan());
         assert_eq!((view.requests[0].confidence.is_some(), view.requests[1].confidence), (true, None));
-    }
-
-    #[test]
-    fn mixed_passes_with_explicit_extent_fit_the_actual_drafter_batch() {
-        let p = [0.9, 0.8];
-        let requests = [request(1, 3, 2, DraftSource::Neural, Some(Evidence::Head(&p)), None),
-            request(2, 4, 4, DraftSource::Copy, Some(Evidence::Head(&p)), None),
-            request(3, 1, 1, DraftSource::Undrafted, None, None)];
-        let routes = routes(8);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: Some(1) })), 5).unwrap();
-        let view = built.view();
-        assert_eq!((view.total_us, view.draft_us, view.drafted_requests), (5_000., 1_200., Some(1)));
-        assert_eq!(view.requests.len(), 3);
-        assert_eq!(view.predicted_us, None);
-        assert_eq!(view.requests[1].confidence, None);
     }
 
     #[test]
@@ -234,39 +209,9 @@ mod tests {
             request(3, 5, 3, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(4, 2, 1, DraftSource::Neural, Some(Evidence::History), None)];
         let routes = routes(17);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: None })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5 })), 5).unwrap();
         let confidence: Vec<_> = built.view().requests.iter().map(|r| r.confidence.map(<[f64]>::len)).collect();
         assert_eq!(confidence, [Some(2), Some(0), Some(4), None]);
-    }
-
-    #[test]
-    fn generic_binding_transcript_keeps_undrafted_anchors_and_complete_resources() {
-        use cuteafd_core::{DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
-        let geometry = PolicyGeometry { layers: vec![LayerResource {
-            class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
-            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx()], regimes: 1 };
-        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
-        let p = [0.9; 5];
-        for _ in 0..160 {
-            let candidates = [DraftCandidate { id: 1, confidence: &p }, DraftCandidate { id: 2, confidence: &[] }];
-            let selection = policy.select_drafted_within(false, &candidates, 5, 8, 1).unwrap();
-            let lengths = selection.as_ref().map_or(vec![5, 0], |s| s.lengths.clone());
-            assert_eq!(lengths[1], 0);
-            let requests = [request(1, lengths[0] + 1, lengths[0] + 1, DraftSource::Neural,
-                Some(Evidence::Head(&p)), None), request(2, 1, 1, DraftSource::Undrafted, None, None)];
-            let routes = routes(lengths[0] + 2);
-            observe(&mut policy, &RoundRecord { shared: false, requests: &requests, routes: &routes,
-                layer_us: &[Some(100.), Some(100.)], times: RoundTimes { total_us: 800, draft_us: Some(200) },
-                draft: Some(DraftPass { width: 5, requests: Some(1) }),
-                predicted: selection.as_ref().map(|s| s.predicted_us) }).unwrap();
-        }
-        assert!(policy.engaged(false, 2));
-        let fit = policy.cost_snapshot(false, 2);
-        assert_eq!(fit.layers[0][3], 320.);
-        assert_eq!(fit.round[3], 160.);
-        assert_eq!(fit.draft[4], 160.);
-        assert_eq!(policy.stats().emitted_requests, 320);
     }
 
     #[test]

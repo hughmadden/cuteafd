@@ -141,8 +141,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// block; a width-7 load can also draft 5 each round, chosen by the policy.
     pub(crate) fn bind_policy(&mut self, geometry: cuteafd_core::PolicyGeometry) -> Result<()> {
         ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
-        let seed = cuteafd_core::PolicySeed::weak(geometry.max_positions);
-        let policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
+        let policy = cuteafd_core::DraftPolicy::new(geometry, self.fixed)?;
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
         Ok(())
@@ -162,7 +161,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         round.predicted = None;
         round.shared = shared;
         let width = round.width;
-        // Every verifier request is present; undrafted/copy members have zero room.
+        // Every request of the round copied: it has no dSpark lengths to choose.
         if requests.is_empty() { return Ok(None); }
         let Some(policy) = &mut self.policy else { return Ok(None) };
         let probabilities = requests.iter().map(|&(id, maximum)| {
@@ -174,8 +173,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let candidates: Vec<_> = requests.iter().zip(&probabilities)
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
-        let drafted_requests = round.drafted_requests;
-        let selection = policy.select_drafted_within(shared, &candidates, width, usize::MAX, drafted_requests)?;
+        let selection = policy.select(shared, &candidates, width)?;
         Ok(match selection {
             Some(selection) => {
                 tracing::debug!(target: "cuteafd::draft_policy", lane, shared,
@@ -189,7 +187,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             None => {
                 let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
                 let full: Vec<_> = requests.iter().map(|r| r.1).collect();
-                self.lanes[lane].predicted = policy.predict_drafted(shared, &ids, &full, width, drafted_requests);
+                self.lanes[lane].predicted = policy.predict(shared, &ids, &full, width);
                 None
             }
         })
@@ -230,7 +228,6 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         };
         self.chains[chain].set_width(width)?;
         self.lanes[lane].width = width;
-        self.lanes[lane].drafted_requests = active.len();
         Ok(width)
     }
     pub fn release(&mut self, id: u64) -> Result<()> {
@@ -451,7 +448,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn skip_copied(&mut self, lane: usize, copied: &[u64], drafting: bool) -> Result<()> {
         ensure!(lane < self.lanes.len(), "invalid draft lane");
         for id in copied { self.confidence_trace.remove(id); }
-        if !drafting { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; }
+        if !drafting { self.lanes[lane].width = 0; }
         Ok(())
     }
 
@@ -503,7 +500,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
         if active.is_empty() {
-            self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0;
+            self.lanes[lane].width = 0;
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
@@ -603,7 +600,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
-        if active.is_empty() { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; return Ok(outputs); }
+        if active.is_empty() { self.lanes[lane].width = 0; return Ok(outputs); }
         let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
         let width = self.apply_width(lane, 0, &widths)?;
         let count = active.len();

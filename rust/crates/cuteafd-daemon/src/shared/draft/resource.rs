@@ -239,28 +239,23 @@ pub(crate) struct Selection {
 /// cold drafts.
 pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize, max_rows: usize)
     -> Selection {
-    select_drafted(policy, candidates, width, max_rows, candidates.len())
-}
-
-pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
-    max_rows: usize, drafted_requests: usize) -> Selection {
     let positions = policy.geometry().max_positions;
     let confidence: Vec<&[f64]> = candidates.iter()
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
     let cores: Vec<DraftCandidate<'_>> = candidates.iter().zip(&confidence)
         .map(|(c, &confidence)| DraftCandidate { id: c.id, confidence }).collect();
     let minimum = |c: &Candidate<'_>, available: usize| if c.selector && c.cold { START_DRAFTS.min(available) } else { 0 };
-    let cold = policy.cold_drafts();
+    let cold = policy.cold_drafts().unwrap_or(usize::MAX);
     let mut lengths: Vec<usize> = confidence.iter().map(|c| c.len().min(cold)).collect();
     let mut predicted = None;
-    if let Ok(Some(selection)) = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests) {
+    if let Ok(Some(selection)) = policy.select_within(false, &cores, width, max_rows) {
         lengths = selection.lengths;
         predicted = Some(selection.predicted_us);
         let ratio = selection.expected_tokens / selection.predicted_us;
         if let [only] = candidates {
             let n = START_DRAFTS.min(confidence[0].len());
             if only.selector && !only.cold && lengths[0] != n {
-                if let Some((tokens, us)) = policy.evaluate_drafted(false, &cores, &[n], width, drafted_requests) {
+                if let Some((tokens, us)) = policy.evaluate(false, &cores, &[n], width) {
                     if ratio < tokens / us * REFERENCE_MARGIN {
                         lengths[0] = n;
                         predicted = Some(us);
@@ -323,10 +318,10 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
         serde_json::json!({"id": c.id, "prior": c.confidence, "calibrated": probabilities,
             "chosen": selection.lengths[i], "cold_request": cold_request, "candidates": candidates})
     }).collect();
-    let cost = policy.cost_snapshot(false, candidates.len());
-    serde_json::json!({"engaged": policy.engaged(false, candidates.len()), "requests": requests,
+    let cost = policy.cost_snapshot(false);
+    serde_json::json!({"engaged": policy.engaged(false), "requests": requests,
         "chosen": selection.lengths, "predicted_us": selection.predicted,
-        "platt": policy.calibration(),
+        "corrections": policy.corrections(false), "platt": policy.calibration(),
         "position_reached": policy.stats().position_reached,
         "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
 }
@@ -365,13 +360,6 @@ pub(crate) struct Verified<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe(policy: &mut DraftPolicy, requests: &[Verified<'_>], routes: &RoundRoutes,
     layer_us: &[Option<f64>], times: RoundTimes, width: usize, predicted: Option<f64>) -> Result<(), ObserveError> {
-    observe_drafted(policy, requests, routes, layer_us, times, width, predicted, None)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>], routes: &RoundRoutes,
-    layer_us: &[Option<f64>], times: RoundTimes, width: usize, predicted: Option<f64>,
-    drafted_requests: Option<usize>) -> Result<(), ObserveError> {
     let features: Vec<Vec<SelectorFeatures>> = requests.iter().map(|r| r.features.unwrap_or_default().iter()
         .map(|&[margin, p_top, entropy, rank]| SelectorFeatures { margin, p_top, entropy, rank }).collect()).collect();
     let round: Vec<RoundRequest<'_>> = requests.iter().zip(&features).map(|(r, features)| RoundRequest {
@@ -384,7 +372,7 @@ pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>
         censor: r.censor,
     }).collect();
     binding::observe(policy, &RoundRecord { shared: false, requests: &round, routes, layer_us, times,
-        draft: (width > 0).then_some(DraftPass { width, requests: drafted_requests }), predicted })
+        draft: (width > 0).then_some(DraftPass { width }), predicted })
 }
 
 static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
@@ -398,7 +386,7 @@ pub(crate) fn snapshot() -> serde_json::Value {
 pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: Option<(u64, u64)>) {
     let stats = policy.stats();
     let geometry = policy.geometry();
-    let snapshot = policy.cost_snapshot(false, 1);
+    let snapshot = policy.cost_snapshot(false);
     let classes: Vec<_> = geometry.classes.iter().zip(&snapshot.layers).map(|(class, c)| serde_json::json!({
         "class": class.label, "layers": geometry.layers.iter().filter(|l| l.class.is_some_and(|k|
             geometry.classes.get(usize::from(k)).is_some_and(|g| g.label == class.label))).count(),
@@ -415,21 +403,15 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         "accept_rate": if stats.position_reached[p] > 0 {
             stats.position_accepted[p] as f64 / stats.position_reached[p] as f64 } else { 0. },
     })).collect();
-    let buckets: Vec<_> = [1, 4, 8, 16].into_iter().map(|requests| {
-        let fit = policy.cost_snapshot(false, requests);
-        let (timed, error) = policy.prediction_health(false, requests);
-        serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
-            "requests_up_to": if requests == 16 { None } else { Some(requests) },
-            "warm": policy.warm(false, requests), "engaged": policy.engaged(false, requests),
-            "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft})
-    }).collect();
     let value = serde_json::json!({
         "mode": "shared",
-        "concurrency_buckets": buckets,
-        "warm": policy.warm(false, 1),
-        "engaged": policy.engaged(false, 1),
-        "prediction_health": { "timed_rounds": policy.prediction_health(false, 1).0,
-            "relative_error": policy.prediction_health(false, 1).1 },
+        "warm": policy.warm(false),
+        "engaged": policy.engaged(false),
+        "prediction_health": { "timed_rounds": policy.prediction_health(false).0,
+            "relative_error": policy.prediction_health(false).1 },
+        "corrections": policy.corrections(false).iter().enumerate().filter(|(_, c)| c[2] > 0.)
+            .map(|(bucket, c)| serde_json::json!({"requests_up_to": 1usize << bucket, "intercept_us": c[0],
+                "us_per_row": c[1], "samples": c[2]})).collect::<Vec<_>>(),
         "rounds": stats.rounds, "observed_rounds": observed, "unobserved_rounds": skipped,
         "selected_rounds": stats.selected_rounds,
         "verified_rows": stats.verified_rows, "verified_drafts": stats.verified_drafts,
@@ -468,7 +450,7 @@ mod tests {
     #[test]
     fn geometry_has_dense_layers_without_class_and_one_class_per_home() {
         let g = geometry(&homes(true), 288, 8, 64, 7, 0).unwrap();
-        DraftPolicy::new(g.clone(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        DraftPolicy::new(g.clone(), false).unwrap();
         assert_eq!((g.layers.len(), g.experts, g.topk, g.max_requests, g.widths.clone(), g.regimes),
             (45, 288, 8, 64, vec![7], 1));
         assert!(g.layers[..3].iter().all(|l| l.class.is_none()));
@@ -495,12 +477,10 @@ mod tests {
     }
 
     fn warm_policy(spark: bool) -> DraftPolicy {
-        let mut policy = DraftPolicy::new(geometry(&homes(spark), 288, 8, 64, 7, 0).unwrap(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        let mut policy = DraftPolicy::new(geometry(&homes(spark), 288, 8, 64, 7, 0).unwrap(), false).unwrap();
         let mut routes = RoundRoutes::new(45, 8);
-        for round in 0..400usize {
-            let count = if round < 200 { 1 } else { 3 };
-            let per = 1 + round % 8;
-            let rows = count * per;
+        for round in 0..200usize {
+            let rows = 1 + round % 8;
             routes.begin(rows);
             for layer in 0..45 {
                 if layer < 3 { routes.dense(layer).unwrap(); continue; }
@@ -510,18 +490,18 @@ mod tests {
             let layer_us: Vec<Option<f64>> = (0..45).map(|l| (l > 0).then_some(300. + 40. * rows as f64)).collect();
             let total = 4_000. + layer_us.iter().flatten().sum::<f64>() + 3_000.;
             let p = [0.8; 7];
-            let request: Vec<_> = (0..count).map(|id| Verified { id: id as u64 + 1, rows: per, accepted: per.min(3), source: DraftSource::Neural,
-                prior: Some(&p[..per - 1]), features: None, censor: None }).collect();
+            let request = [Verified { id: 1, rows, accepted: rows.min(3), source: DraftSource::Neural,
+                prior: Some(&p[..rows - 1]), features: None, censor: None }];
             observe(&mut policy, &request, &routes, &layer_us, RoundTimes { total_us: total as u64,
                 draft_us: Some(3_000) }, 7, None).unwrap();
         }
-        assert!(policy.warm(false, 1));
+        assert!(policy.warm(false));
         policy
     }
 
     #[test]
     fn cold_policy_verifies_every_draft_within_limits_and_cold_dflash_floors_at_five() {
-        let mut policy = DraftPolicy::new(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        let mut policy = DraftPolicy::new(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), false).unwrap();
         let p = [0.1; 7];
         let candidates = [Candidate { id: 1, prior: &p, limit: 7, selector: true, cold: true },
             Candidate { id: 2, prior: &p, limit: 3, selector: false, cold: false },
@@ -546,7 +526,7 @@ mod tests {
         assert_eq!(trace["requests"][0]["candidates"].as_array().unwrap().len(), 7);
         assert_eq!(trace["requests"][0]["calibrated"].as_array().unwrap().len(), 6);
         assert_eq!(trace["requests"][0]["chosen"], chosen.lengths[0]);
-        let cost = policy.cost_snapshot(false, 1);
+        let cost = policy.cost_snapshot(false);
         assert_eq!(trace["cost"]["round"], serde_json::json!(cost.round));
         assert_eq!(trace["cost"]["layers"], serde_json::json!(cost.layers));
         assert_eq!(trace["cost"]["draft"], serde_json::json!(cost.draft));
@@ -567,7 +547,7 @@ mod tests {
         let prices = trace["requests"][0]["candidates"].as_array().unwrap();
         assert_eq!(prices.len(), 8);
         assert!(prices.iter().all(|p| p["predicted_us"].as_f64().is_some_and(|us| us > 0.)));
-        assert!(!policy.engaged(false, 1));
+        assert!(!policy.engaged(false));
         assert_eq!(policy.stats().rounds, 0);
         assert_eq!(select(&mut policy, &candidate, 7, 64).lengths, chosen.lengths);
     }
@@ -590,7 +570,7 @@ mod tests {
 
     #[test]
     fn censored_stops_on_accepted_drafts_offer_only_their_accepted_prefix() {
-        let mut policy = DraftPolicy::new(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        let mut policy = DraftPolicy::new(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), false).unwrap();
         let mut routes = RoundRoutes::new(45, 8);
         routes.begin(9);
         for layer in 0..45 {
@@ -620,7 +600,7 @@ mod tests {
     fn a_seeded_cold_policy_verifies_its_cold_drafts_within_the_row_budget() {
         let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, COPY_EXTENSION).unwrap(), seed())
             .unwrap();
-        assert!(!policy.engaged(false, 1));
+        assert!(!policy.engaged(false));
         let p = [0.1; 7];
         let long = [0.9; 20];
         let candidates = [Candidate { id: 1, prior: &p, limit: 7, selector: false, cold: false },
