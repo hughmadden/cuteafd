@@ -162,7 +162,7 @@ def benches(source, root, args, env):
         test_s += seconds
         text = test_log.read_text(errors='replace')
         totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(text)]
-        ran = sum(t[0] for t in totals)
+        ran = sum(t[0] + t[1] for t in totals)
         medians = BENCH_MEDIANS.findall(text)
         if medians:
             result['medians'][test] = {name: float(value) for name, value in BENCH_VALUE.findall(medians[-1])}
