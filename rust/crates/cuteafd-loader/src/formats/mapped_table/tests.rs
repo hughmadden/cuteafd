@@ -234,29 +234,60 @@ fn all_backends_gather_identical_random_cold_and_warm_rows() -> TestResult {
         expected[slot * width..(slot + 1) * width]
             .copy_from_slice(&payload[row as usize * width..(row as usize + 1) * width]);
     }
-    for backend in [TableBackend::Mmap, TableBackend::MincoreRouted, TableBackend::Uring] {
-        // SAFETY: the test owns immutable shards until this table is dropped.
-        let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
-        table.select_backend(backend);
-        if table.backend() != backend {
-            assert!(std::env::var_os("CUTEAFD_REQUIRE_URING").is_none(),
-                "required backend {backend:?} unavailable");
-            eprintln!("SKIP {backend:?} parity: kernel/seccomp disallows io_uring");
-            continue;
+    for (backend, buffered) in [(TableBackend::Mmap, false), (TableBackend::MincoreRouted, false),
+        (TableBackend::Uring, false), (TableBackend::MincoreRouted, true), (TableBackend::Uring, true)] {
+        for mixed in [false, true] {
+            // SAFETY: the test owns immutable shards until this table is dropped.
+            let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
+            table.select_backend(backend);
+            if table.backend() != backend {
+                assert!(std::env::var("CUTEAFD_REQUIRE_URING").as_deref() != Ok("1"),
+                    "required backend {backend:?} unavailable");
+                eprintln!("SKIP {backend:?} parity: kernel/seccomp disallows io_uring");
+                continue;
+            }
+            if buffered {
+                for part in &table.parts { part.nowait.store(false, Ordering::Relaxed); }
+                table.stats.nowait.store(false, Ordering::Relaxed);
+            }
+            // Evict whole files, including the partial page before the payload.
+            // SAFETY: fadvise only operates on these live immutable test fds.
+            for part in &table.parts {
+                assert_eq!(unsafe { libc::posix_fadvise(part.file.as_raw_fd(), 0, 0,
+                    libc::POSIX_FADV_DONTNEED) }, 0);
+                let pages: Vec<_> = (0..part.mapped_len.div_ceil(page)).map(|p| (0, p)).collect();
+                let mut resident = vec![false; pages.len()];
+                uring::resident(part, &pages, &mut resident, &mut Vec::new())?;
+                assert!(resident.iter().all(|&hit| !hit), "test file is not fully cold");
+            }
+            if mixed {
+                let row = table.row(0)?;
+                for &byte in row.iter().step_by(page) { std::hint::black_box(byte); }
+            }
+            let residency = table.residency(&rows, false)?;
+            assert!(residency.iter().any(|&hit| !hit));
+            assert_eq!(residency.iter().any(|&hit| hit), mixed);
+            let before = table.stats().snapshot();
+            let mut cold = vec![0xa5; expected.len()];
+            table.gather_slots(&rows, &slots, &mut cold)?;
+            assert_eq!(cold, expected, "cold/mixed {backend:?} buffered={buffered}");
+            assert_eq!(table.backend(), backend, "runtime fallback is not qualification");
+            let delta = table.stats().snapshot().since(&before);
+            assert!(delta.page_misses > 0);
+            if mixed && buffered && backend == TableBackend::MincoreRouted {
+                assert!(delta.resident_copy_rows > 0, "resident memcpy path was not exercised");
+            }
+            assert!(table.residency(&rows, false)?.iter().all(|&resident| resident));
+            let before = table.stats().snapshot();
+            let mut warm = vec![0x5a; expected.len()];
+            table.gather_slots(&rows, &slots, &mut warm)?;
+            assert_eq!(warm, expected, "warm {backend:?} buffered={buffered}");
+            assert_eq!(warm, cold);
+            assert_eq!(table.backend(), backend);
+            if buffered && backend == TableBackend::MincoreRouted {
+                assert_eq!(table.stats().snapshot().since(&before).resident_copy_rows, rows.len() as u64);
+            }
         }
-        // Previous mappings are dropped before eviction, so mincore certifies cold rows.
-        for part in &table.parts { assert_eq!(uring::dontneed(part), 0); }
-        assert!(table.residency(&rows, false)?.iter().all(|&resident| !resident));
-        let mut cold = vec![0xa5; expected.len()];
-        table.gather_slots(&rows, &slots, &mut cold)?;
-        assert_eq!(cold, expected, "cold {backend:?}");
-        assert_eq!(table.backend(), backend, "runtime fallback is not qualification");
-        assert!(table.residency(&rows, false)?.iter().all(|&resident| resident));
-        let mut warm = vec![0x5a; expected.len()];
-        table.gather_slots(&rows, &slots, &mut warm)?;
-        assert_eq!(warm, expected, "warm {backend:?}");
-        assert_eq!(warm, cold);
-        assert_eq!(table.backend(), backend);
     }
     Ok(())
 }
