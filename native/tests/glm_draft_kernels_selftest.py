@@ -1,7 +1,8 @@
 """GLM 5.3 Flash drafter kernels: the vocabulary head's tensor-op launch and the FP8 GEMM modes.
 
 Usage: python native/tests/glm_draft_kernels_selftest.py /path/to/libcuteafd_native.so
-           [--head SHARD.safetensors] [--quick]
+           [--head SHARD.safetensors] [--head-shape VOCAB WIDTH] [--head-only]
+           [--head-rows 8,64] [--profile-head] [--quick]
 
 Run with Python containing CUDA PyTorch, on one GPU.
 
@@ -30,7 +31,7 @@ import sys
 import torch
 
 P = C.c_void_p
-VOCAB, WIDTH = 154880, 4096
+DEFAULT_HEAD_SHAPE = (154880, 4096)
 # The DFlash2 drafter's GEMMs (k, n): attention and MLP convolutions, q|k|v, o, gate|up, down,
 # the selector projection, and the context update's fc and k|v rows.
 SHAPES = [(4096, 1024), (4096, 6144), (4096, 4096), (4096, 24576), (12288, 4096), (4096, 256), (20480, 4096),
@@ -46,6 +47,8 @@ def bind(path):
         "cuteafd_vocabulary_head_launch_width": ([P, P, P, P, C.c_int32, P], C.c_int32),
         "cuteafd_vocabulary_head_launch_tensor_op": ([P, P, P, P, C.c_int32, P], C.c_int32),
         "cuteafd_v41_markov_destroy": ([P], C.c_int32),
+        "cuteafd_glm_dflash_topk_workspace": ([C.c_int32], C.c_uint64),
+        "cuteafd_glm_dflash_topk": ([P, P, P, P, C.c_int32, C.c_int32, C.c_int32, C.c_int32, P], C.c_int32),
         "cuteafd_fp8_w8a16_pack": ([P, P, P, C.c_int32, C.c_int32, C.c_int32, P], C.c_int32),
         "cuteafd_fp8_w8a16_workspace": ([C.c_int32, C.c_int32, C.c_int32], C.c_size_t),
         "cuteafd_fp8_w8a16_linear": ([P, P, P, P, C.c_int32, C.c_int32, C.c_int32, C.c_int32, P, C.c_size_t, P],
@@ -60,17 +63,18 @@ def bind(path):
     return lib
 
 
-def read_head(path):
-    """lm_head.weight [VOCAB, WIDTH] BF16 from a safetensors shard, onto the GPU."""
+def read_head(path, vocab, width):
+    """Load just the requested BF16 lm_head.weight from a safetensors shard."""
     with open(path, "rb") as f:
         size = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(size))
         meta = header["lm_head.weight"]
-        assert meta["dtype"] == "BF16" and meta["shape"] == [VOCAB, WIDTH], meta
+        assert meta["dtype"] == "BF16" and meta["shape"] == [vocab, width], meta
         start, end = meta["data_offsets"]
+        assert end - start == vocab * width * 2, meta
         f.seek(8 + size + start)
         data = bytearray(f.read(end - start))
-    return torch.frombuffer(data, dtype=torch.bfloat16).view(VOCAB, WIDTH).cuda()
+    return torch.frombuffer(data, dtype=torch.bfloat16).view(vocab, width).cuda()
 
 
 def timed(fn, runs):
@@ -100,16 +104,19 @@ def top16(logits):
 def head_check(lib, args):
     stream = torch.cuda.current_stream().cuda_stream
     torch.manual_seed(53)
-    weight = read_head(args.head) if args.head else (torch.randn(VOCAB, WIDTH, device="cuda") * 0.02).bfloat16()
+    vocab, width = args.head_shape
+    rows_all = max(24, max(args.head_rows))
+    weight = read_head(args.head, vocab, width) if args.head else (
+        torch.randn(vocab, width, device="cuda") * 0.02).bfloat16()
+    weight_bytes = weight.numel() * weight.element_size()
     workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
     handle = P()
-    assert lib.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), WIDTH, 128, VOCAB,
+    assert lib.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), width, rows_all, vocab,
                                                     C.byref(handle)) == 0
-    rows_all = 128
     # Final-norm-like rows: unit RMS with a per-row scale.
-    x = torch.randn(rows_all, WIDTH, device="cuda") * torch.linspace(0.5, 2.0, rows_all, device="cuda")[:, None]
-    x = x.bfloat16()
-    out = {name: torch.empty(rows_all, VOCAB, device="cuda") for name in ("pedantic", "tensor", "few")}
+    x = (torch.randn(rows_all, width, device="cuda") * torch.linspace(
+        0.5, 2.0, rows_all, device="cuda")[:, None]).bfloat16()
+    out = {name: torch.empty(rows_all, vocab, device="cuda") for name in ("pedantic", "tensor", "few")}
 
     def launch(name, rows):
         if name == "pedantic":
@@ -119,44 +126,84 @@ def head_check(lib, args):
             status = lib.cuteafd_vocabulary_head_launch_tensor_op(handle, x.data_ptr(), weight.data_ptr(),
                                                                   out[name].data_ptr(), rows, stream)
         else:
-            status = lib.cuteafd_vocab_head_rows(x.data_ptr(), weight.data_ptr(), out[name].data_ptr(), rows, WIDTH,
-                                                 VOCAB, stream)
+            status = lib.cuteafd_vocab_head_rows(x.data_ptr(), weight.data_ptr(), out[name].data_ptr(), rows, width,
+                                                 vocab, stream)
         assert status == 0, (name, rows, status)
 
-    for name in ("pedantic", "tensor"):
-        launch(name, rows_all)
-    torch.cuda.synchronize()
-    # FP64 reference for 8 rows, in vocabulary chunks.
-    ref = torch.cat([x[:8].double() @ weight[v:v + 16384].double().T for v in range(0, VOCAB, 16384)], dim=1)
-    scale = ref.abs().amax().item()
-    err = {name: (out[name][:8].double() - ref).abs().amax().item() / scale for name in ("pedantic", "tensor")}
-    print(f"head: max |error| / max |logit| over 8 rows: pedantic {err['pedantic']:.2e}, tensor {err['tensor']:.2e}")
-    assert err["pedantic"] < 1e-5, err
-    assert err["tensor"] < 1e-3, err  # wrong operands or layouts give O(1)
-    def agreement(name, rows):
-        a, b = top16(out["pedantic"][:rows]), top16(out[name][:rows])
-        same_top = (a == b).all(dim=1).float().mean().item()
-        same_first = (a[:, 0] == b[:, 0]).float().mean().item()
-        same_set = sum(set(a[r].tolist()) == set(b[r].tolist()) for r in range(rows)) / rows
-        print(f"head: {name} against pedantic over {rows} rows: top-1 {100 * same_first:.2f}%, top-16 set "
-              f"{100 * same_set:.2f}%, top-16 in order {100 * same_top:.2f}%")
-        return same_first
+    try:
+        for name in out:
+            launch(name, rows_all)
+        torch.cuda.synchronize()
+        # FP64 reference for 8 rows, in vocabulary chunks.
+        ref = torch.cat([x[:8].double() @ weight[v:v + 16384].double().T
+                         for v in range(0, vocab, 16384)], dim=1)
+        scale = ref.abs().amax().item()
+        reference_top = top16(ref)
+        for name in out:
+            err = (out[name][:8].double() - ref).abs().amax().item() / scale
+            print(f"head: {name} max |error| / max |logit| over 8 rows: {err:.2e}")
+            assert err < (1e-3 if name == "tensor" else 1e-5), (name, err)
+            candidate = top16(out[name][:8])
+            print(f"head: {name} against FP64: top-1 "
+                  f"{100 * (candidate[:, 0] == reference_top[:, 0]).float().mean().item():.2f}%, "
+                  f"top-16 in order {100 * (candidate == reference_top).all(dim=1).float().mean().item():.2f}%")
+        baseline = top16(out["pedantic"])
+        for name in ("tensor", "few"):
+            candidate = top16(out[name])
+            same_first = (baseline[:, 0] == candidate[:, 0]).float().mean().item()
+            same_top = (baseline == candidate).all(dim=1).float().mean().item()
+            same_set = sum(set(baseline[r].tolist()) == set(candidate[r].tolist())
+                           for r in range(rows_all)) / rows_all
+            print(f"head: {name} against pedantic over {rows_all} rows: top-1 {100 * same_first:.2f}%, "
+                  f"top-16 set {100 * same_set:.2f}%, top-16 in order {100 * same_top:.2f}%")
+            if name == "tensor":
+                assert same_first >= 0.95
 
-    assert agreement("tensor", rows_all) >= 0.95
-    # The few-row kernel is the exact route up to 24 rows: FP32 products and sums like pedantic, in
-    # another order (the baseline for how often two FP32 orders reorder the top 16).
-    launch("few", 24)
-    torch.cuda.synchronize()
-    few_err = (out["few"][:8].double() - ref).abs().amax().item() / scale
-    assert few_err < 1e-5, few_err
-    agreement("few", 24)
-    runs = 5 if args.quick else 20
-    print("head ms (median of %d): rows, few-row kernel, pedantic cuBLAS, tensor-op cuBLAS" % runs)
-    for rows in (8, 16, 24, 32, 64, 96, 128):
-        few = f"{timed(lambda: launch('few', rows), runs):8.3f}" if rows <= 24 else "       -"
-        print(f"  {rows:4d} {few} {timed(lambda: launch('pedantic', rows), runs):8.3f} "
-              f"{timed(lambda: launch('tensor', rows), runs):8.3f}")
-    assert lib.cuteafd_v41_markov_destroy(handle) == 0
+        # Exercise the serving selector on 8-row blocks, excluding each anchor.
+        drafted = rows_all // 8 * 7
+        unary = torch.empty(drafted, 16, device="cuda")
+        candidates = torch.empty(drafted, 16, device="cuda", dtype=torch.int32)
+        top_workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(drafted), device="cuda", dtype=torch.uint8)
+
+        def select(name, rows):
+            assert lib.cuteafd_glm_dflash_topk(out[name].data_ptr(), unary.data_ptr(), candidates.data_ptr(),
+                top_workspace.data_ptr(), rows // 8, 8, 7, vocab, stream) == 0
+
+        for name in out:
+            select(name, rows_all // 8 * 8)
+            torch.cuda.synchronize()
+            expected = top16(out[name][:rows_all // 8 * 8].view(-1, 8, vocab)[:, 1:].reshape(-1, vocab))
+            assert torch.equal(candidates.long(), expected), ("native selector", name)
+
+        runs = 5 if args.quick else 20
+        print(f"head [{vocab},{width}]: {weight_bytes} BF16 bytes; bandwidth assumes one useful weight read "
+              "per launch, not hardware-measured traffic")
+        for rows in args.head_rows:
+            for name in out:
+                elapsed = timed(lambda: launch(name, rows), runs)
+                print(f"head rows={rows} route={name} median_ms={elapsed:.6f} "
+                      f"useful_weight_GB_s={weight_bytes / elapsed / 1e6:.1f}")
+                if rows % 8 == 0:
+                    elapsed = timed(lambda: select(name, rows), runs)
+                    print(f"topk rows={rows} route={name} median_ms={elapsed:.6f}")
+
+        if args.profile_head:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            try:
+                for rows in args.head_rows:
+                    for name in out:
+                        with torch.cuda.nvtx.range(f"head/{name}/rows{rows}"):
+                            launch(name, rows)
+                        if rows % 8 == 0:
+                            with torch.cuda.nvtx.range(f"topk/{name}/rows{rows}"):
+                                select(name, rows)
+                torch.cuda.synchronize()
+            finally:
+                torch.cuda.profiler.stop()
+    finally:
+        torch.cuda.synchronize()
+        assert lib.cuteafd_v41_markov_destroy(handle) == 0
 
 
 def e4m3_exact_rows(rows, k, generator):
@@ -279,14 +326,33 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
     parser.add_argument("--head", help="checkpoint shard holding lm_head.weight (default: a synthetic head)")
+    parser.add_argument("--head-shape", nargs=2, type=int, metavar=("VOCAB", "WIDTH"),
+                        default=DEFAULT_HEAD_SHAPE, help="expected BF16 head dimensions")
+    parser.add_argument("--head-rows", default="8,16,24,32,64,96,128", help="comma-separated row counts, at most 128")
+    parser.add_argument("--profile-head", action="store_true",
+                        help="one NVTX-labelled head/top-k shot inside cudaProfilerStart/Stop after checks")
     parser.add_argument("--quick", action="store_true", help="three GEMM shapes, fewer timing runs")
-    parser.add_argument("--skip-head", action="store_true")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--skip-head", action="store_true")
+    group.add_argument("--head-only", action="store_true", help="skip unrelated FP8 checks")
     args = parser.parse_args()
+    try:
+        args.head_rows = [int(value) for value in args.head_rows.split(",")]
+    except ValueError:
+        parser.error("--head-rows requires comma-separated integers")
+    if not args.head_rows or any(rows < 1 or rows > 128 for rows in args.head_rows):
+        parser.error("--head-rows must be in [1,128]")
+    vocab, width = args.head_shape
+    if vocab < 1 or vocab > 64 * 12 * 256 or width < 256 or width > 6336 or width % 256:
+        parser.error("head shape requires a supported vocabulary and width: multiple of 256, at most 6336")
+    if args.profile_head and args.skip_head:
+        parser.error("--profile-head requires head checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
     if not args.skip_head:
         head_check(lib, args)
-    fp8_check(lib, args)
+    if not args.head_only:
+        fp8_check(lib, args)
     print("glm draft kernels: all checks passed")
 
 
