@@ -546,6 +546,15 @@ pub struct DraftCandidate<'a> {
     pub confidence: &'a [f64],
 }
 
+/// One pre-draft action proposed by a family adapter. Width zero means skip.
+/// A block drafter supplies skip/block; a chain supplies its depth caps.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftAction {
+    pub width: usize,
+    /// This action's predicted draft time, from the adapter's draft-cost fit.
+    pub draft_us: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftSelection {
     /// Draft rows retained per request, excluding the anchor.
@@ -682,6 +691,8 @@ pub struct DraftPolicy {
     /// where a position has been reached fewer than `POOLED_BELOW` times, so
     /// a few early misses cannot pin a position low before it is explored.
     pooled: Platt,
+    /// Rounds since a supplied non-skip pre-draft action was selected, by regime/width.
+    action_age: BTreeMap<(usize, usize), u64>,
 }
 
 impl DraftPolicy {
@@ -710,6 +721,7 @@ impl DraftPolicy {
             timed: vec![(0, 1.); geometry.regimes],
             engaged: vec![false; geometry.regimes],
             pooled: Platt::new(),
+            action_age: BTreeMap::new(),
             seed,
             priced,
             fixed,
@@ -971,6 +983,55 @@ impl DraftPolicy {
             if best.is_none_or(|(_, b)| ratio > b) { best = Some((width, ratio)); }
         }
         best.map_or(narrow, |(width, _)| width)
+    }
+
+    /// Score skip/block/chain-depth actions with the same resource-priced row
+    /// selector as post-draft length selection. The adapter retains its cold
+    /// start action until the resource fit is usable. Ties retain the first action.
+    pub fn choose_action(&mut self, shared: bool, requests: &[(u64, usize)], actions: &[DraftAction],
+        max_rows: usize) -> Result<Option<usize>, DraftPolicyError> {
+        if requests.is_empty() || requests.len() > self.geometry.max_requests {
+            return Err(DraftPolicyError::Requests(self.geometry.max_requests));
+        }
+        if actions.is_empty() || actions.iter().any(|action| action.width > self.geometry.max_positions
+            || !action.draft_us.is_finite() || action.draft_us < 0.
+            || action.width == 0 && action.draft_us != 0.) {
+            return Err(DraftPolicyError::Geometry("invalid pre-draft action"));
+        }
+        if self.fixed { return Ok(actions.iter().enumerate().max_by_key(|(_, action)| action.width)
+            .map(|(index, _)| index)); }
+        let Some(regime) = self.usable_regime(self.regime(shared)) else { return Ok(None) };
+        let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
+        let mut best: Option<(usize, f64)> = None;
+        for (index, action) in actions.iter().enumerate() {
+            let cumulative: Vec<Vec<f64>> = requests.iter().map(|&(id, available)| {
+                let recent = self.recent.get(&id);
+                let mut product = 1.;
+                (0..action.width.min(available)).map(|position| {
+                    let p = recent.and_then(|r| r[position])
+                        .unwrap_or_else(|| self.calibrated(position, self.raw_mean[position]));
+                    product *= self.request_probability(id, position, p);
+                    product
+                }).collect()
+            }).collect();
+            let selection = self.select_core(regime, &ids, &cumulative, action.draft_us, max_rows);
+            let ratio = selection.expected_tokens / selection.predicted_us;
+            if best.is_none_or(|(_, score)| ratio > score) { best = Some((index, ratio)); }
+        }
+        let can_draft = max_rows > requests.len() && requests.iter().any(|&(_, room)| room > 0);
+        for action in actions.iter().filter(|action| can_draft && action.width > 0) {
+            let age = self.action_age.entry((regime, action.width)).or_default();
+            *age = age.saturating_add(1);
+        }
+        let explore = actions.iter().enumerate().filter(|(_, action)| can_draft && action.width > 0)
+            .filter_map(|(index, action)| self.action_age.get(&(regime, action.width))
+                .filter(|&&age| age >= WIDTH_EXPLORE_ROUNDS).map(|&age| (index, age)))
+            .max_by_key(|&(index, age)| (age, usize::MAX - index)).map(|(index, _)| index);
+        let chosen = explore.or_else(|| best.map(|(index, _)| index));
+        if let Some(index) = chosen.filter(|&index| actions[index].width > 0) {
+            self.action_age.insert((regime, actions[index].width), 0);
+        }
+        Ok(chosen)
     }
 
     /// Forward-growth length selection over survival products, with the round's
@@ -1584,6 +1645,36 @@ mod tests {
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, wide: width > 5 }).unwrap();
         *token += accepted as u64;
+    }
+
+    #[test]
+    fn pre_draft_actions_share_row_prices_and_explore_unused_depths() {
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 3, draft_us: 100. },
+            DraftAction { width: 5, draft_us: 1e12 }];
+        assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(), None);
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 1, 5, 6, 6, &[0.99; 5]); }
+        assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(), Some(1));
+        // With only anchor room, paying for a draft cannot help.
+        assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 1).unwrap(), Some(0));
+        let mut explored = false;
+        for _ in 0..WIDTH_EXPLORE_ROUNDS {
+            explored |= policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap() == Some(2);
+        }
+        assert!(explored);
+        for _ in 0..2 * WIDTH_EXPLORE_ROUNDS {
+            assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 1).unwrap(), Some(0));
+            assert_eq!(policy.choose_action(false, &[(1, 0)], &actions, 64).unwrap(), Some(0));
+        }
+        assert!(policy.choose_action(false, &[], &actions, 64).is_err());
+        assert!(policy.choose_action(false, &[(1, 5)], &[], 64).is_err());
+        assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 0, draft_us: 1. }], 64).is_err());
+        assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 3, draft_us: f64::NAN }], 64).is_err());
+        assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 8, draft_us: 1. }], 64).is_err());
+        let mut fixed = DraftPolicy::new(placement(5), true).unwrap();
+        assert_eq!(fixed.choose_action(false, &[(1, 5)], &[
+            DraftAction { width: 5, draft_us: 100. }, DraftAction { width: 0, draft_us: 0. }], 64).unwrap(), Some(0));
     }
 
     #[test]

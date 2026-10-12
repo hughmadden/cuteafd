@@ -1322,7 +1322,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 .filter(|_| a.job.sampling.is_greedy() && limit > 0).map_or(Vec::new(), |d| {
                     let room = super::draft_binding::COPY_EXTENSION.min(limit.saturating_sub(d.tokens.len()));
                     let copy = copy_drafts(&a.history, d.tokens.len() + room);
-                    super::draft_binding::copy_extension(&d.tokens, &copy).to_vec()
+                    crate::shared::draft::copy::copy_extension(&d.tokens, &copy).to_vec()
                 })).collect(),
             _ => vec![Vec::new(); active.len()],
         };
