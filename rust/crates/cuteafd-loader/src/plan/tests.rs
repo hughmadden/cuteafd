@@ -1536,7 +1536,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_scratch: vec![0; 2], requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let (placed, graphs, working) = glmf::solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
         assert_eq!(working.rtx_layers.len(), expected_rtx);

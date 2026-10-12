@@ -1,6 +1,7 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dspark;
+mod remote_dflash;
 pub(crate) use crate::shared::draft::resource as draft_binding;
 use crate::shared::draft::probe as draft_probe;
 pub(crate) mod engine;
@@ -1151,7 +1152,8 @@ pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool
 
 impl Opened {
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
-        index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool)
+        index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
+        prepared_draft: Option<&remote_dflash::Prepared<'_>>)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -1220,13 +1222,17 @@ impl Opened {
         }
         let sms = inventory.gpus[0].sms as usize;
         let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
-        let (drafter_bytes, drafter_scratch) = args.draft.as_ref().map(|path| -> Result<_> {
+        let (drafter_bytes, drafter_scratch, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
             let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
-            Ok(admission::drafter_inventory(&config, slots, args.draft_sequences.min(slots), &draft_sms,
+            let batch = args.draft_sequences.min(slots);
+            let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
-                args.draft_linear.code() as u8)?)
-        }).transpose()?.unwrap_or_else(|| (0, vec![0; devices.len()]));
+                args.draft_linear.code() as u8)?;
+            let bridge = if prepared_draft.is_some() { admission::drafter_bridge_inventory(&config, slots, batch)? }
+                else { None };
+            Ok((bytes, scratch, bridge))
+        }).transpose()?.unwrap_or_else(|| (0, vec![0; devices.len()], None));
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
@@ -1236,19 +1242,23 @@ impl Opened {
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
         let inputs = admission::GlmfInputs { cfg: &self.cfg, layers, local_tp2_exl3,
-            gpus: inventory.baselines(&[]), pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
+            gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
+                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, remote_dflash::Prepared::sampled_bytes) })).collect(),
+            pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             representation, resident, router_replica_bytes, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
-            drafter_bytes, drafter_scratch, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
+            drafter_bytes, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
         let (placement, graphs, working) = admission::solve_working_set_with_graphs(&inputs, target, automatic_context, sms, true)?;
-        ensure!(placement.movables.iter().all(|(_, gpu)| *gpu == 0), "GPU1 drafter executor not installed");
+        ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0
+            || (*id == placement::MovableId::Drafter && *gpu == 1 && prepared_draft.is_some())),
+            "GLM Flash placement has no matching movable executor");
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
             prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers, "GLM Flash admission before weights");
         let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
@@ -1395,8 +1405,17 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
+        let mut prepared_draft = match (split_device, args.draft.as_ref()) {
+            (Some(peer), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
+                && !dspark::is_dspark(path)? => Some(remote_dflash::Prepared::new(
+                &self.library, crate::shared::peer_split::RankDevice { device: args.device, stream }, peer)?),
+            _ => None,
+        };
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
-            split_device, automatic_context)?;
+            split_device, automatic_context, prepared_draft.as_ref())?;
+        let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
+            .map_or(0, |(_, gpu)| *gpu);
+        if draft_gpu == 0 { drop(prepared_draft.take()); }
         probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
@@ -1554,7 +1573,7 @@ impl Opened {
                 }
             }
         }
-        engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
+        engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take())?;
         if let Some(dense) = self.load_dense(args, &engine.weights.layers)? { engine.set_dense_nvfp4(dense); }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
@@ -1567,6 +1586,9 @@ impl Opened {
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         probe("workspaces")?;
         engine.prime_tp2()?;
+        if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
+            draft.prime(&engine.embedding, engine.draft_head())?;
+        }
         probe("expert-prime")?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
@@ -1589,15 +1611,30 @@ impl Opened {
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
-        embedding: &crate::shared::token_io::TokenEmbedding<'_>) -> Result<Option<dspark::Drafter<'s>>> {
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<remote_dflash::Prepared<'s>>)
+        -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let started = Instant::now();
         let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
             ::from_fp8_option(args.draft_fp8);
-        let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
-            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
-            args.draft_linear)?;
+        let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+        let drafter = if let Some(prepared) = prepared {
+            use crate::families::glm5::dflash::{DflashConfig, GlmDrafter};
+            let cfg = DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "DFlash2 does not fit this target");
+            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
+                .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+            let device = prepared.stream.device;
+            let draft = device.own(|| GlmDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
+                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear))?;
+            dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
+        } else {
+            dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
+                embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
+                args.draft_linear)?
+        };
         drafter.set_draft_head(args.draft_head);
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
             draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());

@@ -592,6 +592,29 @@ fn cold_replay_decode(probe: &probe::ProbeRef, chunk: usize) -> bool {
     probe.as_ref().and_then(|p| p.spec.cold_steps.get(chunk)).is_some_and(|step| step.decode)
 }
 
+// Opt-in raw-state diagnostics for authenticated probes, never ordinary requests.
+fn prefix_state_probe(engine: &GlmfEngine<'_>, family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
+    probe: &probe::ProbeRef, phase: &str) -> Result<()> {
+    let Some(probe) = probe.as_ref() else { return Ok(()) };
+    let Some(root) = std::env::var_os("CUTEAFD_GLMF_PREFIX_STATE_ROOT") else { return Ok(()) };
+    if ![513, 544, 560].contains(&placement.len) { return Ok(()) }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = PathBuf::from(root).join(format!("{id:03}-{phase}-{}", placement.len));
+    std::fs::create_dir(&dir)?;
+    let state = engine.slot_state(placement.slot)?;
+    let paged = super::prefix::paged_rows(family, placement, placement.len)?;
+    let record = probe.record();
+    let metadata = serde_json::json!({"phase": phase, "len": placement.len, "kda_len": placement.kda_len,
+        "slot": placement.slot, "units": placement.units, "state_bytes": state.len(), "paged_bytes": paged.len(),
+        "cold": record.cold, "cached_tokens": record.cached_tokens,
+        "prompt_ids": record.prompt_ids, "generated": record.generated});
+    std::fs::write(dir.join("state.bin"), state)?;
+    std::fs::write(dir.join("paged.bin"), paged)?;
+    std::fs::write(dir.join("metadata.json"), serde_json::to_vec(&metadata)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod media_tests {
     #[test]
@@ -1038,6 +1061,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             };
             let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
             probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
+            prefix_state_probe(engine, &family, &admitted.placement, &job.probe, "admitted")?;
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
@@ -1264,7 +1288,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     }
                     // Drafts only speed decoding up; the step verifies the next tokens alone.
-                    Err(error) => tracing::warn!("{} draft failed: {error:#}", drafter.name()),
+                    Err(error) => {
+                        // A terminal peer bridge is not a reusable target-only fallback.
+                        drafter.require_live()?;
+                        tracing::warn!("{} draft failed: {error:#}", drafter.name());
+                    }
                 }
                 out
             }
@@ -1491,6 +1519,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
                 draft_ring_misses = ring_misses, "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
+            prefix_state_probe(engine, &family, &request.placement, &request.job.probe, "finished")?;
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, request.keys.spans())?;
@@ -1546,10 +1575,20 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
         let start = p.placement.len;
         let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
-            engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            // Text replay must use serving's captured/fused decode, not eager scoring arithmetic.
+            if p.media.spans().is_empty() {
+                engine.verify_device(&mut [(&mut p.placement, chunk.len())], chunk, false)?
+            } else {
+                engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            }
         } else {
             engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
         };
+        if cold_replay_decode(&p.job.probe, p.chunks)
+            && std::env::var_os("CUTEAFD_GLMF_REPLAY_SYNC").is_some() {
+            // Diagnostic only: isolate workspace reuse from source/replay arithmetic.
+            engine.synchronize()?;
+        }
         if end == p.tokens.len() {
             // The first token, while this prompt's logits are the workspace's.
             let logits = logits.context("prefill produced no logits")?;
@@ -1586,6 +1625,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     p.busy += timer.elapsed().as_secs_f64();
     p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
     result?;
+    prefix_state_probe(engine, family, &p.placement, &p.job.probe, "prefilled")?;
     capture_points(family, cache, p);
     p.chunks += 1;
     Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })

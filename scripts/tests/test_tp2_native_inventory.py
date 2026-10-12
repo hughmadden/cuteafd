@@ -110,6 +110,63 @@ def test_cuda_build_attests_real_header_and_always_wraps_registration():
     assert 'elapsed_ms = started.elapsed().as_secs_f64() * 1000.0' in constructor
 
 
+def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    helper = source.split("cuteafd_status_t cublas_handle(", 1)[1].split(
+        "cuteafd_status_t validate_linear_args", 1)[0]
+    mock = r'''
+#include <cassert>
+#include <unordered_map>
+using cuteafd_status_t = int;
+using cublasHandle_t = int*;
+using cublasStatus_t = int;
+using cudaError_t = int;
+constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
+constexpr int cudaSuccess = 0, CUBLAS_STATUS_SUCCESS = 0;
+static int device = 0, device_error = 0, create_error = 0, creates = 0, logs = 0;
+static int owners[8];
+int cudaGetDevice(int* out) { *out = device; return device_error; }
+int cublasCreate(cublasHandle_t* out) {
+  ++creates;
+  if (create_error) return create_error;
+  owners[creates] = device;
+  *out = &owners[creates];
+  return 0;
+}
+int status_from_cuda(int status) { return status; }
+int status_from_cublas(int status) { return status; }
+void log_blas_handle_created(const char*) { ++logs; }
+'''
+    main = r'''
+int main() {
+  cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
+  assert(cublas_handle(nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(creates == 0);
+  assert(cublas_handle(&first) == 0 && *first == 0);
+  device = 1; create_error = 7;
+  assert(cublas_handle(&second) == 7 && second == nullptr);
+  create_error = 0;
+  assert(cublas_handle(&second) == 0 && *second == 1 && first != second);
+  device = 0;
+  assert(cublas_handle(&again) == 0 && again == first);
+  device = 1;
+  assert(cublas_handle(&again) == 0 && again == second);
+  device_error = 19;
+  assert(cublas_handle(&again) == 19 && again == second);
+  assert(creates == 3 && logs == 2);
+}
+'''
+    fixture = tmp_path / "blas_handles.cc"
+    fixture.write_text(mock + "cuteafd_status_t cublas_handle(" + helper + main)
+    executable = tmp_path / "blas_handles"
+    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    str(fixture), "-o", str(executable)], check=True, capture_output=True)
+    subprocess.run([str(executable)], check=True, capture_output=True)
+
+
 def test_inventory_signature_matches_installed_toolkit_without_cuda_initialization(tmp_path):
     header = Path("/usr/local/cuda/include/crt/host_runtime.h")
     compiler = shutil.which("g++")

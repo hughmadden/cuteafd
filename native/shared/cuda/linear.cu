@@ -940,15 +940,24 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out) {
   if (out == nullptr) {
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  static thread_local cublasHandle_t handle = nullptr;
-  if (handle == nullptr) {
+  int device = 0;
+  const cudaError_t device_status = cudaGetDevice(&device);
+  if (device_status != cudaSuccess) {
+    return status_from_cuda(device_status);
+  }
+  // A thread can launch target and remote-drafter work on different devices.
+  static thread_local std::unordered_map<int, cublasHandle_t> handles;
+  auto found = handles.find(device);
+  if (found == handles.end()) {
+    cublasHandle_t handle = nullptr;
     const cublasStatus_t status = cublasCreate(&handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
       return status_from_cublas(status);
     }
+    found = handles.emplace(device, handle).first;
     log_blas_handle_created("cublas");
   }
-  *out = handle;
+  *out = found->second;
   return CUTEAFD_STATUS_OK;
 }
 

@@ -115,6 +115,10 @@ pub(crate) struct RankDevice {
     pub stream: *mut c_void,
 }
 
+fn run_on_rank<T>(library: &NativeLibrary, rank: RankDevice, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    crate::shared::memory::device::Device { library, id: rank.device }.run(body)
+}
+
 /// Runs `body` with `device` current, then `home` again (whatever `body` returned).
 pub(crate) fn on_device<T>(
     library: &NativeLibrary,
@@ -402,12 +406,7 @@ impl<'a> PeerExchange<'a> {
 
     /// Runs `body` with rank `rank`'s device current.
     pub fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        on_device(
-            self.library,
-            self.ranks[rank].device,
-            self.ranks[0].device,
-            body,
-        )
+        run_on_rank(self.library, self.ranks[rank], body)
     }
 
     /// Receive buffer `slot` of rank `rank`.
@@ -480,6 +479,30 @@ impl<'a> PeerExchange<'a> {
                 self.ranks[from].stream,
             )
         })
+    }
+
+    /// Push strided planes on the source rank's stream, then publish one
+    /// sequence. As with `push_to`, the caller orders destination reuse after
+    /// its previous consumer, not merely after the previous publication.
+    pub fn push_planes(&self, from: usize, slot: usize, planes: &[cuteafd_ffi::peer_exchange::PeerPlane]) -> Result<()> {
+        self.require_live()?;
+        ensure!(from < 2, "peer plane source rank {from}");
+        let flag = self.flag_index(slot)?;
+        let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
+        // SAFETY: callers keep every plane live and immutable through the
+        // source stream's copy; the destination reads only after its wait.
+        self.on(from, || unsafe {
+            self.library.peer_push_planes(planes,
+                Some((theirs.flag(flag), mine.send_state(flag))), 0, self.stream(from))
+        })
+    }
+
+    /// Publish completion of earlier work without copying payload bytes. This
+    /// acknowledgement orders the peer's next write after this rank's reader.
+    pub fn signal(&self, from: usize, slot: usize) -> Result<()> {
+        ensure!(from < 2, "peer signal source rank {from}");
+        self.push_to(from, slot, self.ends[from].control.buffer.ptr.cast_const(),
+            self.ends[1 - from].control.buffer.ptr, 0)
     }
 
     /// Queues on `rank`'s stream: `out = bf16(a + b)` over `count` elements (the same
@@ -563,6 +586,32 @@ pub(crate) fn slice_2d(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn rank_callback_restores_remote_ambient_device_on_error_and_unwind() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        library.cuda_set_device(1)?;
+        let target = RankDevice { device: 0, stream: std::ptr::null_mut() };
+        let remote = RankDevice { device: 1, stream: std::ptr::null_mut() };
+        assert_eq!(run_on_rank(&library, target, || library.cuda_get_device())?, 0);
+        assert_eq!(library.cuda_get_device()?, 1);
+        let result: Result<()> = run_on_rank(&library, target, || {
+            assert_eq!(library.cuda_get_device()?, 0);
+            assert_eq!(run_on_rank(&library, remote, || library.cuda_get_device())?, 1);
+            assert_eq!(library.cuda_get_device()?, 0);
+            anyhow::bail!("injected callback failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(library.cuda_get_device()?, 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = run_on_rank(&library, target, || panic!("injected callback unwind"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(library.cuda_get_device()?, 1);
+        Ok(())
+    }
 
     #[test]
     fn slices_cover_the_tensor() {

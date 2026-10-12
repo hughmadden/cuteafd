@@ -82,18 +82,21 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
-        let (draft, drafter_scratch) = if options.glmf_drafter_disabled { (0, vec![0; ranks]) }
-            else if options.drafter_bytes > 0 { (options.drafter_bytes, vec![0; ranks]) } else {
+        let (draft, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, vec![0; ranks], None) }
+            else if options.drafter_bytes > 0 { (options.drafter_bytes, vec![0; ranks], None) } else {
             let path = options.glmf_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
                 crate::resolve_snapshot_at_revision("incoai/GLM-5.3-Flash-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
             });
             let path = path.ok_or_else(|| anyhow::anyhow!("DFlash2 config missing: provide --glmf-drafter-snapshot or disable the drafter"))?;
             let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
-            glmf::drafter_inventory(&config,
-                options.draft_context_slots.unwrap_or(sequences.max(8)) as usize,
-                options.draft_sequences.max(sequences).min(options.draft_context_slots.unwrap_or(sequences.max(8))) as usize,
-                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2)?
+            let slots = options.draft_context_slots.unwrap_or(sequences.max(8)) as usize;
+            let batch = options.draft_sequences.max(sequences).min(slots as u64) as usize;
+            let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
+                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2)?;
+            let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
+                glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
+            (bytes, scratch, bridge)
         };
         let local_tp2_exl3 = ranks == 2 && spark_ranks == 0 && catalog.exl3().is_some();
         let mut baselines = Vec::new();
@@ -125,7 +128,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             resident, router_replica_bytes: router, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
-            drafter_bytes: draft, drafter_scratch, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+            drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,

@@ -1849,6 +1849,9 @@ impl<'a> GlmfEngine<'a> {
             }
             if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
         }
+        if let Some(drafter) = &self.drafter {
+            if let Err(error) = drafter.publish_abort() { failures.push(format!("draft bridge: {error:#}")); }
+        }
         ensure!(failures.is_empty(), "GLM Flash TP2 abort publication: {}", failures.join("; "));
         Ok(())
     }
@@ -2243,10 +2246,13 @@ impl<'a> GlmfEngine<'a> {
 
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
-        drain_ranks(self.ranks(), |rank| {
+        let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
+            if rank == self.ranks() { return self.drafter.as_ref().unwrap().synchronize_remote(); }
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
-        })
+        });
+        if let Some(drafter) = &self.drafter { drafter.finish_terminal(result.is_ok()); }
+        result
     }
 
     /// Before a sequence's first step: zeroes its KDA state and maps its pool pages.

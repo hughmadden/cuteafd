@@ -46,6 +46,8 @@ pub struct GlmfInputs<'a> {
     pub drafter_bytes: u64,
     /// fp8_linear workspace on each candidate GPU, keyed by that GPU's physical SM count.
     pub drafter_scratch: Vec<u64>,
+    /// Present only when the GPU1 DFlash2 executor is requested. dSpark stays local.
+    pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub full_prefill_logits: u64,
@@ -75,7 +77,7 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
     Ok((owned.unwrap(), scratch))
 }
 
-/// Dormant GPU1 DFlash bridge inventory, not permission to move the drafter.
+/// GPU1 DFlash bridge inventory, conditional on installing its executor.
 /// `rows` is the drafter's full admitted batch (sequences * block), not a
 /// target-head launch chunk. GPU1's existing draft destinations are already
 /// in the movable; publisher streams/modules belong to the sampled baseline.
@@ -108,6 +110,22 @@ pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u6
             sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
     }
     Ok(MovableDemands { placement_gpu: 1, demands })
+}
+
+/// Opt-in until the remote executor's hardware gates qualify its default.
+pub fn remote_dflash_requested() -> bool {
+    std::env::var("CUTEAFD_GLMF_REMOTE_DFLASH").as_deref() == Ok("1")
+}
+
+/// Derive bridge capacity from the same checkpoint and batch used by runtime.
+/// Opaque fixture byte totals and dSpark do not imply a remote executor.
+pub fn drafter_bridge_inventory(config: &serde_json::Value, slots: usize, sequences: usize)
+    -> anyhow::Result<Option<MovableDemands>> {
+    if config["speculators_model_type"] == "dspark" { return Ok(None); }
+    use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity};
+    let (g, block) = draft_geometry(config)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, usize::try_from(block)?)?;
+    Ok(Some(remote_dflash_bridge_demands(g.hidden, g.vocab, g.taps, capacity.block_rows as u64)?))
 }
 
 pub use crate::placement::{ComponentDemand as GlmfBufferDemand, SparkWorkingSet as GlmfWorkingSet,
@@ -161,6 +179,22 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     for &scratch in &i.drafter_scratch {
         i.drafter_bytes.checked_add(scratch).ok_or(PlacementError::Overflow("GLM Flash draft inventory"))?;
     }
+    if i.drafter_bridge.as_ref().is_some_and(|bridge| ranks != 2 || i.drafter_bytes == 0
+        || bridge.placement_gpu != 1 || bridge.demands.iter().any(|d| d.gpu > 1)) {
+        return Err(PlacementError::Inventory("GLM Flash remote draft candidate"));
+    }
+    let movables = if i.drafter_bytes == 0 { vec![] } else {
+        let conditional = i.drafter_scratch.iter().enumerate().filter_map(|(rank, &bytes)| {
+            let mut demands = if rank == 1 { i.drafter_bridge.as_ref().map(|b| b.demands.clone()).unwrap_or_default() }
+                else { vec![] };
+            if bytes > 0 { demands.push(Demand::new(rank as u8, Category::Workspace,
+                "DFlash fp8-linear scratch", bytes, Basis::Formula)); }
+            (!demands.is_empty()).then_some(MovableDemands { placement_gpu: rank as u8, demands })
+        }).collect();
+        vec![Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }],
+            allowed: if i.drafter_bridge.is_some() { vec![0, 1] } else { vec![0] },
+            expert_arena: false, conditional }]
+    };
     if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
         return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
     }
@@ -249,11 +283,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
             i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0),
         layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
-        movables: if i.drafter_bytes == 0 { vec![] } else { vec![Movable { id: MovableId::Drafter,
-            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false,
-            conditional: i.drafter_scratch.iter().enumerate().filter(|(_, bytes)| **bytes > 0).map(|(rank, &bytes)|
-                MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
-                    Category::Workspace, "DFlash fp8-linear scratch", bytes, Basis::Formula)] }).collect() }] },
+        movables,
         expert_workspace: if working.includes(GlmfComponent::RtxExperts) { i.expert_workspace } else { 0 },
         tp2_workspace: if working.includes(GlmfComponent::RtxExperts) { i.tp2_workspace } else { [0; 2] },
         onboard: if i.spark_ranks == 0 { i.onboard } else { Onboard::Layers(working.rtx_layers.len()) },
@@ -544,7 +574,7 @@ mod tests {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
-            drafter_scratch: vec![0; ranks], requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
         }
     }
 
@@ -903,6 +933,108 @@ mod tests {
         assert_eq!(req.movables[0].allowed, [0]);
         assert!(req.movables[0].conditional.iter().flat_map(|c| &c.demands).all(|d| d.category == Category::Workspace));
         assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
+    }
+
+    #[test]
+    fn remote_dflash_candidate_combines_scratch_bridge_and_whole_owner() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let config = draft_config();
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        input.drafter_bytes = owned;
+        input.drafter_scratch = scratch;
+        input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
+        let mut req = request(&input).unwrap();
+        assert_eq!(req.movables[0].allowed, [0, 1]);
+        assert_eq!(req.movables[0].conditional.iter().map(|c| c.placement_gpu).collect::<Vec<_>>(), [0, 1]);
+        let candidate = req.movables[0].conditional[1].clone();
+        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash fp8-linear scratch")
+            .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(1, input.drafter_scratch[1])]);
+        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash bridge logits")
+            .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(0, 8 * 8 * 154_880 * 4)]);
+        for home in [0, 1] {
+            req.movables[0].allowed = vec![home];
+            let actual = solve(&req).unwrap();
+            assert_eq!(actual.movables, [(MovableId::Drafter, home)]);
+            let owner = &actual.items[home as usize];
+            assert_eq!(owner.iter().filter(|d| d.group == "Drafter").map(|d| d.bytes).sum::<u64>(), owned);
+            for rank in 0..2 {
+                let bridge = actual.items[rank].iter().filter(|d| d.group.starts_with("DFlash bridge"))
+                    .map(|d| d.bytes).sum::<u64>();
+                let expected = if home == 1 { candidate.demands.iter().filter(|d| d.gpu as usize == rank
+                    && d.group.starts_with("DFlash bridge")).map(|d| d.bytes).sum() } else { 0 };
+                assert_eq!(bridge, expected);
+                if rank != home as usize { assert!(actual.items[rank].iter().all(|d| d.group != "Drafter")); }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_dflash_solver_home_and_charges_equal_planned_and_sampled_baselines() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for expected_home in [0u8, 1] {
+            let mut planned = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            planned.spark_ranks = 0;
+            planned.graphs = GraphSet::budget(&[64 << 20; 2]);
+            planned.requested_pool = Some(262_144);
+            // Make one target rank heavier without forcing the Movable's home.
+            planned.resident[1 - expected_home as usize].weights += 6 << 30;
+            let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170],
+                GlmDraftRepresentation::Fp8Only, 2).unwrap();
+            planned.drafter_bytes = owned;
+            planned.drafter_scratch = scratch;
+            planned.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
+            let (p, pg, pw) = solve_working_set_with_graphs(&planned, 262_144, false, 188, true).unwrap();
+            assert_eq!(p.movables, [(MovableId::Drafter, expected_home)]);
+            let mut measured = planned.clone();
+            for rank in 0..2 {
+                let Baseline::Planned { context_bytes, loaded_bytes } = planned.gpus[rank].1 else { unreachable!() };
+                let sampled_code = context_bytes / 3 + loaded_bytes;
+                let prepared_controls = 1536;
+                let raw_free = measured.gpus[rank].0 - sampled_code - prepared_controls;
+                // Runtime credits prepared controls before charging the selected candidate.
+                measured.gpus[rank].1 = Baseline::Measured { free_bytes: raw_free + prepared_controls };
+                measured.pending_code[rank] = context_bytes - sampled_code;
+            }
+            let (r, rg, rw) = solve_working_set_with_graphs(&measured, 262_144, false, 188, true).unwrap();
+            assert_eq!((pg, pw), (rg, rw));
+            assert_eq!((&p.movables, p.pool_tokens, &p.layers, p.tp2),
+                (&r.movables, r.pool_tokens, &r.layers, r.tp2));
+            let bridge = planned.drafter_bridge.as_ref().unwrap();
+            for rank in 0..2 {
+                let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
+                    .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(bytes(&p, "Drafter"), if rank == expected_home as usize { owned } else { 0 });
+                for demand in &bridge.demands {
+                    if demand.gpu as usize != rank { continue; }
+                    let expected = if expected_home == 1 { demand.bytes } else { 0 };
+                    assert_eq!(bytes(&p, &demand.group), expected);
+                    assert_eq!(bytes(&r, &demand.group), expected);
+                }
+                assert_eq!(bytes(&p, "DFlash fp8-linear scratch"),
+                    if rank == expected_home as usize { planned.drafter_scratch[rank] } else { 0 });
+                let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
+                    capacity_bytes: input.gpus[rank].0, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available()
+                    + placed.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                assert_eq!(total(&planned, &p), total(&measured, &r));
+            }
+        }
+    }
+
+    #[test]
+    fn remote_dflash_candidate_rejects_absent_owner_and_device() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        for ranks in [1, 2] {
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            input.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
+            if ranks == 2 { input.drafter_bytes = 0; }
+            assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash remote draft candidate"))));
+        }
+        assert!(drafter_bridge_inventory(&draft_config(), 0, 1).is_err());
+        assert!(drafter_bridge_inventory(&draft_config(), 8, 9).is_err());
+        assert_eq!(drafter_bridge_inventory(&serde_json::json!({"speculators_model_type":"dspark"}), 8, 8).unwrap(), None);
     }
 
     #[test]

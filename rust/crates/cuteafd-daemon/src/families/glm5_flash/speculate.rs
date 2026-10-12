@@ -89,9 +89,9 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             }
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: done + r }).collect::<Vec<_>>())?;
-            // SAFETY: the oracle owns the stream; a following chunk reuses
-            // the taps and context metadata read by this update.
-            unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
+            // A following oracle chunk reuses taps and context metadata on
+            // the selected drafter device, not necessarily the target stream.
+            engine.synchronize()?;
             done += n;
         }
         let anchor = tokens[position];
@@ -148,9 +148,11 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         Ok(taps)
     };
-    crate::families::glm5::dflash::replay(drafter.replay(), &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
-        engine.weights.head.bf16().context("--draft-replay borrows the target BF16 head; the FP8-only head \
-            (--fp8-head) has no BF16 copy to replay against")?.buffer.ptr, start)
+    crate::families::glm5::dflash::replay_with(drafter.replay(), &tokens, &greedy, &taps,
+        &|t| engine.embedding.host_rows(t), &|sequences, _| {
+            Ok(drafter.draft_device(sequences, &engine.embedding, engine.draft_head())?.into_iter()
+                .map(|draft| draft.tokens).collect())
+        }, start)
 }
 
 /// A drafter setting: (--draft-head, --draft-linear).
