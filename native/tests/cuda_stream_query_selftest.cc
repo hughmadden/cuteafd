@@ -39,6 +39,13 @@ int main() {
   check(cuteafd_cuda_event_create(&start) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_create(&end) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_record_external(nullptr, pending) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  // Real drafters record these markers eagerly before their first capture.
+  check(cuteafd_cuda_event_record_external(start, pending) == CUTEAFD_STATUS_OK);
+  check(cudaMemsetAsync(buffer.ptr, 0x2a, buffer.bytes, static_cast<cudaStream_t>(pending)) == cudaSuccess);
+  check(cuteafd_cuda_event_record_external(end, pending) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
+  float eager_elapsed = -1.0f;
+  check(cuteafd_cuda_event_elapsed_ms(start, end, &eager_elapsed) == CUTEAFD_STATUS_OK && eager_elapsed >= 0.0f);
   check(cuteafd_cuda_graph_begin_capture(pending) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_record_external(start, pending) == CUTEAFD_STATUS_OK);
   check(cudaMemsetAsync(buffer.ptr, 0x5a, buffer.bytes, static_cast<cudaStream_t>(pending)) == cudaSuccess);
@@ -51,6 +58,14 @@ int main() {
     check(cuteafd_cuda_event_elapsed_ms(start, end, &elapsed) == CUTEAFD_STATUS_OK && elapsed >= 0.0f);
     unsigned char first = 0;
     check(cudaMemcpy(&first, buffer.ptr, 1, cudaMemcpyDeviceToHost) == cudaSuccess && first == 0x5a);
+    // An uncaptured shape can run between replays while the graph still owns
+    // references to the same retained events.
+    check(cuteafd_cuda_event_record_external(start, pending) == CUTEAFD_STATUS_OK);
+    check(cudaMemsetAsync(buffer.ptr, 0x2a, buffer.bytes, static_cast<cudaStream_t>(pending)) == cudaSuccess);
+    check(cuteafd_cuda_event_record_external(end, pending) == CUTEAFD_STATUS_OK);
+    check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
+    check(cuteafd_cuda_event_elapsed_ms(start, end, &eager_elapsed) == CUTEAFD_STATUS_OK && eager_elapsed >= 0.0f);
+    check(cudaMemcpy(&first, buffer.ptr, 1, cudaMemcpyDeviceToHost) == cudaSuccess && first == 0x2a);
   }
   check(cuteafd_cuda_graph_exec_destroy(graph) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_destroy(end) == CUTEAFD_STATUS_OK);
