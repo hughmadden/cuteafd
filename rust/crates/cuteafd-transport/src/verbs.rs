@@ -3675,6 +3675,26 @@ impl NativeRdmaEndpoint {
         )
     }
 
+    /// [`Self::poll_stats`] for an idle owner: the completion-event wait ends
+    /// after `window` at the latest, and a window without a completion is the
+    /// native timeout error (`is_verbs_host_rdma_poll_timeout`). `poll_stats`
+    /// raises every timeout to at least 30 s, which suits an exchange in
+    /// flight and would hold an owner of several connections on one of them.
+    fn wait_stats(
+        &self,
+        send: u32,
+        recv: u32,
+        window: Duration,
+    ) -> Result<CuteafdRdmaRcCompletionStats> {
+        self.library.rdma_rc_endpoint_poll(
+            self.info.handle,
+            send,
+            recv,
+            u32::MAX,
+            idle_wait_timeout_ms(window),
+        )
+    }
+
     fn try_poll(&self, send: u32, recv: u32) -> Result<CuteafdRdmaRcCompletionStats> {
         self.library
             .rdma_rc_endpoint_try_poll(self.info.handle, send, recv)
@@ -4629,10 +4649,19 @@ fn default_control_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+/// Native event-wait timeout of an exchange in flight: the caller's timeout,
+/// never less than 30 s.
 fn active_poll_timeout_ms(timeout: Duration) -> u32 {
     let requested = timeout.as_millis().max(1);
     let default = u128::from(30_000_u32);
     requested.max(default).min(u128::from(u32::MAX)) as u32
+}
+
+/// Native event-wait timeout of an idle wait: the caller's window in whole
+/// milliseconds, never more than it asked for; at least 1 ms (the native
+/// floor) and at most `u32::MAX`.
+fn idle_wait_timeout_ms(window: Duration) -> u32 {
+    u32::try_from(window.as_millis().max(1)).unwrap_or(u32::MAX)
 }
 
 fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
@@ -5000,6 +5029,44 @@ mod persistent_tests {
         .context("finishing scheduler sparse routed ProtocolV2 TCP BF16 payload batch");
 
         assert!(is_verbs_host_protocol_v2_persistent_retryable_error(&err));
+    }
+
+    #[test]
+    fn an_idle_wait_keeps_its_window_and_an_active_poll_its_floor() {
+        // The Spark worker's idle wait: 100 ms is 100 ms, not the active floor.
+        assert_eq!(idle_wait_timeout_ms(Duration::from_millis(100)), 100);
+        assert_eq!(idle_wait_timeout_ms(Duration::from_millis(10)), 10);
+        assert_eq!(idle_wait_timeout_ms(Duration::from_secs(45)), 45_000);
+        // Whole milliseconds, never longer than asked; the native floor is 1 ms.
+        assert_eq!(idle_wait_timeout_ms(Duration::from_micros(100_999)), 100);
+        assert_eq!(idle_wait_timeout_ms(Duration::from_micros(999)), 1);
+        assert_eq!(idle_wait_timeout_ms(Duration::ZERO), 1);
+        assert_eq!(idle_wait_timeout_ms(Duration::from_millis(u64::from(u32::MAX))), u32::MAX);
+        assert_eq!(idle_wait_timeout_ms(Duration::from_millis(u64::from(u32::MAX) + 1)), u32::MAX);
+        assert_eq!(idle_wait_timeout_ms(Duration::MAX), u32::MAX);
+        // An exchange in flight still waits at least 30 s, whatever its caller's timeout.
+        assert_eq!(active_poll_timeout_ms(Duration::ZERO), 30_000);
+        assert_eq!(active_poll_timeout_ms(Duration::from_millis(100)), 30_000);
+        assert_eq!(active_poll_timeout_ms(Duration::from_secs(1)), 30_000);
+        assert_eq!(active_poll_timeout_ms(Duration::from_secs(30)), 30_000);
+        assert_eq!(active_poll_timeout_ms(default_control_timeout()), 60_000);
+        assert_eq!(active_poll_timeout_ms(Duration::from_secs(120)), 120_000);
+        assert_eq!(active_poll_timeout_ms(Duration::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn a_window_without_a_completion_is_a_poll_timeout_and_not_a_completion_failure() {
+        // The native wording, as the FFI reports it, for an idle window that ended.
+        let quiet = anyhow::anyhow!(
+            "cuteafd_rdma_rc_endpoint_poll_with_timeout returned status 7: RDMA RC endpoint timed out waiting for completions send=0/0 recv=0/1 poll_iterations=4096"
+        )
+        .context("polling an idle connection");
+        assert!(is_verbs_host_rdma_poll_timeout(&quiet));
+        // A failed completion in the same call must still remove the peer.
+        let failed = anyhow::anyhow!(
+            "cuteafd_rdma_rc_endpoint_poll_with_timeout returned status 7: RDMA RC endpoint recv completion returned non-success status status=12 (transport retry counter exceeded) opcode=128 wr_id=1 vendor_err=129"
+        );
+        assert!(!is_verbs_host_rdma_poll_timeout(&failed));
     }
 
     #[test]

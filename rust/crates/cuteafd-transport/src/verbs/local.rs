@@ -404,7 +404,9 @@ impl LocalVerbsExpertConnection {
     /// `wait = Some(timeout)` and no completion already pending, the call first
     /// blocks on the endpoint's completion channel (armed with
     /// `ibv_req_notify_cq`) for up to `timeout`, so an idle peer is woken by the
-    /// QP event rather than polled.
+    /// QP event rather than polled. `timeout` is the whole wait (`wait_stats`):
+    /// it is not raised to the 30 s floor of an exchange in flight, because the
+    /// owner has other connections to sweep when it ends.
     pub fn poll<F>(&mut self, wait: Option<Duration>, mut execute: F) -> Result<bool>
     where
         F: FnMut(
@@ -422,7 +424,7 @@ impl LocalVerbsExpertConnection {
         let total_started = timing_enabled.then(Instant::now);
         let poll_recv_started = timing_enabled.then(Instant::now);
         let stats = match wait {
-            Some(timeout) => match self.endpoint.poll_stats(0, 1, timeout) {
+            Some(timeout) => match self.endpoint.wait_stats(0, 1, timeout) {
                 Ok(stats) => stats,
                 // The event wait reports a window with no completion as an RDMA
                 // error; on an idle connection that is the expected outcome and
