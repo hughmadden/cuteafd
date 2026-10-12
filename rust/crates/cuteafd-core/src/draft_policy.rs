@@ -2333,6 +2333,13 @@ mod tests {
                 for value in snapshot.layers.iter().flatten().chain(&snapshot.round).chain(&snapshot.draft) {
                     transcript.real("fit", *value);
                 }
+                for value in snapshot.row_knots.iter().chain(snapshot.layer_row_slopes.iter().flatten())
+                    .chain(&snapshot.round_row_slopes) {
+                    transcript.real("row_curve", *value);
+                }
+                for &identified in snapshot.layer_row_identified.iter().flatten().chain(&snapshot.round_row_identified) {
+                    transcript.word("row_identified", u64::from(identified));
+                }
                 let (timed, error) = policy.prediction_health(shared, requests);
                 transcript.word("timed", timed);
                 transcript.real("relative_error", error);
@@ -2391,9 +2398,10 @@ mod tests {
         assert_eq!(fit.theta, before);
     }
 
-    /// Decisions and fits recorded after pooled shrinkage and skip recovery.
-    /// The pool engages sparse buckets earlier; recovery reduces zero lengths.
-    /// A change here is a decision change.
+    /// Decisions and fits, including every row-curve slope and identifiability mask.
+    /// The linear-adapter control is exact; physical/residual ramp ablations
+    /// first change decisions at scenario 0 rounds 22/25, combined at round 25.
+    /// A change here is a decision or fitted-state change.
     #[test]
     fn replay_reproduces_recorded_decisions_and_fits() {
         let mut transcript = Transcript::new();
@@ -2401,7 +2409,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (39_498, 8_580_141_267_688_736_751));
+        assert_eq!((transcript.records, transcript.hash), (98_217, 749_068_173_588_910_718));
     }
 
     fn seed() -> PolicySeed {
