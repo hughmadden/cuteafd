@@ -49,8 +49,6 @@ const WARM_ROUND_SAMPLES: u64 = 12;
 const CALIBRATION_DECAY: f64 = 0.998;
 /// Initial curvature (prior strength) of each position's calibration.
 const CALIBRATION_PRIOR: f64 = 2.;
-/// Per-round weight of the mean prediction-residual correction.
-const BIAS_RATE: f64 = 0.02;
 /// Weight of the newest round in each request's recent calibrated confidence.
 const RECENT_RATE: f64 = 0.5;
 /// Rounds without one draft width before it is tried once again, keeping its
@@ -73,15 +71,13 @@ const PRIOR_SAMPLES: f64 = 0.01;
 pub const MAX_RESOURCE_CLASSES: usize = 4;
 /// Smoothing of a seeded policy's relative prediction error.
 const ERROR_RATE: f64 = 0.1;
-/// Per-sample forgetting of each round-correction cell (memory ~100 rounds
-/// of that concurrency).
-const CORRECTION_DECAY: f64 = 0.99;
-/// Weight, in samples, pulling each correction cell toward zero.
-const CORRECTION_PRIOR: f64 = 2.;
-/// Request-count buckets of the round correction: 1, 2, 3-4, ..., 65-128, more.
-const REQUEST_BUCKETS: usize = 9;
-/// Reached samples a position needs before a seeded policy trusts its own
-/// calibration over the pooled one (PLAN draft policy section 3).
+/// Concurrency regimes for nonphysical round and drafter costs.
+pub const CONCURRENCY_BUCKETS: usize = 4;
+/// C1, C2-4, C5-8 and C9+ share costs only within their bucket.
+pub fn draft_concurrency_bucket(requests: usize) -> usize {
+    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, _ => 3 }
+}
+/// Reached samples before a position uses its own calibration.
 const POOLED_BELOW: u64 = 32;
 
 /// Policy failures. Each is a caller or binding error; none is fatal to
@@ -168,9 +164,8 @@ impl ResourceClass {
 
 /// What a binding knows about its lane before the first round: typical warm
 /// fits as priors, how many drafts to verify until the fits have earned
-/// trust, and the row buckets its padded steps run at. A policy without a
-/// seed (V4.1) keeps the weak physical priors and verifies every draft until
-/// its sample counts are warm.
+/// trust. Every binding supplies a seed; weak priors use the same behavior
+/// path as measured warm priors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicySeed {
     /// Round residual prior: intercept µs, µs per row, µs per request.
@@ -190,48 +185,12 @@ pub struct PolicySeed {
     pub warm_error: f64,
 }
 
-/// One concurrency's correction of the linear model, `a + b * rows` µs: the
-/// residual of each fully timed round (its wall time less the draft pass,
-/// against the fits' prediction for the executed shape before they learn
-/// from it), least squares with forgetting, pulled toward zero. Per-row
-/// costs are not one slope across concurrency: under the head split a C1
-/// row adds attention and exchange work that a C16 row shares, while the
-/// fits that price both are dominated by whichever traffic is current. The
-/// correction gives each concurrency its own level and row slope on top of
-/// the shared physical fits, and restores the mean round time per shape
-/// (stalls included) where the robust fits track typical rounds.
-#[derive(Clone, Copy, Debug)]
-struct Correction {
-    sxx: [[f64; 2]; 2],
-    sxy: [f64; 2],
-    theta: [f64; 2],
-    samples: u64,
-}
-
-impl Correction {
-    const ZERO: Self = Self { sxx: [[0.; 2]; 2], sxy: [0.; 2], theta: [0.; 2], samples: 0 };
-    fn value(&self, rows: f64) -> f64 {
-        self.theta[0] + self.theta[1] * rows
+impl PolicySeed {
+    /// Conservative weak priors for bindings without measured warm fits.
+    pub fn weak(max_positions: usize) -> Self {
+        Self { round: [5000., 300., 200.], draft: [2500., 100.], samples: PRIOR_SAMPLES,
+            cold_drafts: max_positions, warm_rounds: WARM_ROUND_SAMPLES, warm_error: 1. }
     }
-    fn observe(&mut self, rows: f64, residual: f64) {
-        let x = [1., rows];
-        for i in 0..2 {
-            for j in 0..2 {
-                self.sxx[i][j] = CORRECTION_DECAY * self.sxx[i][j] + x[i] * x[j];
-            }
-            self.sxy[i] = CORRECTION_DECAY * self.sxy[i] + x[i] * residual;
-        }
-        self.samples += 1;
-        // Prior precision per coefficient in samples of a typical shape (rows ~4).
-        let a = [[self.sxx[0][0] + CORRECTION_PRIOR, self.sxx[0][1]],
-            [self.sxx[1][0], self.sxx[1][1] + CORRECTION_PRIOR * 16.]];
-        if let Some(theta) = solve_linear(a, self.sxy) { self.theta = theta; }
-    }
-}
-
-/// Correction cell of a round with `requests` requests: 1, 2, 3-4, 5-8, ...
-fn request_bucket(requests: usize) -> usize {
-    ((usize::BITS - requests.max(1).saturating_sub(1).leading_zeros()) as usize).min(REQUEST_BUCKETS - 1)
 }
 
 /// A timed layer with routed experts: the unit the layer fits price.
@@ -460,49 +419,38 @@ type ClassBytes = [f64; MAX_RESOURCE_CLASSES];
 struct CostModel {
     /// [regime][class], x = [1, rows, MB].
     layer: Vec<Vec<Estimator<3>>>,
-    /// [regime], x = [1, rows, requests]; excludes the draft pass.
-    round: Vec<Estimator<3>>,
-    /// [regime] draft pass, x = [1, requests, wide, wide * requests].
-    draft: Vec<Estimator<4>>,
-    /// [regime][narrow, wide] draft passes observed.
-    draft_samples: Vec<[u64; 2]>,
+    /// [regime][concurrency], x = [1, rows, requests]; excludes the draft pass.
+    round: Vec<Vec<Estimator<3>>>,
+    /// [regime][concurrency] draft pass, x = [1, requests, wide, wide * requests].
+    draft: Vec<Vec<Estimator<4>>>,
+    /// [regime][concurrency][narrow, wide] draft passes observed.
+    draft_samples: Vec<Vec<[u64; 2]>>,
     /// Priced layers per class.
     layers_in: Vec<usize>,
 }
 
 impl CostModel {
-    fn new(geometry: &PolicyGeometry, priced: &[Priced], seed: Option<&PolicySeed>) -> Self {
+    fn new(geometry: &PolicyGeometry, priced: &[Priced], seed: &PolicySeed) -> Self {
         let n0 = PRIOR_SAMPLES;
         let layer: Vec<_> = geometry.classes.iter()
             .map(|class| Estimator::new(0.998, class.prior, class.prior_precision)).collect();
-        let (round, draft) = match seed {
-            None => (Estimator::new(0.98, [5000., 300., 200.], [n0, n0 * 36., n0]),
-                Estimator::new(0.98, [2500., 100., 400., 50.], [n0, n0 * 16., n0, n0 * 16.])),
-            // Typical warm fits as priors, worth `samples` rounds of a few rows and requests.
-            Some(seed) => {
-                let n = seed.samples;
-                (Estimator::new(0.98, seed.round, [n, n * 16., n * 4.]),
-                    Estimator::new(0.98, [seed.draft[0], seed.draft[1], 400., 50.], [n, n * 4., n0, n0 * 16.]))
-            }
-        };
+        let n = seed.samples;
+        let round = Estimator::new(0.98, seed.round, [n, n * 16., n * 4.]);
+        let draft = Estimator::new(0.98, [seed.draft[0], seed.draft[1], 400., 50.], [n, n * 4., n0, n0 * 16.]);
         Self {
             layer: vec![layer; geometry.regimes],
-            round: vec![round; geometry.regimes],
-            draft: vec![draft; geometry.regimes],
-            draft_samples: vec![[0; 2]; geometry.regimes],
+            round: vec![vec![round; CONCURRENCY_BUCKETS]; geometry.regimes],
+            draft: vec![vec![draft; CONCURRENCY_BUCKETS]; geometry.regimes],
+            draft_samples: vec![vec![[0; 2]; CONCURRENCY_BUCKETS]; geometry.regimes],
             layers_in: (0..geometry.classes.len()).map(|c| priced.iter().filter(|p| p.class == c).count()).collect(),
         }
     }
-    fn warm(&self, regime: usize) -> bool {
-        self.round[regime].samples >= WARM_ROUND_SAMPLES
+    fn warm(&self, regime: usize, bucket: usize) -> bool {
+        self.round[regime][bucket].samples >= WARM_ROUND_SAMPLES
             && (0..self.layers_in.len()).all(|c| self.layers_in[c] == 0 || self.layer[regime][c].samples >= WARM_LAYER_SAMPLES)
     }
-    /// The regime's own fit once warm, else another regime's warm fit.
-    fn usable_regime(&self, regime: usize) -> Option<usize> {
-        std::iter::once(regime).chain((0..self.round.len()).filter(|&r| r != regime)).find(|&r| self.warm(r))
-    }
     fn predict(&self, regime: usize, rows: f64, requests: f64, megabytes: ClassBytes) -> f64 {
-        let mut total = self.round[regime].predict(&[1., rows, requests]);
+        let mut total = self.round[regime][draft_concurrency_bucket(requests as usize)].predict(&[1., rows, requests]);
         for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
             let layers = self.layers_in[class] as f64;
@@ -511,28 +459,29 @@ impl CostModel {
         total
     }
     /// Predicted µs of the draft pass.
-    fn draft_us(&self, regime: usize, requests: f64, wide: bool) -> f64 {
+    fn draft_us(&self, regime: usize, bucket: usize, requests: f64, wide: bool) -> f64 {
+        if requests == 0. { return 0.; }
         let wide = f64::from(u8::from(wide));
-        self.draft[regime].predict(&[1., requests, wide, wide * requests])
+        self.draft[regime][bucket].predict(&[1., requests, wide, wide * requests])
     }
-    fn widths_warm(&self, regime: usize) -> bool {
-        self.draft_samples[regime].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
+    fn widths_warm(&self, regime: usize, bucket: usize) -> bool {
+        self.draft_samples[regime][bucket].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
     }
     /// Marginal µs of one more row plus `megabytes` of new weight traffic.
-    fn marginal(&self, regime: usize, megabytes: ClassBytes) -> f64 {
-        let mut total = self.round[regime].theta[1];
+    fn marginal(&self, regime: usize, bucket: usize, megabytes: ClassBytes) -> f64 {
+        let mut total = self.round[regime][bucket].theta[1];
         for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
             total += self.layers_in[class] as f64 * theta[1] + theta[2] * megabytes[class];
         }
         total
     }
-    fn snapshot(&self, regime: usize) -> DraftCostSnapshot {
+    fn snapshot(&self, regime: usize, bucket: usize) -> DraftCostSnapshot {
         let pack = |e: &Estimator<3>| [e.theta[0], e.theta[1], e.theta[2], e.samples as f64, e.scale];
-        let draft = &self.draft[regime];
+        let draft = &self.draft[regime][bucket];
         DraftCostSnapshot {
             layers: self.layer[regime].iter().map(pack).collect(),
-            round: pack(&self.round[regime]),
+            round: pack(&self.round[regime][bucket]),
             draft: [draft.theta[0], draft.theta[1], draft.theta[2], draft.theta[3], draft.samples as f64, draft.scale],
         }
     }
@@ -594,6 +543,8 @@ pub struct DraftRoundObservation<'a> {
     /// Wall µs of the draft pass (NaN if none ran), and whether it used the
     /// wide width.
     pub draft_us: f64,
+    /// Sequences passed to the drafter; None retains all-request legacy pricing.
+    pub drafted_requests: Option<usize>,
     pub wide: bool,
     /// The policy's prediction for this round's shape, if it made one.
     pub predicted_us: Option<f64>,
@@ -656,10 +607,6 @@ pub struct DraftPolicy {
     /// Each position is refitted online from the outcomes of the rounds that
     /// reached it.
     calibration: Vec<Platt>,
-    /// Mean residual of the predicted round time per regime. The robust fit
-    /// tracks typical rounds, while throughput depends on mean time including
-    /// stalls; this constant restores the mean without moving the marginals.
-    bias: Vec<f64>,
     /// Per request, short-memory calibrated confidence per drafted position.
     recent: BTreeMap<u64, Vec<Option<f64>>>,
     /// Per request, decayed (accepted, reached) counts per position. Past the
@@ -671,77 +618,62 @@ pub struct DraftPolicy {
     /// recent evidence at that position.
     raw_mean: Vec<f64>,
     /// Draft passes since each width (narrow, wide) last ran.
-    since_width: [u64; 2],
+    since_width: Vec<Vec<[u64; 2]>>,
     stats: DraftPolicyStats,
     /// Routes per (window, layer, expert) in the shape being evaluated.
     counts: Vec<u8>,
     /// Routes per expert of one observed layer.
     scratch: Vec<u16>,
-    /// The binding's seed; `None` keeps the unseeded behavior bit for bit.
-    seed: Option<PolicySeed>,
-    /// Seeded only: per regime and request bucket, the linear correction
-    /// that replaces the scalar bias.
-    correction: Vec<[Correction; REQUEST_BUCKETS]>,
-    /// Seeded only: per regime, fully timed rounds and the smoothed relative
-    /// error of their out-of-sample prediction.
-    timed: Vec<(u64, f64)>,
-    /// Seeded only: per regime, the policy has engaged (it stays engaged).
-    engaged: Vec<bool>,
-    /// Seeded only: one calibration fed by every position's outcomes, used
-    /// where a position has been reached fewer than `POOLED_BELOW` times, so
-    /// a few early misses cannot pin a position low before it is explored.
-    pooled: Platt,
-    /// Rounds since a supplied non-skip pre-draft action was selected, by regime/width.
-    action_age: BTreeMap<(usize, usize), u64>,
+    seed: PolicySeed,
+    /// Per lane regime and concurrency bucket: timed rounds and prediction error.
+    timed: Vec<Vec<(u64, f64)>>,
+    engaged: Vec<Vec<bool>>,
+    /// Native head and constant copy-tail evidence must not train one another.
+    pooled: [Platt; 2],
+    action_age: BTreeMap<(usize, usize, usize), u64>,
+    /// Outstanding extent per request; independent lanes may share a regime.
+    selected_requests: BTreeMap<u64, usize>,
+
 }
 
 impl DraftPolicy {
-    /// `fixed` verifies every available draft but still fits and reports.
-    pub fn new(geometry: PolicyGeometry, fixed: bool) -> Result<Self, DraftPolicyError> {
-        geometry.validate()?;
-        Ok(Self::build(geometry, fixed, None))
-    }
-    /// A policy seeded with its binding's typical warm fits: it engages once
-    /// its fits are warm and predict `seed.warm_rounds` timed rounds within
-    /// `seed.warm_error`, and a per-concurrency correction replaces the bias.
-    pub fn seeded(geometry: PolicyGeometry, seed: PolicySeed) -> Result<Self, DraftPolicyError> {
+    /// Every binding supplies priors; fixed mode still fits and reports.
+    pub fn new(geometry: PolicyGeometry, seed: PolicySeed, fixed: bool) -> Result<Self, DraftPolicyError> {
         geometry.validate()?;
         let finite = seed.round.iter().chain(&seed.draft).chain([&seed.samples, &seed.warm_error]).all(|v| v.is_finite());
         if !finite || seed.samples <= 0. || seed.warm_error <= 0. || seed.round.iter().chain(&seed.draft).any(|&v| v < 0.) {
             return Err(DraftPolicyError::Geometry("seed priors must be finite and nonnegative"));
         }
-        Ok(Self::build(geometry, false, Some(seed)))
+        Ok(Self::build(geometry, fixed, seed))
     }
-    fn build(geometry: PolicyGeometry, fixed: bool, seed: Option<PolicySeed>) -> Self {
+    pub fn seeded(geometry: PolicyGeometry, seed: PolicySeed) -> Result<Self, DraftPolicyError> {
+        Self::new(geometry, seed, false)
+    }
+    fn build(geometry: PolicyGeometry, fixed: bool, seed: PolicySeed) -> Self {
         let priced = geometry.priced();
         let positions = geometry.max_positions;
         Self {
-            cost: CostModel::new(&geometry, &priced, seed.as_ref()),
-            correction: vec![[Correction::ZERO; REQUEST_BUCKETS]; if seed.is_some() { geometry.regimes } else { 0 }],
-            timed: vec![(0, 1.); geometry.regimes],
-            engaged: vec![false; geometry.regimes],
-            pooled: Platt::new(),
+            cost: CostModel::new(&geometry, &priced, &seed),
+            timed: vec![vec![(0, 1.); CONCURRENCY_BUCKETS]; geometry.regimes],
+            engaged: vec![vec![false; CONCURRENCY_BUCKETS]; geometry.regimes],
+            since_width: vec![vec![[0; 2]; CONCURRENCY_BUCKETS]; geometry.regimes],
+            selected_requests: BTreeMap::new(),
+            pooled: [Platt::new(); 2],
             action_age: BTreeMap::new(),
-            seed,
-            priced,
-            fixed,
+            seed, priced, fixed,
             history: BTreeMap::new(),
             novelty: vec![2.5; geometry.layers.len()],
             calibration: vec![Platt::new(); positions],
-            bias: vec![0.; geometry.regimes],
-            recent: BTreeMap::new(),
-            outcomes: BTreeMap::new(),
+            recent: BTreeMap::new(), outcomes: BTreeMap::new(),
             raw_mean: vec![0.9; positions],
-            since_width: [0; 2],
             stats: DraftPolicyStats::new(positions),
             counts: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts)],
-            scratch: vec![0; usize::from(geometry.experts)],
-            geometry,
+            scratch: vec![0; usize::from(geometry.experts)], geometry,
         }
     }
-    /// A fresh policy over the same geometry (and seed, unless `fixed`).
+    /// A fresh policy over the same geometry and priors.
     pub fn restarted(&self, fixed: bool) -> Self {
-        Self::build(self.geometry.clone(), fixed, self.seed.clone().filter(|_| !fixed))
+        Self::build(self.geometry.clone(), fixed, self.seed.clone())
     }
     pub fn fixed(&self) -> bool {
         self.fixed
@@ -755,56 +687,39 @@ impl DraftPolicy {
     fn regime(&self, shared: bool) -> usize {
         usize::from(shared).min(self.geometry.regimes - 1)
     }
-    pub fn cost_snapshot(&self, shared: bool) -> DraftCostSnapshot {
-        self.cost.snapshot(self.regime(shared))
+    pub fn cost_snapshot(&self, shared: bool, requests: usize) -> DraftCostSnapshot {
+        self.cost.snapshot(self.regime(shared), draft_concurrency_bucket(requests))
     }
-    pub fn warm(&self, shared: bool) -> bool {
-        self.cost.warm(self.regime(shared))
+    pub fn warm(&self, shared: bool, requests: usize) -> bool {
+        self.cost.warm(self.regime(shared), draft_concurrency_bucket(requests))
     }
-    /// The policy chooses lengths for this regime (a seeded policy once its
-    /// predictions have earned trust; an unseeded one once warm).
-    pub fn engaged(&self, shared: bool) -> bool {
-        self.usable_regime(self.regime(shared)).is_some()
+    pub fn engaged(&self, shared: bool, requests: usize) -> bool {
+        self.usable_regime(self.regime(shared), requests).is_some()
     }
-    /// Seeded only: drafts each request verifies while the policy has not
-    /// engaged.
-    pub fn cold_drafts(&self) -> Option<usize> {
-        self.seed.as_ref().map(|seed| seed.cold_drafts)
+    pub fn cold_drafts(&self) -> usize { self.seed.cold_drafts }
+    pub fn prediction_health(&self, shared: bool, requests: usize) -> (u64, f64) {
+        self.timed[self.regime(shared)][draft_concurrency_bucket(requests)]
     }
-    /// Seeded only: fully timed rounds and smoothed relative prediction
-    /// error of the regime.
-    pub fn prediction_health(&self, shared: bool) -> (u64, f64) {
-        self.timed[self.regime(shared)]
-    }
-    /// Seeded only: per request bucket (1, 2, 3-4, ...), the correction's
-    /// intercept µs, µs per row and samples.
-    pub fn corrections(&self, shared: bool) -> Vec<[f64; 3]> {
-        self.correction.get(self.regime(shared)).map_or(Vec::new(), |cells|
-            cells.iter().map(|c| [c.theta[0], c.theta[1], c.samples as f64]).collect())
-    }
-    fn engaged_regime(&self, regime: usize) -> bool {
-        self.seed.is_none() && self.cost.warm(regime) || self.engaged[regime]
-    }
-    /// The regime's own fit once engaged, else another regime's.
-    fn usable_regime(&self, regime: usize) -> Option<usize> {
-        if self.seed.is_none() { return self.cost.usable_regime(regime); }
+    /// Another lane's fit may be used, but never another concurrency's fit.
+    fn usable_regime(&self, regime: usize, requests: usize) -> Option<usize> {
+        let bucket = draft_concurrency_bucket(requests);
         std::iter::once(regime).chain((0..self.geometry.regimes).filter(|&r| r != regime))
-            .find(|&r| self.engaged_regime(r))
+            .find(|&r| self.engaged[r][bucket])
     }
-    /// What the linear model misses for a round of `rows` rows and
-    /// `requests` requests: the regime's bias, or a seeded policy's
-    /// per-concurrency correction.
-    fn adjustment(&self, regime: usize, rows: f64, requests: usize) -> f64 {
-        match self.correction.get(regime) {
-            Some(cells) => cells[request_bucket(requests)].value(rows),
-            None => self.bias[regime],
-        }
+    /// Predicted drafter time when every verifier request drafts.
+    pub fn draft_cost(&self, shared: bool, requests: usize, width: usize) -> f64 {
+        self.draft_cost_drafted(shared, requests, requests, width)
     }
-    fn adjustment_per_row(&self, regime: usize, requests: usize) -> f64 {
-        self.correction.get(regime).map_or(0., |cells| cells[request_bucket(requests)].theta[1])
+    /// A mixed batch keeps its verifier concurrency bucket, but prices only
+    /// the sequences actually passed to the drafter.
+    pub fn draft_cost_drafted(&self, shared: bool, requests: usize, drafted_requests: usize, width: usize) -> f64 {
+        if drafted_requests == 0 || width == 0 { return 0.; }
+        self.cost.draft_us(self.regime(shared), draft_concurrency_bucket(requests), drafted_requests as f64,
+            width > self.geometry.widths[0])
     }
     pub fn release(&mut self, id: u64) {
         self.history.remove(&id);
+        self.selected_requests.remove(&id);
         self.recent.remove(&id);
         self.outcomes.remove(&id);
     }
@@ -816,13 +731,9 @@ impl DraftPolicy {
     pub fn calibration(&self) -> Vec<(f64, f64)> {
         self.calibration.iter().map(|platt| (platt.theta[0], platt.theta[1])).collect()
     }
-    /// Mean prediction-residual correction per regime (solo, shared), µs.
-    pub fn time_bias(&self) -> &[f64] {
-        &self.bias
-    }
     fn calibrated(&self, position: usize, probability: f64) -> f64 {
-        if self.seed.is_some() && self.stats.position_reached[position] < POOLED_BELOW {
-            return self.pooled.apply(probability);
+        if self.stats.position_reached[position] < POOLED_BELOW {
+            return self.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].apply(probability);
         }
         self.calibration[position].apply(probability)
     }
@@ -846,11 +757,18 @@ impl DraftPolicy {
     /// Predicted lane µs for explicit lengths after a draft of `width`, if the
     /// fit is usable.
     pub fn predict(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize) -> Option<f64> {
-        let regime = self.usable_regime(self.regime(shared))?;
-        Some(self.predict_regime(regime, ids, lengths, width))
+        self.predict_drafted(shared, ids, lengths, width, ids.len())
+    }
+    /// Price all verifier anchors with the actual drafter batch extent.
+    pub fn predict_drafted(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize,
+        drafted_requests: usize) -> Option<f64> {
+        if ids.is_empty() || ids.len() != lengths.len() || drafted_requests > ids.len() { return None; }
+        let regime = self.usable_regime(self.regime(shared), ids.len())?;
+        for &id in ids { self.selected_requests.insert(id, ids.len()); }
+        Some(self.predict_regime(regime, ids, lengths, width, drafted_requests))
     }
 
-    fn predict_regime(&mut self, regime: usize, ids: &[u64], lengths: &[usize], width: usize) -> f64 {
+    fn predict_regime(&mut self, regime: usize, ids: &[u64], lengths: &[usize], width: usize, drafted_requests: usize) -> f64 {
         self.clear_counts();
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
@@ -859,9 +777,10 @@ impl DraftPolicy {
             }
         }
         let rows = ids.len() + lengths.iter().sum::<usize>();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
+        let draft = if width == 0 { 0. } else {
+            self.cost.draft_us(regime, draft_concurrency_bucket(ids.len()), drafted_requests as f64, width > self.geometry.widths[0])
+        };
         self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft
-            + self.adjustment(regime, rows as f64, ids.len())
     }
 
     /// Expected committed tokens and predicted lane µs of explicit `lengths`
@@ -871,23 +790,29 @@ impl DraftPolicy {
     /// shape against the selection on equal terms.
     pub fn evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
         -> Option<(f64, f64)> {
-        if candidates.len() != lengths.len()
+        self.evaluate_drafted(shared, candidates, lengths, width, candidates.len())
+    }
+
+    /// Evaluate a mixed verifier batch with the actual drafter batch extent.
+    pub fn evaluate_drafted(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize],
+        width: usize, drafted_requests: usize) -> Option<(f64, f64)> {
+        if drafted_requests > candidates.len() || candidates.len() != lengths.len()
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()) {
             return None;
         }
-        let regime = self.usable_regime(self.regime(shared))?;
-        self.evaluate_regime(regime, candidates, lengths, width)
+        let regime = self.usable_regime(self.regime(shared), candidates.len())?;
+        self.evaluate_regime(regime, candidates, lengths, width, drafted_requests)
     }
 
     /// Diagnostic evaluation including seed/physical priors before engagement.
     /// It does not make those warming predictions usable for selection.
     pub fn diagnostic_evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
         -> Option<(f64, f64)> {
-        let regime = self.usable_regime(self.regime(shared)).unwrap_or(self.regime(shared));
-        self.evaluate_regime(regime, candidates, lengths, width)
+        let regime = self.usable_regime(self.regime(shared), candidates.len()).unwrap_or(self.regime(shared));
+        self.evaluate_regime(regime, candidates, lengths, width, candidates.len())
     }
 
-    fn evaluate_regime(&mut self, regime: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
+    fn evaluate_regime(&mut self, regime: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize, drafted_requests: usize)
         -> Option<(f64, f64)> {
         if candidates.len() != lengths.len()
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()
@@ -903,7 +828,7 @@ impl DraftPolicy {
             }
         }
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        Some((expected, self.predict_regime(regime, &ids, lengths, width)))
+        Some((expected, self.predict_regime(regime, &ids, lengths, width, drafted_requests)))
     }
 
     /// Choose draft lengths for one lane after a draft of `width`. Returns
@@ -921,9 +846,16 @@ impl DraftPolicy {
     /// request at its anchor.
     pub fn select_within(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], width: usize, max_rows: usize)
         -> Result<Option<DraftSelection>, DraftPolicyError> {
+        self.select_drafted_within(shared, candidates, width, max_rows, candidates.len())
+    }
+
+    /// Select over all verifier requests while pricing only the sequences drafted.
+    pub fn select_drafted_within(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], width: usize,
+        max_rows: usize, drafted_requests: usize) -> Result<Option<DraftSelection>, DraftPolicyError> {
         if candidates.is_empty() || candidates.len() > self.geometry.max_requests {
             return Err(DraftPolicyError::Requests(self.geometry.max_requests));
         }
+        if drafted_requests > candidates.len() { return Err(DraftPolicyError::RequestExtent); }
         for candidate in candidates {
             if candidate.confidence.len() > self.geometry.max_positions
                 || candidate.confidence.iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
@@ -933,7 +865,7 @@ impl DraftPolicy {
         if self.fixed {
             return Ok(None);
         }
-        let Some(regime) = self.usable_regime(self.regime(shared)) else { return Ok(None) };
+        let Some(regime) = self.usable_regime(self.regime(shared), candidates.len()) else { return Ok(None) };
         // Survival of row k: the product of calibrated conditional acceptance
         // probabilities of positions 1..=k.
         let cumulative: Vec<Vec<f64>> = candidates.iter().map(|c| {
@@ -944,7 +876,10 @@ impl DraftPolicy {
             }).collect()
         }).collect();
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
+        let draft = if width == 0 { 0. } else {
+            self.cost.draft_us(regime, draft_concurrency_bucket(ids.len()), drafted_requests as f64, width > self.geometry.widths[0])
+        };
+        for c in candidates { self.selected_requests.insert(c.id, candidates.len()); }
         Ok(Some(self.select_core(regime, &ids, &cumulative, draft, max_rows)))
     }
 
@@ -957,13 +892,13 @@ impl DraftPolicy {
         let (narrow, wide) = self.geometry.narrow_wide();
         if narrow == wide || requests.is_empty() { return narrow; }
         if self.fixed { return wide; }
-        let regime = self.usable_regime(self.regime(shared));
-        let Some(regime) = regime.filter(|&r| self.cost.widths_warm(r)) else {
+        let regime = self.usable_regime(self.regime(shared), requests.len());
+        let Some(regime) = regime.filter(|&r| self.cost.widths_warm(r, draft_concurrency_bucket(requests.len()))) else {
             // Warm up both draft-cost fits by alternating widths.
-            return if self.stats.width_rounds[0] <= self.stats.width_rounds[1] { narrow } else { wide };
+            return if self.cost.draft_samples[self.regime(shared)][draft_concurrency_bucket(requests.len())][0] <= self.cost.draft_samples[self.regime(shared)][draft_concurrency_bucket(requests.len())][1] { narrow } else { wide };
         };
-        if self.since_width[1] >= WIDTH_EXPLORE_ROUNDS { return wide; }
-        if self.since_width[0] >= WIDTH_EXPLORE_ROUNDS { return narrow; }
+        if self.since_width[regime][draft_concurrency_bucket(requests.len())][1] >= WIDTH_EXPLORE_ROUNDS { return wide; }
+        if self.since_width[regime][draft_concurrency_bucket(requests.len())][0] >= WIDTH_EXPLORE_ROUNDS { return narrow; }
         let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
         let mut best: Option<(usize, f64)> = None;
         for width in [narrow, wide] {
@@ -977,7 +912,7 @@ impl DraftPolicy {
                     product
                 }).collect()
             }).collect();
-            let draft = self.cost.draft_us(regime, ids.len() as f64, width > narrow);
+            let draft = self.cost.draft_us(regime, draft_concurrency_bucket(ids.len()), ids.len() as f64, width > narrow);
             let selection = self.select_core(regime, &ids, &cumulative, draft, usize::MAX);
             let ratio = selection.expected_tokens / selection.predicted_us;
             if best.is_none_or(|(_, b)| ratio > b) { best = Some((width, ratio)); }
@@ -1000,7 +935,7 @@ impl DraftPolicy {
         }
         if self.fixed { return Ok(actions.iter().enumerate().max_by_key(|(_, action)| action.width)
             .map(|(index, _)| index)); }
-        let Some(regime) = self.usable_regime(self.regime(shared)) else { return Ok(None) };
+        let Some(regime) = self.usable_regime(self.regime(shared), requests.len()) else { return Ok(None) };
         let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
         let mut best: Option<(usize, f64)> = None;
         for (index, action) in actions.iter().enumerate() {
@@ -1020,17 +955,18 @@ impl DraftPolicy {
         }
         let can_draft = max_rows > requests.len() && requests.iter().any(|&(_, room)| room > 0);
         for action in actions.iter().filter(|action| can_draft && action.width > 0) {
-            let age = self.action_age.entry((regime, action.width)).or_default();
+            let age = self.action_age.entry((regime, draft_concurrency_bucket(requests.len()), action.width)).or_default();
             *age = age.saturating_add(1);
         }
         let explore = actions.iter().enumerate().filter(|(_, action)| can_draft && action.width > 0)
-            .filter_map(|(index, action)| self.action_age.get(&(regime, action.width))
+            .filter_map(|(index, action)| self.action_age.get(&(regime, draft_concurrency_bucket(requests.len()), action.width))
                 .filter(|&&age| age >= WIDTH_EXPLORE_ROUNDS).map(|&age| (index, age)))
             .max_by_key(|&(index, age)| (age, usize::MAX - index)).map(|(index, _)| index);
         let chosen = explore.or_else(|| best.map(|(index, _)| index));
         if let Some(index) = chosen.filter(|&index| actions[index].width > 0) {
-            self.action_age.insert((regime, actions[index].width), 0);
+            self.action_age.insert((regime, draft_concurrency_bucket(requests.len()), actions[index].width), 0);
         }
+        for &(id, _) in requests { self.selected_requests.insert(id, requests.len()); }
         Ok(chosen)
     }
 
@@ -1047,9 +983,7 @@ impl DraftPolicy {
         let mut rows = ids.len();
         let mut lengths = vec![0usize; ids.len()];
         let mut expected = requests;
-        let mut time = self.cost.predict(regime, rows as f64, requests, megabytes) + draft_us
-            + self.adjustment(regime, rows as f64, ids.len());
-        let per_row = self.adjustment_per_row(regime, ids.len());
+        let mut time = self.cost.predict(regime, rows as f64, requests, megabytes) + draft_us;
         let mut best = DraftSelection {
             lengths: lengths.clone(), expected_tokens: expected, predicted_us: time, evaluated: 1,
         };
@@ -1066,9 +1000,8 @@ impl DraftPolicy {
                 if next > cumulative[index].len() { continue; }
                 let delta = self.peek_row(id, next);
                 let candidate_expected = expected + cumulative[index][next - 1];
-                let marginal = self.cost.marginal(regime, delta);
-                // A seeded correction may lower the row slope, never below a µs.
-                let candidate_time = time + if self.seed.is_some() { (marginal + per_row).max(1.) } else { marginal };
+                let marginal = self.cost.marginal(regime, draft_concurrency_bucket(ids.len()), delta);
+                let candidate_time = time + marginal.max(1.);
                 evaluated += 1;
                 if choice.is_none_or(|(_, e, t)| candidate_expected / candidate_time > e / t) {
                     choice = Some((index, candidate_expected, candidate_time));
@@ -1163,16 +1096,26 @@ impl DraftPolicy {
         if round.routes.len() != layers * rows * topk {
             return Err(DraftPolicyError::RouteShape);
         }
-        if round.requests.iter().any(|r| r.rows == 0 || r.accepted == 0 || r.accepted > r.rows) {
+        if round.requests.is_empty() || round.requests.len() > self.geometry.max_requests
+            || round.requests.iter().any(|r| r.rows == 0 || r.accepted == 0 || r.accepted > r.rows)
+            || round.drafted_requests.is_some_and(|n| n > round.requests.len()) {
             return Err(DraftPolicyError::RequestExtent);
         }
         let regime = self.regime(round.shared);
+        if round.predicted_us.is_some() && round.requests.iter().any(|r| self.selected_requests.get(&r.id) != Some(&round.requests.len())) {
+            return Err(DraftPolicyError::RequestExtent);
+        }
+        for r in round.requests { self.selected_requests.remove(&r.id); }
+        let bucket = draft_concurrency_bucket(round.requests.len());
         let requests = round.requests.len() as f64;
+        let drafted_requests = round.drafted_requests.unwrap_or(round.requests.len());
+        if drafted_requests > round.requests.len() { return Err(DraftPolicyError::RequestExtent); }
+        let drafted_requests = drafted_requests as f64;
         let layer_routes = |layer: usize| &round.routes[layer * rows * topk..][..rows * topk];
         let drafted = round.draft_us.is_finite();
         let draft_us = if drafted { round.draft_us } else { 0. };
         let complete = self.priced.iter().all(|p| round.layer_us.get(p.layer).copied().flatten().is_some());
-        if self.seed.is_some() && complete && round.total_us.is_finite() {
+        if complete && round.total_us.is_finite() {
             // Out of sample: the fits' price of the executed shape before
             // they learn from it, against the round's wall time.
             let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
@@ -1182,18 +1125,16 @@ impl DraftPolicy {
                     * priced.slice_bytes / 1e6;
             }
             let linear = self.cost.predict(regime, rows as f64, requests, megabytes)
-                + if drafted { self.cost.draft_us(regime, requests, round.wide) } else { 0. };
-            let predicted = linear + self.adjustment(regime, rows as f64, round.requests.len());
-            let (count, error) = &mut self.timed[regime];
+                + if drafted { self.cost.draft_us(regime, bucket, drafted_requests, round.wide) } else { 0. };
+            let predicted = linear;
+            let (count, error) = &mut self.timed[regime][bucket];
             *count += 1;
             let relative = ((round.total_us - predicted) / round.total_us.max(1.)).abs().min(1.);
             // A running mean over the first rounds, then exponential smoothing.
             *error += (relative - *error) * (1. / *count as f64).max(ERROR_RATE);
-            self.correction[regime][request_bucket(round.requests.len())].observe(rows as f64, round.total_us - linear);
-            if let Some(seed) = &self.seed {
-                let (count, error) = self.timed[regime];
-                self.engaged[regime] |= self.cost.warm(regime) && count >= seed.warm_rounds && error <= seed.warm_error;
-            }
+            let (count, error) = self.timed[regime][bucket];
+            self.engaged[regime][bucket] |= self.cost.warm(regime, bucket)
+                && count >= self.seed.warm_rounds && error <= self.seed.warm_error;
         }
         let mut layer_sum = 0.;
         for index in 0..self.priced.len() {
@@ -1204,17 +1145,17 @@ impl DraftPolicy {
             self.cost.layer[regime][priced.class].observe([1., rows as f64, megabytes], elapsed);
         }
         if complete && round.total_us.is_finite() {
-            self.cost.round[regime].observe([1., rows as f64, requests],
+            self.cost.round[regime][bucket].observe([1., rows as f64, requests],
                 (round.total_us - layer_sum - draft_us).max(0.));
         }
         if drafted {
             let wide = usize::from(round.wide);
             let flag = wide as f64;
-            self.cost.draft[regime].observe([1., requests, flag, flag * requests], round.draft_us);
-            self.cost.draft_samples[regime][wide] += 1;
+            self.cost.draft[regime][bucket].observe([1., drafted_requests, flag, flag * drafted_requests], round.draft_us);
+            self.cost.draft_samples[regime][bucket][wide] += 1;
             self.stats.width_rounds[wide] += 1;
-            self.since_width[wide] = 0;
-            self.since_width[1 - wide] += 1;
+            self.since_width[regime][bucket][wide] = 0;
+            self.since_width[regime][bucket][1 - wide] += 1;
         }
         let mut offset = 0;
         for request in round.requests {
@@ -1272,7 +1213,7 @@ impl DraftPolicy {
                     self.stats.position_raw_confidence[position] += confidence[position];
                     self.stats.position_accepted[position] += u64::from(position < accepted);
                     self.calibration[position].observe(confidence[position], outcome);
-                    if self.seed.is_some() { self.pooled.observe(confidence[position], outcome); }
+                    self.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].observe(confidence[position], outcome);
                 }
                 let counts = self.outcomes.entry(request.id).or_insert_with(|| vec![(0., 0.); positions]);
                 for count in counts.iter_mut() { count.0 *= OUTCOME_DECAY; count.1 *= OUTCOME_DECAY; }
@@ -1287,10 +1228,6 @@ impl DraftPolicy {
         if let Some(predicted) = round.predicted_us {
             self.stats.selected_rounds += 1;
             if round.total_us.is_finite() {
-                // Bounded step: one stalled round cannot swing the correction.
-                // A seeded policy's per-concurrency correction replaces it.
-                let residual = (round.total_us - predicted).clamp(-0.5 * predicted.abs(), 0.5 * predicted.abs());
-                if self.seed.is_none() { self.bias[regime] += BIAS_RATE * residual; }
                 self.stats.predicted_rounds += 1;
                 self.stats.prediction_error_us += predicted - round.total_us;
                 self.stats.prediction_abs_error_us += (predicted - round.total_us).abs();
@@ -1388,7 +1325,7 @@ mod tests {
         }
         let requests = [ObservedDraftRequest { id: 1, rows, accepted, confidence: None }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: predicted, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: predicted, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         *token += accepted as u64;
         total
     }
@@ -1399,7 +1336,7 @@ mod tests {
 
     #[test]
     fn evaluate_prices_explicit_shapes_as_select_does() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let candidates = [DraftCandidate { id: 1, confidence: &[0.9, 0.8, 0.7, 0.6, 0.5] }];
         assert_eq!(policy.evaluate(false, &candidates, &[3], 5), None, "cold fit");
         let (truth, mut token) = (truth(), 0);
@@ -1418,15 +1355,15 @@ mod tests {
 
     #[test]
     fn estimator_recovers_coefficients_and_predicts_rounds() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..400 {
             let rows = 1 + round % 8;
             run_round(&mut policy, &truth, &mut token, rows, rows, None);
         }
-        assert!(policy.warm(false));
-        let snapshot = policy.cost_snapshot(false);
+        assert!(policy.warm(false, 1));
+        let snapshot = policy.cost_snapshot(false, 1);
         let remote = snapshot.layers[1];
         assert!((remote[2] - 7.5).abs() < 0.3, "remote µs/MB {remote:?}");
         assert!((remote[1] - 12.).abs() < 3., "remote µs/row {remote:?}");
@@ -1462,7 +1399,7 @@ mod tests {
 
     #[test]
     fn certain_drafts_are_always_verified_and_hopeless_ones_trimmed() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
@@ -1482,7 +1419,7 @@ mod tests {
 
     #[test]
     fn selection_matches_exhaustive_search_for_one_request() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
@@ -1498,13 +1435,13 @@ mod tests {
 
     #[test]
     fn warmup_and_fixed_mode_verify_everything() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         assert_eq!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
-        let mut fixed = DraftPolicy::new(placement(5), true).unwrap();
+        let mut fixed = DraftPolicy::new(placement(5), PolicySeed::weak(7), true).unwrap();
         let truth = truth();
         let mut token = 0;
         for _ in 0..300 { run_round(&mut fixed, &truth, &mut token, 6, 3, None); }
-        assert!(fixed.warm(false));
+        assert!(fixed.warm(false, 1));
         assert_eq!(fixed.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
         assert_eq!(fixed.stats().draft_rows[5], 300);
         assert_eq!(fixed.stats().accepted_drafts, 600);
@@ -1512,14 +1449,14 @@ mod tests {
 
     #[test]
     fn shared_experts_across_requests_are_charged_once() {
-        let mut policy = DraftPolicy::new(placement(0), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(0), PolicySeed::weak(7), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
         let layer_us = [None; 40];
         for id in [1, 2] {
             for _ in 0..4 {
                 let requests = [ObservedDraftRequest { id, rows: 1, accepted: 1, confidence: None }];
                 policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                    layer_us: &layer_us, total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+                    layer_us: &layer_us, total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
             }
         }
         policy.clear_counts();
@@ -1531,7 +1468,7 @@ mod tests {
 
     #[test]
     fn groups_follow_the_kernel_row_tiles() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let rows: Vec<u16> = [1, 2, 3, 4, 5, 6].repeat(17);
         assert_eq!(policy.route_groups(&rows, 16), 12.);
         assert_eq!(policy.route_groups(&rows[..96], 16), 6.);
@@ -1540,12 +1477,12 @@ mod tests {
 
     #[test]
     fn confidence_reliability_counts_only_reached_positions() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]; 5]).collect();
         let confidence = [0.9, 0.8, 0.7, 0.6];
         let requests = [ObservedDraftRequest { id: 1, rows: 5, accepted: 2, confidence: Some(&confidence) }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         let stats = policy.stats();
         assert_eq!(stats.position_reached, [1, 1, 0, 0, 0, 0, 0]);
         assert_eq!(stats.position_accepted, [1, 0, 0, 0, 0, 0, 0]);
@@ -1554,7 +1491,7 @@ mod tests {
 
     #[test]
     fn overconfident_positions_are_recalibrated_from_reached_outcomes() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]; 8]).collect();
         // The drafter reports 0.95 at every position; position 1 is truly 0.95,
         // position 6 only 0.8.
@@ -1572,7 +1509,7 @@ mod tests {
             let accepted = truth.iter().take_while(|&&p| uniform() < p).count();
             let requests = [ObservedDraftRequest { id: 1, rows: 8, accepted: accepted + 1, confidence: Some(&confidence) }];
             policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+                layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         }
         assert!((policy.calibrated(0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration());
         assert!((policy.calibrated(5, 0.95) - 0.8).abs() < 0.03, "{:?}", policy.calibration());
@@ -1606,24 +1543,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mean_time_bias_absorbs_skewed_stalls() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
-        let truth = truth();
-        let mut token = 0;
-        for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
-        let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
-        for round in 0..2000 {
-            let predicted = policy.predict(false, &[1], &[0], 5).unwrap();
-            // Every tenth round stalls by 10 ms: mean excess 1 ms.
-            let total = predicted - policy.time_bias()[0] + if round % 10 == 0 { 10_000. } else { 0. };
-            let requests = [ObservedDraftRequest { id: 1, rows: 1, accepted: 1, confidence: None }];
-            policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                layer_us: &[None; 40], total_us: total, predicted_us: Some(predicted), draft_us: f64::NAN, wide: false }).unwrap();
-        }
-        assert!((policy.time_bias()[0] - 1000.).abs() < 250., "{:?}", policy.time_bias());
-    }
-
     /// One solo round of request `id` with `rows` verified rows after a draft
     /// of `width`, timed by the synthetic truth plus the draft pass.
     fn width_round(policy: &mut DraftPolicy, token: &mut u64, id: u64, width: usize, rows: usize,
@@ -1643,13 +1562,13 @@ mod tests {
         }
         let requests = [ObservedDraftRequest { id, rows, accepted, confidence: Some(confidence) }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, wide: width > 5 }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, drafted_requests: None, wide: width > 5 }).unwrap();
         *token += accepted as u64;
     }
 
     #[test]
     fn pre_draft_actions_share_row_prices_and_explore_unused_depths() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 3, draft_us: 100. },
             DraftAction { width: 5, draft_us: 1e12 }];
         assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(), None);
@@ -1672,14 +1591,45 @@ mod tests {
         assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 0, draft_us: 1. }], 64).is_err());
         assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 3, draft_us: f64::NAN }], 64).is_err());
         assert!(policy.choose_action(false, &[(1, 5)], &[DraftAction { width: 8, draft_us: 1. }], 64).is_err());
-        let mut fixed = DraftPolicy::new(placement(5), true).unwrap();
+        let mut fixed = DraftPolicy::new(placement(5), PolicySeed::weak(7), true).unwrap();
         assert_eq!(fixed.choose_action(false, &[(1, 5)], &[
             DraftAction { width: 5, draft_us: 100. }, DraftAction { width: 0, draft_us: 0. }], 64).unwrap(), Some(0));
     }
 
     #[test]
+    fn mixed_batches_price_and_fit_only_the_drafted_sequences() {
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 1, 5, 6, 6, &[0.99; 5]); }
+        let candidates: Vec<_> = (0..16).map(|id| DraftCandidate { id,
+            confidence: if id < 4 { &[0.99; 5] } else { &[] } }).collect();
+        for round in 0..400 { surcharged_round(&mut policy, &mut token, 16 * (1 + round % 4), 16, 0.); }
+        let selection = policy.select_drafted_within(false, &candidates, 5, 64, 4).unwrap().unwrap();
+        assert!(selection.lengths[4..].iter().all(|&n| n == 0));
+        let (tokens, us) = policy.evaluate_drafted(false, &candidates, &selection.lengths, 5, 4).unwrap();
+        assert!((tokens - selection.expected_tokens).abs() < 1e-10);
+        assert!((us - selection.predicted_us).abs() < 1e-8);
+        let (_, all_drafted_us) = policy.evaluate(false, &candidates, &selection.lengths, 5).unwrap();
+        let extra = policy.cost.draft_us(0, 3, 16., false) - policy.cost.draft_us(0, 3, 4., false);
+        assert!((all_drafted_us - us - extra).abs() < 1e-8);
+        assert!(policy.select_drafted_within(false, &candidates, 5, 64, 17).is_err());
+
+        let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest { id,
+            rows: if id < 4 { 6 } else { 1 }, accepted: 1, confidence: None }).collect();
+        let routes = vec![1u16; 40 * 36 * 6];
+        let mut expected = policy.cost.draft[0][3].clone();
+        expected.observe([1., 4., 0., 0.], 3_000.);
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
+            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: 3_000.,
+            drafted_requests: Some(4), wide: false }).unwrap();
+        assert_eq!(format!("{:?}", policy.cost.draft[0][3]), format!("{expected:?}"));
+        // Undrafted members still retain their verifier route history.
+        assert!(policy.history.contains_key(&15));
+    }
+
+    #[test]
     fn width_follows_each_requests_recent_runs() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let mut token = 0;
         // Warmup alternates widths so both draft-cost fits are identified.
         let mut chosen = Vec::new();
@@ -1692,7 +1642,7 @@ mod tests {
             width_round(&mut policy, &mut token, 2, 5, 6, 2, &[0.6; 5]);
         }
         assert!(chosen.contains(&5) && chosen.contains(&7), "{chosen:?}");
-        let fit = policy.cost_snapshot(false).draft;
+        let fit = policy.cost_snapshot(false, 1).draft;
         assert!((fit[2] + fit[3] - 800.).abs() < 100., "wide draft extra {fit:?}");
         assert_eq!(policy.choose_width(false, &[(1, 7)]), 7);
         assert_eq!(policy.choose_width(false, &[(2, 7)]), 5);
@@ -1702,7 +1652,7 @@ mod tests {
 
     #[test]
     fn unused_width_is_revisited() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let mut token = 0;
         for _ in 0..400 {
             let width = policy.choose_width(false, &[(2, 7)]);
@@ -1757,7 +1707,7 @@ mod tests {
         for (scenario, &(local, tp2, remote, wide, fixed)) in scenarios.iter().enumerate() {
             let geometry = v41(|l| l < local, |l| if l < tp2 { 9_400_320. } else if l < local { 18_800_640. } else { remote },
                 if wide > 5 { vec![5, wide] } else { vec![5] });
-            let mut policy = DraftPolicy::new(geometry, fixed).unwrap();
+            let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(7), fixed).unwrap();
             let mut live: Vec<(u64, u64, u32, f64)> = Vec::new(); // (id, next token, pool, quality)
             let mut next_id = 1 + 1000 * scenario as u64;
             for round in 0..320u64 {
@@ -1830,7 +1780,7 @@ mod tests {
                         id: r.0, rows: length + 1, accepted, confidence: if copied { None } else { Some(&c[..]) } })
                     .collect();
                 let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&routes),
-                    layer_us: &layer_us, total_us: total, draft_us, wide: drafted && width > policy.widths()[0],
+                    layer_us: &layer_us, total_us: total, draft_us, drafted_requests: None, wide: drafted && width > policy.widths()[0],
                     predicted_us: predicted });
                 transcript.word("observed", u64::from(result.is_ok()));
                 for (r, &a) in live.iter_mut().zip(&accepted) { r.1 += a as u64; }
@@ -1840,7 +1790,7 @@ mod tests {
                     let mut bad = routes.clone();
                     bad[5][rows - 1][0] = 400;
                     let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&bad),
-                        layer_us: &layer_us, total_us: total, draft_us, wide: false, predicted_us: None });
+                        layer_us: &layer_us, total_us: total, draft_us, drafted_requests: None, wide: false, predicted_us: None });
                     transcript.word("rejected", u64::from(result.is_err()));
                 }
                 if round % 16 == 15 { record_state(transcript, &policy); }
@@ -1851,14 +1801,18 @@ mod tests {
 
     fn record_state(transcript: &mut Transcript, policy: &DraftPolicy) {
         for shared in [false, true] {
-            transcript.word("warm", u64::from(policy.warm(shared)));
-            let snapshot = policy.cost_snapshot(shared);
-            for value in snapshot.layers.iter().flatten().chain(&snapshot.round).chain(&snapshot.draft) {
-                transcript.real("fit", *value);
+            for requests in [1, 4, 8, 16] {
+                transcript.word("warm", u64::from(policy.warm(shared, requests)));
+                let snapshot = policy.cost_snapshot(shared, requests);
+                for value in snapshot.layers.iter().flatten().chain(&snapshot.round).chain(&snapshot.draft) {
+                    transcript.real("fit", *value);
+                }
+                let (timed, error) = policy.prediction_health(shared, requests);
+                transcript.word("timed", timed);
+                transcript.real("relative_error", error);
             }
         }
         for (slope, offset) in policy.calibration() { transcript.real("slope", slope); transcript.real("offset", offset); }
-        for &bias in policy.time_bias() { transcript.real("bias", bias); }
         let stats = policy.stats();
         for value in [stats.rounds, stats.selected_rounds, stats.verified_rows, stats.verified_drafts,
             stats.accepted_drafts, stats.emitted_requests, stats.predicted_rounds] { transcript.word("stat", value); }
@@ -1870,8 +1824,8 @@ mod tests {
         }
     }
 
-    /// Decisions and fits recorded from the pre-geometry `dspark_policy` (work/p0
-    /// e55eeaeb) on the replay above. A change here is a decision change.
+    /// Decisions and fits recorded from the mandatory-seed, bucketed policy.
+    /// A change here is a decision change.
     #[test]
     fn replay_reproduces_recorded_decisions_and_fits() {
         let mut transcript = Transcript::new();
@@ -1879,7 +1833,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (23_994, 2_848_516_388_929_143_687));
+        assert_eq!((transcript.records, transcript.hash), (39_065, 5_055_839_129_435_315_218));
     }
 
     fn seed() -> PolicySeed {
@@ -1909,7 +1863,7 @@ mod tests {
         let observed: Vec<_> = (0..requests).map(|r| ObservedDraftRequest { id: 1 + r as u64, rows: per,
             accepted: per, confidence: None }).collect();
         policy.observe(DraftRoundObservation { shared: false, requests: &observed, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         *token += per as u64;
         total
     }
@@ -1917,56 +1871,128 @@ mod tests {
     #[test]
     fn a_seeded_policy_engages_on_prediction_health_not_sample_counts_alone() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
-        assert_eq!(policy.cold_drafts(), Some(3));
-        assert!(!policy.engaged(false));
+        assert_eq!(policy.cold_drafts(), 3);
+        assert!(!policy.engaged(false, 1));
         assert_eq!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.9; 5] }], 5), Ok(None));
         let mut token = 0;
         for round in 0..200 {
             surcharged_round(&mut policy, &mut token, 1 + round % 6, 1, 0.);
-            if round == 20 { assert!(!policy.engaged(false), "{:?}", policy.prediction_health(false)); }
+            if round == 20 { assert!(!policy.engaged(false, 1), "{:?}", policy.prediction_health(false, 1)); }
         }
-        let (rounds, error) = policy.prediction_health(false);
-        assert!(policy.engaged(false), "{rounds} {error}");
+        let (rounds, error) = policy.prediction_health(false, 1);
+        assert!(policy.engaged(false, 1), "{rounds} {error}");
         assert!(error < 0.03, "{error}");
         assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.9; 5] }], 5).unwrap().is_some());
-        // Unseeded policies have no correction cells and never report health.
-        assert!(DraftPolicy::new(placement(5), false).unwrap().corrections(false).is_empty());
         assert!(DraftPolicy::seeded(placement(5), PolicySeed { samples: 0., ..seed() }).is_err());
         assert!(DraftPolicy::seeded(placement(5), PolicySeed { round: [f64::NAN, 0., 0.], ..seed() }).is_err());
     }
 
     #[test]
-    fn per_concurrency_correction_prices_a_c1_row_surcharge_the_shared_fits_miss() {
+    fn wide_sweep_preserves_c1_costs_but_shares_physics_and_history() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let mut token = 0;
-        // Mixed traffic: C16-style rounds dominate the fits; C1 rows carry 3 ms more each.
+        for round in 0..400 { surcharged_round(&mut policy, &mut token, 1 + round % 7, 1, 3000.); }
+        let mut fresh = policy.clone();
+        let before = policy.cost_snapshot(false, 1);
+        let history = policy.history[&1].clone();
         for round in 0..1200 {
-            if round % 3 == 0 {
-                surcharged_round(&mut policy, &mut token, 1 + round % 7, 1, 3000.);
-            } else {
-                surcharged_round(&mut policy, &mut token, 16 * (1 + round % 4), 16, 3000.);
-            }
+            surcharged_round(&mut policy, &mut token, 16 * (1 + round % 4), 16, 3000.);
         }
-        let cells = policy.corrections(false);
-        assert!((cells[0][1] - 3000.).abs() < 600., "C1 row slope {cells:?}");
-        assert!(cells[4][1].abs() < 600., "C16 row slope {cells:?}");
-        // The C1 prediction follows the surcharge.
+        let after = policy.cost_snapshot(false, 1);
+        assert_eq!(before.round, after.round);
+        assert_eq!(before.draft, after.draft);
+        assert_ne!(before.layers, after.layers);
+        assert_ne!(history, policy.history[&1]);
+        assert_eq!(policy.prediction_health(false, 1), fresh.prediction_health(false, 1));
+        let candidate = [DraftCandidate { id: 1, confidence: &[0.9; 5] }];
+        let old = fresh.select(false, &candidate, 5).unwrap().unwrap();
+        let swept = policy.select(false, &candidate, 5).unwrap().unwrap();
+        assert!(old.lengths[0].abs_diff(swept.lengths[0]) <= 1, "{old:?} {swept:?}");
+        let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 5, draft_us: 2500. }];
+        assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(),
+            fresh.choose_action(false, &[(1, 5)], &actions, 64).unwrap());
         for rows in [2usize, 6] {
-            let predicted = policy.predict(false, &[1], &[rows - 1], 5).unwrap() - policy.cost.draft_us(0, 1., false);
+            let predicted = policy.predict(false, &[1], &[rows - 1], 5).unwrap() - policy.draft_cost(false, 1, 5);
             let actual = surcharged_round(&mut policy, &mut token, rows, 1, 3000.);
             assert!((predicted - actual).abs() / actual < 0.06, "{rows}: {predicted} vs {actual}");
         }
     }
 
     #[test]
+    fn concurrency_boundaries_and_regime_exploration_are_independent() {
+        assert_eq!([0, 1, 2, 4, 5, 8, 9, 16, 128].map(draft_concurrency_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 3]);
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        policy.engaged[0][0] = true;
+        policy.engaged[0][3] = true;
+        let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 5, draft_us: 1e12 }];
+        for _ in 0..WIDTH_EXPLORE_ROUNDS - 1 {
+            assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(), Some(0));
+        }
+        let wide: Vec<_> = (0..16).map(|id| (100 + id, 5)).collect();
+        assert_eq!(policy.choose_action(false, &wide, &actions, 64).unwrap(), Some(0));
+        assert_eq!(policy.action_age[&(0, 3, 5)], 1);
+        assert_eq!(policy.choose_action(false, &[(1, 5)], &actions, 64).unwrap(), Some(1));
+        assert_eq!(policy.action_age[&(0, 3, 5)], 1);
+        assert_eq!(policy.prediction_health(true, 1), (0, 1.));
+        assert_eq!(policy.draft_cost(false, 1, 0), 0.);
+        assert_eq!(policy.draft_cost_drafted(false, 16, 0, 5), 0.);
+    }
+
+    #[test]
+    fn calibration_is_shared_across_buckets_but_native_and_tail_pools_are_separate() {
+        let mut geometry = placement(5);
+        geometry.max_positions = 8;
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(8), false).unwrap();
+        let initial = policy.calibration();
+        let native_pool = policy.pooled[0].theta;
+        // Only tail position seven is reached with a miss; native positions accept.
+        let confidence = [0.9; 8];
+        let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest {
+            id, rows: 9, accepted: 8, confidence: Some(&confidence) }).collect();
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests,
+            routes: &vec![1; 40 * 144 * 6], layer_us: &[None; 40], total_us: f64::NAN,
+            draft_us: f64::NAN, drafted_requests: None, wide: false, predicted_us: None }).unwrap();
+        assert_ne!(initial, policy.calibration());
+        assert_ne!(native_pool, policy.pooled[0].theta);
+        assert_ne!(policy.pooled[0].theta, policy.pooled[1].theta);
+        let native_after = policy.pooled[0].theta;
+        let probability = policy.probabilities(DraftCandidate { id: 99, confidence: &[0.9] })[0];
+        // Training only the tail cannot move a cold native position's prior.
+        for _ in 0..16 { policy.pooled[1].observe(0.9, 0.); }
+        assert_eq!(native_after, policy.pooled[0].theta);
+        assert_eq!(probability, policy.probabilities(DraftCandidate { id: 99, confidence: &[0.9] })[0]);
+        assert!(policy.history.contains_key(&15));
+        assert!(policy.recent.contains_key(&15));
+        policy.release(15);
+        assert!(!policy.history.contains_key(&15) && !policy.recent.contains_key(&15));
+    }
+
+    #[test]
+    fn observation_requires_the_selection_request_extent() {
+        let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
+        let mut token = 0;
+        for round in 0..400 { surcharged_round(&mut policy, &mut token, 1 + round % 7, 1, 0.); }
+        let selected = policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.9; 5] }], 5).unwrap().unwrap();
+        let requests = [ObservedDraftRequest { id: 1, rows: 1, accepted: 1, confidence: None },
+            ObservedDraftRequest { id: 2, rows: 1, accepted: 1, confidence: None }];
+        let before = format!("{policy:?}");
+        assert_eq!(policy.observe(DraftRoundObservation { shared: false, requests: &requests,
+            routes: &[1; 40 * 2 * 6], layer_us: &[None; 40], total_us: 10000., draft_us: f64::NAN,
+            drafted_requests: None, wide: false, predicted_us: Some(selected.predicted_us) }),
+            Err(DraftPolicyError::RequestExtent));
+        assert_eq!(before, format!("{policy:?}"));
+    }
+
+    #[test]
     fn a_row_budget_goes_to_the_requests_whose_drafts_pay() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let (truth, mut token) = (truth(), 0);
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 8, 1 + round % 8, None); }
         let sure = [0.99; 5];
         let hopeless = [0.05; 5];
         let candidates = [DraftCandidate { id: 1, confidence: &sure }, DraftCandidate { id: 2, confidence: &hopeless },
             DraftCandidate { id: 3, confidence: &sure }];
+        for round in 0..400 { surcharged_round(&mut policy, &mut token, 3 * (1 + round % 4), 3, 0.); }
         let free = policy.select(false, &candidates, 5).unwrap().unwrap();
         assert_eq!(free.lengths, [5, 0, 5]);
         // Nine rows: three anchors and six drafts, all to the confident requests.
@@ -1981,7 +2007,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_inputs() {
-        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         assert!(policy.select(false, &[], 5).is_err());
         assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[f64::NAN] }], 5).is_err());
         assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[1.1] }], 5).is_err());
@@ -1989,9 +2015,9 @@ mod tests {
         let requests = [ObservedDraftRequest { id: 1, rows: 2, accepted: 1, confidence: None }];
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
         assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &[None; 40], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
+            layer_us: &[None; 40], total_us: 1., predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).is_err());
         assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests[..0], routes: &[1],
-            layer_us: &[], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
-        assert!(DraftPolicy::new(v41(|_| false, |_| 0., vec![5, 7]), false).is_err());
+            layer_us: &[], total_us: 1., predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).is_err());
+        assert!(DraftPolicy::new(v41(|_| false, |_| 0., vec![5, 7]), PolicySeed::weak(7), false).is_err());
     }
 }
