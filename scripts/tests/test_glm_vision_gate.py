@@ -195,8 +195,10 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert opening.index("self.admit(") < opening.index("TokenEmbedding::load(")
     assert "admitted_graphs.lifetime" in opening
     assert 'full_prefill_logits_bytes(' not in opening
-    assert opening.index("engine.prepare_serving_workspaces()") < opening.index("let result = body(&engine)")
-    assert opening.index("engine.prepare_scoring_prefill()") < opening.index("let result = body(&engine)")
+    startup = opening.index("let result = with_startup_graphs(")
+    assert opening.index("engine.prepare_serving_workspaces()") < startup
+    assert opening.index("engine.prepare_scoring_prefill()") < startup
+    assert startup < opening.index("|| body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
     # Shared DFlash only gains an explicit API; all existing users keep lazy timing.
     drafter = (root / "glm5/dflash.rs").read_text()
