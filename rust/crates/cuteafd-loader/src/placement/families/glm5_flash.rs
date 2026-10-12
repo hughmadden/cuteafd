@@ -1,0 +1,1081 @@
+//! GLM Flash admission before weights: planner and runtime differ only in baseline.
+use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig, resident::{GlmfRepresentation, GlmfResidentRank}};
+use crate::serving_capacity::{self as cache, glmf_graphs};
+use crate::placement::*;
+use cuteafd_core::memory_layout::{Basis, Category};
+
+#[derive(Debug, Clone)]
+pub struct GlmfInputs<'a> {
+    pub cfg: &'a GlmNextConfig,
+    pub layers: usize,
+    /// Sample after programs, before any weights; planned baseline charges context/code only.
+    pub gpus: Vec<(u64, Baseline)>,
+    /// Code not present at the baseline sample: LoadedCode minus already-sampled code, per rank.
+    pub pending_code: Vec<u64>,
+    /// Measured native EXL3 TP2 program/package path, not the legacy Spark graph path.
+    pub local_tp2_exl3: bool,
+    pub headroom_bytes: u64,
+    pub spark_ranks: usize,
+    pub prefill_lanes: u64,
+    pub prefill_rows: u64,
+    pub decode_rows: u64,
+    pub partial_bytes: u64,
+    pub max_context: u64,
+    pub sequences: u64,
+    /// Served graph policy, independent of whether DFlash weights are resident.
+    pub speculation: bool,
+    pub state_slots: u64,
+    pub mark_slots: u64,
+    pub pool_marks: bool,
+    pub index: cache::GlmfIndexCache,
+    pub kda_state_bytes: u64,
+    pub shared_replay: bool,
+    pub representation: GlmfRepresentation,
+    pub resident: Vec<GlmfResidentRank>,
+    /// Exact gate weight + FP32 bias of every selected routed layer, replicated on rank 1.
+    pub router_replica_bytes: u64,
+    /// Exact component-owned step rows with Spark lanes and without Sparks.
+    pub workspace: Vec<GlmfBufferDemand>,
+    pub local_workspace: Vec<GlmfBufferDemand>,
+    pub graphs: GraphSet,
+    /// Routed layers in backbone order, not including dense layers.
+    pub experts: Vec<ExpertCost>,
+    pub expert_workspace: u64,
+    pub tp2_workspace: [u64; 2],
+    /// SM-independent draft weights and owned activations; embedding stays host mapped.
+    pub drafter_bytes: u64,
+    /// fp8_linear workspace on each candidate GPU, keyed by that GPU's physical SM count.
+    pub drafter_scratch: Vec<u64>,
+    pub requested_pool: Option<u64>,
+    pub onboard: Onboard,
+    pub full_prefill_logits: u64,
+}
+
+pub fn default_onboard() -> Onboard { Onboard::Auto }
+
+/// Shared checkpoint-derived inventory; only package scratch depends on the chosen GPU.
+pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
+    sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+    mode: u8) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
+    use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftStorageError};
+    if ![1, 2].contains(&sms.len()) {
+        return Err(GlmDraftStorageError::Unsupported("GLM Flash draft candidate inventory needs one or two GPUs"));
+    }
+    let mut owned = None;
+    let mut scratch = Vec::with_capacity(sms.len());
+    for &sms in sms {
+        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode)?;
+        if owned.is_some_and(|previous| previous != bytes) {
+            return Err(GlmDraftStorageError::Unsupported("GLM Flash owned draft bytes depend on SM count"));
+        }
+        bytes.checked_add(workspace).ok_or(GlmDraftStorageError::Overflow)?;
+        owned = Some(bytes);
+        scratch.push(workspace);
+    }
+    Ok((owned.unwrap(), scratch))
+}
+
+/// Dormant GPU1 DFlash bridge inventory, not permission to move the drafter.
+/// `rows` is the drafter's full admitted batch (sequences * block), not a
+/// target-head launch chunk. GPU1's existing draft destinations are already
+/// in the movable; publisher streams/modules belong to the sampled baseline.
+pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u64)
+    -> Result<MovableDemands, PlacementError> {
+    if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 {
+        return Err(PlacementError::Inventory("GLM Flash remote DFlash bridge geometry"));
+    }
+    let mul = |a: u64, b: u64| a.checked_mul(b)
+        .ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge"));
+    let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
+    let bytes = [
+        ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
+        ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
+        ("DFlash bridge gathered input", hidden_rows),
+        ("DFlash bridge normalized hidden", hidden_rows),
+        ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
+        ("DFlash bridge head scratch", 4 << 20),
+    ];
+    let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
+        Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
+    // Four zero-size receive slots still own 256B each; controls and the
+    // abort word own 256B each. No duplicate payload destination is allocated.
+    for gpu in 0..2 {
+        demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
+            4 * 256 + 256 + 256, Basis::Formula));
+    }
+    for gpu in 0..2 {
+        demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
+            sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
+    }
+    Ok(MovableDemands { placement_gpu: 1, demands })
+}
+
+pub use crate::placement::{ComponentDemand as GlmfBufferDemand, SparkWorkingSet as GlmfWorkingSet,
+    WorkingSetComponent as GlmfComponent};
+
+/// Shared attention/head temporaries remain allocated when every expert is remote.
+/// Both callers use the exact base plus optional RTX-buffer delta.
+pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, prefill_rows: u64, decode_rows: u64,
+    shape: cache::GlmfStepShape, decode: cache::GlmfScratch, prefill: cache::GlmfScratch) -> Vec<GlmfBufferDemand> {
+    (0..if shape.split { 2 } else { 1 }).flat_map(|rank| {
+        let full = if rank == 0 { shape } else {
+            cache::GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape }
+        };
+        let base = cache::GlmfStepShape { local_experts: false, tp2_experts: false, ..full };
+        let bytes = |shape| cache::glmf_step_workspaces(cfg, lanes, prefill_rows, decode_rows,
+            &shape, decode, prefill).device_bytes();
+        let always = bytes(base);
+        [GlmfBufferDemand::new(GlmfComponent::Always, rank as u8, Category::Workspace, "steps", always, Basis::Formula),
+            GlmfBufferDemand::new(GlmfComponent::RtxExperts, rank as u8, Category::Workspace, "steps",
+                bytes(full) - always, Basis::Formula)]
+    }).collect()
+}
+
+/// Explicit-count request (Spark-only validation profile for automatic policies).
+/// Automatic callers use `solve_working_set_with_graphs`, not the generic solver directly.
+pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
+    let routed = i.cfg.dense.iter().take(i.layers).filter(|&&dense| !dense).count();
+    let n = if i.spark_ranks == 0 { routed } else { i.onboard.layers(routed).unwrap_or(0) };
+    request_for_working_set(i, &GlmfWorkingSet::candidate(i, n)?)
+}
+
+pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> Result<PlacementRequest, PlacementError> {
+    let ranks = i.gpus.len();
+    if ![1, 2].contains(&ranks) || i.layers == 0 || i.layers > i.cfg.layers
+        || i.resident.len() != ranks || i.graphs.ranks.len() != ranks
+        || i.pending_code.len() != ranks || ![2, 4].contains(&i.partial_bytes) {
+        return Err(PlacementError::Inventory("GLM Flash rank/layer inventory"));
+    }
+    for profile in [&i.workspace, &i.local_workspace] {
+        if profile.iter().any(|row| row.demand.gpu as usize >= ranks) || (0..ranks).any(|rank|
+            !profile.iter().any(|row| row.demand.gpu as usize == rank && row.component == GlmfComponent::Always)) {
+            return Err(PlacementError::Inventory("GLM Flash step buffer inventory"));
+        }
+    }
+    if *working != GlmfWorkingSet::candidate(i, working.rtx_layers.len())? {
+        return Err(PlacementError::Inventory("GLM Flash selected working set inventory"));
+    }
+    if i.drafter_scratch.len() != ranks || (i.drafter_bytes == 0 && i.drafter_scratch.iter().any(|&bytes| bytes != 0)) {
+        return Err(PlacementError::Inventory("GLM Flash draft scratch inventory"));
+    }
+    for &scratch in &i.drafter_scratch {
+        i.drafter_bytes.checked_add(scratch).ok_or(PlacementError::Overflow("GLM Flash draft inventory"))?;
+    }
+    if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
+        return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
+    }
+    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0 || i.requested_pool.is_some()) {
+        return Err(PlacementError::Inventory("GLM Flash shared replay needs single-GPU automatic Spark admission"));
+    }
+    let geometry = cache::glm_flash_rank_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
+        i.kda_state_bytes, i.decode_rows).map_err(|_| PlacementError::Inventory("GLM Flash cache geometry"))?;
+    let routed = i.cfg.dense[..i.layers].iter().filter(|&&d| !d).count();
+    if i.experts.len() != routed {
+        return Err(PlacementError::Inventory("GLM Flash routed expert inventory"));
+    }
+    let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(PlacementError::Overflow("GLM Flash fixed demand"));
+    let mut fixed = Vec::new();
+    let mut expert = i.experts.iter();
+    let mut layers = Vec::new();
+    for layer in 0..i.layers {
+        let mla = i.cfg.attention[layer] == GlmNextAttention::Mla;
+        let unit = if mla { 256 * (528 + if i.index == cache::GlmfIndexCache::Keys { 512 } else { 0 }) + 64 * 132 } else { 0 };
+        layers.push(LayerDemand { kind: if mla { AttentionClass::Dsa } else { AttentionClass::Kda },
+            weights: ModeBytes::default(), kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
+                unit_bytes_context: mla.then_some([unit / 2; 2]) },
+            fixed_bytes: ModeBytes::default(), context_indexer: mla, colocate: None, extra: vec![],
+            experts: if i.cfg.dense[layer] { None } else { expert.next().copied() },
+            modes: if ranks == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] } });
+    }
+    let mla = i.cfg.attention[..i.layers].iter().filter(|&&a| a == GlmNextAttention::Mla).count() as u64;
+    let tails = if i.index == cache::GlmfIndexCache::Compact { mla * cache::GLMF_INDEX_TAIL_BYTES } else { 0 };
+    let index_replay = if tails > 0 { mla * i.decode_rows * 512 } else { 0 };
+    for (rank, g) in geometry.ranks.iter().enumerate() {
+        let gpu = rank as u8;
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Embedding, "embedding", i.resident[rank].embedding, Basis::Exact));
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "target weights", i.resident[rank].weights, Basis::Exact));
+        if rank == 1 {
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "router replica", i.router_replica_bytes, Basis::Exact));
+        }
+        let replay = if i.shared_replay { 0 } else { g.speculative_replay_bytes - index_replay };
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "KDA state and replay",
+            mul(g.active_state_per_sequence_bytes - tails, i.state_slots)? + replay, Basis::Formula));
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "DSA index tails and replay",
+            mul(tails, i.state_slots)? + index_replay, Basis::Formula));
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "commit tables", g.fixed_state_bytes, Basis::Formula));
+        if !i.pool_marks {
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Prefix, "marks", mul(g.retained_mark_bytes, i.mark_slots)?, Basis::Formula));
+        } else {
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Prefix, "reserved units",
+                (g.persistent_unit_bytes + g.pool_metadata_unit_bytes) * cache::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
+        }
+        fixed.extend(i.graphs.items(rank).into_iter().map(|item|
+            GlmfBufferDemand::new(GlmfComponent::Always, gpu, item.category, &item.group, item.bytes, item.basis)));
+        if ranks == 2 {
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Transport, "peer exchange",
+                glmf_graphs::peer_exchange_bytes(working.prefill_lanes, i.prefill_rows.max(i.decode_rows),
+                    i.cfg.hidden as u64, i.partial_bytes, i.representation.output_shard), Basis::Formula));
+            let slots = 2 * working.prefill_lanes;
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::RtxExperts, gpu, Category::Transport, "route exchange",
+                slots * (i.prefill_rows.max(i.decode_rows) * i.cfg.topk as u64 * 8).max(256)
+                    + ((slots + 1) * 16).max(256), Basis::Formula));
+        }
+        if rank == 0 {
+            if i.decode_rows > cache::GLMF_DECODE_ROWS {
+                fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "wide decode selector",
+                    cache::glmf_selector_bytes(i.decode_rows, i.cfg.vocab_size as u64)
+                        - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
+            }
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
+                cache::glmf_spark_intake_bytes(working.prefill_lanes, working.spark_ranks as u64,
+                    cache::glmf_expert_rows(i.prefill_rows, i.decode_rows), i.cfg.hidden as u64), Basis::Formula));
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
+        }
+    }
+    let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
+    fixed.extend(workspace.iter().cloned());
+    let fixed = working.demands(&fixed).cloned().collect();
+    Ok(PlacementRequest {
+        attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
+        inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
+            capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
+        pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
+            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0),
+        layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
+        movables: if i.drafter_bytes == 0 { vec![] } else { vec![Movable { id: MovableId::Drafter,
+            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false,
+            conditional: i.drafter_scratch.iter().enumerate().filter(|(_, bytes)| **bytes > 0).map(|(rank, &bytes)|
+                MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
+                    Category::Workspace, "DFlash fp8-linear scratch", bytes, Basis::Formula)] }).collect() }] },
+        expert_workspace: if working.includes(GlmfComponent::RtxExperts) { i.expert_workspace } else { 0 },
+        tp2_workspace: if working.includes(GlmfComponent::RtxExperts) { i.tp2_workspace } else { [0; 2] },
+        onboard: if i.spark_ranks == 0 { i.onboard } else { Onboard::Layers(working.rtx_layers.len()) },
+        expert_gpus: usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2)),
+        policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
+            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![] },
+        hops: HopSpec { row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
+            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0 }, executor: super::GLM5_FLASH,
+    })
+}
+
+/// Exact header-only layer residency for the EXL3 and fp8moe loaders.
+pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> anyhow::Result<Vec<ExpertCost>> {
+    use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+    let shape = catalog.routed_experts();
+    let cost = |layer, tp, rank| -> anyhow::Result<Bytes2> {
+        let resident = if let Some(exl3) = catalog.exl3() {
+            exl3.residency(crate::V41Exl3Layer::Backbone(layer), tp, rank)?.device_arena_layout()?.1 as u64
+        } else if let Some(fp8) = catalog.fp8() {
+            Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| -> anyhow::Result<u64> {
+                let (w, _) = fp8.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
+                Ok(sum + (shape.experts * w).max(256) as u64 + fp8.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
+            })?
+        } else { anyhow::bail!("GLM Flash routed experts need EXL3 or fp8moe") };
+        Ok(Bytes2 { resident, staging: 0 })
+    };
+    (shape.first_layer..shape.layers).map(|layer| Ok(ExpertCost { whole: cost(layer, 1, 0)?,
+        half: if tp2 { [cost(layer, 2, 0)?, cost(layer, 2, 1)?] } else { [Bytes2::default(); 2] },
+        tp2, spark_ok: true })).collect()
+}
+
+/// Match the runtime's activation override: only `a16` disables native A4.
+pub fn nvfp4_a4() -> bool {
+    std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16")
+}
+
+/// Exact compiled package arenas; missing packages fail closed, never become zero scratch.
+pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
+    tp: usize) -> anyhow::Result<u64> {
+    expert_workspace_selected(catalog, manifest, rows, tp, nvfp4_a4())
+}
+
+/// Explicit activation selection for deterministic admission and package tests.
+pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
+    tp: usize, a4: bool) -> anyhow::Result<u64> {
+    anyhow::ensure!([1, 2].contains(&tp), "GLM Flash RTX experts need TP1 or TP2");
+    anyhow::ensure!((1..=4096).contains(&rows), "GLM Flash expert capacity must be 1..=4096 rows");
+    let shape = catalog.routed_experts();
+    let lib = inventory::image_lib(manifest);
+    if let Some(exl3) = catalog.exl3() {
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let stem = format!("exl3-glmf-k{tiers}");
+        let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent().unwrap();
+        let root = [parent.join("exl3").join(&stem), lib.join("exl3").join(&stem)]
+            .into_iter().find(|p| p.join(format!("rtx-tp{tp}")).is_dir())
+            .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp{tp} package"))?;
+        let manifests = inventory::exl3_capacities(rows).into_iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("rtx-tp{tp}/m{capacity}/v41_exl3.json")))?)?;
+            anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
+                && value["intermediate"].as_u64() == Some((shape.intermediate / tp) as u64)
+                && value["experts"].as_u64() == Some(shape.experts as u64), "GLM Flash EXL3 package geometry mismatch");
+            Ok(value)
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        return Ok(cache::exl3_workspace_bytes(&manifests, true)? + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 });
+    }
+    let fp8 = catalog.fp8().ok_or_else(|| anyhow::anyhow!("GLM Flash fp8moe catalog missing"))?;
+    let a4_name = "fp8-glmf-nvfp4a4";
+    let name = if a4 && fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4
+        && lib.join("fp8").join(a4_name).join(format!("tp{tp}")).is_dir() {
+        a4_name.to_string()
+    } else { format!("fp8-glmf{}", fp8.format().package_suffix()) };
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
+    let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
+        .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?;
+    let bf16 = lib.join("fp8").join(format!("{name}-bf16"));
+    let sibling = if bf16.join(format!("tp{tp}")).is_dir() {
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(bf16.join("manifest.json"))?)?;
+        inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)
+            .ok_or_else(|| anyhow::anyhow!("missing BF16-input GLM Flash scratch"))?
+    } else { 0 };
+    Ok(scratch.max(sibling) + if tp == 2 { rows * shape.hidden as u64 * 2 } else { 0 })
+}
+
+/// Family-specific canonical selection and solved-home validation over the shared set.
+trait GlmfWorkingSetExt: Sized {
+    fn candidate(i: &GlmfInputs<'_>, n: usize) -> Result<Self, PlacementError>;
+    fn validate(&self, placed: &Placement) -> Result<(), PlacementError>;
+}
+
+impl GlmfWorkingSetExt for GlmfWorkingSet {
+    fn candidate(i: &GlmfInputs<'_>, n: usize) -> Result<Self, PlacementError> {
+        let dense = i.cfg.dense.get(..i.layers).ok_or(PlacementError::Inventory("GLM Flash layer inventory"))?;
+        let routed: Vec<_> = dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer)).collect();
+        if n > routed.len() || (i.spark_ranks == 0 && n != routed.len()) {
+            return Err(PlacementError::Inventory("GLM Flash expert working set inventory"));
+        }
+        let spark_layers = routed[n..].to_vec();
+        let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
+        Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks,
+            prefill_lanes: if spark_ranks == 0 { 1 } else { i.prefill_lanes } })
+    }
+
+    fn validate(&self, placed: &Placement) -> Result<(), PlacementError> {
+        let layers = |spark| placed.layers.iter().enumerate().filter_map(|(layer, home)| {
+            let selected = if spark { home.experts == ExpertHome::Spark } else {
+                matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)
+            };
+            selected.then_some(layer)
+        }).collect::<Vec<_>>();
+        if layers(true) != self.spark_layers || layers(false) != self.rtx_layers {
+            return Err(PlacementError::Inventory("GLM Flash selected expert set disagrees with solved homes"));
+        }
+        Ok(())
+    }
+}
+
+pub fn solve_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
+    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet), PlacementError> {
+    solve_working_set_with_graphs(i, target, automatic_context, sms, rtx_experts)
+        .map(|(placed, graphs, _)| (placed, graphs))
+}
+
+/// Evaluate every executable RTX prefix/Spark suffix with its own fixed costs.
+/// Spark presence never feeds back into a later solve: the empty set is one
+/// closed-form candidate. Graph-geometry shrinking stays local to each candidate.
+pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
+    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
+    request(i)?;
+    let mut graph_cache = std::collections::BTreeMap::new();
+    if i.spark_ranks == 0 {
+        let working = GlmfWorkingSet::candidate(i, i.experts.len())?;
+        let (placed, graphs) = solve_profile_with_graphs(i, target, automatic_context, sms, rtx_experts,
+            None, None, &working, &mut graph_cache)?;
+        working.validate(&placed)?;
+        return Ok((placed, graphs, working));
+    }
+    let routed: Vec<_> = (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).collect();
+    let counts: Vec<_> = match i.onboard.layers(routed.len()) {
+        Some(n) => vec![n],
+        None if !rtx_experts => vec![0],
+        None => (0..=routed.len()).collect(),
+    };
+    let cap = i.onboard.layers(routed.len()).is_none().then_some(target.max(i.max_context));
+    let mut best: Option<((u64, u64), Placement, GraphSet, GlmfWorkingSet)> = None;
+    let mut refusal = None;
+    for n in counts {
+        let working = GlmfWorkingSet::candidate(i, n)?;
+        let spark_layers = &working.spark_layers;
+        if spark_layers.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            refusal.get_or_insert(PlacementError::Inventory("GLM Flash Spark selection requires a contiguous routed range"));
+            continue;
+        }
+        let mut branch = i.clone();
+        branch.onboard = Onboard::Layers(n);
+        let floor = match i.onboard {
+            Onboard::Auto if working.spark_ranks > 0 && i.requested_pool.is_none() => Some(0),
+            Onboard::ExpertsFirst { pool_floor } => Some(i.requested_pool.unwrap_or_else(||
+                pool_floor.max(i.max_context).max(if working.spark_ranks == 0 { crate::placement::pool::AGENTIC_FLOOR_TOKENS } else { 0 }))),
+            _ => None,
+        };
+        match solve_profile_with_graphs(&branch, target, automatic_context, sms, rtx_experts,
+            cap, floor, &working, &mut graph_cache) {
+            Ok((placed, graphs)) => {
+                working.validate(&placed)?;
+                let score = match i.onboard {
+                    Onboard::ExpertsFirst { .. } => (n as u64, placed.pool_tokens),
+                    _ => (placed.pool_tokens, n as u64),
+                };
+                if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
+                    best = Some((score, placed, graphs, working));
+                }
+            }
+            Err(error) => { if refusal.is_none() { refusal = Some(error); } }
+        }
+    }
+    if let Some((_, placed, graphs, working)) = best { return Ok((placed, graphs, working)); }
+    // Preserve the legacy experts-first fallback when the compiled context does
+    // not fit but its explicitly chosen lower floor does, without onboarded layers.
+    if let Onboard::ExpertsFirst { pool_floor } = i.onboard {
+        if i.requested_pool.is_none() && pool_floor < i.max_context {
+            let mut branch = i.clone();
+            branch.onboard = Onboard::Layers(0);
+            let working = GlmfWorkingSet::candidate(i, 0)?;
+            let (placed, graphs) = solve_profile_with_graphs(&branch, target, automatic_context, sms,
+                rtx_experts, cap, Some(pool_floor), &working, &mut graph_cache)?;
+            working.validate(&placed)?;
+            return Ok((placed, graphs, working));
+        }
+    }
+    Err(refusal.unwrap_or(PlacementError::Inventory("GLM Flash has no executable Spark working set")))
+}
+
+/// Rebuild startup graphs at a fixed expert candidate's admitted pool. The
+/// optional cap preserves pool-first/experts-first ceilings while exact onboard
+/// counts retain their existing fill-to-capacity policy.
+fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
+    sms: usize, rtx_experts: bool, cap: Option<u64>, floor: Option<u64>,
+    working: &GlmfWorkingSet, graph_cache: &mut std::collections::BTreeMap<(usize, usize), GraphSet>)
+    -> Result<(Placement, GraphSet), PlacementError> {
+    let configure = |req: &mut PlacementRequest| {
+        if !rtx_experts { req.expert_gpus = 0; }
+        if let Some(cap) = cap { req.pool.ceiling = req.pool.ceiling.min(cap); }
+        if let Some(floor) = floor { req.pool.floor = floor; }
+    };
+    let mut candidate = i.requested_pool.unwrap_or(target.max(i.max_context));
+    if i.requested_pool.is_none() && (i.onboard.layers(i.experts.len()).is_some() || i.spark_ranks == 0) {
+        let mut req = request_for_working_set(i, working)?;
+        configure(&mut req);
+        candidate = solve(&req)?.pool_tokens;
+    }
+    loop {
+        let mut trial = i.clone();
+        if i.graphs.lifetime == Lifetime::Startup {
+            let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
+            trial.graphs = graph_cache.entry((context, candidate as usize)).or_insert_with(||
+                startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
+                    i.speculation, i.gpus.len(), i.decode_rows as usize, sms)).clone();
+            if i.local_tp2_exl3 && working.spark_ranks == 0 {
+                calibrate_local_tp2_graphs(&mut trial.graphs);
+            }
+        }
+        let mut req = request_for_working_set(&trial, working)?;
+        req.pool.target = req.pool.target.max(target).min(candidate);
+        req.pool.ceiling = candidate;
+        configure(&mut req);
+        let placed = solve(&req)?;
+        if i.requested_pool.is_some() || i.graphs.lifetime != Lifetime::Startup || placed.pool_tokens >= candidate {
+            return Ok((placed, trial.graphs));
+        }
+        candidate = placed.pool_tokens;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
+    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    let counts = glmf_graphs::serving_graph_counts(context, pool, cfg.dense_context(), sequences.min(decode_rows), speculation,
+        layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
+    let ranks = counts.iter().enumerate().map(|(rank, &count)| {
+        let role = if gpus == 1 { 0 } else { rank + 1 };
+        let measured = glmf_graphs::measured_graph_bytes(count, role);
+        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
+            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
+        GraphRank { executables: count, bytes: measured + margin, margin }
+    }).collect();
+    GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
+}
+
+/// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
+/// Preserve the separate admission-growth margin; only the ready executable charge changes.
+pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
+    if graphs.ranks.len() != 2 || graphs.lifetime != Lifetime::Startup { return; }
+    for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
+        let (bytes, count) = [(2_074_083_328u64, 12_880u64), (2_004_877_312, 12_600)][rank];
+        let measured = (graph.executables as u128 * bytes as u128).div_ceil(count as u128) as u64;
+        graph.margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
+            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
+        graph.bytes = measured + graph.margin;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_fixture(ranks: usize, bytes: u64) -> Vec<GlmfBufferDemand> {
+        (0..ranks).map(|rank| GlmfBufferDemand::new(GlmfComponent::Always,
+            rank as u8, Category::Workspace, "steps", bytes, Basis::Formula)).collect()
+    }
+
+    fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
+        let context = ArchContext::coordinator(capacity, None).context_bytes;
+        GlmfInputs {
+            cfg, layers: cfg.layers,
+            gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
+                context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
+                loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
+            spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
+            max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
+            index: cache::GlmfIndexCache::Keys, kda_state_bytes: 4, shared_replay: false,
+            representation: GlmfRepresentation::default(),
+            resident: (0..ranks).map(|rank| GlmfResidentRank {
+                embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: 5 << 30 }).collect(),
+            router_replica_bytes: 64 << 20, workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
+            graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
+                8, true, ranks, 64, 188),
+            experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
+                whole: Bytes2 { resident: 2 << 30, staging: 0 },
+                half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
+            expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
+            drafter_scratch: vec![0; ranks], requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+        }
+    }
+
+    #[test]
+    fn copy_window_startup_graphs_match_serving_inventory() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        // No external drafter still captures speculative graphs for default copy windows.
+        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        assert_eq!(copy.shapes, 280);
+        assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
+        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [2_082_618_720, 2_131_554_600]);
+        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
+        assert_eq!(plain.shapes, 112);
+        assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
+    }
+
+    #[test]
+    fn local_tp2_runtime_and_graphs_equal_staged_ready() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        calibrate_local_tp2_graphs(&mut graphs);
+        for (rank, (baseline, ready)) in [(1_027_511_116u64, 3_101_594_444u64),
+            (900_673_356, 2_905_550_668)].into_iter().enumerate() {
+            let items = inventory::glmf_local_tp2_runtime_items(rank);
+            assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), baseline);
+            assert_eq!(baseline + graphs.at_ready(rank), ready);
+            let code = loaded_code("glmf", "exl3-tp2-local", true, rank as u8).unwrap();
+            assert_eq!(inventory::ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
+            let sampled = [598_999_040, 609_484_800][rank];
+            assert_eq!(sampled + code.pending(sampled, 586_416_128), baseline);
+            assert!(graphs.growth(rank) >= 64 << 20);
+        }
+    }
+
+    #[test]
+    fn planner_equals_runtime_glm5_flash() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        for (ranks, capacity) in [(1, 32 << 30), (1, inventory::PRO_TOTAL_BYTES), (2, inventory::PRO_TOTAL_BYTES)] {
+            let planned = inputs(&cfg, ranks, capacity);
+            let planned_request = request(&planned).unwrap();
+            assert_eq!(planned_request.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).count(), 11);
+            let target = planned_request.pool.target;
+            let (p, admitted_graphs) = solve_with_graphs(&planned, target, true, 188, true).unwrap();
+            let mut measured = planned.clone();
+            for rank in 0..ranks {
+                let context = ArchContext::coordinator(capacity, None).context_bytes;
+                let code = loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap();
+                let sample = context + code.bytes / 3;
+                measured.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - sample };
+                measured.pending_code[rank] = code.pending(sample, context);
+            }
+            let (r, measured_graphs) = solve_with_graphs(&measured, target, true, 188, true).unwrap();
+            assert_eq!(admitted_graphs.ranks, measured_graphs.ranks);
+            assert_eq!(p.pool_tokens, r.pool_tokens);
+            assert_eq!(p.onboard_layers, r.onboard_layers);
+            assert_eq!(p.layers, r.layers);
+            assert_eq!(p.tp2, r.tp2);
+            for rank in 0..ranks {
+                let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
+                    .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+                for group in ["graphs", inventory::GRAPH_GROWTH, "records"] {
+                    assert_eq!(bytes(&p, group), bytes(&r, group));
+                }
+                assert_eq!(bytes(&p, "graphs"), admitted_graphs.at_ready(rank));
+                assert_eq!(bytes(&p, inventory::GRAPH_GROWTH), admitted_graphs.growth(rank));
+                let charged = |placed: &Placement| placed.items[rank].iter().map(|i| i.bytes).sum::<u64>();
+                let baseline = |input: &GlmfInputs<'_>| capacity - GpuBudget {
+                    capacity_bytes: capacity, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available();
+                assert_eq!(baseline(&planned) + charged(&p), baseline(&measured) + charged(&r));
+            }
+            if ranks == 2 {
+                assert!(p.tp2.is_some());
+                assert!(!p.layers.iter().any(|l| matches!(l.experts, ExpertHome::RtxWhole { .. })));
+            }
+        }
+    }
+
+    fn draft_config() -> serde_json::Value {
+        serde_json::json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
+            "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+            "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+                "selector_rank":256, "block_size":8}})
+    }
+
+    #[test]
+    fn selected_spark_working_set_matches_planned_and_sampled_baselines() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for (onboard, expected) in [(Onboard::Auto, 3), (Onboard::Layers(1), 1)] {
+            let mut planned = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            planned.onboard = onboard;
+            planned.requested_pool = Some(2 << 20);
+            planned.graphs = GraphSet::budget(&[64 << 20; 2]);
+            let target = 2 << 20;
+            let (p, pg, working) = solve_working_set_with_graphs(&planned, target, false, 188, true).unwrap();
+            assert_eq!(p.onboard_layers, expected);
+            let spark = expected < planned.experts.len();
+            assert_eq!(working.spark_ranks, if spark { 4 } else { 0 });
+            assert_eq!(working.prefill_lanes, if spark { 2 } else { 1 });
+            assert_eq!(working.spark_layers, if spark { vec![2, 3] } else { vec![] });
+            let mut measured = planned.clone();
+            for rank in 0..2 {
+                let Baseline::Planned { context_bytes, loaded_bytes } = planned.gpus[rank].1 else { unreachable!() };
+                let sampled = context_bytes / 3 + loaded_bytes;
+                measured.gpus[rank].1 = Baseline::Measured { free_bytes: measured.gpus[rank].0 - sampled };
+                measured.pending_code[rank] += context_bytes - sampled;
+            }
+            let (r, rg, runtime_working) = solve_working_set_with_graphs(&measured, target, false, 188, true).unwrap();
+            assert_eq!(pg, rg);
+            assert_eq!(working, runtime_working);
+            assert_eq!((p.pool_tokens, &p.layers, p.tp2), (r.pool_tokens, &r.layers, r.tp2));
+            let group = |placed: &Placement, rank: usize, name: &str| placed.items[rank].iter()
+                .filter(|d| d.group == name).map(|d| d.bytes).sum::<u64>();
+            assert_eq!(group(&p, 0, "Spark intake"), if spark { 268_435_456 } else { 0 });
+            for rank in 0..2 {
+                assert_eq!(group(&p, rank, "steps"), if spark { planned.workspace[rank].demand.bytes } else { planned.local_workspace[rank].demand.bytes });
+                let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
+                    capacity_bytes: input.gpus[rank].0, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available()
+                    + placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
+                assert!(total(&planned, &p).abs_diff(total(&measured, &r)) <= 64 << 20);
+                assert_eq!(total(&planned, &p), total(&measured, &r));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_spark_candidate_can_fit_only_because_its_own_costs_are_charged() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        input.requested_pool = Some(2 << 20);
+        input.workspace = workspace_fixture(2, 100 << 30);
+        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        assert_eq!(placed.onboard_layers, input.experts.len());
+        assert!(working.spark_layers.is_empty());
+        assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
+        assert!(placed.items[0].iter().all(|d| d.group != "Spark intake"));
+        input.onboard = Onboard::Layers(1);
+        assert!(solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).is_err());
+    }
+
+    #[test]
+    fn zero_peer_working_set_preserves_existing_request_and_pool_policy() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.spark_ranks = 0;
+        input.prefill_lanes = 1;
+        input.workspace = input.local_workspace.clone();
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        for pool in [None, Some(2 << 20)] {
+            input.requested_pool = pool;
+            let prior = solve_profile_with_graphs(&input, 2 << 20, false, 188, true,
+                None, None, &GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap(),
+                &mut std::collections::BTreeMap::new()).unwrap();
+            let (placed, graphs, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            assert_eq!(placed, prior.0);
+            assert_eq!(graphs, prior.1);
+            assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
+            assert!(working.spark_layers.is_empty());
+        }
+    }
+
+    #[test]
+    fn component_owned_rows_reject_forged_sets_and_drop_inactive_buffers() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        for profile in [&mut input.workspace, &mut input.local_workspace] {
+            for (component, group) in [(GlmfComponent::RtxExperts, "RTX test buffer"),
+                (GlmfComponent::SparkExperts, "Spark test buffer")] {
+                profile.push(GlmfBufferDemand::new(component, 0, Category::Workspace, group, 987654, Basis::Formula));
+            }
+        }
+        for n in [0, 1, 3] {
+            let working: crate::placement::SparkWorkingSet = GlmfWorkingSet::candidate(&input, n).unwrap();
+            let request = request_for_working_set(&input, &working).unwrap();
+            assert_eq!(working.selected_ranks().count(), if n == input.experts.len() { 0 } else { input.spark_ranks });
+            let rows = cache::glmf_expert_rows(input.prefill_rows, input.decode_rows) as u32;
+            let pinned = working.coordinator_staging(cuteafd_core::ExpertGeometry::GLM5_FLASH, rows, false).unwrap();
+            assert_eq!(pinned, if n == input.experts.len() { 0 } else {
+                input.prefill_lanes * u64::from(rows) * (input.cfg.hidden as u64 * 33 / 32 + input.cfg.topk as u64 * 8)
+            });
+            for (component, group) in [(GlmfComponent::RtxExperts, "RTX test buffer"),
+                (GlmfComponent::SparkExperts, "Spark test buffer")] {
+                assert_eq!(request.fixed.iter().any(|d| d.group == group), working.includes(component));
+            }
+            let mut forged = working;
+            forged.prefill_lanes += 1;
+            assert!(matches!(request_for_working_set(&input, &forged),
+                Err(PlacementError::Inventory("GLM Flash selected working set inventory"))));
+        }
+    }
+
+    #[test]
+    fn experts_first_local_branch_keeps_agentic_floor_and_explicit_pool() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        input.max_context = 32768;
+        input.onboard = Onboard::ExpertsFirst { pool_floor: 16384 };
+        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        assert!(working.spark_layers.is_empty());
+        assert_eq!(request_for_working_set(&input, &working).unwrap().pool.floor,
+            crate::placement::pool::AGENTIC_FLOOR_TOKENS);
+        assert!(placed.pool_tokens >= crate::placement::pool::AGENTIC_FLOOR_TOKENS);
+        input.requested_pool = Some(32768);
+        let (placed, _, working) = solve_working_set_with_graphs(&input, 32768, false, 188, true).unwrap();
+        assert!(working.spark_layers.is_empty());
+        assert_eq!(placed.pool_tokens, 32768);
+    }
+
+    #[test]
+    fn selected_working_set_preserves_exact_counts_and_experts_first_priority() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        for (onboard, expected) in [(Onboard::Layers(0), 0), (Onboard::Fraction(0.5), 2),
+            (Onboard::ExpertsFirst { pool_floor: 262_144 }, 3)] {
+            input.onboard = onboard;
+            let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            assert_eq!(placed.onboard_layers, expected);
+            assert_eq!(working.spark_layers.len(), input.experts.len() - expected);
+            if matches!(onboard, Onboard::ExpertsFirst { .. }) { assert!(placed.pool_tokens <= 2 << 20); }
+        }
+    }
+
+    #[test]
+    fn spark_auto_keeps_smaller_pool_and_explicit_pool_stays_strict() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let mut input = inputs(&cfg, 1, 32 << 30);
+        input.max_context = 4 << 20;
+        input.graphs = GraphSet::budget(&[64 << 20]);
+        let (placed, _, working) = solve_working_set_with_graphs(&input, 4 << 20, true, 170, true).unwrap();
+        assert!(placed.pool_tokens < input.max_context);
+        assert_eq!(working.spark_ranks, 4);
+        input.requested_pool = Some(4 << 20);
+        assert!(solve_working_set_with_graphs(&input, 4 << 20, true, 170, true).is_err());
+    }
+
+    #[test]
+    fn inadmissible_noncontiguous_spark_candidates_do_not_hide_empty_candidate() {
+        let mut cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        cfg.dense[2] = true;
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        input.requested_pool = Some(2 << 20);
+        input.onboard = Onboard::Layers(0);
+        assert!(matches!(solve_working_set_with_graphs(&input, 2 << 20, false, 188, true),
+            Err(PlacementError::Inventory("GLM Flash Spark selection requires a contiguous routed range"))));
+        input.onboard = Onboard::Auto;
+        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        assert_eq!(placed.onboard_layers, 2);
+        assert!(working.spark_layers.is_empty());
+    }
+
+    #[test]
+    fn draft_inventory_keeps_owned_bytes_independent_and_scratch_candidate_local() {
+        use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
+        for mode in 0..=2 {
+            for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+                let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode).unwrap();
+                for (rank, sms) in [188, 170].into_iter().enumerate() {
+                    assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
+                        sms, representation, mode).unwrap());
+                }
+                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, [0, 0]); }
+                else { assert!(scratch[0] > scratch[1]); }
+            }
+        }
+        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        assert_eq!(owned, 1_835_700_096);
+        assert_eq!(scratch, [30_491_648, 28_394_496]);
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_bytes = owned;
+        input.drafter_scratch = scratch;
+        let req = request(&input).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
+            c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
+            [(0, 0, Category::Workspace, 30_491_648, Basis::Formula),
+             (1, 1, Category::Workspace, 28_394_496, Basis::Formula)]);
+        let actual = solve(&req).unwrap();
+        assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
+        assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
+        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash fp8-linear scratch").unwrap().bytes, 30_491_648);
+        assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash fp8-linear scratch"));
+        // Splitting the ledger categories must not change the old GPU0 total or pool/layer decision.
+        input.drafter_bytes += input.drafter_scratch[0];
+        input.drafter_scratch.fill(0);
+        let lumped = solve(&request(&input).unwrap()).unwrap();
+        assert_eq!(actual.pool_tokens, lumped.pool_tokens);
+        assert_eq!(actual.layers, lumped.layers);
+        for rank in 0..2 {
+            assert_eq!(actual.items[rank].iter().map(|d| d.bytes).sum::<u64>(),
+                lumped.items[rank].iter().map(|d| d.bytes).sum::<u64>());
+        }
+    }
+
+    #[test]
+    fn draft_inventory_rejects_bad_devices_and_orphan_or_overflow_scratch() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        for sms in [vec![], vec![188, 170, 188], vec![0], vec![4097], vec![188, 0]] {
+            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2).is_err());
+        }
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_scratch = vec![256];
+        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        input.drafter_scratch = vec![256, 0];
+        input.drafter_bytes = 0;
+        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        input.drafter_bytes = u64::MAX;
+        assert!(matches!(request(&input), Err(PlacementError::Overflow("GLM Flash draft inventory"))));
+    }
+
+    #[test]
+    fn draft_inventory_keeps_dspark_local_and_category_separated() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let config = serde_json::json!({"speculators_model_type":"dspark", "block_size":4, "markov_rank":256,
+            "aux_hidden_state_layer_ids":[0,8,16,24,32], "transformer_layer_config":{
+                "hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":3, "num_attention_heads":32,
+                "num_key_value_heads":8, "head_dim":64, "vocab_size":154880}});
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_bytes = owned;
+        input.drafter_scratch = scratch;
+        let req = request(&input).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert!(req.movables[0].conditional.iter().flat_map(|c| &c.demands).all(|d| d.category == Category::Workspace));
+        assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
+    }
+
+    #[test]
+    fn remote_dflash_bridge_counts_full_rows_and_only_new_allocations() {
+        let bridge = remote_dflash_bridge_demands(4096, 154_880, 6, 16 * 8).unwrap();
+        assert_eq!(bridge.placement_gpu, 1);
+        let actual: Vec<_> = bridge.demands.iter().map(|d|
+            (d.gpu, d.category, d.group.as_str(), d.bytes, d.basis)).collect();
+        assert_eq!(actual, vec![
+            (0, Category::Drafter, "DFlash bridge taps", 100_663_296, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge input ids", 512, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge gathered input", 1_048_576, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge normalized hidden", 1_048_576, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge logits", 79_298_560, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge head scratch", 4_194_304, Basis::Formula),
+            (0, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+            (1, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+        ]);
+        assert_eq!(bridge.demands.iter().filter(|d| d.gpu == 0).map(|d| d.bytes).sum::<u64>(), 186_255_360);
+        // Even tiny direct payloads retain their allocator's 256B minimum.
+        let tiny = remote_dflash_bridge_demands(1, 1, 1, 1).unwrap();
+        for group in ["DFlash bridge input ids", "DFlash bridge gathered input",
+            "DFlash bridge normalized hidden", "DFlash bridge logits"] {
+            assert_eq!(tiny.demands.iter().find(|d| d.group == group).unwrap().bytes, 256);
+        }
+    }
+
+    #[test]
+    fn remote_dflash_bridge_rejects_geometry_product_and_total_overflow() {
+        for (hidden, vocab, taps, rows) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1),
+            (1, 1, 1, 0), (1, 1, 1, i32::MAX as u64 + 1)] {
+            assert!(matches!(remote_dflash_bridge_demands(hidden, vocab, taps, rows),
+                Err(PlacementError::Inventory(_))));
+        }
+        for (hidden, vocab, taps, rows) in [(u64::MAX, 1, 1, 1), (1, u64::MAX, 1, 1),
+            (1, 1, u64::MAX, 1), (u64::MAX / 4096, 1, 1, 1)] {
+            assert!(matches!(remote_dflash_bridge_demands(hidden, vocab, taps, rows),
+                Err(PlacementError::Overflow(_))));
+        }
+    }
+
+    #[test]
+    fn remote_dflash_bridge_stays_dormant_for_gpu0_only_drafter() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert!(req.movables[0].conditional.is_empty());
+        let expected = solve(&req).unwrap();
+        req.movables[0].conditional.push(remote_dflash_bridge_demands(cfg.hidden as u64,
+            cfg.vocab_size as u64, 6, 128).unwrap());
+        let actual = solve(&req).unwrap();
+        assert_eq!(actual.items, expected.items);
+        assert_eq!(actual.movables, expected.movables);
+        assert_eq!(actual.pool_tokens, expected.pool_tokens);
+        assert_eq!(actual.layers, expected.layers);
+        assert!(actual.items.iter().flatten().all(|d| !d.group.starts_with("DFlash bridge")));
+    }
+
+    #[test]
+    fn glm5_flash_header_costs_and_fp8_package_scratch_are_static() {
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+        let dir = tempfile::tempdir().unwrap();
+        let config = glm5_flash_config(2);
+        write_snapshot(dir.path(), &config, &glm5_flash_tensors(&config), None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let fp8 = catalog.fp8().unwrap();
+        let costs = expert_costs(&catalog, true).unwrap();
+        let exact = |tp, rank| Fp8Projection::ALL.iter().map(|&proj| {
+            let (bytes, _) = fp8.slice_bytes_with(proj, tp, rank, Slicing::Blocks(128)).unwrap();
+            (bytes * fp8.shape().experts).max(256) as u64
+                + fp8.scale_region_bytes_with(proj, tp, rank, Slicing::Blocks(128)).unwrap().max(256) as u64
+        }).sum::<u64>();
+        assert_eq!(costs[0].whole.resident, exact(1, 0));
+        assert_eq!(costs[0].half.map(|c| c.resident), [exact(2, 0), exact(2, 1)]);
+        let share = dir.path().join("share");
+        let package = dir.path().join("lib/fp8/fp8-glmf");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        let path = share.join("PROGRAMS.json");
+        assert!(expert_workspace(&catalog, Some(&path), 4096, 2).is_err());
+        std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
+            "tp1": {"capacities":[{"capacity":4096,"scratch_bytes":12345}]},
+            "tp2": {"capacities":[{"capacity":4096,"scratch_bytes":67890}]}}}).to_string()).unwrap();
+        assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 1).unwrap(), 12345);
+        assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(), 67890 + 4096 * 4096 * 2);
+        assert!(expert_workspace(&catalog, Some(&path), 4097, 2).is_err());
+        // Measured GLMf TP2 package ABI maxima, plus its owned BF16 output.
+        std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
+            "tp2": {"capacities":[{"capacity":1024,"scratch_bytes":163779584},
+                {"capacity":4096,"scratch_bytes":734346240}]}}}).to_string()).unwrap();
+        for (rows, scratch) in [(1024, 163779584), (4096, 734346240)] {
+            assert_eq!(expert_workspace(&catalog, Some(&path), rows, 2).unwrap(), scratch + rows * 4096 * 2);
+        }
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        assert_eq!(crate::families::glm5_flash::resident::router_replica_bytes(&checkpoint, &cfg, 2).unwrap(),
+            288 * 4096 * 2 + 288 * 4);
+    }
+
+    #[test]
+    fn glm5_flash_nvfp4_a4_and_a16_select_matching_package_scratch() {
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, nvfp4, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = glm5_flash_config(2);
+        config["quantization_config"] = serde_json::json!({"quant_method":"modelopt", "quant_algo":"NVFP4",
+            "config_groups":{"group_0":{"weights":{"num_bits":4,"type":"float","group_size":16}}}});
+        let mut tensors = glm5_flash_tensors(&config);
+        tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
+        for expert in 0..288 {
+            for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+                tensors.extend(nvfp4(&format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}"), n, k));
+            }
+        }
+        write_snapshot(dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        assert_eq!(catalog.fp8().unwrap().format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let manifest = share.join("PROGRAMS.json");
+        let package = |name: &str, scratch| {
+            let root = dir.path().join("lib/fp8").join(name);
+            std::fs::create_dir_all(root.join("tp2")).unwrap();
+            std::fs::write(root.join("manifest.json"), serde_json::json!({"layouts":{
+                "tp2":{"capacities":[{"capacity":4096,"scratch_bytes":scratch}]}}}).to_string()).unwrap();
+            root
+        };
+        package("fp8-glmf-nvfp4", 12345);
+        let a4 = package("fp8-glmf-nvfp4a4", 67890);
+        let output = 4096 * 4096 * 2;
+        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 67890 + output);
+        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, false).unwrap(), 12345 + output);
+        std::fs::remove_dir(a4.join("tp2")).unwrap();
+        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 12345 + output);
+    }
+
+    #[test]
+    fn glm5_flash_graph_inventory_rebuilds_at_the_smaller_pool() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let input = inputs(&cfg, 1, 32 << 30);
+        let (placed, graphs) = solve_with_graphs(&input, 1 << 20, true, 170, true).unwrap();
+        assert!(placed.pool_tokens < 1 << 20);
+        let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+        let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
+            input.sequences as usize, true, 1, 64, 170);
+        assert_eq!(graphs.ranks, expected.ranks);
+    }
+
+    #[test]
+    fn glm5_flash_graph_rebuild_uses_served_policy_not_drafter_residency() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        for (drafter, speculation) in [(0, true), (3 << 30, false)] {
+            let mut input = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+            input.drafter_bytes = drafter;
+            input.speculation = speculation;
+            input.sequences = 128;
+            let (placed, graphs) = solve_with_graphs(&input, 2 << 20, true, 188, true).unwrap();
+            let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+            let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
+                64, speculation, 1, 64, 188);
+            assert_eq!(graphs.ranks, expected.ranks);
+        }
+    }
+
+    #[test]
+    fn glm5_flash_fixed_onboard_graphs_match_admitted_pool() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let mut input = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+        input.onboard = Onboard::Layers(1);
+        let (placed, graphs) = solve_with_graphs(&input, 2 << 20, true, 188, true).unwrap();
+        assert_eq!(placed.onboard_layers, 1);
+        let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+        let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
+            input.sequences as usize, true, 1, 64, 188);
+        assert_eq!(graphs.ranks, expected.ranks);
+    }
+
+    #[test]
+    fn glm5_flash_k0_selectors_fail_closed_until_executors_exist() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
+        assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Kda).all(|l| l.kv_unit.unit_bytes_context.is_none()));
+        assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).all(|l| l.kv_unit.unit_bytes_context.is_some()));
+        assert_eq!(solve(&req).unwrap().attention_placement, AttentionPlacement::Heads);
+        for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+            req.attention_placement = Some(mode);
+            assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
+        }
+    }
+
+    #[test]
+    fn glm5_flash_split_without_tp2_cannot_place_whole_experts() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        for expert in &mut input.experts { expert.tp2 = false; }
+        let placed = solve(&request(&input).unwrap()).unwrap();
+        assert_eq!(placed.onboard_layers, 0);
+        input.onboard = Onboard::Layers(1);
+        assert!(solve(&request(&input).unwrap()).is_err());
+    }
+}

@@ -217,7 +217,7 @@ spark_worker_env=""
 # Options only the Spark expert workers take.
 spark_worker_args=""
 placement_handshake=0
-if [[ "$family" == mimo_v2 && "${CUTEAFD_PLACEMENT_HANDSHAKE:-0}" == 1 ]]; then
+if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && "${CUTEAFD_PLACEMENT_HANDSHAKE:-0}" == 1 ]]; then
   placement_handshake=1
   layer_args+=" --placement-handshake"
 fi
@@ -702,6 +702,8 @@ fi
 # GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
 # GLMF_* spellings still work for one release.
 if [[ $family == glm5_flash ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS)"
+  [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
   fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
     fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
@@ -1286,7 +1288,8 @@ done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
-  # A placement worker waits for the coordinator solve after media admission.
+  # A placement worker bootstraps after media admission and waits for the
+  # coordinator solve before expert weights load.
   ready_marker='worker ready'
   ((placement_handshake == 0)) || ready_marker='worker bootstrap ready'
   ready_deadline=$((SECONDS + 900))

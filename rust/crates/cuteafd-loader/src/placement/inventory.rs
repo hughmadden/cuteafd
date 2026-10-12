@@ -158,11 +158,36 @@ pub const LOADED_CODE: &[LoadedCode] = &[
         source: "v4-flash TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,389,470,672 - context 586,416,128" },
     LoadedCode { family: "glmf", experts: "*", split: false, rank: 0, bytes: 436_389_024,
         source: "glm53f-exl3-min: untracked 2,968,962,208 - graphs 1,946,157,056 - context 586,416,128" },
+    LoadedCode { family: "glmf", experts: "exl3-tp2-local", split: true, rank: 0, bytes: 441_094_988,
+        source: "P6 staged EXL3 TP2 0-Spark startup, 2026-10-12: named program/load/exchange/package/workspace terms; pre-capture 1,027,511,116 - context 586,416,128" },
+    LoadedCode { family: "glmf", experts: "exl3-tp2-local", split: true, rank: 1, bytes: 314_257_228,
+        source: "P6 staged EXL3 TP2 0-Spark startup, 2026-10-12: named second-context/program/load/exchange/package/workspace terms; pre-capture 900,673,356 - context 586,416,128" },
     LoadedCode { family: "glmf", experts: "*", split: true, rank: 0, bytes: 500_143_488,
         source: "glm53f-exl3-max rtx0: untracked 3,317,929,344 - graphs 2,231,369,728 - context 586,416,128" },
     LoadedCode { family: "glmf", experts: "*", split: true, rank: 1, bytes: 215_091_456,
         source: "glm53f-exl3-max rtx1: untracked 3,085,306,112 - graphs 2,283,798,528 - context 586,416,128" },
 ];
+
+/// Physical untracked startup deltas for the P6 EXL3 TP2 / zero-Spark path.
+/// SM120 PRO 6000, CUDA 13.2 LAZY, row128 KDA/output shard/FP8 head, C8,
+/// 4096 prefill, 64 decode; staged probe 2026-10-12, source f5193e78.
+/// Package term includes the route exchange's 524,544 B driver-page reclaim;
+/// it is not resident cubin size (embedded packages total only 2,841,960 B).
+/// Graph capture is measured separately after all expert capacities are primed.
+pub fn glmf_local_tp2_runtime_items(rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
+    use cuteafd_core::memory_layout::{Basis, Category, Item};
+    assert!(rank < 2, "GLM Flash TP2 has exactly two ranks");
+    let terms = [
+        ("CUDA context", 586_416_128),
+        ("second-rank context", [0, 10_485_760][rank]),
+        ("selected program setup", 12_582_912),
+        ("target-load BLAS and driver state", [185_912_576, 183_725_312][rank]),
+        ("peer exchange mappings and setup", 97_364_992),
+        ("EXL3 and route package driver state", 6_817_612),
+        ("workspace BLAS and driver state", [138_416_896, 3_280_640][rank]),
+    ];
+    terms.into_iter().map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Calibrated)).collect()
+}
 
 /// GLM Flash startup executable means (SM120 RTX PRO 6000, CUDA driver
 /// 595.91.07, EXL3 K3.25, 64 decode rows, v3-p2 ready ledgers, 2026-10-10).

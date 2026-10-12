@@ -99,6 +99,49 @@ pub(crate) fn check(schedule: &Schedule) -> Result<(), Deadlock> {
     }
 }
 
+/// GLM Flash layer-major TP2/Spark exchange fixture, including route broadcast.
+#[cfg(test)]
+pub(crate) fn glmf_tp2_fixture(layers: usize, local: std::ops::Range<usize>, lanes: usize, broadcast: bool,
+    independent_first: bool) -> Schedule {
+    let mut s = Schedule::default();
+    let attn = |s: &mut Schedule, gpu, layer, lane| {
+        s.push(gpu, "main", 4 * lane + 2 * (layer % 2), "attention push");
+        s.wait(gpu, "main", 4 * lane + 2 * (layer % 2), "attention wait");
+    };
+    let front = |s: &mut Schedule, layer, lane| {
+        attn(s, 1, layer, lane);
+        if !local.contains(&layer) { s.push(1, "main", 4 * lane + 2 * (layer % 2) + 1, "shared push"); }
+    };
+    for _ in 0..lanes { s.push(0, "main", usize::MAX, "stream push"); }
+    for lane in 0..lanes {
+        s.wait(1, "main", usize::MAX, "stream wait");
+        front(&mut s, 0, lane);
+    }
+    let units: Vec<_> = (0..layers).flat_map(|l| (0..lanes).map(move |k| (l, k))).collect();
+    attn(&mut s, 0, 0, 0);
+    for (i, &(layer, lane)) in units.iter().enumerate() {
+        if local.contains(&layer) {
+            if broadcast {
+                s.push(0, "routes", 2 * lane + layer % 2, "canonical routes push");
+                s.wait(1, "routes", 2 * lane + layer % 2, "canonical routes wait");
+            }
+            s.push(1, "main", 4 * lane + 2 * (layer % 2) + 1, "fused TP2 push");
+        }
+        if layer + 1 < layers {
+            s.wait(1, "main", 4 * lane + 2 * (layer % 2) + 1, "FFN wait");
+            front(&mut s, layer + 1, lane);
+        }
+        let next = units.get(i + 1).copied();
+        let early = independent_first && next.is_some_and(|(_, k)| k != lane);
+        if early { let (l, k) = next.unwrap(); attn(&mut s, 0, l, k); }
+        if layer + 1 < layers { s.push(0, "main", 4 * lane + 2 * (layer % 2) + 1, "FFN push"); }
+        s.wait(0, "main", 4 * lane + 2 * (layer % 2) + 1, "FFN wait");
+        if !early { if let Some((l, k)) = next { attn(&mut s, 0, l, k); } }
+    }
+    s
+}
+
+
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
@@ -236,4 +279,62 @@ mod tests {
             assert_eq!(check(&v4_prefill(6, first, true)), Ok(()), "first GPU1 layer {first}");
         }
     }
+    #[test]
+    fn glmf_tp2_two_lane_local_post_requires_independent_attention_first() {
+        for local in [0..6, 1..4, 4..6] {
+            for broadcast in [false, true] {
+                assert_eq!(check(&glmf_tp2_fixture(6, local.clone(), 2, broadcast, true)), Ok(()));
+            }
+        }
+        assert!(check(&glmf_tp2_fixture(6, 0..6, 2, true, false)).is_err());
+    }
+
+    fn glmf_remote_draft_round(s: &mut Schedule, reused: bool, input_ack_before_head: bool) {
+        if reused { s.wait(0, "draft-taps-ack", 0, "previous tap projection consumed"); }
+        s.push(0, "draft-taps", 0, "target tap pack final");
+        s.wait(1, "draft-taps", 0, "remote tap pack arrival");
+        s.push(1, "draft-taps-ack", 0, "remote tap projection consumed");
+        if reused { s.wait(0, "draft-input-ack", 0, "previous draft input consumed"); }
+        s.push(0, "draft-input", 0, "target embedding gather final");
+        s.wait(1, "draft-input", 0, "remote embedding rows arrival");
+        if reused { s.wait(1, "draft-hidden-ack", 0, "previous target head consumed"); }
+        s.push(1, "draft-hidden", 0, "remote full-R normalized rows final");
+        // Waiting for the entire draft to finish before launching its target
+        // head is a cycle: the draft itself waits for the head's logits.
+        if input_ack_before_head { s.wait(0, "draft-input-ack", 0, "premature input consumed wait"); }
+        s.wait(0, "draft-hidden", 0, "target normalized rows arrival");
+        s.push(0, "draft-hidden-ack", 0, "target full-R head consumed");
+        if reused { s.wait(0, "draft-logits-ack", 0, "previous draft logits consumed"); }
+        s.push(0, "draft-logits", 0, "target full-R logits final");
+        s.wait(1, "draft-logits", 0, "remote logits arrival");
+        s.push(1, "draft-logits-ack", 0, "remote sampler consumed");
+        s.push(1, "draft-input-ack", 0, "remote draft input consumed");
+    }
+
+    #[test]
+    fn glmf_tp2_then_remote_draft_ack_schedule_drains_reused_slots() {
+        // Design fixture only: the remote executor must record this ordering
+        // from its real enqueue paths before enabling GPU1 placement.
+        for lanes in [1, 2] {
+            for broadcast in [false, true] {
+                let mut schedule = Schedule::default();
+                for round in 0..3 {
+                    let target = glmf_tp2_fixture(6, 1..4, lanes, broadcast, true);
+                    for (stream, next) in schedule.streams.iter_mut().zip(target.streams) { stream.extend(next); }
+                    glmf_remote_draft_round(&mut schedule, round > 0, false);
+                }
+                assert_eq!(check(&schedule), Ok(()));
+            }
+        }
+        let mut schedule = glmf_tp2_fixture(6, 1..4, 2, true, true);
+        glmf_remote_draft_round(&mut schedule, false, true);
+        assert_eq!(check(&schedule).unwrap_err().blocked,
+            [Some("premature input consumed wait".into()), Some("remote logits arrival".into())]);
+    }
+
+    #[test]
+    fn glmf_tp2_three_lane_front_is_not_an_admitted_schedule() {
+        assert!(check(&glmf_tp2_fixture(5, 1..4, 3, false, true)).is_err());
+    }
+
 }

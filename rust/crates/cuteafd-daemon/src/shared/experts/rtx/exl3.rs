@@ -222,6 +222,8 @@ impl<'a> Exl3Tp2<'a> {
                                 Some(arena.clone()),
                             )?
                         };
+                        crate::shared::inventory::startup_probe(rank.device.library, &[rank.device.id],
+                            &format!("exl3-package-m{capacity}"))?;
                         ensure!(
                             execution.capacity() == capacity as usize
                                 && execution.output_element_bytes() == 4,

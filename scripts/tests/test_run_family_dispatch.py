@@ -127,6 +127,79 @@ def test_family_table_names_every_launchable_family() -> None:
         assert out.stdout.split()[0] == family
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_glmf_solved_worker_startup_waits_bootstrap_only_when_opted_in(tmp_path: Path, enabled: bool) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": str(int(enabled)),
+                                             "STUB_WORKER_READY": "worker bootstrap ready" if enabled else "worker ready"})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    coordinator = next(line for line in lines if "cuteafd" in line and "serve-glmf" in line)
+    assert ("--placement-handshake" in worker) == enabled
+    assert ("--placement-handshake" in coordinator) == enabled
+    marker = "worker bootstrap ready" if enabled else "worker ready"
+    readiness = next(i for i, line in enumerate(lines) if f"grep -q '{marker}'" in line)
+    assert readiness < lines.index(coordinator)
+    if enabled:
+        assert not any("grep -q 'worker ready'" in line for line in lines)
+
+
+def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1"})
+    assert result.returncode == 0, result.stderr
+    assert "--placement-handshake" not in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+
+
+def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None:
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    pair = source.split("    fn tp2_pair(", 1)[1].split("    fn tp2_publish(", 1)[0]
+    assert "self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;" in pair
+    assert "self.tp2_rank(1, layer, lane, w1, rows, w1.shared.buffer.ptr)" not in pair
+    assert pair.index("self.tp2_rank(1,") < pair.index("self.library.copy_d2d_async(")
+    assert "self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer," in pair
+    assert "rows * self.cfg.hidden * 2, self.stream_of(1)" in pair
+    publish = source.split("    fn tp2_publish(", 1)[1].split("    fn router_on(", 1)[0]
+    assert "workspaces.get(lane)?.shared.buffer.ptr" in publish
+    header = (ROOT / "native/shared/include/cuteafd_experts.h").read_text()
+    assert "No output/input overlap." in header
+
+
+def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
+    body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
+    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
+    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_range(")
+    assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
+    assert "WorkerSelection::new(identity, &spark_layers)" in body
+    assert "let spark = !spark_layers.is_empty();" in body
+    assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
+    assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
+    assert "spark_layers == working.spark_layers" in body
+    admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
+    assert "solve_working_set_with_graphs(" in admission
+    assert "let local_workspace = workspaces(false, 1);" in admission
+    assert "admission::step_workspace_demands(" in admission
+    normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
+    assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
+    planner = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert "Ok((placed, working))" in planner and "selected = Some(working);" in planner
+    assert "0..working.spark_ranks" in planner and "selected.filter(|working| working.spark_ranks > 0)" in planner
+    loader = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash.rs").read_text()
+    request = loader.split("pub fn request_for_working_set(", 1)[1].split("/// Exact header-only", 1)[0]
+    assert "working.demands(&fixed).cloned().collect()" in request
+    assert "SparkWorkingSet as GlmfWorkingSet" in loader
+    assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
+    assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
+    expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
+    assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
+    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())" in expert
+
+
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
     """checkpoint-family.py and cuteafd-loader plan::launch read the same cases the
     same way (both spellings, exact pattern lengths, agreement)."""
@@ -173,7 +246,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready"; echo "worker bootstrap ready"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
@@ -463,6 +536,24 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
     assert "--local-expert-layers" not in launch
+    if value is None:
+        assert "--rtx-expert-layers" not in launch
+    else:
+        assert f"--rtx-expert-layers {value}" in launch
+
+
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
+    keys = "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\n"
+    if value is not None:
+        keys += f"RTX_EXPERT_LAYERS={value}\n"
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm5_next", "num_hidden_layers": 2,
+        "mlp_layer_types": ["sparse"] * 2,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"],
+    }, "test/glmf", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
