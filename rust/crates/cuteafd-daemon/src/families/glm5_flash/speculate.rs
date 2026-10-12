@@ -670,6 +670,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
                 times.push(timer.elapsed().as_secs_f64());
             } else {
                 *engine.profile.borrow_mut() = [0.0; 3];
+                engine.op_profile()?;
             }
         }
         times.sort_by(f64::total_cmp);
@@ -680,6 +681,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         println!("  {per_sequence} rows/sequence ({total} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, \
             Spark exchanges {:.2} ms, head {:.2} ms", 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
             1e3 * phases[1] / n, 1e3 * phases[2] / n);
+        super::print_op_profile(engine, &format!("  verify ops per step, {total} rows"), times.len())?;
     }
     Ok(())
 }
