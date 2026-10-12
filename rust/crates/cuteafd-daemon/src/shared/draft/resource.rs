@@ -273,6 +273,7 @@ pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], wid
 
 pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
     max_rows: usize, drafted_requests: usize) -> Selection {
+    let _timing = super::clock::HostSpan::new(super::clock::HostStage::Select);
     let positions = policy.geometry().max_positions;
     let confidence: Vec<&[f64]> = candidates.iter()
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
@@ -418,13 +419,28 @@ pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>
 
 static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 
+fn publication_due(rounds: u64, last: Option<u64>) -> bool {
+    last.is_none_or(|last| rounds < last || rounds.saturating_sub(last) >= 32)
+}
+
 /// The latest published policy state for the serving `stats` payload.
 pub(crate) fn snapshot() -> serde_json::Value {
     SNAPSHOT.lock().ok().and_then(|slot| slot.clone()).unwrap_or(serde_json::Value::Null)
 }
 
-/// Publish the policy's fits and reliability (`/v1/stats` `draft_policy`).
+/// Publish at startup/reset and at most every 32 observed rounds. The policy
+/// retains the authoritative numbers; this dashboard view may lag 31 rounds.
 pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: Option<(u64, u64)>) {
+    thread_local! {
+        static LAST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+    let rounds = policy.stats().rounds;
+    if !LAST.with(|last| {
+        let due = publication_due(rounds, last.get());
+        if due { last.set(Some(rounds)); }
+        due
+    }) { return; }
+    let _timing = super::clock::HostSpan::new(super::clock::HostStage::Publish);
     let stats = policy.stats();
     let geometry = policy.geometry();
     let snapshot = policy.cost_snapshot(false, 1);
@@ -491,6 +507,16 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_cadence_is_bounded_and_resets() {
+        assert!(publication_due(0, None));
+        assert!(!publication_due(0, Some(0)));
+        assert!(!publication_due(31, Some(0)));
+        assert!(publication_due(32, Some(0)));
+        assert!(publication_due(100, Some(32)));
+        assert!(publication_due(0, Some(100)));
+    }
 
     #[test]
     fn terminal_censorship_preserves_a_real_mismatch() {

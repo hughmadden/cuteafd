@@ -1584,6 +1584,12 @@ impl<'a> Qwen4Engine<'a> {
         &[Option<f64>]) -> T) -> Option<T> {
         let mut probes = self.draft_probes.borrow_mut();
         if probes.is_empty() { return None; }
+        if probes.len() == 1 {
+            let probe = &mut probes[0];
+            let _scope = probe.device.enter().ok()?;
+            let (routes, times) = probe.finish()?;
+            return Some(observe(routes, &times));
+        }
         let mut routes = crate::shared::draft::routes::RoundRoutes::new(self.cfg.layers, self.cfg.topk);
         let mut times = vec![None; self.cfg.layers];
         for (owner, probe) in probes.iter_mut().enumerate() {
@@ -1593,8 +1599,7 @@ impl<'a> Qwen4Engine<'a> {
             if owner == 0 { routes.begin(part.rows()); }
             for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
                 let words = part.rows() * self.cfg.topk;
-                let ids: Vec<_> = part.flat()[index * words..][..words].iter().map(|&id| u32::from(id)).collect();
-                routes.push(index, &ids, u32::MAX).ok()?;
+                routes.push_narrow(index, &part.flat()[index * words..][..words]).ok()?;
                 times[index] = elapsed[index];
             }
         }

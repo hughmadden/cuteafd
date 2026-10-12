@@ -136,6 +136,7 @@ fn confidence<'a>(request: &RoundRequest<'a>) -> Option<&'a [f64]> {
 pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Result<(), ObserveError> {
     let observation = build(record, policy.widths()[0])?;
     trace_round(policy, record);
+    let _timing = super::clock::HostSpan::new(super::clock::HostStage::Observe);
     Ok(policy.observe(observation.view())?)
 }
 
