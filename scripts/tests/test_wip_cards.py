@@ -381,6 +381,7 @@ def test_spark_native_phase_holds_lock_without_locking_cargo(tmp_path):
     for name, script in {
         'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
+        'python3': '#!/bin/sh\nprintf "queue %s\\n" "$*" >> "$TRACE"\n',
     }.items():
         path = tools / name
         path.write_text(script)
@@ -400,10 +401,12 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert rust'))
+    queue = next(i for i, line in enumerate(lines) if line.startswith('queue '))
+    assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 -- true' in lines[queue]
     lock = next(i for i, line in enumerate(lines) if line.startswith('flock -w 1800'))
     native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native'))
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
-    assert rust < lock < native < finalize
+    assert rust < queue < lock < native < finalize
     assert subprocess.run(['flock', '-n', str(home / '.cache/cuteafd/rhea.lock'), 'true']).returncode == 0
 
 

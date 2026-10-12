@@ -545,7 +545,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     let small_card = matches!(family, "deepseek_v41" | "mimo_v2")
         && options.rtx_bytes.first().is_some_and(|&bytes| bytes <= 32 * GIB);
     let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
-        else if family == "deepseek_v41" { if small_card { 1024 } else { 2048 } }
+        else if family == "deepseek_v41" { 2048 }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
     let concurrency = if options.concurrency > 0 { options.concurrency }
@@ -879,15 +879,6 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         devices[0].items.push(Item::new(Category::Experts, "dSpark stage experts", "native", draft_experts, Basis::Exact));
     }
     let mut local_bytes = layer_bytes * local_layers as u64;
-    if family != "deepseek_v4" && local_bytes > 0 && !matches!(report.placement, ExpertPlacement::Local) {
-        if family == "deepseek_v41" && gpus == 2 {
-            for device in devices.iter_mut().take(2) {
-                device.items.push(Item::new(Category::Experts, "resident routed layers", "native-tp2", local_rank_bytes * local_layers as u64, Basis::Formula));
-            }
-        } else {
-            devices[0].items.push(Item::new(Category::Experts, "resident routed layers", "native", local_bytes, Basis::Exact));
-        }
-    }
 
     let spark_geometry = model.spec().moe.as_ref().map(|moe| cuteafd_core::ExpertGeometry {
         hidden: model.spec().hidden as u32, experts: moe.experts as u32,
@@ -1156,10 +1147,48 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
-            pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
-                .unwrap_or_else(|| size_pool(&free, &per_token, unit,
-                    if family == "deepseek_v41" { if small_card { 1 << 20 } else { v41::DEFAULT_POOL_TOKENS } }
-                    else if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
+            if family == "deepseek_v41" {
+                use crate::placement::*;
+                let inventory = Inventory {
+                    gpus: devices.iter().map(|d| GpuBudget {
+                        capacity_bytes: d.capacity_bytes, headroom_bytes: 0,
+                        baseline: Baseline::Measured { free_bytes: d.free_bytes().max(0) as u64 },
+                    }).collect(), spark_ranks: report.spark_ranks, peer_access: active_gpus == 2,
+                };
+                let mut pool = PoolPolicy::resolve(&options.rtx_bytes, context_tokens,
+                    options.pool_tokens, unit, report.spark_ranks == 0);
+                let tails = concurrency + 2 * (marks.saturating_sub(2) / 2);
+                pool.ceiling = ((131_072 - tails) * unit).min(pool.requested.unwrap_or(pool.target).div_ceil(unit) * unit);
+                let cost = ExpertCost { whole: Bytes2 { resident: layer_bytes, staging: 32 * MIB },
+                    half: [Bytes2 { resident: local_rank_bytes, staging: 32 * MIB }; 2],
+                    tp2: active_gpus == 2, spark_ok: true };
+                let request = families::deepseek_v41::request(inventory, pool,
+                    geometry.ranks.iter().map(|r| r.persistent_unit_bytes + r.pool_metadata_unit_bytes).collect(),
+                    vec![cost; model.spec().layers.len()], 256 * MIB,
+                    options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto));
+                match solve(&request) {
+                    Ok(placement) => {
+                        pool_tokens = placement.pool_tokens;
+                        local_layers = placement.onboard_layers;
+                        local_bytes = layer_bytes * local_layers as u64;
+                        for (device, items) in devices.iter_mut().zip(placement.items) {
+                            device.items.extend(items.into_iter().filter(|item| item.category != Category::Kv));
+                        }
+                    }
+                    Err(error) => {
+                        report.placement_supported = false;
+                        report.hints.push(super::Hint {
+                            what: format!("V4.1 shared admission: {error}"),
+                            how: "Reduce the pool or local expert request, or increase the device budget.".into(),
+                        });
+                        notes.push(format!("V4.1 shared admission: {error}"));
+                    }
+                }
+            } else {
+                pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
+                    .unwrap_or_else(|| size_pool(&free, &per_token, unit,
+                        if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
+            }
             if pool_tokens < context_tokens {
                 notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
             }
@@ -1182,18 +1211,18 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         }
         Ok(None) if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2" | "glm5") => {}
         Ok(None) => notes.push(format!("{family}: no cache geometry in the planner yet (engine sizes its own pool)")),
-        Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
+        Err(error) => {
+            if family == "deepseek_v41" {
+                report.placement_supported = false;
+                report.hints.push(super::Hint {
+                    what: format!("V4.1 cache geometry admission: {error}"),
+                    how: "Use a supported CED source layout before allocating the pool.".into(),
+                });
+            }
+            notes.push(format!("{family}: cache geometry: {error}"));
+        },
     }
 
-    if family == "deepseek_v41" && options.local_expert_layers.is_none() && layer_bytes > 0 {
-        let per_gpu = local_rank_bytes;
-        let room = devices.iter().take(active_gpus).map(|d| d.free_bytes().max(0) as u64).min().unwrap_or(0);
-        local_layers = (room.saturating_sub(512 * MIB) / per_gpu).min(model.spec().layers.len() as u64) as usize;
-        local_bytes = layer_bytes * local_layers as u64;
-        for device in devices.iter_mut().take(active_gpus) {
-            device.items.push(Item::new(Category::Experts, "resident routed layers", "native", per_gpu * local_layers as u64 + 256 * MIB, Basis::Formula));
-        }
-    }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     // V4.1 auto-selects local experts after KV sizing. Preserve its original
     // Spark slice accounting even though generic encoder placement needs the

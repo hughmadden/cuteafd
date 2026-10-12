@@ -205,6 +205,11 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
+    /// Resolved V4.1 prefill shape, including automatic capacity admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
     pub experts: Option<ExpertContract>,
     /// Whether this build has a layout for the requested placement.
@@ -260,7 +265,7 @@ impl Default for PlanOptions {
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
-            placement: ExpertPlacement::Sparks { ranks: 4 },
+            placement: ExpertPlacement::Sparks { ranks: 6 },
             spark_budget_bytes: 100 << 30,
             coordinator_budget_bytes: 80 << 30,
             layout: None,
@@ -376,6 +381,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
+        prefill_rows: None,
+        prefill_selection: None,
         experts: None,
         placement_supported: true,
         min_spark_ranks: None,
@@ -626,7 +633,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
         let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
-            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true, ..Default::default() };
+            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
+            glmf_drafter_disabled: true, ..Default::default() };
         let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &inventory,
             options.coordinator_budget_bytes);
     }
@@ -812,10 +820,53 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
         return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
     }
     let count = explicit.unwrap_or(available);
-    let candidate = |ranks| plan(snapshot, &PlanOptions {
-        placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
-    });
+    let candidate = |ranks| -> Result<PlanReport, PlanError> {
+        let mut candidate = PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
+        };
+        let mut report = plan(snapshot, &candidate)?;
+        if report.family.as_deref() != Some("deepseek_v41") || candidate.layout.is_none() {
+            return Ok(report);
+        }
+        let rows = candidate.layout.as_ref().unwrap().prefill_rows;
+        report.prefill_rows = Some(if rows == 0 { 2048 } else { rows });
+        if rows != 0 {
+            if !report.executable() {
+                report.hints.push(Hint {
+                    what: format!("explicit V4.1 prefill capacity {rows} refused by checkpoint or memory admission"),
+                    how: "Keep the requested shape with more memory, or omit prefill rows for automatic admission.".into(),
+                });
+            }
+            return Ok(report);
+        }
+        // Count candidates each solve their largest executable default shape.
+        let reason = report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
+        if !report.executable() {
+            for rows in [1024, 256] {
+                let layout = candidate.layout.as_mut().unwrap();
+                layout.prefill_rows = rows;
+                layout.spark_capacity_rows = rows;
+                let mut smaller = plan(snapshot, &candidate)?;
+                smaller.prefill_rows = Some(rows);
+                if smaller.executable() {
+                    smaller.prefill_selection = Some(format!(
+                        "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));
+                    return Ok(smaller);
+                }
+            }
+        } else {
+            report.prefill_selection = Some("V4.1 automatic prefill selected 2048 rows".into());
+        }
+        Ok(report)
+    };
     let mut requested = candidate(count)?;
+    if count > available {
+        requested.placement_supported = false;
+        requested.hints.push(Hint {
+            what: format!("requested {count} Sparks but only {available} are available"),
+            how: "Choose a count within the available inventory.".into(),
+        });
+    }
     if requested.executable() { return Ok(requested); }
     let reason = requested.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
     let reason = if reason.is_empty() { requested.config_error.clone().unwrap_or_else(||
@@ -854,6 +905,7 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
+    if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {
         let _ = writeln!(out, "image cap  {cap} merged tokens per image (detail=low 256); BF16 residual");

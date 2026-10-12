@@ -236,6 +236,12 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     wip = "--wip" in extra_args
+    exact_count = 0 if "EXPERT_BACKEND=local" in keys else 1
+    for line in keys.splitlines():
+        if line.startswith("SPARK_COUNT="):
+            exact_count = int(line.split("=", 1)[1])
+    if encoder_plan is not None:
+        encoder_plan = {**encoder_plan, "spark_ranks": exact_count}
     if wip:
         (repo / "scripts" / "build").mkdir()
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
@@ -258,6 +264,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and wip else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
                                      if tool == "docker" and preferred_ranks is not None and encoder_plan is None else '') +
+                                    ('case "$*" in *"cuteafd plan"*) n=1; prev=""; for a in "$@"; do '
+                                     '[[ "$prev" != --spark-ranks ]] || n="$a"; prev="$a"; done; '
+                                     'printf \'{"spark_ranks":%s}\\n\' "$n" ;; esac\n'
+                                     if tool == "docker" and preferred_ranks is None and encoder_plan is None else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
                                      if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
@@ -294,7 +304,8 @@ exec python3 -c "$code" "$@"
                                          ' ;; *) echo 0; echo 1 ;; esac\n')
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
-    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
+    initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
+    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), **(extra_env or {})}
     env["HOME"] = str(tmp_path / "home")
@@ -322,7 +333,7 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     plans = [line for line in lines if "cuteafd plan" in line]
-    assert len(plans) == (2 if qwen else 1)
+    assert len(plans) == 1
     staging = next(i for i, line in enumerate(lines) if "docker cp" in line and ".cuteafd-wip" in line)
     for preflight in plans:
         assert staging < lines.index(preflight)
@@ -1227,8 +1238,9 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
     for mode in ("", "fp8"):
         text = _family_launch_lines(tmp_path / (mode or "default"), config, "test/mimo",
                                    f"EXPERT_INPUT={mode}\n")
-        assert "docker run --rm" not in text
-        assert ("--expert-input fp8" in text) == bool(mode)
+        assert '"python3"' not in text
+        serve_line = next(line for line in text.splitlines() if "serve-mimo" in line)
+        assert ("--expert-input fp8" in serve_line) == bool(mode)
     other = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path / "other", other, "test/glm", "EXPERT_INPUT=bf16-decode\nGLM5_FLASH_FP8_MODEL_ID=off\n")
@@ -1633,7 +1645,7 @@ def test_coordinator_gpu_budget_rejects_invalid_values_before_side_effects(tmp_p
 def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_path):
     result = _family_launch_result(tmp_path,
         {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
-        "COORDINATOR_GPU_BUDGET_GIB=32\n", preferred_ranks=4,
+        "COORDINATOR_GPU_BUDGET_GIB=32\n", preferred_ranks=1,
         gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
@@ -1721,18 +1733,14 @@ def test_qwen_preferred_experts_use_the_planner_before_launch(tmp_path: Path, ba
                                                              preferred: int, local: bool) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
                                   f"EXPERT_BACKEND={backend}\n", preferred_ranks=preferred)
-    assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert ("--local-experts" in launch) == local
-    assert ("--peers" in launch) != local
-    assert ("--mtp 3" in launch) == local
-    if local:
-        assert "expertd-native" not in result.stderr
+    assert result.returncode != 0
+    assert "planner changed exact Spark count" in result.stderr
+    assert "cuteafd serve-qwen4" not in result.stderr
 
 
 def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
-                                  "SPECULATOR=mtp\nSPECULATOR_DEPTH=3\n", preferred_ranks=0)
+                                  "SPARK_COUNT=0\nSPECULATOR=mtp\nSPECULATOR_DEPTH=3\n", preferred_ranks=0)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert "--mtp 3" in launch and "--local-experts" in launch
@@ -1787,7 +1795,7 @@ def test_qwen_unqualified_explicit_mtp_keeps_the_existing_depth(tmp_path: Path, 
 def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, restart: bool,
                                                               admitted_gib: float) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
-                                  "test/model", "INSTANCE=own\n", preferred_ranks=0, restart=restart,
+                                  "test/model", "INSTANCE=own\nSPARK_COUNT=0\n", preferred_ranks=0, restart=restart,
                                   gpu_free_mib=12000, container_pids=(123,),
                                   gpu_allocations=((123, 84000), (456, 2000)))
     assert result.returncode == 0, result.stderr
@@ -1797,9 +1805,9 @@ def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, 
 
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
-                                  "", preferred_ranks=0)
+                                  "", preferred_ranks=1)
     assert result.returncode == 0, result.stderr
-    assert "cuteafd plan" not in result.stderr
+    assert "cuteafd plan" in result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert "--peers" in launch and "--local-experts" not in launch
 
@@ -1809,7 +1817,7 @@ def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Pat
 def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, previous_peers: str | None,
                                                              cleanup: bool) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
-                                  "test/model", "INSTANCE=own\n", preferred_ranks=0, restart=True,
+                                  "test/model", "INSTANCE=own\nSPARK_COUNT=0\n", preferred_ranks=0, restart=True,
                                   previous_peers=previous_peers)
     assert result.returncode == 0, result.stderr
     assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
@@ -1837,7 +1845,7 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
         assert f"--encoder-plan-hash {'ab' * 32}" in launch
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off":
-        assert "cuteafd plan" not in result.stderr
+        assert "cuteafd plan" in result.stderr
     else:
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
@@ -1938,7 +1946,7 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
     assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
     if kind == "spark":
         assert f"--encoder-plan-hash {'ab' * 32}" in launch and "--encoder-revision abc" in launch
-    assert ("cuteafd plan" in result.stderr) == (kind != "off")
+    assert "cuteafd plan" in result.stderr
     if kind != "off":
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
@@ -2121,7 +2129,7 @@ def test_towerless_families_default_to_auto_and_start_no_tower(tmp_path, family_
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     assert "--vision auto" in launch
-    assert "cuteafd plan" not in result.stderr
+    assert "cuteafd plan" in result.stderr
     assert "--encoder-listen" not in result.stderr and "--vision-peers" not in launch
 
 
@@ -2139,7 +2147,7 @@ def test_text_only_qualified_family_auto_default_does_not_start_a_tower(tmp_path
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     assert "--vision auto" in launch
-    assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
+    assert "cuteafd plan" in result.stderr and "--encoder-listen" not in result.stderr
 
 
 _GLMF = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
@@ -2270,7 +2278,7 @@ def test_qwen_encoder_explicit_placement_and_default_auto(tmp_path, mode, kind):
         assert "--encoder-max-tokens 1024" in worker
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
     if kind == "off":
-        assert "cuteafd plan" not in result.stderr
+        assert "cuteafd plan" in result.stderr
 
 
 @pytest.mark.parametrize("width", [4096, 6144])

@@ -371,8 +371,7 @@ class StopConfigModeTest(StopHarness):
             "SPARK_COUNT=6\n" + self.host_lines(SIX_HOSTS),
         )
         strict = self.load(config)
-        self.assertEqual(strict.returncode, 2, strict.stdout)
-        self.assertIn("SPARK_COUNT=6 requires explicit", strict.stderr)
+        self.assertEqual(strict.returncode, 0, strict.stderr)
 
     def test_six_hosts_without_topology_stop_all_six(self):
         """The parent's usability case: launch-invalid, cleanup-complete."""

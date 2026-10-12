@@ -91,8 +91,37 @@ pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
         Ok(ceiling.checked_sub(total - free).and_then(|n| n.checked_sub(runtime))
             .with_context(|| format!("GPU {gpu} planner leaves no room after fixed owners and runtime reserve"))? as u64)
     }).collect::<Result<_>>()?;
-    let groups = cuteafd_loader::serving_capacity::deepseek_v41_pool_groups(&config,
-        args.concurrency as u64, args.prefix_cache_entries as u64, &available, target, automatic, args.tp2_attention)?;
+    use cuteafd_loader::placement::*;
+    let slots = args.concurrency as u64;
+    let tails = slots + 2 * args.prefix_cache_entries as u64;
+    let geometry = cuteafd_loader::serving_capacity::deepseek_v41_cache_geometry(&config, memory.len())?;
+    let units: Vec<u64> = geometry.ranks.iter().enumerate().map(|(gpu, rank)| {
+        rank.persistent_unit_bytes + if args.tp2_attention {
+            if gpu == 0 { 2 * 256 * 288 } else { 3 * 256 * 288 }
+        } else { 0 }
+    }).collect();
+    // Charge maximum bounded page tables once, outside the logical pool.
+    let fixed = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
+        &config, memory.len(), slots, 4096, args.tp2_attention)?;
+    let inventory = Inventory {
+        gpus: memory.iter().zip(&available).enumerate().map(|(gpu, (&(_, total), &free))| {
+            let owners = fixed[gpu] - 4096 * units[gpu] + tails * units[gpu];
+            Ok(GpuBudget { capacity_bytes: total as u64, headroom_bytes: 0,
+                baseline: Baseline::Measured { free_bytes: free.checked_sub(owners)
+                    .context("V4.1 fixed cache state and private tails exceed budget")? } })
+        }).collect::<Result<_>>()?, spark_ranks: args.peers.len(), peer_access: memory.len() == 2,
+    };
+    let mut pool = PoolPolicy::resolve(&memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>(),
+        args.max_context_tokens as u64, (!automatic).then_some(requested), 512, args.peers.is_empty());
+    pool.target = target;
+    pool.ceiling = (MAX_GROUPS as u64 - tails) * 512;
+    let placement = solve(&families::deepseek_v41::request(inventory, pool, units,
+        vec![], 0, Onboard::Auto))?;
+    let groups = placement.pool_tokens.div_ceil(512) + tails;
+    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
+        &config, memory.len(), slots, groups, args.tp2_attention)?;
+    ensure!(exact.iter().zip(&available).all(|(used, free)| used <= free),
+        "V4.1 shared solve disagrees with exact cache allocation");
     if automatic {
         ensure!(groups >= (args.max_context_tokens as u64).div_ceil(512)
             + 2 * (args.concurrency as u64 + args.prefix_cache_entries as u64),
@@ -118,7 +147,7 @@ pub(super) fn startup_phase(lib: &cuteafd_ffi::NativeLibrary, phase: &str, devic
     Ok(())
 }
 
-/// Small-card startup admission runs before any weight payload or device owner.
+/// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
 pub(super) fn admit_startup(lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog, args: &crate::cli::NativeServeArgs) -> Result<()> {
@@ -190,14 +219,14 @@ pub(super) fn admit_startup(lib: &cuteafd_ffi::NativeLibrary,
     // Geometry queries initialize native modules; sample their real CUDA cost
     // now, before reading weights, rather than using a card/driver constant.
     let (free, total) = measured_pool_memory(lib)?;
-    ensure!(peak <= free, "32 GB V4.1 startup refused before weights: peak {peak} bytes, free {free}, phases {loading_peaks:?}, owners {owners:?}; use --prefill-batch-tokens 256 or a larger coordinator");
-    let after = free.checked_sub(fixed).with_context(|| format!("32 GB V4.1 fixed startup owners need {fixed} bytes, free {free}; set --prefill-batch-tokens 256, --rtx-expert-layers 0 or use a larger coordinator; owners {owners:?}"))?;
+    ensure!(peak <= free, "V4.1 startup refused before weights: peak {peak} bytes, free {free}, phases {loading_peaks:?}, owners {owners:?}; use --prefill-batch-tokens 256 or a larger coordinator");
+    let after = free.checked_sub(fixed).with_context(|| format!("V4.1 fixed startup owners need {fixed} bytes, free {free}; set --prefill-batch-tokens 256, --rtx-expert-layers 0 or use a larger coordinator; owners {owners:?}"))?;
     let exact = planned_pool_size(args, &[(after, total)])?;
     let pool = PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
         args.prefix_cache_entries as usize, snapshots, exact, args.memory_reservation, after, total)
-        .with_context(|| format!("32 GB V4.1 startup refused before weights: fixed-owner bound {fixed}, owners {owners:?}; use --prefill-batch-tokens 256 or increase coordinator memory"))?;
+        .with_context(|| format!("V4.1 startup refused before weights: fixed-owner bound {fixed}, owners {owners:?}; use --prefill-batch-tokens 256 or increase coordinator memory"))?;
     tracing::info!(fixed_owner_bound_bytes=fixed, startup_peak_bound_bytes=peak, loading_phases=?loading_peaks, owners=?owners, admitted_cache_bytes=pool.cache_bytes,
-        "V4.1 complete small-card startup admission before weight loads");
+        "V4.1 complete startup admission before weight loads");
     Ok(())
 }
 
@@ -680,21 +709,24 @@ impl LocalLayerPlan {
         let graph_reserve_bytes = graph_reserve_bytes(total, None);
         let available = ceiling.saturating_sub(total - free).saturating_sub(RUNTIME_HEADROOM)
             .saturating_sub(graph_reserve_bytes);
-        let target = match requested { LocalLayers::Auto => budgets.len(), LocalLayers::Count(n) => n };
-        ensure!(target <= budgets.len(), "requested RTX layers exceed available layer plans");
-        let mut plan = Self { layers: 0, resident_bytes: 0, workspace_bytes: 0, peak_bytes: 0, graph_reserve_bytes };
-        let mut staging = 0;
-        for budget in budgets.iter().take(target) {
-            let resident = plan.resident_bytes.checked_add(budget.resident_bytes).context("local weight size overflow")?;
-            staging = staging.max(budget.device_staging_bytes);
-            let peak = resident.checked_add(workspace_bytes).and_then(|b| b.checked_add(staging))
-                .context("local layer peak size overflow")?;
-            if peak > available { break; }
-            plan = Self { layers: plan.layers + 1, resident_bytes: resident, workspace_bytes, peak_bytes: peak, graph_reserve_bytes };
-        }
-        if let LocalLayers::Count(n) = requested {
-            ensure!(plan.layers == n, "requested {n} RTX expert layers but only {} fit after KV, workspaces, staging, runtime headroom and graph reserve", plan.layers);
-        }
+        use cuteafd_loader::placement::*;
+        let request = families::deepseek_v41::request(Inventory {
+            gpus: vec![GpuBudget { capacity_bytes: total as u64, headroom_bytes: 0,
+                baseline: Baseline::Measured { free_bytes: available as u64 } }],
+            spark_ranks: 4, peer_access: false,
+        }, PoolPolicy { requested: Some(512), target: 512, floor: 512, ceiling: 512, unit_rows: 512 },
+            vec![0], budgets.iter().map(|b| ExpertCost {
+                whole: Bytes2 { resident: b.resident_bytes as u64, staging: b.device_staging_bytes as u64 },
+                half: [Bytes2::default(); 2], tp2: false, spark_ok: true,
+            }).collect(), workspace_bytes as u64,
+            match requested { LocalLayers::Auto => Onboard::Auto, LocalLayers::Count(n) => Onboard::Layers(n) });
+        let placement = solve(&request)?;
+        let layers = placement.onboard_layers;
+        let resident_bytes = budgets.iter().take(layers).map(|b| b.resident_bytes).sum::<usize>();
+        let workspace_bytes = if layers > 0 { workspace_bytes } else { 0 };
+        let staging = budgets.iter().take(layers).map(|b| b.device_staging_bytes).max().unwrap_or(0);
+        let plan = Self { layers, resident_bytes, workspace_bytes,
+            peak_bytes: resident_bytes + workspace_bytes + staging, graph_reserve_bytes };
         Ok(plan)
     }
 }

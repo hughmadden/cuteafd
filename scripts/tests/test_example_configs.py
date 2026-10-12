@@ -134,7 +134,8 @@ def _family_launch(tmp_path: Path, config: Path) -> subprocess.CompletedProcess[
     bin_dir = _stubs(tmp_path)
     # The encoder plan the coordinator image would print: Spark-first vision with Spark
     # ranks; with local experts the automatic KV target keeps the tower off (the cards).
-    plan = SPARK_PLAN if int(keys(config)["SPARK_COUNT"]) else LOCAL_PLAN
+    count = int(keys(config).get("SPARK_COUNT", sum(key.endswith("_HOST") for key in keys(config))))
+    plan = {**(SPARK_PLAN if count else LOCAL_PLAN), "spark_ranks": count}
     if plan is not None:
         # The encoder plan the coordinator image would print for this layout.
         docker = bin_dir / "docker"

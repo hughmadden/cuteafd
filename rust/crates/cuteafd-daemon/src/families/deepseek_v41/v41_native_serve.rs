@@ -506,7 +506,28 @@ fn worker(
     // Size after vision, both lanes, transports and optional draft allocations are live.
     let (free, total) = if small_card { memory::measured_pool_memory(&lib)? } else { lib.cuda_memory_info()? };
     let reservation = args.memory_reservation;
-    args.kv_pool_size = memory::planned_pool_size(&args, &[(free, total)])?;
+    // Exact local placement is admitted before the automatic pool consumes its
+    // space. Use the same header-derived resident/workspace/staging bound as
+    // the post-pool loader; automatic placement remains pool-first.
+    let fixed_local_peak = if let memory::LocalLayers::Count(count) = args.rtx_expert_layers {
+        if count == 0 { 0 } else {
+            use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave, exl3::Exl3Weights};
+            let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
+            let workspace = if catalog.exl3().is_some() { LocalExpertWave::exl3_device_bytes(&directory, aot_capacity)? }
+                else { LocalExpertWave::device_bytes_for(&lib, aot_capacity, catalog.nvfp4().is_some())? };
+            let budgets = (0..count).map(|layer| {
+                let selection = ExpertLayer::BackboneFull { layer };
+                if catalog.exl3().is_some() { Exl3Weights::plan(&catalog, selection) }
+                else { ExpertWeights::plan(&lib, &catalog, selection) }
+            }).collect::<Result<Vec<_>>>()?;
+            let resident = budgets.iter().try_fold(0usize, |sum, budget| sum.checked_add(budget.resident_bytes).context("local resident overflow"))?;
+            resident.checked_add(workspace.checked_mul(2).context("local workspace overflow")?)
+                .and_then(|bytes| bytes.checked_add(budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)))
+                .context("local loading peak overflow")?
+        }
+    } else { 0 };
+    let pool_free = free.checked_sub(fixed_local_peak).context("exact local expert placement leaves no pool memory")?;
+    args.kv_pool_size = memory::planned_pool_size(&args, &[(pool_free, total)])?;
     let pool = memory::PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
         args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
     tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
@@ -604,10 +625,6 @@ fn worker(
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
-    if compact {
-        ensure!(occupied.checked_add(memory::RUNTIME_HEADROOM).is_some_and(|n| n <= pool.reservation_bytes),
-            "compact residency {occupied} bytes plus runtime headroom exceeds {} byte device ceiling", pool.reservation_bytes);
-    }
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
     if small_card { memory::startup_phase(&lib, "v41/local-experts", device_total)?; }
     crate::shared::memory_report::release_load_staging(&lib);

@@ -26,16 +26,31 @@ pub(crate) fn expert_layers_with_minimum(requested: super::LocalLayers, prefix_p
     ensure!((1..=40).contains(&automatic_minimum),"invalid automatic expert minimum");
     ensure!(prefix_peak.len() == 40 && prefix_peak.windows(2).all(|w|
         w[0].iter().zip(w[1]).all(|(&a, b)| a <= b)), "invalid TP2 prefix budgets");
-    let fits = |count: usize| prefix_peak[count-1].iter().zip(available).all(|(&used, free)| used <= free);
-    let layers = match requested {
+    use cuteafd_loader::placement::*;
+    let onboard = match requested {
         super::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
-            count
+            Onboard::Layers(count)
         }
-        super::LocalLayers::Auto => (automatic_minimum..=40).rev().find(|&count| fits(count))
-            .ok_or_else(|| anyhow::anyhow!("minimum TP2 expert placement does not fit reserved memory"))?,
+        super::LocalLayers::Auto => Onboard::Auto,
     };
-    ensure!(fits(layers), "requested TP2 expert layers exceed the per-GPU memory budget");
+    // Prefix peaks already include shared workspace and loading staging. Their
+    // monotone increments preserve that exact bound without charging it twice.
+    let experts = prefix_peak.iter().enumerate().map(|(layer, peak)| ExpertCost {
+        whole: Bytes2::default(),
+        half: std::array::from_fn(|gpu| Bytes2 { resident: (peak[gpu]
+            - if layer == 0 { 0 } else { prefix_peak[layer - 1][gpu] }) as u64, staging: 0 }),
+        tp2: true, spark_ok: true,
+    }).collect();
+    let inventory = Inventory { gpus: available.into_iter().map(|free| GpuBudget {
+        capacity_bytes: free as u64, headroom_bytes: 0,
+        baseline: Baseline::Measured { free_bytes: free as u64 },
+    }).collect(), spark_ranks: 4, peer_access: true };
+    let pool = PoolPolicy { requested: Some(512), target: 512, floor: 512, ceiling: 512, unit_rows: 512 };
+    let layers = solve(&families::deepseek_v41::request(inventory, pool,
+        vec![0, 0], experts, 0, onboard))?.onboard_layers;
+    ensure!(!matches!(requested, super::LocalLayers::Auto) || layers >= automatic_minimum,
+        "minimum TP2 expert placement does not fit reserved memory");
     Ok(layers)
 }
 

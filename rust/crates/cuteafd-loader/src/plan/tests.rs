@@ -90,6 +90,18 @@ fn v41_config() -> Value {
     })
 }
 
+fn full_v41_config() -> Value {
+    let mut cfg = v41_config();
+    cfg["text_config"]["max_position_embeddings"] = json!(1_048_576);
+    cfg["text_config"]["num_hidden_layers"] = json!(40);
+    cfg["text_config"]["head_dim"] = json!(512);
+    cfg["text_config"]["qk_rope_head_dim"] = json!(64);
+    cfg["text_config"]["sliding_window"] = json!(128);
+    cfg["text_config"]["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
+    cfg["text_config"]["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
+    cfg
+}
+
 #[test]
 fn deepseek_v41_components_formats_and_placement() {
     let dir = snapshot(
@@ -122,7 +134,8 @@ fn deepseek_v41_components_formats_and_placement() {
     assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
     assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6]);
-    assert!(report.executable(), "{}", render(&report));
+    assert!(!report.executable());
+    assert!(report.hints.iter().any(|h| h.what.contains("cache geometry admission")));
 }
 
 #[test]
@@ -147,7 +160,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                 ]);
             }
         }
-        let dir = snapshot(v41_config(), &tensors);
+        let dir = snapshot(full_v41_config(), &tensors);
         for (ranks, gpus) in [(3, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
@@ -165,15 +178,16 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
             for device in &memory.devices {
                 match device.kind {
                     DeviceKind::Spark => {
-                        assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64));
+                        assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64) * 39);
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         assert_eq!(rings.bytes, layout::v41_spark_ring_allowance(
                             "deepseek_v41", options.layout.as_ref().unwrap().spark_capacity_rows, 0, nvfp4,
                         ));
                     }
                     DeviceKind::Rtx => {
-                        let local = device.items.iter().find(|item| item.group == "resident routed layers").unwrap();
-                        assert_eq!(local.bytes, packed(gpus as u64));
+                        let local = device.items.iter().find(|item| item.group.starts_with("resident routed")
+                            || item.group.starts_with("TP2 expert layer halves")).unwrap();
+                        assert_eq!(local.bytes, packed(gpus as u64) + 288 * 1024 * 1024);
                     }
                     _ => {}
                 }
@@ -272,14 +286,14 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                     || i.group == "context+modules")
                 .map(|i| i.bytes).sum::<u64>() })).collect();
         let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-            headroom_bytes: options.headroom_bytes, spark_ranks: 4, skip_routed_experts: false,
+            headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, skip_routed_experts: false,
             prefill_rows: 4096,
             prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
             drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
             full_prefill_logits: false, context: None };
         let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
-        assert_eq!(working.spark.spark_ranks, 4);
+        assert_eq!(working.spark.spark_ranks, report.spark_ranks);
         assert_eq!(working.spark.prefill_lanes, 3);
         assert_eq!(memory.pool_tokens, runtime.pool_tokens);
         for (rank, items) in runtime.items.iter().enumerate() {
@@ -1095,10 +1109,10 @@ fn observed_zero_ranks_panics() {
 fn spark_rank_options_follow_transport_and_packages() {
     let flash = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
     let qwen = qwen_snapshot(4);
-    let dsv41 = snapshot(v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+    let dsv41 = snapshot(full_v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
         t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
     for ranks in 0..=9 {
-        let options = sparks(ranks);
+        let options = PlanOptions { layout: None, ..sparks(ranks) };
         if ranks > 8 {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
@@ -2178,47 +2192,133 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
 }
 
 #[test]
-fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
-    use cuteafd_core::memory_layout::Category;
+fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
     let dir = qwen_snapshot(4);
-    let ample = PlanOptions {
+    let options = PlanOptions {
         layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
-        ..sparks(4)
+        ..sparks(6)
     };
-    assert_eq!(plan_preferred(dir.path(), &PlanOptions::default()).unwrap().placement, ExpertPlacement::Local);
-    let preferred = plan_preferred(dir.path(), &ample).unwrap();
-    assert_eq!(preferred.placement, ExpertPlacement::Local, "{}", render(&preferred));
-    let memory = preferred.memory_layout.as_ref().unwrap();
-    assert!(memory.devices[0].by_category()[&Category::Experts] >
-        component(&preferred, Component::RoutedExpert).bytes);
-    assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0));
-    let explicit_local = plan(dir.path(), &PlanOptions {
-        placement: ExpertPlacement::Local, ..ample.clone()
-    }).unwrap();
-    assert_eq!(memory.devices[0].by_category(),
-        explicit_local.memory_layout.as_ref().unwrap().devices[0].by_category());
-    let unused_peer = PlanOptions {
-        layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![96 << 30, 1 << 30], pool_tokens: Some(32768), ..Default::default()
-        }),
-        ..ample.clone()
-    };
-    assert_eq!(plan_preferred(dir.path(), &unused_peer).unwrap().placement, ExpertPlacement::Local);
-    // Explicit --spark-ranks keeps the requested topology, even when local fits.
-    assert_eq!(plan(dir.path(), &ample).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
-    let tight = PlanOptions {
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![12 << 30], ..Default::default() }),
-        ..ample.clone()
-    };
-    assert_eq!(plan_preferred(dir.path(), &tight).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
-    // Weight-only fit is insufficient when a pinned KV pool overruns the GPU.
-    let oversized_pool = PlanOptions {
-        layout: Some(layout::LayoutOptions { pool_tokens: Some(1 << 40), ..Default::default() }),
-        ..ample
-    };
-    assert_eq!(plan_preferred(dir.path(), &oversized_pool).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
-    let unsupported = qwen_snapshot(3);
-    assert_eq!(plan_preferred(unsupported.path(), &sparks(4)).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+    let all = plan_spark_count(dir.path(), &options, 4, None).unwrap();
+    assert_eq!(all.spark_ranks, 4, "{}", render(&all));
+    assert!(all.spark_count_warning.is_none());
+    let fallback = plan_spark_count(dir.path(), &options, 5, None).unwrap();
+    assert_eq!(fallback.spark_ranks, 4, "{}", render(&fallback));
+    let warning = fallback.spark_count_warning.unwrap();
+    assert!(warning.contains("5") && warning.contains("using 4 Sparks"), "{warning}");
+    let refused = plan_spark_count(dir.path(), &options, 6, Some(5)).unwrap();
+    assert_eq!(refused.spark_ranks, 5);
+    assert!(!refused.executable());
+    assert!(refused.spark_count_warning.is_none());
+    assert!(refused.hints.last().unwrap().what.contains("counts that work:"));
+}
+
+#[test]
+fn v41_32gib_counts_share_pool_and_local_layer_admission() {
+    let cfg = full_v41_config();
+    let dir = snapshot(cfg, &[
+        t("embed.weight", "BF16", &[128, 5120]),
+        t("head.weight", "BF16", &[128, 5120]),
+        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+    ]);
+    for ranks in [2, 3, 4, 6] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+            ..Default::default()
+        }), ..sparks(ranks) };
+        let report = plan_spark_count(dir.path(), &options, 6, Some(ranks)).unwrap();
+        assert_eq!(report.spark_ranks, ranks);
+        if ranks == 2 {
+            assert!(!report.executable(), "two native shards exceed Spark memory");
+            assert!(report.hints.last().unwrap().what.contains("spark0 full memory layout"));
+            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 6]"));
+        } else {
+            assert!(report.executable(), "{}", render(&report));
+            assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
+        }
+        let too_large = PlanOptions { layout: Some(layout::LayoutOptions {
+            pool_tokens: Some(1 << 40), ..options.layout.unwrap()
+        }), ..sparks(ranks) };
+        let refused = plan_spark_count(dir.path(), &too_large, 6, Some(ranks)).unwrap();
+        assert!(!refused.executable());
+        assert!(refused.hints.last().unwrap().what.contains("refused:"));
+    }
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+        ..Default::default()
+    }), ..sparks(6) };
+    let all = plan_spark_count(dir.path(), &options, 6, None).unwrap();
+    assert!(all.executable(), "{}", render(&all));
+    assert_eq!(all.spark_ranks, 6);
+    assert!(all.spark_count_warning.is_none());
+    let fixed = PlanOptions { layout: Some(layout::LayoutOptions {
+        onboard: Some(crate::placement::Onboard::Layers(1)),
+        ..options.layout.as_ref().unwrap().clone()
+    }), ..options.clone() };
+    let local = plan_spark_count(dir.path(), &fixed, 6, Some(4)).unwrap();
+    assert!(local.executable(), "{}", render(&local));
+    assert!(local.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|note| note == "1 routed backbone layers resident on RTX"));
+    let default_prefill = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_rows: 0, ..options.layout.as_ref().unwrap().clone()
+    }), ..options.clone() };
+    let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_rows: 2048, ..default_prefill.layout.as_ref().unwrap().clone()
+    }), ..options.clone() };
+    assert_eq!(plan(dir.path(), &default_prefill).unwrap().memory_layout,
+        plan(dir.path(), &explicit_prefill).unwrap().memory_layout);
+    let unavailable = plan_spark_count(dir.path(), &options, 4, Some(6)).unwrap();
+    assert!(!unavailable.executable());
+    assert_eq!(unavailable.spark_ranks, 6);
+    assert!(unavailable.hints.last().unwrap().what.contains("only 4 are available"));
+}
+
+#[test]
+fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
+    let dir = snapshot(full_v41_config(), &[
+        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+    ]);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(0), context_tokens: 1 << 20,
+        // Fixed backbone/draft owners, independent of the prefill shape.
+        drafter_bytes: 16 << 30, prefill_rows: 0,
+        ..Default::default()
+    }), ..sparks(4) };
+    let automatic = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(automatic.executable(), "{}", render(&automatic));
+    assert_eq!(automatic.prefill_rows, Some(1024));
+    assert!(automatic.prefill_selection.as_ref().unwrap().contains("selected 1024"));
+    assert!(automatic.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
+    let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_rows: 2048, ..options.layout.unwrap()
+    }), ..sparks(4) };
+    let refused = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
+    assert!(!refused.executable());
+    assert_eq!(refused.prefill_rows, Some(2048));
+    assert!(refused.prefill_selection.is_none());
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("V4.1 shared admission")));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
+}
+
+#[test]
+fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
+    let mut config = full_v41_config();
+    config["quantization_config"] = exl3_compact(3);
+    let tensors = exl3("model.layers.0.mlp.experts.0.gate_proj", 2304, 5120, 3);
+    let dir = snapshot(config, &tensors);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+        ..Default::default()
+    }), ..sparks(6) };
+    let refused = plan_spark_count(dir.path(), &options, 6, Some(6)).unwrap();
+    assert!(!refused.executable(), "{}", render(&refused));
+    assert_eq!(refused.spark_ranks, 6);
+    assert!(refused.hints.last().unwrap().what.contains("counts that work:"));
+    let fallback = plan_spark_count(dir.path(), &options, 6, None).unwrap();
+    assert!(fallback.executable(), "{}", render(&fallback));
+    assert_eq!(fallback.spark_ranks, 4);
+    assert!(fallback.spark_count_warning.as_ref().unwrap().contains("using 4 Sparks"));
 }
 
 #[test]
@@ -2438,7 +2538,7 @@ fn explicit_encoder_failure_and_small_pool_admission() {
     }), ..Default::default() };
     let local = plan(dir.path(), &options).unwrap();
     assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
-    for vision in [MediaMode::Rtx(Some(5)), MediaMode::Spark(Some(5))] {
+    for vision in [MediaMode::Rtx(Some(8)), MediaMode::Spark(Some(8))] {
         let invalid = plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
         assert!(!invalid.placement_supported);
         assert!(!invalid.executable());
@@ -2581,7 +2681,7 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
 
 
 #[test]
-fn attention_placement_heads_preserves_default_layout_and_modes_refuse_at_plan_time() {
+fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_plan_time() {
     use crate::placement::AttentionPlacement;
     let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[]),
         snapshot(glm5_config(), &[]), snapshot(glm5_flash_config(45), &[]),
@@ -2592,12 +2692,15 @@ fn attention_placement_heads_preserves_default_layout_and_modes_refuse_at_plan_t
                 rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus], ..Default::default()
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
-            let heads = plan(dir.path(), &PlanOptions { attention_placement: Some(AttentionPlacement::Heads), ..options.clone() }).unwrap();
-            assert_eq!(auto.memory_layout, heads.memory_layout);
-            assert_eq!(auto.config_error, heads.config_error);
-            for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+            let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
+            let explicit_default = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(if gpus == 1 { AttentionPlacement::Heads } else { executor.attention }),
+                ..options.clone()
+            }).unwrap();
+            assert_eq!(auto.memory_layout, explicit_default.memory_layout);
+            assert_eq!(auto.config_error, explicit_default.config_error);
+            for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
                 let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
-                let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
                 if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
                     assert!(unsupported.config_error.is_none());
                 } else {
