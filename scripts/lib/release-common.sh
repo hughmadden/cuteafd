@@ -507,18 +507,15 @@ for value in values:
 PYSTATE
 }
 
-# PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
-# every family, on the coordinator and on every Spark worker:
-#   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
-#   transport-timing  CUTEAFD_PROTOCOL_V2_TCP_TIMING=1 (expert exchange timing)
-#   expert-timing     CUTEAFD_EXPERT_TIMING=1 (Spark worker expert compute timing)
-# Every profiled container also gets CUTEAFD_PROFILE_HOST (the physical host,
-# never the container id, which is what the hostname is inside Docker).
-# PROFILE_DIR=/abs/dir is created on each host (the caller's job), mounted at the
-# same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host and rank.
-# Sets RELEASE_PROFILE_ARGS (docker arguments) in the caller's shell, so a bad
-# value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
-release_profile_switches='census transport-timing expert-timing'
+# PROFILE / PROFILE_DIR / PROFILE_NCU_*: the switches are documented once, at
+# the PROFILE comment in scripts/launch/run-family.sh.
+# release_profile_docker_args sets RELEASE_PROFILE_ARGS (docker environment and
+# mount arguments, for the coordinator and every Spark worker) in the caller's
+# shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
+release_profile_switches='census transport-timing expert-timing draft-timing nsys ncu'
+# nsys sessions are per container; the window is opened and closed with
+# `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
+RELEASE_NSYS_SESSION=cuteafd-profile
 release_profile_docker_args() {
   local profile="$1" dir="$2" host="$3" switch
   local -a switches=()
@@ -535,15 +532,63 @@ release_profile_docker_args() {
       census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug') ;;
       transport-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_PROTOCOL_V2_TCP_TIMING=1) ;;
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
+      draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
+      # Process wrappers (release_profile_wrapper), coordinator only.
+      nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;
       *) release_die "unknown PROFILE switch $switch (known: ${release_profile_switches// /, })" ;;
     esac
   done
+  [[ ",$profile," != *,nsys,* || ",$profile," != *,ncu,* ]] || release_die "PROFILE takes nsys or ncu, not both"
   [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
   RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_PROFILE_HOST=$host")
   if [[ -n "$dir" ]]; then
     [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_DIR must be an absolute directory"
     RELEASE_PROFILE_ARGS+=(-v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
   fi
+}
+
+# Sets RELEASE_PROFILE_WRAPPER: the argv that goes between the image and the
+# served command (`docker run ... IMAGE "${RELEASE_PROFILE_WRAPPER[@]}" cuteafd
+# ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
+# image: the profiler is PID 1, and `docker stop` sends it SIGINT and waits up to
+# 300 s for the report; the cuteafd.graceful-stop label makes smoke teardown and
+# release_stop_local_container use that stop before removing), both empty unless
+# PROFILE names nsys or ncu. Coordinator only: a Spark
+# worker asked to wrap fails closed (Spark workers still get the environment
+# switches from release_profile_docker_args). Call after that helper, which has
+# validated PROFILE and PROFILE_DIR.
+# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET.
+release_profile_wrapper() {
+  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}"
+  RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
+  local wrapped=
+  [[ ",$profile," == *,nsys,* ]] && wrapped=nsys
+  [[ ",$profile," == *,ncu,* ]] && wrapped=ncu
+  if [[ -z "$wrapped" ]]; then
+    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+    return 0
+  fi
+  [[ "$role" == coordinator ]] ||
+    release_die "PROFILE=$wrapped wraps the coordinator only; a Spark worker cannot run it (role $role)"
+  [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE=$wrapped needs an absolute PROFILE_DIR"
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=(--stop-signal SIGINT --stop-timeout 300 --label cuteafd.graceful-stop=1)
+  if [[ "$wrapped" == nsys ]]; then
+    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+    # Collection starts paused (nsys start/stop through docker exec open and
+    # close the window); stopping the session or the container writes the report.
+    RELEASE_PROFILE_WRAPPER=(/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node
+      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
+      "--output=$dir/nsys-$host" --force-overwrite=true)
+    return 0
+  fi
+  [[ -n "$kernel" ]] || release_die "PROFILE=ncu needs PROFILE_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
+  [[ "$kernel" != *[[:space:]]* ]] || release_die "PROFILE_NCU_KERNEL must not contain whitespace"
+  count="${count:-20}" set="${set:-full}"
+  [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "PROFILE_NCU_COUNT must be 1..9999"
+  [[ "$set" =~ ^[a-z_]+$ ]] || release_die "PROFILE_NCU_SET must be an ncu section set name (e.g. full, basic)"
+  RELEASE_PROFILE_WRAPPER=(/usr/local/bin/ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set"
+    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite)
 }
 
 # Shared key grammar for release lifecycle scripts and the family launcher.
@@ -567,7 +612,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
-    PROFILE|PROFILE_DIR) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -793,6 +838,9 @@ release_load_config() {
   SPARK_EP=
   PROFILE=
   PROFILE_DIR=
+  PROFILE_NCU_KERNEL=
+  PROFILE_NCU_COUNT=
+  PROFILE_NCU_SET=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
@@ -1345,7 +1393,12 @@ release_stop_local_container() {
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]]; then
     echo "  coordinator: stopping $container"
-    docker stop -t 30 "$container" >/dev/null
+    # A profiled coordinator (release_profile_wrapper) keeps its own stop timeout.
+    if [[ "$(docker inspect -f '{{index .Config.Labels "cuteafd.graceful-stop"}}' "$container")" == 1 ]]; then
+      docker stop "$container" >/dev/null
+    else
+      docker stop -t 30 "$container" >/dev/null
+    fi
   else
     echo "  coordinator: removing stopped $container"
   fi

@@ -665,6 +665,11 @@ if [[ -n "${PROFILE:-}${PROFILE_DIR:-}" ]]; then
   release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$(hostname -s)"; profile_args=("${RELEASE_PROFILE_ARGS[@]}")
   [[ -z "${PROFILE_DIR:-}" ]] || { mkdir -p "$PROFILE_DIR"; release_require_writable_state "$PROFILE_DIR"; }
 fi
+# PROFILE=nsys|ncu wrap the coordinator (see the PROFILE comment in run-family.sh).
+release_profile_wrapper "${PROFILE:-}" "${PROFILE_DIR:-}" "$(hostname -s)" coordinator \
+  "${PROFILE_NCU_KERNEL:-}" "${PROFILE_NCU_COUNT:-}" "${PROFILE_NCU_SET:-}"
+profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
+profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || release_die 'Graph census requires a WIP build'
@@ -786,7 +791,8 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no --
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" \
-  -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
+  ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
+  -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 if [[ -n "$placement_directory" ]]; then

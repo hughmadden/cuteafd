@@ -884,6 +884,46 @@ def test_profile_collection_pulls_each_spark_and_records_failures(entry, tmp_pat
     assert 'expert-timing-dodo-rank0.jsonl' in result['files']
 
 
+def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
+    with pytest.raises(ValueError, match='PROFILE=nsys captures the timed sweep'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                         {'PROFILE': 'nsys,draft-timing'}, set(), None, 1)
+    window = job['entry']['window']
+    coordinator = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
+    assert window['open']['argv'] == ['docker', 'exec', coordinator, '/usr/local/cuda/bin/nsys', 'start', '--session=cuteafd-profile']
+    assert window['close']['argv'][-2:] == ['stop', '--session=cuteafd-profile']
+    assert window['open']['required'] and window['close']['required']
+    matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())
+    assert matrix['entries'][0]['window'] == window
+    # Other switches add no window.
+    plain = cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
+                           {'PROFILE': 'expert-timing'}, set(), None, 1)
+    assert 'window' not in plain['entry']
+
+
+def test_session_name_matches_the_launcher():
+    text = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    assert f'RELEASE_NSYS_SESSION={cards.NSYS_SESSION}\n' in text
+
+
+def test_profiler_reports_are_summarized_by_name_and_size(entry, tmp_path, monkeypatch):
+    entry = {**entry, 'sparks': [], 'set': {**entry['set'], 'SPARK_COUNT': '0'}, 'levels': [1], 'profile': 'panels:'}
+    job = cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
+    profile = Path(job['entry']['set']['PROFILE_DIR'])
+    sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
+    sweep.parent.mkdir(parents=True)
+    sweep.write_text(json.dumps({'points': [{'c': 1, 'phase': 'levels', 'aggregate_tok_s': 50.0}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and 'produced no .nsys-rep report' in row['error']
+    (profile / 'nsys-raptor.nsys-rep').write_bytes(b'x' * 3 * 2**20)
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass', row
+    assert row['profile']['reports'] == [{'name': 'nsys-raptor.nsys-rep', 'bytes': 3 * 2**20}]
+    cards.write_summary(tmp_path, [row], {'a': {}})
+    assert 'nsys-raptor.nsys-rep (3.0 MiB)' in (tmp_path / 'summary.md').read_text()
+
+
 def test_sweep_rows_and_sweep_only_jobs(entry, tmp_path):
     entry = {**entry, 'profile': 'panels:', 'levels': [1, 16], 'post_load_c1': True}
     job = make(entry, tmp_path)
