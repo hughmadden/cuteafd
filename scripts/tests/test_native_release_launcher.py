@@ -38,6 +38,41 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 finally:
                     path.chmod(original)
 
+    def test_trace_admission_checks_target_not_unrelated_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sibling = root / 'unrelated'
+            sibling.mkdir()
+            sibling.chmod(0o500)
+            trace = root / 'trace.jsonl'
+            command = ['bash', '-c',
+                'source scripts/lib/release-common.sh; release_require_writable_state --file "$1"',
+                'test', str(trace)]
+            try:
+                for existing in [False, True]:
+                    if existing:
+                        trace.write_text('{}\n')
+                        trace.chmod(0o600)
+                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                trace.chmod(0o400)
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(trace), result.stderr)
+                self.assertEqual(trace.stat().st_mode & 0o777, 0o400)
+                trace.chmod(0o600)
+                root.chmod(0o500)
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(root), result.stderr)
+            finally:
+                root.chmod(0o700)
+                sibling.chmod(0o700)
+        for launcher, target in [('run.sh', '$SPECULATION_TRACE'),
+                                 ('scripts/launch/run-family.sh', '$trace')]:
+            self.assertIn(f'release_require_writable_state --file "{target}"',
+                          (ROOT / launcher).read_text())
+
     def test_v41_placement_uses_writable_serving_home(self) -> None:
         source = (ROOT / 'run.sh').read_text()
         self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
@@ -48,7 +83,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
             result = subprocess.run(['bash', '-c', '''
 set -euo pipefail
 source scripts/lib/release-common.sh
-id() { case "$1" in -u) printf '%s' "$TEST_UID" ;; -g) printf '%s' "$TEST_GID" ;; -un) printf '%s' "$TEST_USER" ;; esac; }
+id() { case "$1" in -u) printf '%s' "$TEST_UID" ;; -g) printf '%s' "$TEST_GID" ;; -G) printf '%s 44 107' "$TEST_GID" ;; -un) printf '%s' "$TEST_USER" ;; esac; }
 export -f id
 export -f release_serving_docker_args
 bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}"'
@@ -57,7 +92,9 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
             self.assertEqual(result.returncode, 0, result.stderr)
             args = result.stdout.decode().rstrip('\0').split('\0')
             self.assertEqual(args[:2], ['--user', f'{uid}:{gid}'])
-            env = dict(arg.split('=', 1) for arg in args[3::2])
+            pairs = list(zip(args[2::2], args[3::2]))
+            self.assertEqual([value for flag, value in pairs if flag == '--group-add'], ['44', '107'])
+            env = dict(value.split('=', 1) for flag, value in pairs if flag == '-e')
             self.assertEqual(env['USER'], user)
             self.assertEqual(env['LOGNAME'], user)
             self.assertEqual(env['HF_HOME'], '/hf')

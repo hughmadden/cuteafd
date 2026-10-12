@@ -460,8 +460,11 @@ release_trim() {
 # can differ. Keep caches writable and checkpoint mounts outside root's home.
 # Self-contained so remote launchers can send this function to the worker host.
 release_serving_docker_args() {
-  local user
+  local user group primary_group
+  local -a groups=()
   user="$(id -un)"
+  primary_group="$(id -g)"
+  read -ra groups <<<"$(id -G)"
   RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
     -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
     -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
@@ -469,20 +472,28 @@ release_serving_docker_args() {
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+  # Docker's numeric --user otherwise drops groups used by host access checks.
+  for group in "${groups[@]}"; do
+    [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
+  done
 }
 
 # Fail before serving when legacy root-owned outputs cannot be updated. Check
-# the directory itself and existing descendants without changing modes/owners.
-# This is also shipped to remote worker shells, so it has no repo dependencies.
+# directory descendants, or only a --file target and its parent (not siblings),
+# without changing modes/owners. Shipped to worker shells; no repo dependencies.
 release_require_writable_state() {
   python3 - "$@" <<'PYSTATE'
 import os
 from pathlib import Path
 import sys
-for value in sys.argv[1:]:
+values = sys.argv[1:]
+file_only = bool(values and values[0] == '--file')
+if file_only:
+    values = values[1:]
+for value in values:
     root = Path(value)
-    paths = [root]
-    if root.is_dir():
+    paths = [root, root.parent] if file_only else [root]
+    if root.is_dir() and not file_only:
         def denied(error):
             raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {error.filename}; migrate legacy ownership before launching')
         for directory, dirs, files in os.walk(root, onerror=denied):

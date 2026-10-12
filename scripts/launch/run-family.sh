@@ -558,7 +558,7 @@ done
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
   mkdir -p "$(dirname "$trace")"
-  release_require_writable_state "$(dirname "$trace")"
+  release_require_writable_state --file "$trace"
   trace_args+=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
 fi

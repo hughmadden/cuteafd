@@ -656,7 +656,7 @@ trace_args=()
 if [[ -n "${SPECULATION_TRACE:-}" ]]; then
   [[ "$SPECULATION_TRACE" == /* ]] || release_die 'SPECULATION_TRACE must be an absolute path'
   mkdir -p "$(dirname "$SPECULATION_TRACE")"
-  release_require_writable_state "$(dirname "$SPECULATION_TRACE")"
+  release_require_writable_state --file "$SPECULATION_TRACE"
   trace_args+=(-v "$(dirname "$SPECULATION_TRACE"):$(dirname "$SPECULATION_TRACE")"
     -e "CUTEAFD_SPECULATION_TRACE=$SPECULATION_TRACE")
 fi
