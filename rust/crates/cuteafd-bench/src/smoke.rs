@@ -777,6 +777,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
     };
     let mut observer = None;
+    let mut launcher_started = false;
     let mut hook_results = BTreeMap::new();
     let result = (|| -> Result<Report> {
         let config_path = write_config(entry, repo, configs, parallel)?;
@@ -806,6 +807,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             }
         }
         let mut child = command.spawn().context("starting ./run.sh")?;
+        launcher_started = true;
         let timeout = Duration::from_secs(entry.timeout_s.unwrap_or(900));
         // run.sh waits for readiness itself; poll /health too in case it returns early.
         loop {
@@ -903,11 +905,13 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         Err(error) => {
             outcome.error = Some(format!("{error:#}"));
             let _ = writeln!(log, "error: {error:#}");
-            // The coordinator's last lines explain most failures.
-            let tail = Command::new("docker").args(["logs", "--tail", "40", &coordinator_name(entry, parallel)]).output();
-            if let Ok(tail) = tail {
-                let _ = log.write_all(&tail.stdout);
-                let _ = log.write_all(&tail.stderr);
+            // Only collect serving diagnostics after this entry launched containers.
+            if launcher_started {
+                let tail = Command::new("docker").args(["logs", "--tail", "40", &coordinator_name(entry, parallel)]).output();
+                if let Ok(tail) = tail {
+                    let _ = log.write_all(&tail.stdout);
+                    let _ = log.write_all(&tail.stderr);
+                }
             }
         }
     }
@@ -916,8 +920,11 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             "error": outcome.error, "smoke_hooks": outcome.hooks});
         let _ = std::fs::write(log_path.with_extension("report.json"), serde_json::to_vec_pretty(&failure).unwrap_or_default());
     }
-    if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
-        teardown(entry, &config, &mut log);
+    // A rejected prelaunch hook never owns any serving containers.
+    if launcher_started {
+        if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
+            teardown(entry, &config, &mut log);
+        }
     }
     outcome.total_s = Some(started.elapsed().as_secs_f64());
     outcome.finished = crate::report::now_rfc3339();
@@ -976,6 +983,27 @@ mod tests {
         let override_hook = Hook { argv: vec!["false".into()], ..merged.prelaunch.clone().unwrap() };
         let override_entry = Entry { prelaunch: Some(override_hook.clone()), ..original };
         assert_eq!(override_entry.merged(&defaults).prelaunch, Some(override_hook));
+    }
+
+    #[test]
+    fn failed_prelaunch_hook_never_starts_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let configs = root.path().join("configs");
+        let logs = root.path().join("logs");
+        std::fs::create_dir_all(&configs).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let config = root.path().join("base.config");
+        std::fs::write(&config, "SPARK_COUNT=0\nINSTANCE=smoke-prelaunch-negative-test\n").unwrap();
+        let e = Entry { name: "cold".into(), config: Some(config.display().to_string()),
+            prelaunch: Some(Hook { argv: vec!["false".into()], timeout_s: 2, required: true,
+                cleanup: None, finish_timeout_s: None }), ..Entry::default() };
+        // No run.sh exists: the hook failure must precede any spawn attempt.
+        let outcome = run_entry(&e, root.path(), root.path(), &configs, &logs, "smoke", "test", false);
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome.error.unwrap().contains("prelaunch hook failed before launcher"));
+        assert!(outcome.launch_s.is_none());
+        assert!(outcome.hooks.unwrap()["prelaunch"].contains("exited"));
+        assert!(!std::fs::read_to_string(logs.join("cold.log")).unwrap().contains("teardown"));
     }
 
     #[test]
