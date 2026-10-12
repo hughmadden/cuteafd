@@ -83,6 +83,13 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
+- Target head on tensor cores: `GLM5_FLASH_TARGET_HEAD=tensor`
+  (`--target-head tensor`, opt-in; needs the BF16 head, `GLM5_FLASH_FP8_HEAD=off`)
+  keeps steps of up to 8 rows (one sequence's token and up to seven drafts) on
+  the pedantic FP32 cuBLAS GEMM and runs wider ones (verify steps of two or
+  more sequences, prefill-path scoring, `--nll`) as a BF16 tensor-core GEMM
+  with FP32 accumulation, one read of the head. It changes the target's
+  numerics past 8 rows, so it is KL-gated against `exact`, the default.
 - 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
