@@ -899,6 +899,8 @@ build_coordinator() {
     fi
     ((rust_status != 0 && attempt == 1)) || break
     echo "WIP coordinator Rust phase exited $rust_status; retrying once" >&2
+    # The retry appends to the phase table, so the first attempt's time stays recorded.
+    coordinator_build=("${coordinator_build[@]:0:2}" -e CUTEAFD_WIP_PHASE_APPEND=1 "${coordinator_build[@]:2}")
   done
   ((rust_status == 0)) || release_die "coordinator WIP Rust phase failed (exit $rust_status)"
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import

@@ -168,7 +168,8 @@ wip_phase_mark() {
   printf '%s\t%s\t%s\t%s\n' "$role" "$1" "$2" "${3:-}" >>"$wip_phase_log"
   printf 'WIP phase %s %s: %ss%s\n' "$role" "$1" "$2" "${3:+ ($3)}"
 }
-[[ "$phase" == native ]] || : >"$wip_phase_log"
+# A fresh build starts the table; the native phase and a retried Rust phase append.
+[[ "$phase" == native || "${CUTEAFD_WIP_PHASE_APPEND:-0}" == 1 ]] || : >"$wip_phase_log"
 
 # Native outputs (library, AOT exports, packages, manifests) are a pure function
 # of their inputs: native/, python/, the build helpers, the pinned submodule
