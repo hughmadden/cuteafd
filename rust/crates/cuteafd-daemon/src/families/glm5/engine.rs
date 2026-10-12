@@ -301,6 +301,7 @@ pub(crate) struct GlmEngine<'a> {
     /// Host seconds inside the exchanges: building and posting requests,
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
+    draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
@@ -383,8 +384,32 @@ impl<'a> GlmEngine<'a> {
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
             lanes: RefCell::new(Vec::new()), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
-            exchange_host: RefCell::new([0.0; 4]),
+            exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
+    }
+
+    /// Arm after graph warmup; only explicit verify rounds record signals.
+    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
+        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
+        *self.draft_probe.borrow_mut() = Some(crate::shared::draft::probe::RoundProbe::new(
+            self.library, dense, self.cfg.topk, DECODE_ROWS)?);
+        Ok(())
+    }
+
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+
+    pub(crate) fn probe_end(&self) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
+    }
+
+    /// Read only after the verifier's normal stream synchronization.
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let (routes, times) = probe.as_mut()?.finish()?;
+        Some(observe(routes, &times))
     }
 
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
@@ -960,6 +985,10 @@ impl<'a> GlmEngine<'a> {
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }
+            if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+                // SAFETY: the engine stream owns this round and its layer events.
+                unsafe { probe.mark(index, self.stream) };
+            }
             crate::shared::console::layer_mark(index);
         }
         if layers.len() < self.cfg.layers {
@@ -1207,6 +1236,10 @@ impl<'a> GlmEngine<'a> {
                         runtime)?)
                 }
             };
+            if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+                // SAFETY: the engine stream owns this round and its layer events.
+                unsafe { probe.mark(index, self.stream) };
+            }
             crate::shared::console::layer_mark(index);
         }
         Ok(())
@@ -1441,6 +1474,9 @@ impl<'a> GlmEngine<'a> {
         let timer = std::time::Instant::now();
         let request = {
             let staging = w.router_host.borrow();
+            if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+                probe.staged(index, &staging.bytes()[..t * self.cfg.topk * 4]);
+            }
             expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16)?
         };
         self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
@@ -1462,6 +1498,10 @@ impl<'a> GlmEngine<'a> {
         let bf16 = self.spark_bf16;
         let staged_bytes = t * topk * 8 + t * (if bf16 { h * 2 } else { h + h / 32 });
         let staged = w.router_host.borrow().buffer;
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            let bytes = w.router_host.borrow();
+            probe.staged(index, &bytes.bytes()[..t * self.cfg.topk * 4]);
+        }
         ensure!(staged_bytes <= staged.bytes, "lane wave exceeds its staging");
         // The address crosses to the lane thread as an integer; see the SAFETY note below.
         let staged = staged.ptr as usize;
