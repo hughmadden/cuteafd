@@ -125,6 +125,32 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 expected = b'before\0after\0' if not seed else b'before\0-e\0CUTEAFD_BENCH_NONCE_SEED=pair-123\0after\0'
                 self.assertEqual(result.stdout, expected)
 
+    def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
+        source = (ROOT / 'run.sh').read_text()
+        block = 'trace_args=()\n' + source.split('trace_args=()\n', 1)[1].split('\ngraph_census_args=()', 1)[0]
+        coordinator = source.split('start_coordinator() {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('"${trace_args[@]}"', coordinator)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'trace with spaces' / 'rounds.jsonl')
+            for value, valid in [(None, True), ('', True), (path, True), ('relative.jsonl', False)]:
+                with self.subTest(value=value):
+                    environment = dict(os.environ)
+                    environment.pop('SPECULATION_TRACE', None)
+                    if value is not None:
+                        environment['SPECULATION_TRACE'] = value
+                    harness = 'set -euo pipefail\nrelease_die() { exit 2; }\n'
+                    result = subprocess.run(['bash', '-c', harness + block +
+                        '\nprintf "%s\\0" before "${trace_args[@]}" after'], env=environment, capture_output=True)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    if valid:
+                        expected = ['before']
+                        if value:
+                            parent = str(Path(value).parent)
+                            self.assertTrue(Path(parent).is_dir())
+                            expected += ['-v', f'{parent}:{parent}', '-e', f'CUTEAFD_SPECULATION_TRACE={value}']
+                        expected += ['after']
+                        self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
+
     def test_graph_census_is_wip_only_and_default_argv_is_identical(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             control = Path(directory) / 'bank.txt'

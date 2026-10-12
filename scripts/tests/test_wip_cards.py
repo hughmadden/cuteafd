@@ -25,6 +25,30 @@ def make(entry, tmp_path, arm='baseline', instance='test-base'):
     return cards.generate(entry, arm, dict(instance=instance, slot='s'), tmp_path, tmp_path / 'api-key', {}, set(), None, 1)
 
 
+def test_console_observer_records_policy_stats(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='policy-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'console'}, None, 1)
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    calls = []
+
+    def http(url, path):
+        calls.append(path)
+        if path == '/v1/stats':
+            stop.touch()
+            return {'dspark_policy': {'solo': {'concurrency_buckets': [{'engaged': True}]}}}
+        return {'type': 'snapshot'}
+
+    monkeypatch.setattr(cards, 'http', http)
+    monkeypatch.setattr(cards, 'console_frames', lambda *args: None)
+    monkeypatch.setattr(cards.time, 'sleep', lambda _: None)
+    cards.observe(job)
+    record = json.loads((Path(job['state']) / 'policy-stats.jsonl').read_text())
+    assert record['stats']['dspark_policy']['solo']['concurrency_buckets'][0]['engaged']
+    assert calls == ['/v1/console/snapshot', '/v1/stats']
+
+
 def test_matrix_private_key_and_complete_lanes(entry, tmp_path):
     job = make(entry, tmp_path)
     matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())
