@@ -25,6 +25,7 @@ checks are the script's own startup behavior, which fails before any call.
 """
 from __future__ import annotations
 
+import base64
 import re
 import shlex
 import subprocess
@@ -52,7 +53,7 @@ def _run(body: str, tmp: Path, env: dict[str, str] | None = None):
     _sh(tmp / "bin", "ssh", log,
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        f"for token in \"$@\"; do printf 'A\\t%s\\n' \"$token\" >>{log}; done\n"
+        f"for token in \"$@\"; do printf 'A\\t' >>{log}; printf '%s' \"$token\" | base64 -w0 >>{log}; printf '\\n' >>{log}; done\n"
         f"printf 'E\\n' >>{log}\n"
         'exit "${STUB_SSH_EXIT:-0}"\n')
     environment = {
@@ -78,7 +79,7 @@ def _run(body: str, tmp: Path, env: dict[str, str] | None = None):
                 invocations.append(current)
                 current = []
             elif line.startswith("A\t"):
-                current.append(line[2:])
+                current.append(base64.b64decode(line[2:]).decode())
             else:
                 raise AssertionError(f"unexpected stub line: {line!r}")
         assert not current, f"truncated stub log: {current}"
@@ -281,7 +282,7 @@ def _remote_payload(call: list[str]) -> list[str]:
     """Parse the command at OpenSSH's remote-shell boundary, including empties."""
     command = call[call.index("seed0") + 1:]
     if len(command) == 1:
-        command = shlex.split(command[0])
+        command = shlex.split(command[0][command[0].rindex("bash -s -- "):])
     return command[command.index("--") + 1:]
 
 

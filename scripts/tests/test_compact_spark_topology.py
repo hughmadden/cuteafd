@@ -225,7 +225,7 @@ release_stop_wip_containers
         # worlds: the coordinator keeps the worker at the world it was given.
         for world in (2, 3):
             with self.subTest(world=world):
-                result = subprocess.run(['bash', '-euc', 'docker() { printf "%s\\n" "$@"; }\n' +
+                result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' +
                     remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1', '4096',
                     '107374182400', '19441', 'snapshot', 'fingerprint', '3', str(world)],
                     cwd=ROOT, text=True, capture_output=True)

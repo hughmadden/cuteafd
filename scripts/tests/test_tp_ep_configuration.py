@@ -362,8 +362,8 @@ STUB = r'''#!/usr/bin/env python3
 import json,os,sys,shlex
 from pathlib import Path
 args=sys.argv[1:]; tool=Path(sys.argv[0]).name
-if tool=='ssh' and args and args[-1].startswith('bash -s -- '):
- args=args[:-1]+shlex.split(args[-1])
+if tool=='ssh' and args and 'bash -s -- ' in args[-1]:
+ args=args[:-1]+shlex.split(args[-1][args[-1].rindex('bash -s -- '):])
 with open(os.environ['EVENTS'],'a') as f:f.write(json.dumps([tool,args])+'\n')
 if tool=='docker':
  if args[0]=='inspect':print('running')
@@ -657,7 +657,7 @@ SPARK_COUNT={spark_count}
         source = (ROOT / "run.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
-        harness = 'docker() { printf "%s\\n" "$@"; }\n' + remote
+        harness = 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1", "4096",
              "107374182400", "19441", "snapshot", "fingerprint", "3", "4", "1", "2", "2"],

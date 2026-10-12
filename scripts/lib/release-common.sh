@@ -456,6 +456,57 @@ release_trim() {
   printf '%s' "$value"
 }
 
+# Evaluate on the host that starts the container: Spark and coordinator UIDs
+# can differ. Keep caches writable and checkpoint mounts outside root's home.
+# Self-contained so remote launchers can send this function to the worker host.
+release_serving_docker_args() {
+  local user group primary_group
+  local -a groups=()
+  user="$(id -un)"
+  primary_group="$(id -g)"
+  read -ra groups <<<"$(id -G)"
+  RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
+    -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
+    -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+  # Docker's numeric --user otherwise drops groups used by host access checks.
+  for group in "${groups[@]}"; do
+    [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
+  done
+}
+
+# Fail before serving when legacy root-owned outputs cannot be updated. Check
+# directory descendants, or only a --file target and its parent (not siblings),
+# without changing modes/owners. Shipped to worker shells; no repo dependencies.
+release_require_writable_state() {
+  python3 - "$@" <<'PYSTATE'
+import os
+from pathlib import Path
+import sys
+values = sys.argv[1:]
+file_only = bool(values and values[0] == '--file')
+if file_only:
+    values = values[1:]
+for value in values:
+    root = Path(value)
+    paths = [root, root.parent] if file_only else [root]
+    if root.is_dir() and not file_only:
+        def denied(error):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {error.filename}; migrate legacy ownership before launching')
+        for directory, dirs, files in os.walk(root, onerror=denied):
+            paths.extend(Path(directory) / name for name in dirs + files)
+    for path in paths:
+        if not path.exists() and not path.is_symlink():
+            continue
+        mode = os.W_OK | (os.X_OK if path.is_dir() else 0)
+        if not os.access(path, mode):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {path}; migrate legacy ownership before launching')
+PYSTATE
+}
+
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, on the coordinator and on every Spark worker:
 #   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
