@@ -307,6 +307,17 @@ fn wide_selector_bytes(decode_rows: usize, vocab: usize) -> u64 {
         .saturating_sub(glmf_selector_bytes(engine::DECODE_ROWS as u64, vocab as u64))
 }
 
+/// One startup owner, before TP2 diagnostics and the serving/golden body.
+fn with_startup_graphs<T>(tp2: bool, serving: Option<(usize, bool)>, golden: (usize, bool),
+    warm: impl FnOnce(usize, bool) -> Result<()>, check_tp2: impl FnOnce() -> Result<()>,
+    body: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some((sequences, speculation)) = serving.or(tp2.then_some(golden)) {
+        warm(sequences, speculation)?;
+    }
+    if tp2 { check_tp2()?; }
+    body()
+}
+
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
@@ -316,6 +327,48 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn serving_startup_seals_once_for_tp2_and_spark_layouts() {
+        use std::cell::{Cell, RefCell};
+        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{startup_set, DecodeBuckets};
+
+        for (name, tp2, spark_ranks) in [("tp2-zero-spark", true, 0),
+            ("tp2-spark-suffix", true, 4), ("spark-only", false, 4)] {
+            let startup = startup_set(262144, 262144, 2048, 8, true, 45, true, &DecodeBuckets::new(64));
+            let banks = RefCell::new([GraphBank::with_policy(GraphPolicy::FixedStartup),
+                GraphBank::with_policy(GraphPolicy::FixedStartup)]);
+            let seals = Cell::new([0; 2]);
+            let events = RefCell::new(Vec::new());
+            // The production with_engine sequence, with CPU executable stand-ins.
+            with_startup_graphs(tp2, Some((8, true)), (16, false), |sequences, speculation| {
+                assert_eq!((sequences, speculation), (8, true));
+                events.borrow_mut().push("warm");
+                for (rank, bank) in banks.borrow_mut().iter_mut().enumerate() {
+                    let keys: Vec<_> = startup.keys.iter().enumerate().flat_map(|(shape, _)|
+                        (0..if rank == 0 { 46 } else { 45 }).map(move |segment| (shape, segment))).collect();
+                    for key in &keys { bank.insert(*key, (), None); }
+                    bank.seal_startup(&keys)?;
+                    let mut counts = seals.get(); counts[rank] += 1; seals.set(counts);
+                }
+                Ok(())
+            }, || {
+                assert_eq!(seals.get(), [1, 1]);
+                events.borrow_mut().push("tp2-check");
+                Ok(())
+            }, || {
+                assert_eq!(seals.get(), [1, 1], "{name}, {spark_ranks} Sparks");
+                events.borrow_mut().push("serve");
+                Ok(())
+            }).unwrap();
+            assert_eq!(seals.get(), [1, 1]);
+            assert_eq!(*events.borrow(), if tp2 { vec!["warm", "tp2-check", "serve"] }
+                else { vec!["warm", "serve"] });
+        }
+        let serve = include_str!("serve.rs");
+        assert!(!serve.contains("engine.warm_decode_graphs("), "serving must not own a second warm-up");
     }
 
     #[test]
@@ -1514,14 +1567,14 @@ impl Opened {
         probe("workspaces")?;
         engine.prime_tp2()?;
         probe("expert-prime")?;
-        if engine.has_tp2() {
-            let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, engine.drafter.is_some()));
-            engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
-            probe("graph-capture")?;
-            engine.check_admitted_graphs(&admitted_graphs)?;
-            engine.check_tp2_routes()?;
-        }
-        let result = body(&engine);
+        let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
+            (16, engine.drafter.is_some()), |sequences, speculation| {
+                engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
+                probe("graph-capture")
+            }, || {
+                engine.check_admitted_graphs(&admitted_graphs)?;
+                engine.check_tp2_routes()
+            }, || body(&engine));
         drop(engine);
         // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
