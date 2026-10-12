@@ -23,6 +23,16 @@ def gh(*args):
 
 
 def repo():
+    # The origin remote names the repo PRs live in; `gh repo view` resolves a
+    # fork to its upstream parent. CUTEAFD_PR_REPO overrides both.
+    override = os.environ.get('CUTEAFD_PR_REPO')
+    if override:
+        return override
+    origin = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)
+    url = origin.stdout.strip() if origin.returncode == 0 else ''
+    match = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$', url)
+    if match:
+        return match[1]
     return gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
 
 
