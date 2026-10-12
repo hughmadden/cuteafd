@@ -8,6 +8,8 @@ usage() {
 
 [[ $# -eq 5 || $# -eq 6 ]] || usage
 phase="${6:-all}"
+# Name the failing line and command: a container exec only reports an exit code.
+trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
 case "$phase" in all|rust|native) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
 role="$2"
