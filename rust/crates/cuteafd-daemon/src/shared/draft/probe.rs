@@ -91,7 +91,10 @@ impl<'a> RoundProbe<'a> {
 
     /// Whether a layer's ids go through the ring: every local layer, and
     /// Spark layers too under the ring check.
-    pub fn wants_ring(&self, spark: bool) -> bool { self.active && (!spark || self.check) }
+    pub fn wants_ring(&self, spark: bool) -> bool {
+        // Diagnostic only: isolate route downloads while retaining all clock marks.
+        self.active && (!spark || self.check) && false
+    }
 
     /// Mark the end of `layer` on `stream`.
     ///
