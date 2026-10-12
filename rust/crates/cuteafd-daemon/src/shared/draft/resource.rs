@@ -426,6 +426,7 @@ pub(crate) fn snapshot() -> serde_json::Value {
 
 /// Publish the policy's fits and reliability (`/v1/stats` `draft_policy`).
 pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: Option<(u64, u64)>) {
+    let _timing = super::clock::HostSpan::new(super::clock::HostStage::Publish);
     let stats = policy.stats();
     let geometry = policy.geometry();
     let snapshot = policy.cost_snapshot(false, 1);

@@ -141,7 +141,7 @@ impl Drop for LayerClock<'_> {
 
 /// Aggregate host-only probe/policy work without per-round logging or switches.
 #[derive(Clone, Copy)]
-pub(crate) enum HostStage { Routes, Observe, Select }
+pub(crate) enum HostStage { Routes, Observe, Select, Publish }
 
 pub(crate) struct HostSpan { stage: HostStage, start: Instant }
 
@@ -152,14 +152,14 @@ impl HostSpan {
 impl Drop for HostSpan {
     fn drop(&mut self) {
         use std::sync::atomic::{AtomicU64, Ordering};
-        static SAMPLES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-        static MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        static SAMPLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        static MICROS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let index = self.stage as usize;
         let micros = self.start.elapsed().as_micros() as u64;
         let total = MICROS[index].fetch_add(micros, Ordering::Relaxed) + micros;
         let samples = SAMPLES[index].fetch_add(1, Ordering::Relaxed) + 1;
         if samples % 64 == 0 {
-            let stage = match self.stage { HostStage::Routes => "routes", HostStage::Observe => "observe", HostStage::Select => "select" };
+            let stage = match self.stage { HostStage::Routes => "routes", HostStage::Observe => "observe", HostStage::Select => "select", HostStage::Publish => "publish" };
             tracing::info!(stage, samples, mean_us = total as f64 / samples as f64, "draft policy host timing");
         }
     }
