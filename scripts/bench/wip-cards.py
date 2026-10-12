@@ -30,6 +30,11 @@ CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+# Before -> after table: baseline card metrics, then the client sweep's levels
+# (sweep C<n>) and post-load C1, which are separate measurements.
+SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+LOWER_IS_BETTER = {'kl', 'readiness_s'}
+FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
 PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
 
 
@@ -124,7 +129,8 @@ def load_cards(kit, names):
                 raise ValueError('unsafe card name')
             path = Path(entry['config']).expanduser()
             if not path.is_absolute():
-                path = kit / path
+                # Kit-relative, else repository-relative (in-repo kits name examples/configs/*).
+                path = kit / path if (kit / path).is_file() else REPO / path
             if not path.is_file():
                 path = kit / 'cfg' / path.name
             entry['config'] = str(path.resolve())
@@ -148,7 +154,7 @@ def overrides_from(items):
     return overrides
 
 
-def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat):
+def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'))
     values = config(entry['config'])
@@ -211,19 +217,25 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         (dest / 'profile').mkdir(exist_ok=True)
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
+    if trace:
+        if values.get('SPECULATION_TRACE') or values.get('COORDINATOR_TRACE'):
+            raise ValueError(card + ': --trace owns SPECULATION_TRACE; drop the explicit setting')
+        values['SPECULATION_TRACE'] = str(dest / 'speculation-trace.jsonl')
     base = dest / 'base.config'
     base.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
     metadata = {k: entry.pop(k) for k in ('source_matrix', 'correctness_only', 'published', 'compared', 'kind', 'probes', 'expected_pool') if k in entry}
     entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=run_args)
-    job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool)
+    job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool, trace=bool(trace))
     hook = [sys.executable, str(Path(__file__).resolve())]
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
-    if probes & {'memory', 'console'}:
+    if probes & {'memory', 'console'} or trace:
         entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200), required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
     if expected_pool is not None or 'image' in probes:
         entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    # Re-checked at grant: smoke runs prelaunch once it holds this card's locks.
+    entry['prelaunch'] = dict(argv=hook + ['--preflight-job', str(dest / 'job.json')], timeout_s=300, required=True)
     save(dest / 'job.json', {**job, 'probes': sorted(probes)})
     save(dest / 'matrix.json', dict(build='wip-cards', profile=entry.get('profile', 'smoke'), entries=[entry]))
     return job
@@ -283,6 +295,45 @@ def binary_supports(binary, repo, job, needs):
     missing = [field for field in needs if field + '=' not in result.stderr]
     if missing:
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
+
+
+def speculating(values):
+    """Whether a launch resolves a speculator (traces are written only then)."""
+    return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
+
+
+def preflight_job(job, arm):
+    """Everything about one job that is checkable without hardware: no serving
+    container of ours exists, the arm is sealed on every host it runs on, the
+    slot holds the packages and audio entry the card needs, and the job's
+    trace/profile directories are writable. Returns the artifact record."""
+    values = job['entry']['set']
+    assert_absent(job)
+    needs = job.get('needs') or {'coordinator': [], 'spark': [], 'audio': False}
+    artifacts, problems = {}, []
+    for host in ('raptor', *job['entry']['sparks']):
+        meta = json.loads(slot_check(arm, host))
+        release = 'release' in arm
+        keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
+        artifacts[host] = {k: meta[k] for k in keys}
+        contents = meta.get('contents')
+        if release or contents is None:
+            continue
+        wanted = needs['coordinator'] if host == 'raptor' else needs['spark']
+        missing = sorted(set(wanted) - set(contents['packages']))
+        if missing:
+            problems.append(f"{host}: slot {arm['slot']} lacks {', '.join(missing)} (build with the card's scopes: wip-cards --build)")
+        if needs['audio'] and contents.get('audio') is False:
+            problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
+                            'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
+    for key in ('SPECULATION_TRACE', 'PROFILE_DIR'):
+        if values.get(key):
+            directory = Path(values[key]) if key == 'PROFILE_DIR' else Path(values[key]).parent
+            if not os.access(directory, os.W_OK):
+                problems.append(f'{key} directory {directory} is not writable')
+    if problems:
+        raise ValueError('; '.join(problems))
+    return artifacts
 
 
 def smoke_command(binary, repo, job):
@@ -476,9 +527,24 @@ def observe(job):
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
             cmd = ['docker', 'run', '--rm', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', '--gpus', '"device=' + gpu_list + '"', '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
+        trace_path = Path(job['entry']['set']['SPECULATION_TRACE']) if job.get('trace') else None
+        trace_due = None
         while not stop.exists():
             if sampler and sampler.poll() is not None:
                 raise RuntimeError('memory sampler exited: ' + sampler.stderr.read())
+            if trace_path and not (dest / 'trace-check.json').exists():
+                # After the baseline's warm-up (the first part of the run), the
+                # trace must have records. Diagnostic only: the row decides.
+                try:
+                    active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status').get('active') or {})
+                    if active and (active.get('panel') != 'baseline' or active.get('fraction', 0) >= .05):
+                        trace_due = trace_due or time.monotonic() + 5
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                if trace_due and time.monotonic() >= trace_due:
+                    size = trace_path.stat().st_size if trace_path.is_file() else 0
+                    save(dest / 'trace-check.json', {'after': 'warm-up', 'bytes': size, 'path': str(trace_path),
+                                                     'ok': bool(size) or not speculating(job['entry']['set'])})
             if 'console' in job['probes']:
                 try:
                     snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot')
@@ -565,6 +631,55 @@ def collect_profile(job):
     return result
 
 
+def fail(row, message, kind=None):
+    """Fails a row keeping the first real error: later derived checks are
+    appended to `errors`, never replace it."""
+    errors = row.setdefault('errors', [row['error']] if row.get('error') else [])
+    if message not in errors:
+        errors.append(message)
+    row['status'] = 'failed'
+    row.setdefault('error', message)
+    if not row['error']:
+        row['error'] = message
+    if kind and not row.get('failure_kind'):
+        row['failure_kind'] = kind
+
+
+def first_log_error(dest, entry_name):
+    """The first real error line in a job's smoke logs: the launcher/worker
+    output before smoke's own wrapper line ("error: ./run.sh exited ...")."""
+    logs = dest / 'smoke' / 'logs'
+    wrapper = None
+    for name in (entry_name + '.log', entry_name + '.coordinator.log'):
+        path = logs / name
+        if not path.is_file():
+            continue
+        for line in ANSI.sub('', path.read_text(errors='replace')).splitlines():
+            line = line.strip()
+            if not FAILURE.search(line) or line.startswith('Error response from daemon: No such container'):
+                continue
+            if line.startswith('error: ./run.sh exited') or line.startswith('error: not ready'):
+                wrapper = wrapper or line
+                continue
+            return line[:400]
+    return wrapper
+
+
+def classify(row, launched):
+    """launch: the server never served the card; quality: it served and a
+    correctness check failed; measurement: it served and a measurement or
+    evidence check failed; preflight: refused before any hardware."""
+    if row['status'] == 'pass':
+        return None
+    if row.get('exit_code') == 82:
+        return 'preflight'
+    if not launched:
+        return 'launch'
+    if row.get('quality') in ('fail', 'failed') or any(isinstance(row.get(k), dict) and row[k].get('status') in ('fail', 'failed') for k in ('cache', 'spec')):
+        return 'quality'
+    return 'measurement'
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -573,17 +688,29 @@ def summarize_job(job, exit_code):
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
+    state = dest / 'smoke' / 'state.json'
+    if state.exists():
+        row['smoke'] = json.loads(state.read_text())
+    outcome = (row.get('smoke') or {}).get(job['entry']['name']) or {}
+    # The first real error wins: the launcher's own words, then smoke's outcome
+    # (its wrapper "./run.sh exited ..." last), then checks derived below.
+    found = [e for e in (first_log_error(dest, job['entry']['name']), outcome.get('error')) if e]
+    found.sort(key=lambda e: e.startswith(('error: ./run.sh exited', './run.sh exited', 'error: not ready', 'not ready')))
+    if exit_code or outcome.get('status') not in (None, 'done'):
+        for message in found:
+            fail(row, message)
+    launched = outcome.get('launch_s') is not None or bool(reports)
     sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels'))
     if sweep_only and not reports:
         pass  # No server-side profile ran; the sweep below carries the numbers.
     elif len(reports) != 1:
-        row.update(status='failed', error=f'expected one report, found {len(reports)}')
+        fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
         missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
         if missing:
-            row.update(status='failed', error='requested panels absent from report: ' + ', '.join(sorted(missing)))
+            fail(row, 'requested panels absent from report: ' + ', '.join(sorted(missing)))
         baseline = report.get('baseline') or {}
         card = baseline.get('card') or {}
         quality = baseline.get('quality') or {}
@@ -592,24 +719,35 @@ def summarize_job(job, exit_code):
         row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=(card.get('concurrent') or {}).get('aggregate_tok_s'), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
         # Report/panel statuses serialize as 'failed'; Rust CheckStatus as 'fail'.
         failed = {'fail', 'failed'}
-        if report.get('status') in failed or quality.get('status') in failed or any(c.get('status') in failed for c in checks):
-            row['status'] = 'failed'
+        bad = [c['id'] + (': ' + c['summary'] if c.get('summary') else '') for c in checks if c.get('status') in failed]
+        if bad:
+            fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
+        elif report.get('status') in failed or quality.get('status') in failed:
+            fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
             row[metric] = None
     profile = collect_profile(job)
     if profile:
         row['profile'] = profile
+    trace_path = job['entry']['set'].get('SPECULATION_TRACE')
+    if trace_path and job.get('trace'):
+        path = Path(trace_path)
+        records = sum(1 for line in path.open(errors='replace') if line.strip()) if path.is_file() else 0
+        row['trace'] = {'path': trace_path, 'bytes': path.stat().st_size if path.is_file() else 0, 'records': records,
+                        'expected': speculating(job['entry']['set'])}
+        if row['trace']['expected'] and not records:
+            fail(row, 'speculation trace is empty after the run (' + trace_path + ')', 'measurement')
     sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
               if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
     if job['entry'].get('levels'):
         if len(sweeps) != 1:
-            row.update(status='failed', error=row.get('error') or f'expected one sweep.json, found {len(sweeps)}')
+            fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
             points = json.loads(sweeps[0].read_text()).get('points', [])
             row['sweep'] = points
             for point in points:
-                key = 'post-load C1' if point['phase'] == 'post_load' else f"C{point['c']}"
+                key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
                 row[key] = point['aggregate_tok_s']
     row['peaks'] = peaks(dest)
     row['ledger'] = ledger(dest)
@@ -629,15 +767,13 @@ def summarize_job(job, exit_code):
         path = dest / (key + '.json')
         if path.exists():
             row[key] = json.loads(path.read_text())
-    state = dest / 'smoke' / 'state.json'
-    if state.exists():
-        row['smoke'] = json.loads(state.read_text())
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None, requests=matched_requests(dest), state=str(dest))
         if not row['requests']:
-            row.update(status='failed', error='matched prompts produced no per-request console rounds')
+            fail(row, 'matched prompts produced no per-request console rounds')
+    row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
 
@@ -679,19 +815,20 @@ def validate_matched_pairs(rows, arm_names):
         hashes = [r.get('first_prompt_token_hash') for r in pair]
         if not all(hashes) or len(set(hashes)) != 1:
             for row in pair:
-                row.update(status='failed', error='matched pair missing or mismatched first request prompt token hash', exit_code=81)
+                fail(row, 'matched pair missing or mismatched first request prompt token hash', 'measurement')
+                row['exit_code'] = row.get('exit_code') or 81
                 (Path(row['state']) / 'exit').write_text('81\n')
                 save(Path(row['state']) / 'result.json', row)
 
 
-def summary_math(rows, arm_names):
+def summary_math(rows, arm_names, metrics=METRICS):
     medians, paired = [], []
     for card in sorted({r['card'] for r in rows}):
         for arm in arm_names:
             group = [r for r in rows if r['card'] == card and r['arm'] == arm and r['status'] == 'pass' and not r['simulated']]
-            medians.append(dict(card=card, arm=arm, **{m: statistics.median([r[m] for r in group if isinstance(r.get(m), (float, int))]) if any(isinstance(r.get(m), (float, int)) for r in group) else None for m in METRICS}))
+            medians.append(dict(card=card, arm=arm, **{m: statistics.median([r[m] for r in group if isinstance(r.get(m), (float, int))]) if any(isinstance(r.get(m), (float, int)) for r in group) else None for m in metrics}))
         for candidate in arm_names[1:]:
-            for m in METRICS:
+            for m in metrics:
                 deltas, percentages = [], []
                 for repeat in sorted({r['repeat'] for r in rows}):
                     pair = {r['arm']: r for r in rows if r['card'] == card and r['repeat'] == repeat and r['status'] == 'pass' and not r['simulated']}
@@ -704,23 +841,62 @@ def summary_math(rows, arm_names):
     return medians, paired
 
 
+def status_cell(check):
+    if not isinstance(check, dict):
+        return ''
+    return str(check.get('status', '')) + (' (' + check['summary'][:60] + ')' if check.get('summary') and check.get('status') != 'pass' else '')
+
+
 def write_summary(state, rows, arms):
     validate_matched_pairs(rows, list(arms))
-    medians, paired = summary_math(rows, list(arms))
+    names = list(arms)
+    present = [m for m in SUMMARY_METRICS if any(isinstance(r.get(m), (int, float)) for r in rows)]
+    medians, paired = summary_math(rows, names, present or METRICS)
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired))
-    columns = ['card', 'arm', 'repeat', 'status', 'simulated', *METRICS, 'cache', 'spec', 'peaks', 'quality', 'nonce_seed', 'first_prompt_token_hash', 'requests']
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
         if isinstance(value, (dict, list)):
             value = json.dumps(value, separators=(',', ':'))
         return str(value if value is not None else '').replace('|', '\\|').replace('\n', ' ')
-    text = '| ' + ' | '.join(columns) + ' |\n|' + '|'.join([' --- '] * len(columns)) + '|\n'
-    text += ''.join('| ' + ' | '.join(cell(r.get(c)) for c in columns) + ' |\n' for r in rows)
-    text += '\n## Medians (real hardware, passing rows only)\n\n| Card | Arm | C1 | C8 | 8K |\n| --- | --- | ---: | ---: | ---: |\n'
-    text += ''.join('| ' + ' | '.join(cell(r.get(c)) for c in ('card', 'arm', 'C1', 'C8', '8K')) + ' |\n' for r in medians)
-    text += '\n## Paired Deltas\n\n| Card | Candidate | Metric | Pairs | Delta | Percent |\n| --- | --- | --- | ---: | ---: | ---: |\n'
-    text += ''.join('| ' + ' | '.join(cell(r.get(c)) for c in ('card', 'candidate', 'metric', 'pairs', 'median_delta', 'median_percent')) + ' |\n' for r in paired if r['pairs'])
+    text = f'# wip-cards summary: {state.name}\n\n'
+    failed = [r for r in rows if r['status'] != 'pass']
+    text += f'{len(rows) - len(failed)} of {len(rows)} jobs passed.\n\n'
+    # Before -> after per card and metric: medians of passing real-hardware rows,
+    # ratio after/before, and the paired median where pairs exist.
+    if len(names) > 1:
+        text += '## Before -> after\n\n| Card | Metric | ' + names[0] + ' | ' + ' | '.join(names[1:]) + ' | Ratio | Paired % | Pairs |\n'
+        text += '| --- | --- |' + ' ---: |' * len(names) + ' ---: | ---: | ---: |\n'
+        for card in sorted({r['card'] for r in rows}):
+            by_arm = {m['arm']: m for m in medians if m['card'] == card}
+            for metric in present:
+                values = [by_arm.get(arm, {}).get(metric) for arm in names]
+                if all(v is None for v in values):
+                    continue
+                before, after = values[0], values[-1]
+                ratio = after / before if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before else None
+                pair = next((p for p in paired if p['card'] == card and p['candidate'] == names[-1] and p['metric'] == metric), {})
+                note = ' (lower is better)' if metric in LOWER_IS_BETTER else ''
+                text += f"| {card} | {metric}{note} | " + ' | '.join(cell(v) for v in values) + f" | {cell(ratio)} | {cell(pair.get('median_percent'))} | {pair.get('pairs', 0)} |\n"
+        text += '\n'
+    else:
+        text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'
+        for m in medians:
+            text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
+        text += '\n'
+    text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
+    for r in rows:
+        trace = r.get('trace') or {}
+        trace_cell = (f"{trace.get('records', 0)} records" if trace.get('expected') else 'not expected') if trace else ''
+        profile = r.get('profile') or {}
+        profile_cell = f"{len(profile.get('files', []))} files" if profile else ''
+        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(status_cell(r.get('spec')))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
+    if failed:
+        text += '\n## Failures\n\nlaunch = the server never served the card; quality = it served and a correctness check failed; measurement = it served and a measurement or evidence check failed; preflight = refused before hardware.\n\n'
+        for r in failed:
+            text += f"- **{r['card']} / {r['arm']} / r{r['repeat']}** ({r.get('failure_kind') or 'unknown'}): {r.get('error') or 'exit ' + str(r.get('exit_code'))}\n"
+            for extra in (r.get('errors') or [])[1:]:
+                text += f'  - then: {extra}\n'
     (state / 'summary.md').write_text(text)
 
 
@@ -774,9 +950,20 @@ if root=='-':
     found=subprocess.run(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}',container],capture_output=True,text=True)
     root=found.stdout.strip() if found.returncode==0 and found.stdout.strip() else str(pathlib.Path.home()/'.cache/cuteafd/builds'/('wip-'+instance))
 host=pathlib.Path(root)/'slots'/slot/role
+def contents(p):
+    art=p/'workspace/.cuteafd-wip'
+    packages=sorted(str(d.relative_to(art)) for kind in ('exl3','fp8') if (art/kind).is_dir() for d in (art/kind).iterdir() if d.is_dir())
+    audio=None
+    try:
+        out=subprocess.run(['nm','-D','--defined-only',str(art/'libcuteafd_native.so')],capture_output=True,text=True,timeout=60)
+        if out.returncode==0: audio=any(line.split()[-1:]==['cuteafd_audio_required'] for line in out.stdout.splitlines())
+    except (OSError,subprocess.SubprocessError):
+        pass
+    return dict(packages=packages,audio=audio)
 try:
     m=check(host,lambda path: path.read_bytes())
     m['seal_source']='host:'+str(host)
+    m['contents']=contents(host)
 except PermissionError:
     state=subprocess.run(['docker','inspect','-f','{{.State.Running}}',container],capture_output=True,text=True).stdout.strip()
     if state!='true':
@@ -898,6 +1085,54 @@ def build_scopes(cards):
     return env
 
 
+def package_dir(scope):
+    """The slot directory (under .cuteafd-wip/) a FAMILY:FORMAT scope ships as
+    (scripts/build/build-wip-artifacts.sh), or None for scopes with no package."""
+    family, fmt = scope.split(':', 1)
+    if fmt == 'fp8':
+        return 'fp8/fp8-' + family
+    if fmt in ('nvfp4', 'nvfp4a4'):
+        return f'fp8/fp8-{family}-{fmt}'
+    if fmt.startswith('exl3-k'):
+        return f'exl3/exl3-{family}-{fmt[5:]}'
+    return None
+
+
+def slot_needs(card):
+    """What a sealed slot must contain to launch `card`, per role: the expert
+    packages its scopes ship (the same derivation --build uses) and, when the
+    card places the audio tower, the native audio entry point."""
+    scopes = build_scopes([card])
+    coordinator = {package_dir(s) for s in scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';') if s} - {None}
+    spark = {package_dir(s) for s in scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';') if s} - {None}
+    values = {**config(card['config']), **card.get('set', {})}
+    if int(values.get('SPARK_COUNT', len(card.get('sparks', [])))) == 0:
+        spark = set()
+    return dict(coordinator=sorted(coordinator), spark=sorted(spark),
+                audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON')
+
+
+def toolchain_hash(revision):
+    """The dev toolchain identity of `revision` (scripts/build/dev-toolchain.py
+    over that revision's own files), so a build runs in its pinned dev image."""
+    digest = hashlib.sha256()
+    for name in ('docker/Dockerfile.dev', 'docker/entrypoint.sh', 'scripts/build/install-dev-cache-tools.sh',
+                 'scripts/build/dev-toolchain.py'):
+        shown = subprocess.run(['git', '-C', str(REPO), 'show', f'{revision}:{name}'], capture_output=True, timeout=120)
+        if shown.returncode:
+            raise ValueError(f'cannot read {name} at {revision}: ' + shown.stderr.decode(errors='replace').strip())
+        blob = shown.stdout
+        digest.update(name.encode() + b'\0' + blob + b'\0')
+    return digest.hexdigest()[:16]
+
+
+# Serving-only keys never belong in a build (staging) config.
+BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING', 'COORDINATOR_GPUS',
+              'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+              'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
+              'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
+
+
 def build_lock_mode(revision):
     text = run(['git', '-C', str(REPO), 'show', revision + ':wip.sh']).stdout
     native = run(['git', '-C', str(REPO), 'show', revision + ':scripts/build/build-wip-artifacts.sh']).stdout
@@ -932,24 +1167,21 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         if len(hosts) not in (2, 3, 4, 6):
             hosts += [h for h in HOSTS if h not in hosts][:6 - len(hosts)]
         build_config = state / ('build-' + name + '.config')
-        values = config(cards[0]['config'])
-        values.pop('SPARK_HOSTS', None)
-        values.pop('BENCH_SIMULATED', None)
-        values.pop('BENCH_HARDWARE_CLASS', None)
-        values.pop('BENCH_EXPECT_GLM_RING', None)
-        values.pop('COORDINATOR_GPUS', None)
-        values.pop('COORDINATOR_GPU_UUID', None)
-        values.pop('COORDINATOR_GPU_PCI_BUS_ID', None)
+        # A staging config: the first card's model and its --set/--arm-set
+        # overrides, the union of Spark hosts, and no serving topology. Export
+        # scopes (TP counts, families, audio) come from every card through
+        # build_scopes, never from how many hosts receive the slot.
+        values = {**config(cards[0]['config']), **cards[0].get('set', {})}
         for key in list(values):
-            if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
+            if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
         values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU='1', RTX_GPUS='1')
-        if len(hosts) == 2:
+        if len(hosts) in (2, 3):
+            # Two or three ranks without explicit keys are the compact EXL3 layout.
             values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force', EXL3_PAIRED_TP4='off')
-            values.pop('SPARK_TP', None)
-            values.pop('SPARK_EP', None)
-        else:
-            values.update(EXPERT_FORMAT='native', SPARKINFER_EXL3='disable', EXL3_PAIRED_TP4='off', SPARK_TP=str(len(hosts)), SPARK_EP='1', MODEL_VARIANT='flash')
+        tag = 'tc-' + toolchain_hash(revision)
+        values.update(COORDINATOR_DOCKER_DEV='cuteafd-coordinator-dev:' + tag, SPARK_EXPERT_DOCKER_DEV='cuteafd-spark-expert-dev:' + tag)
+        arm['dev_image_tag'] = tag
         for i, host in enumerate(hosts):
             idx = HOSTS.index(host) + 1
             values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{idx}', f'SPARK_{i}_LANE_B': f'10.55.1.{idx}'})
@@ -990,7 +1222,9 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--kit', type=Path, default=Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit')
+    parser.add_argument('--kit', default=str(Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit'),
+                        help='kit directory, or "gate" for the shared gate kit (scripts/bench/kits/gate: mimo26-flash-max, '
+                        'qwen38-exl3-min, glmf-exl3-max, v41-flash-max)')
     parser.add_argument('--cards', nargs='+', default=[])
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=INSTANCE:SLOT')
     parser.add_argument('--arm-release', action='append', default=[], metavar='NAME=INSTANCE:TAG', help='use published image pair with the same launcher, without --wip')
@@ -1014,6 +1248,12 @@ def main():
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
+                        'checked after warm-up and recorded in result.json')
+    parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
+                        'ones; a rerun job keeps its earlier attempt under attempt-N/')
+    parser.add_argument('--preflight-only', action='store_true', help='run every CPU check (slots, packages, audio, containers, '
+                        'binary, trace dirs), write the plan and exit; for hwlock --preflight')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
@@ -1022,10 +1262,20 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.observe or args.precheck:
         job = json.loads((args.observe or args.precheck).read_text())
         (observe if args.observe else precheck)(job)
+        return 0
+    if args.preflight_job:
+        # Smoke's prelaunch hook: the same checks again, now that smoke holds the locks.
+        job = json.loads(args.preflight_job.read_text())
+        plan = json.loads((args.preflight_job.resolve().parent.parent / 'plan.json').read_text())
+        artifacts = preflight_job(job, plan['arms'][job['arm']])
+        if job.get('artifacts') and artifacts != job['artifacts']:
+            raise ValueError('sealed artifacts changed since enqueue: ' + json.dumps(artifacts, sort_keys=True))
+        print('preflight at grant: pass')
         return 0
     if not NAME.fullmatch(args.task) or args.parallel < 1 or args.repeats < 1:
         parser.error('invalid task, repeats or parallelism')
@@ -1041,7 +1291,23 @@ def main():
         parser.error('--matched-prompts requires --interleave')
     if args.interleave and (len(arms) < 2 or args.parallel != 1):
         parser.error('interleave needs two or more arms and --parallel 1')
+    if len(arms) > 1 and not (args.interleave or args.matrix or args.cleanup or args.build_only):
+        parser.error('several arms need --interleave (an A/B: alternating pairs) or --matrix (every card on every arm, once)')
+    if args.resume and args.cleanup:
+        parser.error('--resume refuses --cleanup')
     state = (args.state or Path.home() / '.cache/cuteafd/builds' / args.task).expanduser().resolve()
+    if not (args.resume or args.cleanup or args.build_only) and (state / 'plan.json').exists() and \
+            any(state.glob('*/exit')):
+        if args.state is None and '--task' not in sys.argv:
+            # The default task name is time-stamped; a same-second collision gets a suffix.
+            for n in itertools.count(2):
+                candidate = state.with_name(f'{state.name}-{n}')
+                if not candidate.exists():
+                    state, args.task = candidate, candidate.name
+                    break
+        else:
+            raise ValueError(f'{state} already holds a run; pass --resume to rerun its failed or missing jobs, '
+                             'or choose a fresh --task/--state')
     state.mkdir(parents=True, exist_ok=True)
     if args.cleanup:
         plan = state / 'plan.json'
@@ -1054,7 +1320,8 @@ def main():
         return 0
     if not args.cards or not (args.matrix or args.interleave):
         parser.error('--cards and --matrix or --interleave required')
-    cards = load_cards(args.kit.expanduser().resolve(), args.cards)
+    kit = REPO / 'scripts/bench/kits' / args.kit if NAME.fullmatch(args.kit) and (REPO / 'scripts/bench/kits' / args.kit).is_dir() else Path(args.kit)
+    cards = load_cards(kit.expanduser().resolve(), args.cards)
     overrides = overrides_from(args.set)
     arm_overrides = {}
     for item in args.arm_set:
@@ -1086,6 +1353,8 @@ def main():
             card['levels'] = levels
             if args.post_load_c1:
                 card['post_load_c1'] = True
+        if args.trace and card.get('family') == 'deepseek_v41' and not (args.repo / 'run.sh').read_text().count('CUTEAFD_SPECULATION_TRACE'):
+            raise ValueError(f"{card['name']}: this checkout's run.sh does not forward SPECULATION_TRACE on the V4.1 path")
     probes = {card['name']: set(card.get('probes', [])) for card in cards}
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.probe:
@@ -1135,7 +1404,11 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat, args.trace) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
+    for job in jobs:
+        job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
+        save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
     for job in jobs:
         if args.nonce_seed is not None or args.matched_prompts:
@@ -1172,32 +1445,68 @@ def main():
                 if kind in job['entry']:
                     print('# smoke ' + kind + ': ' + shlex.join(job['entry'][kind]['argv']))
         return 0
-    needs = ['levels', 'post_load_c1'] if args.levels else []
+    kept = {}
+    if args.resume:
+        for job in jobs:
+            dest = Path(job['state'])
+            result = dest / 'result.json'
+            if result.exists() and json.loads(result.read_text()).get('status') == 'pass':
+                kept[job['state']] = json.loads(result.read_text())
+                continue
+            leftovers = [p for p in dest.iterdir() if p.name in ('exit', 'result.json', 'driver.log', 'smoke', 'reports',
+                         'trace-check.json', 'speculation-trace.jsonl', 'precheck.json', 'console.jsonl',
+                         'console-frames.jsonl', 'policy-stats.jsonl', 'memory.jsonl', 'ready.log', 'profile')]
+            if leftovers and not job.get('grouped'):
+                attempt = next(dest / f'attempt-{n}' for n in itertools.count(1) if not (dest / f'attempt-{n}').exists())
+                attempt.mkdir()
+                for path in leftovers:
+                    path.rename(attempt / path.name)
+                if job['entry']['set'].get('PROFILE_DIR'):
+                    Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
+        if kept:
+            print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     for job in jobs[:1]:
-        binary_supports(args.binary, args.repo, job, needs)
+        binary_supports(args.binary, args.repo, job, ['levels', 'post_load_c1'] if args.levels else [])
+    # Everything checkable without hardware, before any queue ticket.
+    problems = []
+    for job in jobs:
+        if job['state'] in kept:
+            continue
+        try:
+            job['artifacts'] = preflight_job(job, arms[job['arm']])
+            save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
+        except (ValueError, subprocess.SubprocessError) as error:
+            problems.append(f"{job['card']}/{job['arm']}/r{job['repeat']}: {error}")
+    if problems:
+        save(state / 'preflight.json', {'status': 'failed', 'problems': problems})
+        raise ValueError('preflight failed before queuing:\n  ' + '\n  '.join(problems))
+    save(state / 'preflight.json', {'status': 'pass', 'jobs': len(jobs) - len(kept)})
+    if args.preflight_only:
+        print(f'wip-cards: preflight pass for {len(jobs) - len(kept)} job(s); plan {state / "plan.json"}')
+        return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
     if args.nonce_seed is not None:
         env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
     def execute(job):
         dest = Path(job['state'])
+        if job['state'] in kept:
+            return kept[job['state']]
         try:
-            assert_absent(job)
-            job['artifacts'] = {}
-            for host in ('raptor', *job['entry']['sparks']):
-                meta = json.loads(slot_check(arms[job['arm']], host))
-                keys = ('image', 'image_id', 'repo_digests') if 'release' in arms[job['arm']] else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
-                job['artifacts'][host] = {k: meta[k] for k in keys}
-            save(dest / 'job.json', {**job, 'probes': sorted(job['probes'])})
+            # Re-checked right before this job's turn: an earlier job may have
+            # left a container, or a slot may have been rebuilt meanwhile.
+            artifacts = preflight_job(job, arms[job['arm']])
+            if artifacts != job.get('artifacts', artifacts):
+                raise ValueError('sealed artifacts changed since preflight: ' + json.dumps(artifacts, sort_keys=True))
         except (ValueError, subprocess.SubprocessError) as error:
             row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
-            row.update(status='failed', exit_code=82, error=str(error))
+            row.update(status='failed', exit_code=82, error=str(error), failure_kind='preflight', state=str(dest))
             (dest / 'exit').write_text('82\n')
             save(dest / 'result.json', row)
             return row
         exit_file = dest / 'exit'
         if exit_file.exists():
-            raise ValueError('run already exists; use a fresh task/state: ' + str(dest))
+            raise ValueError('run already exists; use --resume or a fresh task/state: ' + str(dest))
         job_env = dict(env)
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
@@ -1207,17 +1516,17 @@ def main():
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
         row = summarize_job(job, code)
+        row['state'] = str(dest)
         if row['status'] != 'pass' and not code:
             exit_file.write_text('81\n')
             row['exit_code'] = 81
+            save(dest / 'result.json', row)
         return row
     if groups and len(groups[0]) > 1:
         group_root = state / 'parallel-smoke'
         try:
             for job in jobs:
-                assert_absent(job)
-                for host in ('raptor', *job['entry']['sparks']):
-                    slot_check(arms[job['arm']], host)
+                preflight_job(job, arms[job['arm']])
         except (ValueError, subprocess.SubprocessError) as error:
             rows = []
             for job in jobs:

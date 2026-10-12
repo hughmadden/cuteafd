@@ -323,6 +323,7 @@ def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
 
 def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'legacy-full-build')
+    monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
     arms = cards.arms_from(['base=b:s'])
     cards.build_arms(['base=old'], arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
@@ -811,7 +812,8 @@ def test_sweep_rows_and_sweep_only_jobs(entry, tmp_path):
         {'c': 16, 'phase': 'levels', 'aggregate_tok_s': 400.0}, {'c': 1, 'phase': 'post_load', 'aggregate_tok_s': 47.5}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass', row
-    assert (row['C1'], row['C16'], row['post-load C1']) == (50.0, 400.0, 47.5)
+    assert (row['sweep C1'], row['sweep C16'], row['post-load C1']) == (50.0, 400.0, 47.5)
+    assert row.get('C1') is None  # the baseline's C1 is a different measurement
 
 
 def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
@@ -821,3 +823,221 @@ def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
         cards.binary_supports('/old/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
     monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='levels=Some([1]) post_load_c1=true', stdout=''))
     cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
+
+
+def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_path, monkeypatch):
+    # #72: a 4-Spark MiMo card was staged on six hosts with SPARK_TP=6 forced into
+    # the build config, its --set overrides were ignored and untagged dev images
+    # were used. Export scope comes from the card; TP never from the staging set.
+    kit = Path.home() / '.cache/cuteafd/builds/release-v2-rc3/kit'
+    if not (kit / 'matrix-main.json').exists():
+        pytest.skip('release-v2-rc3 kit absent')
+    card = cards.load_cards(kit, ['mimo26-flash-max'])[0]
+    card['set']['RTX_EXPERT_LAYERS'] = '0'
+    arms = cards.arms_from(['baseline=x:a', 'candidate=y:b'])
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    cards.build_arms(['baseline=HEAD', 'candidate=HEAD'], arms, [card], tmp_path, 'task', True)
+    cfg = cards.config(tmp_path / 'build-candidate.config')
+    assert 'SPARK_TP' not in cfg and 'SPARK_EP' not in cfg and 'MODEL_VARIANT' not in cfg
+    assert cfg['RTX_EXPERT_LAYERS'] == '0' and cfg['MODEL_ID'].startswith('XiaomiMiMo/')
+    tag = 'tc-' + subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')], capture_output=True, text=True).stdout.strip()
+    assert cfg['COORDINATOR_DOCKER_DEV'] == 'cuteafd-coordinator-dev:' + tag
+    assert cfg['SPARK_EXPERT_DOCKER_DEV'] == 'cuteafd-spark-expert-dev:' + tag
+    scopes = cards.build_scopes([card])
+    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == '4'
+    assert scopes['CUTEAFD_WIP_AUDIO_AOT'] == 'ON'
+    assert cards.slot_needs(card) == {'coordinator': ['fp8/fp8-mimof'], 'spark': ['fp8/fp8-mimof'], 'audio': True}
+
+
+def _fake_slot(packages=(), audio=True):
+    return lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='art',
+                                             contents=dict(packages=list(packages), audio=audio)))
+
+
+def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
+    """Runs main() with hardware stubbed: no containers, a sealed slot, and a
+    smoke 'process' that writes an exit code and (optionally) a result."""
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', *argv])
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'slot_check', slot or _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    launched = []
+    def detached(cmd, log, exit_file, env):
+        job = json.loads((exit_file.parent / 'job.json').read_text())
+        launched.append(job['card'] + '/' + job['arm'])
+        exit_file.write_text(f'{rc_for(job)}\n')
+        return SimpleNamespace(wait=lambda: 0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    def summarize(job, code):
+        row = dict(card=job['card'], arm=job['arm'], repeat=job['repeat'], simulated=False,
+                   status='pass' if code == 0 else 'failed', exit_code=code)
+        if code:
+            row.update(error='launcher said no', failure_kind='launch')
+        cards.save(Path(job['state']) / 'result.json', row)
+        return row
+    monkeypatch.setattr(cards, 'summarize_job', summarize)
+    return cards.main(), launched
+
+
+def test_multi_arm_without_mode_is_refused_with_a_clear_message(entry, tmp_path, monkeypatch, capsys):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--arm', 'a=b:s', '--arm', 'c=d:s', '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+    assert '--interleave' in capsys.readouterr().err
+
+
+def test_resume_keeps_passed_jobs_and_reruns_failed_keeping_old_diagnosis(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry, {**entry, 'name': 'other'})
+    state = tmp_path / 'state'
+    argv = ['--kit', str(kit), '--cards', 'v41-min', 'other', '--matrix', '--arm', 'a=b:s', '--state', str(state)]
+    rc, launched = _run_main(monkeypatch, argv, rc_for=lambda job: 1 if job['card'] == 'other' else 0)
+    assert rc == 1 and sorted(launched) == ['other/a', 'v41-min/a']
+    # A plain retry is refused, never silently mixed with the earlier run.
+    with pytest.raises(ValueError, match='--resume'):
+        _run_main(monkeypatch, argv)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and launched == ['other/a']
+    other = next(state.glob('other-a-r1*'))
+    assert json.loads((other / 'attempt-1' / 'result.json').read_text())['error'] == 'launcher said no'
+    assert json.loads((other / 'result.json').read_text())['status'] == 'pass'
+    summary = json.loads((state / 'summary.json').read_text())
+    assert sorted(r['status'] for r in summary['rows']) == ['pass', 'pass']
+
+
+def test_default_state_is_fresh_when_the_default_task_collides(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    builds = tmp_path / '.cache/cuteafd/builds'
+    argv = ['--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s']
+    _run_main(monkeypatch, argv)
+    first = [p for p in builds.iterdir() if p.name.startswith('cards-')]
+    assert len(first) == 1
+    # Same default name again (a same-second rerun): a fresh state, not a refusal.
+    original = cards.argparse.ArgumentParser.parse_args
+    def same_task(self, *a, **k):
+        args = original(self, *a, **k)
+        args.task = first[0].name
+        return args
+    monkeypatch.setattr(cards.argparse.ArgumentParser, 'parse_args', same_task)
+    _run_main(monkeypatch, argv)
+    assert (builds / (first[0].name + '-2')).is_dir()
+    assert list((builds / (first[0].name + '-2')).glob('*/exit'))
+
+
+def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path, monkeypatch):
+    kit = Path.home() / '.cache/cuteafd/builds/release-v2-rc3/kit'
+    gate = ROOT / 'scripts/bench/kits/gate'
+    argv = ['--kit', str(gate), '--cards', 'mimo26-flash-max', 'glmf-exl3-max', '--matrix', '--arm', 'c=x:s',
+            '--state', str(tmp_path / 'state')]
+    with pytest.raises(ValueError) as caught:
+        _run_main(monkeypatch, argv, slot=_fake_slot(packages=['fp8/fp8-mimof'], audio=False))
+    message = str(caught.value)
+    assert 'preflight failed before queuing' in message
+    assert 'built without the audio tower (AUDIO=auto)' in message
+    assert 'lacks exl3/exl3-glmf-k34, fp8/fp8-glmf' in message
+    assert not list((tmp_path / 'state').glob('*/exit'))
+    assert json.loads((tmp_path / 'state' / 'preflight.json').read_text())['status'] == 'failed'
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
+        packages=['fp8/fp8-mimof', 'exl3/exl3-glmf-k34', 'fp8/fp8-glmf'], audio=True))
+    assert rc == 0 and sorted(launched) == ['glmf-exl3-max/c', 'mimo26-flash-max/c']
+
+
+def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
+    gate = ROOT / 'scripts/bench/kits/gate'
+    state = tmp_path / 'state'
+    argv = ['--kit', str(gate), '--cards', 'qwen38-exl3-min', '--matrix', '--arm', 'c=x:s', '--state', str(state), '--preflight-only']
+    rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4']))
+    assert rc == 0 and launched == []
+    job = json.loads((state / 'qwen38-exl3-min-c-r1' / 'job.json').read_text())
+    hook = job['entry']['prelaunch']['argv']
+    assert hook[-2] == '--preflight-job' and job['entry']['prelaunch']['required'] is True
+    # At grant: same checks; a rebuilt slot (different seal) is refused.
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--preflight-job', hook[-1]])
+    assert cards.main() == 0
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot='s', seal_sha256='other', artifact_manifest_sha256='art',
+                                                                         contents=dict(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4'], audio=True))))
+    with pytest.raises(ValueError, match='sealed artifacts changed since enqueue'):
+        cards.main()
+
+
+def test_trace_is_per_job_owned_and_checked(entry, tmp_path):
+    job = cards.generate(entry, 'a', dict(instance='t', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1, trace=True)
+    trace = Path(job['state']) / 'speculation-trace.jsonl'
+    assert job['entry']['set']['SPECULATION_TRACE'] == str(trace)
+    assert job['entry']['observer']['argv'][-2] == '--observe'
+    with pytest.raises(ValueError, match='--trace owns SPECULATION_TRACE'):
+        cards.generate(entry, 'a', dict(instance='t', slot='s'), tmp_path, tmp_path / 'key', {'SPECULATION_TRACE': '/x'}, set(), None, 1, trace=True)
+    report = Path(job['state']) / 'reports' / 'one' / 'report.json'
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({'baseline': {'quality': {'checks': [], 'status': 'pass'}}}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'measurement'
+    assert 'speculation trace is empty' in row['error']
+    trace.write_text('{"type":"draft_round"}\n{"type":"draft_round"}\n')
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass' and row['trace']['records'] == 2 and row['trace']['path'] == str(trace)
+    off = cards.generate(entry, 'b', dict(instance='u', slot='s'), tmp_path, tmp_path / 'key', {'SPECULATOR': 'off'}, set(), None, 1, trace=True)
+    (Path(off['state']) / 'reports' / 'one').mkdir(parents=True)
+    (Path(off['state']) / 'reports' / 'one' / 'report.json').write_text(report.read_text())
+    row = cards.summarize_job(off, 0)
+    assert row['status'] == 'pass' and row['trace']['expected'] is False
+
+
+def test_arm_specific_config_on_one_build_end_to_end(tmp_path, monkeypatch):
+    # Two arms on one sealed build that differ only by placement (gap 5).
+    gate = ROOT / 'scripts/bench/kits/gate'
+    state = tmp_path / 'state'
+    argv = ['--kit', str(gate), '--cards', 'mimo26-flash-max', '--interleave', '--repeats', '2',
+            '--arm', 'tp2=m-a:s', '--arm', 'zero=m-b:s', '--arm-wip', 'tp2=shared', '--arm-wip', 'zero=shared',
+            '--arm-set', 'tp2:mimo26-flash-max:RTX_EXPERT_LAYERS=41', '--arm-set', 'zero:mimo26-flash-max:RTX_EXPERT_LAYERS=0',
+            '--state', str(state), '--dry-run']
+    _run_main(monkeypatch, argv)
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert [j['arm'] for j in jobs] == ['tp2', 'zero', 'zero', 'tp2']
+    for job in jobs:
+        values = cards.config(Path(job['state']) / 'base.config')
+        assert values['RTX_EXPERT_LAYERS'] == ('41' if job['arm'] == 'tp2' else '0')
+        assert values['WIP_INSTANCE'] == 'shared' and job['entry']['run_args'] == ['--wip', 's']
+    assert len({j['entry']['set']['INSTANCE'] for j in jobs}) == 4
+
+
+def test_first_real_error_wins_and_kinds_are_distinguished(entry, tmp_path):
+    job = make(entry, tmp_path)
+    dest = Path(job['state'])
+    logs = dest / 'smoke' / 'logs'
+    logs.mkdir(parents=True)
+    name = job['entry']['name']
+    (logs / (name + '.log')).write_text('starting\ndodo expert worker exited:\n'
+        'Error: audio library: /opt/cuteafd/lib/libcuteafd_native.so: undefined symbol: cuteafd_audio_required\n'
+        'error: ./run.sh exited exit status: 1 (log x)\nError response from daemon: No such container: c\n')
+    (dest / 'smoke' / 'state.json').write_text(json.dumps({name: {'status': 'failed', 'error': './run.sh exited exit status: 1 (log x)'}}))
+    job['nonce_seed'] = 'seed'
+    row = cards.summarize_job(job, 1)
+    assert row['failure_kind'] == 'launch'
+    assert row['error'] == 'dodo expert worker exited:' or 'undefined symbol: cuteafd_audio_required' in row['error']
+    assert row['errors'][0] == row['error'] and any('./run.sh exited' in e for e in row['errors'][1:])
+    # A later derived check (the prompt hash) never replaces it.
+    cards.validate_matched_pairs([{**row, 'nonce_seed': 'seed', 'state': str(dest)}], ['baseline'])
+    assert json.loads((dest / 'result.json').read_text())['error'] == row['error']
+    # Served, then a correctness check failed: quality, with the check's own words.
+    job2 = make(entry, tmp_path, arm='q', instance='q')
+    report = Path(job2['state']) / 'reports' / 'one' / 'report.json'
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({'baseline': {'quality': {'status': 'fail', 'checks': [
+        {'id': 'spec_lossless', 'status': 'fail', 'summary': 'greedy drafts-on/off token IDs differ at 12'}]}}}))
+    row = cards.summarize_job(job2, 0)
+    assert row['failure_kind'] == 'quality' and 'spec_lossless: greedy drafts-on/off token IDs differ' in row['error']
+
+
+def test_summary_md_has_before_after_ratios_and_failures(tmp_path):
+    rows = [dict(card='c', arm=arm, repeat=r, status='pass', simulated=False, C1=c1, **{'sweep C16': c16, 'post-load C1': p})
+            for r, (arm, c1, c16, p) in enumerate([('base', 100.0, 800.0, 95.0), ('cand', 110.0, 880.0, 100.0)], 1)]
+    rows[1]['repeat'] = 1
+    rows.append(dict(card='d', arm='cand', repeat=1, status='failed', simulated=False, error='undefined symbol: x', failure_kind='launch'))
+    cards.write_summary(tmp_path, rows, {'base': {}, 'cand': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert '## Before -> after' in text
+    assert '| c | C1 | 100 | 110 | 1.1 | 10 | 1 |' in text
+    assert '| c | sweep C16 | 800 | 880 | 1.1 |' in text and 'post-load C1' in text
+    assert '**d / cand / r1** (launch): undefined symbol: x' in text
