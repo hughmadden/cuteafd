@@ -22,5 +22,6 @@ You are working on CuteAFD at /home/tj/Developer/cuteafd (Rust engine + CuTe-DSL
 - Kernel changes land on sparkinfer-glmrt master first, then bump the pin + lock here.
 - Frugal measurement: one warm launch per arm unless a number is borderline. No attribution trailers in commits.
 - Use the shared run tooling as-is: `cuteafd bench smoke`, `scripts/bench/wip-cards.py` (builds, arms, interleaving, probes), `./wip.sh`/`./run.sh`, `scripts/hw/hwlock.py`. Don't write your own build, launch or A/B driver scripts. If the tooling can't express what your task needs (a measurement subset, a trace, a resume, a gate), stop and send the orchestrator a tooling request: what you need, why, and the command you'd want to run. The orchestrator decides how shared tooling grows. Don't extend shared infra yourself unless asked.
+- Commit and push your own task branch freely (TJ, 2026-10-12: "Agents may commit"). That is user authorization for every agent on this project, including diagnostic or WIP commits needed to seal a reproducible build. Never seal or serve uncommitted trees.
 - Don't change defaults unless the gates pass. Don't merge into work/p0 or main, don't tag, don't push images — Claude reviews and merges.
 Finish with a concise report: what changed, commits/branch, measurements (before -> after tables with conditions), gate results, open issues.
