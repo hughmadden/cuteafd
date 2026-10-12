@@ -266,6 +266,8 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2'}}
     arms = cards.arms_from(['base=b:s', 'candidate=c:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    # A revision whose wip.sh predates build slots keeps the outer build.lock.
+    monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
     cards.build_arms(['base=HEAD', 'candidate=HEAD'], arms, [entry, other], tmp_path, 'task', True)
     for arm in ('base', 'candidate'):
         cfg = cards.config(tmp_path / ('build-' + arm + '.config'))
@@ -484,8 +486,9 @@ def test_pool_precheck_and_red_square():
 def _wip_function(name, end):
     text = (ROOT / 'wip.sh').read_text()
     start = text.index(name)
+    helpers = text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_coordinator() {')]
     return text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3] + \
-        text[start:text.index(end, start)]
+        helpers + text[start:text.index(end, start)]
 
 
 def _trace_tools(tmp_path, extra=None):
@@ -505,8 +508,8 @@ def _trace_tools(tmp_path, extra=None):
     return tools
 
 
-def test_spark_native_phase_holds_one_fair_turn_without_locking_cargo(tmp_path):
-    function = _wip_function('build_expert() (', '\ncase "$role" in')
+def test_spark_leg_holds_one_seed_turn_for_its_whole_duration(tmp_path):
+    function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
@@ -528,13 +531,15 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
     end = lines.index('end', turn)
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
     assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 --' in lines[turn]
-    # The export runs inside the held turn; no raw flock and no gap between grant and lock.
-    assert rust < turn < native < end < finalize
+    # One fair turn on the seed covers the whole Spark leg (Cargo, export,
+    # finalize): Spark CPU work never overlaps cards serving from that host.
+    assert turn < rust < native < finalize < end
+    assert sum(line.startswith('turn ') for line in lines) == 1
     assert not any(line.startswith('flock') for line in lines)
 
 
 def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
-    function = _wip_function('build_coordinator() {', '\nbuild_expert() (')
+    function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
     setup = f'''set -euo pipefail

@@ -94,6 +94,10 @@ done
   release_die "invalid source WIP slot name: $from_slot"
 [[ "$slot" != "$from_slot" ]] || release_die "--from-slot must differ from --slot"
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
+# A fresh coordinator-only slot (0-Spark cards) touches no Spark: no Spark dev
+# image, container, process check, build or distribution.
+wip_spark_leg=1
+[[ "$role" != coordinator || -n "$from_slot" ]] || wip_spark_leg=0
 
 release_load_config "$config"
 case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
@@ -295,9 +299,14 @@ rm -f "$process_dir/$1.pid"
 CANCEL
 }
 release_configure_ssh_transport
-build_supervise 'WIP dev image' "$dev_image_logs" 0 \
-  coordinator ensure_local_image cancel_local_dev_image coordinator.log \
-  expert ensure_seed_image cancel_seed_dev_image expert.log
+if ((wip_spark_leg)); then
+  build_supervise 'WIP dev image' "$dev_image_logs" 0 \
+    coordinator ensure_local_image cancel_local_dev_image coordinator.log \
+    expert ensure_seed_image cancel_seed_dev_image expert.log
+else
+  build_supervise 'WIP dev image' "$dev_image_logs" 0 \
+    coordinator ensure_local_image cancel_local_dev_image coordinator.log
+fi
 
 # stream_between_hosts SRC SRC_CMD DST DST_CMD: SRC_CMD's stdout into DST_CMD's stdin, over
 # rdmapipe when both hosts have it, otherwise a plain ssh pipe relayed through this host (the
@@ -403,6 +412,7 @@ preflight_existing_container_images() {
     [[ "$coordinator_device" == "$RELEASE_COORDINATOR_GPU_UUID" ]] ||
       release_die "$coordinator_container is not bound to the configured physical GPU; rerun ./wip.sh --recreate"
   fi
+  ((wip_spark_leg)) || return 0
   expected="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
   for host in "${wip_hosts[@]}"; do
     actual="$(ssh -o BatchMode=yes "$host" "docker inspect -f '{{.Image}}' '$spark_container' 2>/dev/null || true")"
@@ -412,7 +422,7 @@ preflight_existing_container_images() {
 }
 
 preflight_existing_container_images
-distribute_spark_dev_image
+((wip_spark_leg == 0)) || distribute_spark_dev_image
 
 ensure_local_container() {
   local image_id container_id
@@ -552,10 +562,67 @@ docker exec "$container" mkdir -p /wip/build /wip/output /wip/slots /wip/incomin
 REMOTE
 }
 
+# Content-keyed slot reuse. The build key is the committed source tree (with
+# each submodule's pinned commit, as gitlinks in the tree), the slot's config,
+# every resolved build scope, the Spark role set and both dev images. A clean
+# checkout whose key matches a sealed slot elsewhere on these hosts adopts that
+# slot (hardlinks, seal verified, identity resealed) instead of rebuilding.
+# Dirty trees, --from-slot clones and CUTEAFD_WIP_REUSE=off always build.
+wip_build_key=""
+wip_coordinator_key=""
+wip_expert_key=""
+wip_reuse_mode="${CUTEAFD_WIP_REUSE:-on}"
+case "$wip_reuse_mode" in on|off) ;; *) release_die "CUTEAFD_WIP_REUSE must be on or off" ;; esac
+if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$from_slot" ]]; then
+  wip_build_key="$(
+    {
+      # The commit, not only its tree: the slot's BUILD_IDENTITY.json and source
+      # revision stamp name it (report footers, console). Gitlinks pin submodules.
+      printf 'schema 1\ncommit %s\ntree %s\n' "$source_revision" "$(git -C "$repo_root" rev-parse 'HEAD^{tree}')"
+      git -C "$repo_root" ls-tree -r HEAD | awk '$2 == "commit" {print $3, $4}'
+      printf 'config %s\n' "$(sha256sum "$staging_dir/cuteafd.config" | awk '{print $1}')"
+      printf 'toolchain %s caches %s\n' "$wip_toolchain_hash" "${CUTEAFD_BUILD_CACHES:-on}"
+      printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
+      for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
+        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
+        EXL3_BITS VISION_ATTENTION_AOT; do
+        local_name="CUTEAFD_WIP_$key"
+        printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
+      done
+    } | sha256sum | awk '{print $1}'
+  )"
+  # Each role's key adds the dev image that builds it.
+  wip_coordinator_key="$(printf '%s coordinator %s\n' "$wip_build_key" \
+    "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")" | sha256sum | awk '{print $1}')"
+  if ((wip_spark_leg)); then
+    wip_expert_key="$(printf '%s spark-expert %s\n' "$wip_build_key" \
+      "$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")" | sha256sum | awk '{print $1}')"
+  fi
+  echo "WIP build key: $wip_build_key (coordinator $wip_coordinator_key${wip_expert_key:+, expert $wip_expert_key})"
+fi
+
+# wip_reuse_role ROLE HOST ROOT: adopt a verified slot with this key on HOST.
+wip_reuse_role() {
+  local role="$1" host="$2" root="$3" key="$4" found
+  [[ -n "$key" ]] || return 1
+  local -a find_cmd=(python3 - find --key "$key" --role "$role" --slot "$slot" --exclude-root "$root")
+  local -a adopt_cmd=(python3 - adopt --key "$key" --role "$role" --root "$root"
+    --slot "$slot" --instance "${WIP_INSTANCE:-}" --wip-root "${WIP_ROOT:-}")
+  if [[ -z "$host" ]]; then
+    found="$("${find_cmd[@]}" <"$repo_root/scripts/build/wip-slot-reuse.py")" || return 1
+    "${adopt_cmd[@]}" --source "$found" <"$repo_root/scripts/build/wip-slot-reuse.py"
+  else
+    found="$(ssh -o BatchMode=yes "$host" "$(printf '%q ' "${find_cmd[@]}")" <"$repo_root/scripts/build/wip-slot-reuse.py")" || return 1
+    ssh -o BatchMode=yes "$host" "$(printf '%q ' "${adopt_cmd[@]}" --source "$found")" <"$repo_root/scripts/build/wip-slot-reuse.py"
+  fi
+}
+
 echo "== ensuring persistent WIP development containers =="
+wip_hosts_for_containers=("${wip_hosts[@]}")
 ensure_local_container
 remote_pids=()
-for host in "${wip_hosts[@]}"; do
+((wip_spark_leg)) || wip_hosts_for_containers=()
+for host in "${wip_hosts_for_containers[@]}"; do
   ensure_remote_container "$host" &
   remote_pids+=("$!")
 done
@@ -576,6 +643,7 @@ exit 1
 
 wip_expert_processes_active() {
   local host
+  ((wip_spark_leg)) || return 1
   for host in "${wip_hosts[@]}"; do
     if ssh -o BatchMode=yes "$host" docker exec -i "$spark_container" bash -s <<'CONTAINER'
 for pid_file in /wip/run/*.pid; do
@@ -636,6 +704,23 @@ cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
 CONTAINER
 fi
 
+# Reuse needs each role's slot on the host that builds it: raptor and the seed.
+wip_reused_coordinator=0
+wip_reused_expert=0
+if [[ -n "$wip_build_key" && "$wip_reuse_mode" == on ]]; then
+  reuse_started=$SECONDS
+  seed_wip_root=""
+  ((wip_spark_leg == 0)) ||
+    seed_wip_root="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
+  if [[ "$role" != expert ]] && wip_reuse_role coordinator "" "$(realpath "$state_dir")" "$wip_coordinator_key"; then
+    wip_reused_coordinator=1
+  fi
+  if [[ "$role" != coordinator && -n "$seed_wip_root" ]] && wip_reuse_role spark-expert "$seed_host" "$seed_wip_root" "$wip_expert_key"; then
+    wip_reused_expert=1
+  fi
+  echo "WIP phase reuse: $((SECONDS - reuse_started))s (coordinator $wip_reused_coordinator, expert $wip_reused_expert)"
+fi
+
 sync_local_source() {
   docker exec "$coordinator_container" rm -rf /wip/source.next
   docker cp -a "$staging_dir/." "$coordinator_container:/wip/source.next"
@@ -663,6 +748,96 @@ sync_seed_source() {
     "docker exec '$spark_container' rm -rf /wip/source.next && docker cp -a '$remote_staging/.' '$spark_container:/wip/source.next' && docker exec '$spark_container' bash -lc 'rm -rf /wip/source && mv /wip/source.next /wip/source'"
 }
 
+# Native/AOT outputs are cached by input key (build-wip-artifacts.sh). The
+# per-instance store is <root>/cache/native-store; the host-wide store is
+# ~/.cache/cuteafd/native-store/<arch>. Entries move between them as hardlinks
+# (same NVMe filesystem; immutable once published) and are verified against
+# their NATIVE_SHA256SUMS by the build before reuse.
+# native_store_sync HOST ROOT ARCH KEYFILE import|publish (HOST "" = local)
+native_store_sync() {
+  local host="$1" root="$2" arch="$3" output="$4" direction="$5"
+  local script='
+set -euo pipefail
+root="$1"; arch="$2"; output="$3"; direction="$4"
+[[ -s "$root/output/$output/.native-cache-key" ]] || exit 0
+read -r scope key <"$root/output/$output/.native-cache-key"
+[[ "$scope" =~ ^[a-z-]+-[0-9]+$ && "$key" =~ ^[0-9a-f]{64}$ ]] || exit 0
+local_entry="$root/cache/native-store/$scope/$key"
+global_root="$HOME/.cache/cuteafd/native-store/$arch/$scope"
+global_entry="$global_root/$key"
+if [[ "$direction" == import ]]; then
+  [[ -f "$global_entry/COMPLETE" && ! -e "$local_entry" ]] || exit 0
+  mkdir -p "$(dirname "$local_entry")"
+  stage="$local_entry.import-$$"
+  cp -al "$global_entry" "$stage" 2>/dev/null || cp -a "$global_entry" "$stage"
+  mv -T "$stage" "$local_entry" 2>/dev/null || rm -rf "$stage"
+  echo "native cache: imported $scope/$key from the host store"
+else
+  [[ -f "$local_entry/COMPLETE" && ! -e "$global_entry" ]] || exit 0
+  mkdir -p "$global_root"
+  stage="$global_root/.publish-$key-$$"
+  cp -al "$local_entry" "$stage" 2>/dev/null || cp -a "$local_entry" "$stage"
+  mv -T "$stage" "$global_entry" 2>/dev/null || rm -rf "$stage"
+  echo "native cache: published $scope/$key to the host store"
+  # Bound the host store: the most recently used entries per scope.
+  find "$global_root" -mindepth 2 -maxdepth 2 -name COMPLETE -printf "%T@ %h\n" |
+    sort -rn | tail -n +"$((${CUTEAFD_WIP_NATIVE_KEEP:-16} + 1))" | cut -d" " -f2- |
+    while IFS= read -r stale; do rm -rf "$stale"; done
+fi
+'
+  if [[ -z "$host" ]]; then
+    bash -c "$script" native-store "$root" "$arch" "$output" "$direction" || true
+  else
+    ssh -o BatchMode=yes "$host" bash -s -- "$root" "$arch" "$output" "$direction" <<<"$script" || true
+  fi
+}
+
+# native_store_has HOST ROOT OUTPUT: the per-instance store holds a complete entry
+# for the key the rust phase recorded.
+native_store_has() {
+  local probe='read -r scope key <"$1/output/$2/.native-cache-key" && test -f "$1/cache/native-store/$scope/$key/COMPLETE"'
+  if [[ -z "$1" ]]; then
+    bash -c "$probe" native-store "$2" "$3" 2>/dev/null
+  else
+    ssh -o BatchMode=yes "$1" bash -c "$(printf '%q' "$probe")" native-store "$2" "$3" 2>/dev/null
+  fi
+}
+
+# The seed Spark's lock: rhea and moa have their own; a pool Spark is under sparks.
+wip_seed_lock() {
+  case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
+}
+# A lease holds the seed's lock (one fair turn through hwlock) across the whole
+# Spark build leg: source sync, Cargo, native/export, finalize. Spark CPU work
+# would otherwise slow cards serving from that host. The holder is a background
+# hwlock child that waits on a release FIFO; the lease ends when the FIFO opens
+# for writing or the leg's shell exits.
+wip_seed_lease_acquire() {
+  local lock="$1" dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/wip-seed-lease.XXXXXXXX")"
+  mkfifo "$dir/release"
+  wip_seed_lease_dir="$dir"
+  wip_hwlock "$lock" bash -c 'printf granted >"$1/granted"; read -r _ <"$1/release"' wip-seed-lease "$dir" &
+  wip_seed_lease_pid=$!
+  while [[ ! -s "$dir/granted" ]]; do
+    if ! kill -0 "$wip_seed_lease_pid" 2>/dev/null; then
+      wait "$wip_seed_lease_pid" 2>/dev/null || true
+      rm -rf "$dir"
+      wip_seed_lease_dir=""
+      return 1
+    fi
+    sleep 1
+  done
+  export CUTEAFD_WIP_SEED_LEASE="$lock"
+}
+wip_seed_lease_release() {
+  [[ -n "${wip_seed_lease_dir:-}" ]] || return 0
+  : >"$wip_seed_lease_dir/release" 2>/dev/null || true
+  wait "$wip_seed_lease_pid" 2>/dev/null || true
+  rm -rf "$wip_seed_lease_dir"
+  wip_seed_lease_dir=""
+  unset CUTEAFD_WIP_SEED_LEASE
+}
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   sync_local_source
@@ -685,6 +860,7 @@ build_coordinator() {
   fi
   local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
+    -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" \
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
@@ -704,17 +880,44 @@ build_coordinator() {
     "$coordinator_container" \
     /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
-  if [[ "${wip_export_locks:-off}" == on ]]; then
-    # Cargo first, holding no hardware; then the native/AOT export, which
-    # queries the GPU, under a held fair turn on its lock.
-    "${coordinator_build[@]}" rust
+  # Cargo first, holding no hardware; then the native/AOT export, which
+  # queries the GPU, under a held fair turn on its lock. A native-cache hit
+  # restores verified outputs and needs no GPU, so it takes no turn.
+  # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
+  # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
+  # the GPU export, reuse and staging hold none.
+  local rust_status=0 attempt
+  # One retry: a coordinator Rust exec has twice reported 127 although the phase
+  # inside the container completed (open issue). The phase is idempotent and a
+  # retry over a fresh Cargo target takes seconds; a real compile error fails twice.
+  for attempt in 1 2; do
+    rust_status=0
+    if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+      "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust || rust_status=$?
+    else
+      "${coordinator_build[@]}" rust || rust_status=$?
+    fi
+    ((rust_status != 0 && attempt == 1)) || break
+    echo "WIP coordinator Rust phase exited $rust_status; retrying once" >&2
+    # The retry appends to the phase table, so the first attempt's time stays recorded.
+    coordinator_build=("${coordinator_build[@]:0:2}" -e CUTEAFD_WIP_PHASE_APPEND=1 "${coordinator_build[@]:2}")
+  done
+  ((rust_status == 0)) || release_die "coordinator WIP Rust phase failed (exit $rust_status)"
+  native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
+  if [[ "${wip_export_locks:-off}" != on ]]; then
+    "${coordinator_build[@]}" native
+  elif native_store_has "" "${state_dir:-/nonexistent}" coordinator; then
+    echo "WIP coordinator export: native cache hit, no GPU turn"
+    # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
+    docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
+      release_die "coordinator WIP native restore failed"
+  else
     echo "WIP coordinator export: queueing for $wip_export_gpu_lock"
     wip_hwlock "$wip_export_gpu_lock" "${coordinator_build[@]}" native ||
       release_die "coordinator WIP export failed or got no fair turn on $wip_export_gpu_lock"
-  else
-    "${coordinator_build[@]}"
   fi
-  docker exec "$coordinator_container" \
+  native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
+  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
     "$COORDINATOR_DOCKER_DEV" "$image_id"
@@ -722,6 +925,16 @@ build_coordinator() {
 
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    local seed_lock
+    seed_lock="$(wip_seed_lock "$seed_host")"
+    echo "WIP Spark leg: queueing for $seed_lock (held for the whole leg on $seed_host)"
+    local lease_started=$SECONDS
+    wip_seed_lease_acquire "$seed_lock" ||
+      release_die "Spark WIP leg on $seed_host got no fair turn on $seed_lock"
+    trap wip_seed_lease_release EXIT
+    echo "WIP phase expert seed-lock-wait: $((SECONDS - lease_started))s"
+  fi
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
@@ -743,37 +956,64 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
-  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust"
-  if [[ "${wip_export_locks:-off}" == on ]]; then
-    # The export holds the seed's lock (raptor-side) under one held fair turn:
-    # no gap between the queue grant and the flock for another job to enter.
-    local spark_lock
-    case "$seed_host" in rhea|moa) spark_lock="$seed_host" ;; *) spark_lock=sparks ;; esac
-    echo "WIP Spark export: queueing for $spark_lock"
-    wip_hwlock "$spark_lock" timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
-      release_die "Spark WIP export on $seed_host failed or got no fair turn on $spark_lock"
-  else
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
+    release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
+  local seed_root
+  seed_root="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
+  native_store_sync "$seed_host" "$seed_root" aarch64 expert import
+  if [[ "${wip_export_locks:-off}" != on ]]; then
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
+  elif native_store_has "$seed_host" "$seed_root" expert; then
+    echo "WIP Spark export: native cache hit, no lock turn"
+    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native" ||
+      release_die "Spark WIP native restore on $seed_host failed"
+  else
+    # The leg's lease already holds the seed's lock: the export runs inside it.
+    echo "WIP Spark export: inside the ${CUTEAFD_WIP_SEED_LEASE:-seed} lease"
+    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
+      release_die "Spark WIP export on $seed_host failed"
   fi
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
+  native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
 )
 
-case "$role" in
+wip_build_coordinator=0
+wip_build_expert=0
+[[ "$role" == expert || "$wip_reused_coordinator" == 1 ]] || wip_build_coordinator=1
+[[ "$role" == coordinator || "$wip_reused_expert" == 1 ]] || wip_build_expert=1
+wip_build_roles=none
+((wip_build_coordinator == 0)) || wip_build_roles=coordinator
+((wip_build_expert == 0)) || wip_build_roles=expert
+((wip_build_coordinator == 0 || wip_build_expert == 0)) || wip_build_roles=both
+case "$wip_build_roles" in
   coordinator) build_coordinator ;;
   expert) build_expert ;;
   both)
-    build_coordinator &
+    # The coordinator leg records its own exit status: a `wait` that returns
+    # early (seen when the Spark leg finished first) must not be read as the
+    # leg's result while it is still running.
+    coordinator_status_file="$(mktemp "${TMPDIR:-/tmp}/wip-coordinator-status.XXXXXXXX")"
+    ( set +e; ( build_coordinator ); printf '%s\n' "$?" >"$coordinator_status_file" ) &
     coordinator_build_pid=$!
+    wip_wait_coordinator() {
+      local status
+      wait "$coordinator_build_pid" 2>/dev/null || true
+      while kill -0 "$coordinator_build_pid" 2>/dev/null; do sleep 2; done
+      status="$(cat "$coordinator_status_file" 2>/dev/null || true)"
+      rm -f "$coordinator_status_file"
+      [[ "$status" == 0 ]] || { echo "coordinator WIP leg exited ${status:-without a status}" >&2; return 1; }
+    }
     if ! build_expert; then
-      wait "$coordinator_build_pid" || true
+      wip_wait_coordinator || true
       release_die "Spark WIP build failed"
     fi
-    wait "$coordinator_build_pid" || release_die "coordinator WIP build failed"
+    wip_wait_coordinator || release_die "coordinator WIP build failed"
     ;;
+  none) echo "WIP slot $slot: every role reused; nothing to build" ;;
 esac
 
 # A named slot is launchable only when both role artifacts are present. A
@@ -828,10 +1068,17 @@ distribute_expert_slot() {
   ssh -o BatchMode=yes "$seed_host" \
     "docker exec '$spark_container' test -s '/wip/slots/$slot/spark-expert/FINGERPRINT'" ||
     return 0
-  echo "== concurrently distributing Spark WIP slot $slot from $seed_host =="
-  local -a pids=()
-  local host
+  local seed_fingerprint host
+  local -a targets=()
+  seed_fingerprint="$(ssh -o BatchMode=yes "$seed_host" "docker exec '$spark_container' cat '/wip/slots/$slot/spark-expert/FINGERPRINT'")"
   for host in "${wip_target_hosts[@]}"; do
+    [[ "$(ssh -o BatchMode=yes "$host" "docker exec '$spark_container' cat '/wip/slots/$slot/spark-expert/FINGERPRINT' 2>/dev/null" || true)" == "$seed_fingerprint" ]] ||
+      targets+=("$host")
+  done
+  ((${#targets[@]})) || { echo "Spark WIP slot $slot is already on every target host"; return 0; }
+  echo "== concurrently distributing Spark WIP slot $slot from $seed_host to ${targets[*]} =="
+  local -a pids=()
+  for host in "${targets[@]}"; do
     (
       set -o pipefail
       ssh -o BatchMode=yes "$host" \
@@ -854,7 +1101,7 @@ distribute_expert_slot() {
   done
 }
 
-distribute_expert_slot
+((wip_spark_leg == 0)) || distribute_expert_slot
 release_record_wip_slot "$slot"
 if [[ "$role" == both || -n "$from_slot" ]]; then
   echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip '$slot' --restart"

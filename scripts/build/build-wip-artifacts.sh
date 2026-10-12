@@ -8,6 +8,8 @@ usage() {
 
 [[ $# -eq 5 || $# -eq 6 ]] || usage
 phase="${6:-all}"
+# Name the failing line and command: a container exec only reports an exit code.
+trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
 case "$phase" in all|rust|native) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
 role="$2"
@@ -160,7 +162,45 @@ fi
 [[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
 [[ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]] || unset CMAKE_BUILD_PARALLEL_LEVEL
 rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"
+wip_phase_log="$output_dir/BUILD_PHASES.tsv"
+wip_phase_mark() {
+  # PHASE SECONDS [DETAIL]: one row per completed phase, read by finalize-wip-slot.sh.
+  printf '%s\t%s\t%s\t%s\n' "$role" "$1" "$2" "${3:-}" >>"$wip_phase_log"
+  printf 'WIP phase %s %s: %ss%s\n' "$role" "$1" "$2" "${3:+ ($3)}"
+}
+# A fresh build starts the table; the native phase and a retried Rust phase append.
+[[ "$phase" == native || "${CUTEAFD_WIP_PHASE_APPEND:-0}" == 1 ]] || : >"$wip_phase_log"
+
+# Native outputs (library, AOT exports, packages, manifests) are a pure function
+# of their inputs: native/, python/, the build helpers, the pinned submodule
+# trees, every scope switch, role, architecture and the dev toolchain. A hit
+# restores the previous outputs and skips CMake and every GPU export; Cargo
+# still builds the daemon. The store is shared by instances on this host.
+# wip.sh imports and publishes entries between this per-instance store
+# (/wip/cache/native-store, on the host's NVMe build root) and the host-wide
+# ~/.cache/cuteafd/native-store/<arch>, by hardlink, so instances share them.
+native_store_root="${CUTEAFD_WIP_NATIVE_STORE:-$(dirname "$build_dir")/../cache/native-store}"
+native_store_root="$(realpath -m "$native_store_root")"
+native_items=(libcuteafd_native.so PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)
+wip_native_key() {
+  {
+    printf 'schema 1\nrole %s\narch %s %s\n' "$role" "$cuda_arch" "$(uname -m)"
+    # The dev image (wip.sh passes its ID) fixes CUDA, CuTe-DSL, Triton and torch.
+    printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
+    # Every scope switch that reaches CMake or an exporter.
+    env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
+      grep -vE '^CUTEAFD_WIP_(EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
+      LC_ALL=C sort
+    printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
+    # Pinned submodule trees by their verified lock digests (sparkinfer, xgrammar,
+    # transformers), then every native, exporter and build-helper file.
+    cat "$source_dir/third_party/"*.lock.json
+    (cd "$source_dir" && find native python scripts/build -type f ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 |
+      LC_ALL=C sort -z | xargs -0 sha256sum)
+  } | sha256sum | awk '{print $1}'
+}
 if [[ "$phase" != native ]]; then
+  rust_started=$SECONDS
   cargo build \
     --locked \
     --quiet \
@@ -168,12 +208,48 @@ if [[ "$phase" != native ]]; then
     -p cuteafd-daemon \
     --release
   printf '%s' "$wip_rust_fingerprint" >"$rust_phase_marker"
-  [[ "$phase" != rust ]] || exit 0
+  wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]] && echo ' fallback')"
 else
   [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd" ]] ||
     { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }
 fi
 
+native_key=""
+native_entry=""
+native_hit=0
+if [[ "${CUTEAFD_WIP_NATIVE_CACHE:-on}" == on && "${CUTEAFD_BUILD_CACHES:-on}" != off && -n "${CUTEAFD_WIP_DEV_IMAGE_ID:-}" ]]; then
+  native_key_started=$SECONDS
+  native_key="$(wip_native_key)"
+  native_entry="$native_store_root/$role-$cuda_arch/$native_key"
+  if [[ -f "$native_entry/COMPLETE" ]] && (cd "$native_entry/output" && sha256sum --quiet --strict -c ../NATIVE_SHA256SUMS); then
+    native_hit=1
+  fi
+  [[ "$phase" == native ]] ||
+    wip_phase_mark native-key $((SECONDS - native_key_started)) "$native_key $([[ $native_hit == 1 ]] && echo hit || echo miss)"
+fi
+# wip.sh reads this after the rust phase: a hit needs no GPU turn for the native phase.
+# The key is written even on a miss, so wip.sh can import a host-wide entry.
+rm -f "$output_dir/.native-cache-hit" "$output_dir/.native-cache-key"
+[[ -z "$native_key" ]] || printf '%s %s\n' "$role-$cuda_arch" "$native_key" >"$output_dir/.native-cache-key"
+((native_hit == 0)) || printf '%s\n' "$native_key" >"$output_dir/.native-cache-hit"
+if [[ "$phase" == native && "${CUTEAFD_WIP_NATIVE_REQUIRE_HIT:-0}" == 1 ]] && ((native_hit == 0)); then
+  echo 'native cache entry disappeared; the native phase needs its GPU turn' >&2
+  exit 3
+fi
+[[ "$phase" != rust ]] || exit 0
+
+native_started=$SECONDS
+# The output holds exactly this build's native files: no package from an earlier
+# build's scopes survives into the slot.
+for item in "${native_items[@]}"; do rm -rf "${output_dir:?}/$item"; done
+if ((native_hit)); then
+  echo "WIP native outputs: reusing $native_entry (no CMake, no export)"
+  # Only native files are restored: the daemon and its provenance come from Cargo.
+  cp -a "$native_entry/output/." "$output_dir/"
+  touch "$native_entry/COMPLETE"
+  # The build tree is untouched: keep its native fingerprint, record the new Rust one.
+  printf '%s %s' "$wip_rust_fingerprint" "$wip_previous_native" >"$wip_fingerprint_marker"
+else
 # Cargo is complete before GPU admission. Current wip.sh runs this native phase
 # under a held fair turn on the host (CUTEAFD_WIP_HOST_EXPORT_TURN) and passes
 # CUTEAFD_WIP_EXPORT_LOCKS=off; the in-container flock below only serves older
@@ -235,13 +311,6 @@ for export_lock_fd in "${export_lock_fds[@]}"; do
 done
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
-install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
-if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
-  python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
-    "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
-elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
-  rm -f "$output_dir/COMPILER_PROVENANCE.json"
-fi
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 # The coordinator program manifest (DeepSeek V4, GLM, GLM Flash, MiMo, Qwen; an empty table
 # when none was built), as the release images carry it at /opt/cuteafd/share/PROGRAMS.json:
@@ -323,12 +392,46 @@ if [[ "$coordinator_aot" == ON ]]; then
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
+fi
+install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
+if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
+    "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
+elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
+  rm -f "$output_dir/COMPILER_PROVENANCE.json"
+fi
 # Generic-family tables must come from this build, not an earlier role/opt-in.
-if [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF}" == *ON* ]]; then
+# A native-cache hit restored the table with the rest of the native outputs.
+if ((${native_hit:-0})); then
+  :
+elif [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF}" == *ON* ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"
 fi
+# Publish this build's native outputs for the next build with the same key.
+if [[ -n "${native_key:-}" ]] && ((${native_hit:-0} == 0)); then
+  native_stage="$native_store_root/$role-$cuda_arch/.stage-$native_key-$$"
+  rm -rf "$native_stage"
+  mkdir -p "$native_stage/output"
+  for item in "${native_items[@]}"; do
+    [[ ! -e "$output_dir/$item" ]] || cp -a "$output_dir/$item" "$native_stage/output/"
+  done
+  (cd "$native_stage/output" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >../NATIVE_SHA256SUMS)
+  printf '%s\n' "$native_key" >"$native_stage/COMPLETE"
+  if [[ -e "$native_entry" ]]; then
+    rm -rf "$native_stage"  # another build published the same key first
+  else
+    mv -T "$native_stage" "$native_entry" 2>/dev/null || rm -rf "$native_stage"
+  fi
+  # Keep the most recently used entries per role and architecture.
+  find "$native_store_root/$role-$cuda_arch" -mindepth 2 -maxdepth 2 -name COMPLETE -printf '%T@ %h\n' |
+    sort -rn | tail -n +"$((${CUTEAFD_WIP_NATIVE_KEEP:-16} + 1))" | cut -d' ' -f2- |
+    while IFS= read -r stale; do rm -rf "$stale"; done
+fi
+[[ -z "${native_started:-}" ]] ||
+  wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)"
+
 (
   cd "$output_dir"
   sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS

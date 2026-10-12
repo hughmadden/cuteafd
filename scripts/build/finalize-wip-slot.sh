@@ -14,6 +14,7 @@ image="$5"
 image_id="$6"
 wip_instance="${WIP_INSTANCE:-}"
 wip_root="${WIP_ROOT:-}"
+wip_build_key="${CUTEAFD_WIP_BUILD_KEY:-}"
 [[ "$role" == coordinator || "$role" == spark-expert ]] || {
   echo "invalid WIP role: $role" >&2
   exit 2
@@ -114,6 +115,19 @@ metadata = {
     "v41_expert_tp_manifest_sha256": hashlib.sha256(tp_manifest_bytes).hexdigest(),
     "built_unix": int(time.time()),
 }
+# Build key (wip.sh: source tree + scopes + toolchain) and per-phase timings,
+# when the caller recorded them; older callers leave both absent.
+build_key = ${wip_build_key@Q}
+if build_key:
+    metadata["build_key"] = build_key
+phases_path = pathlib.Path(${build_output@Q}) / "BUILD_PHASES.tsv"
+if phases_path.is_file():
+    phases = []
+    for line in phases_path.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2].isdigit():
+            phases.append({"role": parts[0], "phase": parts[1], "seconds": int(parts[2]), "detail": parts[3] if len(parts) > 3 else ""})
+    metadata["build_phases"] = phases
 path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 PY
 sha256sum "$incoming/META.json" | awk '{print $1}' >"$incoming/FINGERPRINT"
