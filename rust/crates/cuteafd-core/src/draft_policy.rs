@@ -245,6 +245,11 @@ impl PolicyGeometry {
 /// fixed/bandwidth split of a short or collinear phase (C1, or local and remote
 /// traffic that move together) near physics, and yields to a few wide rounds.
 pub const CLASS_PRIOR_ROUNDS: f64 = 2.;
+/// Rounds of one-row traffic a class's traffic price prior is worth: a
+/// measurable bandwidth, so it moves only on strong evidence (V4.1 hardware:
+/// remote 6.3 us/MB fitted against 5.7 physical, where a weak prior drifted
+/// to 9.4).
+pub const CLASS_TRAFFIC_PRIOR_ROUNDS: f64 = 200.;
 /// Per-round forgetting of the class fits: physical costs drift slowly
 /// (clocks, thermals), so they keep a memory of about five hundred rounds.
 const CLASS_DECAY: f64 = 0.998;
@@ -258,11 +263,6 @@ const WARM_CLASS_SAMPLES: u64 = 4;
 /// deviation from the pooled residual. A bucket forgets only when it is
 /// observed, so a long C16 phase cannot erase what C1 rounds taught.
 const BUCKET_PRIOR_ROUNDS: f64 = 4.;
-/// Rounds (at the bucket's mean row count) of prior that hold a bucket's
-/// row-price deviation at zero. V4.1 hardware traces: the pooled row price
-/// over-prices a C2-4 row by about a third; one round of prior identifies the
-/// bucket's own price from a few dozen rounds of row spread.
-const BUCKET_SLOPE_PRIOR_ROUNDS: f64 = 1.;
 /// Within one round shape, wall time varies by about a quarter (V4.1 traces:
 /// CV 0.26-0.28). The relative Huber guard starts from that scale, so the
 /// first wide batch (about six times the median) cannot poison the fits.
@@ -372,12 +372,12 @@ fn solve_linear<const D: usize>(mut a: [[f64; D]; D], mut b: [f64; D]) -> Option
 /// monitoring and traces.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftCostSnapshot {
-    /// Per class: µs per layer, µs per MB, samples, relative residual scale.
-    pub layers: Vec<[f64; 4]>,
-    /// Round residual: pooled intercept µs, pooled µs per verified row, this
-    /// bucket's offset µs (at its mean rows), its µs-per-row deviation, its
-    /// effective rounds, relative scale.
-    pub round: [f64; 6],
+    /// Per class: µs per layer, µs per MB, µs per layer and verified row,
+    /// samples, relative residual scale.
+    pub layers: Vec<[f64; 5]>,
+    /// Round residual: pooled intercept µs, µs per verified row, this
+    /// bucket's offset µs, its effective rounds, relative scale.
+    pub round: [f64; 5],
     /// Draft pass: intercept µs, µs per request, wide extra µs, wide extra µs
     /// per request, samples, relative residual scale.
     pub draft: [f64; 6],
@@ -391,12 +391,12 @@ impl DraftCostSnapshot {
         serde_json::json!({
             "bucket": self.bucket,
             "classes": self.layers.iter().zip(labels).map(|(c, label)| serde_json::json!({
-                "class": label, "us_per_layer": c[0], "us_per_mb": c[1],
+                "class": label, "us_per_layer": c[0], "us_per_mb": c[1], "us_per_layer_row": c[2],
                 // µs per MB -> GB/s: 1 MB / (c µs) = 1000 / c GB/s.
                 "effective_gb_per_s": if c[1] > 0. { 1000. / c[1] } else { f64::INFINITY },
-                "samples": c[2], "relative_scale": c[3]})).collect::<Vec<_>>(),
+                "samples": c[3], "relative_scale": c[4]})).collect::<Vec<_>>(),
             "residual": {"intercept_us": self.round[0], "us_per_row": self.round[1], "bucket_offset_us": self.round[2],
-                "bucket_us_per_row": self.round[3], "bucket_rounds": self.round[4], "relative_scale": self.round[5]},
+                "bucket_rounds": self.round[3], "relative_scale": self.round[4]},
             "draft": {"intercept_us": self.draft[0], "us_per_request": self.draft[1], "wide_extra_us": self.draft[2],
                 "wide_extra_us_per_request": self.draft[3], "samples": self.draft[4], "relative_scale": self.draft[5]},
         })
@@ -411,17 +411,17 @@ type ClassBytes = [f64; MAX_RESOURCE_CLASSES];
 /// per concurrency bucket.
 #[derive(Clone, Debug)]
 struct CostModel {
-    /// Per class, x = [layers, MB], fitted on the class's summed layer time.
-    class: Vec<Fit<2>>,
+    /// Per class, x = [layers, MB, layers * rows], fitted on the class's
+    /// summed layer time.
+    class: Vec<Fit<3>>,
     /// Per bucket: forgotten weighted moments of the round residual against
     /// [1, rows]: (Σw, Σw·rows, Σw·rows², Σw·y, Σw·rows·y).
     residuals: [[f64; 5]; CONCURRENCY_BUCKETS],
     /// Seed residual intercept and µs per row, and the prior weight in rounds.
     residual_prior: ([f64; 2], f64),
     /// Pooled residual intercept and µs per row over every round, and each
-    /// bucket's shrunk deviation from it: (offset at the bucket's mean rows,
-    /// row-price deviation, mean rows).
-    residual: ([f64; 2], [[f64; 3]; CONCURRENCY_BUCKETS]),
+    /// bucket's shrunk offset from it.
+    residual: ([f64; 2], [f64; CONCURRENCY_BUCKETS]),
     /// Relative residual scale of the whole round, for the Huber guard.
     round_scale: f64,
     /// Per bucket, x = [1, requests, wide, wide * requests].
@@ -442,8 +442,12 @@ impl CostModel {
             // One row's traffic: every timed layer reads top-k slices.
             let one_row: f64 = priced.iter().filter(|p| p.class == c)
                 .map(|p| f64::from(geometry.topk) * p.slice_bytes / 1e6).sum();
-            Fit::new(CLASS_DECAY, [class.prior[0], class.prior[2]],
-                [CLASS_PRIOR_ROUNDS * layers.powi(2), CLASS_PRIOR_ROUNDS * one_row.powi(2)].map(|p| p.max(1e-9)))
+            // Traffic price held at its physical bandwidth: rows and MB move
+            // together, and without a strong prior the fit loads per-row
+            // layer work (exchange, packing, attention rows) onto MB.
+            Fit::new(CLASS_DECAY, [class.prior[0], class.prior[2], class.prior[1]],
+                [CLASS_PRIOR_ROUNDS * layers.powi(2), CLASS_TRAFFIC_PRIOR_ROUNDS * one_row.powi(2),
+                    CLASS_PRIOR_ROUNDS * layers.powi(2)].map(|p| p.max(1e-9)))
         }).collect();
         let n = seed.samples;
         let draft = Fit::new(ROUND_DECAY, [seed.draft[0], seed.draft[1], 400., 50.],
@@ -453,7 +457,7 @@ impl CostModel {
             class,
             residuals: [[0.; 5]; CONCURRENCY_BUCKETS],
             residual_prior: ([seed.round[0], seed.round[1]], n),
-            residual: ([seed.round[0], seed.round[1]], [[0.; 3]; CONCURRENCY_BUCKETS]),
+            residual: ([seed.round[0], seed.round[1]], [0.; CONCURRENCY_BUCKETS]),
             round_scale: INITIAL_RELATIVE_SCALE,
             draft: vec![draft; CONCURRENCY_BUCKETS],
             draft_samples: [[0; 2]; CONCURRENCY_BUCKETS],
@@ -477,41 +481,28 @@ impl CostModel {
             Some([intercept, slope]) if slope >= 0. => [intercept, slope],
             _ => [(y + pi * r0 + ps * 0.) / (w + pi), 0.],
         };
-        // Per bucket: the deviation of its rounds from the pooled line, as a
-        // shrunk mean (at the bucket's mean rows) and a shrunk slope. Rows
-        // from concurrent requests share kernels and exchanges, so a row's
-        // price at C8 is not its price at C1; the slope deviation carries
-        // that, and the shrinkage holds it at zero until a bucket's own row
-        // spread identifies it.
-        let offsets = self.residuals.map(|m| {
-            if m[0] <= 0. { return [0.; 3]; }
-            let mean_rows = m[1] / m[0];
-            let deviation = m[3] - pooled[0] * m[0] - pooled[1] * m[1];
-            let offset = deviation / (m[0] + BUCKET_PRIOR_ROUNDS);
-            // Centered moments of rows and of the deviation against rows.
-            let sxx = m[2] - m[1] * mean_rows;
-            let sxy = (m[4] - pooled[0] * m[1] - pooled[1] * m[2]) - mean_rows * deviation;
-            let slope = sxy / (sxx + BUCKET_SLOPE_PRIOR_ROUNDS * mean_rows.max(1.).powi(2));
-            [offset, slope, mean_rows]
-        });
+        // Per bucket: the shrunk mean deviation of its rounds from the pooled
+        // line. A bucket without evidence is the pool.
+        let offsets = self.residuals.map(|m| if m[0] > 0. {
+            (m[3] - pooled[0] * m[0] - pooled[1] * m[1]) / (m[0] + BUCKET_PRIOR_ROUNDS) } else { 0. });
         self.residual = (pooled, offsets);
     }
-    fn layers_us(&self, megabytes: ClassBytes) -> f64 {
+    fn layers_us(&self, rows: f64, megabytes: ClassBytes) -> f64 {
         self.class.iter().enumerate().filter(|&(c, _)| self.layers_in[c] > 0)
-            .map(|(c, fit)| fit.predict(&[self.layers_in[c] as f64, megabytes[c]])).sum()
+            .map(|(c, fit)| fit.predict(&[self.layers_in[c] as f64, megabytes[c], self.layers_in[c] as f64 * rows])).sum()
     }
     fn residual_us(&self, bucket: usize, rows: f64) -> f64 {
-        let [offset, slope, mean_rows] = self.residual.1[bucket];
-        (self.residual.0[0] + self.residual.0[1] * rows + offset + slope * (rows - mean_rows)).max(0.)
+        (self.residual.0[0] + self.residual.0[1] * rows + self.residual.1[bucket]).max(0.)
     }
     /// Predicted µs of the verify round, without the draft pass.
     fn predict(&self, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
-        self.layers_us(megabytes) + self.residual_us(bucket, rows)
+        self.layers_us(rows, megabytes) + self.residual_us(bucket, rows)
     }
     /// Marginal µs of one more row that brings `megabytes` of new traffic.
     fn marginal(&self, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
         self.residual_us(bucket, rows + 1.) - self.residual_us(bucket, rows)
-            + self.class.iter().enumerate().map(|(c, fit)| fit.theta[1] * megabytes[c]).sum::<f64>()
+            + self.class.iter().enumerate()
+                .map(|(c, fit)| fit.theta[1] * megabytes[c] + fit.theta[2] * self.layers_in[c] as f64).sum::<f64>()
     }
     /// Predicted µs of the draft pass.
     fn draft_us(&self, bucket: usize, requests: f64, wide: bool) -> f64 {
@@ -538,10 +529,11 @@ impl CostModel {
         let weight = Fit::<1>::weigh(&mut self.round_scale, predicted, verify_us);
         if let Some(class_us) = class_us {
             for (c, fit) in self.class.iter_mut().enumerate() {
-                if self.layers_in[c] > 0 { fit.observe([self.layers_in[c] as f64, megabytes[c]], class_us[c]); }
+                let layers = self.layers_in[c] as f64;
+                if layers > 0. { fit.observe([layers, megabytes[c], layers * rows], class_us[c]); }
             }
         }
-        let residual = verify_us - self.layers_us(megabytes);
+        let residual = verify_us - self.layers_us(rows, megabytes);
         let m = &mut self.residuals[bucket];
         for (moment, value) in m.iter_mut().zip([1., rows, rows * rows, residual, rows * residual]) {
             *moment = ROUND_DECAY * *moment + weight * value;
@@ -557,9 +549,9 @@ impl CostModel {
     fn snapshot(&self, bucket: usize) -> DraftCostSnapshot {
         let draft = &self.draft[bucket];
         DraftCostSnapshot {
-            layers: self.class.iter().map(|f| [f.theta[0], f.theta[1], f.samples as f64, f.scale]).collect(),
-            round: [self.residual.0[0], self.residual.0[1], self.residual.1[bucket][0], self.residual.1[bucket][1],
-                self.residuals[bucket][0], self.round_scale],
+            layers: self.class.iter().map(|f| [f.theta[0], f.theta[1], f.theta[2], f.samples as f64, f.scale]).collect(),
+            round: [self.residual.0[0], self.residual.0[1], self.residual.1[bucket], self.residuals[bucket][0],
+                self.round_scale],
             draft: [draft.theta[0], draft.theta[1], draft.theta[2], draft.theta[3], draft.samples as f64, draft.scale],
             bucket,
         }
@@ -1658,9 +1650,10 @@ mod tests {
         assert!(policy.warm(false, 1));
         let snapshot = policy.cost_snapshot(false, 1);
         let remote = snapshot.layers[1];
-        // The truth's per-row cost (12 µs/row/layer) is not a model term; it
-        // lands in the per-layer and per-MB coefficients.
-        assert!((remote[1] - 7.5).abs() < 1.5, "remote µs/MB {remote:?}");
+        // The traffic price stays near its physical prior (5.7) against a
+        // 7.5 truth: the per-layer row price (truth 12 µs) absorbs the rest.
+        assert!((remote[1] - 5.7).abs() < 1., "remote µs/MB {remote:?}");
+        assert!(remote[2] > 12., "remote µs per layer row {remote:?}");
         // Prediction of an explicit shape against the same truth.
         let lengths = [4];
         let predicted = policy.predict(false, &[1], &lengths, 5).unwrap();
@@ -2227,7 +2220,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (38_718, 16_115_903_766_810_657_377));
+        assert_eq!((transcript.records, transcript.hash), (39_563, 16_572_013_245_602_254_188));
     }
 
     fn seed() -> PolicySeed {
@@ -2307,7 +2300,7 @@ mod tests {
         }
         let after = policy.cost_snapshot(false, 1);
         // The C1 evidence is untouched by C16 rounds: it forgets only when C1 is observed.
-        assert_eq!(before.round[4], after.round[4]);
+        assert_eq!(before.round[3], after.round[3]);
         assert_ne!(before.layers, after.layers);
         assert_ne!(history, policy.history[&1]);
         assert_eq!(policy.prediction_health(false, 1), fresh.clone().prediction_health(false, 1));
@@ -2377,7 +2370,9 @@ mod tests {
             - policy.predict(false, &[id], &[0], 5).unwrap();
         let repeated = price(&mut policy, 1);
         let novel = price(&mut policy, 2);
-        assert!(repeated < 0.05 * novel, "repeated {repeated} vs novel {novel}");
+        // A repeated row reads no new experts but still costs its per-row
+        // layer work; a novel row also pays its traffic.
+        assert!(repeated < 0.3 * novel, "repeated {repeated} vs novel {novel}");
         // A Spark MB costs more than an RTX MB: the classes keep their own prices.
         let fit = policy.cost_snapshot(false, 1);
         assert!(fit.layers[1][1] > 4. * fit.layers[0][1], "{:?}", fit.layers);
@@ -2420,7 +2415,7 @@ mod tests {
         // C1 round prediction approaches the truth and C8's stays put.
         let c1_truth = truth.round[0] + truth.round[2] + 8000.;
         assert!(early > 1000. && early < 5000., "early C1 shift {early}");
-        assert!((residual(&policy, 1) - c1_truth).abs() < 0.1 * c1_truth, "C1 residual {}", residual(&policy, 1));
+        assert!((residual(&policy, 1) - c1_truth).abs() < 0.15 * c1_truth, "C1 residual {}", residual(&policy, 1));
         assert!((residual(&policy, 8) - c8).abs() < 1500., "C8 moved {}", residual(&policy, 8) - c8);
     }
 

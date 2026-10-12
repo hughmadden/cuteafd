@@ -450,7 +450,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
             geometry.classes.get(usize::from(k)).is_some_and(|g| g.label == class.label))).count(),
         "us_per_layer": c[0], "us_per_mb": c[1],
         "effective_gb_per_s": if c[1] > 0. { 1000. / c[1] } else { f64::INFINITY },
-        "samples": c[2], "relative_scale": c[3],
+        "us_per_layer_row": c[2], "samples": c[3], "relative_scale": c[4],
     })).collect();
     let calibration = policy.calibration();
     let reliability: Vec<_> = (0..stats.position_reached.len()).map(|p| serde_json::json!({
@@ -491,7 +491,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         },
         "layers": classes,
         "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
-            "bucket_offset_us": snapshot.round[2], "bucket_us_per_row": snapshot.round[3], "bucket_rounds": snapshot.round[4] },
+            "bucket_offset_us": snapshot.round[2], "bucket_rounds": snapshot.round[3] },
         "draft": { "intercept_us": snapshot.draft[0], "us_per_request": snapshot.draft[1],
             "samples": snapshot.draft[4] },
         "route_ring_check": ring.map(|(layers, mismatched)| serde_json::json!({"layers": layers, "mismatched": mismatched})),
