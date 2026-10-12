@@ -930,6 +930,11 @@ if [[ $family == glm5_flash ]]; then
     on) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_TRACE=1") ;;
     *) echo "GLM5_FLASH_DRAFT_TRACE must be on or off" >&2; exit 2 ;;
   esac
+  remote_drafter="$(get GLM5_FLASH_REMOTE_DRAFTER)"
+  case "$remote_drafter" in
+    ""|on|off) ;;
+    *) echo "GLM5_FLASH_REMOTE_DRAFTER must be on or off" >&2; exit 2 ;;
+  esac
   spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
   if [[ -n "$spec_tau" ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
@@ -963,7 +968,12 @@ case "$family" in
     if [[ "${CUTEAFD_GLMF_PREFILL_LANES:-}" == 1 ]]; then rdma_endpoints=1; fi
     [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES")
     # Planner and server must offer the same conditional drafter homes.
-    [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
+    # Explicit config overrides the legacy process-wide diagnostic switch.
+    case "$remote_drafter" in
+      on) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=1) ;;
+      off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
+      "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
+    esac ;;
   qwen4) rdma_endpoints=1 ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"

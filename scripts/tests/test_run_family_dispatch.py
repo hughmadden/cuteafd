@@ -1024,6 +1024,7 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "GLM5_FLASH_DRAFT_TRACE must be"),
+    ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
@@ -2026,6 +2027,24 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
     if kind != "off":
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("setting,value,legacy", [("on", "1", "0"), ("off", "0", "1")])
+def test_glmf_remote_drafter_config_overrides_env_for_plan_and_server(tmp_path, setting, value, legacy):
+    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REMOTE_DRAFTER={setting}\n",
+                                  encoder_plan=plan, extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": legacy})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    server = next(line for line in lines if "cuteafd serve-glmf" in line)
+    for command in (planner, server):
+        assert command.count("-e CUTEAFD_GLMF_REMOTE_DFLASH=") == 1, command
+        assert f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}" in command, command
+    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
 
 
 @pytest.mark.parametrize("value", ["", "0", "1"])
