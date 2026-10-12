@@ -192,8 +192,10 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     trim = serve[serve.index("        let mut sequences: Vec<Vec<u32>>"):serve.index("        let starts: Vec<usize>")]
     assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
     assert "Drafts::Copy" not in serve
-    assert serve.index("crate::shared::draft::copy::extension(") < serve.index("let mut sequences: Vec<Vec<u32>>")
-    assert "resource::select_drafted(" in serve
+    copy = serve.index("resource::copy_continuation(")
+    select = serve.index("resource::select_drafted(", copy)
+    substitute = serve.index("*proposal = copy.tokens;", select)
+    assert copy < select < substitute < serve.index("let mut sequences: Vec<Vec<u32>>")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route

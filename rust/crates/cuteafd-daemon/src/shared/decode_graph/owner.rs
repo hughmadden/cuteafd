@@ -46,8 +46,11 @@ mod tests {
             drop(Wave { _storage: Storage });
             return;
         }
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["shared::decode_graph::owner::tests::failed_drop_drain_aborts_before_field_release", "--exact"])
+        // Only the intentional abort child disables core dumps; keep its signal observable.
+        let mut command = std::process::Command::new("bash");
+        command.args(["-ec", "ulimit -c 0; exec \"$@\"", "fatal-drain-child"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["shared::decode_graph::owner::tests::failed_drop_drain_aborts_before_field_release", "--exact"])
             .env(CHILD, "1");
         let status = command.status().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGABRT));
