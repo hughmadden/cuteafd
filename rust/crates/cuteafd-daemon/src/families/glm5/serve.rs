@@ -419,6 +419,13 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     }
 }
 
+/// Weak GLM 5.3 priors from its EXL3 K4/TP4 D4 run, not GLM Flash's fits.
+/// C1 residual was 1355 us; drafter medians were 3634 us at C1 and 7288 us at C4.
+fn draft_seed() -> cuteafd_core::PolicySeed {
+    cuteafd_core::PolicySeed { round: [1250., 20., 100.], draft: [2400., 1220.], samples: 0.01,
+        cold_drafts: 5, warm_rounds: 24, warm_error: 0.08 }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
@@ -437,7 +444,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             None, &opened.snapshot, Some(ranks))?;
         engine.arm_draft_probe()?;
         SharedPolicy::new(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS, d.cfg.drafts(),
-            resource::Prior::Selector(d.selector_fit("glm5", false)?), resource::seed())
+            resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
@@ -741,9 +748,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let run_draft = if eligible.is_empty() { false } else if policy.fixed.is_some()
             || active.iter().any(|a| a.drafts.cold() && eligible.iter().any(|&(id, _)| id == a.ticket.id())) { true } else {
             let shared = shared.as_mut().expect("eligible draft slots have a shared policy");
-            let fit = shared.policy.cost_snapshot(false).draft;
+            let width = drafter.unwrap().cfg.drafts();
             let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
-                width: drafter.unwrap().cfg.drafts(), draft_us: fit[0] + fit[1] * eligible.len() as f64 }];
+                width, draft_us: shared.policy.draft_cost_drafted(false, active.len(), eligible.len(), width) }];
             // Undrafted members still contribute their anchors, routes and emitted tokens.
             let requests: Vec<_> = active.iter().map(|a| (a.ticket.id(),
                 eligible.iter().find(|&&(id, _)| id == a.ticket.id()).map_or(0, |&(_, room)| room))).collect();
@@ -997,6 +1004,16 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
 #[cfg(test)]
 mod draft_tests {
     use super::*;
+
+    #[test]
+    fn glm53_seed_uses_its_own_weak_drafter_prices() {
+        let seed = draft_seed();
+        assert_eq!(seed.samples, 0.01);
+        assert_eq!(seed.cold_drafts, 5);
+        assert!((seed.draft[0] + seed.draft[1] - 3634.).abs() < 50.);
+        assert!((seed.draft[0] + 4. * seed.draft[1] - 7288.).abs() < 50.);
+        assert_ne!(seed.draft, crate::shared::draft::resource::seed().draft);
+    }
 
     #[test]
     fn stops_censor_only_unjudged_agreed_drafts() {
