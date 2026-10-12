@@ -250,6 +250,9 @@ pub const CLASS_PRIOR_ROUNDS: f64 = 2.;
 const CLASS_DECAY: f64 = 0.998;
 /// Per-round forgetting of the round residual and draft-pass fits.
 const ROUND_DECAY: f64 = 0.98;
+/// Layer-timed rounds each class fit needs before the policy engages; layer
+/// times may be sampled on a cadence, the physical priors carry the rest.
+const WARM_CLASS_SAMPLES: u64 = 4;
 /// Rounds of prior that hold a concurrency bucket's residual at the pooled
 /// one: the bucket keeps `n / (n + BUCKET_PRIOR_ROUNDS)` of its own mean's
 /// deviation from the pooled residual. A bucket forgets only when it is
@@ -519,20 +522,24 @@ impl CostModel {
     /// The class and residual fits have seen enough fully timed rounds.
     fn warm(&self) -> bool {
         self.rounds >= WARM_ROUND_SAMPLES
+            && self.class.iter().zip(&self.layers_in).all(|(fit, &n)| n == 0 || fit.samples >= WARM_CLASS_SAMPLES)
     }
     fn widths_warm(&self, bucket: usize) -> bool {
         self.draft_samples[bucket].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
     }
     /// Learn from one fully timed round: each class from its summed layer
     /// time, the residual from the rest of the verify time.
-    fn observe_round(&mut self, bucket: usize, rows: f64, megabytes: ClassBytes, class_us: &[f64], verify_us: f64) {
+    fn observe_round(&mut self, bucket: usize, rows: f64, megabytes: ClassBytes, class_us: Option<&[f64]>,
+        verify_us: f64) {
         if !verify_us.is_finite() { return; }
         // The guard is relative to the whole round: a residual is small next
         // to the layer time it sits beside.
         let predicted = self.predict(bucket, rows, megabytes);
         let weight = Fit::<1>::weigh(&mut self.round_scale, predicted, verify_us);
-        for (c, fit) in self.class.iter_mut().enumerate() {
-            if self.layers_in[c] > 0 { fit.observe([self.layers_in[c] as f64, megabytes[c]], class_us[c]); }
+        if let Some(class_us) = class_us {
+            for (c, fit) in self.class.iter_mut().enumerate() {
+                if self.layers_in[c] > 0 { fit.observe([self.layers_in[c] as f64, megabytes[c]], class_us[c]); }
+            }
         }
         let residual = verify_us - self.layers_us(megabytes);
         let m = &mut self.residuals[bucket];
@@ -1351,8 +1358,12 @@ impl DraftPolicy {
         let layer_routes = |layer: usize| &round.routes[layer * rows * topk..][..rows * topk];
         let drafted = round.draft_us.is_finite();
         let draft_us = if drafted { round.draft_us } else { 0. };
+        // Layer times may be sampled on a cadence: the class fits learn only
+        // from rounds that carry every priced layer's time, while prediction
+        // health and the round residual (the total less the class fits'
+        // prediction) learn from every timed round.
         let complete = self.priced.iter().all(|p| round.layer_us.get(p.layer).copied().flatten().is_some());
-        if complete && round.total_us.is_finite() {
+        if round.total_us.is_finite() {
             let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
             let mut class_us = [0.; MAX_RESOURCE_CLASSES];
             for index in 0..self.priced.len() {
@@ -1371,7 +1382,8 @@ impl DraftPolicy {
                 *count += 1;
                 *error += (relative - *error) * (1. / *count as f64).max(ERROR_RATE);
             }
-            self.cost.observe_round(bucket, rows as f64, megabytes, &class_us, round.total_us - draft_us);
+            self.cost.observe_round(bucket, rows as f64, megabytes, complete.then_some(&class_us[..]),
+                round.total_us - draft_us);
             // A bucket engages on its own prediction health once it has
             // evidence, and on the pooled health before that.
             let (pooled_count, pooled_error) = self.pooled_timed;
@@ -2215,7 +2227,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (38_503, 16_385_753_189_273_000_008));
+        assert_eq!((transcript.records, transcript.hash), (38_718, 16_115_903_766_810_657_377));
     }
 
     fn seed() -> PolicySeed {
@@ -2450,6 +2462,46 @@ mod tests {
             }
             assert_eq!(selected.lengths, best.1, "case {case}");
         }
+    }
+
+    /// Layer times on one round in eight: the class fits learn from those,
+    /// the residual and prediction health from every round.
+    #[test]
+    fn sampled_layer_times_still_fit_every_round() {
+        let truth = physics();
+        let mut sampled = DraftPolicy::seeded(placement(5), seed()).unwrap();
+        let mut every = DraftPolicy::seeded(placement(5), seed()).unwrap();
+        let (mut a, mut b) = (0, 0);
+        for round in 0..400 {
+            let rows = 1 + round % 8;
+            run_round(&mut every, &truth, &mut a, rows, rows, None);
+            cadence_round(&mut sampled, &truth, &mut b, rows, round % 8 == 0);
+        }
+        assert_eq!(sampled.prediction_health(false, 1).0, every.prediction_health(false, 1).0);
+        assert!(sampled.engaged(false, 1));
+        for rows in [2usize, 8] {
+            let s = sampled.clone().predict(false, &[1], &[rows - 1], 5).unwrap();
+            let e = every.clone().predict(false, &[1], &[rows - 1], 5).unwrap();
+            assert!((s - e).abs() / e < 0.03, "{rows}: sampled {s} vs every {e}");
+        }
+    }
+
+    fn cadence_round(policy: &mut DraftPolicy, truth: &Truth, token: &mut u64, rows: usize, timed: bool) {
+        let token_rows: Vec<_> = (0..rows).map(|r| token_routes(*token + r as u64, 24)).collect();
+        let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|l| token_rows.iter().map(|t| t[l]).collect()).collect();
+        let mut layer_us = [None; 40];
+        let mut total = truth.round[0] + truth.round[1] * rows as f64 + truth.round[2];
+        for layer in 1..40 {
+            let class = policy.geometry.layers[layer].class.unwrap() as usize;
+            let mb = groups(&routes[layer]) * policy.geometry.layers[layer].slice_bytes / 1e6;
+            let t = truth.alpha[class] + truth.beta[class] * rows as f64 + truth.us_per_mb[class] * mb;
+            if timed { layer_us[layer] = Some(t); }
+            total += t;
+        }
+        let requests = [ObservedDraftRequest { id: 1, rows, accepted: rows, confidence: None }];
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
+            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
+        *token += rows as u64;
     }
 
     #[test]
