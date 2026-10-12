@@ -13,6 +13,41 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_serving_identity_is_evaluated_on_each_host(self) -> None:
+        for uid, gid, user in [('1000', '1000', 'tj'), ('1001', '1002', 'spark user')]:
+            result = subprocess.run(['bash', '-c', '''
+set -euo pipefail
+source scripts/lib/release-common.sh
+id() { case "$1" in -u) printf '%s' "$TEST_UID" ;; -g) printf '%s' "$TEST_GID" ;; -un) printf '%s' "$TEST_USER" ;; esac; }
+export -f id
+export -f release_serving_docker_args
+bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}"'
+'''], cwd=ROOT, capture_output=True,
+                env={**os.environ, 'TEST_UID': uid, 'TEST_GID': gid, 'TEST_USER': user})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.decode().rstrip('\0').split('\0')
+            self.assertEqual(args[:2], ['--user', f'{uid}:{gid}'])
+            env = dict(arg.split('=', 1) for arg in args[3::2])
+            self.assertEqual(env['USER'], user)
+            self.assertEqual(env['LOGNAME'], user)
+            self.assertEqual(env['HF_HOME'], '/hf')
+            self.assertEqual(env['CUTEAFD_BENCH_DIR'], '/run/cuteafd/bench')
+            for key in ['HOME', 'TORCH_EXTENSIONS_DIR', 'XDG_CACHE_HOME',
+                        'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR']:
+                self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
+
+    def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            self.assertIn('$(declare -f release_serving_docker_args)', source)
+            self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
+            self.assertNotIn('/root/', source)
+            self.assertNotIn('-e USER=tj', source)
+            self.assertIn(':/run/cuteafd/bench', source)
+            self.assertIn(':/run/cuteafd/usage', source)
+        v41 = (ROOT / 'run.sh').read_text().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
+        self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))
         result = subprocess.run(['bash', '-c',

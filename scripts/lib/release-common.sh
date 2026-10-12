@@ -456,6 +456,21 @@ release_trim() {
   printf '%s' "$value"
 }
 
+# Evaluate on the host that starts the container: Spark and coordinator UIDs
+# can differ. Keep caches writable and checkpoint mounts outside root's home.
+# Self-contained so remote launchers can send this function to the worker host.
+release_serving_docker_args() {
+  local user
+  user="$(id -un)"
+  RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
+    -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
+    -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
+    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
+    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
+    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
+    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+}
+
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, on the coordinator and on every Spark worker:
 #   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)

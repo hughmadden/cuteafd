@@ -327,6 +327,24 @@ exec python3 -c "$code" "$@"
                           env=env, capture_output=True, text=True, timeout=30)
 
 
+@pytest.mark.parametrize("wip", [False, True])
+def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
+    result = _family_launch_result(
+        tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_args=("--wip", "slot-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    coordinator = next(line for line in result.stderr.splitlines() if "serve-qwen4 --snapshot" in line)
+    assert f"--user {os.getuid()}:{os.getgid()}" in coordinator
+    assert "HF_HOME=/hf" in coordinator
+    assert "CUTEAFD_BENCH_DIR=/run/cuteafd/bench" in coordinator
+    worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
+    assert 'id -u' in worker and 'id -g' in worker
+    assert 'release_serving_docker_args; docker run -d' in worker
+    assert '"${RELEASE_SERVING_ARGS[@]}"' in worker
+    assert '/root/' not in coordinator + worker
+
+
 @pytest.mark.parametrize("qwen", [False, True])
 def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen):
     config = ({**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"},
@@ -1356,7 +1374,7 @@ def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path,
     expected = source
     if source_kind == "hub_snapshot":
         source = str(tmp_path / "hf/hub/models--test--model/snapshots/abc")
-        expected = "/root/.cache/huggingface/hub/models--test--model/snapshots/abc"
+        expected = "/hf/hub/models--test--model/snapshots/abc"
     elif source_kind == "external_snapshot":
         source = str(tmp_path / "vendor")
         Path(source).mkdir()
@@ -1612,7 +1630,7 @@ def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
         text = _family_launch_lines(tmp_path / sub, config, model, keys + extra)
         return text, [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
 
-    snap = lambda name: f"--draft /root/.cache/huggingface/hub/models--{name.replace('/', '--')}/snapshots/abc"
+    snap = lambda name: f"--draft /hf/hub/models--{name.replace('/', '--')}/snapshots/abc"
     text, lines = launch("a", "")
     assert lines and snap(default) in lines[0], text
     assert "drafts with dflash2" in text
@@ -1704,7 +1722,7 @@ def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, ke
         assert "--draft" not in launch
         assert ("--mtp 1" in launch) == (expected == "mtp")
     else:
-        assert "--draft /root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        assert "--draft /hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
         if expected == "checkpoint":
             assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
         else:

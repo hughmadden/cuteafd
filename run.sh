@@ -358,7 +358,7 @@ fi
 # Select and admit the count before touching any serving container or Spark.
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
-count_mounts=(-v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro")
+count_mounts=(-v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -372,7 +372,7 @@ count_prefill=0
 ((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
 [[ "$DSPARK" != off ]] || count_args+=(--native-mtp-layers 0)
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
-  "${count_command[@]}" plan "/root/.cache/huggingface/$snapshot_rel" --vision "$VISION" --audio off \
+  "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
   --json --layout --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
@@ -688,11 +688,6 @@ if [[ -n "$wip_layout" ]]; then
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro"
     -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
-    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
-    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
-    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
-    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh
@@ -728,7 +723,7 @@ bench_dir="$HOME/.cache/cuteafd/bench"
 mkdir -p "$bench_dir"
 start_coordinator() {
 echo "== starting native RTX coordinator =="
-local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
+local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 local -a api_mount_args=()
 agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
@@ -739,8 +734,8 @@ case "${USAGE:-on}" in on|off) ;; *) release_die "USAGE must be on or off" ;; es
 if ((console_supported)); then
   args+=(--usage "${USAGE:-on}")
 
-  args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
-  api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
+  args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /run/cuteafd/usage)
+  api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/run/cuteafd/usage")
 fi
 if [[ -n "${API_KEY_FILE:-}" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
@@ -779,15 +774,16 @@ if ((topology_explicit)); then
   args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
 fi
 [[ -z "$placement_directory" ]] || args+=(--placement-directory "$placement_directory")
-docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
+release_serving_docker_args
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no --gpus "$gpu_request" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
   "${wip_mount_args[@]}" \
-  "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
-  -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
+  "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" \
+  -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 if [[ -n "$placement_directory" ]]; then
@@ -832,7 +828,7 @@ for i in "${!hosts[@]}"; do
   if [[ -n "${PROFILE:-}" ]]; then
     release_profile_docker_args "$PROFILE" "${PROFILE_DIR:-}" "$host"; remote_args+=(--profile-args "${RELEASE_PROFILE_ARGS[@]}")
   fi
-  release_ssh "$host" "bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
+  release_ssh "$host" "$(declare -f release_serving_docker_args); export -f release_serving_docker_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
 # Defaults keep a legacy invocation (ten positional arguments) valid.
@@ -856,11 +852,6 @@ if [[ "$wip_slot" != __none__ ]]; then
   wip_args=(-v "$layout/bin:/opt/cuteafd/bin:ro" -v "$layout/lib:/opt/cuteafd/lib:ro"
     -v "$layout/share:/opt/cuteafd/share:ro"
     -v "$layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
-    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
-    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
-    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
-    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
@@ -881,7 +872,8 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
-docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+release_serving_docker_args
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done

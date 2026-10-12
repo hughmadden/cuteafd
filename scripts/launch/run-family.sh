@@ -73,7 +73,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
-snapshot="/root/.cache/huggingface/hub/models--${model//\//--}/snapshots/$revision"
+snapshot="/hf/hub/models--${model//\//--}/snapshots/$revision"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
 # Family, the serving command and the layers with routed experts.
 described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
@@ -152,20 +152,13 @@ if [[ -n "$wip_slot" ]]; then
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
-    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
-    -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
-    -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
     -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
   wip_worker_args="-v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/bin:/opt/cuteafd/bin:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
-    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/source:/source:ro \
-    -e PYTHONPATH=/source/third_party/sparkinfer -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj \
-    -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache \
-    -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor \
+    -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/source:/source:ro -e PYTHONPATH=/source/third_party/sparkinfer \
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
@@ -196,7 +189,7 @@ snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
   [[ -n "$rev" ]] || rev="$(<"$dir/refs/main")"
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
-  printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
+  printf '%s' "/hf/hub/models--${id//\//--}/snapshots/$rev"
 }
 # SPECULATOR picks the drafter. Unset, each family takes the speculator its
 # release card ran (examples/configs/*.config; scripts/tests/test_example_configs.py
@@ -306,7 +299,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
     chat_template_from="$(readlink -f "$chat_template_from")"
     release_validate_path_setting CHAT_TEMPLATE_FROM "$chat_template_from"
     if release_path_within "$chat_template_from" "$hub"; then
-      chat_template_from="/root/.cache/huggingface/hub${chat_template_from#"$hub"}"
+      chat_template_from="/hf/hub${chat_template_from#"$hub"}"
     else
       chat_template_mounts=(-v "$chat_template_from:$chat_template_from:ro")
     fi
@@ -1063,7 +1056,7 @@ audio_encoder_hash=""
       plan_draft_args+=("$flag" "$value")
     fi
   done
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
     "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -1292,9 +1285,9 @@ for ((rank = 0; rank < ranks; rank++)); do
   worker_profile="" worker_prep=""
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && "
-  ssh "$host" "${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
-    -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
+  ssh "$host" "$(declare -f release_serving_docker_args); release_serving_docker_args; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
+    -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --rdma-endpoints $rdma_endpoints --capacity 4096 --device-budget-bytes $budget $layer_args$spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
@@ -1366,8 +1359,8 @@ console_supported=0
 if release_console_supported "$coordinator_image" "${wip_layout:+$wip_layout/bin/cuteafd}"; then
   console_supported=1
   release_prepare_console "${instance:-default}"
-  api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
-  family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage --usage "$usage")
+  api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/run/cuteafd/usage")
+  family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /run/cuteafd/usage --usage "$usage")
 fi
 if [[ -n "$API_KEY_FILE" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }
@@ -1413,12 +1406,13 @@ tp2_env_args=()
 for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
   [[ -z "${!key:-}" ]] || tp2_env_args+=(-e "$key=${!key}")
 done
-docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
+release_serving_docker_args
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
-  -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
+  -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY "$default_concurrency")" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
