@@ -226,10 +226,16 @@ impl<'a> PeerExchange<'a> {
         let mut exchange = Self::new(library, ranks, slots, slot_bytes)?;
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, ranks[0].device, || {
+                let probe = |stage| crate::shared::inventory::startup_probe(
+                    library, &[ranks[rank].device], stage);
+                probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
+                probe("peer-abort-after-preload")?;
                 let word = DeviceAllocation::new(library, 256)?;
                 library.cuda_zero_bytes(word.buffer, word.buffer.bytes)?;
+                probe("peer-abort-after-word")?;
                 let stream = library.cuda_stream_create()?;
+                probe("peer-abort-after-publisher-stream")?;
                 Ok(AbortSide {
                     library,
                     device: ranks[rank].device,

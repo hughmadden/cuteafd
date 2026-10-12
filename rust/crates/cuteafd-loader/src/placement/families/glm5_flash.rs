@@ -216,6 +216,12 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Transport, "peer exchange",
                 glmf_graphs::peer_exchange_bytes(working.prefill_lanes, i.prefill_rows.max(i.decode_rows),
                     i.cfg.hidden as u64, i.partial_bytes, i.representation.output_shard), Basis::Formula));
+            // new_abortable owns a separate 256-byte word on each exchange end.
+            // CUDA publisher streams/function loading are driver costs, not payload storage.
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Transport,
+                "peer abort word", 256, Basis::Formula));
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::RtxExperts, gpu, Category::Transport,
+                "route abort word", 256, Basis::Formula));
             let slots = 2 * working.prefill_lanes;
             fixed.push(GlmfBufferDemand::new(GlmfComponent::RtxExperts, gpu, Category::Transport, "route exchange",
                 slots * (i.prefill_rows.max(i.decode_rows) * i.cfg.topk as u64 * 8).max(256)
@@ -706,6 +712,25 @@ mod tests {
             assert_eq!(graphs, prior.1);
             assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
             assert!(working.spark_layers.is_empty());
+        }
+    }
+
+    #[test]
+    fn abort_words_follow_exchange_ownership_on_each_rank() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            for onboard in [0, 1, 3] {
+                let working = GlmfWorkingSet::candidate(&input, onboard).unwrap();
+                let request = request_for_working_set(&input, &working).unwrap();
+                for rank in 0..ranks {
+                    let bytes = |group: &str| request.fixed.iter()
+                        .filter(|d| d.gpu as usize == rank && d.group == group)
+                        .map(|d| { assert_eq!(d.basis, Basis::Formula); d.bytes }).sum::<u64>();
+                    assert_eq!(bytes("peer abort word"), if ranks == 2 { 256 } else { 0 });
+                    assert_eq!(bytes("route abort word"), if ranks == 2 && onboard > 0 { 256 } else { 0 });
+                }
+            }
         }
     }
 
