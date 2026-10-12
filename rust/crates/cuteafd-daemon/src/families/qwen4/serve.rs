@@ -586,7 +586,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let geometry = resource::geometry(&engine.draft_homes(snapshot)?, engine.cfg.experts, engine.cfg.topk,
             DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION)?;
         engine.arm_draft_probe()?;
-        Some(cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?)
+        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
+        crate::shared::draft::apply_length_rule(&mut policy);
+        Some(policy)
     } else { None };
     let mut trace = Trace::open()?;
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
