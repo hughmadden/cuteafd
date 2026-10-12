@@ -922,6 +922,7 @@ def main():
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
+    parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed-host', default='moa', choices=('rhea', 'moa'), help='out-of-pool Spark that compiles and seals --build arms (default moa)')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
@@ -934,6 +935,8 @@ def main():
         return 0
     if not NAME.fullmatch(args.task) or args.parallel < 1 or args.repeats < 1:
         parser.error('invalid task, repeats or parallelism')
+    if args.build_only and (not args.build or args.cleanup):
+        parser.error('--build-only requires --build and refuses --cleanup')
     arms = arms_from(args.arm, args.arm_release)
     shared_wip(arms, args.arm_wip, args.build, args.parallel)
     if args.nonce_seed is not None and (not args.nonce_seed or '\n' in args.nonce_seed or '\r' in args.nonce_seed):
@@ -1005,6 +1008,9 @@ def main():
             variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
             build_cards.append(variant)
     build_arms(args.build, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    if args.build_only:
+        save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
+        return 0
     key_file = state / 'api-key'
     if not key_file.exists():
         fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
