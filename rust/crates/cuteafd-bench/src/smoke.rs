@@ -309,7 +309,15 @@ mod fair {
         }
 
         /// Whether a live, older ticket wants any of our locks (prunes stale ones).
+        /// Tickets of `hwlock.py --gate` ancestors (`CUTEAFD_HW_GATE_TICKETS`)
+        /// hold the turn for this process, so they never block it.
         pub(super) fn older_conflict(&self) -> Result<bool> {
+            let ancestors: Vec<u64> = std::env::var("CUTEAFD_HW_GATE_TICKETS").unwrap_or_default()
+                .split(':').filter_map(|s| s.parse().ok()).collect();
+            self.older_conflict_except(&ancestors)
+        }
+
+        fn older_conflict_except(&self, ancestors: &[u64]) -> Result<bool> {
             let mut names: Vec<_> = std::fs::read_dir(&self.queue)?.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| n.ends_with(".ticket")).collect();
@@ -323,7 +331,7 @@ mod fair {
                     Err(std::fs::TryLockError::WouldBlock) => {}
                     Err(_) => continue,
                 }
-                if seq >= self.seq {
+                if seq >= self.seq || ancestors.contains(&seq) {
                     continue;
                 }
                 let mut text = String::new();
@@ -364,6 +372,20 @@ mod fair {
             std::fs::write(&stale, r#"{"locks":["gpu1"]}"#).unwrap();
             assert!(!newer.older_conflict().unwrap());
             assert!(!stale.exists());
+        }
+
+        #[test]
+        fn a_gated_parent_ticket_does_not_block_its_child() {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Ticket::take(dir.path(), &["sparks.lock", "gpu0.lock", "gpu1.lock"]).unwrap();
+            let child = Ticket::take(dir.path(), &["sparks.lock", "gpu1.lock"]).unwrap();
+            assert!(child.older_conflict_except(&[]).unwrap());
+            assert!(!child.older_conflict_except(&[gate.seq]).unwrap());
+            // Another job's older ticket still blocks the child.
+            let other = Ticket::take(dir.path(), &["gpu1.lock"]).unwrap();
+            let late = Ticket::take(dir.path(), &["gpu1.lock"]).unwrap();
+            assert!(late.older_conflict_except(&[gate.seq]).unwrap());
+            drop(other);
         }
     }
 }

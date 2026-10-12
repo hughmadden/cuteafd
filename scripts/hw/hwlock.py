@@ -39,6 +39,7 @@ from pathlib import Path
 ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa')
 LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 POLL_S = 2.0
+GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)
 
 
 def canonical(names) -> list[str]:
@@ -78,10 +79,20 @@ def _take_ticket(queue: Path, locks: list[str]) -> tuple[int, Path, object]:
     return seq, path, handle
 
 
+GATE_ENV = 'CUTEAFD_HW_GATE_TICKETS'
+
+
+def gate_ancestors() -> set[int]:
+    """Tickets of `--gate` ancestors: they hold the turn for this process, so
+    a ticket taken inside a gated command must not wait behind them."""
+    return {int(s) for s in os.environ.get(GATE_ENV, '').split(':') if s.isdigit()}
+
+
 def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[str]:
-    """Live tickets older than `before` (all, when None) wanting any of `locks`.
-    Removes stale tickets of any age on the way (their owner's flock is free)."""
-    wanted, found = set(locks), []
+    """Live tickets older than `before` (all, when None) wanting any of `locks`,
+    except our own `--gate` ancestors. Removes stale tickets of any age on the
+    way (their owner's flock is free)."""
+    wanted, found, ancestors = set(locks), [], gate_ancestors()
     for path in sorted(queue.glob('*.ticket')):
         seq = int(path.name.split('.', 1)[0])
         try:
@@ -89,8 +100,8 @@ def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[s
                 try:
                     fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    if before is not None and seq >= before:
-                        continue  # live and not older: ours or behind us
+                    if before is not None and seq >= before or seq in ancestors:
+                        continue  # live and not older (ours or behind us), or our gate
                     data = json.loads(path.read_text() or '{}')
                     if wanted & set(data.get('locks', [])):
                         found.append(path.name)
@@ -154,6 +165,7 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
     check_preflight(preflight, preflight_timeout)
     queue = _queue()
     seq, path, ticket = _take_ticket(queue, locks)
+    GATE_SEQ[0] = seq
     deadline = time.monotonic() + wait
     held, announced = None, False
     try:
@@ -219,6 +231,8 @@ def main() -> int:
             env = dict(os.environ)
             if not args.gate:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
+            else:
+                env[GATE_ENV] = ':'.join(filter(None, [os.environ.get(GATE_ENV, ''), str(GATE_SEQ[0])]))
             return subprocess.run(cmd, env=env).returncode
     except PreflightFailed as error:
         print(f'hwlock: {error}', file=sys.stderr)

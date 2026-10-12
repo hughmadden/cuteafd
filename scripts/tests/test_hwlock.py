@@ -195,3 +195,26 @@ def test_gate_ticket_keeps_later_waiters_behind_the_running_command(lockdir):
     second = spawn(lockdir, 'gpu1', 0.05, lockdir / 'second')
     assert first.wait(timeout=30) == 0 and second.wait(timeout=30) == 0
     assert wait_for(lockdir / 'second') - wait_for(lockdir / 'first') >= 0.9
+
+
+def test_command_inside_a_gate_is_not_blocked_by_its_own_gate_ticket(lockdir):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    # The gated command queues for the same locks itself (as `cuteafd bench smoke` does).
+    inner = f'{sys.executable} {SCRIPT} --locks sparks,gpu1 --wait 5 -- true'
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'sparks,gpu0,gpu1', '--gate', '--wait', '5',
+                             '--', 'sh', '-c', inner], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+def test_gate_exemption_covers_only_ancestors(lockdir):
+    queue = lockdir / 'hwq'
+    queue.mkdir()
+    with hwlock.hold(['gpu1'], wait=5, gate=True):
+        gate = hwlock.GATE_SEQ[0]
+        theirs = [p.name for p in queue.glob('*.ticket')]
+        assert hwlock.older_conflicts(queue, ['gpu1'], None) == theirs
+        os.environ[hwlock.GATE_ENV] = str(gate)
+        try:
+            assert hwlock.older_conflicts(queue, ['gpu1'], None) == []
+        finally:
+            del os.environ[hwlock.GATE_ENV]
