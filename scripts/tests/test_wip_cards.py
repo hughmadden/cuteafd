@@ -83,6 +83,48 @@ def test_key_file_created_private_and_never_printed(tmp_path, entry, monkeypatch
     assert key.read_text().strip() not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('dry', [False, True])
+def test_build_only_builds_without_generating_or_launching_jobs(tmp_path, entry, monkeypatch, dry):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    calls = []
+
+    def build(items, arms, selected, dest, task, dry_run, seed):
+        calls.append((items, selected, dest, task, dry_run, seed))
+        arms['base']['root'] = '/sealed/root'
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('build-only must not generate or launch smoke jobs')
+
+    monkeypatch.setattr(cards, 'build_arms', build)
+    monkeypatch.setattr(cards, 'generate', forbidden)
+    monkeypatch.setattr(cards, 'detached', forbidden)
+    argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+            '--arm', 'base=test:s', '--state', str(state), '--task', 'build-only',
+            '--build', 'base=HEAD', '--build-only', '--seed-host', 'rhea',
+            '--set', 'v41-min:SPARK_COUNT=4']
+    monkeypatch.setattr(sys, 'argv', argv + (['--dry-run'] if dry else []))
+    assert cards.main() == 0
+    assert len(calls) == 1
+    items, selected, dest, task, dry_run, seed = calls[0]
+    assert (items, dest, task, dry_run, seed) == (['base=HEAD'], state, 'build-only', dry, 'rhea')
+    assert selected[0]['set']['SPARK_COUNT'] == '4'
+    assert len(selected[0]['sparks']) == 4
+    plan = json.loads((state / 'plan.json').read_text())
+    assert plan['jobs'] == [] and plan['arms']['base']['root'] == '/sealed/root'
+    assert not (state / 'api-key').exists()
+
+
+@pytest.mark.parametrize('extra', [[], ['--build', 'base=HEAD', '--cleanup']])
+def test_build_only_requires_build_and_refuses_cleanup(tmp_path, entry, monkeypatch, extra):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--arm', 'base=test:s', '--build-only', *extra])
+    with pytest.raises(SystemExit) as error:
+        cards.main()
+    assert error.value.code == 2
+
+
 def test_parallel_refuses_published_and_overlap(entry, tmp_path):
     a = make(entry, tmp_path)
     b_entry = {**entry, 'name': 'other', 'gpus': [1], 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2', 'ADDR': '0.0.0.0:8501', 'EXPERT_PORT': '19601'}}
