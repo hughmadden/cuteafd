@@ -23,3 +23,12 @@ pub(crate) mod probe;
 pub(crate) mod resource;
 pub(crate) mod routes;
 pub(crate) mod runtime;
+
+/// Apply the opt-in length rule (`CUTEAFD_DRAFT_SURVIVAL_LENGTHS`, launcher key
+/// `DRAFT_SURVIVAL_LENGTHS`): verify drafts while their calibrated survival is
+/// at least one half, with width, skip and copy actions still resource priced.
+pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
+    let survival = super::draft_policy::enabled("CUTEAFD_DRAFT_SURVIVAL_LENGTHS");
+    if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
+    policy.set_survival_lengths(survival);
+}

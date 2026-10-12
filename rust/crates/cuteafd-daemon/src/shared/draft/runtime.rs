@@ -13,7 +13,9 @@ impl SharedPolicy {
     pub fn new(homes: &[resource::LayerHome], experts: usize, topk: usize, rows: usize,
         width: usize, prior: resource::Prior, seed: PolicySeed) -> Result<Self> {
         let geometry = resource::geometry(homes, experts, topk, rows, width, COPY_EXTENSION)?;
-        Ok(Self { policy: DraftPolicy::seeded(geometry, seed)?, prior })
+        let mut policy = DraftPolicy::seeded(geometry, seed)?;
+        super::apply_length_rule(&mut policy);
+        Ok(Self { policy, prior })
     }
 
     pub fn prior(&self, history: &DraftHistory, evidence: &resource::DraftEvidence<'_>, extension: usize) -> Vec<f64> {

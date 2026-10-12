@@ -444,12 +444,13 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
     let stats = policy.stats();
     let geometry = policy.geometry();
     let snapshot = policy.cost_snapshot(false, 1);
+    let labels: Vec<_> = geometry.classes.iter().map(|class| class.label).collect();
     let classes: Vec<_> = geometry.classes.iter().zip(&snapshot.layers).map(|(class, c)| serde_json::json!({
         "class": class.label, "layers": geometry.layers.iter().filter(|l| l.class.is_some_and(|k|
             geometry.classes.get(usize::from(k)).is_some_and(|g| g.label == class.label))).count(),
-        "intercept_us": c[0], "us_per_row": c[1], "us_per_mb": c[2],
-        "effective_gb_per_s": if c[2] > 0. { 1000. / c[2] } else { f64::INFINITY },
-        "samples": c[3], "residual_scale_us": c[4],
+        "us_per_layer": c[0], "us_per_mb": c[1],
+        "effective_gb_per_s": if c[1] > 0. { 1000. / c[1] } else { f64::INFINITY },
+        "samples": c[2], "relative_scale": c[3],
     })).collect();
     let calibration = policy.calibration();
     let reliability: Vec<_> = (0..stats.position_reached.len()).map(|p| serde_json::json!({
@@ -466,16 +467,10 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
             "requests_up_to": if requests == 16 { None } else { Some(requests) },
             "warm": policy.warm(false, requests), "engaged": policy.engaged(false, requests),
-            "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft,
-            "round_local": fit.round_local, "round_pooled": fit.round_pooled,
-            "round_identified": fit.round_identified, "draft_local": fit.draft_local,
-            "draft_pooled": fit.draft_pooled, "draft_identified": fit.draft_identified,
-            "layers_identified": fit.layers_identified, "row_knots": fit.row_knots,
-                    "layer_row_slopes": fit.layer_row_slopes, "layer_row_identified": fit.layer_row_identified,
-                    "round_row_slopes": fit.round_row_slopes, "round_row_identified": fit.round_row_identified})
+            "timed_rounds": timed, "relative_error": error, "cost": fit.to_json(&labels)})
     }).collect();
     let value = serde_json::json!({
-        "mode": "shared",
+        "mode": if policy.survival_lengths() { "survival" } else { "shared" },
         "concurrency_buckets": buckets,
         "warm": policy.warm(false, 1),
         "engaged": policy.engaged(false, 1),
@@ -496,7 +491,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         },
         "layers": classes,
         "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
-            "us_per_request": snapshot.round[2], "samples": snapshot.round[3] },
+            "bucket_offset_us": snapshot.round[2], "bucket_rounds": snapshot.round[3] },
         "draft": { "intercept_us": snapshot.draft[0], "us_per_request": snapshot.draft[1],
             "samples": snapshot.draft[4] },
         "route_ring_check": ring.map(|(layers, mismatched)| serde_json::json!({"layers": layers, "mismatched": mismatched})),

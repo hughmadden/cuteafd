@@ -77,7 +77,7 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
-    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE"]
+    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE", "DRAFT_SURVIVAL_LENGTHS"]
     keys = "".join(f"{name}={value}\n" for name in names) if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
