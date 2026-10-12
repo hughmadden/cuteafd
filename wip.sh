@@ -742,6 +742,9 @@ build_expert() (
     local spark_lock spark_lock_fd
     case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
     exec {spark_lock_fd}>>"$spark_lock"
+    # Queue fairly first (scripts/hw/hwlock.py), then hold the flock for the export.
+    python3 "$(dirname "${BASH_SOURCE[0]}")/scripts/hw/hwlock.py" --locks "$(basename "$spark_lock" .lock)" --wait 1800 -- true \
+      || release_die "timed out waiting for a fair turn on Spark export $seed_host"
     flock -w 1800 "$spark_lock_fd" || release_die "timed out waiting for Spark export on $seed_host"
   fi
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
