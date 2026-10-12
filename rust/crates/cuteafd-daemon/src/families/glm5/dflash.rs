@@ -776,7 +776,10 @@ impl<'a> GlmDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: metadata consumers and overwrites share the owned drafter
+        // stream; pinned staging survives through the upload completion event.
+        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
+            bytes, self.stream) }
     }
 
     /// Explicit serving startup admission; other callers retain lazy allocation.

@@ -176,8 +176,8 @@ impl<'a> RemoteDflash<'a> {
         let Some((first, last)) = tap_frontier(rows)? else { return Ok(()) };
         let pitch = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
         self.checked(|| {
-            // The existing synchronous metadata upload may not order with a
-            // nonblocking stream. Finish its previous readers before reusing it.
+            // Conservatively retire the paired bridge before publishing the
+            // next context wave; metadata uploads themselves are stream-ordered.
             self.synchronize()?;
             self.draft.device.run(|| self.draft.update_with(rows, || {
                 if self.update_pending.get() { self.exchange.wait(0, TAPS)?; }

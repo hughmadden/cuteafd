@@ -904,6 +904,9 @@ pub(crate) struct GoldenArgs {
     /// Require byte-exact real-row logits for speculative masked decode padding 3->4, 9->16, 17->32 and 33->64.
     #[arg(long)]
     pub padding_check: bool,
+    /// Compare queued multi-chunk prefill and decode replay with a drained reference, byte-for-byte.
+    #[arg(long)]
+    pub upload_check: bool,
     /// Isolate one real routed-expert layer with --local-experts: compare a
     /// fixed first row across m1/m16/m80 packages and require that changing
     /// later inputs in the same row geometry cannot change it. No backbone
@@ -1839,6 +1842,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if let Some(rows) = args.bench_verify {
         return speculate::bench_verify(args, engine, rows);
+    }
+    if args.upload_check {
+        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+        return prefix::upload_check(engine, &tokens[..n], args.prefill_chunk.unwrap_or(256));
     }
     if let Some(at) = args.resume_at {
         let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?

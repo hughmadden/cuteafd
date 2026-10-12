@@ -1232,6 +1232,7 @@ pub struct NativeLibrary {
     lib: ManuallyDrop<Library>,
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
+    ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
 
@@ -1536,6 +1537,16 @@ fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
     memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
 }
 
+/// Per-destination pinned source and copy-completion fence. Raw owners are
+/// released by NativeLibrary only after every pending upload has completed.
+struct OrderedH2DStaging {
+    staging: SyncH2DStagingBuffer,
+    event: *mut c_void,
+    pending: bool,
+}
+// SAFETY: the library mutex serializes access; each entry retains its device id.
+unsafe impl Send for OrderedH2DStaging {}
+
 struct SyncH2DStagingBuffer {
     // Released explicitly by NativeLibrary while its module is loaded. Do not
     // add an automatic release here: failed-drain quarantine retains this raw
@@ -1604,6 +1615,11 @@ impl Drop for NativeLibrary {
             // avoids releasing pinned memory while completion is unknown.
             return;
         }
+        if let Err(error) = self.release_ordered_h2d_staging() {
+            self.quarantine_module_after_failed_drain();
+            tracing::error!(%error, "retaining ordered uploads after failed completion drain");
+            return;
+        }
         if let Ok(staging) = self.sync_h2d_staging.get_mut() {
             staging.release_with_library(&self.lib);
         }
@@ -1646,6 +1662,7 @@ impl NativeLibrary {
             lib: ManuallyDrop::new(lib),
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
+            ordered_h2d_staging: Mutex::new(Default::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
     }
@@ -2111,6 +2128,9 @@ impl NativeLibrary {
 
 
 
+    /// Blocking default-stream upload for fresh storage or a destination whose
+    /// prior consumers have completed. This does not join nonblocking streams;
+    /// use `copy_h2d_ordered` for queued workspace reuse.
     pub fn copy_h2d(&self, dst: CuteafdDeviceBuffer, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
@@ -2131,6 +2151,84 @@ impl NativeLibrary {
             std::ptr::copy_nonoverlapping(src.as_ptr(), staging.ptr.cast::<u8>(), src.len());
         }
         unsafe { self.copy_h2d_raw_ptr(dst, staging.ptr as *const c_void, src.len()) }
+    }
+
+    /// Upload after prior consumers on `stream`, retaining the pinned source
+    /// until the copy's event completes. Unlike default-stream copy_h2d, this
+    /// permits workspace reuse while previous compute is still queued.
+    ///
+    /// # Safety
+    /// `dst` and `stream` belong to the current device and remain live through
+    /// queued work. Every reader/writer of dst is ordered on this stream (or
+    /// joined onto it by an event); this call is outside graph capture.
+    pub unsafe fn copy_h2d_ordered(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void) -> Result<()> {
+        if src.is_empty() { return Ok(()); }
+        anyhow::ensure!(!dst.ptr.is_null() && src.len() <= dst.bytes, "ordered H2D destination is too small or null");
+        anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
+        let device = self.cuda_get_device()?;
+        let mut entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        let key = (device, stream as usize, dst.ptr as usize);
+        if !entries.contains_key(&key) {
+            entries.insert(key, OrderedH2DStaging { staging: SyncH2DStagingBuffer::default(),
+                event: self.cuda_event_create_ordering()?, pending: false });
+        }
+        let entry = entries.get_mut(&key).expect("ordered upload entry inserted");
+        if entry.pending {
+            // SAFETY: this entry owns the event recorded after its last copy.
+            if let Err(error) = unsafe { self.cuda_event_synchronize(entry.event) } {
+                self.quarantine_module_after_failed_drain();
+                return Err(error);
+            }
+            entry.pending = false;
+        }
+        let staging = entry.staging.ensure(self, src.len())?;
+        // SAFETY: pinned staging is private, large enough, and its last reader completed.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), staging.ptr.cast::<u8>(), src.len()); }
+        entry.pending = true;
+        // SAFETY: caller supplies live stream/destination; the entry retains the source.
+        let queued = unsafe { self.copy_host_buffer_h2d_async(dst, staging, src.len(), stream)
+            .and_then(|()| self.cuda_event_record(entry.event, stream)) };
+        if let Err(error) = queued {
+            // A failed enqueue/record can still leave work queued without a usable fence.
+            // SAFETY: caller retains the stream, and staging stays owned during the drain.
+            if unsafe { self.cuda_stream_synchronize(stream) }.is_err() {
+                self.quarantine_module_after_failed_drain();
+            } else {
+                entry.pending = false;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_ordered_h2d_staging(&self) -> Result<()> {
+        let mut entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        if entries.is_empty() { return Ok(()); }
+        let previous = self.cuda_get_device()?;
+        let drained = (|| -> Result<()> {
+            // Prove all completions before releasing any source or module code.
+            for ((device, _, _), entry) in entries.iter_mut() {
+                self.cuda_set_device(*device)?;
+                if entry.pending {
+                    // SAFETY: the entry owns this live event on its recorded device.
+                    unsafe { self.cuda_event_synchronize(entry.event)?; }
+                    entry.pending = false;
+                }
+            }
+            for ((device, _, _), entry) in entries.iter_mut() {
+                self.cuda_set_device(*device)?;
+                entry.staging.release_with_library(&self.lib);
+                // SAFETY: all pending copies completed; this event is owned by the entry.
+                unsafe { self.cuda_event_destroy(entry.event)?; }
+                entry.event = std::ptr::null_mut();
+            }
+            entries.clear();
+            Ok(())
+        })();
+        let restored = self.cuda_set_device(previous);
+        drained.and(restored)
     }
 
     pub fn copy_host_buffer_h2d(

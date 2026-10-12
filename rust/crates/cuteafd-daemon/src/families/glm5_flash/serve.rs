@@ -1584,11 +1584,6 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         } else {
             engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
         };
-        if cold_replay_decode(&p.job.probe, p.chunks)
-            && std::env::var_os("CUTEAFD_GLMF_REPLAY_SYNC").is_some() {
-            // Diagnostic only: isolate workspace reuse from source/replay arithmetic.
-            engine.synchronize()?;
-        }
         if end == p.tokens.len() {
             // The first token, while this prompt's logits are the workspace's.
             let logits = logits.context("prefill produced no logits")?;

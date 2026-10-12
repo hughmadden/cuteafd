@@ -612,6 +612,45 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
     Ok(out)
 }
 
+/// Exercise production workspace reuse without selection, downloads, or a
+/// barrier between chunks. A separate run drains after each call as the oracle.
+/// Both runs reuse the same placement, so only queue ordering changes.
+pub(crate) fn upload_check(engine: &GlmfEngine<'_>, tokens: &[u32], chunk: usize) -> Result<()> {
+    use super::engine::Allocator;
+    ensure!(engine.weights.layers.len() == engine.cfg.layers, "--upload-check needs every layer");
+    let chunk = chunk.clamp(1, engine.prefill_capacity());
+    ensure!(tokens.len() > 2 * chunk && tokens.len() + 31 <= engine.max_context,
+        "--upload-check needs at least three chunks and room for 31 decode rows");
+    let family = GlmfPrefix::new(engine, PrefixMarks::Pool, |_| 0)?;
+    let mut allocator = Allocator::with_reserved(engine.pages, engine.slots, family.layout().mark_store.reserved());
+    let mut placement = allocator.admit(tokens.len() + 31)?;
+    let mut expected = None;
+    for barrier in [true, false] {
+        engine.synchronize()?;
+        placement.len = 0;
+        placement.kda_len = 0;
+        for part in tokens.chunks(chunk) {
+            engine.prefill_device(&mut placement, part)?.context("upload check prefill logits")?;
+            if barrier { engine.synchronize()?; }
+        }
+        let prefill = (engine.slot_state(placement.slot)?, paged_rows(&family, &placement, placement.len)?);
+        for token in tokens.iter().cycle().take(31) {
+            engine.verify_device(&mut [(&mut placement, 1)], &[*token], false)?
+                .context("upload check decode logits")?;
+            if barrier { engine.synchronize()?; }
+        }
+        let replay = (engine.slot_state(placement.slot)?, paged_rows(&family, &placement, placement.len)?);
+        if let Some((reference_prefill, reference_replay)) = &expected {
+            ensure!(reference_prefill == &prefill, "queued multi-chunk prefill differs from drained state");
+            ensure!(reference_replay == &replay, "queued decode replay differs from drained state");
+        } else { expected = Some((prefill, replay)); }
+    }
+    allocator.release(placement);
+    println!("upload check: {} tokens in {} chunks, 31 decode rows: state and paged bytes identical without barriers",
+        tokens.len(), tokens.len().div_ceil(chunk));
+    Ok(())
+}
+
 /// glmf-golden --resume-at P: prefill `tokens[..P]` into sequence A, capture its snapshot (shared
 /// units, the copied tail unit, the KDA mark), restore it into sequence B (its own KDA slot and
 /// pool-page mapping), continue both with the same chunks and `decode` greedy single-row steps,

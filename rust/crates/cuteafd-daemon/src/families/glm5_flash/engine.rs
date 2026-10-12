@@ -2276,8 +2276,10 @@ impl<'a> GlmfEngine<'a> {
             // Entries other sequences' queued steps read keep their values.
             for rank in 0..self.ranks() {
                 let map = self.caches_of(rank).pool_logical.buffer;
-                self.on(rank, || self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
-                    bytes_of(&host[..])))?;
+                // SAFETY: each rank's map consumers run on its owned stream.
+                self.on(rank, || unsafe { self.library.copy_h2d_ordered(
+                    cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
+                    bytes_of(&host[..]), self.stream_of(rank)) })?;
             }
         }
         Ok(())
@@ -2631,7 +2633,8 @@ impl<'a> GlmfEngine<'a> {
         let t = tokens.len();
         let host = std::time::Instant::now();
         let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
-        self.library.copy_h2d(staged, &embed)?;
+        // SAFETY: embedding scratch is read/written only on the engine stream.
+        unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
         self.host_op("host: embedding upload", host);
         self.timed("stream expansion", || {
             for s in 0..HC {
@@ -2642,7 +2645,7 @@ impl<'a> GlmfEngine<'a> {
                     ..w.streams[0].buffer
                 };
                 // SAFETY: both buffers are live workspace buffers of at least `t` pitched
-                // rows; the upload above completed before the copies are queued.
+                // rows; the upload precedes these copies on the same stream.
                 unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
             }
             Ok(())
@@ -2651,7 +2654,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// The device table's rows of the `t` staged ids, four copies each, into stream buffer 0.
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
-        // SAFETY: the ids are on the device (a completed copy) and the streams hold t x 4 rows.
+        // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
             w.streams[0].buffer.ptr, self.stream) }
     }
@@ -2694,7 +2697,11 @@ impl<'a> GlmfEngine<'a> {
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
         let bytes = bytes_of(values);
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        let rank = usize::from(self.peer.as_ref().is_some_and(|p| p.device == dev.buffer.device_id));
+        // SAFETY: this engine owns the destination and its rank stream; uploads
+        // precede new consumers and follow previous consumers outside capture.
+        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
+            bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
@@ -3061,11 +3068,8 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.pool_table, &tables.pool_table)
     }
 
-    /// Writes a step's tables into rank 1's `w1` after its stream drained (every wait on it is
-    /// matched by a push rank 0 queued earlier, so it drains).
+    /// Upload rank 1's tables after its prior consumers on the peer stream.
     fn peer_tables(&self, w1: &Workspace<'_>, tables: &StepTables) -> Result<()> {
-        // SAFETY: the engine owns the peer stream.
-        self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
         self.on(1, || self.put_tables(w1, tables))
     }
 

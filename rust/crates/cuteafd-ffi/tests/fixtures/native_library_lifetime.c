@@ -133,14 +133,52 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
     return pack_status;
 }
 
+struct upload_event { void *dst; const void *src; size_t bytes; };
+static struct upload_event pending_upload;
+static void *upload_events[128];
+static size_t upload_event_count;
+
+int cuteafd_cuda_event_create_ordering(void **out) {
+    if (upload_event_count == 128) return 1;
+    *out = calloc(1, sizeof(struct upload_event));
+    if (!*out) return 1;
+    upload_events[upload_event_count++] = *out;
+    event('C');
+    return 0;
+}
+int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
+                         size_t bytes, void *stream) {
+    (void)stream;
+    if (bytes > dst.bytes) return 1;
+    pending_upload = (struct upload_event){dst.ptr, source, bytes};
+    event('Q');
+    return 0;
+}
+int cuteafd_cuda_event_record(void *handle, void *stream) {
+    (void)stream;
+    *(struct upload_event *)handle = pending_upload;
+    memset(&pending_upload, 0, sizeof(pending_upload));
+    event('R');
+    return 0;
+}
 int cuteafd_cuda_event_synchronize(void *handle) {
-    (void)handle;
     event('S');
-    return ++drain_calls > drain_after ? drain_status : 0;
+    int status = ++drain_calls > drain_after ? drain_status : 0;
+    if (status) return status;
+    for (size_t i = 0; i < upload_event_count; ++i) {
+        if (upload_events[i] == handle) {
+            struct upload_event *upload = handle;
+            if (upload->bytes) memcpy(upload->dst, upload->src, upload->bytes);
+            upload->bytes = 0;
+        }
+    }
+    return 0;
 }
 
 int cuteafd_cuda_event_destroy(void *handle) {
-    (void)handle;
+    for (size_t i = 0; i < upload_event_count; ++i) {
+        if (upload_events[i] == handle) { free(handle); upload_events[i] = NULL; }
+    }
     event('E');
     return 0;
 }
