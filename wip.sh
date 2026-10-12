@@ -111,9 +111,15 @@ wip_export_locks=off
 if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]]; then
   wip_export_locks=on
   [[ "$COORDINATOR_GPU" =~ ^[01]$ ]] || release_die "export locking needs COORDINATOR_GPU=0 or 1"
-  # Only the selected GPU is exposed to the coordinator build container.
-  wip_export_lock="$HOME/.cache/cuteafd/gpu${COORDINATOR_GPU}.lock"
+  # Only the selected GPU is exposed to the coordinator build container. The
+  # native/AOT phase runs under a held fair turn on that GPU's lock
+  # (CUTEAFD_WIP_HOST_EXPORT_TURN: scripts/hw/hwlock.py on the host, which
+  # queues and then holds the flock for the export); the Rust phase holds none.
+  wip_export_gpu_lock="gpu${COORDINATOR_GPU}"
 fi
+wip_hwlock() {
+  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$1" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-1800}" -- "${@:2}"
+}
 mapfile -t wip_hosts < <(release_spark_values HOST)
 ((${#wip_hosts[@]})) || release_die "configuration has no active Spark hosts"
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
@@ -426,10 +432,6 @@ ensure_local_container() {
     cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
       docker start "$coordinator_container" >/dev/null
-    if [[ "${wip_export_locks:-off}" == on ]]; then
-      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip-export-gpu.lock"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$wip_export_lock" ]] ||
-        release_die "export lock mount missing or changed; recreate this task's WIP container"
-    fi
     docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
     return
   fi
@@ -447,11 +449,6 @@ ensure_local_container() {
     -e CUDA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )
-  if [[ "${wip_export_locks:-off}" == on ]]; then
-    mkdir -p "$(dirname "$wip_export_lock")"
-    touch "$wip_export_lock"
-    args+=(-v "$wip_export_lock:/wip-export-gpu.lock" -e CUTEAFD_WIP_EXPORT_LOCKS=on -e CUTEAFD_WIP_EXPORT_LOCK_FILES=/wip-export-gpu.lock)
-  fi
   local -a cache_args=()
   local cache_plan
   cache_plan="$(cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash")" || release_die "WIP cache plan failed"
@@ -686,9 +683,9 @@ build_coordinator() {
       cuteafd_compiler_cache_warn 'WIP cache mounts absent; --recreate to enable caching'
     fi
   fi
-  docker exec \
+  local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
-    -e "CUTEAFD_WIP_EXPORT_LOCKS=${wip_export_locks:-off}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
+    -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
@@ -706,7 +703,17 @@ build_coordinator() {
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
     "$coordinator_container" \
     /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator
+    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    # Cargo first, holding no hardware; then the native/AOT export, which
+    # queries the GPU, under a held fair turn on its lock.
+    "${coordinator_build[@]}" rust
+    echo "WIP coordinator export: queueing for $wip_export_gpu_lock"
+    wip_hwlock "$wip_export_gpu_lock" "${coordinator_build[@]}" native ||
+      release_die "coordinator WIP export failed or got no fair turn on $wip_export_gpu_lock"
+  else
+    "${coordinator_build[@]}"
+  fi
   docker exec "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
@@ -739,20 +746,20 @@ build_expert() (
   build_command="docker exec -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust"
   if [[ "${wip_export_locks:-off}" == on ]]; then
-    local spark_lock spark_lock_fd
-    case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
-    exec {spark_lock_fd}>>"$spark_lock"
-    # Queue fairly first (scripts/hw/hwlock.py), then hold the flock for the export.
-    python3 "$repo_root/scripts/hw/hwlock.py" --locks "$(basename "$spark_lock" .lock)" --wait 1800 -- true \
-      || release_die "timed out waiting for a fair turn on Spark export $seed_host"
-    flock -w 1800 "$spark_lock_fd" || release_die "timed out waiting for Spark export on $seed_host"
+    # The export holds the seed's lock (raptor-side) under one held fair turn:
+    # no gap between the queue grant and the flock for another job to enter.
+    local spark_lock
+    case "$seed_host" in rhea|moa) spark_lock="$seed_host" ;; *) spark_lock=sparks ;; esac
+    echo "WIP Spark export: queueing for $spark_lock"
+    wip_hwlock "$spark_lock" timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
+      release_die "Spark WIP export on $seed_host failed or got no fair turn on $spark_lock"
+  else
+    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
   fi
-  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
   timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
-  [[ -z "${spark_lock_fd:-}" ]] || exec {spark_lock_fd}>&-
 )
 
 case "$role" in

@@ -440,19 +440,33 @@ def test_pool_precheck_and_red_square():
     assert cards.struct.unpack('>II', png[16:24]) == (224, 224)
 
 
-def test_spark_native_phase_holds_lock_without_locking_cargo(tmp_path):
+def _wip_function(name, end):
     text = (ROOT / 'wip.sh').read_text()
-    function = text[text.index('build_expert() ('):text.index('\ncase "$role" in', text.index('build_expert() ('))]
+    start = text.index(name)
+    return text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3] + \
+        text[start:text.index(end, start)]
+
+
+def _trace_tools(tmp_path, extra=None):
     tools = tmp_path / 'tools'
     tools.mkdir()
-    for name, script in {
+    scripts = {
         'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
+        'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
-        'python3': '#!/bin/sh\nprintf "queue %s\\n" "$*" >> "$TRACE"\n',
-    }.items():
-        path = tools / name
-        path.write_text(script)
-        path.chmod(0o755)
+        # hwlock stand-in: record the turn, then run the command it guards.
+        'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
+        'timeout': '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done; shift\nexec "$@"\n',
+        **(extra or {})}
+    for name, script in scripts.items():
+        (tools / name).write_text(script)
+        (tools / name).chmod(0o755)
+    return tools
+
+
+def test_spark_native_phase_holds_one_fair_turn_without_locking_cargo(tmp_path):
+    function = _wip_function('build_expert() (', '\ncase "$role" in')
+    tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
@@ -468,13 +482,39 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert rust'))
-    queue = next(i for i, line in enumerate(lines) if line.startswith('queue '))
-    assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 -- true' in lines[queue]
-    lock = next(i for i, line in enumerate(lines) if line.startswith('flock -w 1800'))
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native'))
+    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native') and not line.startswith('turn '))
+    end = lines.index('end', turn)
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
-    assert rust < queue < lock < native < finalize
-    assert subprocess.run(['flock', '-n', str(home / '.cache/cuteafd/rhea.lock'), 'true']).returncode == 0
+    assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 --' in lines[turn]
+    # The export runs inside the held turn; no raw flock and no gap between grant and lock.
+    assert rust < turn < native < end < finalize
+    assert not any(line.startswith('flock') for line in lines)
+
+
+def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
+    function = _wip_function('build_coordinator() {', '\nbuild_expert() (')
+    tools = _trace_tools(tmp_path)
+    trace = tmp_path / 'trace'
+    setup = f'''set -euo pipefail
+repo_root={str(ROOT)!r}
+sync_local_source() {{ :; }}
+release_die() {{ exit 2; }}
+cuteafd_compiler_cache_warn() {{ :; }}
+slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
+'''
+    subprocess.run(['bash', '-c', setup + function + '\nbuild_coordinator'], check=True,
+                   env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
+    lines = trace.read_text().splitlines()
+    rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
+    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native') and not line.startswith('turn '))
+    assert 'scripts/hw/hwlock.py --locks gpu1 --wait 1800 --' in lines[turn]
+    assert rust < turn < native < lines.index('end', turn)
+    assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
+    wip = (ROOT / 'wip.sh').read_text()
+    assert '/wip-export-gpu.lock' not in wip
 
 
 def test_split_native_phase_requires_matching_rust_source_and_cache_mode():

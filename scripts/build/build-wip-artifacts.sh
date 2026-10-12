@@ -118,7 +118,7 @@ cuteafd_compiler_cache_setup "$build_dir"
 # kache restores hardlinks; plain and cached Cargo must not share outputs.
 export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
 [[ "$phase" == native ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
+if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
   # AOT outputs remain reusable; only the stale configure identity is discarded.
   rm -f "$build_dir/native/CMakeCache.txt"
@@ -174,8 +174,10 @@ else
     { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }
 fi
 
-# Cargo is complete before GPU admission. Locks are host files individually
-# bind-mounted by wip.sh; ordinary WIP builds do not acquire hardware locks.
+# Cargo is complete before GPU admission. Current wip.sh runs this native phase
+# under a held fair turn on the host (CUTEAFD_WIP_HOST_EXPORT_TURN) and passes
+# CUTEAFD_WIP_EXPORT_LOCKS=off; the in-container flock below only serves older
+# containers that still mount a lock file. Ordinary WIP builds take no locks.
 export_lock_fds=()
 if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]]; then
   for export_lock in ${CUTEAFD_WIP_EXPORT_LOCK_FILES:?missing export lock files}; do

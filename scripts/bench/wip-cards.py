@@ -1141,7 +1141,11 @@ BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_E
 def build_lock_mode(revision):
     text = run(['git', '-C', str(REPO), 'show', revision + ':wip.sh']).stdout
     native = run(['git', '-C', str(REPO), 'show', revision + ':scripts/build/build-wip-artifacts.sh']).stdout
-    return 'native-phase' if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native else 'legacy-full-build'
+    # Native-phase sources lock only their export: on the host under a held fair
+    # turn (CUTEAFD_WIP_HOST_EXPORT_TURN) or, older, through a mounted lock file.
+    if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
+        return 'native-phase'
+    return 'legacy-full-build'
 
 
 def build_arms(items, arms, cards, state, task, dry, seed='moa'):
