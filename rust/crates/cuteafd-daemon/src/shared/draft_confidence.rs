@@ -127,8 +127,10 @@ impl ConfidencePolicy {
         Ok(Self { key, selector, online: Calibration::default(), enabled: false, trace: None })
     }
 
-    /// Native MTP has history rates but no top-16 selector features.
-    pub fn history(key: String) -> Result<Self> { Self::new(key, None) }
+    /// Native MTP's frozen history prior has no selector or online owner here.
+    pub fn history(key: String) -> Result<Self> {
+        Ok(Self { key, selector: None, online: Calibration::default(), enabled: false, trace: None })
+    }
 
     fn new(key: String, selector: Option<SelectorFit>) -> Result<Self> {
         let trace = super::draft_policy::speculation_trace_path("CUTEAFD_DRAFT_CONFIDENCE_TRACE")

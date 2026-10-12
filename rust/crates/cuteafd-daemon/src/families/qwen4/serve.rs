@@ -486,6 +486,28 @@ impl VerifyStats {
 #[cfg(test)]
 mod verify_tests {
     #[test]
+    fn shared_draft_binding_preserves_config_geometry_and_history_prior() {
+        use crate::shared::draft::resource::{self, LayerHome};
+        use crate::shared::draft_policy::DraftHistory;
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(4)).unwrap();
+        let homes: Vec<_> = (0..cfg.layers).map(|index| if index < 2 {
+            LayerHome::Local { slice_bytes: 4096. }
+        } else { LayerHome::Remote { slice_bytes: 8192. } }).collect();
+        let geometry = resource::geometry(&homes, cfg.experts, cfg.topk, super::DECODE_ROWS, 3,
+            crate::shared::draft::copy::COPY_EXTENSION).unwrap();
+        assert_eq!((geometry.layers.len(), usize::from(geometry.experts), usize::from(geometry.topk)),
+            (cfg.layers, cfg.experts, cfg.topk));
+        assert_eq!((geometry.max_requests, geometry.widths.clone(), geometry.max_positions),
+            (super::DECODE_ROWS, vec![3], 35));
+        assert!(geometry.layers.iter().all(|layer| layer.class.is_some()));
+        let mut history = DraftHistory::default();
+        history.observe(3, 2);
+        let priors = super::super::mtp_policy::acceptance(&[&history], &[3]);
+        assert_eq!(priors[0], history.pooled(3, std::iter::empty::<&DraftHistory>()));
+    }
+
+    #[test]
     fn copy_trim_retains_mandatory_tokens_and_proposal_prefixes() {
         for sequences in 1..=16 {
             for extra in 0..=64-sequences {

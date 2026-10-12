@@ -1267,6 +1267,40 @@ mod port_tests {
     }
 
     #[test]
+    fn shared_draft_binding_preserves_config_geometry_and_frozen_prior() {
+        use crate::shared::draft::resource::LayerHome;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/tests/fixtures/mimo-qualified-pro.json")).unwrap();
+        let cfg = cuteafd_loader::families::mimo_v2::MimoV2Config::from_hf(&fixture["target_config"]).unwrap();
+        let homes: Vec<_> = cfg.dense.iter().enumerate().map(|(index, &dense)| {
+            if dense { LayerHome::Dense }
+            else if index % 2 == 0 { LayerHome::Local { slice_bytes: 4096. } }
+            else { LayerHome::Remote { slice_bytes: 8192. } }
+        }).collect();
+        let geometry = resource::geometry(&homes, cfg.experts, cfg.topk, DECODE_ROWS, 7,
+            crate::shared::draft::copy::COPY_EXTENSION).unwrap();
+        assert_eq!((geometry.layers.len(), usize::from(geometry.experts), usize::from(geometry.topk)),
+            (cfg.layers, cfg.experts, cfg.topk));
+        assert_eq!((geometry.max_requests, geometry.widths.clone(), geometry.max_positions),
+            (DECODE_ROWS, vec![7], 39));
+        for (dense, layer) in cfg.dense.iter().zip(&geometry.layers) { assert_eq!(layer.class.is_none(), *dense); }
+        let directory = tempfile::tempdir().unwrap();
+        let confidence = crate::shared::draft_confidence::ConfidencePolicy::load_prior(
+            directory.path(), "mimo_v2/dflash2/test".into()).unwrap();
+        let mut history = DraftHistory::default();
+        history.observe(7, 4);
+        let features = [[1.0, 0.8, 0.5, 0.0]; 7];
+        let expected = crate::shared::draft_confidence::SelectorFit::default()
+            .confidence(&history.conditional(7), &features).unwrap();
+        assert_eq!(confidence.prior(&history, Some(&features), 7), expected);
+        assert_eq!(confidence.prior(&history, None, 3), history.conditional(3));
+        let mtp = crate::shared::draft_confidence::ConfidencePolicy::history("mimo_v2/mtp/test".into()).unwrap();
+        let rates = mtp.prior(&history, None, 3);
+        assert_eq!(rates, history.conditional(3));
+        assert_eq!(mtp.apply(&rates), rates);
+    }
+
+    #[test]
     fn port_knobs_default_off_and_sixteen_slots_are_configurable() {
         let default = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib"]);
         let args = default.serve;
