@@ -1830,6 +1830,7 @@ impl<'a> GlmfEngine<'a> {
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
             2 * self.prefill_lane_count, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
+        routes.trace_identity("glmf-tp2-routes");
         let combine = FusedCombine::new(self.library, ExchangeDtype::Bf16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok().map(|s| s.parse::<usize>())
             .transpose().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval")?.unwrap_or(0);
@@ -2167,6 +2168,7 @@ impl<'a> GlmfEngine<'a> {
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
+        exchange.trace_identity("glmf-target-main");
         // Both GPUs run the indexer; per-rank index tails are not built yet.
         ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {

@@ -110,6 +110,31 @@ def test_cuda_build_attests_real_header_and_always_wraps_registration():
     assert 'elapsed_ms = started.elapsed().as_secs_f64() * 1000.0' in constructor
 
 
+def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
+    native = (ROOT / "native/shared/cuda/peer_exchange.cu").read_text()
+    wait = native.split("__global__ void wait_flag_abortable", 1)[1].split(
+        "__global__ void publish_abort", 1)[0]
+    timeout = wait.split("global_ns() - start > kWaitTimeoutNs", 1)[1]
+    for field in ["flag=%p", "state=%p", "aborted=%p", "expected=%u", "observed=%u",
+                  "receive=%u", "abort=%u"]:
+        assert field in timeout
+    assert timeout.index("printf(") < timeout.index("__trap()")
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
+    identity = shared.split("pub fn trace_identity", 1)[1].split(
+        "pub fn terminal_state", 1)[0]
+    assert 'var("CUTEAFD_PEER_WAIT_DIAGNOSTICS")' in identity
+    for field in ["device =", "stream =", "flag_index =", "receive_state =", "abort ="]:
+        assert field in identity
+    assert "synchronize(" not in identity
+    assert "copy_d2h" not in identity
+    family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
+    engine = (family / "engine.rs").read_text()
+    assert 'routes.trace_identity("glmf-tp2-routes")' in engine
+    assert 'exchange.trace_identity("glmf-target-main")' in engine
+    assert 'exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits")' in (
+        family / "remote_dflash.rs").read_text()
+
+
 def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
     compiler = shutil.which("g++")
     if not compiler:

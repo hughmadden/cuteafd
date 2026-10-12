@@ -259,6 +259,23 @@ impl<'a> PeerExchange<'a> {
         Ok(exchange)
     }
 
+    /// Startup-only pointer map for failure-only CUDA watchdog messages. Do
+    /// not download control words or add synchronization to the exchange path.
+    pub fn trace_identity(&self, name: &'static str) {
+        if !std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1") { return }
+        for rank in 0..2 {
+            let end = &self.ends[rank];
+            for flag in 0..=end.recv.len() {
+                let abort = self.abort.as_ref().map(|a| a.sides[rank].word.buffer.ptr);
+                tracing::info!(exchange = name, rank, device = self.ranks[rank].device,
+                    stream = ?self.ranks[rank].stream, flag_index = flag,
+                    direct = flag == end.recv.len(), flag = ?end.flag(flag),
+                    send_state = ?end.send_state(flag), receive_state = ?end.recv_state(flag),
+                    abort = ?abort, "peer wait watchdog pointer map");
+            }
+        }
+    }
+
     pub fn terminal_state(&self) -> TerminalState {
         self.abort
             .as_ref()

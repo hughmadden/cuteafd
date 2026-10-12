@@ -32,6 +32,7 @@ impl<'a> Prepared<'a> {
         let stream = Stream::new(Device { library, id: peer })?;
         let exchange = PeerExchange::new_abortable(library,
             [target, RankDevice { device: peer, stream: stream.raw }], 4, 0)?;
+        exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits");
         Ok(Self { exchange, stream })
     }
 

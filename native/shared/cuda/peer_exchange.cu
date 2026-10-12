@@ -170,7 +170,11 @@ __global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const
         break;
       }
       if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
-        printf("peer_wait_abortable: missing push or terminal abort after 60 s\n");
+        printf("peer_wait_abortable: missing push or terminal abort after 60 s "
+               "flag=%p state=%p aborted=%p expected=%u observed=%u receive=%u abort=%u\n",
+               static_cast<const void*>(flag), static_cast<void*>(state),
+               static_cast<const void*>(aborted), expected, load_acquire_sys(flag),
+               state[0], load_acquire_sys(aborted));
         __trap();
       }
     }
