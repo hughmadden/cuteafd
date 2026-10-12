@@ -273,6 +273,7 @@ pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], wid
 
 pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
     max_rows: usize, drafted_requests: usize) -> Selection {
+    let _timing = super::clock::HostSpan::new(super::clock::HostStage::Select);
     let positions = policy.geometry().max_positions;
     let confidence: Vec<&[f64]> = candidates.iter()
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
