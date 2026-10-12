@@ -135,6 +135,21 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
         family / "remote_dflash.rs").read_text()
 
 
+def test_remote_context_wave_drains_after_acknowledgement_before_next_target_chunk():
+    family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
+    remote = (family / "remote_dflash.rs").read_text()
+    update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
+    assert update.count("self.synchronize()?") == 2
+    ack = update.index("self.exchange.signal(1, TAPS)?")
+    assert ack < update.rindex("self.synchronize()?") < update.rindex("Ok(())")
+    # Per-chunk updates stay in place; retirement cannot defer ring writes
+    # until turn end or drop an intermediate context wave.
+    bench = (family / "speculate.rs").read_text().split(
+        "draft_prefill_bench(args, &golden", 1)[1].split("fn draft_prefill_bench", 1)[0]
+    assert bench.index("engine.prefill_device(") < bench.index("drafter.update(")
+    assert "for chunk in prompt.chunks" in bench
+
+
 def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
     compiler = shutil.which("g++")
     if not compiler:

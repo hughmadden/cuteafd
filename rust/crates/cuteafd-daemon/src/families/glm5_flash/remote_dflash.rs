@@ -196,6 +196,10 @@ impl<'a> RemoteDflash<'a> {
             // that the incoming taps arrived. The next overwrite waits for it.
             self.exchange.signal(1, TAPS)?;
             self.update_pending.set(true);
+            // Both target ranks have issued this chunk before update. Retire
+            // its tap readers before another target chunk can enter CUDA host
+            // calls on GPU1 with a bridge wait still outstanding.
+            self.synchronize()?;
             Ok(())
         })
     }
