@@ -58,7 +58,7 @@ const GROUP_ROWS: u8 = 16;
 /// Most drafter positions the binding prices (GLM drafters propose 7 or 8).
 const MAX_POSITIONS: usize = 16;
 /// Most copy positions appended past the drafter's window.
-pub(crate) const COPY_EXTENSION: usize = 32;
+pub(crate) use crate::shared::draft::copy::COPY_EXTENSION;
 /// Raw acceptance of an agreed copy's continuation before calibration.
 pub(crate) const TAIL_PRIOR: f64 = 0.9;
 /// Drafts per request until the policy engages: about the C1 optimum of the
@@ -338,14 +338,6 @@ fn fit_budget(lengths: &mut [usize], max_rows: usize) -> bool {
         rows -= 1;
     }
     trimmed
-}
-
-/// An agreed copy's continuation: the tokens a copy window `copy` proposes
-/// past the drafter's whole window `drafted`, when it repeats that window
-/// exactly; empty otherwise (a partial or coincidental match drops out).
-pub(crate) fn copy_extension<'c>(drafted: &[u32], copy: &'c [u32]) -> &'c [u32] {
-    if drafted.is_empty() || copy.len() <= drafted.len() || copy[..drafted.len()] != *drafted { return &[]; }
-    &copy[drafted.len()..]
 }
 
 /// One verified request of a GLM Flash round.
@@ -640,12 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn copies_extend_only_a_draft_they_agree_with_over_its_whole_window() {
-        assert_eq!(copy_extension(&[1, 2, 3], &[1, 2, 3, 4, 5]), [4, 5]);
-        assert!(copy_extension(&[1, 2, 3], &[1, 2, 9, 4, 5]).is_empty());
-        assert!(copy_extension(&[1, 2, 3], &[1, 2, 3]).is_empty());
-        assert!(copy_extension(&[1, 2, 3], &[1, 2]).is_empty());
-        assert!(copy_extension(&[], &[1, 2]).is_empty());
+    fn copy_extension_positions_follow_the_neural_width() {
         // Extension positions sit past the drafter's width in the geometry.
         let g = geometry(&homes(true), 288, 8, 64, 7, COPY_EXTENSION).unwrap();
         assert_eq!((g.widths.clone(), g.max_positions), (vec![7], 7 + COPY_EXTENSION));

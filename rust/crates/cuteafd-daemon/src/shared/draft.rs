@@ -17,5 +17,6 @@
 //! carries between selection and observation.
 pub(crate) mod binding;
 pub(crate) mod clock;
+pub(crate) mod copy;
 pub(crate) mod evidence;
 pub(crate) mod routes;
