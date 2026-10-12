@@ -740,6 +740,13 @@ pub struct DraftPolicy {
     counts: Vec<u8>,
     /// Routes per expert of one observed layer.
     scratch: Vec<u16>,
+    /// Experts already in the shape being evaluated, one bit per (window,
+    /// layer, expert). While no count has reached its layer's `group_rows`,
+    /// `count % group_rows == 0` is exactly "bit clear", so a peek tests bits
+    /// in a few kilobytes instead of counts.
+    occupancy: Vec<u64>,
+    /// Some count reached its layer's `group_rows`: peeks use the counts.
+    saturated: bool,
     seed: PolicySeed,
     /// Per concurrency bucket: timed rounds and smoothed relative error of
     /// the out-of-sample round prediction.
@@ -800,7 +807,9 @@ impl DraftPolicy {
             raw_mean: vec![0.9; positions],
             stats: DraftPolicyStats::new(positions),
             counts: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts)],
-            scratch: vec![0; usize::from(geometry.experts)], geometry,
+            scratch: vec![0; usize::from(geometry.experts)],
+            occupancy: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts).div_ceil(64)],
+            saturated: false, geometry,
         }
     }
     /// A fresh policy over the same geometry and priors.
@@ -1089,6 +1098,11 @@ impl DraftPolicy {
                 }).collect()
             }).collect();
             let draft = self.cost.draft_us(bucket, ids.len() as f64, width > narrow);
+            if let Some((_, narrow_ratio)) = best.filter(|_| width > narrow) {
+                // Exact pruning: no wide shape beats every expected token over
+                // the anchors-only time with the wide pass.
+                if self.wide_cannot_win(bucket, &ids, &cumulative, draft, narrow_ratio) { continue; }
+            }
             let selection = self.select_core(bucket, &ids, &cumulative, draft, usize::MAX, false);
             let ratio = selection.expected_tokens / selection.predicted_us;
             if best.is_none_or(|(_, b)| ratio > b) { best = Some((width, ratio)); }
@@ -1154,6 +1168,28 @@ impl DraftPolicy {
             self.selected_draft_room.insert(id, can_draft && room > 0 && minimal.is_some());
         }
         Ok(chosen)
+    }
+
+    /// Exact pruning of a width: any shape of `k` drafts has at most the `k`
+    /// largest survivals as extra expected tokens, and costs at least the
+    /// anchors-only time plus `k` rows that read no new expert weights. If no
+    /// `k` beats `ratio` under those bounds, no shape does.
+    fn wide_cannot_win(&mut self, bucket: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64, ratio: f64)
+        -> bool {
+        let mut survivals: Vec<f64> = cumulative.iter().flatten().copied().collect();
+        survivals.sort_by(|a, b| b.total_cmp(a));
+        let anchors = vec![0; ids.len()];
+        let mut time = self.predict_bucket_draft(bucket, ids, &anchors, draft_us);
+        let mut expected = ids.len() as f64;
+        if expected / time > ratio { return false; }
+        let mut rows = ids.len() as f64;
+        for survival in survivals {
+            expected += survival;
+            time += self.cost.marginal(bucket, rows, [0.; MAX_RESOURCE_CLASSES]).max(0.);
+            rows += 1.;
+            if expected / time > ratio { return false; }
+        }
+        true
     }
 
     /// Forward-growth length selection over survival products, with the round's
@@ -1264,6 +1300,8 @@ impl DraftPolicy {
 
     fn clear_counts(&mut self) {
         self.counts.fill(0);
+        self.occupancy.fill(0);
+        self.saturated = false;
     }
 
     fn count_index(&self, window: usize, layer: usize, expert: u16) -> usize {
@@ -1279,6 +1317,35 @@ impl DraftPolicy {
     /// Megabytes of new weight traffic per class if row `row` of `id` joined
     /// the current shape, averaged over the forecast windows.
     fn peek_row(&self, id: u64, row: usize) -> ClassBytes {
+        if self.saturated { return self.peek_row_counts(id, row); }
+        let topk = usize::from(self.geometry.topk);
+        let words = usize::from(self.geometry.experts).div_ceil(64);
+        let layers = self.geometry.layers.len();
+        let history = self.history.get(&id);
+        let mut total = [0.; MAX_RESOURCE_CLASSES];
+        for window in 0..WINDOWS {
+            let routes = history.and_then(|h| h.get(window + row));
+            let base = window * layers;
+            for priced in &self.priced {
+                let groups = match routes {
+                    Some(routes) => {
+                        let occupied = &self.occupancy[(base + priced.layer) * words..][..words];
+                        routes[priced.layer * topk..][..topk].iter()
+                            .filter(|&&e| occupied[usize::from(e) >> 6] >> (e & 63) & 1 == 0).count() as f64
+                    }
+                    None if row == 0 => topk as f64,
+                    None => self.novelty[priced.layer],
+                };
+                total[priced.class] += groups * priced.slice_bytes;
+            }
+        }
+        let total = total.map(|bytes| bytes / WINDOWS as f64 / 1e6);
+        debug_assert_eq!(total, self.peek_row_counts(id, row));
+        total
+    }
+
+    /// The count-table forecast `peek_row` must equal.
+    fn peek_row_counts(&self, id: u64, row: usize) -> ClassBytes {
         let topk = usize::from(self.geometry.topk);
         let mut total = [0.; MAX_RESOURCE_CLASSES];
         for window in 0..WINDOWS {
@@ -1303,10 +1370,13 @@ impl DraftPolicy {
         for window in 0..WINDOWS {
             let Some(token) = self.history.get(&id).and_then(|h| h.get(window + row)) else { continue };
             for priced in &self.priced {
+                let words = usize::from(self.geometry.experts).div_ceil(64);
+                let slot = window * self.geometry.layers.len() + priced.layer;
                 for &expert in &token[priced.layer * topk..][..topk] {
-                    let index = (window * self.geometry.layers.len() + priced.layer)
-                        * usize::from(self.geometry.experts) + usize::from(expert);
+                    let index = slot * usize::from(self.geometry.experts) + usize::from(expert);
                     self.counts[index] = self.counts[index].saturating_add(1);
+                    self.occupancy[slot * words + (usize::from(expert) >> 6)] |= 1 << (expert & 63);
+                    self.saturated |= self.counts[index] >= priced.group_rows;
                 }
             }
         }
