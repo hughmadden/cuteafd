@@ -421,7 +421,11 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
             "requests_up_to": if requests == 16 { None } else { Some(requests) },
             "warm": policy.warm(false, requests), "engaged": policy.engaged(false, requests),
-            "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft})
+            "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft,
+            "round_local": fit.round_local, "round_pooled": fit.round_pooled,
+            "round_identified": fit.round_identified, "draft_local": fit.draft_local,
+            "draft_pooled": fit.draft_pooled, "draft_identified": fit.draft_identified,
+            "layers_identified": fit.layers_identified})
     }).collect();
     let value = serde_json::json!({
         "mode": "shared",

@@ -252,6 +252,8 @@ struct Estimator<const D: usize> {
     prior_mean: [f64; D],
     prior_precision: [f64; D],
     theta: [f64; D],
+    local_theta: [f64; D],
+    identified: [bool; D],
     scale: f64,
     samples: u64,
 }
@@ -265,6 +267,8 @@ impl<const D: usize> Estimator<D> {
             prior_mean,
             prior_precision,
             theta: prior_mean,
+            local_theta: prior_mean,
+            identified: [false; D],
             scale: 0.,
             samples: 0,
         }
@@ -302,7 +306,8 @@ impl<const D: usize> Estimator<D> {
         self.solve();
     }
     /// Use capped pooled information as a moving prior, not extra observations.
-    /// Local evidence retains its original decay and eventually dominates.
+    /// Local evidence retains its original decay; prior strength follows the
+    /// bucket's lifetime samples so forgetting cannot cap its independence.
     fn shrink_to(&mut self, pooled: &Self) {
         if self.samples == 0 || self.sxx == pooled.sxx && self.sxy == pooled.sxy {
             self.theta = pooled.theta;
@@ -310,7 +315,7 @@ impl<const D: usize> Estimator<D> {
         }
         let pooled_evidence = pooled.sxx[0][0].max(1.);
         let prior_samples = (WARM_ROUND_SAMPLES as f64).min(pooled_evidence)
-            / (1. + self.sxx[0][0] / WARM_ROUND_SAMPLES as f64);
+            / (1. + self.samples as f64 / WARM_ROUND_SAMPLES as f64);
         let mut information = pooled.sxx;
         for i in 0..D { information[i][i] += pooled.prior_precision[i]; }
         // Express pooled confidence in the local design's units: a wide
@@ -327,16 +332,53 @@ impl<const D: usize> Estimator<D> {
     /// Solve the regularized normal equations, holding coefficients that would
     /// turn negative at zero (active set, at most D passes).
     fn solve(&mut self) {
+        self.identified = self.identifiable();
         self.solve_with_prior([[0.; D]; D], self.prior_mean);
+        self.local_theta = self.theta;
+    }
+    /// Test excitation in observed data, without counting regularization as
+    /// evidence. Normalization makes this independent of rows/MB units.
+    fn identifiable(&self) -> [bool; D] {
+        let mut normalized = [[0.; D]; D];
+        for i in 0..D {
+            for j in 0..D {
+                normalized[i][j] = self.sxx[i][j]
+                    / (self.sxx[i][i] * self.sxx[j][j]).sqrt().max(1e-30);
+            }
+        }
+        let mut identified = [false; D];
+        identified[0] = self.samples > 0;
+        // Keep an independent basis: prefer traffic to a collinear row count,
+        // and wide*requests to its duplicate wide flag in a constant batch.
+        for column in (1..D).rev() {
+            if self.sxx[column][column] <= 1e-12 { continue; }
+            let mut a = [[0.; D]; D];
+            let mut b = [0.; D];
+            for i in 0..D {
+                a[i][i] = 1.;
+                if !identified[i] { continue; }
+                b[i] = normalized[column][i];
+                for j in 0..D {
+                    if identified[j] { a[i][j] = normalized[i][j]; }
+                }
+                a[i][i] += 1e-9;
+            }
+            let Some(projection) = solve_linear(a, b) else { continue; };
+            let explained: f64 = projection.iter().zip(b).map(|(x, y)| x * y).sum();
+            identified[column] = 1. - explained >= 0.01;
+        }
+        identified
     }
     fn solve_with_prior(&mut self, information: [[f64; D]; D], mean: [f64; D]) {
-        let mut fixed = [false; D];
+        let mut fixed = self.identified.map(|identified| !identified);
+        let mut values = self.local_theta;
         for _ in 0..D {
             let mut a = [[0.; D]; D];
             let mut b = [0.; D];
             for i in 0..D {
                 if fixed[i] {
                     a[i][i] = 1.;
+                    b[i] = values[i];
                     continue;
                 }
                 for j in 0..D {
@@ -347,10 +389,13 @@ impl<const D: usize> Estimator<D> {
                 a[i][i] += self.prior_precision[i];
                 b[i] = self.sxy[i] + self.prior_precision[i] * mean[i]
                     + information[i].iter().zip(mean).map(|(a, m)| a * m).sum::<f64>();
+                for j in 0..D {
+                    if fixed[j] { b[i] -= (self.sxx[i][j] + information[i][j]) * values[j]; }
+                }
             }
             let Some(solution) = solve_linear(a, b) else { return };
             match (0..D).find(|&i| !fixed[i] && solution[i] < 0.) {
-                Some(i) => fixed[i] = true,
+                Some(i) => { fixed[i] = true; values[i] = 0.; }
                 None => {
                     self.theta = solution;
                     return;
@@ -439,6 +484,14 @@ pub struct DraftCostSnapshot {
     /// Draft pass: intercept µs, µs per request, wide extra µs, wide extra µs
     /// per request, samples, scale.
     pub draft: [f64; 6],
+    /// Unblended local coefficients, pooled coefficients and excitation masks.
+    pub round_local: [f64; 3],
+    pub round_pooled: [f64; 3],
+    pub round_identified: [bool; 3],
+    pub draft_local: [f64; 4],
+    pub draft_pooled: [f64; 4],
+    pub draft_identified: [bool; 4],
+    pub layers_identified: Vec<[bool; 3]>,
 }
 
 /// Megabytes of expert traffic per resource class.
@@ -531,6 +584,13 @@ impl CostModel {
             layers: self.layer[regime].iter().map(pack).collect(),
             round: pack(&self.round[regime][bucket]),
             draft: [draft.theta[0], draft.theta[1], draft.theta[2], draft.theta[3], draft.samples as f64, draft.scale],
+            round_local: self.round[regime][bucket].local_theta,
+            round_pooled: self.pooled_round[regime].theta,
+            round_identified: self.round[regime][bucket].identified,
+            draft_local: draft.local_theta,
+            draft_pooled: self.pooled_draft[regime].theta,
+            draft_identified: draft.identified,
+            layers_identified: self.layer[regime].iter().map(|e| e.identified).collect(),
         }
     }
 }
@@ -1690,6 +1750,51 @@ mod tests {
     }
 
     #[test]
+    fn collinear_wide_traffic_cannot_erase_identified_row_cost() {
+        let mut fit = Estimator::new(0.98, [100., 15., 5.], [0.01; 3]);
+        for n in 0..800 {
+            let rows = 1. + (n % 8) as f64;
+            let mb = 10. + ((n / 8) % 7) as f64 * 10.;
+            fit.observe([1., rows, mb], 200. + 60. * rows + 4. * mb);
+        }
+        assert!(fit.identified[1]);
+        assert!((fit.theta[1] - 60.).abs() < 1.);
+        for n in 0..1200 {
+            let rows = 16. + (n % 8) as f64;
+            let mb = rows * 20.;
+            fit.observe([1., rows, mb], 200. + 60. * rows + 4. * mb);
+        }
+        assert!(!fit.identified[1], "wide rows and bytes are collinear");
+        assert!((fit.theta[1] - 60.).abs() < 3., "row slope {:?}", fit.theta);
+        assert!((fit.predict(&[1., 4., 30.]) - 560.).abs() < 30.);
+    }
+
+    #[test]
+    fn mature_bucket_prior_keeps_decaying_after_effective_evidence_saturates() {
+        let mut local = Estimator::new(0.98, [100., 60., 4.], [0.01; 3]);
+        let mut pooled = local.clone();
+        for n in 0..1600 {
+            let rows = 1. + (n % 8) as f64;
+            let mb = 10. + ((n / 8) % 7) as f64 * 10.;
+            local.observe([1., rows, mb], 200. + 60. * rows + 4. * mb);
+            pooled.observe([1., rows, mb], 300. + 600. * rows + 40. * mb);
+        }
+        let identified = local.theta[1];
+        local.shrink_to(&pooled);
+        assert!((local.theta[1] - identified).abs() < 3., "{:?}", local.theta);
+        assert_eq!(local.samples, 1600);
+    }
+
+    #[test]
+    fn constant_regressors_keep_their_prior_instead_of_becoming_free() {
+        let mut fit = Estimator::new(0.98, [100., 60., 4.], [0.01; 3]);
+        for _ in 0..400 { fit.observe([1., 16., 320.], 2440.); }
+        assert_eq!(fit.theta[1], 60.);
+        assert_eq!(fit.theta[2], 4.);
+        assert_eq!(fit.identified, [true, false, false]);
+    }
+
+    #[test]
     fn cold_residual_buckets_follow_pool_and_local_evidence_can_dominate() {
         let geometry = placement(5);
         let mut cost = CostModel::new(&geometry, &geometry.priced(), &PolicySeed::weak(7));
@@ -2034,6 +2139,11 @@ mod tests {
                 }
                 let requests: Vec<(u64, usize)> = live.iter()
                     .map(|r| (r.0, 1 + mix.below(wide as u64) as usize)).collect();
+                if scenario == 0 && round == 22 && std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP").is_some() {
+                    eprintln!("first changed round masks {:?}; {:?}",
+                        policy.cost.layer[policy.regime(shared)].iter().map(|e| e.identified).collect::<Vec<_>>(),
+                        policy.cost_snapshot(shared, requests.len()));
+                }
                 let width = policy.choose_width(shared, &requests);
                 transcript.word("width", width as u64);
                 let confidence: Vec<Vec<f64>> = requests.iter().zip(&live).map(|(&(_, available), r)|
@@ -2042,6 +2152,22 @@ mod tests {
                 let candidates: Vec<_> = live.iter().zip(&confidence)
                     .map(|(r, c)| DraftCandidate { id: r.0, confidence: c }).collect();
                 let ids: Vec<u64> = live.iter().map(|r| r.0).collect();
+                if scenario == 0 && round == 22 && std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP").is_some() {
+                    let mut constrained = policy.clone();
+                    let mut free = policy.clone();
+                    let regime = free.regime(shared);
+                    for e in &mut free.cost.layer[regime] {
+                        e.identified.fill(true);
+                        e.solve_with_prior([[0.; 3]; 3], e.prior_mean);
+                    }
+                    for e in &mut free.cost.round[regime] {
+                        e.identified.fill(true);
+                        e.solve_with_prior([[0.; 3]; 3], e.prior_mean);
+                    }
+                    eprintln!("same-state masked {:?}; unmasked {:?}",
+                        constrained.select(shared, &candidates, width).unwrap(),
+                        free.select(shared, &candidates, width).unwrap());
+                }
                 let lengths = match policy.select(shared, &candidates, width).unwrap() {
                     Some(selection) => {
                         for &length in &selection.lengths { transcript.word("length", length as u64); }
@@ -2133,6 +2259,49 @@ mod tests {
             .chain([&stats.prediction_error_us, &stats.prediction_abs_error_us, &stats.observed_us]) {
             transcript.real("sum", value);
         }
+    }
+
+    #[test]
+    fn masking_changes_decisions_only_with_unidentified_coefficients() {
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 1, 5, 6, 4, &[0.8; 5]); }
+        let mut unmasked = policy.clone();
+        let mut masked = 0;
+        for fits in &mut unmasked.cost.layer {
+            for fit in fits {
+                masked += fit.identified.iter().filter(|&&v| !v).count();
+                fit.identified.fill(true);
+                fit.solve_with_prior([[0.; 3]; 3], fit.prior_mean);
+            }
+        }
+        for fits in &mut unmasked.cost.round {
+            for fit in fits {
+                masked += fit.identified.iter().filter(|&&v| !v).count();
+                fit.identified.fill(true);
+                fit.solve_with_prior([[0.; 3]; 3], fit.prior_mean);
+            }
+        }
+        assert!(masked > 0);
+        let mut changed = 0;
+        for n in 1..100 {
+            let p = n as f64 / 100.;
+            let candidates = [DraftCandidate { id: 1, confidence: &[p; 5] }];
+            let constrained = policy.select(false, &candidates, 5).unwrap().unwrap();
+            let free = unmasked.select(false, &candidates, 5).unwrap().unwrap();
+            if constrained.lengths != free.lengths { changed += 1; }
+        }
+        assert!(changed > 0, "same-state unmasking must change a boundary decision");
+        // Fully independently excited coefficients have no masked solve delta.
+        let mut fit = Estimator::new(0.98, [100., 60., 4.], [0.01; 3]);
+        for n in 0..400 {
+            let x = [1., 1. + (n % 8) as f64, 10. + ((n / 8) % 7) as f64 * 10.];
+            fit.observe(x, 200. + 60. * x[1] + 4. * x[2]);
+        }
+        assert_eq!(fit.identified, [true; 3]);
+        let before = fit.theta;
+        fit.solve_with_prior([[0.; 3]; 3], fit.prior_mean);
+        assert_eq!(fit.theta, before);
     }
 
     /// Decisions and fits recorded after pooled shrinkage and skip recovery.
