@@ -491,7 +491,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         },
         "layers": classes,
         "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
-            "bucket_offset_us": snapshot.round[2], "bucket_rounds": snapshot.round[3] },
+            "bucket_offset_us": snapshot.round[2], "bucket_us_per_row": snapshot.round[3], "bucket_rounds": snapshot.round[4] },
         "draft": { "intercept_us": snapshot.draft[0], "us_per_request": snapshot.draft[1],
             "samples": snapshot.draft[4] },
         "route_ring_check": ring.map(|(layers, mismatched)| serde_json::json!({"layers": layers, "mismatched": mismatched})),

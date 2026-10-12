@@ -340,7 +340,7 @@ mod tests {
         // Each round teaches the class (one per round, summed over its
         // layers), the residual and the draft pass once.
         assert_eq!(fit.layers[0][2], 160.);
-        assert!(fit.round[3] > 0.);
+        assert!(fit.round[4] > 0.);
         assert_eq!(fit.draft[4], 160.);
         assert_eq!(policy.stats().emitted_requests, 320);
     }

@@ -101,7 +101,9 @@ fn replay_recorded_trace() {
             let base = priced.clone().predict_drafted(shared, &ids, &recorded, width, n);
             let plus = priced.clone().predict_drafted(shared, &ids, &longer, width, n);
             let marginal = base.zip(plus).map(|(a, b)| b - a);
+            let recorded_us = base;
             let line = serde_json::json!({"forecast": index, "requests": ids.len(), "rows": record["rows"],
+                "recorded_predicted_us": recorded_us,
                 "marginal_us": marginal, "fit": format!("{:?}", priced.cost_snapshot(shared, ids.len())),
                 "forecast_mb": forecast, "anchor_mb": anchors, "actual_mb": actual});
             writeln!(sink, "{line}").unwrap();
