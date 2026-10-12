@@ -652,11 +652,12 @@ impl<'a> MimoEngine<'a> {
         }).collect()
     }
 
-    fn probe_mark(&self, index: usize) {
+    fn probe_mark(&self, index: usize) -> Result<()> {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
             // SAFETY: the clock and stream belong to rank zero and outlive this round.
-            unsafe { probe.mark(index, self.stream) };
+            unsafe { probe.mark(index, self.stream)? };
         }
+        Ok(())
     }
 
     fn probe_ring(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
@@ -1636,7 +1637,7 @@ impl<'a> MimoEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index);
+            self.probe_mark(index)?;
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
@@ -1753,19 +1754,19 @@ impl<'a> MimoEngine<'a> {
                 if index < layers.len() { self.peer_segment(index, w1, tables, t, launch)?; }
             }
             if last || !launch { continue; }
-            if layers[index].dense { self.probe_mark(index); continue; }
+            if layers[index].dense { self.probe_mark(index)?; continue; }
             if self.tp2_layer(index) { self.probe_ring(w, index, t)?; }
             if self.tp2_layer(index) {
                 self.tp2_experts(0, index, 0, w, t)?;
                 let peer = w1.context("MiMo TP2 decode workspace")?;
                 self.tp2_experts(1, index, 0, peer, t)?;
                 if index + 1 == layers.len() { self.tp2_post(1, index, 0, peer, t)?; }
-                self.probe_mark(index);
+                self.probe_mark(index)?;
                 continue;
             }
             if self.rtx_local_layer(index) {
                 self.moe_run(w, index, t, true)?;
-                self.probe_mark(index);
+                self.probe_mark(index)?;
                 continue;
             }
             match self.experts.as_ref() {
@@ -1779,7 +1780,7 @@ impl<'a> MimoEngine<'a> {
                 None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index);
+            self.probe_mark(index)?;
         }
         Ok(())
     }

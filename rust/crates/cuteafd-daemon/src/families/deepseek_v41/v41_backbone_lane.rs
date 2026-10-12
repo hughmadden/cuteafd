@@ -519,6 +519,8 @@ pub(crate) struct BackboneLane<'w, 'a> {
     layer: usize,
     phase: Phase,
     capture_routes: bool,
+    capture_layer_times: bool,
+    captured_rounds: u64,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
@@ -580,6 +582,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             layer: first_layer,
             phase: Phase::Idle,
             capture_routes: false,
+            capture_layer_times: false,
+            captured_rounds: 0,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
@@ -929,6 +933,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     #[cfg(test)]
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     pub fn set_route_capture(&mut self, enabled: bool) {
+        if enabled {
+            self.capture_layer_times = crate::shared::draft::probe::timing_round(self.captured_rounds);
+            self.captured_rounds = self.captured_rounds.wrapping_add(1);
+        } else {
+            self.capture_layer_times = false;
+        }
         self.capture_routes = enabled;
         self.router.set_ring_capture(enabled);
         if enabled {
@@ -962,7 +972,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.
     pub(crate) fn record_layer_entry(&mut self) {
-        if !self.capture_routes { return; }
+        if !self.capture_routes || !self.capture_layer_times { return; }
         let stream = self.block.finish_stream();
         // SAFETY: the FFN-finish stream is live on this lane's device; marks
         // are read only after the pass completes. Unchained passes drained
@@ -970,7 +980,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         unsafe { self.layer_clock.mark_entry(self.layer, stream, !crate::shared::memory::chain::active()); }
     }
     fn record_layer_finish(&mut self) {
-        if !self.capture_routes { return; }
+        if !self.capture_routes || !self.capture_layer_times { return; }
         let stream = self.block.finish_stream();
         // SAFETY: as `record_layer_entry`.
         unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }

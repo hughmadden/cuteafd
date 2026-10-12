@@ -987,7 +987,7 @@ impl<'a> GlmEngine<'a> {
             }
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
                 // SAFETY: the engine stream owns this round and its layer events.
-                unsafe { probe.mark(index, self.stream) };
+                unsafe { probe.mark(index, self.stream)? };
             }
             crate::shared::console::layer_mark(index);
         }
@@ -1238,7 +1238,7 @@ impl<'a> GlmEngine<'a> {
             };
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
                 // SAFETY: the engine stream owns this round and its layer events.
-                unsafe { probe.mark(index, self.stream) };
+                unsafe { probe.mark(index, self.stream)? };
             }
             crate::shared::console::layer_mark(index);
         }

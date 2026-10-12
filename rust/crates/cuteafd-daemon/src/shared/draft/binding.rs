@@ -346,6 +346,36 @@ mod tests {
     }
 
     #[test]
+    fn sampled_layer_times_preserve_routes_and_round_observations() {
+        use cuteafd_core::{LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()], regimes: 1 };
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let p = [0.9; 5];
+        let requests = [request(1, 6, 4, DraftSource::Neural, Some(Evidence::Head(&p)), None)];
+        let routes = routes(6);
+        for round in 0..160 {
+            let layer_us = if super::super::probe::timing_round(round) {
+                [Some(100.), Some(100.)]
+            } else { [None, None] };
+            let record = RoundRecord { shared: false, requests: &requests, routes: &routes,
+                layer_us: &layer_us, times: RoundTimes { total_us: 800, draft_us: Some(200) },
+                draft: Some(DraftPass { width: 5, requests: Some(1) }), predicted: None };
+            let observation = build(&record, 5).unwrap();
+            assert_eq!(observation.view().routes, routes.flat());
+            assert_eq!(observation.view().total_us, 800.);
+            assert_eq!(observation.view().layer_us, layer_us);
+            observe(&mut policy, &record).unwrap();
+        }
+        let fit = policy.cost_snapshot(false, 1);
+        assert_eq!(fit.layers[0][3], 40.);
+        assert_eq!(fit.round[3], 160.);
+        assert_eq!(policy.stats().rounds, 160);
+    }
+
+    #[test]
     fn round_trace_captures_head_routes_grouped_bytes_and_calibrated_probabilities() {
         use cuteafd_core::{DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
         let geometry = PolicyGeometry { layers: vec![LayerResource {
