@@ -112,8 +112,8 @@ impl From<(u64, usize, u32, bool)> for LaneRequest {
 /// route history, never the drafter's calibration or acceptance evidence. A
 /// round with a copy is not a shape the policy selected, so it keeps no
 /// prediction. A draft pass beside a copy covered only the other requests, so
-/// it gives no draft-cost sample, and its time is taken out of the round total
-/// so the round fit's residual stays exact.
+/// its measured time fits that actual drafter extent. Copies have no prediction
+/// because their rows were chosen outside the shared policy.
 ///
 /// V4.1 truncates proposals by grammar and output budget before verification,
 /// so the executed rows already exclude them; a stop token on an accepted draft
@@ -139,7 +139,7 @@ pub(super) fn observe(policy: &mut DraftPolicy, confidence_trace: &BTreeMap<u64,
     let rows = requests.iter().map(|request| request.rows).sum();
     lane.routes.fill(capture, rows, ROUTE_EXPERT_MASK)?;
     binding::observe(policy, &RoundRecord { shared, requests: &round, routes: &lane.routes,
-        layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width }), predicted })
+        layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width, requests: Some(lane.drafted_requests) }), predicted })
 }
 
 static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
@@ -154,7 +154,7 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
     let geometry = policy.geometry();
     let (narrow, wide) = (policy.widths()[0], policy.widths()[policy.widths().len() - 1]);
     let fit = |shared: bool| {
-        let snapshot = policy.cost_snapshot(shared);
+        let snapshot = policy.cost_snapshot(shared, 1);
         let classes: Vec<_> = geometry.classes.iter()
             .zip(snapshot.layers).map(|(class, c)| serde_json::json!({
                 "class": class.label,
@@ -164,7 +164,15 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
                 "samples": c[3], "residual_scale_us": c[4],
             })).collect();
         serde_json::json!({
-            "warm": policy.warm(shared),
+            "warm": policy.warm(shared, 1),
+            "concurrency_buckets": ([1, 4, 8, 16].into_iter().map(|requests| {
+                let fit = policy.cost_snapshot(shared, requests);
+                let (timed, error) = policy.prediction_health(shared, requests);
+                serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
+                    "requests_up_to": if requests == 16 { None } else { Some(requests) },
+                    "warm": policy.warm(shared, requests), "engaged": policy.engaged(shared, requests),
+                    "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft})
+            }).collect::<Vec<_>>()),
             "layers": classes,
             "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
                 "us_per_request": snapshot.round[2], "samples": snapshot.round[3],
@@ -202,7 +210,6 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
         "draft_widths": { "narrow": narrow, "wide": wide },
         "width_rounds": { "narrow": stats.width_rounds[0], "wide": stats.width_rounds[1] },
         "confidence_reliability": reliability,
-        "time_bias_us": { "solo": policy.time_bias()[0], "shared": policy.time_bias()[1] },
         "prediction": {
             "rounds": stats.predicted_rounds,
             "mean_error_us": if stats.predicted_rounds > 0 {
@@ -236,6 +243,7 @@ mod tests {
         total_us: u64, draft_us: u64, width: usize, predicted: Option<f64>) -> Result<(), ObserveError> {
         let mut lane = LaneRound::new(LAYERS, TOPK);
         lane.width = width;
+        lane.drafted_requests = requests.iter().filter(|r| !r.3).count();
         lane.predicted = predicted;
         let requests: Vec<LaneRequest> = requests.iter().map(|&r| r.into()).collect();
         observe(policy, confidence_trace, &mut lane, shared, routes, layer_us, &requests,
@@ -258,17 +266,18 @@ mod tests {
     fn rounds_without_copies_observe_as_before() {
         let layer_us = vec![Some(150.0); LAYERS];
         let requests = [(1u64, 5usize, 3u32, false), (2, 8, 1, false)];
-        for (width, predicted) in [(5, Some(18_000.)), (7, None), (0, Some(9_000.))] {
+        for width in [5, 7, 0] {
             let confidence: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, ..)|
                 trace().get(&id).map(|logits| logits.iter().map(|&x| sigmoid(x)).collect())).collect();
             let observed: Vec<_> = requests.iter().zip(&confidence).map(|(&(id, rows, accepted, _), confidence)|
                 ObservedDraftRequest { id, rows, accepted: accepted as usize, confidence: confidence.as_deref() })
                 .collect();
-            let mut before = DraftPolicy::new(placement(), false).unwrap();
+            let mut before = DraftPolicy::new(placement(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+            let predicted = None;
             before.observe(DraftRoundObservation { shared: false, requests: &observed, routes: &flat_routes(&routes(13)),
                 layer_us: &layer_us, total_us: 20_000., predicted_us: predicted,
-                draft_us: if width > 0 { 1_500. } else { f64::NAN }, wide: width > 5 }).unwrap();
-            let mut after = DraftPolicy::new(placement(), false).unwrap();
+                draft_us: if width > 0 { 1_500. } else { f64::NAN }, drafted_requests: None, wide: width > 5 }).unwrap();
+            let mut after = DraftPolicy::new(placement(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
             observe_now(&mut after, &trace(), false, &routes(13), &layer_us, &requests, 20_000, 1_500, width, predicted)
                 .unwrap();
             assert_eq!(format!("{before:?}"), format!("{after:?}"), "width {width}");
@@ -277,15 +286,16 @@ mod tests {
 
     /// A copied request is verified like any other but drafted by nobody: its
     /// rows teach the cost fits, never the drafter's calibration or acceptance
-    /// evidence, the draft-cost fit or the time bias, even with a stale trace.
+    /// evidence, even with a stale trace. Its measured mixed draft pass still fits.
     #[test]
     fn copy_rounds_teach_costs_but_never_the_drafters_evidence() {
         let layer_us = vec![Some(150.0); LAYERS];
         // Request 1 verified four drafts and accepted two; request 2 verified
         // seven and accepted none.
         let round = |copied| [(1u64, 5usize, 3u32, false), (2, 8, 1, copied)];
-        let observe_round = |requests: &[(u64, usize, u32, bool)], width, predicted| {
-            let mut policy = DraftPolicy::new(placement(), false).unwrap();
+        let observe_round = |requests: &[(u64, usize, u32, bool)], width, _predicted: Option<f64>| {
+            let predicted = None;
+            let mut policy = DraftPolicy::new(placement(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
             let rows = requests.iter().map(|r| r.1).sum();
             observe_now(&mut policy, &trace(), false, &routes(rows), &layer_us, requests, 20_000, 1_500, width, predicted)
                 .unwrap();
@@ -301,25 +311,23 @@ mod tests {
         assert_eq!(copy.stats().position_accepted, solo.stats().position_accepted);
         assert_eq!(copy.calibration(), solo.calibration());
         assert_ne!(control.calibration(), solo.calibration());
-        // No prediction and no time bias from a shape the policy did not select.
-        assert_eq!((control.stats().predicted_rounds, copy.stats().predicted_rounds), (1, 0));
-        assert_ne!(control.time_bias(), [0.; 2]);
-        assert_eq!(copy.time_bias(), [0.; 2]);
-        // The draft pass beside a copy covered one request of two: no draft sample.
-        assert_eq!((control.cost_snapshot(false).draft[4], copy.cost_snapshot(false).draft[4]), (1., 0.));
-        assert_eq!(copy.stats().width_rounds, [0, 0]);
+        // Cold policies have no selected prediction.
+        assert_eq!((control.stats().predicted_rounds, copy.stats().predicted_rounds), (0, 0));
+        // A mixed draft pass teaches its measured, one-request drafter extent.
+        assert_eq!((control.cost_snapshot(false, 2).draft[4], copy.cost_snapshot(false, 2).draft[4]), (1., 1.));
+        assert_eq!(copy.stats().width_rounds, [1, 0]);
         // The copy's rows still teach the layer and round fits, and taking the
         // draft time out of the total leaves the round residual exact.
-        assert_eq!(copy.cost_snapshot(false).layers, control.cost_snapshot(false).layers);
-        assert_eq!(copy.cost_snapshot(false).round, control.cost_snapshot(false).round);
+        assert_eq!(copy.cost_snapshot(false, 2).layers, control.cost_snapshot(false, 2).layers);
+        assert_eq!(copy.cost_snapshot(false, 2).round, control.cost_snapshot(false, 2).round);
         assert_eq!((copy.stats().rounds, copy.stats().verified_rows, copy.stats().verified_drafts), (1, 13, 11));
 
         // A round in which every request copied ran no draft pass at all.
         let copies = observe_round(&[(2, 8, 4, true)], 0, None);
         let undrafted = observe_round(&[(3, 8, 4, false)], 0, None);
         assert_eq!(copies.stats().position_reached, [0; 7]);
-        assert_eq!(copies.cost_snapshot(false).draft[4], 0.);
-        assert_eq!(copies.cost_snapshot(false).round, undrafted.cost_snapshot(false).round);
+        assert_eq!(copies.cost_snapshot(false, 1).draft[4], 0.);
+        assert_eq!(copies.cost_snapshot(false, 1).round, undrafted.cost_snapshot(false, 1).round);
     }
 
     /// The V4.1 geometry is the constants the policy hard-coded before it took
@@ -346,9 +354,8 @@ mod tests {
         let classes: Vec<_> = geometry.classes.iter().map(|c| (c.label, c.prior, c.prior_precision)).collect();
         assert_eq!(classes, [("local", [700., 15., 0.8], [0.01, 0.01 * 36., 0.01 * 300f64.powi(2)]),
             ("remote", [900., 15., 5.7], [0.01, 0.01 * 36., 0.01 * 100f64.powi(2)])]);
-        let policy = DraftPolicy::new(geometry, false).unwrap();
+        let policy = DraftPolicy::new(geometry, cuteafd_core::PolicySeed::weak(7), false).unwrap();
         assert_eq!((policy.stats().draft_rows.len(), policy.stats().position_reached.len()), (8, 7));
-        assert_eq!(policy.time_bias(), [0.; 2]);
         // Router flag bits above the expert index are dropped by the binding.
         let mut routes = crate::shared::draft::routes::RoundRoutes::new(1, TOPK);
         routes.fill(&[vec![[512 | 383, 1, 2, 3, 4, 5]]], 1, ROUTE_EXPERT_MASK).unwrap();

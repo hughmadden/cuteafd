@@ -156,11 +156,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // Lengths are chosen from this lane's proposals and routes only;
                 // the peer lane's activity selects the shared-regime fit.
                 if let Some(draft) = draft.as_deref_mut() {
-                    let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
-                        .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id(), input.len()-1)).collect();
+                    let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied)
+                        .map(|((&slot, input), &copied)| (active[slot].as_ref().unwrap().id(), if copied { 0 } else { input.len()-1 })).collect();
                     if let Some(lengths) = draft.select_lengths(lane, &candidates, shared)? {
-                        for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
-                            .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
+                        for ((input, &copied), length) in inputs.iter_mut().zip(&copied).zip(lengths) {
+                            if !copied { input.truncate(length+1); }
+                        }
                     }
                 }
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
