@@ -120,13 +120,10 @@ pub(super) fn startup_phase(lib: &cuteafd_ffi::NativeLibrary, phase: &str, devic
 
 /// Small-card startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
-pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
+pub(super) fn admit_startup(lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog, args: &crate::cli::NativeServeArgs) -> Result<()> {
     use super::*;
     let (_, total) = lib.cuda_memory_info()?;
-    if total > 32usize << 30 { return Ok(()); }
-    ensure!(args.rtx_expert_layers == LocalLayers::Count(0),
-        "32 GB V4.1 startup admission requires --rtx-expert-layers 0; use a larger coordinator for local experts");
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;

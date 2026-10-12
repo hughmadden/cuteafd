@@ -202,6 +202,9 @@ pub struct PlanReport {
     pub placement: ExpertPlacement,
     /// Spark ranks of the placement (0: local-only).
     pub spark_ranks: usize,
+    /// A single diagnostic when an unspecified Spark count falls back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spark_count_warning: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
     pub experts: Option<ExpertContract>,
     /// Whether this build has a layout for the requested placement.
@@ -372,6 +375,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         bytes_by_owner: BTreeMap::new(),
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
+        spark_count_warning: None,
         experts: None,
         placement_supported: true,
         min_spark_ranks: None,
@@ -800,56 +804,56 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     report.experts = contract;
 }
 
-/// Select a measured faster local layout when it fits a serving reservation.
-/// Explicit placements use `plan` instead. Qualification is intentionally narrow:
-/// Qwen EXL3 K4/K5 has resident TP1 experts; other formats retain their placement.
+/// Plan an exact count, or the widest feasible count in the available inventory.
+/// Count policy never depends on card size; each candidate uses the same admission.
+pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize,
+    explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    if available > 8 {
+        return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
+    }
+    let count = explicit.unwrap_or(available);
+    let candidate = |ranks| plan(snapshot, &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
+    });
+    let mut requested = candidate(count)?;
+    if requested.executable() { return Ok(requested); }
+    let reason = requested.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
+    let reason = if reason.is_empty() { requested.config_error.clone().unwrap_or_else(||
+        "checkpoint tensors or required package artifacts unavailable".into()) } else { reason };
+    let mut working = Vec::new();
+    let mut best = None;
+    for ranks in (0..=available).rev().filter(|&ranks| ranks != count) {
+        let report = candidate(ranks)?;
+        if report.executable() {
+            working.push(ranks);
+            if best.is_none() { best = Some(report); }
+        }
+    }
+    if explicit.is_none() {
+        if let Some(mut report) = best {
+            report.spark_count_warning = Some(format!(
+                "requested all {available} available Sparks: {reason}; using {} Sparks", report.spark_ranks));
+            return Ok(report);
+        }
+    }
+    working.sort_unstable();
+    requested.hints.push(Hint {
+        what: format!("Spark count {count} refused: {reason}; counts that work: {working:?}"),
+        how: "Choose a working SPARK_COUNT/SPARK_HOSTS or change the reported admission constraint.".into(),
+    });
+    Ok(requested)
+}
+
+/// Unspecified placement uses all available Sparks before considering fallback.
 pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    let fallback = plan(snapshot, options)?;
-    if fallback.family.as_deref() != Some("qwen4")
-        || fallback.experts.as_ref().is_none_or(|e| e.package != "qwen4:exl3-k45" || e.local.is_err()) {
-        return Ok(fallback);
-    }
-    // The runtime reserves 12 GiB before loading resident experts (4096-row
-    // logits, two lane workspaces, recurrent/prefix state and graph growth).
-    // Reserve the optional native MTP weights too, even when drafting is off.
-    let mtp: u64 = fallback.components.iter()
-        .filter(|c| matches!(c.component, Component::Speculator | Component::SpeculatorExpert))
-        .map(|c| c.bytes).sum();
-    let mut layout = options.layout.clone().unwrap_or_else(|| layout::LayoutOptions {
-        // The coordinator budget is weight-only; the default inventory is
-        // the same 95.5 GiB RTX used by `plan --layout`.
-        pool_tokens: Some(32_768),
-        ..Default::default()
-    });
-    layout.head_split = false;
-    // The layout already charges native MTP weights and expert arenas.
-    // Keep the weight-only admission reserve without duplicating them as
-    // an external drafter in the per-device layout.
-    let capacity = layout.rtx_bytes.first().copied().unwrap_or(options.coordinator_budget_bytes);
-    let local_options = PlanOptions {
-        placement: ExpertPlacement::Local,
-        coordinator_budget_bytes: options.coordinator_budget_bytes.min(capacity.saturating_sub(12 << 30).saturating_sub(mtp)),
-        layout: Some(layout),
-        ..options.clone()
-    };
-    if local_options.coordinator_budget_bytes == 0 { return Ok(fallback); }
-    let mut local = plan(snapshot, &local_options)?;
-    if !local.executable() || local.memory_layout.as_ref().is_none_or(|l| l.pool_tokens == 0
-        || l.devices.iter().any(|d| d.free_bytes() < 0)) {
-        return Ok(fallback);
-    }
-    local.hints.push(Hint {
-        what: "Qwen EXL3: prefer resident local experts (qualified faster than Spark TP4)".into(),
-        how: "Explicit --spark-ranks selects a Spark layout; launcher EXPERT_BACKEND=spark overrides auto.".into(),
-    });
-    if options.layout.is_none() { local.memory_layout = None; }
-    Ok(local)
+    plan_spark_count(snapshot, options, options.placement.spark_ranks(), None)
 }
 
 /// Human-readable report.
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {
         let _ = writeln!(out, "image cap  {cap} merged tokens per image (detail=low 256); BF16 residual");

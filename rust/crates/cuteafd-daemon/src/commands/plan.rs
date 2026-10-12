@@ -1,6 +1,6 @@
 //! `cuteafd plan`: inspect a checkpoint and report what this build can serve.
 use anyhow::{Context, Result};
-use cuteafd_loader::plan::{budget_bytes, plan, plan_preferred, render, ExpertPlacement, PlanError, PlanOptions};
+use cuteafd_loader::plan::{budget_bytes, plan, plan_spark_count, render, ExpertPlacement, PlanError, PlanOptions};
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
         audio: args.audio,
-        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
+        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
             .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
@@ -134,7 +134,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
         let args = file_args(args, &snapshot)?;
-        let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4));
+        let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
         let parse = |name: &str| {
             anyhow::ensure!(!(args.no_speculator && name == "drafter"), "--no-speculator conflicts with drafter role");
             ReadRole::parse(name, placement,
@@ -206,8 +206,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
-        else { plan_preferred(&snapshot, &options)? };
+    let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
+    if args.json {
+        if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -217,7 +219,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
     }
     if args.require_ready && !report.executable() {
-        anyhow::bail!("{} is not servable by this build", args.model);
+        anyhow::bail!("{} is not servable by this build: {}", args.model,
+            report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; "));
     }
     Ok(())
 }
@@ -550,6 +553,7 @@ mod tests {
             revision: None,
             hf_home: None,
             spark_ranks: Some(spark_ranks),
+            available_sparks: 6,
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
