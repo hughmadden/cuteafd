@@ -13,6 +13,36 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_serving_state_refuses_unwritable_files_and_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / 'profile'
+            nested.mkdir()
+            trace = nested / 'trace.jsonl'
+            trace.write_text('{}\n')
+            command = ['bash', '-c',
+                'source scripts/lib/release-common.sh; release_require_writable_state "$1"',
+                'test', str(root)]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path, mode in [(trace, 0o400), (nested, 0o500)]:
+                original = path.stat().st_mode & 0o777
+                path.chmod(mode)
+                try:
+                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('serving state is not writable by uid', result.stderr)
+                    self.assertIn(str(path), result.stderr)
+                    self.assertIn('migrate legacy ownership before launching', result.stderr)
+                    self.assertEqual(path.stat().st_mode & 0o777, mode)
+                finally:
+                    path.chmod(original)
+
+    def test_v41_placement_uses_writable_serving_home(self) -> None:
+        source = (ROOT / 'run.sh').read_text()
+        self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
+        self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
+
     def test_serving_identity_is_evaluated_on_each_host(self) -> None:
         for uid, gid, user in [('1000', '1000', 'tj'), ('1001', '1002', 'spark user')]:
             result = subprocess.run(['bash', '-c', '''
@@ -39,7 +69,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
             source = (ROOT / launcher).read_text()
-            self.assertIn('$(declare -f release_serving_docker_args)', source)
+            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state)', source)
             self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
@@ -173,7 +203,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                     environment.pop('SPECULATION_TRACE', None)
                     if value is not None:
                         environment['SPECULATION_TRACE'] = value
-                    harness = 'set -euo pipefail\nrelease_die() { exit 2; }\n'
+                    harness = f'set -euo pipefail\nsource {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}\n'
                     result = subprocess.run(['bash', '-c', harness + block +
                         '\nprintf "%s\\0" before "${trace_args[@]}" after'], env=environment, capture_output=True)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)

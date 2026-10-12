@@ -595,6 +595,7 @@ console_supported=0
 if release_console_supported "$COORDINATOR_DOCKER_INFERENCE" "${wip_layout:+$wip_layout/bin/cuteafd}"; then
   console_supported=1
   release_prepare_console "${INSTANCE:-default}"
+  release_require_writable_state "$USAGE_DIR"
 fi
 if ((restart)); then
   release_stop_services "$coordinator" "$spark_prefix"
@@ -627,7 +628,7 @@ placement_directory=
 # then overlap remote loading. Explicit all-remote single-RTX launches need no
 # handoff. Planning uses only the local device and never connects to a worker.
 if ((RELEASE_RTX_GPUS == 2)) || [[ "$RTX_EXPERT_LAYERS" != 0 ]]; then
-  placement_directory=/run/cuteafd-placement
+  placement_directory=/tmp/cuteafd-home/placement
 fi
 
 # Optional RDMA tuning values travel to both roles only when the operator sets
@@ -655,13 +656,14 @@ trace_args=()
 if [[ -n "${SPECULATION_TRACE:-}" ]]; then
   [[ "$SPECULATION_TRACE" == /* ]] || release_die 'SPECULATION_TRACE must be an absolute path'
   mkdir -p "$(dirname "$SPECULATION_TRACE")"
+  release_require_writable_state "$(dirname "$SPECULATION_TRACE")"
   trace_args+=(-v "$(dirname "$SPECULATION_TRACE"):$(dirname "$SPECULATION_TRACE")"
     -e "CUTEAFD_SPECULATION_TRACE=$SPECULATION_TRACE")
 fi
 profile_args=()
 if [[ -n "${PROFILE:-}${PROFILE_DIR:-}" ]]; then
   release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$(hostname -s)"; profile_args=("${RELEASE_PROFILE_ARGS[@]}")
-  [[ -z "${PROFILE_DIR:-}" ]] || mkdir -p "$PROFILE_DIR"
+  [[ -z "${PROFILE_DIR:-}" ]] || { mkdir -p "$PROFILE_DIR"; release_require_writable_state "$PROFILE_DIR"; }
 fi
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
@@ -721,6 +723,7 @@ fi
 # The in-server benchmark keeps its history (SQLite) on the host.
 bench_dir="$HOME/.cache/cuteafd/bench"
 mkdir -p "$bench_dir"
+release_require_writable_state "$bench_dir"
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
@@ -828,7 +831,7 @@ for i in "${!hosts[@]}"; do
   if [[ -n "${PROFILE:-}" ]]; then
     release_profile_docker_args "$PROFILE" "${PROFILE_DIR:-}" "$host"; remote_args+=(--profile-args "${RELEASE_PROFILE_ARGS[@]}")
   fi
-  release_ssh "$host" "$(declare -f release_serving_docker_args); export -f release_serving_docker_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
+  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state); export -f release_serving_docker_args release_require_writable_state; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
 # Defaults keep a legacy invocation (ten positional arguments) valid.
@@ -861,7 +864,7 @@ for ((profile_at = 1; profile_at <= $#; profile_at++)); do
   [[ "${!profile_at}" != --profile-args ]] || { profile_args=("${@:profile_at+1}"); break; }
 done
 for ((profile_at = 0; profile_at + 1 < ${#profile_args[@]}; profile_at++)); do
-  [[ "${profile_args[profile_at]}" != -v ]] || mkdir -p "${profile_args[profile_at+1]%%:*}"
+  [[ "${profile_args[profile_at]}" != -v ]] || { mkdir -p "${profile_args[profile_at+1]%%:*}"; release_require_writable_state "${profile_args[profile_at+1]%%:*}"; }
 done
 rdma_args=()
 [[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")

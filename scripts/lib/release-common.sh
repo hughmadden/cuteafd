@@ -471,6 +471,31 @@ release_serving_docker_args() {
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
 }
 
+# Fail before serving when legacy root-owned outputs cannot be updated. Check
+# the directory itself and existing descendants without changing modes/owners.
+# This is also shipped to remote worker shells, so it has no repo dependencies.
+release_require_writable_state() {
+  python3 - "$@" <<'PYSTATE'
+import os
+from pathlib import Path
+import sys
+for value in sys.argv[1:]:
+    root = Path(value)
+    paths = [root]
+    if root.is_dir():
+        def denied(error):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {error.filename}; migrate legacy ownership before launching')
+        for directory, dirs, files in os.walk(root, onerror=denied):
+            paths.extend(Path(directory) / name for name in dirs + files)
+    for path in paths:
+        if not path.exists() and not path.is_symlink():
+            continue
+        mode = os.W_OK | (os.X_OK if path.is_dir() else 0)
+        if not os.access(path, mode):
+            raise SystemExit(f'serving state is not writable by uid {os.getuid()}: {path}; migrate legacy ownership before launching')
+PYSTATE
+}
+
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, on the coordinator and on every Spark worker:
 #   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)

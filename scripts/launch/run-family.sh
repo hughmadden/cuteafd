@@ -534,6 +534,7 @@ probe_args=()
 probe_root="$(get PROBE_DUMP_ROOT)"
 if [[ -n "$probe_root" ]]; then
   [[ "$probe_root" == /* && -d "$probe_root" ]] || { echo "PROBE_DUMP_ROOT must be an existing absolute directory" >&2; exit 2; }
+  release_require_writable_state "$probe_root"
   probe_args=(-v "$probe_root:$probe_root" -e "CUTEAFD_PROBE_DUMP_ROOT=$probe_root")
 fi
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
@@ -557,6 +558,7 @@ done
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
   mkdir -p "$(dirname "$trace")"
+  release_require_writable_state "$(dirname "$trace")"
   trace_args+=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
 fi
@@ -1284,8 +1286,8 @@ for ((rank = 0; rank < ranks; rank++)); do
   release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$host"
   worker_profile="" worker_prep=""
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
-  [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && "
-  ssh "$host" "$(declare -f release_serving_docker_args); release_serving_docker_args; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
+  [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
+  ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state); release_serving_docker_args; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
@@ -1337,6 +1339,7 @@ peer_args=()
 # name labels its reports.
 bench_dir="$HOME/.cache/cuteafd/bench"
 mkdir -p "$bench_dir"
+release_require_writable_state "$bench_dir"
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
@@ -1359,6 +1362,7 @@ console_supported=0
 if release_console_supported "$coordinator_image" "${wip_layout:+$wip_layout/bin/cuteafd}"; then
   console_supported=1
   release_prepare_console "${instance:-default}"
+  release_require_writable_state "$USAGE_DIR"
   api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/run/cuteafd/usage")
   family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /run/cuteafd/usage --usage "$usage")
 fi
@@ -1382,7 +1386,7 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 # (release_profile_docker_args in release-common.sh).
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
-[[ -z "$(get PROFILE_DIR)" ]] || mkdir -p "$(get PROFILE_DIR)"
+[[ -z "$(get PROFILE_DIR)" ]] || { mkdir -p "$(get PROFILE_DIR)"; release_require_writable_state "$(get PROFILE_DIR)"; }
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph census requires a WIP build' >&2; exit 2; }
