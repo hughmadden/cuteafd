@@ -270,3 +270,27 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     cards.build_arms(['cand=new'], arms, [entry], tmp_path, 'task', True)
     assert '--role coordinator' in capsys.readouterr().out
     assert arms['cand']['build_role'] == 'coordinator'
+
+
+def test_seed_lease_holds_the_real_flock_until_released(tmp_path):
+    """The lease runs through the real hwlock queue: the flock is held while the
+    leg runs and free again after release."""
+    text = (ROOT / 'wip.sh').read_text()
+    helpers = text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3]
+    helpers += text[text.index("# The seed Spark's lock: rhea and moa have their own"):text.index('build_coordinator() {')]
+    locks = tmp_path / 'locks'
+    locks.mkdir()
+    probe = 'import fcntl,sys; f=open(sys.argv[1],"a"); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)'
+    command = helpers + f'''
+repo_root={str(ROOT)!r}
+wip_seed_lease_acquire moa
+[[ "$CUTEAFD_WIP_SEED_LEASE" == moa ]]
+if python3 -c {probe!r} {str(locks / 'moa.lock')!r} 2>/dev/null; then echo free-while-held; fi
+wip_seed_lease_release
+python3 -c {probe!r} {str(locks / 'moa.lock')!r} && echo free-after
+[[ "$(wip_seed_lock rhea) $(wip_seed_lock ostrich)" == "rhea sparks" ]]
+'''
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + command], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'TMPDIR': str(tmp_path)})
+    assert result.returncode == 0, result.stderr
+    assert 'free-while-held' not in result.stdout and 'free-after' in result.stdout

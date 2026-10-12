@@ -803,6 +803,41 @@ native_store_has() {
   fi
 }
 
+# The seed Spark's lock: rhea and moa have their own; a pool Spark is under sparks.
+wip_seed_lock() {
+  case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
+}
+# A lease holds the seed's lock (one fair turn through hwlock) across the whole
+# Spark build leg: source sync, Cargo, native/export, finalize. Spark CPU work
+# would otherwise slow cards serving from that host. The holder is a background
+# hwlock child that waits on a release FIFO; the lease ends when the FIFO opens
+# for writing or the leg's shell exits.
+wip_seed_lease_acquire() {
+  local lock="$1" dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/wip-seed-lease.XXXXXXXX")"
+  mkfifo "$dir/release"
+  wip_seed_lease_dir="$dir"
+  wip_hwlock "$lock" bash -c 'printf granted >"$1/granted"; read -r _ <"$1/release"' wip-seed-lease "$dir" &
+  wip_seed_lease_pid=$!
+  while [[ ! -s "$dir/granted" ]]; do
+    if ! kill -0 "$wip_seed_lease_pid" 2>/dev/null; then
+      wait "$wip_seed_lease_pid" 2>/dev/null || true
+      rm -rf "$dir"
+      wip_seed_lease_dir=""
+      return 1
+    fi
+    sleep 1
+  done
+  export CUTEAFD_WIP_SEED_LEASE="$lock"
+}
+wip_seed_lease_release() {
+  [[ -n "${wip_seed_lease_dir:-}" ]] || return 0
+  : >"$wip_seed_lease_dir/release" 2>/dev/null || true
+  wait "$wip_seed_lease_pid" 2>/dev/null || true
+  rm -rf "$wip_seed_lease_dir"
+  wip_seed_lease_dir=""
+  unset CUTEAFD_WIP_SEED_LEASE
+}
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   sync_local_source
@@ -878,6 +913,16 @@ build_coordinator() {
 
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    local seed_lock
+    seed_lock="$(wip_seed_lock "$seed_host")"
+    echo "WIP Spark leg: queueing for $seed_lock (held for the whole leg on $seed_host)"
+    local lease_started=$SECONDS
+    wip_seed_lease_acquire "$seed_lock" ||
+      release_die "Spark WIP leg on $seed_host got no fair turn on $seed_lock"
+    trap wip_seed_lease_release EXIT
+    echo "WIP phase expert seed-lock-wait: $((SECONDS - lease_started))s"
+  fi
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
@@ -911,13 +956,10 @@ build_expert() (
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native" ||
       release_die "Spark WIP native restore on $seed_host failed"
   else
-    # The export holds the seed's lock (raptor-side) under one held fair turn:
-    # no gap between the queue grant and the flock for another job to enter.
-    local spark_lock
-    case "$seed_host" in rhea|moa) spark_lock="$seed_host" ;; *) spark_lock=sparks ;; esac
-    echo "WIP Spark export: queueing for $spark_lock"
-    wip_hwlock "$spark_lock" timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
-      release_die "Spark WIP export on $seed_host failed or got no fair turn on $spark_lock"
+    # The leg's lease already holds the seed's lock: the export runs inside it.
+    echo "WIP Spark export: inside the ${CUTEAFD_WIP_SEED_LEASE:-seed} lease"
+    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
+      release_die "Spark WIP export on $seed_host failed"
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" "$spark_container" \
