@@ -164,7 +164,10 @@ def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None
     assert "self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer," in pair
     assert "rows * self.cfg.hidden * 2, self.stream_of(1)" in pair
     publish = source.split("    fn tp2_publish(", 1)[1].split("    fn router_on(", 1)[0]
-    assert "workspaces.get(lane)?.shared.buffer.ptr" in publish
+    assert "w1.shared.buffer.ptr" in publish
+    for body in (pair, publish):
+        assert "tp2_prepared_peer(prepared_peer)?" in body
+        assert "self.peer_workspaces(" not in body
     header = (ROOT / "native/shared/include/cuteafd_experts.h").read_text()
     assert "No output/input overlap." in header
 

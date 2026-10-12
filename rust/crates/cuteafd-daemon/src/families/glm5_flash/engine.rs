@@ -501,6 +501,11 @@ impl<'a> PeerWorkspaces<'_, 'a> {
     }
 }
 
+// Routed TP2 work consumes the exact peer workspace prepared by the step.
+fn tp2_prepared_peer<T>(prepared: Option<&T>) -> Result<&T> {
+    prepared.context("TP2 peer workspace")
+}
+
 /// Host tables of one step.
 #[derive(Default)]
 struct StepTables {
@@ -2030,9 +2035,9 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn tp2_pair(&self, layer: usize, lane: usize, w: &Workspace<'_>, rows: usize, scalar: Scalar, cap: &str) -> Result<()> {
-        let peer_workspaces = self.peer_workspaces(is_decode(cap), Some(lane + 1))?.context("TP2 peer workspace")?;
-        let w1 = peer_workspaces.get(lane)?;
+    #[allow(clippy::too_many_arguments)]
+    fn tp2_pair(&self, layer: usize, lane: usize, w: &Workspace<'_>, prepared_peer: Option<&Workspace<'_>>, rows: usize, scalar: Scalar, cap: &str) -> Result<()> {
+        let w1 = tp2_prepared_peer(prepared_peer)?;
         let weights = &self.weights.layers[layer];
         self.ffn(w, weights, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, scalar)?;
         let peer = self.peer()?;
@@ -2052,9 +2057,9 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn tp2_publish(&self, layer: usize, lane: usize, rows: usize, decode: bool) -> Result<()> {
-        let workspaces = self.peer_workspaces(decode, Some(lane + 1))?.context("TP2 peer workspace")?;
-        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), workspaces.get(lane)?.shared.buffer.ptr, rows * self.cfg.hidden * 2)
+    fn tp2_publish(&self, layer: usize, lane: usize, rows: usize, prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
+        let w1 = tp2_prepared_peer(prepared_peer)?;
+        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.shared.buffer.ptr, rows * self.cfg.hidden * 2)
     }
 
     fn router_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: usize, spans: &[Span]) -> Result<()> {
@@ -3353,10 +3358,10 @@ impl<'a> GlmfEngine<'a> {
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
-                self.moe(w, index, layer, t, rows, cap, tables.decode, &spans)?;
+                self.moe(w, index, layer, t, rows, cap, tables.decode, &spans, w1)?;
             }
             if self.tp2_layer(index) {
-                self.tp2_publish(index, 0, t, tables.decode)?;
+                self.tp2_publish(index, 0, t, w1)?;
                 if let Some(w1) = w1 {
                     self.peer_post(index, 0, w1, t, cap)?;
                     if index + 1 < layers.len() { self.peer_attention(index + 1, 0, w1, t, cap, tables)?; }
@@ -3534,7 +3539,7 @@ impl<'a> GlmfEngine<'a> {
                     // padding tail of the decode workspace's `delta` is cleared after the expert work.
                     crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
                         self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true,
-                            &[Span { first: 0, rows: real }])
+                            &[Span { first: 0, rows: real }], w1)
                     }, |tail| {
                         let offset = tail.start * self.cfg.hidden * 2;
                         let bytes = tail.len() * self.cfg.hidden * 2;
@@ -3559,11 +3564,11 @@ impl<'a> GlmfEngine<'a> {
                 } else {
                     // The router ran inside this layer's segment: its ids are still in place.
                     self.probe_ring(index, w, t, matches!(self.experts, Some(Experts::Spark { .. })))?;
-                    self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
+                    self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?;
                 }
             }
             if self.tp2_layer(index) {
-                self.tp2_publish(index, 0, t, true)?;
+                self.tp2_publish(index, 0, t, w1)?;
                 if index + 1 < layers.len() {
                     if let Some(w1) = w1 { self.peer_segment(index + 1, w1, t, tables)?; }
                 }
@@ -4094,9 +4099,9 @@ impl<'a> GlmfEngine<'a> {
     /// `spans`: the router scores' rows (each packed sequence's, or the whole step).
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
-        decode: bool, spans: &[Span]) -> Result<()> {
+        decode: bool, spans: &[Span], prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
         self.moe_front(w, index, layer, t, rows, cap, spans)?;
-        self.moe_experts(w, index, layer, t, rows, cap, decode)
+        self.moe_experts(w, index, layer, t, rows, cap, decode, prepared_peer)
     }
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
@@ -4204,9 +4209,9 @@ impl<'a> GlmfEngine<'a> {
     /// Spark path while the ranks compute).
     #[allow(clippy::too_many_arguments)]
     fn moe_experts(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
-        decode: bool) -> Result<()> {
+        decode: bool, prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
         let h = self.cfg.hidden;
-        if self.tp2_layer(index) { return self.tp2_pair(index, 0, w, t, rows, cap); }
+        if self.tp2_layer(index) { return self.tp2_pair(index, 0, w, prepared_peer, t, rows, cap); }
         let experts = self.routed_experts(index).context("MoE layer without experts")?;
         let shared = || {
             self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
@@ -4491,6 +4496,7 @@ impl<'a> GlmfEngine<'a> {
             for (index, &unit) in units.iter().enumerate() {
                 let (layer, lane) = unit;
                 let w = &workspaces[lane];
+                let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;
                 if layers[layer].dense || self.tp2_layer(layer)
                     || self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
                     // A local post may wait behind a previous lane's Spark FFN on the peer stream.
@@ -4513,11 +4519,11 @@ impl<'a> GlmfEngine<'a> {
                 if layers[layer].dense {
                     local_post()?;
                 } else if self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
-                    self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false)?;
+                    self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
                     local_post()?;
                 } else if self.tp2_layer(layer) {
-                    self.tp2_pair(layer, lane, w, count_of(lane), rows_of(lane), cap)?;
-                    self.tp2_publish(layer, lane, count_of(lane), false)?;
+                    self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?;
+                    self.tp2_publish(layer, lane, count_of(lane), w1)?;
                     local_post()?;
                 } else {
                     let t = lanes[lane].0.kv_slots.len();
@@ -4742,6 +4748,40 @@ mod tp2_tests {
         drop(library);
         assert_eq!(fixture.events()?, "DDSSddU");
         Ok(())
+    }
+
+    #[test]
+    fn tp2_uses_the_steps_prepared_peer_for_decode_and_every_prefill_lane() {
+        let decode = "rank1-decode";
+        let prefill = ["rank1-prefill-lane0", "rank1-prefill-lane1"];
+        for prepared in std::iter::once(&decode).chain(prefill.iter()) {
+            let pair = tp2_prepared_peer(Some(prepared)).unwrap();
+            let publisher = tp2_prepared_peer(Some(prepared)).unwrap();
+            assert!(std::ptr::eq(pair, prepared));
+            assert!(std::ptr::eq(publisher, prepared));
+        }
+        assert!(tp2_prepared_peer::<usize>(None).is_err());
+
+        // Bind the CPU identity check to the actual callers: no expert helper
+        // may select a different workspace after the step prepared its peer.
+        let source = include_str!("engine.rs").split("\n#[cfg(test)]").next().unwrap();
+        let pair = source.split("    fn tp2_pair(").nth(1).unwrap().split("    fn tp2_publish(").next().unwrap();
+        let publisher = source.split("    fn tp2_publish(").nth(1).unwrap().split("    fn router_on(").next().unwrap();
+        for body in [pair, publisher] {
+            assert!(body.contains("tp2_prepared_peer(prepared_peer)?"));
+            assert!(!body.contains("self.peer_workspaces("));
+        }
+        assert!(source.contains("let peer_workspaces = self.peer_workspaces(tables.decode, None)?;"));
+        assert!(source.contains("let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;"));
+        assert!(source.contains("let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;"));
+        assert!(source.contains("self.moe(w, index, layer, t, rows, cap, tables.decode, &spans, w1)?"));
+        assert!(source.contains("self.tp2_publish(index, 0, t, w1)?"));
+        assert!(source.contains("self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?"));
+        assert!(source.contains("&[Span { first: 0, rows: real }], w1)"));
+        assert!(source.contains("self.moe_experts(w, index, layer, t, rows, cap, decode, prepared_peer)"));
+        assert!(source.contains("self.tp2_pair(index, 0, w, prepared_peer, t, rows, cap)"));
+        assert!(source.contains("self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?"));
+        assert!(source.contains("self.tp2_publish(layer, lane, count_of(lane), w1)?"));
     }
 
     #[test]
