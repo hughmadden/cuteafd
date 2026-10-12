@@ -519,15 +519,17 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 /// A near tie passes. Otherwise the flip is verify rounding, reported but not
 /// gated, when plain decoding is deterministic (`decode_repeats`: the
 /// drafts-off rerun reproduced every token and row byte for byte) and the
-/// drafted rows already differed from one-row decode before the flip (verify
-/// steps round differently from single rows). It fails when plain decoding
+/// drafted rows already differed from one-row decode before the flip by at
+/// most [`TIE_NATS`] nats. Larger pre-flip drift is not rounding evidence.
+/// It fails when plain decoding
 /// does not repeat (the comparison proves nothing) or when the rows were
 /// byte-identical up to the flip (a sudden change points at state, not
 /// rounding).
 fn flip_verdict(tie: bool, decode_repeats: bool, noise: &RowNoise) -> CheckStatus {
     if tie {
         CheckStatus::Pass
-    } else if decode_repeats && noise.compared > 0 && noise.identical < noise.compared {
+    } else if decode_repeats && noise.compared > 0 && noise.identical < noise.compared
+        && noise.max.is_finite() && noise.max <= TIE_NATS {
         CheckStatus::Info
     } else {
         CheckStatus::Fail
@@ -602,16 +604,23 @@ const TIE_NATS: f64 = 0.05;
 /// as several rows of one request, a different kernel shape than one-row decode.
 const VERIFY_NOISE_NATS: f64 = 0.5;
 
-/// A flip past a near tie but under [`VERIFY_NOISE_NATS`] says the verify rows round
-/// differently, not that speculation changes the model: reported, not gated. Larger
-/// flips still fail. The summary says whether plain C4 also differs from C1.
+/// A modest-margin flip may be reported only with bounded pre-flip drift.
+/// Missing evidence or drift above [`TIE_NATS`] keeps the failure; a small
+/// margin alone cannot establish that speculative state is sound.
 fn batch_variant_speculation(quality: &mut Quality) {
     let batch_variant = quality.checks.iter().any(|c| c.id == "c1_c4" && c.status == CheckStatus::Info
         && c.metrics.get("identical").and_then(|v| v.as_u64()).is_some_and(|n| n < 4));
     let Some(check) = quality.checks.iter_mut().find(|c| c.id == "spec_lossless" && c.status == CheckStatus::Fail)
     else { return };
     let margin = check.metrics.get("divergence_margin").and_then(|v| v.as_f64());
-    if margin.is_some_and(|m| m < VERIFY_NOISE_NATS) {
+    let noise = check.metrics.get("prefix_noise_max").and_then(|v| v.as_f64());
+    let count = |key| check.metrics.get(key).and_then(|v| v.as_u64());
+    let repeats = count("tokens").is_some_and(|n| n > 0
+        && count("repeat_identical_prefix") == Some(n) && count("repeat_rows_identical") == Some(n));
+    let differing_prefix = count("prefix_rows_compared").is_some_and(|n| n > 0
+        && count("prefix_rows_identical").is_some_and(|identical| identical < n));
+    if repeats && differing_prefix && margin.is_some_and(|m| m < VERIFY_NOISE_NATS)
+        && noise.is_some_and(|n| n.is_finite() && n <= TIE_NATS) {
         check.status = CheckStatus::Info;
         check.summary = format!("{} · not gated: under {VERIFY_NOISE_NATS} nats{}", check.summary,
             if batch_variant { "; C4 differs from C1 too" } else { "" });
@@ -880,7 +889,7 @@ mod tests {
 
     #[test]
     fn a_flip_after_verify_rounding_is_informational_only_when_decode_repeats() {
-        let noise = |compared, identical| RowNoise { compared, identical, max: 0.1, median: 0.01, first_over: None };
+        let noise = |compared, identical| RowNoise { compared, identical, max: 0.001, median: 0.0001, first_over: None };
         // A near tie passes whatever else holds.
         assert_eq!(flip_verdict(true, false, &noise(0, 0)), CheckStatus::Pass);
         // Deterministic decode, and drafted rows differed before the flip: rounding.
@@ -891,19 +900,50 @@ mod tests {
         assert_eq!(flip_verdict(false, true, &noise(30, 30)), CheckStatus::Fail);
         // A flip at the first token leaves no pre-flip evidence.
         assert_eq!(flip_verdict(false, true, &noise(0, 0)), CheckStatus::Fail);
+        for max in [0.050001, 0.4, f64::INFINITY, f64::NAN] {
+            let noisy = RowNoise { max, ..noise(30, 2) };
+            assert_eq!(flip_verdict(false, true, &noisy), CheckStatus::Fail);
+        }
+        assert_eq!(flip_verdict(false, true, &RowNoise { max: TIE_NATS, ..noise(30, 2) }), CheckStatus::Info);
     }
 
     #[test]
     fn small_speculation_flips_are_reported_not_gated() {
-        let quality = |margin: f64, identical: u64| {
+        let quality = |margin: f64, identical: u64, noise: Option<f64>| {
             let mut q = Quality::default();
-            q.checks.push(check("spec_lossless", CheckStatus::Fail, json!({"divergence_margin": margin})));
+            q.checks.push(check("spec_lossless", CheckStatus::Fail,
+                json!({"divergence_margin": margin, "prefix_noise_max": noise,
+                    "tokens": 128, "repeat_identical_prefix": 128, "repeat_rows_identical": 128,
+                    "prefix_rows_compared": 30, "prefix_rows_identical": 2})));
             q.checks.push(check("c1_c4", CheckStatus::Info, json!({"identical": identical})));
             batch_variant_speculation(&mut q);
             q.checks[0].status
         };
-        assert_eq!(quality(0.28, 0), CheckStatus::Info);
-        assert_eq!(quality(0.12, 4), CheckStatus::Info);
-        assert_eq!(quality(1.2, 0), CheckStatus::Fail);
+        assert_eq!(quality(0.28, 0, Some(0.001)), CheckStatus::Info);
+        assert_eq!(quality(0.12, 4, Some(TIE_NATS)), CheckStatus::Info);
+        assert_eq!(quality(1.2, 0, Some(0.001)), CheckStatus::Fail);
+        assert_eq!(quality(0.12, 0, Some(0.4)), CheckStatus::Fail);
+        assert_eq!(quality(0.12, 0, Some(0.050001)), CheckStatus::Fail);
+        assert_eq!(quality(0.12, 0, None), CheckStatus::Fail);
+        for (compared, identical) in [(0, 0), (30, 30)] {
+            let mut q = Quality::default();
+            q.checks.push(check("spec_lossless", CheckStatus::Fail, json!({
+                "divergence_margin": 0.12, "prefix_noise_max": 0.001,
+                "tokens": 128, "repeat_identical_prefix": 128, "repeat_rows_identical": 128,
+                "prefix_rows_compared": compared, "prefix_rows_identical": identical
+            })));
+            batch_variant_speculation(&mut q);
+            assert_eq!(q.checks[0].status, CheckStatus::Fail);
+        }
+        for repeats in [0, 127] {
+            let mut q = Quality::default();
+            q.checks.push(check("spec_lossless", CheckStatus::Fail, json!({
+                "divergence_margin": 0.12, "prefix_noise_max": 0.001,
+                "tokens": 128, "repeat_identical_prefix": repeats, "repeat_rows_identical": repeats,
+                "prefix_rows_compared": 30, "prefix_rows_identical": 2
+            })));
+            batch_variant_speculation(&mut q);
+            assert_eq!(q.checks[0].status, CheckStatus::Fail);
+        }
     }
 }
