@@ -231,9 +231,10 @@ def ternary(rows, k, scale, generator):
 def fp8_check(lib, args):
     stream = torch.cuda.current_stream().cuda_stream
     generator = torch.Generator().manual_seed(8)
-    shapes = SHAPES[:3] if args.quick else SHAPES
-    # 136 and 200: a 128-row pass and a shorter one (8 rows: the W8A16 path; 72: another wide pass).
-    row_counts = (1, 8, 9, 16, 33, 64, 65, 96, 127, 128, 136, 200)
+    shapes = args.fp8_shapes or (SHAPES[:3] if args.quick else SHAPES)
+    profile_buffers = []
+    # 136 and 200 exercise a full pass followed by the skinny or wide remainder.
+    row_counts = sorted(set((1, 8, 9, 16, 33, 64, 65, 96, 127, 128, 136, 200)) | set(args.fp8_rows))
     for k, n in shapes:
         weight = (torch.randn(n, k, generator=generator) * 0.02).bfloat16().cuda()
         packed = torch.empty(n * k, device="cuda", dtype=torch.uint8)
@@ -314,12 +315,29 @@ def fp8_check(lib, args):
                     print(f"fp8 [{k}, {n}] {rows} rows: w8a8 relative RMS drift {drift:.2e} (E4M3 activations); "
                           f"on exact activations max |gap| {gap:.2e} (bound {bound:.2e})")
         runs = 5 if args.quick else 20
-        line = f"fp8 [{k}, {n}] ms (median of {runs}), rows: w8a16 / wide / w8a8:"
-        for rows in (8, 16, 32, 64, 128):
-            out = torch.empty(rows, n, device="cuda")
-            line += " %d: %s" % (rows, " / ".join(f"{timed(lambda: run(mode, x, rows, out), runs):.4f}"
-                                                  for mode in (0, 1, 2)))
-        print(line)
+        weight_bytes = packed.numel() + scale.numel() * scale.element_size()
+        for rows in args.fp8_rows:
+            out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+            for mode in (0, 1, 2):
+                elapsed = timed(lambda: run(mode, x, rows, out), runs)
+                print(f"fp8 k={k} n={n} rows={rows} mode={mode} median_ms={elapsed:.6f} "
+                      f"useful_weight_GB_s={weight_bytes / elapsed / 1e6:.1f}")
+        if args.profile_fp8:
+            profile_buffers.append((k, n, x, packed, scale, workspace,
+                                    torch.empty(max(args.fp8_rows), n, device="cuda", dtype=torch.bfloat16)))
+    if args.profile_fp8:
+        torch.cuda.synchronize()
+        torch.cuda.profiler.start()
+        try:
+            for k, n, x, packed, scale, workspace, out in profile_buffers:
+                for rows in args.fp8_rows:
+                    for mode in (0, 1, 2):
+                        with torch.cuda.nvtx.range(f"fp8/k{k}/n{n}/rows{rows}/mode{mode}"):
+                            assert lib.cuteafd_fp8_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(),
+                                out.data_ptr(), 0, rows, k, n, mode, workspace.data_ptr(), workspace.numel(), stream) == 0
+            torch.cuda.synchronize()
+        finally:
+            torch.cuda.profiler.stop()
 
 
 def main():
@@ -331,6 +349,10 @@ def main():
     parser.add_argument("--head-rows", default="8,16,24,32,64,96,128", help="comma-separated row counts, at most 128")
     parser.add_argument("--profile-head", action="store_true",
                         help="one NVTX-labelled head/top-k shot inside cudaProfilerStart/Stop after checks")
+    parser.add_argument("--fp8-shapes", help="comma-separated KxN shapes; overrides --quick's shape subset")
+    parser.add_argument("--fp8-rows", default="8,16,32,64,128", help="comma-separated profiling row counts")
+    parser.add_argument("--profile-fp8", action="store_true",
+                        help="one NVTX-labelled projection shot after checks; use with --skip-head")
     parser.add_argument("--quick", action="store_true", help="three GEMM shapes, fewer timing runs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--skip-head", action="store_true")
@@ -347,6 +369,19 @@ def main():
         parser.error("head shape requires a supported vocabulary and width: multiple of 256, at most 6336")
     if args.profile_head and args.skip_head:
         parser.error("--profile-head requires head checks")
+    if args.profile_fp8 and (args.head_only or args.profile_head or not args.skip_head):
+        parser.error("--profile-fp8 requires --skip-head and one capture range")
+    try:
+        args.fp8_rows = [int(value) for value in args.fp8_rows.split(",")]
+        args.fp8_shapes = [tuple(int(value) for value in shape.lower().split("x"))
+                           for shape in args.fp8_shapes.split(",")] if args.fp8_shapes else None
+    except ValueError:
+        parser.error("invalid FP8 row counts or KxN shapes")
+    if not args.fp8_rows or any(rows < 1 or rows > 2048 for rows in args.fp8_rows):
+        parser.error("--fp8-rows must be in [1,2048]")
+    if args.fp8_shapes and any(len(shape) != 2 or shape[0] < 128 or shape[0] % 128 or
+                              shape[1] < 16 or shape[1] % 16 for shape in args.fp8_shapes):
+        parser.error("--fp8-shapes requires K multiples of 128 and N multiples of 16")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
     if not args.skip_head:
