@@ -217,6 +217,7 @@ fn step(
     let heads = cfg.n_heads as u64 / if rank == 1 { 2 } else { 1 };
     let topk = cfg.n_activated_experts as u64;
     let lead = |bytes: u64| if rank == 0 { bytes } else { 256 };
+    let draft = |bytes: u64| if rank == 0 && cfg.n_mtp_layers > 0 { bytes } else { 0 };
     // Eighteen metadata arrays (C4/C128 x9); four length/visible arrays.
     let metadata_rows = rows
         .checked_add(2)
@@ -228,12 +229,12 @@ fn step(
         mul(&[rows, 16, 4])?,
         mul(&[rows, 4])?,
         mul(&[rows, h, 2])?,
-        mul(&[
+        draft(mul(&[
             rows.min(128),
             cfg.dspark_target_layer_ids.len() as u64,
             h,
             2,
-        ])?,
+        ])?),
         mul(&[rows, 8])?,
         mul(&[rows, 8])?,
         mul(&[rows, 128, 4])?,
@@ -268,13 +269,13 @@ fn step(
         scratch.shared_bytes,
         4096,
         lead(mul(&[rows.min(64), cfg.vocab_size as u64, 4])?),
-        mul(&[rows.min(128), h, 2])?,
-        mul(&[rows.min(128), h, 4])?,
-        mul(&[rows, 4])?,
-        mul(&[rows, 4])?,
+        draft(mul(&[rows.min(128), h, 2])?),
+        draft(mul(&[rows.min(128), h, 4])?),
+        draft(mul(&[rows, 4])?),
+        draft(mul(&[rows, 4])?),
         // native dsv4_dspark.cu: kArgmaxBlocks=256, value/id pairs x8.
-        mul(&[rows, 256, 8])?,
-        mul(&[rows, 4])?,
+        draft(mul(&[rows, 256, 8])?),
+        draft(mul(&[rows, 4])?),
         if ranks == 2 { mul(&[rows, h, 2])? } else { 256 },
         lead(4 << 20), // VocabularyHead persistent workspace.
     ];
@@ -365,8 +366,8 @@ mod tests {
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_732_576_176);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_385_367_472);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_711_427_504);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_364_218_800);
         assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
@@ -380,8 +381,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_970_786_736);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_350_948_272);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_940_200_880);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_320_362_416);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes
@@ -393,6 +394,30 @@ mod tests {
             tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes,
             3 * 256
         );
+    }
+
+    #[test]
+    fn draft_workspace_is_owned_only_by_the_selected_lead_rank() {
+        for pro in [false, true] {
+            let mut cfg = config(pro);
+            let scratch = V4WorkspaceScratch::default();
+            let off = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, scratch).unwrap();
+            cfg.n_mtp_layers = 3;
+            let selected = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, scratch).unwrap();
+            // Runtime workspace_here allocates taps per lane plus six shared
+            // draft buffers per step, each with the same 256-byte floor.
+            let h = cfg.dim as u64;
+            let removed: u64 = [(4096u64, 2u64), (64, 1)].into_iter().map(|(rows, lanes)| {
+                let taps = rows.min(128) * cfg.dspark_target_layer_ids.len() as u64 * h * 2;
+                let shared = [rows.min(128) * h * 2, rows.min(128) * h * 4,
+                    rows * 4, rows * 4, rows * 256 * 8, rows * 4];
+                lanes * (taps.max(256) - 256)
+                    + shared.into_iter().map(|bytes| bytes.max(256) - 256).sum::<u64>()
+            }).sum();
+            assert_eq!(selected[0].device_bytes(1032).unwrap() - off[0].device_bytes(1032).unwrap(), removed);
+            assert_eq!(selected[1], off[1]);
+            assert_eq!(selected[0].pool_unit_device_bytes, off[0].pool_unit_device_bytes);
+        }
     }
 
     #[test]

@@ -96,11 +96,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // library loads, so its helpers and every wire size agree with it.
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
     let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
-    let catalog = if v41 && inventory.quantization().is_none_or(|quant| quant["quant_method"] != "exl3") {
+    let mut catalog = if v41 && inventory.quantization().is_none_or(|quant| quant["quant_method"] != "exl3") {
         cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
     } else {
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let geometry = catalog.routed_experts().geometry()?;
     config.bf16_ingress |= inventory.spark_input_is_bf16();
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")

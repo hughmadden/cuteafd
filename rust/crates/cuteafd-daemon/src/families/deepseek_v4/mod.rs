@@ -230,7 +230,9 @@ pub(crate) struct Loaded {
 }
 
 pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4",
+        if args.dspark { "dspark" } else { "off" }))?;
     let geometry = catalog.routed_experts().geometry()?;
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let family = match geometry.family() {
@@ -310,7 +312,7 @@ pub(crate) fn with_engine<T>(
             .collect(),
     };
     let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
-        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&loaded.cfg) })?;
+        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&loaded.cfg, args.dspark) })?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;

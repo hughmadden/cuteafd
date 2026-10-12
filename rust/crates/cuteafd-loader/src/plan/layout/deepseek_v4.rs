@@ -1,13 +1,14 @@
 //! V4 resident tensor bytes and ownership, matching WeightLoader's head split.
 use crate::plan::{Checkpoint, Component};
 
-pub(super) fn resident_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<(String, String, u64)>>> {
+pub(super) fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool) -> Option<Vec<Vec<(String, String, u64)>>> {
     let family = crate::plan::family::detect(checkpoint)?;
     let model = family.open(checkpoint).ok()?;
     let mut groups = vec![std::collections::BTreeMap::<(String, String), u64>::new(); ranks];
     for tensor in &checkpoint.tensors {
         let name = &tensor.meta.name;
         let role = family.classify(model.spec(), name)?;
+        if !dspark && role.component == Component::Speculator { continue; }
         if matches!(role.component, Component::RoutedExpert | Component::SpeculatorExpert | Component::MappedTable | Component::Vision) {
             continue;
         }

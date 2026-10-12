@@ -12,6 +12,8 @@ pub enum ReadRole {
     Vision,
     Audio,
     Drafter,
+    /// A drafter with separate weights; no target-checkpoint tensors are read.
+    ExternalDrafter,
 }
 
 impl ReadRole {
@@ -21,7 +23,7 @@ impl ReadRole {
                 local_experts: placement == ExpertPlacement::Local, speculator }),
             "vision" => Ok(Self::Vision),
             "audio" => Ok(Self::Audio),
-            "drafter" => Ok(Self::Drafter),
+            "drafter" => Ok(if speculator { Self::Drafter } else { Self::ExternalDrafter }),
             _ => {
                 let rank = value.strip_prefix("spark").context("role must be coordinator, rtx0, rtx1, sparkN, vision, audio or drafter")?
                     .parse::<usize>().context("Spark rank must be an integer")?;
@@ -36,7 +38,8 @@ impl ReadRole {
         match self {
             Self::Coordinator { .. } => "coordinator".into(),
             Self::Spark { rank, world } => format!("spark{rank} (TP{world})"),
-            Self::Vision => "vision".into(), Self::Audio => "audio".into(), Self::Drafter => "drafter".into(),
+            Self::Vision => "vision".into(), Self::Audio => "audio".into(),
+            Self::Drafter | Self::ExternalDrafter => "drafter".into(),
         }
     }
 }
@@ -44,8 +47,15 @@ impl ReadRole {
 pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTreeSet<String>> {
     let family = family::detect(checkpoint).context("checkpoint family is not supported")?;
     let model = family.open(checkpoint)?;
+    let ownership = match role {
+        ReadRole::Coordinator { speculator: true, .. } | ReadRole::Drafter =>
+            super::spec::DraftOwnership::selected(family.id(),
+                if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" } else { "mtp" }),
+        _ => super::spec::DraftOwnership::None,
+    };
     Ok(checkpoint.tensor_names().filter(|name| {
         let Some(tensor) = family.classify(model.spec(), name) else { return false };
+        if !ownership.includes(tensor.component) { return false; }
         match role {
             ReadRole::Coordinator { local_experts, speculator } => match tensor.component {
                 Component::RoutedExpert => local_experts,
@@ -59,6 +69,7 @@ pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTree
             ReadRole::Vision => tensor.component == Component::Vision,
             ReadRole::Audio => tensor.component == Component::Audio,
             ReadRole::Drafter => matches!(tensor.component, Component::Speculator | Component::SpeculatorExpert),
+            ReadRole::ExternalDrafter => false,
         }
     }).map(str::to_owned).collect())
 }

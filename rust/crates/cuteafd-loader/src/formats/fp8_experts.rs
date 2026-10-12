@@ -196,6 +196,16 @@ impl Fp8ExpertTensors {
         Self::read_selected(snapshot, shape, None)
     }
 
+    /// Remove unused draft headers without rereading backbone shards.
+    pub(crate) fn retain_backbone(&mut self) {
+        let prefix = self.prefix.clone();
+        let end = self.shape.layers;
+        self.tensors.retain(|name, _| name.strip_prefix(&prefix)
+            .and_then(|name| name.strip_prefix("layers."))
+            .and_then(|name| name.split('.').next()?.parse::<usize>().ok())
+            .is_some_and(|layer| layer < end));
+    }
+
     /// Open only selected layers, using a selected layer's actual headers to
     /// establish format. MTP-only readers must never probe a backbone shard.
     pub fn read_layers(snapshot: &Path, shape: RoutedExpertShape, layers: &std::collections::BTreeSet<usize>) -> Result<Self> {

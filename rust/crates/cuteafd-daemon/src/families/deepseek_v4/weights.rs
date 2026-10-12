@@ -353,7 +353,7 @@ impl<'a> WeightLoader<'a, '_> {
     /// Every layer (rank 0's shares under a head split, the other rank's in the
     /// second value), the drafter and the head.
     #[allow(clippy::type_complexity)]
-    pub fn model(&self, cfg: &DeepseekV4Config) -> Result<(ModelWeights<'a>, Vec<Vec<LayerWeights<'a>>>)> {
+    pub fn model(&self, cfg: &DeepseekV4Config, dspark: bool) -> Result<(ModelWeights<'a>, Vec<Vec<LayerWeights<'a>>>)> {
         let mut shares: Vec<Vec<LayerWeights<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..cfg.n_layers {
             for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
@@ -364,7 +364,7 @@ impl<'a> WeightLoader<'a, '_> {
         let layers = shares.next().context("rank 0")?;
         Ok((ModelWeights {
             layers,
-            dspark: self.dspark(cfg)?,
+            dspark: if dspark { self.dspark(cfg)? } else { None },
             head: self.tensor("head.weight")?,
             head_fn: self.tensor("hc_head_fn")?,
             head_scale: self.tensor("hc_head_scale")?,

@@ -47,6 +47,84 @@ fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
     dir
 }
 
+fn unused_checkpoint_draft_bytes(config: Value, native: Tensor, v4: bool) {
+    use spec::DraftOwnership;
+    use files::{required_tensors, ReadRole};
+    let dir = tempfile::tempdir().unwrap();
+    let expert_name = if native.0.starts_with("mtp.0.") {
+        "mtp.0.ffn.experts.0.w1.weight".to_owned()
+    } else {
+        let prefix = native.0.strip_suffix("enorm.weight").unwrap();
+        format!("{prefix}mlp.experts.0.gate_proj.weight")
+    };
+    let natives = [native, t(expert_name, "BF16", &[128, 128])];
+    if v4 {
+        write_v4_snapshot(dir.path());
+        let config: Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        write_snapshot(dir.path(), &config, &natives, None);
+    } else { write_snapshot(dir.path(), &config, &natives, None); }
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let family = family::detect(&checkpoint).unwrap();
+    for selected in ["off", "dflash2"] {
+        let ownership = DraftOwnership::selected(family.id(), selected);
+        assert!(!ownership.uses_checkpoint());
+        let report = plan(dir.path(), &PlanOptions { draft_ownership: Some(ownership), ..Default::default() }).unwrap();
+        let draft: Vec<_> = report.components.iter().filter(|c|
+            matches!(c.component, Component::Speculator | Component::SpeculatorExpert)).collect();
+        assert!(!draft.is_empty(), "native fixture must be classified for {}", family.id());
+        assert!(draft.iter().all(|c| c.bytes == 0 && c.status == Status::Disabled));
+        for role in [ReadRole::Coordinator { local_experts: true, speculator: false }, ReadRole::Spark { rank: 0, world: 4 }] {
+            let required = required_tensors(&checkpoint, role).unwrap();
+            assert!(natives.iter().all(|tensor| !required.contains(&tensor.0)));
+        }
+    }
+    if matches!(family.id(), "deepseek_v4" | "deepseek_v41" | "mimo_v2" | "qwen4") {
+        let selected = if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" } else { "mtp" };
+        let ownership = DraftOwnership::selected(family.id(), selected);
+        assert!(ownership.uses_checkpoint());
+        let report = plan(dir.path(), &PlanOptions { draft_ownership: Some(ownership), ..Default::default() }).unwrap();
+        assert!(report.components.iter().any(|c| c.component == Component::Speculator && c.bytes > 0));
+        let required = required_tensors(&checkpoint, ReadRole::Coordinator { local_experts: false, speculator: true }).unwrap();
+        assert!(natives.iter().all(|tensor| required.contains(&tensor.0)));
+    }
+}
+
+#[test]
+fn glm5_unused_native_draft_bytes_are_absent() {
+    unused_checkpoint_draft_bytes(glm5_config(), t("model.layers.78.enorm.weight", "BF16", &[128]), false);
+}
+#[test]
+fn glmf_unused_native_draft_bytes_are_absent() {
+    unused_checkpoint_draft_bytes(glm5_flash_config(4), t("model.language_model.layers.4.enorm.weight", "BF16", &[128]), false);
+}
+#[test]
+fn mimo_unused_native_draft_bytes_are_absent() {
+    unused_checkpoint_draft_bytes(mimo_flash_config(), t("model.mtp.layers.0.enorm.weight", "BF16", &[128]), false);
+}
+#[test]
+fn bundled_mimo_dflash_default_does_not_charge_native_mtp() {
+    let native = t("model.mtp.layers.0.enorm.weight", "BF16", &[128]);
+    let dir = snapshot(mimo_flash_config(), &[native]);
+    std::fs::create_dir(dir.path().join("dflash")).unwrap();
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let draft = component(&report, Component::Speculator);
+    assert_eq!(draft.bytes, 0);
+    assert_eq!(draft.status, Status::Disabled);
+}
+
+#[test]
+fn qwen_unused_native_draft_bytes_are_absent() {
+    unused_checkpoint_draft_bytes(qwen4_config(4), t("mtp.layers.0.enorm.weight", "BF16", &[128]), false);
+}
+#[test]
+fn v4_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
+    unused_checkpoint_draft_bytes(json!({}), t("mtp.0.main_norm.weight", "BF16", &[4096]), true);
+}
+#[test]
+fn v41_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
+    unused_checkpoint_draft_bytes(v41_config(), t("mtp.0.main_norm.weight", "BF16", &[5120]), false);
+}
+
 fn sparks(ranks: usize) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), ..PlanOptions::default() }
 }
@@ -1384,9 +1462,13 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
         glmf_table_pages, GlmfScratchOptions, GlmfStepShape};
     use cuteafd_core::memory_layout::{Category, DeviceKind};
-    let config = glm5_flash_config(4);
+    let mut config = glm5_flash_config(4);
+    config["text_config"]["num_nextn_predict_layers"] = json!(1);
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
     let mut tensors = glm5_flash_tensors(&config);
+    let native: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".layers.3.mlp.experts.0."))
+        .map(|(name, dtype, shape)| (name.replace(".layers.3.", ".layers.4."), *dtype, shape.clone())).collect();
+    tensors.extend(native);
     // Weight-only admission sums checkpoint headers; include every expert as the solver does.
     let expert_zero: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".mlp.experts.0.")).cloned().collect();
     for expert in 1..cfg.experts {
@@ -1410,7 +1492,12 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     let path = share.join("PROGRAMS.json");
     std::fs::write(&path, manifest.to_string()).unwrap();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
-    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let mut catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    assert_eq!(catalog.routed_experts().layers, cfg.layers);
+    assert!(catalog.fp8().unwrap().has_layer(cfg.layers));
+    catalog.select_draft(spec::DraftOwnership::None).unwrap();
+    assert!(!catalog.fp8().unwrap().has_layer(cfg.layers));
+    assert!(catalog.fp8().unwrap().has_layer(cfg.layers - 1));
     let lookup = glmf_manifest_scratch(&manifest);
     let scratch = GlmfScratchOptions { split: true, ..Default::default() };
     let decode = glmf_step_scratch(&lookup, &cfg, scratch, 64, true).unwrap();

@@ -238,7 +238,8 @@ pub(crate) struct Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
