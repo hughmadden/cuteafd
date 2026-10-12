@@ -218,3 +218,20 @@ def test_gate_exemption_covers_only_ancestors(lockdir):
             assert hwlock.older_conflicts(queue, ['gpu1'], None) == []
         finally:
             del os.environ[hwlock.GATE_ENV]
+
+
+def test_gated_child_is_not_deadlocked_by_a_younger_waiter_behind_its_gate(lockdir):
+    # 2026-10-12: gate 74 (sparks,gpu0) held the turn; a 3-lock job 76 queued behind it;
+    # the gate's smoke child then took ticket 77 (younger than 76) and waited on 76 forever.
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    marker = lockdir / 'child-ran'
+    inner = (f'{sys.executable} -c "import time; time.sleep(0.6)"; '
+             f'{sys.executable} {SCRIPT} --locks sparks,gpu0 --wait 10 -- '
+             f'{sys.executable} -c "import pathlib; pathlib.Path({str(marker)!r}).write_text(\'1\')"')
+    gate = subprocess.Popen([sys.executable, str(SCRIPT), '--locks', 'sparks,gpu0', '--gate', '--wait', '10',
+                             '--', 'sh', '-c', inner], env=env, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.3)
+    blocked = spawn(lockdir, 'sparks,gpu0,gpu1', 0.1, lockdir / 'three')  # queues behind the gate
+    assert gate.wait(timeout=30) == 0, gate.stderr.read()
+    assert marker.exists()
+    assert blocked.wait(timeout=30) == 0

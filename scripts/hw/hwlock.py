@@ -88,6 +88,20 @@ def gate_ancestors() -> set[int]:
     return {int(s) for s in os.environ.get(GATE_ENV, '').split(':') if s.isdigit()}
 
 
+def inside_live_gate(queue: Path) -> bool:
+    """Whether a `--gate` ancestor's ticket is still live (it holds our turn)."""
+    for seq in gate_ancestors():
+        for path in queue.glob(f'{seq:012d}.*.ticket'):
+            try:
+                with open(path) as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            except FileNotFoundError:
+                continue
+    return False
+
+
 def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[str]:
     """Live tickets older than `before` (all, when None) wanting any of `locks`,
     except our own `--gate` ancestors. Removes stale tickets of any age on the
@@ -164,6 +178,21 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
     locks = canonical(names)
     check_preflight(preflight, preflight_timeout)
     queue = _queue()
+    if not gate and inside_live_gate(queue):
+        # The --gate ancestor already won this job's turn; a new, younger
+        # ticket would wait behind jobs that themselves wait on the gate.
+        held = None
+        deadline = time.monotonic() + wait
+        while (held := _try_flocks(locks)) is None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'no flocks for {",".join(locks)} after {wait:.0f} s inside a gate')
+            time.sleep(POLL_S)
+        try:
+            yield
+        finally:
+            for handle in held:
+                handle.close()
+        return
     seq, path, ticket = _take_ticket(queue, locks)
     GATE_SEQ[0] = seq
     deadline = time.monotonic() + wait

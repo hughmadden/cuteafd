@@ -288,6 +288,24 @@ mod fair {
         _file: File,
     }
 
+    /// Whether this process runs inside a live `hwlock.py --gate` ticket
+    /// (`CUTEAFD_HW_GATE_TICKETS`), which already holds this job's turn.
+    pub(super) fn inside_gate(dir: &Path) -> bool {
+        let queue = dir.join("hwq");
+        std::env::var("CUTEAFD_HW_GATE_TICKETS").unwrap_or_default().split(':')
+            .filter_map(|s| s.parse::<u64>().ok())
+            .any(|seq| live(&queue, seq))
+    }
+
+    fn live(queue: &Path, seq: u64) -> bool {
+        let prefix = format!("{seq:012}.");
+        std::fs::read_dir(queue).into_iter().flatten().flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(&prefix) && name.ends_with(".ticket")
+                && File::open(entry.path()).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+        })
+    }
+
     impl Ticket {
         pub(super) fn take(dir: &Path, locks: &[&str]) -> Result<Self> {
             let queue = dir.join("hwq");
@@ -379,6 +397,16 @@ mod fair {
         }
 
         #[test]
+        fn a_child_of_a_live_gate_takes_no_ticket_of_its_own() {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Ticket::take(dir.path(), &["sparks.lock", "gpu0.lock"]).unwrap();
+            assert!(super::live(&dir.path().join("hwq"), gate.seq));
+            assert!(!super::live(&dir.path().join("hwq"), gate.seq + 1));
+            drop(gate);
+            assert!(!super::live(&dir.path().join("hwq"), 1));
+        }
+
+        #[test]
         fn a_gated_parent_ticket_does_not_block_its_child() {
             let dir = tempfile::tempdir().unwrap();
             let gate = Ticket::take(dir.path(), &["sparks.lock", "gpu0.lock", "gpu1.lock"]).unwrap();
@@ -458,10 +486,13 @@ impl Locks {
             return Ok(true);
         }
         // Fair turn order shared with scripts/hw/hwlock.py: a waiter takes its
-        // locks only when no older live ticket wants any of them.
-        let ticket = fair::Ticket::take(&dir, &wanted)?;
+        // locks only when no older live ticket wants any of them. Inside an
+        // `hwlock.py --gate`, the gate already won this job's turn: a new,
+        // younger ticket would queue behind jobs that themselves wait on the
+        // gate (a deadlock), so a gated child only waits for the flocks.
+        let ticket = if fair::inside_gate(&dir) { None } else { Some(fair::Ticket::take(&dir, &wanted)?) };
         loop {
-            if !ticket.older_conflict()? {
+            if !ticket.as_ref().map_or(Ok(false), |t| t.older_conflict())? {
                 let mut taken = Vec::new();
                 for &name in &wanted {
                     let file = File::options().create(true).append(true).open(dir.join(name))?;
