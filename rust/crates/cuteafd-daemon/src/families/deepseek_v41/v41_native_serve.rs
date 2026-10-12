@@ -298,10 +298,12 @@ fn worker(
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
-    let catalog = cuteafd_loader::read_official_v41_catalog(
+    let mut catalog = cuteafd_loader::read_official_v41_catalog(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         &args.snapshot,
     )?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
+        if args.dspark { "dspark" } else { "off" }))?;
     let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,

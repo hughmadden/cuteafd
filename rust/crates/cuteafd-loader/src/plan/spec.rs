@@ -66,6 +66,32 @@ pub enum SpeculatorSpec {
     Dspark { stages: usize, experts: usize, top_k: usize, target_layers: Vec<usize> },
 }
 
+/// Resolved ownership of draft tensors in the target checkpoint. External
+/// dSpark (GLM Flash) is deliberately distinct from bundled dSpark (V4.x).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftOwnership {
+    None,
+    NativeMtp,
+    BundledDspark,
+}
+
+impl DraftOwnership {
+    pub fn selected(family: &str, speculator: &str) -> Self {
+        match (family, speculator) {
+            ("mimo_v2" | "qwen4", "mtp") => Self::NativeMtp,
+            ("deepseek_v4" | "deepseek_v41", "dspark") => Self::BundledDspark,
+            _ => Self::None,
+        }
+    }
+
+    pub fn uses_checkpoint(self) -> bool { self != Self::None }
+
+    pub fn includes(self, component: super::Component) -> bool {
+        !matches!(component, super::Component::Speculator | super::Component::SpeculatorExpert)
+            || self.uses_checkpoint()
+    }
+}
+
 /// A large lookup table that stays in host memory (engram, n-gram memory, PLE).
 #[derive(Debug, Clone, Serialize)]
 pub struct MappedTableSpec {

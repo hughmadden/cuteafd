@@ -246,6 +246,8 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
+    pub draft_ownership: Option<spec::DraftOwnership>,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
@@ -262,6 +264,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            draft_ownership: None,
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
@@ -457,11 +460,18 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         }
     };
     let spec = model.spec();
+    let ownership = options.draft_ownership.unwrap_or_else(|| {
+        let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
+        spec::DraftOwnership::selected(family.id(), if !native { "off" }
+            else if family.id() == "mimo_v2" && snapshot.join("dflash").is_dir() { "dflash2" }
+            else if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" }
+            else { "mtp" })
+    });
     if !checkpoint.missing_shards.is_empty() {
         let mut requirements: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let ranks = options.placement.spark_ranks();
         let mut read_roles = vec![files::ReadRole::Coordinator {
-            local_experts: ranks == 0, speculator: false }];
+            local_experts: ranks == 0, speculator: ownership.uses_checkpoint() }];
         read_roles.extend((0..ranks).map(|rank| files::ReadRole::Spark { rank, world: ranks }));
         if options.vision != MediaMode::Off { read_roles.push(files::ReadRole::Vision); }
         if report.audio != MediaMode::Off { read_roles.push(files::ReadRole::Audio); }
@@ -550,7 +560,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             rejections.truncate(REJECTIONS_KEPT);
         }
         let disabled = (*component == Component::Vision && options.vision == MediaMode::Off)
-            || (*component == Component::Audio && report.audio == MediaMode::Off);
+            || (*component == Component::Audio && report.audio == MediaMode::Off)
+            || !ownership.includes(*component);
         let status = if disabled { Status::Disabled } else { match family.runtime() {
             RuntimeStatus::Planned => Status::Planned,
             RuntimeStatus::Serving if rejected == 0 => Status::Ready,
@@ -575,7 +586,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             }
         }
         let source_bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
-        if disabled { report.disabled_media_bytes += source_bytes; }
+        if disabled && matches!(component, Component::Vision | Component::Audio) {
+            report.disabled_media_bytes += source_bytes;
+        }
         let bytes = if disabled { 0 } else { source_bytes };
         let owner = owner_for(*component);
         report.components.push(ComponentPlan {
@@ -591,7 +604,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
-        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, layout_options,
+        let mut layout_options = layout_options.clone();
+        if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
+        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &layout_options,
             options.coordinator_budget_bytes);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
@@ -634,7 +649,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         // A tensor-only inventory does not request an external speculation checkpoint.
         let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
             spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
-            glmf_drafter_disabled: true, ..Default::default() };
+            glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
+            ..Default::default() };
         let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &inventory,
             options.coordinator_budget_bytes);
     }

@@ -309,8 +309,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     let experts = if args.local_experts || (args.peers.is_some() && args.mtp > 0) {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-        let catalog = if args.local_experts { cuteafd_loader::read_expert_catalog(source)? }
+        let mut catalog = if args.local_experts { cuteafd_loader::read_expert_catalog(source)? }
             else { cuteafd_loader::read_qwen4_mtp_expert_catalog(source, 1)? };
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("qwen4",
+            if args.mtp > 0 { "mtp" } else { "off" }))?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
             "--local-experts runs FP8 or EXL3 experts; {} has neither", source.display());
         Some(catalog)

@@ -527,6 +527,8 @@ impl<'a> Engine<'a> {
         let lead = rank == 0;
         let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let h = self.cfg.dim;
+        let draft = lead && self.weights.dspark.is_some();
+        let draft_bytes = |bytes| if draft { bytes } else { 0 };
         // Rank 1 runs only its head-split share; rank 0 keeps every head for
         // the unsplit dSpark stages.
         let heads = if rank == 1 { self.cfg.n_heads / 2 } else { self.cfg.n_heads };
@@ -547,7 +549,7 @@ impl<'a> Engine<'a> {
                 tokens: self.alloc(t * 4)?,
                 shared: self.alloc(t * h * 2)?,
                 tables: self.step_buffers(t)?,
-                taps: self.alloc(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2)?,
+                taps: self.alloc(draft_bytes(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
             })
         };
         Ok(Workspace {
@@ -568,12 +570,12 @@ impl<'a> Engine<'a> {
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
-            main_x: self.alloc(t.min(TAP_ROWS) * h * 2)?,
-            main_work: self.alloc(t.min(TAP_ROWS) * h * 4)?,
-            first_tokens: self.alloc(t * 4)?,
-            drafts: self.alloc(t * 4)?,
-            markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
-            draft_ids: self.alloc(t * 4)?,
+            main_x: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 2))?,
+            main_work: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 4))?,
+            first_tokens: self.alloc(draft_bytes(t * 4))?,
+            drafts: self.alloc(draft_bytes(t * 4))?,
+            markov: self.alloc(if draft { self.library.dsv4_markov_workspace(t)? } else { 0 })?,
+            draft_ids: self.alloc(draft_bytes(t * 4))?,
             router_host: HostAllocation::new(self.library, lead_only(t * (topk * 8 + h + h / 32)))?,
             sum: self.alloc(if self.split_family.is_some() { t * h * 2 } else { 256 })?,
             // SAFETY: the workspace buffer lives in the same struct and drops

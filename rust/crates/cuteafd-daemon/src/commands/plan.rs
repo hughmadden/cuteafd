@@ -20,6 +20,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let options = PlanOptions {
+        draft_ownership: None,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
@@ -142,7 +143,15 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
+    let cfg = launch_config(args.config.as_deref())?;
+    resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
+        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        layout.glmf_drafter_disabled = args.speculator == "off";
+        layout.glm5_drafter_disabled = args.speculator == "off";
         let config = std::fs::File::open(snapshot.join("config.json")).ok()
             .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
         let v41 = config.as_ref().is_some_and(|value| {
@@ -159,7 +168,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         let parse = |name: &str| {
             anyhow::ensure!(!(args.no_speculator && name == "drafter"), "--no-speculator conflicts with drafter role");
             ReadRole::parse(name, placement,
-                args.include_speculator || matches!(args.speculator.as_str(), "mtp" | "dspark"))
+                cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator).uses_checkpoint())
         };
         let complete_roles = |mut roles: Vec<ReadRole>| {
             if roles.iter().any(|r| matches!(r, ReadRole::Coordinator { .. })) {
@@ -271,27 +280,13 @@ fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result
     Ok(Some(seen.len()))
 }
 
-/// Resolve the release defaults or the launcher's plain KEY=VALUE config.
-/// Never execute a shell configuration while constructing a file inventory.
-fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
-    use cuteafd_loader::plan::MediaMode;
-    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
-    let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
-    let cfg = launch_config(args.config.as_deref())?;
-    if let Some(model) = cfg.get("MODEL_ID") {
-        if !PathBuf::from(&args.model).is_dir() {
-            anyhow::ensure!(model == &args.model, "--config MODEL_ID={model} differs from {}", args.model);
-        }
-    }
-    if args.spark_ranks.is_none() {
-        if cfg.get("EXPERT_BACKEND").is_some_and(|v| v == "local") { args.spark_ranks = Some(0); }
-        else if let Some(ranks) = cfg.get("SPARK_COUNT") { args.spark_ranks = Some(ranks.parse().context("SPARK_COUNT")?); }
-    }
+fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     let default = match family {
         "glm5" | "glm5_flash" => "dflash2",
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
-        "mimo_v2" | "qwen4" => "mtp",
-        "deepseek_v4" | "deepseek_v41" => "dspark",
+        "mimo_v2" | "qwen4" if args.native_mtp_layers > 0 => "mtp",
+        "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
         _ => "off",
     };
     if args.speculator == "auto" {
@@ -320,6 +315,26 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
+    Ok(())
+}
+
+/// Resolve the release defaults or the launcher's plain KEY=VALUE config.
+/// Never execute a shell configuration while constructing a file inventory.
+fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
+    use cuteafd_loader::plan::MediaMode;
+    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
+    let cfg = launch_config(args.config.as_deref())?;
+    if let Some(model) = cfg.get("MODEL_ID") {
+        if !PathBuf::from(&args.model).is_dir() {
+            anyhow::ensure!(model == &args.model, "--config MODEL_ID={model} differs from {}", args.model);
+        }
+    }
+    if args.spark_ranks.is_none() {
+        if cfg.get("EXPERT_BACKEND").is_some_and(|v| v == "local") { args.spark_ranks = Some(0); }
+        else if let Some(ranks) = cfg.get("SPARK_COUNT") { args.spark_ranks = Some(ranks.parse().context("SPARK_COUNT")?); }
+    }
+    resolve_speculator(&mut args, snapshot, family, &cfg)?;
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
             serde_json::from_reader(std::fs::File::open(layout)?)?;
@@ -359,14 +374,14 @@ fn attach_snapshots(manifest: &mut cuteafd_loader::plan::files::FileManifest,
     roles: &[cuteafd_loader::plan::files::ReadRole], args: &PlanArgs) -> Result<()> {
     use cuteafd_loader::plan::files::{manifest_standalone, ReadRole};
     let coordinator = roles.iter().any(|r| matches!(r, ReadRole::Coordinator { .. }));
-    if (coordinator || roles.contains(&ReadRole::Drafter)) && args.speculator == "dflash2"
+    if (coordinator || roles.contains(&ReadRole::Drafter) || roles.contains(&ReadRole::ExternalDrafter)) && args.speculator == "dflash2"
         && args.drafter_snapshot.is_none() {
         let root = PathBuf::from(&manifest.snapshot);
         cuteafd_loader::plan::files::include_directory(manifest, &root, "dflash")?;
     }
     let configured = [
         ("drafter", &args.drafter_snapshot, coordinator && args.speculator != "off"
-            || roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. }))),
+            || roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::ExternalDrafter | ReadRole::Coordinator { speculator: true, .. }))),
         ("vision", &args.vision_snapshot, roles.contains(&ReadRole::Vision)),
         ("audio", &args.audio_snapshot, roles.contains(&ReadRole::Audio)),
     ];
@@ -800,6 +815,13 @@ mod tests {
         let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
         attach_snapshots(&mut manifest, &roles, &off).unwrap();
         assert!(!manifest.files.iter().any(|f| f.path.starts_with("dflash/")));
+        let external = cuteafd_loader::plan::files::ReadRole::parse("drafter", ExpertPlacement::Local, false).unwrap();
+        assert_eq!(external, cuteafd_loader::plan::files::ReadRole::ExternalDrafter);
+        let inventory = cuteafd_loader::plan::Checkpoint::inventory(target.path()).unwrap();
+        assert!(cuteafd_loader::plan::files::required_tensors(&inventory, external).unwrap().is_empty());
+        let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &[external]).unwrap();
+        attach_snapshots(&mut manifest, &[external], &automatic).unwrap();
+        assert!(manifest.files.iter().any(|f| f.path.starts_with("dflash/")));
     }
 
     #[test]
@@ -870,6 +892,37 @@ mod tests {
         assert_eq!(cli.vision, Some(cuteafd_loader::plan::MediaMode::Off));
         assert_eq!(cli.audio, Some(cuteafd_loader::plan::MediaMode::Auto));
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "bad"]).is_err());
+    }
+
+    #[test]
+    fn resolved_checkpoint_ownership_matches_config_and_legacy_choices() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let dir = tempfile::tempdir().unwrap();
+        for (family, key, value, expected) in [
+            ("glm5_flash", "SPECULATOR", "dspark", DraftOwnership::None),
+            ("glm5", "SPECULATOR", "off", DraftOwnership::None),
+            ("mimo_v2", "DFLASH", "on", DraftOwnership::None),
+            ("mimo_v2", "MTP", "2", DraftOwnership::NativeMtp),
+            ("qwen4", "MTP", "0", DraftOwnership::None),
+            ("deepseek_v4", "DSPARK", "off", DraftOwnership::None),
+            ("deepseek_v41", "DSPARK", "on", DraftOwnership::BundledDspark),
+        ] {
+            let mut request = args(dir.path(), 4, false);
+            let cfg = std::collections::BTreeMap::from([(key.into(), value.into())]);
+            resolve_speculator(&mut request, dir.path(), family, &cfg).unwrap();
+            assert_eq!(DraftOwnership::selected(family, &request.speculator), expected);
+            request.speculator = "off".into();
+            resolve_speculator(&mut request, dir.path(), family, &cfg).unwrap();
+            assert_eq!(DraftOwnership::selected(family, &request.speculator), DraftOwnership::None);
+        }
+        std::fs::create_dir(dir.path().join("dflash")).unwrap();
+        let mut request = args(dir.path(), 4, false);
+        resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
+        assert_eq!(request.speculator, "dflash2");
+        let mut request = args(dir.path(), 4, false);
+        request.native_mtp_layers = 0;
+        resolve_speculator(&mut request, dir.path(), "deepseek_v4", &Default::default()).unwrap();
+        assert_eq!(request.speculator, "off");
     }
 
     #[test]

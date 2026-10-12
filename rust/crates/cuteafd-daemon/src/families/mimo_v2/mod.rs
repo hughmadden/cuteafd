@@ -752,8 +752,12 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
         "selected resident weight formats");
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
-    let catalog = (!args.skip_experts)
-        .then(|| cuteafd_loader::read_expert_catalog(&args.snapshot)).transpose()?;
+    let catalog = (!args.skip_experts).then(|| {
+        let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("mimo_v2",
+            if args.mtp > 0 { "mtp" } else { "off" }))?;
+        Ok::<_, anyhow::Error>(catalog)
+    }).transpose()?;
     let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
     let shape = cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
         experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,

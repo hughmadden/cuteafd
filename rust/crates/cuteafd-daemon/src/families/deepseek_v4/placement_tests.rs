@@ -51,7 +51,9 @@ fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> 
 
 fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool) -> anyhow::Result<Placement> {
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
-    let catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4",
+        if case.dspark { "dspark" } else { "off" }))?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
     let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
     let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
@@ -61,7 +63,7 @@ fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool)
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
     let cli = Cli::try_parse_from(argv)?;
-    // serve-dsv4 owns caches for every dSpark stage the checkpoint carries.
+    // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let gpus = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
@@ -203,6 +205,23 @@ fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
             assert_eq!(p.expert_ranges[1].peak_bytes, 0);
             assert_eq!(p.tp2.unwrap().layers, p.onboard_layers);
         }
+    }
+}
+
+#[test]
+fn planner_equals_runtime_v4_bundled_draft_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic(dir.path());
+    cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3);
+    for rtx in [1, 2] {
+        let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
+            context: 1_048_576, budget: 32 << 30, peer_budget: None,
+            onboard: Some(Onboard::Layers(0)), dspark: false, exchange_f32: false };
+        let p = assert_equal(&case, &format!("bundled draft off rtx{rtx}"));
+        assert!(p.expert_ranges.iter().all(|range| range.peak_bytes == 0));
+        let (layout, _, _) = planned(&case);
+        assert!(!layout.devices.iter().flat_map(|device| &device.items).any(|item|
+            item.group == "speculator" || item.group == "speculator_expert"));
     }
 }
 

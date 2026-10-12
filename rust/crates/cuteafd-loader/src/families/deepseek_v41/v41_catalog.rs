@@ -139,6 +139,27 @@ impl V41CoordinatorTensorReader {
 }
 
 impl OfficialV41Catalog {
+    /// Restrict the coordinator catalog to the selected checkpoint drafter.
+    /// Spark workers always select `None`: bundled draft experts are local.
+    pub fn select_draft(&mut self, ownership: crate::plan::spec::DraftOwnership) -> Result<()> {
+        if ownership.uses_checkpoint() { return Ok(()); }
+        let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
+        let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
+        let model = family.open(&checkpoint)?;
+        let keep = |name: &str| family.classify(model.spec(), name)
+            .is_none_or(|role| ownership.includes(role.component));
+        self.tensors.retain(|tensor| keep(&tensor.metadata.name));
+        if let Some(manifest) = &mut self.exl3 {
+            manifest.projections.retain(|name, _| keep(name));
+            manifest.experts.draft_stages = 0;
+            manifest.experts.draft_experts = 0;
+        }
+        self.experts.draft_stages = 0;
+        self.experts.draft_experts = 0;
+        if let Some(tensors) = &mut self.fp8 { tensors.retain_backbone(); }
+        Ok(())
+    }
+
     pub fn exl3(&self) -> Option<&crate::V41Exl3Manifest> {
         self.exl3.as_ref()
     }
@@ -814,15 +835,13 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
 fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
     // The geometry from the coordinator's own config readers, so the Spark
     // ranks and serve-glm / serve-glmf agree on the routed layers.
-    let (dense, mtp, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+    let (dense, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(config)?;
-        let text = config.get("text_config").unwrap_or(config);
-        let mtp = text["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize;
-        (cfg.dense.clone(), mtp, (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
+        (cfg.dense.clone(), (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
     } else {
         let cfg = crate::families::glm5::GlmDsaConfig::from_hf(config)?;
         let dense = (0..cfg.layers).map(|layer| layer < cfg.first_moe_layer).collect::<Vec<_>>();
-        (dense, cfg.mtp_layers, (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
+        (dense, (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
     };
     let (layers, experts, topk, hidden, intermediate) = shape;
     let first_layer = dense.iter().position(|dense| !dense).context("GLM config has no MoE layer")?;
@@ -841,10 +860,9 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         return Ok(catalog);
     }
     if config["quantization_config"]["quant_method"] == "fp8" {
-        // The official FP8 experts (~675 GiB) do not fit the Spark pool; the
-        // catalog serves selected layers, above all the MTP layer, whose ids
-        // follow the backbone (num_hidden_layers..): the id bound includes them.
-        return fp8_catalog(snapshot, RoutedExpertShape { layers: layers + mtp, ..shape });
+        // Both GLM runtimes select external drafters. Native nextn experts
+        // after the backbone are not part of the worker or placement inventory.
+        return fp8_catalog(snapshot, shape);
     }
     ensure!(
         config["quantization_config"]["quant_method"] == "exl3",
@@ -1359,6 +1377,51 @@ mod tests {
             V41TensorPlacement::HostMappedEngram
         );
     }
+    #[test]
+    fn selected_bundled_dspark_keeps_tensors_and_worker_selection_drops_them() {
+        use crate::plan::spec::DraftOwnership;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = official_config();
+        let names = ["layers.0.ffn.experts.0.w1.weight", "mtp.0.ffn.experts.0.w1.weight", "mtp.0.main_norm.weight"];
+        std::fs::write(dir.path().join("config.json"), include_bytes!("official-v41-config.json")).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), serde_json::json!({
+            "weight_map": names.iter().map(|name| (*name, "fixture.safetensors")).collect::<BTreeMap<_, _>>()
+        }).to_string()).unwrap();
+        let shape = RoutedExpertShape::of_v41(&cfg);
+        let mut catalog = OfficialV41Catalog {
+            config: Some(cfg), experts: shape, snapshot: dir.path().to_path_buf(),
+            tensors: names.iter().map(|name| V41Tensor {
+                shard: "fixture.safetensors".into(), placement: placement(name),
+                metadata: SafetensorsTensorMetadata { name: (*name).into(), dtype: DType::Bf16,
+                    shape: vec![128], byte_offset: 0, byte_length: 256 },
+            }).collect(), exl3: Some(crate::V41Exl3Manifest {
+                config: None, experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
+                projections: names[..2].iter().map(|name| {
+                    let name = name.strip_suffix(".weight").unwrap().to_owned();
+                    (name.clone(), crate::V41Exl3Projection { name, kind: crate::V41Exl3ProjectionKind::Gate,
+                        bits: 4, input_features: 128, output_features: 128 })
+                }).collect(), decoder_tiers: vec![4], ple_quantization: None,
+                mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
+                storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,
+            }), nvfp4: None, fp8: None,
+        };
+        catalog.select_draft(DraftOwnership::selected("deepseek_v41", "dspark")).unwrap();
+        assert_eq!(catalog.tensors.len(), 3);
+        assert_eq!(catalog.exl3().unwrap().projections.len(), 2);
+        assert_eq!(catalog.experts, shape);
+        catalog.select_draft(DraftOwnership::None).unwrap();
+        assert_eq!(catalog.tensors.len(), 1);
+        assert_eq!(catalog.tensors[0].metadata.name, names[0]);
+        assert_eq!(catalog.experts.draft_stages, 0);
+        assert_eq!(catalog.experts.draft_experts, 0);
+        assert_eq!(catalog.experts.layers, shape.layers);
+        let manifest = catalog.exl3().unwrap();
+        assert_eq!(manifest.projections.len(), 1);
+        assert!(manifest.projections.keys().all(|name| !name.starts_with("mtp.")));
+        assert_eq!(manifest.experts.draft_stages, 0);
+        assert_eq!(manifest.experts.draft_experts, 0);
+    }
+
     #[test]
     fn rejects_same_byte_count_with_wrong_representation() {
         let spec = ExpectedTensor {

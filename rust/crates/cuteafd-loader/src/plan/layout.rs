@@ -535,9 +535,8 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     let native_layers = if family == "deepseek_v4" && options.native_mtp_layers > 0 {
         discovered_native_layers
     } else { options.native_mtp_layers.min(discovered_native_layers) };
-    // V4 always loads all checkpoint stages and their caches; --dspark only
-    // changes expert residency and whether the scheduler drafts with them.
-    let cache_native_layers = if family == "deepseek_v4" { discovered_native_layers } else { native_layers };
+    // Cache and graph ownership follows the selected checkpoint drafter.
+    let cache_native_layers = native_layers;
     let mut workspace_manifest = options.workspace_manifest.as_deref().or_else(|| {
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)
@@ -1611,7 +1610,7 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
         ]]);
     }
     if family == "deepseek_v4" {
-        return deepseek_v4::resident_weights(checkpoint, ranks);
+        return deepseek_v4::resident_weights(checkpoint, ranks, mtp);
     }
     None
 }
