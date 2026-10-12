@@ -7,7 +7,7 @@ use cuteafd_ffi::{
     V41RouteReducer,
 };
 use std::ffi::c_void;
-mod timing;
+pub(crate) mod timing;
 use timing::ExpertTiming;
 
 /// Native roles that publish token-major FP32 routed partials and therefore
@@ -66,6 +66,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     small: Option<DecodeExecution<'library>>,
     reducer: V41RouteReducer<'library>,
     timing: Option<ExpertTiming<'library>>,
+    worker_timing: Option<timing::WorkerTiming<'library>>,
     scratch: DeviceAllocation<'library>,
     pub(crate) hidden: DeviceAllocation<'library>,
     ids: DeviceAllocation<'library>,
@@ -240,6 +241,7 @@ impl<'library> ExpertWeights<'library> {
             small,
             reducer,
             timing,
+            worker_timing: None,
             compact_reducer,
             compact_output,
             scratch,
@@ -256,6 +258,11 @@ impl<'library> ExpertWeights<'library> {
     }
 }
 impl<'weights, 'library> ExpertExecution<'weights, 'library> {
+    pub(crate) fn install_worker_timing(&mut self, rank: usize) -> Result<()> {
+        self.worker_timing = timing::WorkerTiming::from_env(self.library, rank)?;
+        Ok(())
+    }
+
     /// Bind this worker to its replicated group before serving. Called once at
     /// startup; every remote request for this worker must then carry the native
     /// ownership contract and is unpacked for exactly this group.
@@ -651,7 +658,9 @@ impl ExpertExecution<'_, '_> {
                 timing.record(0, self.stream.raw)?;
             }
         }
+        // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
+            if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
             self.launch(request.rows(), false)?;
         }
         if let Some(timing) = &self.timing {
@@ -682,7 +691,15 @@ impl ExpertExecution<'_, '_> {
                 timing.record(2, self.stream.raw)?;
             }
         }
+        // SAFETY: the reducer and kernel precede this end event on the owned stream.
+        unsafe {
+            if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
+        }
         self.synchronize()?;
+        if let Some(timing) = &mut self.worker_timing {
+            // SAFETY: synchronize completed both event records.
+            unsafe { timing.publish(request.request_id(), request.layer(), request.rows(), executor_id, "native")?; }
+        }
         let executed_us = started.map(|t| t.elapsed().as_micros() as u64);
         if destination.is_none() {
             self.library.copy_d2h(&mut exchange.partials[..bytes], CuteafdDeviceBuffer { bytes, ..output })?;

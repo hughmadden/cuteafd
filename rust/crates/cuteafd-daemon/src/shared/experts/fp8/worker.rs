@@ -22,6 +22,7 @@ pub(crate) struct Fp8Worker<'a> {
     capacity: usize,
     layer: usize,
     executor_id: u64,
+    timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
 }
 
 impl<'a> Fp8Worker<'a> {
@@ -51,6 +52,7 @@ impl<'a> Fp8Worker<'a> {
         ];
         let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
         let executor_id = cuteafd_transport::expert::v41_spark_executor_id(experts.tp, experts.rank)?;
+        let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?;
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             experts,
@@ -60,6 +62,7 @@ impl<'a> Fp8Worker<'a> {
             capacity,
             layer: 0,
             executor_id,
+            timing,
         })
     }
 
@@ -121,6 +124,7 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: inputs, output and the resident layer are live device memory of
         // the documented extents; the stream is synchronized below.
         unsafe {
+            if let Some(timing) = &self.timing { timing.record(0, self.stream.raw)?; }
             if bf16 {
                 self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
@@ -128,7 +132,12 @@ impl<'a> Fp8Worker<'a> {
                 self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
+            if let Some(timing) = &self.timing { timing.record(1, self.stream.raw)?; }
             self.library.cuda_stream_synchronize(self.stream.raw)?;
+        }
+        if let Some(timing) = &mut self.timing {
+            // SAFETY: the existing worker barrier completed both event records.
+            unsafe { timing.publish(request.request_id(), request.layer(), request.rows(), executor_id, "fp8_moe")?; }
         }
         if destination.is_none() {
             ensure!(exchange.partials.len() >= bytes, "FP8 host exchange is too small");
