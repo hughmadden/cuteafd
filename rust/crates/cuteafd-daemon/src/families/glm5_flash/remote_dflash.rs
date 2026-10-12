@@ -1,6 +1,6 @@
 //! One GPU1 DFlash2 owner; the target retains its single embedding and head.
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, GlmDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
-use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Stream};
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event, Stream};
 use crate::shared::peer_split::{PeerExchange, RankDevice, TerminalState};
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Result};
@@ -25,15 +25,21 @@ fn tap_frontier(rows: &[ContextRow]) -> Result<Option<(usize, usize)>> {
 pub(crate) struct Prepared<'a> {
     pub exchange: PeerExchange<'a>,
     pub stream: Stream<'a>,
+    target_peer: RankDevice,
+    target_ready: Event<'a>,
 }
 
 impl<'a> Prepared<'a> {
-    pub fn new(library: &'a NativeLibrary, target: RankDevice, peer: i32) -> Result<Self> {
-        let stream = Stream::new(Device { library, id: peer })?;
+    pub fn new(library: &'a NativeLibrary, target: RankDevice, target_peer: RankDevice) -> Result<Self> {
+        ensure!(target.device != target_peer.device && !target_peer.stream.is_null(),
+            "remote draft requires the peer target producer stream");
+        let device = Device { library, id: target_peer.device };
+        let stream = Stream::new(device)?;
+        let target_ready = Event { device, raw: device.run(|| library.cuda_event_create_ordering())? };
         let exchange = PeerExchange::new_abortable(library,
-            [target, RankDevice { device: peer, stream: stream.raw }], 4, 0)?;
+            [target, RankDevice { device: target_peer.device, stream: stream.raw }], 4, 0)?;
         exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits");
-        Ok(Self { exchange, stream })
+        Ok(Self { exchange, stream, target_peer, target_ready })
     }
 
     /// Sampled before admission but charged only for the selected GPU1 candidate.
@@ -54,7 +60,9 @@ pub(crate) struct RemoteDflash<'a> {
     pub draft: DeviceOwner<'a, GlmDrafter<'a>>,
     target: DeviceOwner<'a, TargetBuffers<'a>>,
     exchange: PeerExchange<'a>,
-    // The drafter and exchange drop before the stream they borrow.
+    target_peer: RankDevice,
+    target_ready: Event<'a>,
+    // The drafter, exchange and event drop before the stream they borrow.
     stream: Stream<'a>,
     rows: usize,
     update_pending: Cell<bool>,
@@ -85,8 +93,8 @@ impl<'a> RemoteDflash<'a> {
                 logits: alloc("DFlash bridge logits")?, head, _head_workspace: workspace })
         })?;
         draft.device.run(|| draft.prepare_workspace())?;
-        Ok(Self { draft, target, exchange: prepared.exchange, stream: prepared.stream, rows,
-            update_pending: Cell::new(false) })
+        Ok(Self { draft, target, exchange: prepared.exchange, target_peer: prepared.target_peer,
+            target_ready: prepared.target_ready, stream: prepared.stream, rows, update_pending: Cell::new(false) })
     }
 
     /// All draft and target-head first-use work finishes without peer waits.
@@ -173,6 +181,14 @@ impl<'a> RemoteDflash<'a> {
         }))
     }
 
+    pub(crate) fn validate_target_peer(&self, producer: RankDevice) -> Result<()> {
+        ensure!(self.target_peer.device == producer.device && self.target_peer.stream == producer.stream
+            && self.target_ready.device.id == producer.device
+            && self.stream.device.id == producer.device && self.exchange.stream(1) == self.stream.raw,
+            "resident remote peer waits must be ordered behind the cooperative target producer");
+        Ok(())
+    }
+
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         let Some((first, last)) = tap_frontier(rows)? else { return Ok(()) };
         let pitch = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
@@ -190,6 +206,19 @@ impl<'a> RemoteDflash<'a> {
                     source_pitch: pitch as u64, destination_pitch: pitch as u64,
                 } };
                 self.exchange.push_planes(0, TAPS, &[plane])?;
+                // Both target ranks have submitted this prefill chunk or decode
+                // round. A resident waiter must not steal the SM needed by the
+                // peer target's full-grid cooperative EXL3 launch. Wait on its
+                // completion event before starting the TAPS spinner, with no host
+                // sync. GPU0 publishes TAPS N before its chunk-N+1 waits, so this
+                // spinner retires before GPU1 needs its next cooperative grid.
+                self.validate_target_peer(self.target_peer)?;
+                self.stream.device.run(|| unsafe {
+                    // SAFETY: both same-device streams and the reusable ordering
+                    // event survive every queued update; the preceding wave drained.
+                    self.draft.device.library.cuda_event_record(self.target_ready.raw, self.target_peer.stream)?;
+                    self.draft.device.library.cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)
+                })?;
                 self.exchange.wait(1, TAPS)
             }))?;
             // Acknowledgement means all context readers are finished, not just
@@ -316,6 +345,7 @@ mod tests {
         library.cuda_set_device(0)?;
         let device = Device { library: &library, id: 0 };
         let lead = Stream::new(device)?;
+        let peer_target = Stream::new(Device { library: &library, id: 1 })?;
         let cfg = DflashConfig::read(&draft_path)?;
         let inventory = Checkpoint::open_for_role(&target_path, "remote-draft-component", |name|
             name.ends_with("embed_tokens.weight") || name == "lm_head.weight")?;
@@ -336,7 +366,8 @@ mod tests {
         let file = dflash::prefetch(&draft_path).join().map_err(|_| anyhow::anyhow!("fixture draft read panicked"))??;
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
-            let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw }, 1)?;
+            let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
+                RankDevice { device: 1, stream: peer_target.raw })?;
             let local = GlmDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8)?;
             let draft_device = prepared.stream.device;

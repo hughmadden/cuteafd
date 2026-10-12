@@ -119,6 +119,27 @@ pub(crate) struct RankDevice {
     pub stream: *mut c_void,
 }
 
+fn check_cooperative_wait_stream(waiter: RankDevice, producer: RankDevice) -> Result<()> {
+    ensure!(waiter.device == producer.device && waiter.stream == producer.stream && !producer.stream.is_null(),
+        "resident peer wait is not serialized with its cooperative producer");
+    Ok(())
+}
+
+#[cfg(test)]
+mod cooperative_wait_tests {
+    use super::*;
+
+    #[test]
+    fn independent_resident_wait_stream_requires_an_event_edge() {
+        let producer = RankDevice { device: 1, stream: 1usize as *mut c_void };
+        assert!(check_cooperative_wait_stream(producer, producer).is_ok());
+        assert!(check_cooperative_wait_stream(RankDevice { stream: 2usize as *mut c_void, ..producer }, producer).is_err());
+        assert!(check_cooperative_wait_stream(RankDevice { device: 0, ..producer }, producer).is_err());
+        let default = RankDevice { stream: std::ptr::null_mut(), ..producer };
+        assert!(check_cooperative_wait_stream(default, default).is_err());
+    }
+}
+
 fn run_on_rank<T>(library: &NativeLibrary, rank: RankDevice, body: impl FnOnce() -> Result<T>) -> Result<T> {
     crate::shared::memory::device::Device { library, id: rank.device }.run(body)
 }
@@ -456,6 +477,14 @@ impl<'a> PeerExchange<'a> {
     pub fn abort_word(&self, rank: usize) -> Result<Option<*const u32>> {
         ensure!(rank < 2, "abort word of rank {rank}");
         Ok(self.abort.as_ref().map(|abort| abort.sides[rank].word.buffer.ptr.cast_const().cast()))
+    }
+
+    /// Startup check for exchanges sharing a full-grid cooperative producer.
+    /// A different wait stream needs an explicit producer-event prerequisite
+    /// instead (as the remote draft bridge enforces at every context wave).
+    pub(crate) fn require_cooperative_producer_stream(&self, rank: usize, producer: RankDevice) -> Result<()> {
+        ensure!(rank < 2, "invalid cooperative peer-wait rank {rank}");
+        check_cooperative_wait_stream(self.ranks[rank], producer)
     }
 
     pub fn stream(&self, rank: usize) -> *mut c_void {

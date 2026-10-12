@@ -1446,9 +1446,13 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let mut prepared_draft = match (split_device, args.draft.as_ref()) {
-            (Some(peer), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
-                && !dspark::is_dspark(path)? => Some(remote_dflash::Prepared::new(
-                &self.library, crate::shared::peer_split::RankDevice { device: args.device, stream }, peer)?),
+            (Some(_), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
+                && !dspark::is_dspark(path)? => {
+                let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
+                Some(remote_dflash::Prepared::new(&self.library,
+                    crate::shared::peer_split::RankDevice { device: args.device, stream },
+                    crate::shared::peer_split::RankDevice { device, stream: peer_stream })?)
+            },
             _ => None,
         };
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
@@ -1614,6 +1618,10 @@ impl Opened {
             }
         }
         engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take())?;
+        if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
+            let (device, stream) = peer_stream.context("remote draft lost its target producer")?;
+            draft.validate_target_peer(crate::shared::peer_split::RankDevice { device, stream })?;
+        }
         if let Some(dense) = self.load_dense(args, &engine.weights.layers)? { engine.set_dense_nvfp4(dense); }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);

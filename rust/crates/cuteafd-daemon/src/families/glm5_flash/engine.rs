@@ -1831,6 +1831,11 @@ impl<'a> GlmfEngine<'a> {
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
             2 * self.prefill_lane_count, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
         routes.trace_identity("glmf-tp2-routes");
+        for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
+            RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
+            self.exchange()?.require_cooperative_producer_stream(rank, producer)?;
+            routes.require_cooperative_producer_stream(rank, producer)?;
+        }
         let combine = FusedCombine::new(self.library, ExchangeDtype::Bf16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok().map(|s| s.parse::<usize>())
             .transpose().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval")?.unwrap_or(0);

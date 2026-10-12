@@ -817,6 +817,12 @@ impl<'a> Exl3Execution<'a> {
         binding.core.bind(&inputs, rows);
         binding.sum.bind(&inputs, rows);
         binding.sum.pointers[binding.output_slot] = output.ptr;
+        // The packed core is a full-grid cooperative launch (SMs * blocks_per_sm):
+        // fork b12x/moe/_shared/kernels/w4a16/mixed_trellis.py:973-978;
+        // its grid barriers are at :1142/:1314. See stream-wait redesign #104.
+        // Every resident peer waiter on this device must run on this producer
+        // stream or behind its completion event; one independent spinner can
+        // prevent the entire cooperative grid from becoming resident forever.
         self.kernel
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
         self.kernel

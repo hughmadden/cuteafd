@@ -174,15 +174,30 @@ static_assert(sizeof(cuteafd_peer_diagnostic_t) == 64);
     assert result.returncode == 0, result.stderr
 
 
-def test_remote_context_wave_keeps_baseline_order_for_diagnostic_reproduction():
+def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
     remote = (family / "remote_dflash.rs").read_text()
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
     assert update.count("self.synchronize()?") == 1
     ack = update.index("self.exchange.signal(1, TAPS)?")
     assert update.index("self.synchronize()?") < ack < update.rindex("Ok(())")
-    # Preserve each intermediate context wave; the failed end-update retirement
-    # is not part of the baseline-order diagnostic experiment.
+    event = update.index("cuda_event_record(self.target_ready.raw, self.target_peer.stream)")
+    wait = update.index("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)")
+    assert update.index("self.exchange.push_planes(0, TAPS") < event < wait
+    assert wait < update.index("self.exchange.wait(1, TAPS)") < ack
+    assert "chunk-N+1 waits" in update
+    assert "cuda_event_create_ordering" in remote
+    assert "target_ready: Event<'a>" in remote
+    assert remote.index("target_ready: Event<'a>", remote.index("pub(crate) struct RemoteDflash")) < remote.index(
+        "stream: Stream<'a>", remote.index("pub(crate) struct RemoteDflash"))
+    startup = (family / "mod.rs").read_text()
+    assert startup.index("engine.drafter = self.load_drafter") < startup.index("draft.validate_target_peer(")
+    engine = (family / "engine.rs").read_text()
+    assert "self.exchange()?.require_cooperative_producer_stream(rank, producer)?" in engine
+    assert "routes.require_cooperative_producer_stream(rank, producer)?" in engine
+    # Preserve intermediate context waves, and apply the same edge to decode.
+    draft_dispatch = (family / "dspark.rs").read_text()
+    assert "Self::RemoteDflash(d) => d.update(rows)" in draft_dispatch
     bench = (family / "speculate.rs").read_text().split(
         "draft_prefill_bench(args, &golden", 1)[1].split("fn draft_prefill_bench", 1)[0]
     assert bench.index("engine.prefill_device(") < bench.index("drafter.update(")
