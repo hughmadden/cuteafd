@@ -155,7 +155,7 @@ printf '%s' "$CONSOLE_SECRET_FILE"
         assert source.count("release_print_console_link") == 1
         assert "--console-secret-file /run/cuteafd-console-secret" in source
         assert "dst=/run/cuteafd-console-secret,readonly" in source
-        assert "/root/.cache/cuteafd/usage" in source
+        assert "/run/cuteafd/usage" in source
 
 
 def test_console_capability_label_and_wip_probe(tmp_path):
