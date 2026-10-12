@@ -8,7 +8,7 @@
 use crate::client::Client;
 use crate::panels::common::{aggregate, median, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
-use crate::text::nonce;
+use crate::text::{filler, nonce};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
@@ -28,9 +28,21 @@ pub struct Point {
     pub errors: usize,
 }
 
+/// One cold prefill at a chosen length (after one untimed warm request there).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrefillPoint {
+    /// Requested prompt tokens.
+    pub length: u64,
+    pub prompt_tokens: u64,
+    pub tok_s: f64,
+    pub ttft_s: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sweep {
     pub points: Vec<Point>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefill: Vec<PrefillPoint>,
 }
 
 impl Sweep {
@@ -77,12 +89,51 @@ fn measure(client: &Client, c: usize, phase: &str) -> Result<Point> {
         ttft_s: median(&mut ttft), errors })
 }
 
+/// Cold prefill at each length: fit tokens per filler word from two short
+/// requests, then per length one untimed warm request and one measured request
+/// with a fresh prefix (it must reuse no cached tokens).
+fn prefill(client: &Client, lengths: &[u64], max_context: u64) -> Result<Vec<PrefillPoint>> {
+    let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
+        client.chat(plain(&format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
+    };
+    let (a, b) = (ask(300, 101)?, ask(900, 102)?);
+    let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
+    let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
+    let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.3, 20.0) };
+    let mut points = Vec::new();
+    for &length in lengths {
+        let target = length.min(max_context.saturating_sub(64)) as f64;
+        let words = ((target - intercept) / slope).max(64.0) as usize;
+        ask(words, 200 + length).with_context(|| format!("{length}-token prefill warm-up"))?;
+        let chat = ask(words, 300 + length).with_context(|| format!("{length}-token prefill"))?;
+        let t = chat.timing;
+        anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
+        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s });
+    }
+    Ok(points)
+}
+
+/// Parses `8192,32768` (prompt lengths 256..=1M tokens).
+pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
+    let lengths: Vec<u64> = text.split(',').map(str::trim).filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u64>().map_err(|_| format!("prefill length {p:?} is not a number")))
+        .collect::<Result<_, _>>()?;
+    if lengths.is_empty() || lengths.iter().any(|l| !(256..=1 << 20).contains(l)) {
+        return Err("prefill lengths must be 256..=1048576 tokens".into());
+    }
+    Ok(lengths)
+}
+
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
-pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool) -> Result<Sweep> {
+pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64]) -> Result<Sweep> {
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
     let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
-    client.discover().context("sweep: /v1/models")?;
+    let record = client.discover().context("sweep: /v1/models")?;
     let mut sweep = Sweep::default();
+    if !prefill_lengths.is_empty() {
+        let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
+        sweep.prefill = prefill(&client, prefill_lengths, max_context)?;
+    }
     for &c in levels {
         sweep.points.push(measure(&client, c, "levels")?);
     }
@@ -106,10 +157,18 @@ mod tests {
     }
 
     #[test]
+    fn prefill_lengths_parse_and_bound() {
+        assert_eq!(parse_lengths("8192,32768").unwrap(), vec![8192, 32768]);
+        for bad in ["", "100", "x", "2000000"] {
+            assert!(parse_lengths(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn rate_looks_up_level_and_phase() {
         let sweep = Sweep { points: vec![
             Point { c: 1, phase: "levels".into(), aggregate_tok_s: 50.0, ..Point::default() },
-            Point { c: 1, phase: "post_load".into(), aggregate_tok_s: 48.0, ..Point::default() }] };
+            Point { c: 1, phase: "post_load".into(), aggregate_tok_s: 48.0, ..Point::default() }], prefill: vec![] };
         assert_eq!(sweep.rate(1, "levels"), Some(50.0));
         assert_eq!(sweep.rate(1, "post_load"), Some(48.0));
         assert_eq!(sweep.rate(16, "levels"), None);

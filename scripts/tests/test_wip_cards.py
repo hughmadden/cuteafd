@@ -1041,3 +1041,29 @@ def test_summary_md_has_before_after_ratios_and_failures(tmp_path):
     assert '| c | C1 | 100 | 110 | 1.1 | 10 | 1 |' in text
     assert '| c | sweep C16 | 800 | 880 | 1.1 |' in text and 'post-load C1' in text
     assert '**d / cand / r1** (launch): undefined symbol: x' in text
+
+
+def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'prefill', '--prefill-lengths', '8192', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['profile'] == 'panels:prefill' and e['baseline'] is False and e['prefill_lengths'] == [8192]
+    for listed, expected in [('baseline,prefill', None), ('none', None)]:
+        state2 = tmp_path / ('s-' + listed.replace(',', '-'))
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--state', str(state2), '--panels', listed, '--prefill-lengths', '8192', '--dry-run'])
+        assert cards.main() == 0
+        assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
+
+
+def test_prefill_sweep_rows(entry, tmp_path):
+    entry = {**entry, 'profile': 'panels:', 'prefill_lengths': [8192]}
+    job = make(entry, tmp_path)
+    sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
+    sweep.parent.mkdir(parents=True)
+    sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8170, 'tok_s': 9000.0, 'ttft_s': 0.91}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass' and row['prefill 8192'] == 9000.0 and row['prefill 8192 TTFT s'] == 0.91

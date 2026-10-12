@@ -30,6 +30,11 @@ pub struct RunRequest {
     /// `panel -> passes` overrides.
     #[serde(default)]
     pub passes: HashMap<String, u32>,
+    /// `false`: run explicit `panels` without the baseline (basic card + quick
+    /// quality) when none is cached; panels then price themselves from default
+    /// rates. Ignored for profiles; default true.
+    #[serde(default)]
+    pub baseline: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -376,6 +381,7 @@ impl Bench {
         };
         let passes: Vec<(String, u32)> = request.passes.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let (plan, dropped) = profiles::resolve(&planned, &passes);
+        let skip_baseline = request.panels.is_some() && request.baseline == Some(false);
         let id = uuid::Uuid::new_v4().simple().to_string();
         let active = ActiveRun { id: id.clone(), token: uuid::Uuid::new_v4().simple().to_string(),
             cancel: Arc::new(AtomicBool::new(false)), started: Instant::now(), eta_s: 0.0, panel: "starting".into(),
@@ -402,7 +408,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text);
+            bench.execute(active, base, plan, report, text, skip_baseline);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -416,7 +422,7 @@ impl Bench {
     }
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
-        report: Arc<Mutex<Report>>, text: Option<BenchText>) {
+        report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -426,7 +432,7 @@ impl Bench {
             std::thread::Builder::new().name("cuteafd-bench-tick".into())
                 .spawn(move || bench.tick(&report, &progress, &done, &base)).ok()
         };
-        let outcome = self.run_plan(&active, &base, &report, &progress, &plan);
+        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -466,7 +472,7 @@ impl Bench {
     }
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
-        plan: &[PlannedPanel]) -> anyhow::Result<()> {
+        plan: &[PlannedPanel], skip_baseline: bool) -> anyhow::Result<()> {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
@@ -485,10 +491,12 @@ impl Bench {
         let estimates: Vec<(String, f64, u32)> = plan.iter().filter_map(|p| panels::find(&p.id)
             .map(|panel| (p.id.clone(), panel.estimate_s(&rates, &info), p.passes))).collect();
         let mut remaining: f64 = estimates.iter().map(|(_, s, n)| s * f64::from(*n)).sum::<f64>()
-            + if baseline.is_none() { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
+            + if baseline.is_none() && !skip_baseline { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
         let total = remaining.max(1.0);
         let baseline = match baseline {
-            Some(b) => b,
+            Some(b) => Some(b),
+            // Explicit panels alone: no basic card, no quick quality.
+            None if skip_baseline => None,
             None => {
                 let estimate = crate::baseline::estimate_s(&rates, &info);
                 self.begin(active, "baseline", estimate, remaining, total, 1, 1, progress);
@@ -499,10 +507,10 @@ impl Bench {
                     self.baselines.lock().expect("baselines lock").insert(fingerprint.clone(), b.clone());
                 }
                 rates = Rates::from_baseline(&b);
-                b
+                Some(b)
             }
         };
-        report.lock().expect("report lock").baseline = Some(baseline.clone());
+        report.lock().expect("report lock").baseline = baseline.clone();
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
         let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
         for (index, planned) in plan.iter().enumerate() {
@@ -527,7 +535,7 @@ impl Bench {
             for pass in 1..=planned.passes {
                 client.check()?;
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
-                let ctx = Ctx { client: &client, info: &info, baseline: Some(&baseline), rates, progress, pass,
+                let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
                     history: &earlier, max_context, max_output };
                 let table_before = panels::common::mapped_counters(&client);
                 let outcome = panel.run(&ctx);

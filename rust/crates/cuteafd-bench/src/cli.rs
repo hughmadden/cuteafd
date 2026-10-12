@@ -14,6 +14,9 @@ pub struct RunOptions {
     pub profile: Option<String>,
     pub panels: Option<Vec<String>>,
     pub passes: Vec<(String, u32)>,
+    /// `Some(false)` asks the server to run explicit panels without its
+    /// baseline (servers that predate the field run it anyway).
+    pub baseline: Option<bool>,
     /// `svg` (report, card, panels), `png` (report and card), `card` (card.png only), `json`.
     pub export: Vec<String>,
     /// Output directory; `None`: `benchmarks/<family>/<date>-<profile>-<hardware>/` under `root`.
@@ -117,6 +120,9 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         body["panels"] = json!(panels);
     }
     body["passes"] = Value::Object(options.passes.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
+    if let Some(baseline) = options.baseline {
+        body["baseline"] = json!(baseline);
+    }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {

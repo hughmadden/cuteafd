@@ -109,6 +109,13 @@ pub struct Entry {
     /// Re-measure C1 after the widest sweep level (post-load C1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_load_c1: Option<bool>,
+    /// Cold prefill at these prompt lengths, in the same sweep (`[8192]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_lengths: Option<Vec<u64>>,
+    /// `false` runs explicit panels without the server's baseline (basic card
+    /// + quick quality); default true. Needs a server build that honours it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,6 +222,8 @@ impl Entry {
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
             levels: self.levels.clone().or_else(|| defaults.levels.clone()),
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
+            prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
+            baseline: self.baseline.or(defaults.baseline),
         }
     }
 
@@ -647,6 +656,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             let text = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
             crate::sweep::parse_levels(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         }
+        if let Some(lengths) = &entry.prefill_lengths {
+            let text = lengths.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            crate::sweep::parse_lengths(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
+        }
         if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
             bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
         }
@@ -663,9 +676,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} set={:?}", e.name,
-                e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
-                e.post_load_c1.unwrap_or(false), e.set);
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} set={:?}",
+                e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
+                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.set);
         }
         return Ok(());
     }
@@ -893,9 +906,11 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             None => (Some(profile.to_string()), None),
         };
         let api_key = std::env::var("CUTEAFD_API_KEY").ok();
-        if let (Some(levels), true) = (&entry.levels, panels.as_ref().is_some_and(Vec::is_empty)) {
-            let levels = levels.clone();
-            let sweep = crate::sweep::run(&url, api_key.as_deref(), &levels, entry.post_load_c1.unwrap_or(false))?;
+        let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
+        let run_sweep = || crate::sweep::run(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+            entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]));
+        if sweeping && panels.as_ref().is_some_and(Vec::is_empty) {
+            let sweep = run_sweep()?;
             let dir = out_root.join("sweep-only").join(&entry.name);
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
@@ -903,7 +918,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             outcome.sweep = Some(sweep);
             return Ok(None);
         }
-        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![],
+        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline,
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
             api_key: api_key.clone(), quiet: true,
@@ -921,8 +936,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         crate::cli::write_exports(&report, &dir, &options.export)?;
         outcome.dir = Some(dir.display().to_string());
-        if let Some(levels) = &entry.levels {
-            let sweep = crate::sweep::run(&url, api_key.as_deref(), levels, entry.post_load_c1.unwrap_or(false))?;
+        if sweeping {
+            let sweep = run_sweep()?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
             outcome.sweep = Some(sweep);
         }

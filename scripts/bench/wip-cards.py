@@ -33,7 +33,7 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
-LOWER_IS_BETTER = {'kl', 'readiness_s'}
+LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
 PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
 
@@ -700,7 +700,7 @@ def summarize_job(job, exit_code):
         for message in found:
             fail(row, message)
     launched = outcome.get('launch_s') is not None or bool(reports)
-    sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels'))
+    sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels') or job['entry'].get('prefill_lengths'))
     if sweep_only and not reports:
         pass  # No server-side profile ran; the sweep below carries the numbers.
     elif len(reports) != 1:
@@ -740,15 +740,18 @@ def summarize_job(job, exit_code):
             fail(row, 'speculation trace is empty after the run (' + trace_path + ')', 'measurement')
     sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
               if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
-    if job['entry'].get('levels'):
+    if job['entry'].get('levels') or job['entry'].get('prefill_lengths'):
         if len(sweeps) != 1:
             fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
-            points = json.loads(sweeps[0].read_text()).get('points', [])
-            row['sweep'] = points
-            for point in points:
+            sweep = json.loads(sweeps[0].read_text())
+            row['sweep'] = sweep.get('points', [])
+            for point in row['sweep']:
                 key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
                 row[key] = point['aggregate_tok_s']
+            for point in sweep.get('prefill', []):
+                row[f"prefill {point['length']}"] = point['tok_s']
+                row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
     row['peaks'] = peaks(dest)
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
@@ -850,7 +853,9 @@ def status_cell(check):
 def write_summary(state, rows, arms):
     validate_matched_pairs(rows, list(arms))
     names = list(arms)
-    present = [m for m in SUMMARY_METRICS if any(isinstance(r.get(m), (int, float)) for r in rows)]
+    extra = sorted({k for r in rows for k in r if k.startswith('prefill ') and isinstance(r.get(k), (int, float))},
+                   key=lambda k: (int(k.split()[1]), k))
+    present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired))
     def cell(value):
@@ -876,7 +881,7 @@ def write_summary(state, rows, arms):
                 before, after = values[0], values[-1]
                 ratio = after / before if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before else None
                 pair = next((p for p in paired if p['card'] == card and p['candidate'] == names[-1] and p['metric'] == metric), {})
-                note = ' (lower is better)' if metric in LOWER_IS_BETTER else ''
+                note = ' (lower is better)' if metric in LOWER_IS_BETTER or metric.endswith('TTFT s') else ''
                 text += f"| {card} | {metric}{note} | " + ' | '.join(cell(v) for v in values) + f" | {cell(ratio)} | {cell(pair.get('median_percent'))} | {pair.get('pairs', 0)} |\n"
         text += '\n'
     else:
@@ -1248,6 +1253,8 @@ def main():
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
+                        'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
                         'checked after warm-up and recorded in result.json')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
@@ -1340,15 +1347,25 @@ def main():
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
         if not levels or len(set(levels)) != len(levels) or not all(1 <= x <= 256 for x in levels):
             parser.error('--levels takes distinct concurrency levels in 1..256, e.g. 1,16')
+    prefill_lengths = None
+    if args.prefill_lengths:
+        prefill_lengths = [int(x) for x in args.prefill_lengths.split(',') if x.strip().isdigit()]
+        if not prefill_lengths or len(prefill_lengths) != len([x for x in args.prefill_lengths.split(',') if x.strip()]) \
+                or not all(256 <= x <= 1 << 20 for x in prefill_lengths):
+            parser.error('--prefill-lengths takes prompt lengths in 256..1048576, e.g. 8192')
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not levels:
-            parser.error('--panels none runs nothing without --levels')
+        if not selection and not (levels or prefill_lengths):
+            parser.error('--panels none runs nothing without --levels or --prefill-lengths')
         profile = 'panels:' + selection
-        requested_panels(profile)
+        listed = requested_panels(profile)
         for card in cards:
             card['profile'] = profile
+            if listed and 'baseline' not in listed:
+                card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
     for card in cards:
+        if prefill_lengths:
+            card['prefill_lengths'] = prefill_lengths
         if levels:
             card['levels'] = levels
             if args.post_load_c1:
@@ -1465,8 +1482,10 @@ def main():
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
+    fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+        (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else [])
     for job in jobs[:1]:
-        binary_supports(args.binary, args.repo, job, ['levels', 'post_load_c1'] if args.levels else [])
+        binary_supports(args.binary, args.repo, job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []
     for job in jobs:
