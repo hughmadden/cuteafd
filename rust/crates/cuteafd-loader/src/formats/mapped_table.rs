@@ -8,9 +8,9 @@
 //! Rows reach the GPU in three steps, each bounded:
 //!
 //! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
-//!   hashes before its layer), [`TablePrefetcher`] advises the touched pages
-//!   (`MADV_WILLNEED`) on a background worker with a bounded queue and page
-//!   budget; a full queue drops the advice, never blocks the caller;
+//!   hashes before its layer), [`TablePrefetcher`] reads the touched rows with
+//!   the hybrid on a background worker; unavailable-ring fallback uses
+//!   `MADV_WILLNEED`. Queue, rows and pages are bounded; a full queue drops work;
 //! - gather: rows are copied in request order into caller storage, either on
 //!   a [`GatherPool`] (parallel page faults, the caller waits) or on a
 //!   [`GatherWorker`] (request-owned tickets and recycled staging slots);
@@ -18,7 +18,7 @@
 //!
 //! Page cache is the host cache: under memory pressure the kernel evicts table
 //! pages and the next gather brings them back. [`TableStats`] distinguishes
-//! NOWAIT hits from mmap residency snapshots, not just major faults. [`HotRowCache`] optionally pins the hottest rows by budget.
+//! NOWAIT hits from mmap residency snapshots, not just major faults.
 use cuteafd_core::DType;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -268,33 +268,10 @@ impl RowFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableBackend { Uring, Mmap, MincoreRouted }
+enum TableBackend { Mmap, MincoreRouted }
 impl std::fmt::Display for TableBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { Self::Uring => "uring", Self::Mmap => "mmap", Self::MincoreRouted => "mincore-routed" })
-    }
-}
-impl std::str::FromStr for TableBackend {
-    type Err = MappedTableError;
-    fn from_str(value: &str) -> Result<Self> {
-        match value { "uring" => Ok(Self::Uring), "mmap" => Ok(Self::Mmap), "mincore-routed" => Ok(Self::MincoreRouted),
-            _ => Err(invalid("table backend must be uring, mmap or mincore-routed")) }
-    }
-}
-static BACKEND: Mutex<Option<TableBackend>> = Mutex::new(None);
-impl TableBackend {
-    /// CLI override takes precedence over CUTEAFD_TABLE_BACKEND. mmap remains
-    /// the default until identical-config hardware qualification passes.
-    pub fn set_override(backend: Self) { *BACKEND.lock().unwrap_or_else(|p| p.into_inner()) = Some(backend); }
-    fn configured() -> Self {
-        if let Some(backend) = *BACKEND.lock().unwrap_or_else(|p| p.into_inner()) { return backend; }
-        match std::env::var("CUTEAFD_TABLE_BACKEND") {
-            Ok(value) => match value.parse() {
-                Ok(backend) => backend,
-                Err(error) => { tracing::warn!(%error, "invalid mapped-table override; using mmap"); Self::Mmap }
-            },
-            Err(_) => Self::Mmap,
-        }
+        f.write_str(match self { Self::Mmap => "mmap-fallback", Self::MincoreRouted => "mincore-routed" })
     }
 }
 static TABLES: Mutex<Vec<(String, Weak<TableStats>)>> = Mutex::new(Vec::new());
@@ -423,13 +400,7 @@ impl MappedTable {
             }
         }
         table.stats.approximate.store(table.parts.iter().any(|part| part.fuse), Ordering::Relaxed);
-        let off = match std::env::var("CUTEAFD_TABLE_ACCOUNTING").ok().as_deref() {
-            None | Some("full") => false,
-            Some("off") => true,
-            Some(value) => { tracing::warn!(value, "invalid table accounting; using full residency"); false }
-        };
-        table.stats.accounting_off.store(off, Ordering::Relaxed);
-        table.select_backend(TableBackend::configured());
+        table.initialize_reads();
         Ok(table)
     }
 
@@ -608,15 +579,14 @@ impl MappedTable {
     }
 
     fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool) -> Result<uring::ReadStats> {
-        let routed = self.backend() == TableBackend::MincoreRouted;
         let unsupported: Vec<_> = reads.iter().enumerate().filter_map(|(i, read)|
             (!read.part.nowait.load(Ordering::Relaxed)).then_some(i)).collect();
         let selected: Vec<_> = unsupported.iter().map(|&i| rows[i]).collect();
         let mut hits = vec![None; reads.len()];
-        if !selected.is_empty() && (routed || !self.stats.accounting_off.load(Ordering::Relaxed)) {
+        if !selected.is_empty() {
             for (index, hit) in unsupported.into_iter().zip(self.residency(&selected, prefetch)?) { hits[index] = Some(hit); }
         }
-        if routed && hits.contains(&Some(true)) {
+        if hits.contains(&Some(true)) {
             // Unsupported-file resident rows use mmap; NOWAIT-capable files
             // retain exact completion-based classification in this mode too.
             let mut pending = Vec::with_capacity(reads.len());
@@ -655,33 +625,30 @@ impl MappedTable {
         }
     }
 
-    pub fn backend(&self) -> TableBackend {
+    fn backend(&self) -> TableBackend {
         self.stats.backend()
     }
 
-    /// Select an explicit backend, retaining mmap only if ring setup or Read
-    /// is unsupported. Files without NOWAIT use bounded mincore accounting.
+    /// Initialize the qualified hybrid; mmap is only an unavailable-ring fallback.
     /// Called before any workers start.
-    pub fn select_backend(&self, requested: TableBackend) {
-        self.select_with_probe(requested, || self.parts.iter().try_for_each(|part| {
+    fn initialize_reads(&self) {
+        self.initialize_with_probe(|| self.parts.iter().try_for_each(|part| {
             part.nowait.store(uring::probe(part)?, Ordering::Relaxed);
             Ok(())
         }));
     }
-    fn select_with_probe(&self, requested: TableBackend, probe: impl FnOnce() -> Result<()>) {
-        let result = if requested != TableBackend::Mmap { probe() } else { Ok(()) };
+    fn initialize_with_probe(&self, probe: impl FnOnce() -> Result<()>) {
+        let result = probe();
         let available = result.is_ok();
-        if let Err(error) = result { tracing::warn!(%error, "io_uring unavailable (kernel/filesystem/seccomp); using mmap"); }
-        self.stats.routed.store(requested == TableBackend::MincoreRouted && available, Ordering::Relaxed);
-        self.stats.uring.store(requested != TableBackend::Mmap && available, Ordering::Relaxed);
+        if let Err(error) = result { tracing::warn!(%error, "io_uring unavailable (kernel/filesystem/seccomp); using mmap fallback"); }
+        self.stats.uring.store(available, Ordering::Relaxed);
         self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
-        tracing::info!(backend = %self.backend(), requested = %requested,
-            max_ring_entries = uring::MAX_BATCH,
+        tracing::info!(backend = %self.backend(), max_ring_entries = uring::MAX_BATCH,
             accounting = self.stats.accounting(),
-            reason = if !available { "io_uring unavailable" } else if requested == TableBackend::Mmap { "explicit override or qualification default" }
-                else if requested == TableBackend::MincoreRouted && !self.stats.nowait.load(Ordering::Relaxed) { "explicit override; resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
-                else if !self.stats.nowait.load(Ordering::Relaxed) { "explicit override; buffered reads with mincore where NOWAIT unsupported" } else { "explicit override; NOWAIT supported" },
-            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE-mounted tables use approximate residency accounting; a local ext4/xfs copy with NOWAIT gives exact hit/miss counts" } else { "NOWAIT capability is probed per file" },
+            reason = if !available { "io_uring unavailable" }
+                else if !self.stats.nowait.load(Ordering::Relaxed) { "resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
+                else { "NOWAIT supported" },
+            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "NOWAIT capability is probed per file" },
             "mapped table backend");
     }
 
@@ -769,13 +736,9 @@ pub struct TableStats {
     prefetch_jobs: AtomicU64,
     prefetch_pages: AtomicU64,
     prefetch_dropped: AtomicU64,
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
     uring: AtomicBool,
-    routed: AtomicBool,
     nowait: AtomicBool,
     approximate: AtomicBool,
-    accounting_off: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
     interval_max: [AtomicU64; 6],
     devices: Mutex<Vec<String>>,
@@ -843,8 +806,6 @@ pub struct TableStatsSnapshot {
     pub prefetch_pages: u64,
     /// Prefetch batches refused by a full queue.
     pub prefetch_dropped: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
     /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
@@ -912,15 +873,13 @@ pub struct TableStatsSnapshot {
 impl TableStats {
     fn backend(&self) -> TableBackend {
         if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
-        else if self.routed.load(Ordering::Relaxed) { TableBackend::MincoreRouted }
-        else { TableBackend::Uring }
+        else { TableBackend::MincoreRouted }
     }
     fn accounting(&self) -> &'static str {
         if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
         else if self.backend() == TableBackend::MincoreRouted {
             if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
         }
-        else if self.uring.load(Ordering::Relaxed) && self.accounting_off.load(Ordering::Relaxed) { "unclassified batch makespan (mincore off)" }
         else if self.approximate.load(Ordering::Relaxed) { "fuse: mincore (approx)" }
         else { "mincore" }
     }
@@ -956,10 +915,7 @@ impl TableStats {
     pub fn record_prefetch_dropped(&self) {
         self.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn record_cache(&self, hits: usize, misses: usize) {
-        self.cache_hits.fetch_add(hits as u64, Ordering::Relaxed);
-        self.cache_misses.fetch_add(misses as u64, Ordering::Relaxed);
-    }
+
     fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
         let (copied, late) = if prefetch { (&self.prefetch_resident_copy_rows, &self.prefetch_late_major_faults) }
             else { (&self.resident_copy_rows, &self.late_major_faults) };
@@ -1028,8 +984,6 @@ impl TableStats {
             prefetch_jobs: get(&self.prefetch_jobs),
             prefetch_pages: get(&self.prefetch_pages),
             prefetch_dropped: get(&self.prefetch_dropped),
-            cache_hits: get(&self.cache_hits),
-            cache_misses: get(&self.cache_misses),
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
@@ -1093,8 +1047,6 @@ impl TableStatsSnapshot {
             prefetch_jobs: d(self.prefetch_jobs, earlier.prefetch_jobs),
             prefetch_pages: d(self.prefetch_pages, earlier.prefetch_pages),
             prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
-            cache_hits: d(self.cache_hits, earlier.cache_hits),
-            cache_misses: d(self.cache_misses, earlier.cache_misses),
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
@@ -1141,16 +1093,13 @@ impl TableStatsSnapshot {
 
         }
     }
-    /// Rows served without a major fault (page cache or hot-row cache), 0..1.
+    /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.
     pub fn resident_rate(&self) -> f64 {
         let rows = self.page_hits + self.page_misses;
         if rows == 0 { return 1.0; }
         self.page_hits as f64 / rows as f64
     }
-    pub fn cache_hit_rate(&self) -> Option<f64> {
-        let total = self.cache_hits + self.cache_misses;
-        (total > 0).then(|| self.cache_hits as f64 / total as f64)
-    }
+
 }
 
 /// Anything whose rows can be advised as a unit (one table, or V4.1's paired
@@ -1301,7 +1250,6 @@ pub struct GatherReport {
     pub rows: usize,
     pub elapsed: Duration,
     pub major_faults: i64,
-    pub cache_hits: usize,
 }
 
 /// A dedicated thread pool for synchronous gathers: concurrent page faults
@@ -1327,9 +1275,8 @@ impl GatherPool {
         self.threads
     }
 
-    /// Copy `rows` of `table` into `output` in order (duplicates kept), hits
-    /// from `cache` first; the batch is validated before any write.
-    pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8], cache: Option<&HotRowCache>)
+    /// Copy rows in order (duplicates kept); validate the batch before writing.
+    pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8])
         -> Result<GatherReport> {
         use rayon::prelude::*;
         let started = Instant::now();
@@ -1340,57 +1287,43 @@ impl GatherPool {
         for &row in rows {
             table.locate(row)?;
         }
-        if let Some(cache) = cache {
-            if cache.row_bytes() != row_bytes {
-                return Err(invalid("hot-row cache row size differs from its table"));
-            }
-        }
-        let (hits, misses) = match cache {
-            Some(cache) => cache.lookup(rows, output),
-            None => (0, (0..rows.len()).collect()),
-        };
+        let slots: Vec<_> = (0..rows.len()).collect();
         let faults = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
         // Several chunks per thread balance uneven fault latency.
-        let chunk = misses.len().div_ceil(self.threads * 4).max(1);
+        let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
         if table.backend() != TableBackend::Mmap {
-            let selected: Vec<_> = misses.iter().map(|&index| rows[index]).collect();
-            table.gather_slots(&selected, &misses, output)?;
+            table.gather_slots(rows, &slots, output)?;
         } else {
-        let selected: Vec<_> = misses.iter().map(|&index| rows[index]).collect();
-        table.record_residency(&selected)?;
-        self.pool.install(|| {
-            misses.par_chunks(chunk).try_for_each(|indices| -> Result<()> {
-                let before = thread_faults();
-                for &index in indices {
-                    let source = table.row(rows[index])?;
-                    debug_assert!((index + 1) * row_bytes <= output_len);
-                    // SAFETY: `misses` holds distinct indices, so every task
-                    // writes disjoint row slots of `output`, which outlives the
-                    // scoped `install`; bounds were validated above.
-                    let destination = unsafe {
-                        std::slice::from_raw_parts_mut((base as *mut u8).add(index * row_bytes), row_bytes)
-                    };
-                    destination.copy_from_slice(source);
-                }
-                for (total, value) in faults.iter().zip(thread_faults_since(before)) {
-                    if value > 0 {
-                        total.fetch_add(value as u64, Ordering::Relaxed);
+            table.record_residency(rows)?;
+            self.pool.install(|| {
+                slots.par_chunks(chunk).try_for_each(|indices| -> Result<()> {
+                    let before = thread_faults();
+                    for &index in indices {
+                        let source = table.row(rows[index])?;
+                        debug_assert!((index + 1) * row_bytes <= output_len);
+                        // SAFETY: `slots` holds distinct indices, so every task
+                        // writes disjoint row slots of `output`, which outlives the
+                        // scoped `install`; bounds were validated above.
+                        let destination = unsafe {
+                            std::slice::from_raw_parts_mut((base as *mut u8).add(index * row_bytes), row_bytes)
+                        };
+                        destination.copy_from_slice(source);
                     }
-                }
-                Ok(())
-            })
-        })?;
-        }
-        if let Some(cache) = cache {
-            cache.insert(misses.iter().map(|&index| (rows[index], &output[index * row_bytes..(index + 1) * row_bytes])));
-            table.stats.record_cache(hits, misses.len());
+                    for (total, value) in faults.iter().zip(thread_faults_since(before)) {
+                        if value > 0 {
+                            total.fetch_add(value as u64, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(())
+                })
+            })?;
         }
         let elapsed = started.elapsed();
         let faults = faults.map(|value| value.load(Ordering::Relaxed) as i64);
         table.stats.record_gather(rows.len(), output.len(), elapsed, faults);
-        Ok(GatherReport { rows: rows.len(), elapsed, major_faults: faults[1], cache_hits: hits })
+        Ok(GatherReport { rows: rows.len(), elapsed, major_faults: faults[1] })
     }
 }
 
@@ -1425,137 +1358,16 @@ impl GatherPool {
     /// # Safety
     /// `output..output + len` must stay valid, and must be neither read nor
     /// written by anything else, until the handle is waited on or dropped.
-    pub unsafe fn spawn_gather(self: &Arc<Self>, table: Arc<MappedTable>, rows: Vec<u64>, output: *mut u8, len: usize,
-        cache: Option<Arc<HotRowCache>>) -> PendingGather {
+    pub unsafe fn spawn_gather(self: &Arc<Self>, table: Arc<MappedTable>, rows: Vec<u64>, output: *mut u8, len: usize) -> PendingGather {
         let (sender, done) = mpsc::sync_channel(1);
         let pool = Arc::clone(self);
         let output = output as usize;
         self.pool.spawn(move || {
             // SAFETY: valid and exclusive until the handle observes completion (contract above).
             let out = unsafe { std::slice::from_raw_parts_mut(output as *mut u8, len) };
-            let _ = sender.send(pool.gather(&table, &rows, out, cache.as_deref()));
+            let _ = sender.send(pool.gather(&table, &rows, out));
         });
         PendingGather { done, finished: false }
-    }
-}
-
-/// A budgeted LRU of hot rows that survives page-cache eviction (useful when
-/// a table is larger than RAM or shares it with other work). Off by default:
-/// the page cache already caches rows while memory allows.
-pub struct HotRowCache {
-    inner: Mutex<Lru>,
-    row_bytes: usize,
-}
-
-const NIL: u32 = u32::MAX;
-
-struct Lru {
-    slots: HashMap<u64, u32>,
-    keys: Vec<u64>,
-    prev: Vec<u32>,
-    next: Vec<u32>,
-    head: u32,
-    tail: u32,
-    data: Vec<u8>,
-    capacity: usize,
-}
-
-impl Lru {
-    fn unlink(&mut self, slot: u32) {
-        let (p, n) = (self.prev[slot as usize], self.next[slot as usize]);
-        if p == NIL { self.head = n } else { self.next[p as usize] = n }
-        if n == NIL { self.tail = p } else { self.prev[n as usize] = p }
-    }
-    fn push_front(&mut self, slot: u32) {
-        self.prev[slot as usize] = NIL;
-        self.next[slot as usize] = self.head;
-        if self.head != NIL {
-            self.prev[self.head as usize] = slot;
-        }
-        self.head = slot;
-        if self.tail == NIL {
-            self.tail = slot;
-        }
-    }
-}
-
-impl HotRowCache {
-    /// None when `budget_bytes` holds no row.
-    pub fn new(row_bytes: usize, budget_bytes: usize) -> Option<Self> {
-        let capacity = (budget_bytes / row_bytes.max(1)).min(NIL as usize - 1);
-        (capacity > 0 && row_bytes > 0).then(|| Self {
-            inner: Mutex::new(Lru {
-                slots: HashMap::with_capacity(capacity),
-                keys: Vec::with_capacity(capacity),
-                prev: Vec::with_capacity(capacity),
-                next: Vec::with_capacity(capacity),
-                head: NIL,
-                tail: NIL,
-                data: Vec::new(),
-                capacity,
-            }),
-            row_bytes,
-        })
-    }
-
-    pub fn row_bytes(&self) -> usize {
-        self.row_bytes
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |lru| lru.slots.len())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Copy cached rows into their output slots; returns hits and the
-    /// indices (into `rows`) still to read.
-    fn lookup(&self, rows: &[u64], output: &mut [u8]) -> (usize, Vec<usize>) {
-        let Ok(mut lru) = self.inner.lock() else { return (0, (0..rows.len()).collect()) };
-        let mut misses = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            match lru.slots.get(row).copied() {
-                Some(slot) => {
-                    let at = slot as usize * self.row_bytes;
-                    output[index * self.row_bytes..(index + 1) * self.row_bytes]
-                        .copy_from_slice(&lru.data[at..at + self.row_bytes]);
-                    lru.unlink(slot);
-                    lru.push_front(slot);
-                }
-                None => misses.push(index),
-            }
-        }
-        (rows.len() - misses.len(), misses)
-    }
-
-    fn insert<'r>(&self, rows: impl Iterator<Item = (u64, &'r [u8])>) {
-        let Ok(mut lru) = self.inner.lock() else { return };
-        for (row, bytes) in rows {
-            if lru.slots.contains_key(&row) {
-                continue;
-            }
-            let slot = if lru.keys.len() < lru.capacity {
-                let slot = lru.keys.len() as u32;
-                lru.keys.push(row);
-                lru.prev.push(NIL);
-                lru.next.push(NIL);
-                lru.data.extend_from_slice(bytes);
-                slot
-            } else {
-                let slot = lru.tail;
-                lru.unlink(slot);
-                let old = lru.keys[slot as usize];
-                lru.slots.remove(&old);
-                lru.keys[slot as usize] = row;
-                let at = slot as usize * self.row_bytes;
-                lru.data[at..at + self.row_bytes].copy_from_slice(bytes);
-                slot
-            };
-            lru.slots.insert(row, slot);
-            lru.push_front(slot);
-        }
     }
 }
 

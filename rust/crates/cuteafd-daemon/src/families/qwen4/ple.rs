@@ -3,36 +3,18 @@
 //! scale (~48 GiB). Token ids hash to rows on the host (`NgramHasher`), 16
 //! per token; the `qwen4_ple_*` program gathers `table[ids]`.
 //!
-//! Placement (`--table-placement`):
-//! - `mapped` (default): the shards stay memory-mapped (page cache, nothing
-//!   read at startup); each step's rows are gathered on host threads into a
-//!   pinned ring and uploaded, and the program reads them from device memory
-//!   with identity ids (`shared::mapped_table`);
-//! - `host-preload`: the table is read into mapped pinned host memory at
-//!   startup and the program reads each token's rows over PCIe;
-//! - `device`: the table is copied to the GPU.
-use crate::shared::mapped_table::{MappedTableArgs, MappedTableDevice, TablePlacement};
+//! Shards stay mapped; each step gathers rows into a pinned upload ring.
+use crate::shared::mapped_table::{MappedTableArgs, MappedTableDevice};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
-use cuteafd_ffi::{CuteafdHostBuffer, NativeLibrary};
+use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use cuteafd_loader::families::qwen4::{NgramHasher, Qwen4Config};
-use std::ffi::c_void;
-use std::os::unix::fs::FileExt;
 use std::time::Instant;
 
-enum Storage<'a> {
-    Host(&'a NativeLibrary, CuteafdHostBuffer),
-    Device(DeviceAllocation<'a>),
-    Mapped(MappedTableDevice<'a>),
-}
-
 pub(crate) struct PleTable<'a> {
-    storage: Storage<'a>,
-    /// Device-visible address of row 0 (null when mapped: each step's rows
-    /// are uploaded instead).
-    pub table: *mut c_void,
+    mapped: MappedTableDevice<'a>,
     /// FP32 [1] table scale on the device (1.0 for BF16 tables).
     pub scale: DeviceAllocation<'a>,
     pub fp8: bool,
@@ -41,34 +23,19 @@ pub(crate) struct PleTable<'a> {
     pub hasher: NgramHasher,
 }
 
-impl Drop for PleTable<'_> {
-    fn drop(&mut self) {
-        if let Storage::Host(library, buffer) = &mut self.storage {
-            if let Err(error) = library.free_host_buffer(buffer) {
-                tracing::error!(%error, "freeing the PLE table");
-            }
-        }
-    }
-}
-
 fn i64s(bytes: &[u8]) -> Vec<i64> {
     bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect()
 }
 
 impl<'a> PleTable<'a> {
-    /// The mapped table when the placement is `mapped`.
-    pub fn mapped(&self) -> Option<&MappedTableDevice<'a>> {
-        match &self.storage {
-            Storage::Mapped(mapped) => Some(mapped),
-            _ => None,
-        }
+    pub fn mapped(&self) -> &MappedTableDevice<'a> {
+        &self.mapped
     }
 
     /// `max_rows`: the most token rows one step gathers (mapped placement).
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
-        placement: TablePlacement, args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
+        args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("ple");
-        let threads = args.threads;
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
             fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
@@ -119,75 +86,13 @@ impl<'a> PleTable<'a> {
         let scale_dev = DeviceAllocation::new(library, 256)?;
         library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: 4, ..scale_dev.buffer }, &scale.to_le_bytes())?;
         let started = Instant::now();
-        // Byte offset of each shard in the array.
-        let mut starts = Vec::with_capacity(shards.len());
-        let mut at = 0usize;
-        for shard in &shards {
-            starts.push(at);
-            at += shard.meta.shape[0] * row_bytes;
-        }
-        let read_into = |base: *mut u8| -> Result<()> {
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let base = base as usize;
-            std::thread::scope(|scope| -> Result<()> {
-                let workers: Vec<_> = (0..threads.max(1)).map(|_| scope.spawn(|| -> Result<()> {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(shard) = shards.get(i) else { return Ok(()) };
-                        let file = std::fs::File::open(checkpoint.snapshot.join(&shard.shard))?;
-                        let len = shard.meta.shape[0] * row_bytes;
-                        ensure!(len as u64 == shard.meta.byte_length, "PLE shard {i} byte length");
-                        // SAFETY: shard i owns bytes starts[i]..starts[i]+len of the table.
-                        let dest = unsafe { std::slice::from_raw_parts_mut((base + starts[i]) as *mut u8, len) };
-                        for (k, chunk) in dest.chunks_mut(64 << 20).enumerate() {
-                            file.read_exact_at(chunk, shard.meta.byte_offset + (k * (64 << 20)) as u64)
-                                .with_context(|| format!("reading PLE shard {i}"))?;
-                        }
-                    }
-                })).collect();
-                for worker in workers {
-                    worker.join().map_err(|_| anyhow::anyhow!("PLE reader panicked"))??;
-                }
-                Ok(())
-            })
-        };
-        let (storage, table) = match placement {
-            TablePlacement::Mapped => {
-                let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();
-                // SAFETY: checkpoint snapshots are immutable while the server runs.
-                let mapped = unsafe { cuteafd_loader::MappedTable::from_tensors(&checkpoint.snapshot, &tensors)? };
-                ensure!(mapped.row_bytes() == row_bytes && mapped.rows() as usize == rows, "mapped PLE table geometry");
-                let device = MappedTableDevice::new(library, "ple", mapped, args, max_rows * cfg.ple_rows())?;
-                (Storage::Mapped(device), std::ptr::null_mut())
-            }
-            TablePlacement::HostPreload => {
-                let buffer = library.alloc_host_buffer(total)?;
-                read_into(buffer.ptr.cast())?;
-                let alias = library.cuda_host_buffer_device_alias(buffer)?;
-                (Storage::Host(library, buffer), alias.ptr)
-            }
-            TablePlacement::Device => {
-                let device = DeviceAllocation::new(library, total)?;
-                // Stage shard by shard through pageable memory (a one-time load).
-                let mut staging = vec![0u8; shards.iter().map(|s| s.meta.byte_length as usize).max().unwrap_or(0)];
-                for (i, shard) in shards.iter().enumerate() {
-                    let len = shard.meta.byte_length as usize;
-                    let file = std::fs::File::open(checkpoint.snapshot.join(&shard.shard))?;
-                    file.read_exact_at(&mut staging[..len], shard.meta.byte_offset)?;
-                    let dest = cuteafd_ffi::CuteafdDeviceBuffer {
-                        // SAFETY: the shard's bytes lie inside the device table.
-                        ptr: unsafe { device.buffer.ptr.cast::<u8>().add(starts[i]) }.cast(),
-                        bytes: len,
-                        ..device.buffer
-                    };
-                    library.copy_h2d(dest, &staging[..len])?;
-                }
-                let ptr = device.buffer.ptr;
-                (Storage::Device(device), ptr)
-            }
-        };
-        tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, ?placement, parts = shards.len(),
+        let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();
+        // SAFETY: checkpoint snapshots are immutable while the server runs.
+        let mapped = unsafe { cuteafd_loader::MappedTable::from_tensors(&checkpoint.snapshot, &tensors)? };
+        ensure!(mapped.row_bytes() == row_bytes && mapped.rows() as usize == rows, "mapped PLE table geometry");
+        let mapped = MappedTableDevice::new(library, "ple", mapped, args, max_rows * cfg.ple_rows())?;
+        tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, parts = shards.len(),
             elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table ready");
-        Ok(Self { storage, table, scale: scale_dev, fp8, rows, row_bytes, hasher })
+        Ok(Self { mapped, scale: scale_dev, fp8, rows, row_bytes, hasher })
     }
 }

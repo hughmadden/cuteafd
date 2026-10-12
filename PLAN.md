@@ -6245,19 +6245,22 @@ Ideas TJ wants kept for later; not v2 work.
   Also: revive the deterministic Spark prefill reducer; delete
   `work/mxfp4-tails` and `work/v41-exact`, and the old draft-policy switches
   once shared drafting covers every family.
-- **Qualify the mapped-table io_uring backends (TJ).** They already exist
-  in the shared `cuteafd-loader` `MappedTable` (6b2a47bf, 10-07), used by
-  V4.1 engram and Qwen PLE: `mmap` (default), `uring` and `mincore-routed`
-  (mincore residency check, resident rows copied, misses as concurrent
-  io_uring reads), with hit/miss, byte and 7-tier miss-latency stats in the
-  console and bench. CPU cold-page witness, mmap -> mincore-routed: 3,072
-  rows 197 -> 4.6 ms. Warm pages: equal. What is missing is the
-  identical-config hardware A/B that the code requires before a default
-  change: V4.1 (engram on raptor) and Qwen (95 GiB BF16 PLE), cold and warm
-  page cache, C1/C16 and readiness. Flip the default if it is no worse warm.
-  The 10-01 mapped-tables campaign predates these backends.
-  `HostPreload` (whole table in pinned RAM) and `Device` stay opt-in and are
-  never auto-selected for tables this size.
+- **Mapped tables: one qualified hybrid (issue #42, 10-12).** V4.1 engram
+  and Qwen PLE share `MappedTable`: NOWAIT-capable files use buffered
+  io_uring; unsupported files route mincore-resident rows to memcpy and
+  pending rows to concurrent buffered reads. mmap remains only an automatic
+  unavailable-ring fallback. No backend selector, whole-table HostPreload/
+  Device placement, whole-table warming or hot-row cache remains. Gather,
+  prefetch and upload are bounded per step; tables remain page-cache backed.
+  Exact random cold/mixed/warm bytes and fixed-seed C1 text passed for all
+  qualification arms. Qwen's 95 GiB BF16 PLE routed/mmap warm C1/C16 ratios
+  were 0.995/0.997. V4.1 1 RTX + 3 Sparks, three rotated speculation-off
+  rounds with an untimed wave per width: routed/mmap paired medians
+  0.997 C1, 0.990 C16; uring/mmap 0.997/1.003. No clear <0.95 regression
+  across rounds, so the agreed hybrid preference selects routed. Launches
+  stayed about 59-60 s. Speculation-on C16 is informational, not a gate.
+  FUSE mincore misses are approximate residency observations, not physical
+  I/O, and must not be compared as device reads between implementations.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

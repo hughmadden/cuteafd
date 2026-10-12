@@ -16,7 +16,7 @@ fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
     stats.record_gather(2, 8, Duration::from_micros(4), [0; 3]);
     stats.uring.store(true, Ordering::Relaxed);
     let fresh = reader.snapshot();
-    assert_eq!(fresh[0].backend, "uring");
+    assert_eq!(fresh[0].backend, "mincore-routed");
     assert_eq!(fresh[0].cumulative.gathers, 1);
     assert_eq!(fresh[0].cumulative.rows, 2);
     assert!(fresh[0].interval.is_none());
@@ -33,7 +33,7 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shard files through the table's lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    table.select_with_probe(TableBackend::Uring, || Err(MappedTableError::Io {
+    table.initialize_with_probe(|| Err(MappedTableError::Io {
         context: "injected io_uring_setup seccomp failure".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
@@ -48,14 +48,14 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
 #[test]
 fn runtime_ring_setup_failure_falls_back_for_demand_and_prefetch() -> TestResult {
     for errno in [libc::ENOMEM, libc::EPERM] {
-        for backend in [TableBackend::Uring, TableBackend::MincoreRouted] {
+        {
             for prefetch in [false, true] {
                 let (_dir, parts) = parted([3, 3, 2])?;
                 // SAFETY: this test owns immutable shards through all gathers.
                 let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
                 for part in &table.parts { part.nowait.store(true, Ordering::Relaxed); }
                 // Startup probe succeeded; the worker's first setup then fails.
-                table.select_with_probe(backend, || Ok(()));
+                table.initialize_with_probe(|| Ok(()));
                 uring::fail_next_setup(errno);
                 let mut output = [0; 12];
                 if prefetch { assert_eq!(table.prefetch(&[7, 2, 7], 8)?, 2); }
@@ -133,8 +133,8 @@ fn unclassified_waves_count_batches_not_rows() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: this test owns the immutable shards until all reads are drained.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    table.select_backend(TableBackend::Uring);
-    if table.backend() != TableBackend::Uring {
+    table.initialize_reads();
+    if table.backend() != TableBackend::MincoreRouted {
         eprintln!("SKIP unclassified wave execution: kernel/seccomp disallows io_uring");
         return Ok(());
     }
@@ -165,11 +165,11 @@ fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestRe
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shards until both tables are dropped.
     let mmap = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    mmap.select_backend(TableBackend::Mmap);
+    mmap.stats.uring.store(false, Ordering::Relaxed);
     // SAFETY: same immutable test files.
     let uring = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    uring.select_backend(TableBackend::Uring);
-    if uring.backend() != TableBackend::Uring {
+    uring.initialize_reads();
+    if uring.backend() != TableBackend::MincoreRouted {
         eprintln!("SKIP io_uring execution: kernel/seccomp/filesystem disallows buffered NOWAIT");
         return Ok(());
     }
@@ -177,10 +177,10 @@ fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestRe
     let pool = GatherPool::new("uring-parity", 3)?;
     let mut expected = [0; 24];
     let mut actual = [0; 24];
-    pool.gather(&mmap, &rows, &mut expected, None)?;
-    pool.gather(&uring, &rows, &mut actual, None)?;
+    pool.gather(&mmap, &rows, &mut expected)?;
+    pool.gather(&uring, &rows, &mut actual)?;
     assert_eq!(actual, expected);
-    assert_eq!(uring.backend(), TableBackend::Uring);
+    assert_eq!(uring.backend(), TableBackend::MincoreRouted);
     assert_eq!(uring.stats().snapshot().page_hits, 6);
     assert_eq!(uring.prefetch(&rows, 16)?, 3);
     let prefetched = uring.stats().snapshot();
@@ -190,18 +190,11 @@ fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestRe
     assert!(uring.gather_slots(&[0, 8], &[0, 1], &mut actual).is_err());
     assert_eq!(actual, expected);
     assert!(uring.gather_slots(&[0, 1], &[0, 0], &mut actual).is_err());
-    let cache = HotRowCache::new(4, 64).unwrap();
-    pool.gather(&uring, &rows, &mut actual, Some(&cache))?;
-    let before = uring.stats().snapshot();
-    pool.gather(&uring, &rows, &mut actual, Some(&cache))?;
-    let delta = uring.stats().snapshot().since(&before);
-    assert_eq!(delta.page_hits + delta.page_misses, 0, "managed cache hits are not page-cache reads");
-    assert_eq!(delta.cache_hits, 6);
     Ok(())
 }
 
 #[test]
-fn all_backends_gather_identical_random_cold_and_warm_rows() -> TestResult {
+fn hybrid_and_fallback_gather_identical_random_cold_and_warm_rows() -> TestResult {
     let page = page_bytes()?;
     let width = page + 13;
     let counts = [67, 71];
@@ -234,12 +227,12 @@ fn all_backends_gather_identical_random_cold_and_warm_rows() -> TestResult {
         expected[slot * width..(slot + 1) * width]
             .copy_from_slice(&payload[row as usize * width..(row as usize + 1) * width]);
     }
-    for (backend, buffered) in [(TableBackend::Mmap, false), (TableBackend::MincoreRouted, false),
-        (TableBackend::Uring, false), (TableBackend::MincoreRouted, true), (TableBackend::Uring, true)] {
+    for (backend, buffered) in [(TableBackend::Mmap, false), (TableBackend::MincoreRouted, false), (TableBackend::MincoreRouted, true)] {
         for mixed in [false, true] {
             // SAFETY: the test owns immutable shards until this table is dropped.
             let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
-            table.select_backend(backend);
+            table.initialize_reads();
+            if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
             if table.backend() != backend {
                 assert!(std::env::var("CUTEAFD_REQUIRE_URING").as_deref() != Ok("1"),
                     "required backend {backend:?} unavailable");
@@ -301,11 +294,12 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
     let payload: Vec<_> = (0..8 * page).map(|i| (i % 251) as u8).collect();
     file.write_all(&payload)?;
     file.as_file().sync_all()?;
-    for backend in [TableBackend::Mmap, TableBackend::Uring] {
+    for backend in [TableBackend::Mmap, TableBackend::MincoreRouted] {
         // SAFETY: test file is immutable while the table lives.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
-        table.select_backend(backend);
-        if backend == TableBackend::Uring && table.backend() != backend {
+        table.initialize_reads();
+        if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
+        if backend == TableBackend::MincoreRouted && table.backend() != backend {
             eprintln!("SKIP NOWAIT miss execution: unsupported kernel/seccomp/filesystem");
             continue;
         }
@@ -319,7 +313,7 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
         let cold = table.stats().snapshot();
         assert_eq!((cold.page_hits, cold.page_misses), (0, 3));
         assert_eq!(cold.miss_request_bytes, (3 * page) as u64);
-        if backend == TableBackend::Uring {
+        if backend == TableBackend::MincoreRouted {
             assert_eq!(cold.miss_histogram.iter().sum::<u64>(), 3);
             assert!(cold.miss_ns > 0 && cold.miss_max_ns > 0);
         }
@@ -335,68 +329,6 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
 }
 
 #[test]
-fn unsupported_nowait_keeps_buffered_uring_and_mincore_accounting() -> TestResult {
-    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
-    let page = page_bytes()?;
-    let payload: Vec<_> = (0..8 * page).map(|i| (i % 251) as u8).collect();
-    file.write_all(&payload)?;
-    file.as_file().sync_all()?;
-    // SAFETY: test owns the immutable file until the table is dropped.
-    let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
-    table.select_backend(TableBackend::Uring);
-    if table.backend() != TableBackend::Uring {
-        eprintln!("SKIP buffered io_uring: kernel/seccomp unavailable");
-        return Ok(());
-    }
-    table.parts[0].nowait.store(false, Ordering::Relaxed);
-    table.select_with_probe(TableBackend::Uring, || Ok(()));
-    table.name_stats("uring-unsupported-nowait-test");
-    let named = mapped_table_stats().into_iter().find(|t| t.name == "uring-unsupported-nowait-test").unwrap();
-    assert_eq!((named.backend.as_str(), named.accounting), ("uring", "mincore"));
-    // SAFETY: fadvise only evicts this clean, test-owned file's pages.
-    assert_eq!(unsafe { libc::posix_fadvise(file.as_file().as_raw_fd(), 0,
-        payload.len() as i64, libc::POSIX_FADV_DONTNEED) }, 0);
-    let rows = [1, 3, 3, 6];
-    let mut out = vec![0; rows.len() * page];
-    table.gather_into(&rows, &mut out)?;
-    let cold = table.stats().snapshot();
-    assert_eq!(table.backend(), TableBackend::Uring);
-    assert_eq!((cold.page_hits, cold.page_misses, cold.nowait_batches), (0, 4, 0));
-    assert_eq!(cold.miss_histogram.iter().sum::<u64>(), 4);
-    assert_eq!(cold.miss_request_bytes, (4 * page) as u64);
-    assert!(cold.miss_ns > 0 && cold.residency_ns > 0);
-    for (slot, &row) in rows.iter().enumerate() {
-        assert_eq!(&out[slot * page..(slot + 1) * page], &payload[row as usize * page..(row as usize + 1) * page]);
-    }
-    table.gather_into(&rows, &mut out)?;
-    let warm = table.stats().snapshot().since(&cold);
-    assert_eq!((warm.page_hits, warm.page_misses, warm.miss_ns), (4, 0, 0));
-    assert_eq!(warm.miss_histogram, [0; 7]);
-    assert_eq!(table.prefetch(&rows, 8)?, 3);
-    let prefetch = table.stats().snapshot().since(&cold);
-    assert_eq!((prefetch.prefetch_hits, prefetch.prefetch_misses, prefetch.prefetch_nowait_batches), (4, 0, 0));
-    assert_eq!(prefetch.page_hits, 4, "prefetch must not count demand hits");
-    let before = table.stats().snapshot();
-    table.stats.accounting_off.store(true, Ordering::Relaxed);
-    table.gather_into(&rows, &mut out)?;
-    let off = table.stats().snapshot().since(&before);
-    assert_eq!((off.page_hits, off.page_misses, off.residency_ns), (0, 0, 0));
-    assert_eq!((off.unclassified_rows, off.unclassified_bytes), (4, (4 * page) as u64));
-    assert_eq!(off.unclassified_batch_histogram.iter().sum::<u64>(), 1);
-    assert_eq!(off.unclassified_batches, 1);
-    assert!(off.unclassified_batch_ns > 0);
-    assert_eq!(off.unclassified_batch_ns, off.unclassified_batch_max_ns);
-    assert_eq!(off.miss_histogram, [0; 7]);
-    assert_eq!(table.prefetch(&rows, 8)?, 3);
-    let off = table.stats().snapshot().since(&before);
-    assert_eq!((off.unclassified_rows, off.prefetch_unclassified_rows), (4, 4));
-    assert_eq!(off.prefetch_unclassified_batch_histogram.iter().sum::<u64>(), 1);
-    assert_eq!((off.unclassified_batches, off.prefetch_unclassified_batches), (1, 1));
-    assert!(off.prefetch_unclassified_batch_ns > 0);
-    Ok(())
-}
-
-#[test]
 fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestResult {
     let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
     let page = page_bytes()?;
@@ -406,11 +338,9 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
     let open = || -> Result<MappedTable> {
         // SAFETY: this test owns the immutable file until all tables drop.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
-        table.select_backend(TableBackend::MincoreRouted);
+        table.initialize_reads();
         table.parts[0].nowait.store(false, Ordering::Relaxed);
         table.stats.nowait.store(false, Ordering::Relaxed);
-        // Routing still needs residency when ordinary uring accounting is off.
-        table.stats.accounting_off.store(true, Ordering::Relaxed);
         Ok(table)
     };
     let table = open()?;
@@ -443,7 +373,7 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
     assert!(table.gather_slots(&[1, 8], &[0, 1], &mut output).is_err());
     assert_eq!(output, expected);
     let pool = GatherPool::new("hybrid-contract", 2)?;
-    pool.gather(&table, &rows, &mut output, None)?;
+    pool.gather(&table, &rows, &mut output)?;
     let warm = table.stats().snapshot().since(&mixed);
     assert_eq!((warm.page_hits, warm.page_misses, warm.resident_copy_rows), (4, 0, 4));
     assert_eq!((warm.miss_ns, warm.unclassified_rows), (0, 0));
@@ -468,7 +398,7 @@ fn mincore_routing_keeps_nowait_exact_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    table.select_backend(TableBackend::MincoreRouted);
+    table.initialize_reads();
     if table.backend() == TableBackend::MincoreRouted && table.stats.nowait.load(Ordering::Relaxed) {
         let mut output = [0; 12];
         table.gather_into(&[7, 2, 7], &mut output)?;
@@ -477,7 +407,7 @@ fn mincore_routing_keeps_nowait_exact_and_falls_back_safely() -> TestResult {
         assert_eq!((stats.page_hits, stats.resident_copy_rows, stats.residency_ns), (3, 0, 0));
         assert!(stats.nowait_batches > 0);
     }
-    table.select_with_probe(TableBackend::MincoreRouted, || Err(MappedTableError::Io {
+    table.initialize_with_probe(|| Err(MappedTableError::Io {
         context: "injected unavailable io_uring".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
@@ -485,7 +415,6 @@ fn mincore_routing_keeps_nowait_exact_and_falls_back_safely() -> TestResult {
     let mut output = [0; 12];
     table.gather_into(&[7, 2, 7], &mut output)?;
     assert_eq!(output, [7, 7, 7, 7, 2, 2, 2, 2, 7, 7, 7, 7]);
-    assert_eq!("mincore-routed".parse::<TableBackend>()?, TableBackend::MincoreRouted);
     Ok(())
 }
 
@@ -630,10 +559,10 @@ fn parts_form_one_row_space_for_uniform_and_ragged_splits() -> TestResult {
         assert!(table.prefetch(&[0, 7], 1).is_err());
         let pool = GatherPool::new("test-gather", 3)?;
         let mut pooled = vec![0; out.len()];
-        let report = pool.gather(&table, &rows, &mut pooled, None)?;
+        let report = pool.gather(&table, &rows, &mut pooled)?;
         assert_eq!(pooled, expected);
         assert_eq!(report.rows, rows.len());
-        assert!(pool.gather(&table, &[1, 9], &mut [0; 8], None).is_err());
+        assert!(pool.gather(&table, &[1, 9], &mut [0; 8]).is_err());
         let stats = table.stats().snapshot();
         assert_eq!((stats.gathers, stats.rows, stats.bytes), (1, 6, 24));
     }
@@ -668,33 +597,6 @@ fn checkpoint_tensors_validate_dtype_width_payload_and_paths() -> TestResult {
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[(shards[0].as_str(), &short)]) }.is_err());
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[("../a.safetensors", &metas[0])]) }.is_err());
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[]) }.is_err());
-    Ok(())
-}
-
-#[test]
-fn hot_row_cache_serves_hits_and_evicts_least_recent() -> TestResult {
-    let (_dir, parts) = parted([3, 3, 2])?;
-    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    let cache = HotRowCache::new(4, 8).expect("two rows");
-    assert!(HotRowCache::new(4, 3).is_none());
-    let pool = GatherPool::new("test-cache", 2)?;
-    let gather = |rows: &[u64]| -> std::result::Result<(Vec<u8>, GatherReport), MappedTableError> {
-        let mut out = vec![0; rows.len() * 4];
-        let report = pool.gather(&table, rows, &mut out, Some(&cache))?;
-        Ok((out, report))
-    };
-    let (out, report) = gather(&[1, 2])?;
-    assert_eq!((out, report.cache_hits), (vec![1, 1, 1, 1, 2, 2, 2, 2], 0));
-    let (out, report) = gather(&[2, 1, 2])?;
-    assert_eq!((out, report.cache_hits), (vec![2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2], 3));
-    // Row 1 is least recent after [2, 1, 2]; inserting 5 evicts it.
-    gather(&[5])?;
-    assert_eq!(cache.len(), 2);
-    let (out, report) = gather(&[1, 5])?;
-    assert_eq!((out, report.cache_hits), (vec![1, 1, 1, 1, 5, 5, 5, 5], 1));
-    let stats = table.stats().snapshot();
-    assert_eq!((stats.cache_hits, stats.cache_misses), (4, 4));
-    assert!(pool.gather(&table, &[0], &mut [0; 4], HotRowCache::new(8, 64).as_ref()).is_err());
     Ok(())
 }
 
@@ -763,177 +665,15 @@ fn spawned_gathers_complete_into_caller_storage() -> TestResult {
     let table = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
     let pool = Arc::new(GatherPool::new("test-spawn", 2)?);
     let mut out = vec![0u8; 12];
-    let pending = unsafe { pool.spawn_gather(table.clone(), vec![6, 0, 4], out.as_mut_ptr(), out.len(), None) };
+    let pending = unsafe { pool.spawn_gather(table.clone(), vec![6, 0, 4], out.as_mut_ptr(), out.len()) };
     assert_eq!(pending.wait()?.rows, 3);
     assert_eq!(out, [6, 6, 6, 6, 0, 0, 0, 0, 4, 4, 4, 4]);
     // An invalid row fails without writing; dropping an unwaited gather waits for it.
-    let failing = unsafe { pool.spawn_gather(table.clone(), vec![1, 8, 1], out.as_mut_ptr(), out.len(), None) };
+    let failing = unsafe { pool.spawn_gather(table.clone(), vec![1, 8, 1], out.as_mut_ptr(), out.len()) };
     assert!(failing.wait().is_err());
     assert_eq!(out, [6, 6, 6, 6, 0, 0, 0, 0, 4, 4, 4, 4]);
-    let cache = Arc::new(HotRowCache::new(4, 64).expect("rows"));
-    drop(unsafe { pool.spawn_gather(table.clone(), vec![2, 2, 2], out.as_mut_ptr(), out.len(), Some(cache.clone())) });
+    drop(unsafe { pool.spawn_gather(table.clone(), vec![2, 2, 2], out.as_mut_ptr(), out.len()) });
     assert_eq!(out, [2; 12]);
-    assert_eq!(cache.len(), 1);
-    Ok(())
-}
-
-#[test]
-#[ignore = "Warm/cold backend latency distributions; release-mode CPU characterization"]
-fn mapped_backend_latency_measurement() -> TestResult {
-    let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
-    file.as_file().set_len(16u64 << 30)?;
-    let path = std::env::var_os("CUTEAFD_TABLE_PROBE_FILE").map(PathBuf::from)
-        .unwrap_or_else(|| file.path().into());
-    let offset: u64 = std::env::var("CUTEAFD_TABLE_PROBE_OFFSET").unwrap_or_default().parse().unwrap_or(0);
-    let rows = ((std::fs::metadata(&path)?.len() - offset) / 256).min(1 << 26);
-    let table = |backend, off| -> Result<MappedTable> {
-        // SAFETY: fixture and selected sealed checkpoint stay immutable.
-        let table = unsafe { MappedTable::single(&path, offset, rows, u8_rows(256))? };
-        table.select_backend(backend);
-        if backend != TableBackend::Mmap && table.backend() != backend { return Err(invalid("io_uring unavailable in latency measurement")); }
-        // Compare the same ordinary buffered reads on every filesystem; the
-        // separate capability probe reports whether native NOWAIT is supported.
-        table.parts[0].nowait.store(false, Ordering::Relaxed);
-        table.stats.nowait.store(false, Ordering::Relaxed);
-        table.stats.accounting_off.store(off, Ordering::Relaxed);
-        Ok(table)
-    };
-    let mmap = table(TableBackend::Mmap, false)?;
-    let off = table(TableBackend::Uring, true)?;
-    let full = table(TableBackend::Uring, false)?;
-    let hybrid = table(TableBackend::MincoreRouted, false)?;
-    let report = |phase: &str, mode: &str, count: usize, samples: &mut Vec<f64>| {
-        samples.sort_by(f64::total_cmp);
-        eprintln!("phase={phase} mode={mode} rows={count} samples={} median_us={:.3} p99_us={:.3}", samples.len(), samples[samples.len()/2], samples[(samples.len()*99/100).min(samples.len()-1)]);
-    };
-    let ids = |count| {
-        let mut state = 0x1234_5678u64;
-        (0..count).map(|_| { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state % rows }).collect::<Vec<_>>()
-    };
-    eprintln!("file={} offset={offset} rows_in_space={rows} width=256", path.display());
-    for count in [1, 24, 384, 1536, 3072] {
-        let ids = ids(count);
-        let mut output = vec![0; count * 256];
-        let mut expected = vec![0; output.len()];
-        mmap.gather_into(&ids, &mut expected)?;
-        for (mode, table) in [("mmap+mincore", &mmap), ("uring-off", &off), ("uring+mincore", &full), ("mincore-routed", &hybrid)] {
-            for _ in 0..10 { table.gather_into(&ids, &mut output)?; }
-            let mut samples = Vec::with_capacity(100);
-            for _ in 0..100 {
-                let started = Instant::now();
-                table.gather_into(&ids, &mut output)?;
-                samples.push(started.elapsed().as_secs_f64() * 1e6);
-            }
-            assert_eq!(output, expected);
-            report("warm", mode, count, &mut samples);
-        }
-    }
-    drop((mmap, off, full, hybrid));
-    if std::env::var("CUTEAFD_TABLE_PROBE_COLD").ok().as_deref() == Some("1") {
-        for count in [1, 24, 384, 1536, 3072] {
-            let ids = ids(count);
-            for backend in [TableBackend::Mmap, TableBackend::Uring] {
-                let mut samples = Vec::with_capacity(3);
-                let mut misses = 0;
-                let mut tiers = [0u64; 7];
-                for _ in 0..3 {
-                    let table = table(backend, false)?;
-                    if uring::dontneed(&table.parts[0]) != 0 { return Err("bounded DONTNEED unavailable".into()); }
-                    let mut output = vec![0; count * 256];
-                    let started = Instant::now();
-                    table.gather_into(&ids, &mut output)?;
-                    samples.push(started.elapsed().as_secs_f64() * 1e6);
-                    let stats = table.stats().snapshot();
-                    misses += stats.page_misses;
-                    for (total, value) in tiers.iter_mut().zip(stats.miss_histogram) { *total += value; }
-                }
-                report("after-dontneed-attempt", &backend.to_string(), count, &mut samples);
-                eprintln!("cold_observed mode={backend} rows={count} misses={misses} requested={} miss_tiers={tiers:?}", 3 * count);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
-#[ignore = "Fresh nonresident-file witness; explicit sealed PLE file required"]
-fn mapped_backend_fresh_cold_measurement() -> TestResult {
-    use std::os::unix::fs::FileExt;
-    let path = PathBuf::from(std::env::var_os("CUTEAFD_TABLE_PROBE_FILE").ok_or("an explicit sealed PLE file is required")?);
-    let offset: u64 = std::env::var("CUTEAFD_TABLE_PROBE_OFFSET")?.parse()?;
-    let rows = ((std::fs::metadata(&path)?.len() - offset) / 256).min(1 << 26);
-    let open = |backend| -> Result<MappedTable> {
-        // SAFETY: the selected sealed checkpoint remains immutable.
-        let table = unsafe { MappedTable::single(&path, offset, rows, u8_rows(256))? };
-        table.select_backend(backend);
-        if table.backend() != backend { return Err(invalid("cold witness backend unavailable")); }
-        // Ordinary buffered reads compare the same unsupported-NOWAIT route;
-        // native NOWAIT capability is characterized by the separate probe.
-        table.parts[0].nowait.store(false, Ordering::Relaxed);
-        table.stats.nowait.store(false, Ordering::Relaxed);
-        table.stats.accounting_off.store(false, Ordering::Relaxed);
-        Ok(table)
-    };
-    let tables = [open(TableBackend::Mmap)?, open(TableBackend::Uring)?, open(TableBackend::MincoreRouted)?];
-    let part = &tables[0].parts[0];
-    let page_count = part.mapped_len / part.page_bytes;
-    let mut state = 0x98ab_cdef_8765_4321u64;
-    let mut seen = BTreeSet::new();
-    let mut scanned = 0usize;
-    eprintln!("fresh_cold file={} offset={offset} width=256 page_bytes={} cache_advice=none", path.display(), part.page_bytes);
-    for count in [384, 1536, 3072] {
-        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
-        for repetition in 0..3 {
-            for step in 0..3 {
-                let index = (repetition + step) % 3;
-                let table = &tables[index];
-                let mut selected = Vec::with_capacity(count);
-                while selected.len() < count {
-                    if scanned >= 262_144 {
-                        eprintln!("UNAVAILABLE fresh_nonresident rows={count} mode={} scanned={scanned} found={}", table.backend(), selected.len());
-                        return Err("bounded search could not find enough fresh nonresident pages".into());
-                    }
-                    let mut candidates = Vec::with_capacity(4096);
-                    for _ in 0..4096 {
-                        scanned += 1;
-                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                        let page = (state as usize % page_count).max(1);
-                        let row = (page * part.page_bytes - part.data_offset).div_ceil(256) as u64;
-                        if row < rows && seen.insert(page) { candidates.push(row); }
-                    }
-                    let flags = table.residency(&candidates, false)?;
-                    for (row, hit) in candidates.into_iter().zip(flags) {
-                        if !hit && selected.len() < count { selected.push(row); }
-                    }
-                    // The snapshot is the cold witness; neither successful
-                    // DONTNEED nor a first-time PTE fault establishes coldness.
-                    let flags = table.residency(&selected, false)?;
-                    selected = selected.into_iter().zip(flags).filter_map(|(row, hit)| (!hit).then_some(row)).collect();
-                }
-                let before = table.stats().snapshot();
-                let mut output = vec![0; count * 256];
-                let started = Instant::now();
-                table.gather_into(&selected, &mut output)?;
-                let elapsed = started.elapsed().as_secs_f64() * 1e6;
-                samples[index].push(elapsed);
-                let stats = table.stats().snapshot().since(&before);
-                eprintln!("fresh_sample mode={} rows={count} repetition={repetition} confirmed_nonresident={count} observed_misses={} resident_copy_rows={} elapsed_us={elapsed:.3} miss_tiers={:?}", table.backend(), stats.page_misses, stats.resident_copy_rows, stats.miss_histogram);
-                assert_eq!(stats.page_misses, count as u64, "cold pages changed before the backend's snapshot");
-                assert_eq!(stats.resident_copy_rows, 0);
-                if table.backend() != TableBackend::Mmap { assert_eq!(stats.miss_histogram.iter().sum::<u64>(), count as u64); }
-                // Check bytes after timing; positioned reads cannot warm the witness.
-                let mut expected = vec![0; output.len()];
-                for (&row, slot) in selected.iter().zip(expected.chunks_exact_mut(256)) {
-                    part.file.read_exact_at(slot, offset + row * 256)?;
-                }
-                assert_eq!(output, expected);
-            }
-        }
-        for (index, sample) in samples.iter_mut().enumerate() {
-            sample.sort_by(f64::total_cmp);
-            eprintln!("fresh_summary mode={} rows={count} samples=3 median_us={:.3} max_us={:.3}", tables[index].backend(), sample[1], sample[2]);
-        }
-    }
     Ok(())
 }
 
@@ -949,7 +689,7 @@ fn residency_overhead_measurement() -> TestResult {
     file.as_file().sync_all()?;
     // SAFETY: immutable fixture survives every gather and mapping.
     let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(), offset: 0, rows: rows as u64 }], u8_rows(width))? };
-    table.select_backend(TableBackend::Mmap);
+    table.stats.uring.store(false, Ordering::Relaxed);
     for count in [24, 384, 1536, 3072] {
         let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
         let mut output = vec![0; count * width];

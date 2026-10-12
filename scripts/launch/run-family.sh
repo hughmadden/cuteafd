@@ -13,18 +13,16 @@ restart=0
 restart_all=0
 family=""
 embedding_override=""
-table_override=""
 wip_slot=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
     --family) family="${2:?--family requires ID}"; shift 2 ;;
-    --table-backend) table_override="${2:?--table-backend requires uring, mmap or mincore-routed}"; shift 2 ;;
     --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
     --all) restart_all=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--table-backend uring|mmap|mincore-routed] [--restart [--all]] [--wip SLOT]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--restart [--all]] [--wip SLOT]" >&2; exit 2 ;;
   esac
 done
 ((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
@@ -36,8 +34,6 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
-table_backend="${table_override:-$(get TABLE_BACKEND "${CUTEAFD_TABLE_BACKEND:-mmap}")}"
-release_validate_table_backend "$table_backend"
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
@@ -1336,7 +1332,6 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 # CONSOLE_TEXT=on (default) lets the live console at / stream generated token text to
 # viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
-family_args+=(--table-backend "$table_backend")
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 api_mount_args=()
@@ -1372,8 +1367,6 @@ esac
 # GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
 gateway="$(get GATEWAY "")"
 case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo "GATEWAY must be on or off" >&2; exit 2 ;; esac
-table_env_args=()
-[[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 graph_census_args=()
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph census requires a WIP build' >&2; exit 2; }
@@ -1400,7 +1393,7 @@ done
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
