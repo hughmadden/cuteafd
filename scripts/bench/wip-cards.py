@@ -440,6 +440,8 @@ def observe(job):
     memory = (dest / 'memory.jsonl').open('w')
     console = (dest / 'console.jsonl').open('w')
     frames = (dest / 'console-frames.jsonl').open('w')
+    policy = (dest / 'policy-stats.jsonl').open('w')
+    policy_sample_at = 0.
     reader = None
     if 'console' in job['probes']:
         reader = threading.Thread(target=console_frames, args=(os.environ['CUTEAFD_SMOKE_URL'], stop, frames), daemon=True)
@@ -460,6 +462,11 @@ def observe(job):
                     snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot')
                     console.write(json.dumps({'time': time.time(), 'snapshot': snapshot}) + '\n')
                     console.flush()
+                    if time.monotonic() >= policy_sample_at:
+                        stats = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/stats')
+                        policy.write(json.dumps({'time': time.time(), 'stats': stats}) + '\n')
+                        policy.flush()
+                        policy_sample_at = time.monotonic() + 1.
                 except (OSError, RuntimeError):
                     pass
             time.sleep(.25)
@@ -471,6 +478,7 @@ def observe(job):
         if reader:
             reader.join(timeout=3)
         frames.close()
+        policy.close()
         memory.close()
         console.close()
     if 'memory' in job['probes'] and not (dest / 'memory.jsonl').stat().st_size:
