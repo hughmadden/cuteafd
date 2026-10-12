@@ -186,7 +186,7 @@ pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) ->
     let wanted = (sms * 16).div_ceil(tiles).clamp(1, blocks);
     let splits = blocks.div_ceil(blocks.div_ceil(wanted));
     let capacity = if mode == 0 { 64 } else { 128 };
-    align(2 * capacity * 4) + align(k * capacity * 2)
+    align(2 * capacity * 4) + align(k.div_ceil(256) * capacity * 4) + align(k * capacity * 2)
         + if mode == 2 { align(k / 128 * capacity * 4) } else { 0 }
         + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 }
 }
@@ -384,6 +384,17 @@ mod tests {
         g.layers = u64::MAX;
         assert_eq!(GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Bf16Only,
             GlmDraftCapacity::new(20, 16, 8).unwrap(), 2048).unwrap_err(), GlmDraftStorageError::Overflow);
+    }
+
+    #[test]
+    fn fp8_scratch_admits_split_row_maxima_before_packed_activations() {
+        // n=65536 removes projection split-K, isolating the scale/packing arenas.
+        let bytes = draft_fp8_scratch_bytes(8, 4096, 65536, 188, 0);
+        assert_eq!(bytes, 512 + 16 * 64 * 4 + 4096 * 64 * 2);
+        let wide = draft_fp8_scratch_bytes(128, 4096, 65536, 188, 1);
+        assert_eq!(wide, 1024 + 16 * 128 * 4 + 4096 * 128 * 2);
+        assert_eq!(draft_fp8_scratch_bytes(128, 4096, 65536, 188, 2),
+            wide + 32 * 128 * 4);
     }
 
     #[test]

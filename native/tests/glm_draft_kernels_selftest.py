@@ -247,6 +247,7 @@ def fp8_check(lib, args):
     generator = torch.Generator().manual_seed(8)
     shapes = args.fp8_shapes or (SHAPES[:3] if args.quick else SHAPES)
     profile_buffers = []
+    baseline = bind(args.fp8_baseline) if args.fp8_baseline else None
     # 136 and 200 exercise a full pass followed by the skinny or wide remainder.
     row_counts = sorted(set((1, 8, 9, 16, 33, 64, 65, 96, 127, 128, 136, 200)) | set(args.fp8_rows))
     for k, n in shapes:
@@ -266,6 +267,40 @@ def fp8_check(lib, args):
             status = lib.cuteafd_fp8_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), out.data_ptr(), out_f32,
                                             rows, k, n, mode, workspace.data_ptr(), workspace.numel(), stream)
             assert status == 0, (k, n, mode, rows, out_f32, status)
+
+        if baseline:
+            baseline_bytes = max(baseline.cuteafd_fp8_linear_workspace(rows_max, k, n, mode) for mode in (0, 1, 2))
+            baseline_workspace = torch.empty(baseline_bytes, device="cuda", dtype=torch.uint8)
+
+            def run_baseline(mode, x, rows, out):
+                status = baseline.cuteafd_fp8_linear(x.data_ptr(), packed.data_ptr(), scale.data_ptr(), out.data_ptr(),
+                    int(out.dtype == torch.float32), rows, k, n, mode, baseline_workspace.data_ptr(),
+                    baseline_workspace.numel(), stream)
+                assert status == 0, ("baseline", k, n, mode, rows, status)
+
+            # Include power-of-two boundaries, padding rows, and wide-pass tails.
+            edge = torch.empty(rows_max, k, dtype=torch.bfloat16)
+            for row in range(rows_max):
+                if row % 7 == 0:
+                    edge[row].zero_()
+                else:
+                    exponent = (row % 41) - 20
+                    value = 2.0 ** exponent
+                    edge[row].fill_(value * (1.0 + (row % 3) / 128.0))
+                    edge[row, 1::2].neg_()
+            for label, source in (("random", None), ("pow2", edge.cuda())):
+                if source is None:
+                    source = (torch.randn(rows_max, k, generator=generator) * 3.0).bfloat16().cuda()
+                for rows in row_counts:
+                    for mode in (0, 1, 2):
+                        for dtype in (torch.float32, torch.bfloat16):
+                            candidate = torch.empty(rows, n, device="cuda", dtype=dtype)
+                            reference = torch.empty_like(candidate)
+                            run(mode, source, rows, candidate)
+                            run_baseline(mode, source, rows, reference)
+                            torch.cuda.synchronize()
+                            assert torch.equal(candidate, reference), ("baseline bits", label, k, n, rows, mode, dtype)
+            print(f"fp8 [{k}, {n}]: baseline bit equality passed at {row_counts}")
 
         x = (torch.randn(rows_max, k, generator=generator) * torch.linspace(0.1, 3.0, rows_max)[:, None]).bfloat16()
         x = x.cuda()
@@ -336,6 +371,10 @@ def fp8_check(lib, args):
                 elapsed = timed(lambda: run(mode, x, rows, out), runs)
                 print(f"fp8 k={k} n={n} rows={rows} mode={mode} median_ms={elapsed:.6f} "
                       f"useful_weight_GB_s={weight_bytes / elapsed / 1e6:.1f}")
+                if baseline:
+                    base_ms = timed(lambda: run_baseline(mode, x, rows, out), runs)
+                    print(f"fp8 baseline k={k} n={n} rows={rows} mode={mode} median_ms={base_ms:.6f} "
+                          f"speedup={base_ms / elapsed:.4f}")
         if args.profile_fp8:
             profile_buffers.append((k, n, x, packed, scale, workspace,
                                     torch.empty(max(args.fp8_rows), n, device="cuda", dtype=torch.bfloat16)))
@@ -365,6 +404,7 @@ def main():
     parser.add_argument("--profile-head", action="store_true",
                         help="one NVTX-labelled head/top-k shot inside cudaProfilerStart/Stop after checks")
     parser.add_argument("--fp8-shapes", help="comma-separated KxN shapes; overrides --quick's shape subset")
+    parser.add_argument("--fp8-baseline", help="sealed baseline library for exact FP8 output comparison")
     parser.add_argument("--fp8-rows", default="8,16,32,64,128", help="comma-separated profiling row counts")
     parser.add_argument("--profile-fp8", action="store_true",
                         help="one NVTX-labelled projection shot after checks; use with --skip-head")
