@@ -99,6 +99,13 @@ Attention (KDA), a minority run MLA + DSA.
   --decode-rows)`, so prefill lanes narrower than 128 rows still take a
   127-row verify step through the experts. The launcher passes the decode
   rows to the encoder placement plan as well as to serving.
+- Target head on tensor cores: `GLM5_FLASH_TARGET_HEAD=tensor`
+  (`--target-head tensor`, opt-in; needs the BF16 head, `GLM5_FLASH_FP8_HEAD=off`)
+  keeps steps of up to 8 rows (one sequence's token and up to seven drafts) on
+  the pedantic FP32 cuBLAS GEMM and runs wider ones (verify steps of two or
+  more sequences, prefill-path scoring, `--nll`) as a BF16 tensor-core GEMM
+  with FP32 accumulation, one read of the head. It changes the target's
+  numerics past 8 rows, so it is KL-gated against `exact`, the default.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`). Marks live in a
   device arena of 2C + 2 marks (147.6 MB each with an FP32 state), which both
