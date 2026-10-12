@@ -1154,6 +1154,12 @@ def build_lock_mode(revision):
     return 'legacy-full-build'
 
 
+def build_slot_capable(revision):
+    """Whether `revision`'s wip.sh takes a build slot around Cargo itself (CUTEAFD_WIP_BUILD_SLOT)."""
+    shown = subprocess.run(['git', '-C', str(REPO), 'show', revision + ':wip.sh'], capture_output=True, text=True, timeout=120)
+    return shown.returncode == 0 and 'CUTEAFD_WIP_BUILD_SLOT' in shown.stdout
+
+
 def build_arms(items, arms, cards, state, task, dry, seed='moa'):
     scopes = build_scopes(cards)
     for item in items:
@@ -1175,6 +1181,9 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         build_role = 'both' if spark_cards else 'coordinator'
         arm['build_role'] = build_role
         build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', build_role, '--config', str(state / ('build-' + name + '.config'))]
+        # A wip.sh that takes a build slot around Cargo itself needs no outer build.lock:
+        # staging, reuse, GPU export turns and distribution then never block other builds.
+        arm['build_slot'] = build_slot_capable(revision)
         if arm['build_lock_mode'] == 'legacy-full-build':
             print('# legacy arm: GPU lock held for the full build')
             build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
@@ -1224,13 +1233,15 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         commands = [
             *prepare,
             [sys.executable, str(REPO / 'scripts/build/assert-build-filesystem.py'), str(root), str(source)],
-            ['flock', '-w', '1800', str(Path.home() / '.cache/cuteafd/build.lock'), *build_cmd],
+            build_cmd if arm['build_slot'] else ['flock', '-w', '1800', str(Path.home() / '.cache/cuteafd/build.lock'), *build_cmd],
         ]
         for cmd in commands:
             print(shlex.join(cmd))
             if not dry:
-                if cmd[0] == 'flock':
-                    if build_role == 'both':
+                if cmd is commands[-1]:
+                    # A native-phase wip.sh takes the seed's fair turn itself, around the export only:
+                    # Cargo, slot reuse and native-cache hits need no Spark lock, so they never queue.
+                    if build_role == 'both' and arm['build_lock_mode'] != 'native-phase':
                         # Wait (not fail) while another job's export holds the seed Spark; wip.sh
                         # takes the lock itself for the native phase, so release it at once.
                         seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
@@ -1242,6 +1253,8 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
                         mark = ['python3', '-c', marker]
                         run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
+                    if arm['build_slot']:
+                        env['CUTEAFD_WIP_BUILD_SLOT'] = 'on'
                     if arm['build_lock_mode'] == 'legacy-full-build':
                         env.pop('CUTEAFD_WIP_EXPORT_LOCKS', None)
                     save(state / ('build-' + name + '.json'), dict(revision=revision, lock_mode=arm['build_lock_mode'], scopes=scopes, command=cmd))

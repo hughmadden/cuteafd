@@ -848,7 +848,14 @@ build_coordinator() {
   # Cargo first, holding no hardware; then the native/AOT export, which
   # queries the GPU, under a held fair turn on its lock. A native-cache hit
   # restores verified outputs and needs no GPU, so it takes no turn.
-  "${coordinator_build[@]}" rust
+  # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
+  # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
+  # the GPU export, reuse and staging hold none.
+  if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+    "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust
+  else
+    "${coordinator_build[@]}" rust
+  fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
   if [[ "${wip_export_locks:-off}" != on ]]; then
     "${coordinator_build[@]}" native

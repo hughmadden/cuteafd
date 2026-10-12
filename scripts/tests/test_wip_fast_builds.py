@@ -227,3 +227,46 @@ def test_source_checkout_initializes_only_build_submodules_from_local_stores():
     assert 'deepseek-harness "' not in text and 'gptqmodel "' not in text
     assert 'remote set-url origin "$url"' in text
     assert 'verify-$name-source.py' in text
+
+
+def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    import sys
+    spec = importlib.util.spec_from_file_location('wip_cards_fast', ROOT / 'scripts/bench/wip-cards.py')
+    cards = importlib.util.module_from_spec(spec)
+    sys.modules['wip_cards_fast'] = cards
+    spec.loader.exec_module(cards)
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
+    monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: True)
+    config = tmp_path / 'card.config'
+    config.write_text('SPARK_COUNT=4\n')
+    entry = {'name': 'v41-max', 'family': 'deepseek_v41', 'config': str(config), 'sparks': ['ostrich', 'dodo', 'emu', 'kiwi']}
+    arms = cards.arms_from(['cand=c:s'])
+    cards.build_arms(['cand=new'], arms, [entry], tmp_path, 'task', True)
+    text = capsys.readouterr().out
+    assert 'build.lock' not in text and 'wip.sh --slot s --role both' in text
+    assert arms['cand']['build_slot'] is True
+    source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    assert "if build_role == 'both' and arm['build_lock_mode'] != 'native-phase':" in source
+    wip = (ROOT / 'wip.sh').read_text()
+    assert '"$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust' in wip
+
+
+def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    import sys
+    spec = importlib.util.spec_from_file_location('wip_cards_fast0', ROOT / 'scripts/bench/wip-cards.py')
+    cards = importlib.util.module_from_spec(spec)
+    sys.modules['wip_cards_fast0'] = cards
+    spec.loader.exec_module(cards)
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
+    monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
+    config = tmp_path / 'card.config'
+    config.write_text('SPARK_COUNT=0\n')
+    entry = {'name': 'glmf-max', 'family': 'glm5_flash', 'config': str(config), 'sparks': [], 'gpus': [0, 1]}
+    arms = cards.arms_from(['cand=c:s'])
+    cards.build_arms(['cand=new'], arms, [entry], tmp_path, 'task', True)
+    assert '--role coordinator' in capsys.readouterr().out
+    assert arms['cand']['build_role'] == 'coordinator'
