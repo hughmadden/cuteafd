@@ -2559,7 +2559,6 @@ impl<'a> Qwen4Engine<'a> {
             let owner = self.state_map.layers[index].owner;
             let w = work[owner];
             self.on_owner(owner, || {
-                self.probe_entry(index);
                 match layer.attention {
                     Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, cap, tables.spec)?,
                     Qwen4Attention::Full => self.full(w, index, layer, rows, cap, tables)?,
@@ -2585,6 +2584,8 @@ impl<'a> Qwen4Engine<'a> {
                 }
                 Ok(())
             })?;
+            crate::shared::console::layer_mark(index);
+            self.on_owner(owner, || self.probe_layer(w, index, t))?;
             if let Some(next) = next {
                 let next_owner = next_owner.context("Qwen next attention owner")?;
                 if next_owner != owner {
@@ -2598,13 +2599,12 @@ impl<'a> Qwen4Engine<'a> {
                     })?;
                 }
                 self.on_owner(next_owner, || {
+                    self.probe_entry(index + 1);
                     if self.cfg.ple_layers.contains(&(index + 1)) { self.finish_ple(work[next_owner])?; }
                     self.enter(work[next_owner], &mut cur[next_owner], (!materialize).then_some(()), next,
                         index + 1, rows, tables.spec)
                 })?;
             }
-            crate::shared::console::layer_mark(index);
-            self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, t))?;
         }
         let ticket = hops.send(1, 0, work[1].streams[cur[1]].buffer.ptr, t)?;
         let landed = hops.land(ticket)?;
