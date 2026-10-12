@@ -209,7 +209,8 @@ tok/s; C1 decode and concurrent code aggregate with thinking off (up to C8, clam
 - **MiMo sliced checkpoints:** copy the checkpoint's `dflash/` directory into
   the slice by hand until the next release.
   [Details](docs/sliced-checkpoints.md#known-limit-v200)
-- **GLM Flash tr3** vision needs `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash`.
+- **GLM Flash tr3** vision needs `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash`; without
+  it `VISION=auto` serves text only and says so.
 
 ### Methodology
 

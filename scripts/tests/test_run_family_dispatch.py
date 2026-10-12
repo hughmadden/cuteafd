@@ -1952,6 +1952,66 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
         assert f"--vision {mode or 'auto'}" in preflight
 
 
+@pytest.mark.parametrize("vision", [None, "auto"])
+def test_glmf_auto_vision_serves_text_when_the_plan_turns_vision_off(tmp_path, vision):
+    """VISION=auto (the default) follows the encoder plan: when `cuteafd plan` resolves automatic
+    vision to off (a checkpoint whose own chat template cannot mark images, with no
+    CHAT_TEMPLATE_FROM), the launch is text only: serve-glmf gets --vision off and no encoder
+    identity, and no worker starts an encoder. The plan is asked for auto, without a template source."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "encoder_plan_hash": "ab" * 32,
+            "vision": "off", "encoder": {"kind": {"kind": "off"}, "replicas": []}}
+    keys = "RTX_GPUS=1\nSPECULATOR=off\n" + (f"VISION={vision}\n" if vision else "")
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " "
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line) + " "
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    assert " --vision auto " in planner and "--chat-template-from" not in planner, planner
+    assert " --vision off " in launch and launch.count(" --vision ") == 1, launch
+    for flag in ("--vision-peers", "--encoder-plan-hash", "--encoder-revision", "--chat-template-from"):
+        assert flag not in launch, (flag, launch)
+    assert "--encoder" not in worker, worker
+
+
+@pytest.mark.parametrize("vision,kind", [(None, "spark"), ("auto", "spark"), ("auto", "rtx"), ("spark:0", "spark"),
+                                         ("rtx:0", "rtx")])
+def test_glmf_encoder_placement_plan_gets_the_template_source_serving_gets(tmp_path, vision, kind):
+    """With CHAT_TEMPLATE_FROM the plan is told the template source serve-glmf gets (once each), so
+    automatic vision stays on for a checkpoint whose own template cannot mark images; the launch is
+    the placement the plan chose, as before."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    placement = {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0})}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = ("RTX_GPUS=1\nSPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nCHAT_TEMPLATE_FROM=test/model\n"
+            + (f"VISION={vision}\n" if vision else ""))
+    result = _family_launch_result(tmp_path, config, "test/model", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " "
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line) + " "
+    for command in [planner, launch]:
+        assert " --chat-template-from test/model " in command and command.count("--chat-template-from") == 1, command
+    assert f" --vision {vision or 'auto'} " in planner, planner
+    assert f" --vision {kind}:0 " in launch, launch
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+
+
+def test_glmf_text_launch_gives_the_plan_no_template_source(tmp_path):
+    """VISION=off ignores CHAT_TEMPLATE_FROM on both commands, as before."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=off\n"
+                                   "CHAT_TEMPLATE_FROM=test/model\n")
+    assert result.returncode == 0, result.stderr
+    assert "cuteafd plan" in result.stderr and "--chat-template-from" not in result.stderr
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
                                              ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
 def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, keys, forwarded):

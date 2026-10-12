@@ -285,6 +285,8 @@ Kernels: what exists, what to write (WP‑3 unless noted).
 - the API returns 400 with the launch hint;
 - `cuteafd plan` prints the bytes saved.
 
+`VISION=auto` resolves to this mode, with one note, for a GLM 5.3 Flash checkpoint whose own chat template cannot mark images and whose config names no base model, unless `CHAT_TEMPLATE_FROM` supplies the vendor template; an explicit placement is refused instead.
+
 The plan hash includes the placement, so coordinator and Sparks agree.
 
 ## 8. Quality gates and the fidelity framework

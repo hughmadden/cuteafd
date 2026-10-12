@@ -298,6 +298,8 @@ case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; e
 family_args=(--embedding-placement "$embedding")
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
+# Without it, VISION=auto serves a GLM Flash checkpoint whose own chat template cannot mark images
+# as text: the encoder plan below turns vision off and says so. An explicit placement still fails.
 chat_template_from="$(get CHAT_TEMPLATE_FROM)"
 if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   [[ "$family" == glm5_flash ]] || release_die "CHAT_TEMPLATE_FROM currently applies only to GLM Flash vision"
@@ -1033,6 +1035,9 @@ audio_encoder_hash=""
     fi
     [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+    # The plan resolves VISION=auto as serve-glmf would serve it: with the template source serving
+    # gets, vision stays on; without one, a checkpoint template that cannot mark images plans text.
+    [[ -z "$chat_template_from" || "$vision" == off ]] || plan_draft_args+=(--chat-template-from "$chat_template_from")
   fi
   [[ "$family" != glm5_flash || "${index_cache:-keys}" != compact ]] || plan_draft_args+=(--index-cache compact)
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.

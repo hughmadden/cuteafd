@@ -144,6 +144,23 @@ pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
     })
 }
 
+/// Automatic vision for a checkpoint that ships a tower but cannot mark images from its own files
+/// (`GlmEncoding::vision_template_gap`): text only, with the note to log. An explicit placement, an
+/// explicit template source and a checkpoint without a tower are returned as given; serving still
+/// refuses an explicit placement its template cannot serve.
+pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std::path::Path,
+    template_from: Option<&str>) -> Result<(cuteafd_loader::plan::MediaMode, Option<String>)> {
+    use cuteafd_loader::plan::MediaMode;
+    if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config(mode, snapshot)?.is_none() {
+        return Ok((mode, None));
+    }
+    Ok(match GlmEncoding::vision_template_gap(snapshot)? {
+        Some(gap) => (MediaMode::Off, Some(format!("VISION=auto serves text only (vision off): {gap}; \
+            set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template to serve images"))),
+        None => (mode, None),
+    })
+}
+
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
@@ -1918,6 +1935,85 @@ mod serve_cli_tests {
         assert_eq!(draft_probs(&dflash), vec![0.9, 0.6]);
         let dspark = Draft { tokens: vec![1, 2], features: vec![[0.0; 4]; 2], confidence: vec![0.8, 0.4] };
         assert_eq!(draft_probs(&dspark), vec![0.8, 0.4]);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod auto_vision_tests {
+    use super::auto_vision;
+    use cuteafd_loader::plan::MediaMode;
+    use serde_json::json;
+    use std::path::Path;
+
+    pub(crate) const MARKS_IMAGES: &str = "{% for m in messages %}{% for p in m.content %}{% if p.type in ['image','image_url'] %}<boi><img><eoi>{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}<think>";
+    pub(crate) const TEXT_ONLY: &str = "text-only quant reminder<think>";
+
+    /// The chat files of a GLM 5.3 Flash snapshot: an eight-token vocabulary with the image
+    /// markers, `template`, and a config with or without a tower and a declared base model.
+    pub(crate) fn chat_files(path: &Path, template: &str, tower: bool, base: Option<&str>) {
+        let markers = ["<unk>", "<boi>", "<img>", "<eoi>", "</think>", "<tool_call>", "</tool_call>", "<think>"];
+        let vocab: serde_json::Map<String, serde_json::Value> = markers.iter().enumerate()
+            .map(|(id, token)| (token.to_string(), json!(id))).collect();
+        let added: Vec<_> = markers.iter().enumerate().map(|(id, content)| json!({"id":id,
+            "content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true})).collect();
+        let tokenizer = json!({"version":"1.0","truncation":null,"padding":null,"added_tokens":added,
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":vocab,"unk_token":"<unk>"}});
+        std::fs::write(path.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let mut config = json!({"model_type":"glm5_next","vocab_size":8,"image_start_token_id":1,
+            "image_token_id":2,"image_end_token_id":3,"eos_token_id":[0]});
+        if tower { config["vision_config"] = json!({"depth":24}); }
+        if let Some(base) = base { config["base_model"] = json!(base); }
+        std::fs::write(path.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(path.join("chat_template.jinja"), template).unwrap();
+    }
+
+    #[test]
+    fn auto_serves_text_when_the_checkpoint_template_cannot_mark_images() {
+        let temp = tempfile::tempdir().unwrap();
+        chat_files(temp.path(), TEXT_ONLY, true, None);
+        let (mode, note) = auto_vision(MediaMode::Auto, temp.path(), None).unwrap();
+        let note = note.unwrap();
+        assert_eq!(mode, MediaMode::Off);
+        assert!(note.contains("vision off") && note.contains("does not render image markers")
+            && note.contains("no base_model") && note.contains("CHAT_TEMPLATE_FROM=")
+            && note.contains(&temp.path().display().to_string()), "{note}");
+        // The resolved mode serves the text template; serving the tower still refuses this checkpoint.
+        assert!(super::super::media::vision_config(mode, temp.path()).unwrap().is_none());
+        let refused = super::GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).unwrap_err().to_string();
+        assert!(refused.contains("VISION enabled") && refused.contains("CHAT_TEMPLATE_FROM"), "{refused}");
+    }
+
+    #[test]
+    fn explicit_placement_and_an_explicit_template_source_are_left_to_serving() {
+        let temp = tempfile::tempdir().unwrap();
+        chat_files(temp.path(), TEXT_ONLY, true, None);
+        for mode in [MediaMode::Spark(None), MediaMode::Spark(Some(1)), MediaMode::Rtx(None), MediaMode::Rtx(Some(0)),
+            MediaMode::Off] {
+            assert_eq!(auto_vision(mode, temp.path(), None).unwrap(), (mode, None));
+        }
+        // The source is not opened here: serve-glmf validates it, as before.
+        assert_eq!(auto_vision(MediaMode::Auto, temp.path(), Some("vendor/flash")).unwrap(), (MediaMode::Auto, None));
+        assert_eq!(auto_vision(MediaMode::Auto, temp.path(), Some("/does/not/exist")).unwrap(), (MediaMode::Auto, None));
+    }
+
+    #[test]
+    fn auto_is_unchanged_for_a_usable_template_a_declared_base_model_and_no_tower() {
+        let temp = tempfile::tempdir().unwrap();
+        chat_files(temp.path(), MARKS_IMAGES, true, None);
+        assert_eq!(auto_vision(MediaMode::Auto, temp.path(), None).unwrap(), (MediaMode::Auto, None));
+        // A declared base model is serving's to resolve (or to refuse when it is not downloaded).
+        chat_files(temp.path(), TEXT_ONLY, true, Some("vendor/flash"));
+        assert_eq!(auto_vision(MediaMode::Auto, temp.path(), None).unwrap(), (MediaMode::Auto, None));
+        // No tower: no template is read at all, as on a text-only checkpoint today.
+        chat_files(temp.path(), TEXT_ONLY, false, None);
+        std::fs::remove_file(temp.path().join("chat_template.jinja")).unwrap();
+        std::fs::remove_file(temp.path().join("tokenizer.json")).unwrap();
+        assert_eq!(auto_vision(MediaMode::Auto, temp.path(), None).unwrap(), (MediaMode::Auto, None));
+        // A tower whose chat files cannot be read is an error here, not a silent text launch.
+        chat_files(temp.path(), TEXT_ONLY, true, None);
+        std::fs::remove_file(temp.path().join("tokenizer.json")).unwrap();
+        assert!(auto_vision(MediaMode::Auto, temp.path(), None).is_err());
     }
 }
 

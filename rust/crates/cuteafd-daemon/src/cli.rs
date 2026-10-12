@@ -199,6 +199,11 @@ pub(crate) struct PlanArgs {
     /// Auto enables qualified bundled audio towers, otherwise off.
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
     pub(crate) audio: cuteafd_loader::plan::MediaMode,
+    /// GLM 5.3 Flash's explicit vision template source, as serve-glmf takes it (not opened here).
+    /// Without one, automatic vision plans text only when the checkpoint's own chat template
+    /// cannot mark images, as serve-glmf serves it.
+    #[arg(long)]
+    pub(crate) chat_template_from: Option<String>,
     /// Override automatic placement of the untied token embedding.
     #[arg(long, alias = "embed-placement", value_enum)]
     pub(crate) embedding_placement: Option<crate::shared::token_io::EmbedPlacement>,
