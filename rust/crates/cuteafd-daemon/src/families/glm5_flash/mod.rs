@@ -912,6 +912,9 @@ pub(crate) struct GoldenArgs {
     /// Private per-round logits/state/MLA dumps for same-width placement diagnostics.
     #[arg(long, requires = "replay_trace")]
     pub replay_dump: Option<PathBuf>,
+    /// Continue private dump diagnostics across serial-geometry differences, never a correctness PASS.
+    #[arg(long, requires = "replay_dump")]
+    pub replay_dump_continue: bool,
     /// Diagnostic full-device drain before drafter launches and context updates.
     #[arg(long, requires = "replay_trace")]
     pub replay_draft_sync: bool,
@@ -1007,8 +1010,8 @@ mod replay_cli_tests {
         let trace = Parse::try_parse_from(base.into_iter().chain(["--replay-check", "9", "--replay-production",
             "--replay-trace", "/trace"])).unwrap();
         assert_eq!(trace.args.replay_trace.as_deref(), Some(std::path::Path::new("/trace")));
-        assert!(trace.args.replay_dump.is_none() && !trace.args.replay_draft_sync);
-        for option in [vec!["--replay-dump", "/dump"], vec!["--replay-draft-sync"]] {
+        assert!(trace.args.replay_dump.is_none() && !trace.args.replay_draft_sync && !trace.args.replay_dump_continue);
+        for option in [vec!["--replay-dump", "/dump"], vec!["--replay-draft-sync"], vec!["--replay-dump-continue"]] {
             assert!(Parse::try_parse_from(base.into_iter().chain(option)).is_err());
         }
         let diagnostic = Parse::try_parse_from(base.into_iter().chain(["--replay-check", "6",
@@ -1016,6 +1019,12 @@ mod replay_cli_tests {
             "--replay-draft-sync"])).unwrap();
         assert!(diagnostic.args.replay_draft_sync);
         assert_eq!(diagnostic.args.replay_dump.as_deref(), Some(std::path::Path::new("/dump")));
+        assert!(Parse::try_parse_from(base.into_iter().chain(["--replay-check", "6", "--replay-production",
+            "--replay-trace", "/trace", "--replay-dump-continue"])).is_err());
+        let continuation = Parse::try_parse_from(base.into_iter().chain(["--replay-check", "6",
+            "--replay-production", "--replay-trace", "/trace", "--replay-dump", "/dump",
+            "--replay-dump-continue"])).unwrap();
+        assert!(continuation.args.replay_dump_continue);
     }
 }
 

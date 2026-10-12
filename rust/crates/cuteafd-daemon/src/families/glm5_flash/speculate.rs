@@ -562,6 +562,11 @@ fn first_differing_byte(a: &[u8], b: &[u8]) -> Option<usize> {
         .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
 }
 
+fn replay_round_valid(dump_continue: bool, geometry_exact: bool, serial_emissions_exact: bool,
+    recorded_emissions_exact: bool) -> bool {
+    recorded_emissions_exact && (dump_continue || (geometry_exact && serial_emissions_exact))
+}
+
 fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
     path: &std::path::Path) -> Result<()> {
     use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
@@ -625,6 +630,8 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
             target.len = start + keep;
             target.kda_len = target.len;
             let committed = engine.slot_state(target.slot)?;
+            let committed_mla = args.replay_dump_continue.then(||
+                super::prefix::paged_rows(&family, &target, target.len)).transpose()?;
             if args.replay_draft_sync { engine.replay_device_sync()?; }
             if let Some(drafter) = &engine.drafter {
                 drafter.update(&(0..keep).map(|r| ContextRow { tap_row: r, slot: 0, position: start + r })
@@ -632,6 +639,10 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
             }
             ensure!(engine.slot_state(target.slot)? == committed,
                 "round {}: drafter context update changed target state", round.round);
+            if let Some(before) = committed_mla {
+                ensure!(super::prefix::paged_rows(&family, &target, target.len)? == before,
+                    "round {}: drafter context update changed target MLA", round.round);
+            }
             Some(committed)
         };
         let mut expected = Vec::new();
@@ -671,14 +682,19 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
                 "state_first_byte": state_first, "mla_first_byte": paged_first }))?)?;
         }
         let first = actual[..keep * vocab].iter().zip(&expected).position(|(a,b)| a.to_bits() != b.to_bits());
-        let emissions_exact = expected.chunks_exact(vocab).map(argmax).eq(emitted.iter().copied());
+        let emissions_exact = actual[..keep * vocab].chunks_exact(vocab).map(argmax).eq(emitted.iter().copied());
+        let serial_emissions_exact = expected.chunks_exact(vocab).map(argmax).eq(emitted.iter().copied());
         println!("round {}: start {start}, live {}, bucket {}, keep {keep}: logits exact {logit_exact}, \
             first differing (row,vocab) {:?}; state exact {state_exact}, first byte {state_first:?}; \
             MLA exact {paged_exact}, first byte {paged_first:?}; \
-            selector exact {sampler_exact}; recorded emissions exact {emissions_exact}", round.round, input.len(),
+            selector exact {sampler_exact}; recorded emissions exact {emissions_exact}; \
+            serial emissions exact {serial_emissions_exact}", round.round, input.len(),
             engine.serving_decode_rows(input.len(), round.spec), first.map(|i| (i / vocab, i % vocab)));
-        ensure!(logit_exact && state_exact && paged_exact && sampler_exact && emissions_exact,
-            "round {}: first serving replay divergence", round.round);
+        ensure!(replay_round_valid(args.replay_dump_continue, logit_exact && state_exact && paged_exact,
+            serial_emissions_exact, emissions_exact), "round {}: first serving replay divergence", round.round);
+        if args.replay_dump_continue {
+            println!("round {}: dump-only diagnostic; serial-geometry comparison is informational, not a correctness PASS", round.round);
+        }
         if round.finished[0] {
             println!("round {}: finished cold frontier; persistent state and MLA comparison skipped", round.round);
             break;
@@ -964,6 +980,19 @@ mod tests {
         assert_eq!(super::first_differing_byte(&[1, 2], &[1, 3]), Some(1));
         assert_eq!(super::first_differing_byte(&[1], &[1, 2]), Some(1));
         assert_eq!(super::first_differing_byte(&[1], &[1]), None);
+    }
+
+    #[test]
+    fn replay_dump_continuation_never_waives_recorded_emissions() {
+        for continue_dump in [false, true] {
+            for geometry in [false, true] {
+                for serial_emissions in [false, true] {
+                    assert!(!super::replay_round_valid(continue_dump, geometry, serial_emissions, false));
+                    assert_eq!(super::replay_round_valid(continue_dump, geometry, serial_emissions, true),
+                        continue_dump || (geometry && serial_emissions));
+                }
+            }
+        }
     }
 
     #[test]
