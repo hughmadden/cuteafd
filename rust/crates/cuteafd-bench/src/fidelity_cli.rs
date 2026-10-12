@@ -122,6 +122,12 @@ fn validate_served_reference(reference: &Reference, model: &str, dataset: bool) 
     Ok(())
 }
 
+fn get(agent: &ureq::Agent, url: &str, key: &Option<String>) -> Result<Value> {
+    let mut request = agent.get(url);
+    if let Some(key) = key { request = request.set("authorization", &format!("Bearer {key}")); }
+    Ok(request.call()?.into_json()?)
+}
+
 fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -> Result<Value> {
     let mut request = agent.post(url);
     if let Some(key) = key { request = request.set("authorization", &format!("Bearer {key}")); }
@@ -149,9 +155,9 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(900)).build();
     let base = args.url.trim_end_matches('/');
-    let models: Value = agent.get(&format!("{base}/v1/models")).call()?.into_json()?;
+    let models = get(&agent, &format!("{base}/v1/models"), &args.api_key)?;
     let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let status: Value = agent.get(&format!("{base}/v1/bench/status")).call()?.into_json()?;
+    let status = get(&agent, &format!("{base}/v1/bench/status"), &args.api_key)?;
     let model = status["checkpoint"].as_str().unwrap_or(served);
     let mut model_record = models["data"][0].clone();
     model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
@@ -399,6 +405,58 @@ mod tests {
         argv.extend_from_slice(extra);
         let Action::Run(args) = Cli::try_parse_from(argv).unwrap().args.action else { panic!("run action") };
         args
+    }
+
+    #[test]
+    fn discovery_sends_api_key_on_models_and_bench_status() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for path in ["/v1/models", "/v1/bench/status"] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "discovery request timed out");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), format!("GET {path} HTTP/1.1"));
+                let mut authenticated = false;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" { break; }
+                    authenticated |= line.trim().eq_ignore_ascii_case("authorization: Bearer unit-test-key");
+                }
+                assert!(authenticated, "{path} missing API key");
+                let body = if path == "/v1/models" { r#"{"data":[{"id":"test/model"}]}"# } else { "{}" };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let args = parse(&["--url", &url, "--api-key", "unit-test-key"]);
+        let error = run(&args).unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("no verified published fidelity config for test/model"), "{error:#}");
+    }
+
+    #[test]
+    fn cli_creates_dump_parent_before_authenticated_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let dump = temp.path().join("new/arm/dump");
+        let args = parse(&["--dump-dir", dump.to_str().unwrap(), "--url", "http://127.0.0.1:1"]);
+        assert!(run(&args).is_err());
+        assert!(dump.is_dir());
+        assert!(!dump.join("window-000").exists());
     }
 
     #[test]
