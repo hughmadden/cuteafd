@@ -743,3 +743,81 @@ def test_slot_check_reads_host_root_without_any_container(tmp_path, monkeypatch)
     (slot / 'workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS').write_text('changed\n')
     with pytest.raises(ValueError, match='raptor: missing or unsealed WIP slot serving:s: .*ARTIFACT_SHA256SUMS seal mismatch'):
         cards.slot_check(arm, 'raptor')
+
+
+def _kit(tmp_path, *entries):
+    kit = tmp_path / 'kit'
+    kit.mkdir(exist_ok=True)
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=list(entries))))
+    return kit
+
+
+def test_panels_levels_and_post_load_reach_every_job(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
+        '--arm', 'a=b:s', '--arm', 'c=d:s', '--state', str(state), '--panels', 'none', '--levels', '1,16', '--post-load-c1', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+        assert matrix['profile'] == 'panels:'
+        assert matrix['levels'] == [1, 16] and matrix['post_load_c1'] is True
+
+
+@pytest.mark.parametrize('extra,match', [(['--post-load-c1'], 'needs --levels'), (['--panels', 'none'], 'runs nothing'),
+    (['--levels', '1,1'], 'distinct'), (['--panels', 'bogus'], 'unknown requested panel')])
+def test_subset_flags_refuse_nonsense(entry, tmp_path, monkeypatch, extra, match):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(tmp_path / 'state'), *extra, '--dry-run'])
+    with pytest.raises((SystemExit, ValueError), match=None) as caught:
+        cards.main()
+    if caught.type is ValueError:
+        assert match in str(caught.value)
+
+
+def test_profile_dir_is_per_job_and_driver_owned(entry, tmp_path):
+    job = cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                         {'PROFILE': 'expert-timing,transport-timing'}, set(), None, 1)
+    values = job['entry']['set']
+    assert values['PROFILE_DIR'] == str(Path(job['state']) / 'profile')
+    assert (Path(job['state']) / 'profile').is_dir()
+    assert 'PROFILE_DIR=' + values['PROFILE_DIR'] in (Path(job['state']) / 'base.config').read_text()
+    with pytest.raises(ValueError, match='PROFILE_DIR is owned by the driver'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE_DIR': '/x'}, set(), None, 1)
+
+
+def test_profile_collection_pulls_each_spark_and_records_failures(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'expert-timing'}, set(), None, 1)
+    seen = []
+    def fake(cmd, **kwargs):
+        seen.append(cmd)
+        if 'emu:' in cmd[-2]:
+            raise subprocess.CalledProcessError(23, cmd, stderr='no such dir')
+        Path(cmd[-1], 'expert-timing-' + cmd[-2].split(':')[0] + '-rank0.jsonl').write_text('{}\n')
+    monkeypatch.setattr(cards.subprocess, 'run', fake)
+    result = cards.collect_profile(job)
+    assert [c[-2].split(':')[0] for c in seen] == ['ostrich', 'dodo', 'emu']
+    assert result['hosts']['emu'].startswith('failed') and result['hosts']['ostrich'] == 'collected'
+    assert 'expert-timing-dodo-rank0.jsonl' in result['files']
+
+
+def test_sweep_rows_and_sweep_only_jobs(entry, tmp_path):
+    entry = {**entry, 'profile': 'panels:', 'levels': [1, 16], 'post_load_c1': True}
+    job = make(entry, tmp_path)
+    sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
+    sweep.parent.mkdir(parents=True)
+    sweep.write_text(json.dumps({'points': [{'c': 1, 'phase': 'levels', 'aggregate_tok_s': 50.0},
+        {'c': 16, 'phase': 'levels', 'aggregate_tok_s': 400.0}, {'c': 1, 'phase': 'post_load', 'aggregate_tok_s': 47.5}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass', row
+    assert (row['C1'], row['C16'], row['post-load C1']) == (50.0, 400.0, 47.5)
+
+
+def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='  v41 family=x set={}', stdout=''))
+    with pytest.raises(ValueError, match='predates smoke fields levels, post_load_c1'):
+        cards.binary_supports('/old/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
+    monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='levels=Some([1]) post_load_c1=true', stdout=''))
+    cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])

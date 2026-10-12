@@ -43,7 +43,7 @@ def requested_panels(profile):
     if not profile.startswith('panels:'):
         return []
     panels = [p.strip() for p in profile[7:].split(',') if p.strip()]
-    bad = set(panels) - PANELS
+    bad = set(panels) - PANELS - {'baseline'}
     if bad:
         raise ValueError('unknown requested panel: ' + ', '.join(sorted(bad)))
     return panels
@@ -204,6 +204,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     label = f'{card}-{arm_name}-r{repeat}' + ('-simulated' if simulated else '')
     dest = state / label
     dest.mkdir(parents=True, exist_ok=True)
+    if values.get('PROFILE'):
+        # One per-job directory, mounted on the coordinator and every Spark at
+        # the same path; Spark-side files are collected back after the run.
+        values['PROFILE_DIR'] = str(dest / 'profile')
+        (dest / 'profile').mkdir(exist_ok=True)
+    elif 'PROFILE_DIR' in values:
+        raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
     base = dest / 'base.config'
     base.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
     metadata = {k: entry.pop(k) for k in ('source_matrix', 'correctness_only', 'published', 'compared', 'kind', 'probes', 'expected_pool') if k in entry}
@@ -261,6 +268,21 @@ def smoke_groups(jobs, parallel):
     if parallel > 1 and len({j['arm'] for j in jobs}) == 1:
         return [jobs]
     return [[job] for job in jobs]
+
+
+def binary_supports(binary, repo, job, needs):
+    """Asks the smoke binary itself (a CPU-only --dry-run of this job's matrix)
+    whether it knows each needed entry field; an older binary would ignore them."""
+    if not needs:
+        return
+    result = subprocess.run([binary, 'bench', 'smoke', '--matrix', str(Path(job['state']) / 'matrix.json'), '--repo', str(repo),
+                             '--state', str(Path(job['state']) / 'smoke-dry'), '--dry-run'],
+                            capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise ValueError(f"{binary} bench smoke --dry-run failed: {(result.stderr or result.stdout).strip().splitlines()[-1:]}")
+    missing = [field for field in needs if field + '=' not in result.stderr]
+    if missing:
+        raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
 
 
 def smoke_command(binary, repo, job):
@@ -524,6 +546,25 @@ def ledger(dest):
     return {'lines': lines, 'spark_ring_peak_bytes': rings, 'device_used_peak_bytes': device_peaks}
 
 
+def collect_profile(job):
+    """Copies Spark-side PROFILE files back into the job's profile directory
+    (the coordinator writes there directly). Missing hosts are recorded, not fatal."""
+    values = job['entry']['set']
+    directory = values.get('PROFILE_DIR')
+    if not directory:
+        return None
+    result = {'dir': directory, 'switches': values.get('PROFILE', '').split(','), 'hosts': {}}
+    for host in job['entry']['sparks']:
+        try:
+            subprocess.run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes', f'{host}:{directory}/', directory + '/'],
+                           check=True, capture_output=True, text=True, timeout=300)
+            result['hosts'][host] = 'collected'
+        except (subprocess.SubprocessError, OSError) as error:
+            result['hosts'][host] = 'failed: ' + (getattr(error, 'stderr', '') or str(error)).strip()[:200]
+    result['files'] = sorted(p.name for p in Path(directory).glob('*') if p.is_file())
+    return result
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -532,7 +573,10 @@ def summarize_job(job, exit_code):
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
-    if len(reports) != 1:
+    sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels'))
+    if sweep_only and not reports:
+        pass  # No server-side profile ran; the sweep below carries the numbers.
+    elif len(reports) != 1:
         row.update(status='failed', error=f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
@@ -553,6 +597,20 @@ def summarize_job(job, exit_code):
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
             row[metric] = None
+    profile = collect_profile(job)
+    if profile:
+        row['profile'] = profile
+    sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
+              if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
+    if job['entry'].get('levels'):
+        if len(sweeps) != 1:
+            row.update(status='failed', error=row.get('error') or f'expected one sweep.json, found {len(sweeps)}')
+        else:
+            points = json.loads(sweeps[0].read_text()).get('points', [])
+            row['sweep'] = points
+            for point in points:
+                key = 'post-load C1' if point['phase'] == 'post_load' else f"C{point['c']}"
+                row[key] = point['aggregate_tok_s']
     row['peaks'] = peaks(dest)
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
@@ -952,6 +1010,10 @@ def main():
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
+    parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
+                        '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
+    parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
+    parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
@@ -1004,6 +1066,26 @@ def main():
             raise ValueError('arm override names must be selected cards')
         for card, values in parsed.items():
             arm_overrides.setdefault(name, {}).setdefault(card, {}).update(values)
+    if args.post_load_c1 and not args.levels:
+        parser.error('--post-load-c1 needs --levels')
+    levels = None
+    if args.levels:
+        levels = [int(x) for x in args.levels.split(',') if x.strip()]
+        if not levels or len(set(levels)) != len(levels) or not all(1 <= x <= 256 for x in levels):
+            parser.error('--levels takes distinct concurrency levels in 1..256, e.g. 1,16')
+    if args.panels is not None:
+        selection = '' if args.panels.strip() == 'none' else args.panels.strip()
+        if not selection and not levels:
+            parser.error('--panels none runs nothing without --levels')
+        profile = 'panels:' + selection
+        requested_panels(profile)
+        for card in cards:
+            card['profile'] = profile
+    for card in cards:
+        if levels:
+            card['levels'] = levels
+            if args.post_load_c1:
+                card['post_load_c1'] = True
     probes = {card['name']: set(card.get('probes', [])) for card in cards}
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.probe:
@@ -1090,6 +1172,9 @@ def main():
                 if kind in job['entry']:
                     print('# smoke ' + kind + ': ' + shlex.join(job['entry'][kind]['argv']))
         return 0
+    needs = ['levels', 'post_load_c1'] if args.levels else []
+    for job in jobs[:1]:
+        binary_supports(args.binary, args.repo, job, needs)
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
     if args.nonce_seed is not None:

@@ -447,6 +447,45 @@ release_trim() {
   printf '%s' "$value"
 }
 
+# PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
+# every family, on the coordinator and on every Spark worker:
+#   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
+#   transport-timing  CUTEAFD_PROTOCOL_V2_TCP_TIMING=1 (expert exchange timing)
+#   expert-timing     CUTEAFD_EXPERT_TIMING=1 (Spark worker expert compute timing)
+# Every profiled container also gets CUTEAFD_PROFILE_HOST (the physical host,
+# never the container id, which is what the hostname is inside Docker).
+# PROFILE_DIR=/abs/dir is created on each host (the caller's job), mounted at the
+# same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host and rank.
+# Sets RELEASE_PROFILE_ARGS (docker arguments) in the caller's shell, so a bad
+# value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
+release_profile_switches='census transport-timing expert-timing'
+release_profile_docker_args() {
+  local profile="$1" dir="$2" host="$3" switch
+  local -a switches=()
+  RELEASE_PROFILE_ARGS=()
+  if [[ -z "$profile" ]]; then
+    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE"
+    return 0
+  fi
+  [[ "$profile" =~ ^[a-z-]+(,[a-z-]+)*$ ]] ||
+    release_die "PROFILE must be a comma list of: ${release_profile_switches// /, }"
+  IFS=, read -ra switches <<<"$profile"
+  for switch in "${switches[@]}"; do
+    case "$switch" in
+      census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug') ;;
+      transport-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_PROTOCOL_V2_TCP_TIMING=1) ;;
+      expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
+      *) release_die "unknown PROFILE switch $switch (known: ${release_profile_switches// /, })" ;;
+    esac
+  done
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_PROFILE_HOST=$host")
+  if [[ -n "$dir" ]]; then
+    [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_DIR must be an absolute directory"
+    RELEASE_PROFILE_ARGS+=(-v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
+  fi
+}
+
 # Shared key grammar for release lifecycle scripts and the family launcher.
 release_known_key() {
   case "$1" in
@@ -468,6 +507,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
+    PROFILE|PROFILE_DIR) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -692,6 +732,8 @@ release_load_config() {
   # geometry (TP = SPARK_COUNT, EP = 1). See docs/tp-ep-configuration.md.
   SPARK_TP=
   SPARK_EP=
+  PROFILE=
+  PROFILE_DIR=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev

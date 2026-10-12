@@ -102,6 +102,13 @@ pub struct Entry {
     pub prelaunch: Option<Hook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observer: Option<Hook>,
+    /// Client-side code-decode sweep after the profile (`[1, 16]`), written to
+    /// `sweep.json` beside the report; see `crate::sweep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levels: Option<Vec<usize>>,
+    /// Re-measure C1 after the widest sweep level (post-load C1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_load_c1: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -206,6 +213,8 @@ impl Entry {
             precheck: self.precheck.clone().or_else(|| defaults.precheck.clone()),
             prelaunch: self.prelaunch.clone().or_else(|| defaults.prelaunch.clone()),
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
+            levels: self.levels.clone().or_else(|| defaults.levels.clone()),
+            post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
         }
     }
 
@@ -251,6 +260,9 @@ pub struct Outcome {
     pub finished: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<BTreeMap<String, String>>,
+    /// The client-side sweep, when the entry asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<crate::sweep::Sweep>,
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -631,6 +643,13 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         }
         crate::profiles::validate_selection(entry.profile.as_deref().or(matrix.profile.as_deref()).unwrap_or("smoke"))
             .map_err(anyhow::Error::msg)?;
+        if let Some(levels) = &entry.levels {
+            let text = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
+            crate::sweep::parse_levels(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
+        }
+        if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
+            bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
+        }
         entries.push(entry);
     }
     let mut state = load_state(&paths.state);
@@ -644,8 +663,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} set={:?}", e.name,
-                e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.set);
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} set={:?}", e.name,
+                e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
+                e.post_load_c1.unwrap_or(false), e.set);
         }
         return Ok(());
     }
@@ -810,7 +830,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     let mut observer = None;
     let mut launcher_started = false;
     let mut hook_results = BTreeMap::new();
-    let result = (|| -> Result<Report> {
+    let result = (|| -> Result<Option<Report>> {
         let config_path = write_config(entry, repo, configs, parallel)?;
         let config = read_config(&config_path)?;
         let port = entry.port(&config);
@@ -866,15 +886,27 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 .unwrap_or_else(|error| format!("{error:#}")));
             checked.context("precheck hook failed before workload")?;
         }
-        // `panels:a,b` runs those panels instead of a profile.
-        let (profile, panels) = match profile.strip_prefix("panels:") {
-            Some(list) => (None, Some(list.split(',').map(str::to_string).collect())),
+        // `panels:a,b` runs those panels instead of a profile; a bare `panels:`
+        // runs no server-side profile at all (the sweep alone, when set).
+        let (profile, panels): (Option<String>, Option<Vec<String>>) = match profile.strip_prefix("panels:") {
+            Some(list) => (None, Some(list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())),
             None => (Some(profile.to_string()), None),
         };
-        let options = crate::cli::RunOptions { url, profile, panels, passes: vec![],
+        let api_key = std::env::var("CUTEAFD_API_KEY").ok();
+        if let (Some(levels), true) = (&entry.levels, panels.as_ref().is_some_and(Vec::is_empty)) {
+            let levels = levels.clone();
+            let sweep = crate::sweep::run(&url, api_key.as_deref(), &levels, entry.post_load_c1.unwrap_or(false))?;
+            let dir = out_root.join("sweep-only").join(&entry.name);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
+            outcome.dir = Some(dir.display().to_string());
+            outcome.sweep = Some(sweep);
+            return Ok(None);
+        }
+        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![],
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
-            api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true,
+            api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))) };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
@@ -889,7 +921,12 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         crate::cli::write_exports(&report, &dir, &options.export)?;
         outcome.dir = Some(dir.display().to_string());
-        Ok(report)
+        if let Some(levels) = &entry.levels {
+            let sweep = crate::sweep::run(&url, api_key.as_deref(), levels, entry.post_load_c1.unwrap_or(false))?;
+            std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
+            outcome.sweep = Some(sweep);
+        }
+        Ok(Some(report))
     })();
     if let Some(mut child) = observer.take() {
         let observed = child.finish();
@@ -907,7 +944,17 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let _ = std::fs::write(log_path.with_extension("hooks.json"), serde_json::to_vec_pretty(&outcome.hooks).unwrap_or_default());
     }
     match result {
-        Ok(report) => {
+        Ok(None) => {
+            outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
+            outcome.code_tok_s = outcome.sweep.as_ref().and_then(|s| s.rate(1, "levels"));
+            let running = Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+            if running == Some(false) {
+                outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
+                outcome.status = "failed".into();
+            }
+        }
+        Ok(Some(report)) => {
             outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
             if let (Some(hooks), Some(dir)) = (&outcome.hooks, &outcome.dir) {
                 let path = Path::new(dir).join("report.json");

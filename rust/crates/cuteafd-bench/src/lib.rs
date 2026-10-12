@@ -27,6 +27,7 @@ pub mod sample;
 pub mod server;
 pub mod smoke;
 pub mod store;
+pub mod sweep;
 pub mod text;
 
 pub use runner::{Bench, UsageToggle};
