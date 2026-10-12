@@ -304,6 +304,8 @@ cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_synchronize(void* cuda_stream);
+// Diagnostic drain of all work on the current CUDA device.
+cuteafd_status_t cuteafd_cuda_device_synchronize(void);
 // Returns immediately: ready=0 means pending; asynchronous errors remain errors.
 cuteafd_status_t cuteafd_cuda_stream_query(void* cuda_stream, int32_t* ready);
 cuteafd_status_t cuteafd_cuda_stream_wait_event(void* cuda_stream, void* cuda_event);

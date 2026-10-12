@@ -729,6 +729,37 @@ impl<'a> GlmDrafter<'a> {
         }
     }
 
+    /// Mutable owners for the opt-in GLM Flash replay alias diagnostic.
+    pub(crate) fn replay_write_ranges(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
+        let mut ranges = Vec::new();
+        for (name, buffer) in [("taps", &self.taps), ("fused", &self.fused),
+            ("fused_norm", &self.fused_norm), ("context_kv", &self.context_kv),
+            ("context_positions", &self.context_positions), ("context_slots", &self.context_slots)] {
+            ranges.push((format!("drafter/{name}"), buffer.buffer));
+        }
+        for (layer, buffers) in self.layers.iter().enumerate() {
+            ranges.push((format!("drafter/layer{layer}/k_ring"), buffers.k_ring.buffer));
+            ranges.push((format!("drafter/layer{layer}/v_ring"), buffers.v_ring.buffer));
+        }
+        if let Some(buffer) = &self.fp8_workspace {
+            ranges.push(("drafter/fp8_workspace".into(), buffer.buffer));
+        }
+        if let Some(w) = self.workspace.borrow().as_ref() {
+            for (name, buffer) in [("h", &w.h), ("n", &w.n), ("conv", &w.conv),
+                ("dynamic", &w.dynamic), ("qkv", &w.qkv), ("q", &w.q), ("k", &w.k),
+                ("v", &w.v), ("attn", &w.attn), ("delta", &w.delta), ("gate_up", &w.gate_up),
+                ("act", &w.act), ("logits", &w.logits), ("unary", &w.unary),
+                ("candidates", &w.candidates), ("projected", &w.projected), ("anchors", &w.anchors),
+                ("ids", &w.ids), ("tokens", &w.tokens), ("features", &w.features),
+                ("positions", &w.positions), ("tables", &w.tables),
+                ("attention_workspace", &w.attention_workspace), ("topk_workspace", &w.topk_workspace),
+                ("head_workspace", &w._head_workspace)] {
+                ranges.push((format!("drafter/step/{name}"), buffer.buffer));
+            }
+        }
+        ranges
+    }
+
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         self.update_with(rows, || Ok(()))

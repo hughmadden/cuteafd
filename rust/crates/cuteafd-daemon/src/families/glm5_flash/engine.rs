@@ -2262,6 +2262,67 @@ impl<'a> GlmfEngine<'a> {
         result
     }
 
+    /// Replay-only discriminator: drain even streams outside the engine's inventory.
+    pub(crate) fn replay_device_sync(&self) -> Result<()> {
+        for rank in 0..self.ranks() {
+            self.on(rank, || self.library.cuda_device_synchronize())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_owner_ranges(&self) -> Result<serde_json::Value> {
+        let mut target = Vec::new();
+        for rank in 0..self.ranks() {
+            let device = if rank == 1 { self.peer()?.device } else { self.device };
+            let caches = self.caches_of(rank);
+            for (name, buffer) in [("kda_state", caches.kda_state.buffer),
+                ("kda_conv", caches.kda_conv.buffer), ("kda_replay", caches.kda_replay),
+                ("commit_tables", caches.commit_tables.buffer), ("pool_logical", caches.pool_logical.buffer)] {
+                target.push((device, format!("target/{name}"), buffer));
+            }
+            for (layer, buffer) in caches.kv.iter().enumerate() {
+                if let Some(buffer) = buffer {
+                    target.push((device, format!("target/layer{layer}/kv"), buffer.buffer));
+                }
+            }
+            for (layer, index) in caches.index.iter().enumerate() {
+                if let Some(index) = index {
+                    target.push((device, format!("target/layer{layer}/index_pool"), index.pools.buffer));
+                    if let Some(keys) = &index.keys {
+                        target.push((device, format!("target/layer{layer}/index_keys"), keys.buffer));
+                    }
+                }
+            }
+            if let Some((tails, records)) = &caches.index_tails {
+                target.push((device, "target/index_tails".into(), tails.buffer));
+                target.push((device, "target/index_replay".into(), records.buffer));
+            }
+        }
+        let writes = match &self.drafter {
+            Some(super::dspark::Drafter::RemoteDflash(d)) => d.replay_write_ranges(),
+            Some(super::dspark::Drafter::Dflash2(d)) => d.replay_write_ranges().into_iter()
+                .map(|(name, buffer)| (self.device, name, buffer)).collect(),
+            _ => Vec::new(),
+        };
+        let encode = |ranges: &[(i32, String, cuteafd_ffi::CuteafdDeviceBuffer)]| {
+            ranges.iter().map(|(device, name, buffer)| serde_json::json!({"device": device,
+                "name": name, "start": buffer.ptr as usize, "bytes": buffer.bytes})).collect::<Vec<_>>()
+        };
+        let mut overlaps = Vec::new();
+        for (device, name, buffer) in &writes {
+            let start = buffer.ptr as usize;
+            let end = start.checked_add(buffer.bytes).context("draft owner range overflow")?;
+            for (other_device, other_name, other) in &target {
+                let other_start = other.ptr as usize;
+                let other_end = other_start.checked_add(other.bytes).context("target owner range overflow")?;
+                if device == other_device && start < other_end && other_start < end {
+                    overlaps.push(serde_json::json!({"write": name, "target": other_name, "device": device}));
+                }
+            }
+        }
+        Ok(serde_json::json!({"target": encode(&target), "draft_writes": encode(&writes), "overlaps": overlaps}))
+    }
+
     /// Before a sequence's first step: zeroes its KDA state and maps its pool pages.
     fn start(&self, placement: &GlmfPlacement) -> Result<()> {
         self.map_pools(placement)?;

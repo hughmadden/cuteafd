@@ -1903,6 +1903,14 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_cuda_stream_destroy", status)
     }
 
+    /// Diagnostic drain of every stream on the calling thread's current CUDA device.
+    pub fn cuda_device_synchronize(&self) -> Result<()> {
+        type Call = unsafe extern "C" fn() -> i32;
+        // SAFETY: the pinned native ABI takes no operands; this library owns the symbol.
+        let status = unsafe { self.lib.get::<Call>(b"cuteafd_cuda_device_synchronize")?() };
+        self.status_to_result("cuteafd_cuda_device_synchronize", status)
+    }
+
     pub unsafe fn cuda_stream_synchronize(&self, cuda_stream: *mut c_void) -> Result<()> {
         let synchronize_fn: Symbol<CudaStreamSynchronizeFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_stream_synchronize")? };

@@ -133,6 +133,17 @@ impl<'a> RemoteDflash<'a> {
         })
     }
 
+    pub(crate) fn replay_write_ranges(&self) -> Vec<(i32, String, CuteafdDeviceBuffer)> {
+        let mut ranges: Vec<_> = self.draft.replay_write_ranges().into_iter()
+            .map(|(name, buffer)| (self.draft.device.id, name, buffer)).collect();
+        for (name, buffer) in [("taps", &self.target.taps), ("ids", &self.target.ids),
+            ("input", &self.target.input), ("hidden", &self.target.hidden),
+            ("logits", &self.target.logits), ("head_workspace", &self.target._head_workspace)] {
+            ranges.push((self.target.device.id, format!("bridge/{name}"), buffer.buffer));
+        }
+        ranges
+    }
+
     pub fn require_live(&self) -> Result<()> { self.exchange.require_live() }
 
     pub fn publish_abort(&self) -> Result<()> {

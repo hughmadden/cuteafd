@@ -537,12 +537,41 @@ fn parse_replay_rounds(text: &str, vocab: usize, decode_rows: usize) -> Result<V
 }
 
 /// The target, selector, commit and drafter context lifecycle from a cold single-request trace.
-fn replay_rounds(engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
+fn private_replay_dir(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => ensure!(meta.is_dir() && meta.permissions().mode() & 0o077 == 0,
+            "replay dump must be a private, non-symlink directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn private_replay_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?.write_all(bytes)?;
+    Ok(())
+}
+
+fn first_differing_byte(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b).position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
+}
+
+fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
     path: &std::path::Path) -> Result<()> {
     use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
     use cuteafd_core::TargetSamplingParams;
     let rounds = parse_replay_rounds(&std::fs::read_to_string(path)?, engine.cfg.vocab_size, engine.decode_rows)?;
     ensure!(engine.production_replay_ready() && engine.slots >= 2, "trace replay needs production graphs and two slots");
+    if let Some(dir) = &args.replay_dump {
+        private_replay_dir(dir)?;
+        private_replay_write(&dir.join("owners.json"), &serde_json::to_vec_pretty(&engine.replay_owner_ranges()?)?)?;
+    }
     let capacity = rounds.iter().map(|r| r.starts[0].checked_add(r.verify_tokens[0].len())
         .context("trace position overflow")).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap().max(prefill);
     ensure!(capacity <= engine.max_context, "trace exceeds admitted context");
@@ -569,6 +598,7 @@ fn replay_rounds(engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
         let (input, emitted) = (&round.verify_tokens[0], &round.committed_tokens[0]);
         ensure!(input[0] == anchor, "round {}: anchor does not continue the preceding emission", round.round);
         let start = target.len;
+        if args.replay_draft_sync { engine.replay_device_sync()?; }
         if round.neural_tokens[0].is_some() {
             let drafter = engine.drafter.as_ref().context("neural trace replay needs --draft")?;
             let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor: input[0], position: start, valid_from: 0 }],
@@ -595,6 +625,7 @@ fn replay_rounds(engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
             target.len = start + keep;
             target.kda_len = target.len;
             let committed = engine.slot_state(target.slot)?;
+            if args.replay_draft_sync { engine.replay_device_sync()?; }
             if let Some(drafter) = &engine.drafter {
                 drafter.update(&(0..keep).map(|r| ContextRow { tap_row: r, slot: 0, position: start + r })
                     .collect::<Vec<_>>())?;
@@ -610,16 +641,40 @@ fn replay_rounds(engine: &GlmfEngine<'_>, sequence: &[u32], prefill: usize,
         }
         finite_logits(&expected)?;
         let logit_exact = exact_logits(&actual[..keep * vocab], &expected);
-        let state_exact = match &committed {
-            Some(state) => *state == engine.slot_state(serial.slot)?,
-            None => true,
+        let serial_state = committed.as_ref().map(|_| engine.slot_state(serial.slot)).transpose()?;
+        let state_first = committed.as_ref().zip(serial_state.as_ref())
+            .and_then(|(a, b)| first_differing_byte(a, b));
+        let state_exact = state_first.is_none();
+        let paged = if round.finished[0] { None } else {
+            Some((super::prefix::paged_rows(&family, &target, target.len)?,
+                super::prefix::paged_rows(&family, &serial, serial.len)?))
         };
-        let paged_exact = round.finished[0] || super::prefix::paged_rows(&family, &target, target.len)?
-            == super::prefix::paged_rows(&family, &serial, serial.len)?;
+        let paged_first = paged.as_ref().and_then(|(a, b)| first_differing_byte(a, b));
+        let paged_exact = paged_first.is_none();
+        if let Some(dir) = &args.replay_dump {
+            let dir = dir.join(format!("round{}", round.round));
+            private_replay_dir(&dir)?;
+            for (name, logits) in [("target-logits.bin", &actual[..keep * vocab]), ("serial-logits.bin", expected.as_slice())] {
+                private_replay_write(&dir.join(name), &logits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+            }
+            if let Some((target_state, serial_state)) = committed.as_ref().zip(serial_state.as_ref()) {
+                private_replay_write(&dir.join("target-state.bin"), target_state)?;
+                private_replay_write(&dir.join("serial-state.bin"), serial_state)?;
+            }
+            if let Some((target_paged, serial_paged)) = &paged {
+                private_replay_write(&dir.join("target-mla.bin"), target_paged)?;
+                private_replay_write(&dir.join("serial-mla.bin"), serial_paged)?;
+            }
+            private_replay_write(&dir.join("geometry.json"), &serde_json::to_vec(&serde_json::json!({
+                "round": round.round, "start": start, "live": input.len(), "keep": keep,
+                "bucket": engine.serving_decode_rows(input.len(), round.spec), "sync": args.replay_draft_sync,
+                "state_first_byte": state_first, "mla_first_byte": paged_first }))?)?;
+        }
         let first = actual[..keep * vocab].iter().zip(&expected).position(|(a,b)| a.to_bits() != b.to_bits());
         let emissions_exact = expected.chunks_exact(vocab).map(argmax).eq(emitted.iter().copied());
         println!("round {}: start {start}, live {}, bucket {}, keep {keep}: logits exact {logit_exact}, \
-            first differing (row,vocab) {:?}; state exact {state_exact}; MLA exact {paged_exact}; \
+            first differing (row,vocab) {:?}; state exact {state_exact}, first byte {state_first:?}; \
+            MLA exact {paged_exact}, first byte {paged_first:?}; \
             selector exact {sampler_exact}; recorded emissions exact {emissions_exact}", round.round, input.len(),
             engine.serving_decode_rows(input.len(), round.spec), first.map(|i| (i / vocab, i % vocab)));
         ensure!(logit_exact && state_exact && paged_exact && sampler_exact && emissions_exact,
@@ -638,7 +693,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
     let sequence = tokens(args)?;
     let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     if let Some(path) = &args.replay_trace {
-        return replay_rounds(engine, &sequence, prefill, path);
+        return replay_rounds(args, engine, &sequence, prefill, path);
     }
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     ensure!(!args.replay_production || engine.production_replay_ready(),
@@ -888,6 +943,27 @@ mod tests {
         // --decode-rows 128: up to 128 rows (`--replay-check 128`), with the 64-row default prefill.
         assert_eq!(super::replay_bounds(400, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
         assert!(super::replay_bounds(400, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
+    }
+
+    #[test]
+    fn replay_dump_is_private_and_refuses_overwrites_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dump");
+        super::private_replay_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let file = dir.join("state.bin");
+        super::private_replay_write(&file, &[1, 2]).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(super::private_replay_write(&file, &[3]).is_err());
+        let link = root.path().join("link");
+        symlink(&dir, &link).unwrap();
+        assert!(super::private_replay_dir(&link).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::private_replay_dir(&dir).is_err());
+        assert_eq!(super::first_differing_byte(&[1, 2], &[1, 3]), Some(1));
+        assert_eq!(super::first_differing_byte(&[1], &[1, 2]), Some(1));
+        assert_eq!(super::first_differing_byte(&[1], &[1]), None);
     }
 
     #[test]
