@@ -304,3 +304,21 @@ def test_wip_root_config_env_and_legacy_default(tmp_path):
     assert 'args+=(-v "$root:/wip")' in text
     assert 'remote_staging="$WIP_ROOT/source-staging"' in text
     assert 'WIP_ROOT (environment or config)' in text
+
+
+def test_each_serving_instance_stages_its_own_run_layout(tmp_path):
+    # Two servers of one sealed slot must not re-stage (rm + mv) each other's layout.
+    script = f'''set -euo pipefail
+source "{COMMON}"
+WIP_INSTANCE=shared; release_record_wip_slot gate
+for serving in arm-a arm-b ""; do
+  WIP_INSTANCE=shared; release_wip_slot_instance gate; release_wip_serving_layout "$serving"
+  printf '%s\\n' "$WIP_LAYOUT_SLOT"
+done
+'''
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, HOME=str(tmp_path)), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["shared/gate/serve-arm-a", "shared/gate/serve-arm-b", "shared/gate/serve-default"]
+    for launcher in (ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"):
+        text = launcher.read_text()
+        assert text.index("release_wip_slot_instance \"$wip_slot\"") < text.index("release_wip_serving_layout")

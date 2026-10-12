@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""One CPU gate for a checkout: cargo workspace tests and the script suite.
+
+  scripts/dev/cpu-gate --task NAME [--cargo] [--scripts] [--skip-live-planners] [--base REV]
+
+With neither --cargo nor --scripts both run. Everything lives under
+~/.cache/cuteafd/builds/NAME (asserted build filesystem): the Cargo target
+(target-cpu-gate, plain rustc, kept apart from kache targets), TMPDIR and
+pytest's basetemp. Submodules are initialized at their pinned commits first.
+Compiling (cargo test --no-run) holds a build slot (scripts/build/build-slot.sh,
+slot 0 is build.lock); running the tests holds none. Each suite has its own
+timeout. The python is the checkout's .venv, else the main checkout's.
+
+The verdict comes from the parsed test summaries, never from an exit code
+alone: a suite passes only when its summaries report more than zero tests and
+no failures. Failing test ids are listed per suite. --base REV runs the same
+gate on a detached worktree of REV and reports only the ids that are new in
+this checkout. --skip-live-planners skips the slow live-inventory V4 planner
+tests (real checkpoints + manifests) and records that choice.
+
+Writes NAME/cpu-gate.json and NAME/cpu-gate.md; exit 0 only when every
+requested suite passed (or, with --base, introduced no new failing ids).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+REPO = Path(__file__).resolve().parents[2]
+BUILDS = Path.home() / '.cache/cuteafd/builds'
+# Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
+LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
+                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+CARGO_RESULT = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored', re.M)
+CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
+CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
+PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
+PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
+
+
+def log(message):
+    print(f'cpu-gate: {message}', file=sys.stderr, flush=True)
+
+
+def checked(cmd, **kwargs):
+    result = subprocess.run(cmd, text=True, capture_output=True, **kwargs)
+    if result.returncode:
+        raise SystemExit(f'cpu-gate: {cmd[0]} {" ".join(cmd[1:3])} failed: {(result.stderr or result.stdout).strip()[-400:]}')
+    return result.stdout
+
+
+def python_for(source):
+    for candidate in (source / '.venv/bin/python', REPO / '.venv/bin/python',
+                      Path(checked(['git', '-C', str(source), 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip()).parent / '.venv/bin/python'):
+        if candidate.is_file():
+            return candidate
+    raise SystemExit('cpu-gate: no .venv here or in the main checkout (uv venv --python 3.12 .venv; see AGENTS.md)')
+
+
+def prepare(source, root):
+    checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(root)])
+    for path in (root / 'tmp', root / 'logs'):
+        path.mkdir(parents=True, exist_ok=True)
+    log(f'submodules at their pinned commits ({source})')
+    checked(['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive'], timeout=1800)
+    checked([sys.executable, str(source / 'scripts/build/verify-sparkinfer-source.py'), '--source',
+             str(source / 'third_party/sparkinfer'), '--lock', str(source / 'third_party/sparkinfer.lock.json')])
+
+
+def run_logged(cmd, log_path, env, cwd, timeout):
+    started = time.monotonic()
+    with open(log_path, 'w') as output:
+        try:
+            code = subprocess.run(cmd, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            code = 124
+            output.write(f'\ncpu-gate: timed out after {timeout} s\n')
+    return code, time.monotonic() - started
+
+
+def cargo(source, root, args, env):
+    target = root / 'target-cpu-gate'
+    checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': env.get('CARGO_BUILD_JOBS', '16'),
+           'RUST_TEST_THREADS': env.get('RUST_TEST_THREADS', '16')}
+    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
+        env.pop(key, None)  # Plain rustc: never share a target with kache's read-only outputs.
+    log('cargo: compiling tests (build slot held while compiling)')
+    build_log = root / 'logs/cargo-build.log'
+    code, build_s = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
+                                '--no-run'], build_log, env, source / 'rust', args.cargo_build_timeout)
+    result = dict(suite='cargo', build_exit=code, build_s=round(build_s), build_log=str(build_log))
+    if code:
+        tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
+        return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or f'exit {code}')}
+    skips = []
+    if args.skip_live_planners:
+        for name in LIVE_PLANNERS:
+            skips += ['--skip', name]
+    test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
+    if skips:
+        test_args.append('--exact')
+    log('cargo: running tests (no build slot)')
+    test_log = root / 'logs/cargo-test.log'
+    code, test_s = run_logged(test_args, test_log, env, source / 'rust', args.cargo_timeout)
+    text = test_log.read_text(errors='replace')
+    totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(text)]
+    passed, failed, ignored = (sum(t[i] for t in totals) for i in range(3))
+    ids = sorted(set(CARGO_FAIL.findall(text)))
+    result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
+                  binaries=len(totals), failing=ids, skipped_live_planners=list(LIVE_PLANNERS) if skips else [])
+    if code == 124:
+        result.update(status='failed', error=f'timed out after {args.cargo_timeout} s')
+    elif passed == 0:
+        result.update(status='failed', error='no test summaries parsed (nothing ran?)')
+    elif failed or ids or code:
+        result.update(status='failed', error=f'{failed} failed' + ('' if failed or ids else f' (exit {code}, no failing ids parsed)'))
+    else:
+        result['status'] = 'pass'
+    return result
+
+
+def scripts(source, root, args, env):
+    python = python_for(source)
+    test_log = root / 'logs/pytest.log'
+    log(f'scripts: pytest ({python})')
+    cmd = ['nice', '-n', '19', str(python), '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
+           str(root / 'tmp/pytest'), 'scripts/tests']
+    code, seconds = run_logged(cmd, test_log, env, source, args.scripts_timeout)
+    text = test_log.read_text(errors='replace')
+    summary = PYTEST_SUMMARY.findall(text)
+    counts = {key: int(value) for value, key in re.findall(r'(\d+) (passed|failed|errors?|skipped)', summary[-1] if summary else '')}
+    ids = sorted(set(PYTEST_FAIL.findall(text)))
+    result = dict(suite='scripts', exit=code, test_s=round(seconds), log=str(test_log), python=str(python),
+                  passed=counts.get('passed', 0), failed=counts.get('failed', 0) + counts.get('error', 0) + counts.get('errors', 0),
+                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None)
+    if code == 124:
+        result.update(status='failed', error=f'timed out after {args.scripts_timeout} s')
+    elif not summary or result['passed'] == 0:
+        result.update(status='failed', error='no pytest summary parsed (nothing ran?)')
+    elif result['failed'] or ids or code:
+        result.update(status='failed', error=f"{result['failed']} failed" + ('' if result['failed'] or ids else f' (exit {code})'))
+    else:
+        result['status'] = 'pass'
+    return result
+
+
+def gate(source, root, args):
+    prepare(source, root)
+    env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    suites = []
+    if args.cargo:
+        suites.append(cargo(source, root, args, env))
+    if args.scripts:
+        suites.append(scripts(source, root, args, env))
+    head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
+    dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
+    return dict(source=str(source), head=head, dirty=dirty, suites=suites,
+                status='pass' if suites and all(s['status'] == 'pass' for s in suites) else 'failed')
+
+
+def render(record):
+    lines = [f"# CPU gate {record['task']}: {record['verdict']}", '',
+             f"HEAD {record['head'][:12]}{' (dirty)' if record['dirty'] else ''}" +
+             (f", base {record['base']['head'][:12]}" if record.get('base') else ''), '',
+             '| Suite | Status | Passed | Failed | Seconds | Note |', '| --- | --- | ---: | ---: | ---: | --- |']
+    for suite in record['suites']:
+        note = suite.get('error', '')
+        if suite.get('skipped_live_planners'):
+            note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+        lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
+                     f"{suite.get('build_s', 0) + suite.get('test_s', 0)} | {note} |")
+    for suite in record['suites']:
+        if suite.get('failing'):
+            lines += ['', f"## Failing {suite['suite']} ids", *[f'- {i}' for i in suite['failing']]]
+    if record.get('new_failing') is not None:
+        lines += ['', '## New against base']
+        lines += [f'- {suite}: {i}' for suite, ids in record['new_failing'].items() for i in ids] or ['- none']
+    return '\n'.join(lines) + '\n'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
+    parser.add_argument('--cargo', action='store_true')
+    parser.add_argument('--scripts', action='store_true')
+    parser.add_argument('--skip-live-planners', action='store_true', help='skip the live-inventory V4 planner tests (recorded)')
+    parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
+    parser.add_argument('--source', type=Path, default=REPO, help='checkout to gate (default: this one)')
+    parser.add_argument('--cargo-build-timeout', type=int, default=7200)
+    parser.add_argument('--cargo-timeout', type=int, default=5400)
+    parser.add_argument('--scripts-timeout', type=int, default=3600)
+    args = parser.parse_args()
+    if not NAME.fullmatch(args.task):
+        parser.error('--task must be a plain name')
+    if not (args.cargo or args.scripts):
+        args.cargo = args.scripts = True
+    root = BUILDS / args.task
+    root.mkdir(parents=True, exist_ok=True)
+    record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+              'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
+    if args.base:
+        base_source = root / 'base-src'
+        if base_source.exists():
+            checked(['git', '-C', str(base_source), 'checkout', '-q', '--detach', args.base])
+        else:
+            checked(['git', '-C', str(args.source), 'worktree', 'add', '-q', '--detach', str(base_source), args.base])
+        record['base'] = gate(base_source, root / 'base', args)
+        record['new_failing'] = {}
+        for suite in record['suites']:
+            before = next((s for s in record['base']['suites'] if s['suite'] == suite['suite']), {})
+            record['new_failing'][suite['suite']] = sorted(set(suite.get('failing', [])) - set(before.get('failing', [])))
+        ran = all(s.get('passed', 0) > 0 for s in record['suites'])
+        record['verdict'] = 'pass' if ran and not any(record['new_failing'].values()) else 'failed'
+    else:
+        record['verdict'] = record['status']
+    (root / 'cpu-gate.json').write_text(json.dumps(record, indent=2) + '\n')
+    (root / 'cpu-gate.md').write_text(render(record))
+    sys.stdout.write(render(record))
+    log(f"verdict {record['verdict']}: {root / 'cpu-gate.md'}")
+    return 0 if record['verdict'] == 'pass' else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

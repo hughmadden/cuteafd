@@ -102,7 +102,22 @@ but bounded engineering still goes to Sol.
 
 Hardware-card briefs use `scripts/bench/wip-cards.py`; see
 [WIP hardware cards](docs/wip-cards.md) for the shared kit, arm, probe,
-build and cleanup contract. Do not copy an RC driver or take outer serving
+build and cleanup contract. Two commands cover most briefs; paste them:
+
+```sh
+# A/B two commits on cards: builds both arms, preflights on the CPU, queues fairly,
+# interleaves, and writes summary.md (before -> after per card and metric, first real error).
+python3 scripts/bench/wip-cards.py --kit gate --interleave --repeats 1 --cards qwen38-exl3-min \
+  --arm base=<task>-b:<slot> --arm cand=<task>-c:<slot> --build base=origin/work/p0 --build cand=HEAD \
+  --panels baseline --levels 1,16 --post-load-c1 --trace --binary <cuteafd built from HEAD> --task <task>
+# CPU gate: cargo + script suite, verdict from parsed summaries, optional new-failure diff against a base.
+scripts/dev/cpu-gate --task <task> [--cargo] [--scripts] [--skip-live-planners] [--base origin/work/p0]
+```
+
+Same build, two configurations: `--arm-wip` both arms to one sealed WIP
+instance and `--arm-set ARM:CARD:KEY=VALUE`. `--set CARD:PROFILE=...` turns
+on profiling everywhere, `--preflight-only` checks without queuing, and
+`--resume` reruns only failed jobs. Do not copy an RC driver or take outer serving
 locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests run at
 nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 
@@ -364,4 +379,5 @@ duplicating it. Record the lesson in the table below.
 | Shared Cargo target across two worktrees reused base metadata for the candidate (false-fresh build) | A/B builds use a separate `CARGO_TARGET_DIR` per arm |
 | Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
+| ~2,700 hand-written driver scripts; most of one day's failures came from them (wrong container prefix, stale markers, dropped trace, missing --interleave) | The preamble's two commands; wip-cards preflights before queuing, `--resume` replaces retries, and agents ask for tooling instead of writing drivers |
 | Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |

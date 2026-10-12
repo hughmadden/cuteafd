@@ -349,7 +349,7 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
         assert staging < lines.index(preflight)
         assert "cuteafd-coordinator-dev cuteafd plan" in preflight
         for part in ("bin", "lib", "share"):
-            assert f"wip-run/plan-test/slot-test/{part}:/opt/cuteafd/{part}:ro" in preflight
+            assert f"wip-run/plan-test/slot-test/serve-default/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
 
 

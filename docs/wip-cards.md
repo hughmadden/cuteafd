@@ -54,3 +54,38 @@ removes only task-owned build roots/containers, overlays and registrations on
 raptor and all six Sparks; existing arms without this task's ownership marker
 are deliberately refused, never adopted. Keep the same `--task`, `--state`
 and arms for cleanup. Source worktrees are retained for inspection.
+
+## Subsets, traces, profiles, preflight and resume
+
+- `--kit gate` is the in-repo kit (`scripts/bench/kits/gate`): mimo26-flash-max,
+  qwen38-exl3-min, glmf-exl3-max (2 RTX, 0 Sparks, EXL3) and v41-flash-max on
+  `examples/configs`, with ports of their own.
+- `--panels LIST` replaces every card's profile (`baseline` alone for the basic
+  card and quick quality, `none` for no server profile). `--levels 1,16` adds a
+  client-side code-decode sweep after it (one warm and one measured wave per
+  level); `--post-load-c1` measures C1 again after the widest level. The sweep
+  runs in the smoke binary, so arms with different server builds measure the
+  same workload; pass `--binary` built from a checkout that has it (wip-cards
+  checks).
+- `--trace` gives every job `SPECULATION_TRACE=<job>/speculation-trace.jsonl`.
+  The observer notes it after warm-up; a speculating arm that wrote nothing
+  fails its row. `--set CARD:PROFILE=census,transport-timing,expert-timing`
+  turns profiling on in the coordinator and every Spark worker
+  (`CUTEAFD_PROFILE_HOST` names the physical host); the per-job `profile/`
+  directory collects every host's files.
+- Preflight runs before any queue ticket and again at grant (smoke's prelaunch
+  hook): no serving container of ours exists, the arm is sealed on every host,
+  the slot holds the expert packages and audio entry the card needs (the same
+  derivation `--build` uses), and trace/profile directories are writable.
+  `--preflight-only` runs it alone, e.g. as `hwlock.py --preflight`.
+- A state directory holds one run. `--resume` keeps passed jobs and reruns the
+  failed or missing ones, moving the earlier attempt to `attempt-N/`. Without
+  `--state`/`--task`, each run gets a fresh time-stamped state.
+- `summary.md`: before -> after per card and metric with ratios and paired
+  medians, then each job's spec/cache/trace/profile status and its first real
+  error (the launcher's own line first). Failures are classified as preflight,
+  launch, quality or measurement.
+- `--build` writes a staging config: the first card's model with its
+  `--set`/`--arm-set` overrides, no serving topology (export TP and families
+  come from every card's scopes), and dev images tagged with the revision's
+  toolchain identity.

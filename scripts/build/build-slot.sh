@@ -10,8 +10,16 @@ set -uo pipefail
 
 slots="${CUTEAFD_BUILD_SLOTS:-3}"
 wait_s="${CUTEAFD_BUILD_SLOT_WAIT:-7200}"
-dir="$HOME/.cache/cuteafd"
+dir="${CUTEAFD_LOCK_DIR:-$HOME/.cache/cuteafd}"
 (($# > 0)) || { echo "usage: $0 COMMAND [ARGS...]" >&2; exit 2; }
+# The slots exclude other builds only through the shared lock files: a missing
+# lock directory (e.g. a container without it mounted) would silently create a
+# private lock that excludes nothing.
+[[ -d "$dir" && -w "$dir" ]] || {
+  echo "build-slot: lock directory $dir is missing or not writable; run on the host or mount it (cuteafd-dev.sh does)" >&2
+  exit 2
+}
+fd=
 deadline=$((SECONDS + wait_s))
 while :; do
   for ((i = 0; i < slots; i++)); do

@@ -342,6 +342,7 @@ sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.
 wip_layout=""
 if [[ -n "$wip_slot" ]]; then
   release_wip_slot_instance "$wip_slot"
+  release_wip_serving_layout "${INSTANCE:-}"
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"

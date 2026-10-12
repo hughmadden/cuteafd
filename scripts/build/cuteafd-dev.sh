@@ -66,6 +66,19 @@ docker_args+=(
   -e "CARGO_HOME=$container_home/cargo"
 )
 
+# Host build slots (scripts/build/build-slot.sh) exclude through these lock
+# files; mount them at the same path so a compile inside takes the real slot.
+# Only the slot files are shared (created first, so the container never makes
+# a private copy); the hardware locks and the fair queue stay host-only.
+lock_dir="$HOME/.cache/cuteafd"
+mkdir -p "$lock_dir"
+docker_args+=(-e "CUTEAFD_LOCK_DIR=$lock_dir")
+for ((slot = 0; slot < ${CUTEAFD_BUILD_SLOTS:-3}; slot++)); do
+  slot_lock="$lock_dir/build.lock"
+  ((slot == 0)) || slot_lock="$lock_dir/build.lock.$slot"
+  touch "$slot_lock"
+  docker_args+=(-v "$slot_lock:$slot_lock")
+done
 if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
   python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$CUTEAFD_DEV_TARGET_DIR"
   mkdir -p "$CUTEAFD_DEV_TARGET_DIR"

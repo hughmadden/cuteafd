@@ -92,6 +92,15 @@ PYMETA
   WIP_LAYOUT_SLOT="${WIP_INSTANCE:+$WIP_INSTANCE/}$slot"
 }
 
+# One staged run layout per serving instance: a launch re-stages its layout
+# (rm + mv), which must never swap files under another live server of the same
+# slot. Launchers call this after release_wip_slot_instance.
+release_wip_serving_layout() {
+  local serving="${1:-}"
+  [[ -z "$serving" || "$serving" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid serving instance: $serving"
+  WIP_LAYOUT_SLOT="$WIP_LAYOUT_SLOT/serve-${serving:-default}"
+}
+
 release_record_wip_slot() {
   release_validate_wip_instance
   python3 - "$HOME/.cache/cuteafd/wip-slots" "$1" "${WIP_INSTANCE:-}" <<'PYMETA'

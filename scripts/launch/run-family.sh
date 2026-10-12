@@ -142,6 +142,7 @@ if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
   WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
   release_wip_slot_instance "$wip_slot"
+  release_wip_serving_layout "$instance"
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
