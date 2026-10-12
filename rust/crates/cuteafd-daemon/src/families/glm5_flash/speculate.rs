@@ -320,7 +320,8 @@ pub(super) fn draft_modes(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequences:
 /// step against the sequence.
 pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft")?;
-    let mut sequence = tokens(args)?;
+    let golden = tokens(args)?;
+    let mut sequence = golden.clone();
     let prefill = args.prefill.unwrap_or(sequence.len() / 2).min(sequence.len() - 1);
     let end = match args.generate {
         Some(n) if n > 0 => {
@@ -330,7 +331,8 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         _ => sequence.len(),
     };
     let greedy = end > sequence.len();
-    let mut placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
+    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut placement = allocator.admit(end + 1)?;
     let started = Instant::now();
     let logits = prefill_with_taps(engine, &mut placement, &sequence[..prefill], 0)?;
     if greedy {
@@ -376,6 +378,46 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
             .decode_ids(&sequence[prefill..], false).map(|d| d.text).unwrap_or_default();
         println!("generated: {text:?}");
     }
+    engine.synchronize()?;
+    allocator.release(placement);
+    draft_prefill_bench(args, &golden, prefill, engine.prefill_capacity(), |prompt| {
+        let mut fresh = allocator.admit(prompt.len())?;
+        let started = Instant::now();
+        // Serving leaves intermediate logits on device; a host download would
+        // drain both target ranks before the context bridge and hide wait cycles.
+        for chunk in prompt.chunks(engine.prefill_capacity()) {
+            let start = fresh.len;
+            engine.prefill_device(&mut fresh, chunk)?.context("prefill needs every layer")?;
+            let n = chunk.len().min(TAP_ROWS);
+            let first = start + chunk.len() - n;
+            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r })
+                .collect::<Vec<_>>())?;
+        }
+        engine.synchronize()?;
+        let seconds = started.elapsed().as_secs_f64();
+        allocator.release(fresh);
+        Ok(seconds)
+    })
+}
+
+fn draft_prefill_bench(args: &GoldenArgs, golden: &[u32], prefill: usize, capacity: usize,
+    mut run: impl FnMut(&[u32]) -> Result<f64>) -> Result<()> {
+    if args.bench_prefill == 0 { return Ok(()) }
+    let n = args.bench_prefill_tokens.unwrap_or(prefill.min(capacity));
+    ensure!(n > 0 && !golden.is_empty(), "--bench-prefill needs a nonempty prompt");
+    let prompt: Vec<_> = golden.iter().copied().cycle().take(n).collect();
+    let mut times = Vec::with_capacity(args.bench_prefill);
+    for index in 0..args.bench_prefill {
+        println!("post-draft prefill {}/{}, {n} tokens: starting", index + 1, args.bench_prefill);
+        let seconds = run(&prompt)?;
+        println!("post-draft prefill {}/{}, {n} tokens: completed in {seconds:.2} s",
+            index + 1, args.bench_prefill);
+        times.push(seconds);
+    }
+    times.sort_by(f64::total_cmp);
+    let median = times[times.len() / 2];
+    println!("post-draft prefill bench: {n} tokens, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
+        1e3 * median, n as f64 / median, 1e3 * times[0]);
     Ok(())
 }
 
@@ -795,6 +837,44 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_prefill_options_run_requested_fresh_prompts() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Parse {
+            #[command(flatten)]
+            args: super::GoldenArgs,
+        }
+        let base = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden",
+            "--draft", "/drafter"];
+        let mut args = Parse::try_parse_from(base.into_iter().chain([
+            "--bench-prefill", "3", "--bench-prefill-tokens", "8"])).unwrap().args;
+        assert!(args.engine.draft.is_some());
+        let mut seen = Vec::new();
+        super::draft_prefill_bench(&args, &[1, 2, 3], 2, 4, |prompt| {
+            seen.push(prompt.to_vec());
+            Ok(1.0)
+        }).unwrap();
+        assert_eq!(seen, vec![vec![1, 2, 3, 1, 2, 3, 1, 2]; 3]);
+        args.bench_prefill_tokens = None;
+        args.bench_prefill = 1;
+        super::draft_prefill_bench(&args, &[1, 2, 3], 5, 2, |prompt| {
+            assert_eq!(prompt, &[1, 2]);
+            Ok(1.0)
+        }).unwrap();
+        args.bench_prefill = 0;
+        super::draft_prefill_bench(&args, &[], 0, 0, |_| panic!("disabled benchmark ran")).unwrap();
+        args.bench_prefill = 1;
+        args.bench_prefill_tokens = Some(0);
+        assert!(super::draft_prefill_bench(&args, &[1], 1, 1, |_| panic!("empty benchmark ran")).is_err());
+        let source = include_str!("speculate.rs");
+        let draft_run = source.split("pub(super) fn draft_run").nth(1).unwrap()
+            .split("fn draft_prefill_bench").next().unwrap();
+        assert!(draft_run.contains("draft_prefill_bench(args, &golden"));
+        assert!(draft_run.find("allocator.release(placement)").unwrap()
+            < draft_run.find("draft_prefill_bench(args, &golden").unwrap());
+    }
+
     #[test]
     fn replay_check_rejects_invalid_bounds_before_subtracting() {
         use super::super::engine::{DECODE_ROWS, WIDE_DECODE_ROWS};

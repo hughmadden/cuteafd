@@ -861,8 +861,9 @@ pub(crate) struct GoldenArgs {
     /// (no layer downloads) from the prefilled sequence.
     #[arg(long, default_value_t = 0)]
     pub bench_decode: usize,
-    /// Time this many more prefills of the golden prompt (up to --prefill-rows
-    /// tokens) on fresh sequences, without layer downloads.
+    /// Time this many more prefills of the golden prompt on fresh sequences,
+    /// without layer downloads. With --draft, run after draft/decode and retain
+    /// the drafter and its exchange state between requests.
     #[arg(long, default_value_t = 0)]
     pub bench_prefill: usize,
     /// Prompt length of --bench-prefill (the golden tokens repeated), in
