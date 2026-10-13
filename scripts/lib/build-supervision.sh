@@ -60,7 +60,12 @@ build_supervise() {
   remaining=$((remaining + 1))
   set +m
   while ((remaining)); do
-    if ! read -r -t 1 completed status <&8; then
+    # Poll with read -t 0, which consumes nothing. A timed read that expires
+    # mid-line keeps its partial input, so the next read saw "xpert" for "expert".
+    # Each leg writes its whole line in one printf, so a ready line is complete.
+    if read -r -t 0 <&8; then
+      read -r completed status <&8
+    else
       # SIGKILL/OOM skips EXIT notification. Do not wait forever on a FIFO whose
       # write end the supervisor itself holds open; reap a dead worker instead.
       completed=""
@@ -72,7 +77,7 @@ build_supervise() {
           break
         fi
       done
-      [[ -n "$completed" ]] || continue
+      [[ -n "$completed" ]] || { sleep 1; continue; }
       release_die "[$completed] $build_context leg failed (exit $status); killed without exit status notification; stopping the other leg; see $build_log_dir"
     fi
     case "$completed" in

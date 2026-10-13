@@ -35,7 +35,7 @@ def test_fenced_heading_does_not_count(tmp_path):
 
 
 @pytest.mark.parametrize('secret', [
-    'sk-example', 'ghp_example', 'github_pat_example', '-----BEGIN PRIVATE KEY-----',
+    'sk-proj-' + 'Ab3' * 8, 'ghp_example', 'github_pat_example', '-----BEGIN PRIVATE KEY-----',
     'AKIAEXAMPLE', 'xoxb-example', 'xoxp-example', 'Bearer example',
     'token: ' + 'a' * 40, 'secret = ' + 'QWxhZGRpbg' * 6,
     '"api_key": "' + 'a' * 48 + '"',
@@ -45,6 +45,11 @@ def test_secret_patterns_rejected(tmp_path, secret):
         common.validate_body(BODY + secret, tmp_path)
     with pytest.raises(ValueError):
         common.validate_public(secret, tmp_path)
+
+
+def test_words_ending_in_sk_are_not_secrets(tmp_path):
+    # "task-owned" and "disk-backed" contain "sk-" but are not keys.
+    common.validate_public('task-owned slots and disk-backed caches', tmp_path)
 
 
 @pytest.mark.parametrize('name', ['service-api-key.txt', 'api.key'])

@@ -209,3 +209,22 @@ def test_split_state_and_tail_wiring():
     assert text.index('--write "$source_manifest"') < text.index('build_coordinator_release() (')
     assert '"${native_build_jobs:-__legacy__}"' in text
     assert 'CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs' in text
+
+
+def test_leg_names_survive_a_poll_that_times_out_mid_line(tmp_path):
+    """Both leg names come back whole. The original race (a timed read expiring
+    mid-line dropped "e" from "expert") is timing-dependent; this checks behaviour."""
+    script = f"""
+set -euo pipefail
+release_die() {{ echo "DIE: $*" >&2; exit 9; }}
+source {ROOT / 'scripts/lib/build-supervision.sh'}
+slow() {{ sleep 1.5; }}
+fast() {{ :; }}
+none() {{ :; }}
+for i in 1 2 3; do
+  build_supervise test "{tmp_path}/$i" 0 coordinator slow none c.log expert fast none e.log
+done
+"""
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count('[expert] test leg complete') == 3

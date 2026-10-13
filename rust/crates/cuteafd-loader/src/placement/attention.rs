@@ -38,6 +38,8 @@ pub fn parse(value: &str) -> Result<Option<AttentionPlacement>, String> {
 pub enum LayerOwnership {
     #[default]
     Ranges,
+    /// One contiguous range per GPU; neither execution owner may be empty.
+    NonemptyRanges,
     Alternating,
 }
 

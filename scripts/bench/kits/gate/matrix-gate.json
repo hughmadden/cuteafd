@@ -46,6 +46,24 @@
    }
   },
   {
+   "name": "qwen38-exl3-2rtx",
+   "family": "qwen4",
+   "config": "examples/configs/qwen38-exl3-min.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [],
+   "set": {
+    "ADDR": "0.0.0.0:8737",
+    "EXPERT_PORT": "19837",
+    "RTX_GPUS": "2",
+    "COORDINATOR_GPU": "0",
+    "SPARK_COUNT": "0",
+    "EXPERT_BACKEND": "local"
+   }
+  },
+  {
    "name": "glmf-exl3-max",
    "family": "glm5_flash",
    "config": "examples/configs/glm53-flash-exl3-max.config",

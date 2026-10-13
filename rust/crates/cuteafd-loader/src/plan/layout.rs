@@ -16,6 +16,7 @@ mod glm5_flash;
 mod v41;
 mod mimo;
 mod glm5;
+mod qwen_dual;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -125,6 +126,10 @@ pub struct LayoutOptions {
     pub native_mtp_layers: usize,
     /// Qwen full-attention record format; index keys remain BF16.
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
+    /// Selected Qwen projection/head residency, matching serve-qwen4.
+    pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
+    /// Qwen immutable attention scratch override.
+    pub qwen_attention_plan_rows: Option<usize>,
     /// Whole routed backbone layers resident on the coordinator.
     pub local_expert_layers: Option<usize>,
     /// Families on the shared solver (V4): how many routed layers are
@@ -190,6 +195,9 @@ impl Default for LayoutOptions {
             context_tokens: 0,
             native_mtp_layers: 3,
             qwen_kv: Default::default(),
+            qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
+                fp8_projections: false, fp8_head: true },
+            qwen_attention_plan_rows: None,
             local_expert_layers: None,
             onboard: None,
             exchange_f32: false,
@@ -560,6 +568,11 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     if family == "mimo_v2" {
         return mimo::layout(report, model, checkpoint, options, prefill_rows, concurrency,
             context_tokens, workspace_manifest.as_ref());
+    }
+    if family == "qwen4" && options.rtx_bytes.len() == 2 && options.head_split
+        && report.placement == ExpertPlacement::Local {
+        return qwen_dual::layout(report, model, checkpoint, options, prefill_rows, concurrency,
+            context_tokens, cache_native_layers > 0, workspace_manifest.as_ref());
     }
     let conversions = load_conversions(family, checkpoint);
     let mut costs = family_costs(family);

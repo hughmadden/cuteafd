@@ -916,7 +916,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
             }
             if let Some(trace) = trace_ref.as_mut() {
-                if let Err(error) = trace.cycle(request.id, *start, rows.len(), committed, planned[i], false,
+                let copy = copies[i].as_ref().is_some_and(|copy| copy.uses_copy(drafted));
+                if let Err(error) = trace.cycle(request.id, *start, rows.len(), committed, planned[i], copy,
                     draft_list[i].as_ref(), verify_ms) {
                     tracing::warn!("trace: {error:#}");
                 }

@@ -57,7 +57,7 @@ def task_dir(task=None):
 
 def validate_public(text, directory):
     patterns = (
-        r'sk-', r'ghp_', r'github_pat_', r'-----BEGIN', r'AKIA',
+        r'\bsk-[A-Za-z0-9_-]{16,}', r'ghp_', r'github_pat_', r'-----BEGIN', r'AKIA',
         r'xox[bp]-', r'Bearer\s+',
         r'(?i)\b(?:[\w-]*(?:key|token|secret)[\w-]*)\b[\s\"\']*[:=][\s\"\']*[A-Za-z0-9+/=_-]{32,}',
     )

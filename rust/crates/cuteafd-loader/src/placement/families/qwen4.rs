@@ -147,6 +147,81 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
     }).collect()
 }
 
+/// Package selection is checkpoint-native and shared by plan and runtime.
+pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path)
+    -> anyhow::Result<[std::path::PathBuf; 2]> {
+    let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
+    if let Some(exl3) = catalog.exl3() {
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
+        Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
+    } else {
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?;
+        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let rank = |rank| -> anyhow::Result<_> {
+            Ok(root.join(format!("tp2-w{}", tensors.rank_width(2, rank,
+                crate::formats::fp8_experts::Slicing::Blocks(128))?)))
+        };
+        Ok([rank(0)?, rank(1)?])
+    }
+}
+
+/// The separate, full-width MTP expert arena stays on the head owner. Include
+/// every retained TP1 capacity, not the target's half-width workspace.
+pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path,
+    rows: u64) -> anyhow::Result<Vec<Demand>> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(rows > 0, "Qwen MTP workspace needs positive rows");
+    let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
+    let (resident, scratch) = if let Some(exl3) = catalog.exl3() {
+        let resident = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1 as u64;
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}/rtx-tp1"));
+        anyhow::ensure!(rows > 0 && rows <= 4096, "Qwen MTP EXL3 capacity exceeds 4096 rows");
+        let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
+            let path = root.join(format!("m{capacity}/v41_exl3.json"));
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| anyhow::anyhow!("Qwen expert package {}: {error}", path.display()))?)?;
+            anyhow::ensure!(m["hidden"].as_u64() == Some(shape.hidden as u64)
+                && m["intermediate"].as_u64() == Some(shape.intermediate as u64)
+                && m["experts"].as_u64() == Some(shape.experts as u64)
+                && m["top_k"].as_u64() == Some(shape.topk as u64)
+                && m["capacity"].as_u64() == Some(capacity), "Qwen MTP package geometry: {}", path.display());
+            Ok(m)
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+    } else {
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen MTP format unsupported"))?.for_layer(shape.layers)?;
+        tensors.validate_layer(shape.layers)?;
+        let resident = Fp8Projection::ALL.iter().try_fold(0u64, |total, &projection| {
+            let (weights, _) = tensors.slice_bytes_with(projection, 1, 0, Slicing::Padded)?;
+            let scales = tensors.scale_region_bytes_with(projection, 1, 0, Slicing::Padded)?;
+            Ok::<_, anyhow::Error>(total + weights as u64 * shape.experts as u64 + scales as u64)
+        })?;
+        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let info = &manifest["layouts"]["tp1"];
+        let weights = match tensors.format() {
+            ExpertFormat::Fp8Block128 => info["weights"].as_str() == Some("fp8"),
+            ExpertFormat::Mxfp4 => info["weights"].as_str() == Some("mxfp4"),
+            ExpertFormat::Nvfp4 => matches!(info["weights"].as_str(), Some("nvfp4" | "nvfp4a4")),
+        };
+        anyhow::ensure!(info["tp"].as_u64() == Some(1)
+            && info["hidden"].as_u64() == Some(shape.hidden as u64)
+            && info["intermediate"].as_u64() == Some(shape.intermediate as u64)
+            && info["slice"].as_u64() == Some(shape.intermediate as u64)
+            && info["experts"].as_u64() == Some(shape.experts as u64)
+            && info["top_k"].as_u64() == Some(shape.topk as u64)
+            && info["input"].as_str() == Some("bf16") && weights,
+            "Qwen MTP package must be native full-width BF16-input TP1: {}", root.display());
+        let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", rows)
+            .ok_or_else(|| anyhow::anyhow!("Qwen MTP package has no capacity for {rows} rows"))?.max(256);
+        (resident, scratch)
+    };
+    Ok(vec![Demand::new(0, Category::Experts, "MTP expert weights", resident, Basis::Exact),
+        Demand::new(0, Category::Experts, "MTP expert workspace", scratch, Basis::Formula)])
+}
+
 /// Exact rank-package workspace before CUDA initialization. Packages are
 /// explicitly selected by the caller; unequal ranks may never fall back to a
 /// padded sibling. The runtime also checks its DSO ABI against these totals.
@@ -168,7 +243,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
             anyhow::ensure!(rows <= 4096, "Qwen EXL3 TP2 capacity exceeds 4096 rows");
             let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
                 let path = package.join(format!("m{capacity}/v41_exl3.json"));
-                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| anyhow::anyhow!("Qwen expert package {}: {error}", path.display()))?)?;
                 anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
                     && value["intermediate"].as_u64() == Some(width)
                     && value["experts"].as_u64() == Some(shape.experts as u64)
@@ -243,8 +318,8 @@ impl QwenTp2Rows {
             exchange_slot_bytes: align(bytes.max(partial_bytes))? })
     }
 
-    /// Data buffers and existing peer control only. Abort words and independent
-    /// publisher resources are admitted separately by the sealed transport API.
+    /// Persistent buffers of the abortable two-slot expert exchange. Native
+    /// publisher modules and streams belong to the context/module baseline.
     pub fn demands(self) -> anyhow::Result<Vec<Demand>> {
         let receive = self.exchange_slot_bytes.max(256).checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("Qwen TP2 receive extent overflow"))?;
@@ -253,6 +328,7 @@ impl QwenTp2Rows {
             Demand::new(gpu, Category::Transport, "expert receive", receive, Basis::Formula),
             Demand::new(gpu, Category::Transport, "expert reduction", self.reduction_bytes, Basis::Formula),
             Demand::new(gpu, Category::Transport, "expert peer control", 256, Basis::Formula),
+            Demand::new(gpu, Category::Transport, "expert abort word", 256, Basis::Formula),
         ]).collect())
     }
 }
@@ -302,8 +378,35 @@ pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
 /// stays single-owner until safety and numerical gates enable this caller.
+/// Match each owner's loaded program recipe, including its attention reduction plan.
+pub fn dual_program_manifests(manifest: &serde_json::Value, sms: [u32; 2],
+    plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<[serde_json::Value; 2]> {
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
+    let mut manifests = [manifest.clone(), manifest.clone()];
+    for (owner, manifest) in manifests.iter_mut().enumerate() {
+        cuteafd_core::coordinator_programs::select_card_plans(manifest, sms[owner])?;
+        for entry in manifest["programs"].as_array_mut().into_iter().flatten() {
+            if entry["name"].as_str().is_some_and(|name| selected.contains(name)) {
+                if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(&entry["geometry"], plan)? {
+                    entry["scratch_bytes_at_capacity"]["scratch"] = bytes.into();
+                }
+            }
+        }
+    }
+    Ok(manifests)
+}
+
+/// PeerExchange has two receive slots plus its control slot; progress is 48
+/// bytes per slot, with the allocator's 256-byte minimum on each owner.
+pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
+    if !enabled { return Vec::new(); }
+    [0, 1].map(|gpu| Demand::new(gpu, Category::Workspace,
+        "expert peer diagnostics", 256, Basis::Exact)).to_vec()
+}
+
 pub struct QwenDualInputs<'a> {
     pub admission: QwenAdmissionInputs<'a>,
+    pub owner_manifests: [Option<&'a serde_json::Value>; 2],
     pub gpus: [GpuBudget; 2],
     pub layer_weights: &'a [u64],
     pub layer_experts: &'a [Option<ExpertCost>],
@@ -363,8 +466,12 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     // Preserve single-owner per-token rounding; do not hide rounded table bytes.
     for bytes in &mut overhead { *bytes = bytes.div_ceil(QWEN_UNIT_ROWS as u64) * QWEN_UNIT_ROWS as u64; }
     let mut fixed = inputs.fixed.clone();
-    let admitted = qwen_admission(a)?;
     for gpu in 0..2 {
+        let owner = QwenAdmissionInputs { cfg: a.cfg, layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
+            manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
+            slots: a.slots, mark_bytes: a.mark_bytes, full_prefill_logits: a.full_prefill_logits,
+            ple: a.ple, future_expert_bytes: a.future_expert_bytes, headroom: a.headroom };
+        let admitted = qwen_admission(&owner)?;
         fixed.extend(admitted.items.iter().filter(|(_, group, _)| matches!(*group, "decode step" | "prefill step"))
             .map(|&(category, group, bytes)| Demand::new(gpu as u8, category, group, bytes, Basis::Formula)));
         fixed.push(Demand::new(gpu as u8, Category::Kv, "owner commit tables", 3 * 64 * 4, Basis::Formula));
@@ -387,7 +494,8 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         attention_placement: Some(AttentionPlacement::Layers), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: overhead.to_vec(), fixed, movables: Vec::new(), expert_workspace: 0,
         tp2_workspace: inputs.tp2_workspace, onboard: inputs.onboard, expert_gpus: 2,
-        policy: LayerPolicy { default: DUAL_WHOLE.to_vec(), by_kind: Vec::new(), ..LayerPolicy::default() },
+        policy: LayerPolicy { default: DUAL_WHOLE.to_vec(), by_kind: Vec::new(),
+            ownership: LayerOwnership::NonemptyRanges, ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: a.cfg.hc_width() as u64 * 2, rows: a.prefill_rows.max(64), lanes: 1,
             entry_gpu: 0, head_gpu: 0 },
         executor: ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true,
@@ -554,10 +662,10 @@ mod tests {
                 assert_eq!(p.reduction_bytes, rows * 5120);
                 assert_eq!(p.exchange_slot_bytes, align(payload.max(p.partial_bytes)));
                 let demands = p.demands()?;
-                assert_eq!(demands.len(), 8);
+                assert_eq!(demands.len(), 10);
                 for rank in 0..2 {
                     let rank_bytes = demands.iter().filter(|d| d.gpu == rank).map(|d| d.bytes).sum::<u64>();
-                    assert_eq!(rank_bytes, payload + 2 * p.exchange_slot_bytes.max(256) + rows * 5120 + 256);
+                    assert_eq!(rank_bytes, payload + 2 * p.exchange_slot_bytes.max(256) + rows * 5120 + 512);
                 }
             }
         }
@@ -649,6 +757,61 @@ mod tests {
         manifest["layouts"]["tp2-w256"]["input"] = serde_json::json!("wire");
         save(&manifest);
         assert!(dual_expert_workspace(&catalog, paths, 9).is_err());
+
+        config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+        for expert in 0..512 {
+            for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+                tensors.extend(nvfp4(&format!("mtp.layers.0.mlp.experts.{expert}.{projection}"), n, k));
+            }
+        }
+        let draft_dir = tempfile::tempdir().unwrap();
+        write_snapshot(draft_dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(draft_dir.path()).unwrap();
+        let lib = draft_dir.path().join("lib/libcuteafd_native.so");
+        let root = lib.parent().unwrap().join("fp8/fp8-qwen4-nvfp4a4");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("manifest.json");
+        let mut draft_manifest = serde_json::json!({"layouts": {"tp1": package(640, 1000)}});
+        draft_manifest["layouts"]["tp1"]["tp"] = 1.into();
+        let save_draft = |value: &serde_json::Value| std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        save_draft(&draft_manifest);
+        let demand = dual_draft_demands(&catalog, &lib, 9).unwrap();
+        assert_eq!(demand[0].bytes, cost.whole.resident);
+        assert_eq!(demand[1].bytes, 1000);
+        assert!(dual_draft_demands(&catalog, &lib, 0).is_err());
+        assert!(dual_draft_demands(&catalog, &lib, 17).is_err());
+        for (key, invalid) in [("tp", serde_json::json!(2)), ("slice", serde_json::json!(384)),
+            ("input", serde_json::json!("wire")), ("weights", serde_json::json!("fp8"))] {
+            let mut wrong = draft_manifest.clone();
+            wrong["layouts"]["tp1"][key] = invalid;
+            save_draft(&wrong);
+            assert!(dual_draft_demands(&catalog, &lib, 9).is_err(), "invalid {key}");
+        }
+    }
+
+    #[test]
+    fn dual_card_scratch_selects_each_owner_and_diagnostics_are_opt_in() {
+        let manifest = serde_json::json!({"programs": [{"name": "qwen4_sparse_gqa_kv_fp8_m64",
+            "card_plans": [
+                {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 8192}, "geometry": {}},
+                {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 1024}, "geometry": {}}
+            ]}]});
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
+        for sms in [[170, 188], [188, 170]] {
+            let owners = dual_program_manifests(&manifest, sms, plan).unwrap();
+            for rank in 0..2 {
+                assert_eq!(crate::serving_capacity::qwen_graphs::qwen_step_scratch(
+                    &owners[rank], true, false, Qwen4KvCache::Fp8).0,
+                    if sms[rank] == 170 { 8192 } else { 1024 });
+            }
+        }
+        assert!(dual_peer_diagnostics(false).is_empty());
+        let demands = dual_peer_diagnostics(true);
+        assert_eq!(demands.len(), 2);
+        for (rank, demand) in demands.iter().enumerate() {
+            assert_eq!(demand.gpu as usize, rank);
+            assert_eq!(demand.bytes, 256);
+        }
     }
 
     #[test]
@@ -673,7 +836,15 @@ mod tests {
                 crate::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head: false });
             let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
             fixed.extend(transport.iter().chain(&staging).cloned());
+            let manifest = serde_json::json!({"programs": [{"name": "qwen4_sparse_gqa_kv_fp8_m64",
+                "card_plans": [
+                    {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 8192}, "geometry": {}},
+                    {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 1024}, "geometry": {}}
+                ]}]});
+            let manifests = dual_program_manifests(&manifest, [170, 188],
+                cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap()).unwrap();
             let inputs = |measured| QwenDualInputs {
+                owner_manifests: manifests.each_ref().map(Some),
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
@@ -690,6 +861,15 @@ mod tests {
             let measured = dual_placement(&inputs(true)).unwrap();
             assert_eq!(planned, measured);
             assert_eq!(planned.pool_tokens, 2 << 20);
+            let decode = |rank: usize| planned.items[rank].iter().find(|item| item.group == "decode step").unwrap().bytes;
+            assert_eq!(decode(0) - decode(1), if kv_format == Qwen4KvCache::Fp8 { 8192 - 1024 } else { 0 });
+            for enabled in [false, true] {
+                let mut diagnostic = inputs(false);
+                diagnostic.fixed.extend(dual_peer_diagnostics(enabled));
+                let request = dual_request(&diagnostic, [0; 2]).unwrap();
+                assert_eq!(request.fixed.iter().filter(|d| d.group == "expert peer diagnostics").count(),
+                    if enabled { 2 } else { 0 });
+            }
             for demand in transport.iter().chain(&staging) {
                 assert!(planned.items[usize::from(demand.gpu)].iter().any(|item|
                     item.group == demand.group && item.category == demand.category && item.bytes == demand.bytes));

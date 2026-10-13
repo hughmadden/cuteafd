@@ -475,6 +475,8 @@ def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
     assert f"--user {os.getuid()}:{os.getgid()}" in coordinator
     assert "HF_HOME=/hf" in coordinator
     assert "CUTEAFD_BENCH_DIR=/run/cuteafd/bench" in coordinator
+    # Dashboard fidelity reuses the host's verified reference cache (no re-download).
+    assert "/.cache/cuteafd/fidelity:/tmp/cuteafd-home/.cache/cuteafd/fidelity" in coordinator
     worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
     assert 'id -u' in worker and 'id -g' in worker
     assert 'release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; docker run -d' in worker or ('release_serving_docker_args; cuteafd_cdi_gpu_args all' in worker and 'docker run -d' in worker)
@@ -1724,6 +1726,77 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
     assert "auto selected GPU 0 alone" in result.stderr
+
+
+@pytest.mark.parametrize("keys,physical_gpus,ranks,dual", [
+    ("", (0, 1), 0, True),
+    ("RTX_GPUS=2\n", (0, 1), 0, True),
+    ("RTX_GPUS=1\n", (0, 1), 0, False),
+    ("COORDINATOR_SPLIT=off\n", (0, 1), 0, False),
+    ("", (0,), 0, False),
+    ("", (0, 1), 1, False),
+])
+def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys: str,
+                                                           physical_gpus: tuple[int, ...],
+                                                           ranks: int, dual: bool) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  keys + f"SPARK_COUNT={ranks}\nSPECULATOR=off\n",
+                                  physical_gpus=physical_gpus)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert ("--split-device" in launch) == dual
+    assert ("CUTEAFD_ATTENTION_PLACEMENT=layers" in launch) == dual
+    assert ("--local-experts" in launch) == (ranks == 0)
+    if dual:
+        assert "--rtx-expert-layers all" in launch
+        preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+        assert "--attention-placement layers" in preflight
+        assert "--rtx-expert-layers all" in preflight
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
+def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  keys + "SPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--split-device" in launch and "--local-experts" in launch
+    assert "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
+    assert "has no head split yet" not in result.stderr
+
+
+
+@pytest.mark.parametrize("onboard", ["auto", "all", "max", "100%"])
+def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert f"--rtx-expert-layers {onboard}" in launch
+    assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
+
+
+@pytest.mark.parametrize("owners", ["0,1", "1,0"])
+@pytest.mark.parametrize("encoder_owner", [0, 1])
+def test_qwen_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, owners: str, encoder_owner: int) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 0,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": encoder_owner}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
+                                  "SPECULATOR=off\nVISION=auto\nAUDIO=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    expected = owners.split(",")[encoder_owner]
+    assert f"--vision rtx:{expected}" in launch
+
+
+def test_qwen_dual_rejects_attention_head_sharding(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  "RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nATTENTION_PLACEMENT=heads\n")
+    assert result.returncode != 0
+    assert "head-split attention is not implemented" in result.stderr
 
 
 def test_split_off_explicitly_uses_the_first_gpu(tmp_path: Path) -> None:
