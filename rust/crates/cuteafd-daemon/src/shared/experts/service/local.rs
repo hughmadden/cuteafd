@@ -319,8 +319,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // completion-channel poll, which still busy-polls briefly) with an
     // `idle_wait` upper bound. One wait covers one endpoint, so while idle the
     // loop blocks on one connection per pass and rotates; the pass itself still
-    // sweeps every connection with a non-blocking poll, which bounds pickup to
-    // one wait window. Any request or admission resets the idle timer.
+    // sweeps every connection with a non-blocking poll, so a request on a
+    // connection other than the waited one is picked up when that wait ends:
+    // within one window, or two when the rotation wraps past it (three or more
+    // connections). The wait must therefore end after `idle_wait`
+    // (`LocalVerbsExpertConnection::poll`), not after an active exchange's
+    // timeout. Any request or admission resets the idle timer.
     let idle_spin = Duration::from_secs(30);
     let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
