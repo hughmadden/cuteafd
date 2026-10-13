@@ -1776,20 +1776,43 @@ def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) 
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 
+@pytest.mark.parametrize("family", ["qwen4", "glm5_flash", "mimo_flash", "mimo_pro"])
 @pytest.mark.parametrize("owners", ["0,1", "1,0"])
 @pytest.mark.parametrize("encoder_owner", [0, 1])
-def test_qwen_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, owners: str, encoder_owner: int) -> None:
-    config = {**SPLIT_CONFIGS["qwen4"], "vision_config": {"depth": 24}}
+def test_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, family: str,
+                                                 owners: str, encoder_owner: int) -> None:
+    config = {**SPLIT_CONFIGS[family], "vision_config": {"depth": 24}}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 0,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": encoder_owner}, "replicas": []}}
     result = _family_launch_result(tmp_path, config, "test/model",
                                   f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
-                                  "SPECULATOR=off\nVISION=auto\nAUDIO=off\n", encoder_plan=plan)
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\nVISION=auto\nAUDIO=off\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    serve = {"qwen4": "serve-qwen4", "glm5_flash": "serve-glmf",
+             "mimo_flash": "serve-mimo", "mimo_pro": "serve-mimo"}[family]
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     expected = owners.split(",")[encoder_owner]
     assert f"--vision rtx:{expected}" in launch
+
+
+@pytest.mark.parametrize("family", ["mimo_flash", "mimo_pro"])
+@pytest.mark.parametrize("owners", ["0,1", "1,0"])
+@pytest.mark.parametrize("encoder_owner", [0, 1])
+def test_dual_maps_audio_encoder_owner_to_visible_device(tmp_path: Path, family: str,
+                                                       owners: str, encoder_owner: int) -> None:
+    config = {**SPLIT_CONFIGS[family], "model_type": "mimo_v2",
+              "hidden_size": 4096 if family == "mimo_flash" else 6144,
+              "audio_config": {"audio_channels": 20}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 0,
+            "encoder_plan_hash": "ab" * 32, "encoder": None,
+            "audio_encoder": {"kind": {"kind": "rtx", "gpu": encoder_owner}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/model",
+                                  f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
+                                  "SPECULATOR=off\nVISION=off\nAUDIO=auto\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert f"--audio rtx:{owners.split(',')[encoder_owner]}" in launch
 
 
 def test_qwen_dual_rejects_attention_head_sharding(tmp_path: Path) -> None:
