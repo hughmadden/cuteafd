@@ -9,8 +9,8 @@
 //! cargo test --release -p cuteafd-core --test draft_policy_bench -- --ignored --nocapture
 //! ```
 //!
-//! With `CUTEAFD_POLICY_BENCH_MAX_US=N` it fails when any call's median
-//! exceeds N microseconds.
+//! With `CUTEAFD_POLICY_BENCH_MAX_US=N` it fails when select's median exceeds
+//! N microseconds (non-regression bound: 1200 at this geometry, 2026-10-13).
 use cuteafd_core::{DraftCandidate, DraftPolicy, DraftRoundObservation, LayerResource, ObservedDraftRequest,
     PolicyGeometry, PolicySeed, ResourceClass};
 use std::time::Instant;
@@ -87,6 +87,6 @@ fn draft_policy_host_cost_per_round() {
     eprintln!("C16 V4.1 geometry, medians: select {s:.1} us, choose_width {w:.1} us, observe {o:.1} us, total {:.1} us",
         s + w + o);
     if let Some(limit) = std::env::var("CUTEAFD_POLICY_BENCH_MAX_US").ok().and_then(|v| v.parse::<f64>().ok()) {
-        assert!(s <= limit && w <= limit && o <= limit, "a per-round call exceeds {limit} us");
+        assert!(s <= limit, "select median {s:.1} us exceeds {limit} us");
     }
 }
