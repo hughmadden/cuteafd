@@ -99,8 +99,32 @@ def test_every_exporter_imports_the_pin_and_the_native_key_carries_it():
         text = path.read_text()
         if 'cute.compile' in text or 'b12x' in text:
             assert '_pinned_sparkinfer' in text, path.name
-    assert SOURCE.rstrip().endswith('HOST_TARGET = host_target()')
-    assert '_pin_cute_host_target()' in SOURCE
+    # The pin runs at import, as a module-level statement every exporter executes.
+    assert '\n_pin_cute_host_target()\nHOST_TARGET = host_target()\n' in SOURCE
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     key = build[build.index('wip_native_key() {'):build.index('\n}\n', build.index('wip_native_key() {'))]
     assert 'CUTEAFD_CUTE_HOST_TARGET' in key and '/python/' not in key and 'find native python' in key
+
+
+def test_manifests_record_the_compiled_target_not_the_export_hosts_gpu_name():
+    pin = _pin_module()
+    tree = ast.parse(SOURCE)
+    fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'export_target')
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'pin', 'exec'), pin.__dict__)
+    props = types.SimpleNamespace(major=12, minor=0, name='NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition')
+    assert pin.export_target(props) == 'sm120'
+    for name in ('export_b12x_v41_experts_aot.py', 'export_b12x_v41_nvfp4_aot.py', 'export_b12x_exl3_aot.py',
+                 'export_b12x_v41_fp8_aot.py'):
+        text = (ROOT / 'python/tools/aot' / name).read_text()
+        assert 'props.name' not in text and 'properties.name' not in text, name
+        assert '_pinned_sparkinfer.export_target(' in text, name
+
+
+def test_cuda_objects_are_seeded_per_translation_unit():
+    # nvcc embedded tmpxft_<pid> names and random per-TU IDs: two builds of the
+    # same source never matched. Every .cu compile gets -objtemp and its own seed.
+    cmake = (ROOT / 'native/CMakeLists.txt').read_text()
+    block = cmake[cmake.index('function(cuteafd_reproducible_cuda_objects)'):]
+    assert '"-objtemp" "--frandom-seed=${target}/${relative}"' in block
+    assert 'file(RELATIVE_PATH relative "${CMAKE_CURRENT_SOURCE_DIR}"' in block
+    assert 'cmake_language(DEFER CALL cuteafd_reproducible_cuda_objects)' in cmake

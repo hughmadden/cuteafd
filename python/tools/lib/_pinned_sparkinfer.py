@@ -128,3 +128,10 @@ def _pin_cute_host_target() -> None:
 
 _pin_cute_host_target()
 HOST_TARGET = host_target()
+
+
+def export_target(properties) -> str:
+    """What an AOT manifest records as its device: the compiled target
+    ("sm120"), never the export host's GPU marketing name, which made two hosts'
+    identical exports differ (RTX PRO 6000 vs its Max-Q edition, #127)."""
+    return f"sm{properties.major}{properties.minor}"
