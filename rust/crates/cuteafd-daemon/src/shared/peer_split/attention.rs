@@ -3,7 +3,7 @@
 use super::context::{combine_order, slot, ContextExchange};
 use super::{hop::HopLink, PeerExchange, DIRECT};
 use anyhow::{ensure, Result};
-use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerMode, Placement};
+use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, LayerMode, Placement};
 use std::ffi::c_void;
 
 #[derive(Clone, Copy)]
@@ -121,6 +121,46 @@ trait LayerProtocol {
     fn land(&self, ticket: Self::Ticket) -> Result<*mut c_void>;
 }
 
+/// Deferred FFN work is retained in the engine, never in a temporary ticket:
+/// dropping this non-owning handle on error cannot free an in-flight wave.
+/// The enclosing whole-submit boundary aborts and drains the engine's owners.
+pub(crate) trait PipelineKernels: LayerKernels {
+    type FfnTicket: Copy;
+    /// Queue both ranks' publications in the same lane order. Defer any wait
+    /// for another unit's publication to finish_ffn, never to this method.
+    fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Self::FfnTicket>;
+    fn finish_ffn(&mut self, layer: usize, ticket: Self::FfnTicket) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneOrder {
+    /// Consecutive prefill chunks share mutable compressor/KV history.
+    OrderedChunks,
+    /// Decode/verify lanes contain disjoint request state and can be staggered.
+    Independent,
+}
+
+/// A graph segment cannot alias another rank, lane, mode or payload shape.
+/// Families append their exact pointer/table/workspace binding key; GraphBank
+/// retains GraphOwner pins and releases retired segments only after drainage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LayerSegmentKey<K> {
+    pub layer: usize,
+    pub lane: usize,
+    pub rank: u8,
+    pub mode: LayerMode,
+    pub rows: usize,
+    pub binding: K,
+}
+
+impl<K> LayerSegmentKey<K> {
+    pub fn new(plan: &LayerExecutionPlan, layer: usize, lane: usize, rank: u8, rows: usize, binding: K) -> Result<Self> {
+        ensure!(rank < 2 && (lane as u64) < plan.spec().lanes && rows > 0 && rows as u64 <= plan.spec().rows,
+            "graph segment outside admitted rank/lane/rows");
+        Ok(Self { layer, lane, rank, mode: plan.mode(layer)?, rows, binding })
+    }
+}
+
 struct LayerExchange<'a, 'b> {
     peer: &'a PeerExchange<'b>,
     hops: &'a HopLink<'b>,
@@ -200,6 +240,87 @@ fn layer_stack_with(placement: &Placement, exchange: &impl LayerProtocol,
     }
     hops_at(HopPoint::Exit, kernels)?;
     ensure!(hop_index == placement.hops.len(), "attention placement has out-of-order hop points");
+    Ok(())
+}
+
+/// Shared two-lane serving executor. Binding happens before any capture or
+/// enqueue, and requires hop/FFN waits to share one terminal owner. A family
+/// supplies only attention/FFN kernels and residual packing, not peer order.
+pub(crate) fn layer_pipeline<K: PipelineKernels>(plan: &LayerExecutionPlan, peer: &PeerExchange<'_>,
+    hops: &HopLink<'_>, order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    hops.validate_binding(plan, peer)?;
+    layer_pipeline_with(plan, &LayerExchange { peer, hops }, order, rows, kernels)
+}
+
+fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
+    lane: usize, rows: usize, kernels: &mut impl LayerKernels) -> Result<()> {
+    for (index, &hop) in plan.hops().iter().enumerate().filter(|(_, hop)| hop.at == point) {
+        transfer(exchange, index, hop, lane, rows, kernels)?;
+    }
+    Ok(())
+}
+
+fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, layer: usize,
+    lane: usize, rows: usize, kernels: &mut impl LayerKernels) -> Result<Option<usize>> {
+    exchange.require_live()?;
+    if layer == 0 { pipeline_hops(exchange, plan, HopPoint::Entry, lane, rows, kernels)?; }
+    pipeline_hops(exchange, plan, HopPoint::BeforeLayer(layer), lane, rows, kernels)?;
+    let owner = match plan.mode(layer)? {
+        LayerMode::HeadSplit => { kernels.heads(layer)?; None }
+        LayerMode::ContextSplit => {
+            let ordinal = plan.modes()[..layer].iter().filter(|&&mode| mode == LayerMode::ContextSplit).count();
+            kernels.context(layer, ordinal)?;
+            None
+        }
+        LayerMode::Whole { gpu, ffn } => {
+            kernels.owned(layer, usize::from(gpu))?;
+            (ffn == FfnMode::Owner).then_some(usize::from(gpu))
+        }
+    };
+    pipeline_hops(exchange, plan, HopPoint::AfterAttention(layer), lane, rows, kernels)?;
+    Ok(owner)
+}
+
+fn layer_pipeline_with<K: PipelineKernels>(plan: &LayerExecutionPlan, exchange: &impl LayerProtocol,
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    ensure!(!kernels.is_empty() && kernels.len() <= 2 && kernels.len() == rows.len()
+        && kernels.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+    ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
+        "layer pipeline rows outside admission");
+    exchange.require_live()?;
+    let count = plan.modes().len();
+    match order {
+        LaneOrder::OrderedChunks => {
+            for layer in 0..count {
+                for lane in 0..kernels.len() {
+                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane])?;
+                    let ticket = kernels[lane].begin_ffn(layer, owner)?;
+                    exchange.require_live()?;
+                    kernels[lane].finish_ffn(layer, ticket)?;
+                }
+            }
+        }
+        LaneOrder::Independent => {
+            // Lane 1 trails lane 0 by one layer. All publications in a wave
+            // precede its completion waits, with identical FFN lane order on
+            // both ranks. A wave closes before reusing its parity receive slots.
+            for wave in 0..count + kernels.len() - 1 {
+                let mut pending = Vec::with_capacity(kernels.len());
+                for lane in 0..kernels.len() {
+                    let Some(layer) = wave.checked_sub(lane).filter(|&layer| layer < count) else { continue };
+                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane])?;
+                    pending.push((lane, layer, kernels[lane].begin_ffn(layer, owner)?));
+                }
+                for (lane, layer, ticket) in pending {
+                    exchange.require_live()?;
+                    kernels[lane].finish_ffn(layer, ticket)?;
+                }
+            }
+        }
+    }
+    for lane in 0..kernels.len() {
+        pipeline_hops(exchange, plan, HopPoint::Exit, lane, rows[lane], &mut kernels[lane])?;
+    }
     Ok(())
 }
 
@@ -363,6 +484,176 @@ mod tests {
         assert!(layer_stack_with(&p, &r, 1, 6, &mut &r).is_err());
         assert!(layer_stack_with(&p, &r, 1, 0, &mut &r).is_err());
         assert!(r.calls.borrow().is_empty());
+    }
+
+    fn execution_plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPlan {
+        use cuteafd_loader::placement::{plan_hops, HopSpec, ResidualHome};
+        let spec = HopSpec { row_bytes: 32, rows: 6, lanes: 2, entry_gpu: entry, head_gpu: head };
+        let mut p = placement(modes);
+        p.hops = plan_hops(modes, &spec);
+        p.residual = vec![ResidualHome::Owned(entry)];
+        for &mode in modes {
+            p.residual.push(p.residual.last().unwrap().transition(mode).home);
+        }
+        LayerExecutionPlan::new(&p, spec).unwrap()
+    }
+
+    #[test]
+    fn execution_plan_rejects_stale_hops_residuals_and_prefix_owners() {
+        use cuteafd_loader::placement::LayerPlanError;
+        let modes = [LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, LayerMode::HeadSplit];
+        let plan = execution_plan(&modes, 0, 1);
+        plan.validate_state_owners(0, &[1]).unwrap();
+        plan.validate_state_owners(1, &[1, 0]).unwrap();
+        for owners in [&[][..], &[0][..], &[0, 1][..], &[1, 1][..]] {
+            assert!(plan.validate_state_owners(0, owners).is_err());
+        }
+        let mut p = placement(&modes);
+        p.residual = plan.homes().to_vec();
+        p.hops = plan.hops().to_vec();
+        for index in 0..p.hops.len() {
+            let mut missing = p.clone();
+            missing.hops.remove(index);
+            assert_eq!(LayerExecutionPlan::new(&missing, plan.spec()), Err(LayerPlanError::Hops));
+            let mut wrong = p.clone();
+            wrong.hops[index].from = 1 - wrong.hops[index].from;
+            assert_eq!(LayerExecutionPlan::new(&wrong, plan.spec()), Err(LayerPlanError::Hops));
+        }
+        p.residual[1] = cuteafd_loader::placement::ResidualHome::Owned(1);
+        assert_eq!(LayerExecutionPlan::new(&p, plan.spec()), Err(LayerPlanError::Residual));
+    }
+
+    #[test]
+    fn graph_segments_distinguish_owner_lane_shape_and_binding() {
+        let plan = execution_plan(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], 0, 0);
+        let key = LayerSegmentKey::new(&plan, 0, 0, 1, 4, 17usize).unwrap();
+        for (lane, rank, rows, binding) in [(1, 1, 4, 17), (0, 0, 4, 17), (0, 1, 6, 17), (0, 1, 4, 18)] {
+            assert_ne!(key, LayerSegmentKey::new(&plan, 0, lane, rank, rows, binding).unwrap());
+        }
+        for (layer, lane, rank, rows) in [(1, 0, 0, 1), (0, 2, 0, 1), (0, 0, 2, 1), (0, 0, 0, 0), (0, 0, 0, 7)] {
+            assert!(LayerSegmentKey::new(&plan, layer, lane, rank, rows, 17).is_err());
+        }
+    }
+
+    struct PipelineRecorder<'a> {
+        shared: &'a PipelineTrace,
+        lane: usize,
+    }
+    #[derive(Default)]
+    struct PipelineTrace {
+        hops: Vec<Hop>,
+        schedule: RefCell<super::super::order::Schedule>,
+        calls: RefCell<Vec<(usize, usize, &'static str)>>,
+        closed: std::cell::Cell<bool>,
+    }
+    impl PipelineTrace {
+        fn pair(&self, exchange: &'static str, slot: usize) {
+            let mut s = self.schedule.borrow_mut();
+            for rank in 0..2 { s.push(rank, exchange, slot, format!("{exchange} push {slot}")); }
+            for rank in 0..2 { s.wait(rank, exchange, slot, format!("{exchange} wait {slot}")); }
+        }
+    }
+    impl LayerProtocol for PipelineTrace {
+        type Ticket = (usize, usize, usize);
+        fn require_live(&self) -> Result<()> { ensure!(!self.closed.get(), "retired fixture"); Ok(()) }
+        fn push_entry(&self, from: usize, _: *const c_void, _: *mut c_void, _: usize) -> Result<()> {
+            self.schedule.borrow_mut().push(from, "entry", DIRECT, "entry push"); Ok(())
+        }
+        fn wait_entry(&self, to: usize) -> Result<()> {
+            self.schedule.borrow_mut().wait(to, "entry", DIRECT, "entry wait"); Ok(())
+        }
+        fn send(&self, index: usize, lane: usize, source: *const c_void, _: usize) -> Result<Self::Ticket> {
+            let from = source as usize - 1;
+            let to = self.hops[index].to;
+            let ordinal = self.hops[..index].iter().filter(|hop| hop.charged() && hop.to == to).count();
+            let slot = 2 * lane + ordinal % 2;
+            self.schedule.borrow_mut().push(from, "hop", slot, "hop push");
+            Ok((1 - from, slot, index))
+        }
+        fn land(&self, (to, slot, _index): Self::Ticket) -> Result<*mut c_void> {
+            self.schedule.borrow_mut().wait(to, "hop", slot, "hop wait");
+            Ok(std::ptr::null_mut())
+        }
+    }
+    impl LayerKernels for PipelineRecorder<'_> {
+        fn pack(&mut self, hop: Hop) -> Result<*const c_void> { Ok((usize::from(hop.from) + 1) as *const c_void) }
+        fn entry_destination(&mut self, _: usize) -> Result<*mut c_void> { Ok(std::ptr::null_mut()) }
+        fn adopt(&mut self, _: Hop, _: *mut c_void) -> Result<()> { Ok(()) }
+        fn heads(&mut self, layer: usize) -> Result<()> {
+            self.shared.calls.borrow_mut().push((self.lane, layer, "heads"));
+            self.shared.pair("heads", 2 * self.lane + layer % 2); Ok(())
+        }
+        fn context(&mut self, layer: usize, ordinal: usize) -> Result<()> {
+            self.shared.calls.borrow_mut().push((self.lane, layer, "context"));
+            for exchange in ["query", "candidate", "partial"] {
+                self.shared.pair(exchange, 2 * self.lane + ordinal % 2);
+            }
+            Ok(())
+        }
+        fn owned(&mut self, layer: usize, _: usize) -> Result<()> {
+            self.shared.calls.borrow_mut().push((self.lane, layer, "owned")); Ok(())
+        }
+        fn ffn(&mut self, _: usize, _: Option<usize>) -> Result<()> { panic!("pipeline uses deferred FFN"); }
+    }
+    impl PipelineKernels for PipelineRecorder<'_> {
+        type FfnTicket = Option<usize>;
+        fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Self::FfnTicket> {
+            self.shared.calls.borrow_mut().push((self.lane, layer, "begin"));
+            if owner.is_none() {
+                let slot = 2 * self.lane + layer % 2;
+                let mut s = self.shared.schedule.borrow_mut();
+                s.push(0, "routes", slot, "routes");
+                s.wait(1, "routes", slot, "routes wait");
+                s.push(1, "results", slot, "results");
+                for rank in 0..2 { s.push(rank, "ffn", slot, format!("ffn push lane {} L{layer}", self.lane)); }
+                Ok(Some(slot))
+            } else { Ok(None) }
+        }
+        fn finish_ffn(&mut self, layer: usize, ticket: Self::FfnTicket) -> Result<()> {
+            self.shared.calls.borrow_mut().push((self.lane, layer, "finish"));
+            if let Some(slot) = ticket {
+                let mut s = self.shared.schedule.borrow_mut();
+                s.wait(0, "results", slot, "result wait");
+                for rank in 0..2 { s.wait(rank, "ffn", slot, format!("ffn wait lane {} L{layer}", self.lane)); }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn real_pipeline_schedule_drains_every_mixed_owner_interleaving_and_fault_prefix() {
+        use super::super::order::{check, check_submission_faults};
+        let modes = [LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split },
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }];
+        for order in [LaneOrder::OrderedChunks, LaneOrder::Independent] {
+            for lanes in 1..=2 {
+                for entry in 0..2 {
+                    for head in 0..2 {
+                        let plan = execution_plan(&modes, entry, head);
+                        let trace = PipelineTrace { hops: plan.hops().to_vec(), ..PipelineTrace::default() };
+                        let mut kernels: Vec<_> = (0..lanes).map(|lane| PipelineRecorder { shared: &trace, lane }).collect();
+                        layer_pipeline_with(&plan, &trace, order, &vec![6; lanes], &mut kernels).unwrap();
+                        trace.schedule.borrow_mut().end_request();
+                        check(&trace.schedule.borrow()).unwrap();
+                        check_submission_faults(&trace.schedule.borrow()).unwrap();
+                        let calls = trace.calls.borrow();
+                        assert_eq!(calls.len(), modes.len() * lanes * 3);
+                        if order == LaneOrder::OrderedChunks && lanes == 2 {
+                            for layer in 0..modes.len() {
+                                let done = calls.iter().position(|&call| call == (0, layer, "finish")).unwrap();
+                                let next = calls.iter().position(|&(lane, l, kind)| lane == 1 && l == layer && kind != "begin" && kind != "finish").unwrap();
+                                assert!(done < next, "shared prefill history must commit before its next chunk");
+                            }
+                        }
+                        trace.closed.set(true);
+                        let before = trace.schedule.borrow().streams.clone();
+                        assert!(layer_pipeline_with(&plan, &trace, order, &vec![6; lanes], &mut kernels).is_err());
+                        assert_eq!(before, trace.schedule.borrow().streams);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

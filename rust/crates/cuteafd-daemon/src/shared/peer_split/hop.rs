@@ -90,6 +90,19 @@ impl<'a> HopLink<'a> {
         Ok(())
     }
 
+    /// Serving layer executors borrow the exact same terminal owner as entry
+    /// and FFN exchanges; a legacy non-abortable hop cannot be bound to them.
+    pub(crate) fn validate_binding(&self, plan: &cuteafd_loader::placement::LayerExecutionPlan,
+        peer: &super::PeerExchange<'_>) -> Result<()> {
+        ensure!(self.spec == plan.spec() && self.hops == plan.hops(), "hop storage differs from layer plan");
+        let words = [peer.abort_word(0)?.context("rank 0 exchange is not abortable")?,
+            peer.abort_word(1)?.context("rank 1 exchange is not abortable")?];
+        ensure!(self.abort == Some(words), "hops must borrow the layer exchange's terminal owner");
+        ensure!((0..2).all(|rank| self.ranks[rank].device == peer.device(rank)
+            && self.ranks[rank].stream == peer.stream(rank)), "hop and FFN streams differ");
+        peer.require_live()
+    }
+
     /// Receive bytes held on `rank` (the solver charged exactly this).
     pub fn receive_bytes(&self, rank: usize) -> u64 {
         self.ends[rank].recv.iter().map(|r| r.buffer.bytes as u64).sum()
