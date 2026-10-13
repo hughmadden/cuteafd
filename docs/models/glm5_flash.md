@@ -83,13 +83,17 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
-- Target head on tensor cores: `GLM5_FLASH_TARGET_HEAD=tensor`
-  (`--target-head tensor`, opt-in; needs the BF16 head, `GLM5_FLASH_FP8_HEAD=off`)
-  keeps steps of up to 8 rows (one sequence's token and up to seven drafts) on
-  the pedantic FP32 cuBLAS GEMM and runs wider ones (verify steps of two or
-  more sequences, prefill-path scoring, `--nll`) as a BF16 tensor-core GEMM
-  with FP32 accumulation, one read of the head. It changes the target's
-  numerics past 8 rows, so it is KL-gated against `exact`, the default.
+- Target head on tensor cores (Hugh Madden, #102): with the BF16 head
+  (`GLM5_FLASH_FP8_HEAD=off`; the launcher's `auto` head is FP8),
+  `GLM5_FLASH_TARGET_HEAD=auto` (default) resolves to `tensor`: steps of up
+  to 8 rows (one sequence's token and up to seven drafts) stay on the pedantic
+  FP32 cuBLAS GEMM, wider ones (verify steps of two or more sequences,
+  prefill-path scoring, `--nll`) run as a BF16 tensor-core GEMM with FP32
+  accumulation, one read of the head. Against `exact` over 2,048 full-prefill
+  rows: KL 1.24e-10 nats, top-1 2,048/2,048. `exact` (pedantic GEMM at every
+  row count) stays as an explicit diagnostic. `auto` forwards nothing and the
+  engine resolves it (`--target-head` unset); with the FP8 head the setting
+  does not apply, and an explicit `tensor` there is refused.
 - 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the

@@ -7,10 +7,11 @@
 //! verify, prefill tails, `--nll` full prefill, draft blocks) runs the
 //! `glmf_head_fp8` program in [`FP8_HEAD_ROWS`]-row spans.
 //!
-//! The target's logits through the BF16 head ([`TargetHeadMode`], `--target-head`): `exact` runs
-//! the pedantic FP32 cuBLAS GEMM (CUDA cores) at every row count; `tensor` keeps steps of up to
-//! [`TARGET_HEAD_TENSOR_ROWS`]` - 1` rows on it and runs wider ones as a BF16 tensor-core GEMM with
-//! FP32 accumulation, which reads the head once for every row count.
+//! The target's logits through the BF16 head ([`TargetHeadMode`], `--target-head`): `tensor`
+//! (the BF16 head's default) keeps steps of up to [`TARGET_HEAD_TENSOR_ROWS`]` - 1` rows on the
+//! pedantic FP32 cuBLAS GEMM (CUDA cores) and runs wider ones as a BF16 tensor-core GEMM with FP32
+//! accumulation, which reads the head once for every row count; `exact` (a diagnostic) keeps every
+//! row count on the pedantic GEMM. The FP8 head runs its own program either way.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};
@@ -19,11 +20,11 @@ use std::ffi::c_void;
 /// Rows one `glmf_head_fp8` launch takes (its GEMV's M tile).
 pub(crate) const FP8_HEAD_ROWS: usize = 16;
 
-/// How the target's logits run through the BF16 head (`--target-head`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+/// How the target's logits run through the BF16 head (`--target-head`; unset resolves with
+/// [`TargetHeadMode::resolve`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum TargetHeadMode {
     /// The pedantic FP32 cuBLAS GEMM (FP32 products and sums on CUDA cores) at every row count.
-    #[default]
     Exact,
     /// Up to 8 rows as `exact` (a one-sequence step: one token and up to seven drafts); from
     /// [`TARGET_HEAD_TENSOR_ROWS`] rows a BF16 tensor-core GEMM with FP32 accumulation and logits.
@@ -35,6 +36,13 @@ pub(crate) enum TargetHeadMode {
 pub(crate) const TARGET_HEAD_TENSOR_ROWS: usize = 9;
 
 impl TargetHeadMode {
+    /// The mode serving runs: an explicit `--target-head`, else `tensor` over the BF16 head and
+    /// `exact` over the FP8 head (whose own program ignores the mode, so its launches are
+    /// unchanged).
+    pub fn resolve(requested: Option<Self>, fp8_head: bool) -> Self {
+        requested.unwrap_or(if fp8_head { Self::Exact } else { Self::Tensor })
+    }
+
     /// Whether `rows` logit rows run on tensor cores.
     pub fn tensor_cores(self, rows: usize) -> bool {
         self == TargetHeadMode::Tensor && rows >= TARGET_HEAD_TENSOR_ROWS
@@ -112,7 +120,6 @@ mod tests {
     /// sequence (up to 8 rows) keep the pedantic GEMM's bits.
     #[test]
     fn the_target_head_takes_tensor_cores_from_nine_rows_only_when_asked() {
-        assert_eq!(TargetHeadMode::default(), TargetHeadMode::Exact);
         for rows in [1, 8, 9, 64, 127, 128, 4096] {
             assert!(!TargetHeadMode::Exact.tensor_cores(rows), "{rows}");
         }
@@ -121,6 +128,19 @@ mod tests {
         }
         for rows in [9, 16, 56, 64, 127, 128, 4096] {
             assert!(TargetHeadMode::Tensor.tensor_cores(rows), "{rows}");
+        }
+    }
+
+    /// Unset resolves to `tensor` over the BF16 head and to `exact` (inert) over the FP8 head; an
+    /// explicit mode always wins.
+    #[test]
+    fn the_target_head_resolves_tensor_over_the_bf16_head_only_when_unset() {
+        assert_eq!(TargetHeadMode::resolve(None, false), TargetHeadMode::Tensor);
+        assert_eq!(TargetHeadMode::resolve(None, true), TargetHeadMode::Exact);
+        for fp8_head in [false, true] {
+            for mode in [TargetHeadMode::Exact, TargetHeadMode::Tensor] {
+                assert_eq!(TargetHeadMode::resolve(Some(mode), fp8_head), mode);
+            }
         }
     }
 
