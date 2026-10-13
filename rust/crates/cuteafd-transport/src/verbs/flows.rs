@@ -598,6 +598,7 @@ mod tests {
         let native = endpoint();
         VerbsHostProtocolV2PersistentStart {
             message: "protocol_v2_persistent_start".into(),
+            wire_version: PERSISTENT_CONTROL_VERSION,
             execution_lane: 0,
             request_capacity_wire_bytes: 8 << 20,
             response_capacity_wire_bytes: 8 << 20,
@@ -629,19 +630,20 @@ mod tests {
     }
 
     #[test]
-    fn label_zero_keeps_the_session_handshake_byte_identical() {
-        // Off: the start and ready messages carry no new field, so either end
-        // may be an older build.
+    fn versioned_session_preserves_optional_flow_label() {
+        // Flow labels remain optional within the current bootstrap version.
         let start = serde_json::to_value(session_start(0)).unwrap();
         assert!(start.get("flow_label").is_none());
         let back: VerbsHostProtocolV2PersistentStart = serde_json::from_value(start).unwrap();
         assert_eq!(back.flow_label, 0);
-        // On: the label travels, and an older worker ignores it.
+        // On: the label travels and the worker echoes it.
         let start = serde_json::to_value(session_start(7)).unwrap();
         assert_eq!(start["flow_label"], 7);
         assert_eq!(serde_json::from_value::<VerbsHostProtocolV2PersistentStart>(start).unwrap().flow_label, 7);
         let ready = |flow_label| VerbsHostProtocolV2PersistentReady {
             message: "protocol_v2_persistent_ready".into(),
+            wire_version: PERSISTENT_CONTROL_VERSION,
+            expert_grouping: None,
             server_endpoint: session_start(0).client_endpoint,
             server_native_endpoint: endpoint(),
             flow_label,
@@ -651,6 +653,19 @@ mod tests {
         assert_eq!(serde_json::from_value::<VerbsHostProtocolV2PersistentReady>(old).unwrap().flow_label, 0);
         let echoed = serde_json::to_value(ready(7)).unwrap();
         assert_eq!(serde_json::from_value::<VerbsHostProtocolV2PersistentReady>(echoed).unwrap().flow_label, 7);
+    }
+
+    #[test]
+    fn persistent_bootstrap_rejects_legacy_and_unknown_versions_before_payload() {
+        for version in [None, Some(1), Some(3)] {
+            // Deliberately omit all endpoint fields: version failure must be first.
+            let mut value = serde_json::json!({"message":"protocol_v2_persistent_ready"});
+            if let Some(version) = version { value["wire_version"] = version.into(); }
+            let error = decode_persistent_control::<VerbsHostProtocolV2PersistentReady>(value).unwrap_err();
+            assert!(error.to_string().contains("version mismatch"));
+        }
+        let start = serde_json::to_value(session_start(0)).unwrap();
+        assert!(decode_persistent_control::<VerbsHostProtocolV2PersistentStart>(start).is_ok());
     }
 
     #[test]

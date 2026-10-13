@@ -25,7 +25,7 @@ fn geometry() -> PolicyGeometry {
         layers: (0..LAYERS).map(|l| LayerResource { class: Some(u8::from(l >= 8)),
             slice_bytes: if l < 8 { 18_800_640. } else { 4_700_160. }, group_rows: 16, timed: l > 0 }).collect(),
         experts: 384, topk: TOPK as u8, max_requests: REQUESTS, max_positions: POSITIONS, widths: vec![5, 7],
-        classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 2,
+        classes: vec![ResourceClass::rtx(), ResourceClass::spark()], group_rows_by_rows: Vec::new(), regimes: 2,
     }
 }
 

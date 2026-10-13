@@ -301,6 +301,26 @@ impl<'a> Exl3Worker<'a> {
 
     pub(crate) fn is_paired(&self) -> bool { self.paired }
 
+    pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping, InstalledExpertVariant};
+        let variants = self.executions.iter().map(|execution| InstalledExpertVariant::from_queries(
+            execution.capacity(), |_| Ok(execution.group_rows())))).collect::<Result<Vec<_>>>()?;
+        let selector = match self.row_policy {
+            Exl3RowPolicy::Nearest => ExpertGroupingSelector::Exl3Nearest,
+            Exl3RowPolicy::GlmFlashK64 => ExpertGroupingSelector::Exl3GlmFlashK64,
+        };
+        let report = InstalledExpertGrouping::new(loaded, rank, self.capacity, selector, variants)?;
+        for rows in 1..=self.capacity {
+            let execution = self.executions.iter().find(|execution|
+                execution.capacity() >= self.row_policy.required_capacity(rows))
+                .context("missing installed EXL3 grouping capacity")?;
+            ensure!(report.group_rows(rows)? == execution.group_rows(),
+                "EXL3 installed grouping differs from actual selector at rows {rows}");
+        }
+        Ok(report)
+    }
+
     /// The staged ids, ownership words and weights of a call of `routes` routes.
     fn staged(&mut self, routes: usize) -> (&mut [i32], &mut [i32], &mut [f32]) {
         assert!(routes * 4 <= self.weights_offset - self.ownership_words * 4,

@@ -153,6 +153,10 @@ impl SparkExperts {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
+    /// Immutable metadata returned by the workers' completed persistent bootstrap.
+    pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
+        self.clients.installed_grouping()
+    }
     /// Topology this transport was bound to, if any.
     pub fn topology(&self) -> Option<SparkTopology> {
         self.topology

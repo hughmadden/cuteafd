@@ -12,6 +12,8 @@ pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
     sessions: Vec<Option<VerbsHostProtocolV2PersistentClientSession>>,
+    /// Bootstrap seals survive a QP reconnect and are never queried per request.
+    expert_grouping: Vec<Option<crate::worker_selection::InstalledExpertGrouping>>,
     retired: Vec<TcpStream>,
     retirement_error: Option<String>,
     capacity: Option<u32>,
@@ -58,6 +60,7 @@ impl LocalTp4Client {
             peers,
             config,
             sessions: (0..world).map(|_| None).collect(),
+            expert_grouping: vec![None; world],
             retired: Vec::new(),
             retirement_error: None,
             capacity: None,
@@ -76,6 +79,30 @@ impl LocalTp4Client {
         }
     }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
+
+    pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
+        let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
+            report.clone().with_context(|| format!("worker rank {rank} did not report installed expert grouping")))
+            .collect::<Result<Vec<_>>>()?;
+        crate::worker_selection::InstalledExpertGrouping::validate_ranks(&reports)?;
+        Ok(reports)
+    }
+
+    fn retain_grouping(&mut self, rank: usize) -> Result<()> {
+        let current = self.sessions[rank].as_ref().and_then(|session| session.expert_grouping.as_ref());
+        if let Some(previous) = &self.expert_grouping[rank] {
+            anyhow::ensure!(current == Some(previous), "worker rank {rank} changed installed grouping on reconnect");
+        }
+        if let Some(report) = current {
+            report.validate_connection(rank, self.peers.len())?;
+            self.expert_grouping[rank] = Some(report.clone());
+        }
+        crate::worker_selection::seal_installed_grouping(self.peers[rank], current)?;
+        if self.expert_grouping.iter().all(Option::is_some) {
+            self.installed_grouping()?;
+        }
+        Ok(())
+    }
 
     fn retire_session(&mut self, rank: usize) -> Result<()> {
         if let Some(session) = self.sessions[rank].take() {
@@ -246,7 +273,12 @@ impl LocalTp4Client {
                     self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
                         && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0),
                 )?);
+                self.retain_grouping(rank)?;
             }
+        }
+        if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
+        // Every rank's bootstrap is validated before any request enters a QP.
+        for rank in 0..self.peers.len() {
             let session = self.sessions[rank].as_mut().unwrap();
             let timing = session.post_chunk_request(request, &self.config)?;
             if self.stagger && rank + 1 < self.peers.len() && request.hidden_payload.len() <= STAGGER_MAX_BYTES

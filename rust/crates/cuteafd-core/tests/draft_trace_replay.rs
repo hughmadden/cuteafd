@@ -25,7 +25,9 @@ fn geometry(record: &Value, max_positions: usize, widths: Vec<usize>) -> PolicyG
     let topk = record["route_layout"][2].as_u64().unwrap() as u8;
     let experts = 1 + record["routes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).max().unwrap() as u16;
     PolicyGeometry { layers, experts: experts.max(512), topk, max_requests: 64, max_positions, widths,
-        classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 2 }
+        classes: vec![ResourceClass::rtx(), ResourceClass::spark()], group_rows_by_rows: record["group_rows_by_rows"].as_array().map_or_else(Vec::new, |rows|
+            rows.iter().map(|row| row.as_array().unwrap().iter()
+                .map(|group| group.as_u64().unwrap() as u8).collect()).collect()), regimes: 2 }
 }
 
 #[test]

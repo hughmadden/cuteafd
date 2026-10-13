@@ -246,6 +246,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // the process environment per connection or per poll.
     let protocol_v2_timing = cuteafd_transport::protocol_v2_timing_from_env();
     let worker_rank = config.rank;
+    let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+        &config.snapshot, geometry, config.world, config.topology)?;
+    let resident = config.resident_layers(geometry.layers as usize)?;
+    ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
+    let loaded = cuteafd_transport::worker_selection::WorkerSelection::new(identity,
+        &resident.collect::<Vec<_>>())?;
+    let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
         .spawn(move || {
@@ -253,12 +260,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let admitted = match &ring_budget {
-                            Some(budget) => LocalVerbsExpertConnection::accept_with_selection(
+                            Some(budget) => LocalVerbsExpertConnection::accept_with_grouping(
                                 stream,
                                 max_frame_bytes,
                                 protocol_v2_timing,
                                 Arc::clone(budget),
                                 worker_selection.as_ref().map(|selection| (worker_rank, selection)),
+                                expert_grouping.as_ref(),
                             ),
                             None => LocalVerbsExpertConnection::accept(
                                 stream,

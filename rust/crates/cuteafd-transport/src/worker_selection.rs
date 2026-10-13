@@ -22,7 +22,7 @@ impl WorkerIdentity {
     /// bytes, not a local pathname or a separately computed plan, identify it.
     pub fn from_snapshot(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,
         world: usize, topology: Option<crate::expert::SparkTopology>) -> Result<Self> {
-        ensure!(matches!(world, 1 | 2 | 3 | 4 | 6), "unsupported worker world");
+        ensure!((1..=8).contains(&world), "unsupported worker world");
         if let Some(topology) = topology {
             ensure!(topology.world_size() == world, "worker topology/world mismatch");
         }
@@ -88,7 +88,7 @@ impl WorkerSelection {
         ensure!(self.version == VERSION, "unsupported worker selection version");
         ensure!(self.identity.checkpoint.len() == 64 && self.identity.checkpoint.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid worker checkpoint digest");
-        ensure!(matches!(self.identity.world, 1 | 2 | 3 | 4 | 6), "unsupported worker world");
+        ensure!((1..=8).contains(&self.identity.world), "unsupported worker world");
         ensure!(self.identity.geometry.iter().all(|&value| value > 0), "invalid worker geometry");
         if let Some([tp, ep]) = self.identity.topology {
             ensure!(crate::expert::SparkTopology::new(tp, ep)?.world_size() == self.identity.world as usize,
@@ -104,6 +104,160 @@ impl WorkerSelection {
     pub fn validate_for(&self, identity: &WorkerIdentity) -> Result<()> {
         self.validate()?;
         ensure!(&self.identity == identity, "worker checkpoint/geometry/topology identity mismatch");
+        Ok(())
+    }
+}
+
+/// One actually installed capacity specialization, including a hybrid's compact prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledExpertVariant {
+    capacity: usize,
+    group_rows: usize,
+    compact_live_rows: usize,
+}
+
+impl InstalledExpertVariant {
+    /// Read the loaded execution once at startup, never from a coordinator-side manifest.
+    pub fn from_queries(capacity: usize, mut query: impl FnMut(usize) -> Result<usize>) -> Result<Self> {
+        ensure!((1..=4096).contains(&capacity), "invalid installed expert variant capacity");
+        let group_rows = query(0)?;
+        let mut compact_live_rows = 0;
+        let mut grouped = false;
+        for rows in 1..=capacity {
+            let group = query(rows)?;
+            if group == group_rows { grouped = true; }
+            else {
+                ensure!(group == 1 && !grouped,
+                    "installed expert grouping is not a compact prefix at rows {rows}");
+                compact_live_rows = rows;
+            }
+        }
+        let variant = Self { capacity, group_rows, compact_live_rows };
+        variant.validate()?;
+        Ok(variant)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!((1..=4096).contains(&self.capacity)
+            && matches!(self.group_rows, 1 | 8 | 16 | 32 | 64 | 128)
+            && self.compact_live_rows <= self.capacity,
+            "invalid installed expert capacity/group/compact cutoff");
+        ensure!(self.group_rows != 1 || self.compact_live_rows == 0,
+            "group-one expert variant cannot have a separate compact prefix");
+        Ok(())
+    }
+
+    fn group_rows(&self, rows: usize) -> usize {
+        if rows > 0 && rows <= self.compact_live_rows { 1 } else { self.group_rows }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64 }
+
+/// The exact loaded worker, its resident layers and its immutable launch selector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledExpertGrouping {
+    loaded: WorkerSelection,
+    rank: usize,
+    capacity: usize,
+    selector: ExpertGroupingSelector,
+    variants: Vec<InstalledExpertVariant>,
+}
+
+impl InstalledExpertGrouping {
+    pub fn new(loaded: WorkerSelection, rank: usize, capacity: usize,
+        selector: ExpertGroupingSelector, mut variants: Vec<InstalledExpertVariant>) -> Result<Self> {
+        variants.sort_by_key(|variant| variant.capacity);
+        let report = Self { loaded, rank, capacity, selector, variants };
+        report.validate()?;
+        Ok(report)
+    }
+
+    pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
+
+    fn validate(&self) -> Result<()> {
+        self.loaded.validate()?;
+        ensure!(self.rank < self.loaded.identity.world as usize && !self.loaded.ranges.is_empty(),
+            "invalid installed expert rank/resident layers");
+        ensure!((1..=4096).contains(&self.capacity) && (1..=6).contains(&self.variants.len()),
+            "invalid installed expert report capacity/variant count");
+        for variant in &self.variants { variant.validate()?; }
+        ensure!(self.variants.windows(2).all(|pair| pair[0].capacity < pair[1].capacity),
+            "installed expert capacities must be distinct and ascending");
+        let capacities: Vec<_> = self.variants.iter().map(|variant| variant.capacity).collect();
+        let expected = match self.selector {
+            ExpertGroupingSelector::Native => {
+                ensure!(capacities.last() == Some(&self.capacity)
+                    && capacities.iter().all(|&c| c == self.capacity || c == 1 || (c == 80 && self.capacity > 80)),
+                    "native report must name its actual main and optional m1/m80 executions");
+                capacities.clone()
+            }
+            ExpertGroupingSelector::Exl3Nearest | ExpertGroupingSelector::Exl3GlmFlashK64 => {
+                let policy = if self.selector == ExpertGroupingSelector::Exl3Nearest {
+                    cuteafd_core::Exl3RowPolicy::Nearest
+                } else { cuteafd_core::Exl3RowPolicy::GlmFlashK64 };
+                policy.capacities(self.capacity)?.into_iter().map(|c| c as usize).collect()
+            }
+        };
+        ensure!(capacities == expected, "installed expert capacities disagree with launch selector");
+        Ok(())
+    }
+
+    /// Zero is the main compiled tile; positive rows follow the installed selector.
+    pub fn group_rows(&self, rows: usize) -> Result<usize> {
+        ensure!(rows <= self.capacity, "expert rows {rows} exceed installed capacity {}", self.capacity);
+        let required = if self.selector == ExpertGroupingSelector::Exl3GlmFlashK64 {
+            cuteafd_core::Exl3RowPolicy::GlmFlashK64.required_capacity(rows)
+        } else { rows };
+        let variant = if rows == 0 { self.variants.last() } else {
+            self.variants.iter().find(|variant| variant.capacity >= required)
+        }.context("missing installed expert grouping capacity")?;
+        Ok(variant.group_rows(rows))
+    }
+
+    pub fn validate_for(&self, identity: &WorkerIdentity, rank: usize, rows: usize,
+        mut layers: std::ops::Range<usize>) -> Result<()> {
+        self.validate()?;
+        self.loaded.validate_for(identity)?;
+        ensure!(self.rank == rank, "installed expert grouping rank mismatch");
+        ensure!(rows <= self.capacity, "installed expert grouping does not cover verifier rows {rows}");
+        ensure!(layers.all(|layer| self.loaded.ranges.iter()
+            .any(|range| (range.first as usize..range.end as usize).contains(&layer))),
+            "installed expert grouping does not cover admitted remote layers");
+        Ok(())
+    }
+
+    pub(crate) fn validate_connection(&self, rank: usize, world: usize) -> Result<()> {
+        self.validate()?;
+        let geometry = cuteafd_core::expert_geometry();
+        ensure!(self.rank == rank && self.loaded.identity.world as usize == world
+            && self.loaded.identity.geometry == [geometry.hidden, geometry.experts, geometry.topk,
+                geometry.intermediate, geometry.layers],
+            "installed expert grouping connection rank/world/geometry mismatch");
+        Ok(())
+    }
+
+    /// Mixed packages for any shared layer fail before the coordinator becomes ready.
+    pub fn validate_ranks(reports: &[Self]) -> Result<()> {
+        ensure!(!reports.is_empty(), "no installed expert grouping reports");
+        for (rank, report) in reports.iter().enumerate() {
+            report.validate()?;
+            ensure!(report.rank == rank && report.loaded.identity.world as usize == reports.len()
+                && report.loaded.identity == reports[0].loaded.identity,
+                "installed expert grouping identity/rank/world mismatch");
+            for previous in &reports[..rank] {
+                let overlap = report.layers().iter().any(|a| previous.layers().iter()
+                    .any(|b| a.first < b.end && b.first < a.end));
+                ensure!(!overlap || (report.capacity == previous.capacity
+                    && report.selector == previous.selector && report.variants == previous.variants),
+                    "installed expert grouping differs across ranks {} and {rank} for the same layer (mixed packages)",
+                    previous.rank);
+            }
+        }
         Ok(())
     }
 }
@@ -166,6 +320,26 @@ pub(crate) fn peer_selection_digest(peer: SocketAddr) -> Result<Option<String>> 
     Ok(seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?.get(&peer).cloned())
 }
 
+// Prefill lanes and device proxies open separate clients to the same worker.
+// Seal their loaded reports together, including reconnects, before posting work.
+pub(crate) fn seal_installed_grouping(peer: SocketAddr, current: Option<&InstalledExpertGrouping>) -> Result<()> {
+    static GROUPING: OnceLock<Mutex<BTreeMap<SocketAddr, InstalledExpertGrouping>>> = OnceLock::new();
+    if let Some(report) = current {
+        report.validate()?;
+        if let Some(digest) = peer_selection_digest(peer)? {
+            ensure!(report.loaded.digest()? == digest, "worker {peer} grouping differs from sealed placement");
+        }
+    }
+    let mut seals = GROUPING.get_or_init(Mutex::default).lock()
+        .map_err(|_| anyhow::anyhow!("worker grouping seals poisoned"))?;
+    if let Some(previous) = seals.get(&peer) {
+        ensure!(current == Some(previous), "worker {peer} changed installed grouping across lanes or reconnect");
+    } else if let Some(report) = current {
+        seals.insert(peer, report.clone());
+    }
+    Ok(())
+}
+
 /// Solve first, then select all workers concurrently before opening Spark links.
 /// An acknowledgment names the exact loaded set, rank and identity; all later
 /// connections to these peers are sealed to that selection for this process.
@@ -224,6 +398,67 @@ pub(crate) fn acknowledge_repeat(stream: &mut TcpStream, value: serde_json::Valu
 mod tests {
     use super::*;
     fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), geometry: [6144, 384, 8, 2048, 70], world: 2, topology: None } }
+    fn grouping(rank: usize, compact: usize) -> InstalledExpertGrouping {
+        let loaded = WorkerSelection::new(identity(), &[13, 14, 15]).unwrap();
+        let variants = [1, 80, 256].into_iter().map(|capacity|
+            InstalledExpertVariant::from_queries(capacity, |rows|
+                Ok(if rows > 0 && rows <= compact.min(capacity) { 1 } else { 16 })).unwrap()).collect();
+        InstalledExpertGrouping::new(loaded, rank, 256, ExpertGroupingSelector::Native, variants).unwrap()
+    }
+
+    #[test]
+    fn loaded_grouping_roundtrips_and_checks_identity_rank_range_and_capacity() {
+        let report = grouping(0, 8);
+        let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(report, restored);
+        restored.validate_for(&identity(), 0, 128, 13..16).unwrap();
+        for (rows, group) in [(0, 16), (1, 1), (8, 1), (9, 16), (80, 16), (81, 16), (256, 16)] {
+            assert_eq!(restored.group_rows(rows).unwrap(), group);
+        }
+        assert!(restored.group_rows(257).is_err());
+        assert!(restored.validate_for(&identity(), 1, 128, 13..16).is_err());
+        assert!(restored.validate_for(&identity(), 0, 257, 13..16).is_err());
+        assert!(restored.validate_for(&identity(), 0, 128, 12..16).is_err());
+        let mut other = identity(); other.checkpoint = "1".repeat(64);
+        assert!(restored.validate_for(&other, 0, 128, 13..16).is_err());
+    }
+
+    #[test]
+    fn mixed_loaded_grouping_is_rejected_for_shared_layers() {
+        InstalledExpertGrouping::validate_ranks(&[grouping(0, 8), grouping(1, 8)]).unwrap();
+        let error = InstalledExpertGrouping::validate_ranks(&[grouping(0, 8), grouping(1, 4)]).unwrap_err();
+        assert!(error.to_string().contains("mixed packages"));
+        assert!(InstalledExpertGrouping::validate_ranks(&[grouping(0, 8), grouping(0, 8)]).is_err());
+    }
+
+    #[test]
+    fn loaded_grouping_seal_rejects_changed_or_missing_reconnect_report() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let original = grouping(0, 8);
+        seal_installed_grouping(peer, Some(&original)).unwrap();
+        seal_installed_grouping(peer, Some(&original)).unwrap();
+        assert!(seal_installed_grouping(peer, Some(&grouping(0, 4))).is_err());
+        assert!(seal_installed_grouping(peer, None).is_err());
+    }
+
+    #[test]
+    fn loaded_grouping_checks_selector_and_compact_prefix() {
+        assert!(InstalledExpertVariant::from_queries(80, |rows|
+            Ok(if rows == 7 { 1 } else { 16 })).is_err());
+        assert!(InstalledExpertVariant::from_queries(0, |_| Ok(16)).is_err());
+        assert!(InstalledExpertVariant::from_queries(1, |_| Ok(3)).is_err());
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variants = [1, 16, 80].into_iter().map(|capacity|
+            InstalledExpertVariant::from_queries(capacity, |_| Ok(capacity.min(64))).unwrap()).collect::<Vec<_>>();
+        let report = InstalledExpertGrouping::new(loaded.clone(), 0, 16,
+            ExpertGroupingSelector::Exl3GlmFlashK64, variants.clone()).unwrap();
+        assert_eq!(report.group_rows(1).unwrap(), 1);
+        assert_eq!(report.group_rows(2).unwrap(), 64);
+        assert_eq!(report.group_rows(16).unwrap(), 64);
+        assert!(InstalledExpertGrouping::new(loaded, 0, 16, ExpertGroupingSelector::Exl3Nearest, variants).is_err());
+    }
+
     #[test]
     fn worker_selection_validates_absolute_ranges_and_identity() {
         let selection = WorkerSelection::new(identity(), &[13, 14, 15, 20]).unwrap();
@@ -233,7 +468,7 @@ mod tests {
         assert!(selection.validate_for(&other).is_err());
         assert_ne!(selection.digest().unwrap(), WorkerSelection::new(identity(), &[14, 15, 20]).unwrap().digest().unwrap());
         assert!(WorkerSelection::new(identity(), &[]).unwrap().ranges().is_empty());
-        let mut invalid = identity(); invalid.world = 5;
+        let mut invalid = identity(); invalid.world = 9;
         assert!(WorkerSelection::new(invalid, &[]).is_err());
         let mut invalid = identity(); invalid.topology = Some([2, 2]);
         assert!(WorkerSelection::new(invalid, &[]).is_err());

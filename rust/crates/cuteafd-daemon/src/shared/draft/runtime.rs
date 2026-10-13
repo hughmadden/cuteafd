@@ -54,6 +54,10 @@ mod tests {
 
     fn assert_state(left: &DraftPolicy, right: &DraftPolicy) {
         assert_eq!(left.geometry(), right.geometry());
+        assert_fits(left, right);
+    }
+
+    fn assert_fits(left: &DraftPolicy, right: &DraftPolicy) {
         assert_eq!(left.stats(), right.stats());
         assert_eq!(left.calibration(), right.calibration());
         assert_eq!(left.selected_cell(), right.selected_cell());
@@ -73,7 +77,7 @@ mod tests {
                 LayerResource { class: Some(1), slice_bytes: 765_432., group_rows: 32, timed: true },
             ],
             experts: 256, topk: 8, max_requests: 64, max_positions: 5 + COPY_EXTENSION,
-            widths: vec![3, 5], classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 2,
+            widths: vec![3, 5], classes: vec![ResourceClass::rtx(), ResourceClass::spark()], group_rows_by_rows: Vec::new(), regimes: 2,
         };
         let shared = SharedPolicy::with_geometry(geometry.clone(), resource::Prior::History,
             PolicySeed::weak(5)).unwrap();
@@ -179,6 +183,10 @@ mod tests {
         let mut legacy = legacy_glm(&homes, width);
         let mut shared = SharedPolicy::new(&homes, 288, 8, 64, width, resource::Prior::Head,
             resource::seed()).unwrap();
+        let mut installed_geometry = shared.policy.geometry().clone();
+        installed_geometry.group_rows_by_rows = vec![vec![16; homes.len()]; 65];
+        let mut installed = SharedPolicy::with_geometry(installed_geometry, resource::Prior::Head,
+            resource::seed()).unwrap();
         let mut histories = BTreeMap::<u64, DraftHistory>::new();
         let mut selected = 0;
         let mut priced = 0;
@@ -209,6 +217,9 @@ mod tests {
                 let after = resource::select_drafted(&mut shared.policy, &candidates, pass.width, 64, n);
                 assert_eq!(before.lengths, after.lengths, "round {index}");
                 assert_eq!(before.predicted, after.predicted, "round {index}");
+                let after = resource::select_drafted(&mut installed.policy, &candidates, pass.width, 64, n);
+                assert_eq!(before.lengths, after.lengths, "installed round {index}");
+                assert_eq!(before.predicted, after.predicted, "installed round {index}");
                 predicted = before.predicted;
                 priced += usize::from(predicted.is_some());
                 selected += 1;
@@ -239,19 +250,25 @@ mod tests {
                 requests: &verified, routes: &routes, layer_us: &layer_us,
                 times: RoundTimes { total_us: record["total_us"].as_u64().unwrap(),
                     draft_us: record["draft_us"].as_u64() }, draft: pass, predicted };
-            for policy in [&mut legacy.policy, &mut shared.policy] { binding::observe(policy, &observation).unwrap(); }
+            for policy in [&mut legacy.policy, &mut shared.policy, &mut installed.policy] {
+                binding::observe(policy, &observation).unwrap();
+            }
             assert_state(&legacy.policy, &shared.policy);
+            assert_fits(&legacy.policy, &installed.policy);
             let ids: Vec<_> = verified.iter().map(|r| r.id).collect();
             let lengths: Vec<_> = verified.iter().map(|r| r.rows - 1).collect();
-            assert_eq!(legacy.policy.forecast_megabytes(&ids, &lengths), shared.policy.forecast_megabytes(&ids, &lengths));
+            let forecast = legacy.policy.forecast_megabytes(&ids, &lengths);
+            assert_eq!(forecast, shared.policy.forecast_megabytes(&ids, &lengths));
+            assert_eq!(forecast, installed.policy.forecast_megabytes(&ids, &lengths));
             for request in &verified {
                 if request.source == DraftSource::Neural {
                     let proposed = if request.censor.is_some() { request.accepted - 1 } else { request.rows - 1 };
                     histories.entry(request.id).or_default().observe(proposed, request.accepted - 1);
                 }
                 let confidence = priors[verified.iter().position(|r| r.id == request.id).unwrap()].as_deref().unwrap_or(&[]);
-                assert_eq!(legacy.policy.probabilities(DraftCandidate { id: request.id, confidence }),
-                    shared.policy.probabilities(DraftCandidate { id: request.id, confidence }));
+                let probabilities = legacy.policy.probabilities(DraftCandidate { id: request.id, confidence });
+                assert_eq!(probabilities, shared.policy.probabilities(DraftCandidate { id: request.id, confidence }));
+                assert_eq!(probabilities, installed.policy.probabilities(DraftCandidate { id: request.id, confidence }));
             }
         }
         assert!(selected > 0);

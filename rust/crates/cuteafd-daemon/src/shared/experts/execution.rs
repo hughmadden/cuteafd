@@ -374,6 +374,22 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.execution_state(u32::try_from(rows)?).0.group_rows_for(rows)
     }
 
+    pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping, InstalledExpertVariant};
+        let mut kernels = vec![&self.kernel];
+        kernels.extend([&self.decode, &self.small].into_iter().flatten().map(|state| &state.kernel));
+        let variants = kernels.into_iter().map(|kernel| InstalledExpertVariant::from_queries(
+            kernel.info().capacity_rows as usize, |rows| kernel.group_rows_for(rows))).collect::<Result<Vec<_>>>()?;
+        let report = InstalledExpertGrouping::new(loaded, rank, self.kernel.info().capacity_rows as usize,
+            ExpertGroupingSelector::Native, variants)?;
+        for rows in 0..=self.kernel.info().capacity_rows as usize {
+            ensure!(report.group_rows(rows)? == self.group_rows(rows)?,
+                "native installed grouping differs from actual selector at rows {rows}");
+        }
+        Ok(report)
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
     }

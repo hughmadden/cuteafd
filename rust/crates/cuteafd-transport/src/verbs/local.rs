@@ -157,12 +157,20 @@ impl LocalVerbsExpertConnection {
         stream: TcpStream, max_frame_bytes: usize, timing: bool,
         budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
     ) -> Result<Self> {
-        // Keep legacy setup ordering byte-for-byte when selection is off.
+        Self::accept_with_grouping(stream, max_frame_bytes, timing, budget, selection, None)
+    }
+
+    /// Publish the immutable report obtained from this worker's loaded executions.
+    pub fn accept_with_grouping(
+        stream: TcpStream, max_frame_bytes: usize, timing: bool,
+        budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
+        grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
+    ) -> Result<Self> {
         if selection.is_none() { verbs_host_preflight()?; }
         let start = match Self::read_persistent_start(&stream, max_frame_bytes, selection) {
             Ok(start) => start,
             Err(error) => {
-                if selection.is_some() && !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
+                if !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
                     let mut stream = stream;
                     let _ = crate::worker_selection::reject_worker_selection(&mut stream, &error);
                 }
@@ -208,7 +216,7 @@ impl LocalVerbsExpertConnection {
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
         let mut connection =
-            Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing)?;
+            Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping)?;
         connection.ring_reservation = Some(reservation);
         Ok(connection)
     }
@@ -248,7 +256,7 @@ impl LocalVerbsExpertConnection {
             crate::worker_selection::acknowledge_repeat(&mut stream.try_clone()?, value, rank, expected)?;
             return Err(crate::worker_selection::WorkerSelectionOnly.into());
         }
-        let start: VerbsHostProtocolV2PersistentStart = serde_json::from_value(value)?;
+        let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(value)?;
         let digest = selection.map(|(_, selection)| selection.digest()).transpose()?;
         anyhow::ensure!(start.worker_selection_digest == digest,
             "worker connection does not match its loaded placement");
@@ -316,7 +324,7 @@ impl LocalVerbsExpertConnection {
         timing: bool,
     ) -> Result<Self> {
         let (request_ring, response_ring) = Self::validated_rings(&start)?;
-        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing)
+        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, None)
     }
 
     fn initialize_with_rings(
@@ -326,6 +334,7 @@ impl LocalVerbsExpertConnection {
         request_ring: VerbsHostRdmaRing,
         response_ring: VerbsHostRdmaRing,
         timing: bool,
+        grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
     ) -> Result<Self> {
         let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
         let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_on_device(
@@ -400,6 +409,8 @@ impl LocalVerbsExpertConnection {
             &mut stream,
             &VerbsHostProtocolV2PersistentReady {
                 message: "protocol_v2_persistent_ready".to_owned(),
+                wire_version: PERSISTENT_CONTROL_VERSION,
+                expert_grouping: grouping.cloned(),
                 server_endpoint,
                 server_native_endpoint: endpoint.native_descriptor(),
                 flow_label: start.flow_label,
@@ -841,7 +852,8 @@ mod budget_tests {
         endpoint["role"] = "client".into();
         endpoint["host"] = "coordinator".into();
         let mut start = serde_json::json!({
-            "message": "protocol_v2_persistent_start", "execution_lane": lane,
+            "message": "protocol_v2_persistent_start", "wire_version": PERSISTENT_CONTROL_VERSION,
+            "execution_lane": lane,
             "request_capacity_wire_bytes": 4096, "response_capacity_wire_bytes": 4096,
             "request_registered_span_bytes": 32768, "response_registered_span_bytes": 32768,
             "ring_depth": 8, "request_slot_stride_bytes": 4096, "response_slot_stride_bytes": 4096,
