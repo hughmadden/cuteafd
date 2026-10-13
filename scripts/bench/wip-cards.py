@@ -34,7 +34,9 @@ HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
 # wip.sh moves its sealed slots through sparknest.
 SEED_HOSTS = ('kakapo',)
 SEEDS = ('rhea', 'moa', *SEED_HOSTS)
-DEFAULT_SEED = 'moa'
+# kakapo passed its gate 2026-10-13 (mimo26-flash-max: cold build sealed, distributed
+# through sparknest, served at C1 with 0 errors); it isolates seed CPU load from serving.
+DEFAULT_SEED = 'kakapo'
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')

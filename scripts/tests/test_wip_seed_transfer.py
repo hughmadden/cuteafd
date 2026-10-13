@@ -55,9 +55,8 @@ def test_seed_lanes_resolve_pool_rails_without_ssh_and_dry_runs_never_probe(monk
     assert cards.seed_lanes('kakapo', True) == ('0.0.0.0', '0.0.0.0')
 
 
-def test_default_seed_stays_moa_until_the_kakapo_gate_passes():
-    # Switched to kakapo once its hardware gate passed; this pins whichever is current.
-    assert cards.DEFAULT_SEED in cards.SEEDS
+def test_default_seed_is_the_build_only_kakapo():
+    assert cards.DEFAULT_SEED == 'kakapo'
 
 
 def test_cleanup_covers_seed_hosts_and_the_instance_nest_area(entry, monkeypatch, capsys):
