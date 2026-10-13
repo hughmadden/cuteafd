@@ -674,7 +674,7 @@ v41_fp8_head_args=()
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
-        harness = 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
+        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1", "4096",
              "107374182400", "19441", "snapshot", "fingerprint", "3", "4", "1", "2", "2"],

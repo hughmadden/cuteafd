@@ -6,6 +6,7 @@
 
 cuteafd_cdi_require() { # cuteafd_cdi_require NAME...   (fail unless the CDI spec lists each)
   local name spec found
+  [[ "${CUTEAFD_CDI_CHECK:-on}" != off ]] || return 0   # script tests only: no real spec on the machine
   local -a specs=(${CUTEAFD_CDI_SPECS:-/var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml})
   for name in "$@"; do
     found=0

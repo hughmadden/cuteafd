@@ -18,7 +18,7 @@ def _repo(tmp_path: Path) -> Path:
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
     shutil.copy(ROOT / "run.sh", repo / "run.sh")
-    for name in ("release-common.sh", "checkpoint-family.py"):
+    for name in ("release-common.sh", "checkpoint-family.py", "cdi-gpus.sh"):
         shutil.copy(ROOT / "scripts" / "lib" / name, repo / "scripts" / "lib" / name)
     fake = repo / "scripts" / "launch" / "run-family.sh"
     fake.write_text('#!/usr/bin/env bash\nprintf "run-family %s\\n" "$*"\n')
@@ -325,6 +325,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    shutil.copy(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     wip = "--wip" in extra_args
     exact_count = 0 if "EXPERT_BACKEND=local" in keys else 1
     for line in keys.splitlines():

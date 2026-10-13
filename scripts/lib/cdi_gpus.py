@@ -7,6 +7,7 @@ scripts/lib/cdi-gpus.sh.
 """
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -31,7 +32,7 @@ def cdi_gpu_args(gpus: Iterable[object] | str, specs: Iterable[Path] = SPECS) ->
     if not wanted or not all(wanted):
         raise ValueError('empty GPU request')
     have = cdi_names(specs)
-    missing = [g for g in wanted if g not in have]
+    missing = [] if os.environ.get('CUTEAFD_CDI_CHECK') == 'off' else [g for g in wanted if g not in have]  # off: script tests only
     if missing:
         raise RuntimeError(f'CDI device nvidia.com/gpu={",".join(missing)} is not in /var/run/cdi/nvidia.yaml; '
                            'run: sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml')

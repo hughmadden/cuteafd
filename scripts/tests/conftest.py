@@ -21,3 +21,9 @@ def no_shell_startup_files(monkeypatch: pytest.MonkeyPatch) -> None:
     them; helpers that build their environment from scratch never carried them."""
     for name in SHELL_STARTUP_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_real_cdi_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launcher tests mock docker and name fake GPUs; the machine's CDI spec is not theirs to check."""
+    monkeypatch.setenv("CUTEAFD_CDI_CHECK", "off")

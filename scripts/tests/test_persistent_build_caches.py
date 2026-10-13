@@ -41,7 +41,7 @@ def fixture(tmp_path, kind="ext4", device="nvme0n1p2"):
         path.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("CUTEAFD_", "CARGO_", "KACHE_", "SCCACHE_"))}
-    env.update(HOME=str(tmp_path / "home"), PATH=str(binary) + os.pathsep + env["PATH"],
+    env.update(HOME=str(tmp_path / "home"), PATH=str(binary) + os.pathsep + env["PATH"], CUTEAFD_CDI_CHECK="off",
                DOCKER_LOG=str(tmp_path / "docker.log"))
     return env
 
@@ -144,6 +144,7 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
         prefix = 'set -euo pipefail\n'
         prefix += f'source "{ROOT}/scripts/build/build-caches.sh"\n'
         prefix += f'source "{ROOT}/scripts/build/compiler-cache.sh"\n'
+        prefix += f'source "{ROOT}/scripts/lib/cdi-gpus.sh"; export_gpu_uuid=uuid\n'
         prefix += 'cuteafd_build_cache_defaults\n'
         if entry == "release":
             prefix += f'repo_root="{ROOT}"; release_build_root="{tmp_path}/build"; release_source_parent="$release_build_root"; release_toolchain_hash=abcd\n'

@@ -13,6 +13,11 @@ SH = ROOT / 'scripts/lib/cdi-gpus.sh'
 YAML = 'devices:\n    - name: "0"\n    - name: "1"\n    - name: GPU-abc-123\n    - name: all\n'
 
 
+@pytest.fixture(autouse=True)
+def real_check(monkeypatch):
+    monkeypatch.setenv('CUTEAFD_CDI_CHECK', 'on')
+
+
 @pytest.fixture
 def spec(tmp_path):
     path = tmp_path / 'nvidia.yaml'
