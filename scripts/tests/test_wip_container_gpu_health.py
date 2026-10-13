@@ -43,7 +43,7 @@ case "$1" in
 esac
 ''')
     (bindir / 'docker').chmod(0o755)
-    script = _functions() + f'''
+    script = 'CUTEAFD_CDI_CHECK=off\n' + (ROOT / 'scripts/lib/cdi-gpus.sh').read_text() + _functions() + f'''
 release_die() {{ echo "DIE $*" >&2; exit 9; }}
 cuteafd_build_cache_docker_args() {{ :; }}
 COORDINATOR_DOCKER_DEV=img coordinator_container=c wip_toolchain_hash=hash wip_mount_root={tmp_path}
