@@ -648,6 +648,9 @@ impl<'a> DsparkDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         match input {
             DraftInput::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -684,7 +687,7 @@ impl<'a> DsparkDrafter<'a> {
                 l.glmf_dspark_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, c.causal, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.causal, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
                 l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
                     w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;

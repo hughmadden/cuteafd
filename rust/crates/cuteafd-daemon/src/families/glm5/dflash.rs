@@ -972,6 +972,9 @@ impl<'a> GlmDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
         let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
@@ -1018,7 +1021,7 @@ impl<'a> GlmDrafter<'a> {
                 l.glm_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,

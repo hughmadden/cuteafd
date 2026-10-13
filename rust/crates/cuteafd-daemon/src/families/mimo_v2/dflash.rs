@@ -700,6 +700,9 @@ impl<'a> MimoDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         match anchors {
             Anchors::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -743,7 +746,7 @@ impl<'a> MimoDrafter<'a> {
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4),
                     at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,

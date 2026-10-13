@@ -135,3 +135,13 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     assert 'timed' in names and 'elapsed' not in names
     assert 'checked_launch' in names
+    source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
+    for path, entry in [('mimo_v2/dflash.rs', 'fn draft_from('),
+                        ('glm5/dflash.rs', 'fn draft_from('),
+                        ('glm5_flash/dspark.rs', 'fn draft_from(')]:
+        text = (source / path).read_text()
+        step = text.split(entry, 1)[1].split('l.cuda_stream_synchronize(s)?', 1)[0]
+        assert 'tables[s_count..2 * s_count].iter().copied().max()' in step
+        assert 'max_keys,' in step and 'RING + block,' not in step
+        assert 'cuda_graph_begin_capture' not in step and 'cuda_graph_launch' not in step
+        assert 'attention_workspace(sequences,' in text and 'RING + c.block' in text
