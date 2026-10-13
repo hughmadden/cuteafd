@@ -108,7 +108,9 @@ esac
     (bindir / 'docker').write_text(f'#!/usr/bin/env bash\necho "docker $*" >> {trace}\n[[ "$1" == run ]] && echo cid123\nexit 0\n')
     for tool in ('nvidia-smi', 'docker'):
         (bindir / tool).chmod(0o755)
-    script = _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
+    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    helper = common[common.index('release_gpu_device_args() {'):common.index('\n}\n', common.index('release_gpu_device_args() {')) + 3]
+    script = helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
 wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
 '''
@@ -122,3 +124,9 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     assert '-e CUTEAFD_WIP_DSV4_AOT=ON' in run and '-e CUTEAFD_WIP_EXPERT_FAMILIES=a;b' in run
     assert 'docker exec cid123 /wip/source/scripts/build/build-wip-artifacts.sh' in calls and calls.rstrip().endswith('rm -f cid123')
     assert 'capped on gpu1' in result.stdout
+
+
+def test_the_export_containers_gpu_binding_has_one_call_site():
+    # The CDI switch (--device nvidia.com/gpu=...) edits release_gpu_device_args only.
+    on = _function('wip_capped_export_on')
+    assert 'release_gpu_device_args "$gpu"' in on and '--gpus' not in on

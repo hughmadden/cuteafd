@@ -1043,7 +1043,7 @@ wip_capped_export() {
   local status=0
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
     python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" -- \
-    bash -c "$(declare -f wip_capped_export_on); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
+    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
     status=$?
   ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
 }
@@ -1064,8 +1064,9 @@ wip_capped_export_on() {
   for ((i = 2; i < ${#build[@]}; i++)); do
     [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
   done
-  local id status=0
-  id="$(docker run -d --name "${coordinator_container}-export-$$" --user "$(id -u):$(id -g)" --gpus "device=$gpu" \
+  local id status=0 gpu_args
+  mapfile -t gpu_args < <(release_gpu_device_args "$gpu")
+  id="$(docker run -d --name "${coordinator_container}-export-$$" --user "$(id -u):$(id -g)" "${gpu_args[@]}" \
     -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}" \
     -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
     --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
