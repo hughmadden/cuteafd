@@ -46,10 +46,10 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             == crate::placement::Onboard::Auto {
             media_options.onboard = Some(crate::placement::Onboard::Layers(0));
         }
-        // Explicit pool prevents fixed zero onboarding from growing to all free memory.
-        media_options.pool_tokens = Some(options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
-            crate::placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None,
-                256, spark_ranks == 0).target));
+        // Fixed zero onboarding must not grow an automatic pool to all free
+        // memory: cap it at the target, but let it shrink to fit like the main
+        // solve. An explicit POOL_TOKENS stays strict.
+        media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
         match apply(checkpoint, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
             Ok(placement) => {
@@ -67,6 +67,9 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             Err(error) => {
                 report.placement_supported = false;
                 notes.push(format!("MiMo media admission: {error:#}"));
+                // The refusal text is built from hints, so carry the actual note.
+                report.hints.push(super::super::Hint { what: format!("MiMo media admission: {error:#}"),
+                    how: "Select a fitting Spark layout or a smaller explicit pool.".into() });
                 // A mandatory target failure must not leave media unresolved or
                 // advertise its unallocated RTX headroom as available.
                 for device in &mut admission {
@@ -315,7 +318,8 @@ pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptio
             crate::placement::Baseline::Planned { context_bytes: 0,
                 loaded_bytes: device.used_bytes() })).collect(),
         headroom_floor: options.headroom_bytes, spark_ranks, startup_probe_bytes: probe,
-        context, requested_pool: options.pool_tokens, onboard,
+        context, requested_pool: options.pool_tokens,
+        pool_ceiling_at_target: options.pool_ceiling_at_target, onboard,
         experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64,
     };
     let solution = match crate::placement::families::mimo_v2::solve_working_set(&inputs, &no_spark.steady) {
@@ -525,7 +529,7 @@ mod tests {
                     kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                         (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                     headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
-                    context, requested_pool: opts.pool_tokens, onboard, experts, expert_workspace,
+                    context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
                     tp2_workspace, rows: 4096, lanes: lanes as u64 };
                 let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
                 let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();

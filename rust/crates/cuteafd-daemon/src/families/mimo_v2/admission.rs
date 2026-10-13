@@ -475,7 +475,7 @@ pub(super) fn preflight(
         cfg, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
-        context: args.max_context as u64, requested_pool: policy.pool_tokens,
+        context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
         onboard: args.onboard, experts: expert_costs, expert_workspace, tp2_workspace,
         rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
     };
