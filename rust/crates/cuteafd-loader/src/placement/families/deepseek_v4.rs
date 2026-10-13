@@ -79,6 +79,11 @@ pub struct V4Inputs<'a> {
     /// entry). Part of the baseline on both sides; on a PRO card the reserve envelope covers it
     /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
     pub code_bytes: Vec<u64>,
+    /// The build's C4 token-split programs (`manifest_context`): `None` keeps every layer
+    /// head-split. Only two GPUs with peer access use it.
+    pub context: Option<V4Context>,
+    /// `--attention-placement`: `None` is auto (the family's recorded default).
+    pub attention: Option<AttentionPlacement>,
 }
 
 /// Native C4 context kernel scratch, read from the selected AOT manifest.
@@ -89,7 +94,7 @@ pub struct V4Context {
 }
 
 /// Fail closed when either head range or any gather/merge primitive is absent.
-/// This inventories bindings only; it does not advertise executor support.
+/// A build without them keeps every layer head-split.
 pub fn manifest_context(manifest: &serde_json::Value, family: &str, heads: usize,
     decode_rows: u64) -> Option<V4Context> {
     let programs = manifest["programs"].as_array()?;
@@ -233,6 +238,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     let budgets = inputs.gpus.iter().zip(&reserves).map(|(&(capacity_bytes, baseline), &headroom_bytes)|
         GpuBudget { capacity_bytes, headroom_bytes, baseline }).collect::<Vec<_>>();
     let first = inputs.first_routed;
+    let context = inputs.context.filter(|_| gpus == 2);
     let layers = (0..inputs.cfg.n_layers).map(|layer| {
         let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
         let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
@@ -248,7 +254,12 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             colocate: None, fixed_bytes: ModeBytes::default(), extra: Vec::new(),
             context_indexer: inputs.cfg.compress_ratios[layer] == 4,
             experts,
-            modes: if gpus == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
+            // Only C4 layers token-split; C128 and window-only layers stay head-split.
+            modes: match (gpus, context.is_some() && inputs.cfg.compress_ratios[layer] == 4) {
+                (2, true) => vec![LayerMode::HeadSplit, LayerMode::ContextSplit],
+                (2, false) => vec![LayerMode::HeadSplit],
+                _ => vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
+            },
         }
     }).collect();
     let movables = if inputs.draft.is_empty() { Vec::new() } else {
@@ -257,13 +268,11 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     };
     let geometry_unit = 256;
     Ok(PlacementRequest {
-        attention_placement: None,
+        attention_placement: inputs.attention,
         layers_first_gpu: 0,
-        context_buffers: ContextBuffers { staging_unit_bytes: deepseek_v4_layer_unit_bytes(4), staging_unit_rows: 256,
-            query_row_bytes: if inputs.cfg.dim == 4096 { 32_768 } else { 65_536 },
-            partial_row_bytes: if inputs.cfg.dim == 4096 { 32_896 } else { 65_792 },
-            candidate_row_bytes: if inputs.cfg.dim == 4096 { 4_096 } else { 8_192 },
-            compiled_extent: inputs.max_context, decode_rows: inputs.decode_rows, lanes: PREFILL_LANES, workspace_bytes: 0 },
+        // Exactly what the engine allocates under context (charged only when a layer runs it).
+        context_buffers: context_buffers(inputs.cfg, inputs.max_context, inputs.prefill_rows, inputs.decode_rows,
+            PREFILL_LANES, context.unwrap_or_default()),
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
@@ -276,13 +285,19 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         tp2_workspace: inputs.tp2_workspace,
         onboard: inputs.onboard,
         expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
+        // `heads` is V4's recorded decision until `context` passes its gates (#58): auto must not
+        // reach for the C4 split as a memory lever; `--attention-placement context` selects it.
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-            by_kind: Vec::new(), ..LayerPolicy::default() },
+            by_kind: Vec::new(), attention: if context.is_some() { vec![(AttentionClass::Csa, AttentionPlacement::Heads)] }
+                else { Vec::new() }, ..LayerPolicy::default() },
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
         // broadcast of the embedding rows into GPU1's step input.
         hops: HopSpec { row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
             lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0 },
-        executor: super::DEEPSEEK_V4,
+        // A build without the C4 context programs runs heads only.
+        executor: if context.is_some() { super::DEEPSEEK_V4 }
+            else { ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
+                attention: AttentionPlacement::Heads, ..super::DEEPSEEK_V4 } },
     })
 }
 
