@@ -280,14 +280,16 @@ def capture(launcher_root: Path, case: str) -> dict:
                                 capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         if result.returncode:
             raise RuntimeError(f"{case}: launcher exited {result.returncode}\n{result.stdout[-2000:]}\n{result.stderr[-4000:]}")
-        runs = []
+        runs, plans = [], []
         for line in log.read_text().splitlines():
             kind, host, value = json.loads(line)
             if kind == "run":
                 runs.append({"host": host, "argv": [normalize(v, root) for v in value]})
+            elif kind == "plan":
+                plans.append([normalize(v, root) for v in value])
         # Spark workers start in parallel: order by host, coordinator first.
         runs.sort(key=lambda run: (run["host"] != "raptor", run["host"]))
-        return {"case": case, "containers": runs}
+        return {"case": case, "containers": runs, "plans": plans}
 
 
 def parse_run(argv: list[str]) -> dict:

@@ -978,7 +978,8 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     scopes = cards.build_scopes([card])
     assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == '4'
     assert scopes['CUTEAFD_WIP_AUDIO_AOT'] == 'ON'
-    assert cards.slot_needs(card) == {'coordinator': ['fp8/fp8-mimof'], 'spark': ['fp8/fp8-mimof'], 'audio': True}
+    assert cards.slot_needs(card) == {'coordinator': ['fp8/fp8-mimof'], 'spark': ['fp8/fp8-mimof'], 'audio': True,
+                                      'tp_role': None, 'nvfp4': False}
 
 
 def _fake_slot(packages=(), audio=True):
@@ -1199,3 +1200,107 @@ def test_prefill_sweep_rows(entry, tmp_path):
     sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8170, 'tok_s': 9000.0, 'ttft_s': 0.91}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass' and row['prefill 8192'] == 9000.0 and row['prefill 8192 TTFT s'] == 0.91
+
+
+def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
+    return lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='art',
+        contents=dict(packages=[], audio=True, tp_roles=None if roles is None else dict(
+            roles=list(roles), verified=verified, nvfp4=list(nvfp4), error=error))))
+
+
+@pytest.mark.parametrize('roles,verified,error,message', [
+    # The #98 slot: built for the TP4 set, no extra roles.
+    ([], False, None, 'attests Spark TP roles <none>, not tp3'),
+    (['tp2', 'tp6'], True, None, 'attests Spark TP roles tp2;tp6, not tp3'),
+    (['tp3'], False, None, 'TP symbols are not verified for tp3'),
+    (None, True, None, 'has no V41_EXPERT_TP_AOT.json'),
+    ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
+])
+def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
+    """#98: the card-derived Spark TP (v41-flash-min: SPARK_TP=3) must be attested by
+    every rank's slot before enqueue, as the launcher refuses it at launch."""
+    gate = ROOT / 'scripts/bench/kits/gate'
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
+            '--state', str(tmp_path / 'state')]
+    with pytest.raises(ValueError) as caught:
+        _run_main(monkeypatch, argv, slot=_slot_with_roles(roles, verified, error=error))
+    text = str(caught.value)
+    assert 'preflight failed before queuing' in text and message in text
+    for host in ('ostrich', 'dodo', 'emu'):
+        assert f'{host}: slot s' in text
+    assert 'CUTEAFD_WIP_SPARK_TP_ROLES=tp3' in text
+    assert not list((tmp_path / 'state').glob('*/exit'))
+    # A slot that attests tp3 with verified symbols launches.
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_slot_with_roles(['tp3']))
+    assert rc == 0 and launched == ['v41-flash-min/c']
+
+
+def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatch):
+    gate = ROOT / 'scripts/bench/kits/gate'
+    state = tmp_path / 'state'
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s', '--state', str(state),
+            '--preflight-only']
+    rc, launched = _run_main(monkeypatch, argv, slot=_slot_with_roles(['tp2', 'tp3', 'tp6']))
+    assert rc == 0 and launched == []
+    job = json.loads((state / 'v41-flash-min-c-r1' / 'job.json').read_text())
+    assert job['needs']['tp_role'] == 'tp3'
+    hook = job['entry']['prelaunch']['argv']
+    # At grant the slot no longer attests tp3 (rebuilt or swapped): refused.
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--preflight-job', hook[-1]])
+    monkeypatch.setattr(cards, 'slot_check', _slot_with_roles(['tp2']))
+    with pytest.raises(ValueError, match='attests Spark TP roles tp2, not tp3'):
+        cards.main()
+
+
+@pytest.mark.parametrize('keys,role', [
+    ({'SPARK_COUNT': '4'}, None),
+    ({'SPARK_COUNT': '3', 'SPARK_TP': '3', 'SPARK_EP': '1'}, 'tp3'),
+    ({'SPARK_COUNT': '6', 'SPARK_TP': '6', 'SPARK_EP': '1'}, 'tp6'),
+    ({'SPARK_COUNT': '4', 'SPARK_TP': '2', 'SPARK_EP': '2'}, 'tp2'),
+    ({'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1'}, None),
+    # A native count other than 4 is TP=count at launch.
+    ({'SPARK_COUNT': '6'}, 'tp6'),
+    ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
+    ({'SPARK_COUNT': '0'}, None),
+])
+def test_v41_tp_role_matches_the_launcher_derivation(tmp_path, keys, role):
+    config = tmp_path / 'c.config'
+    config.write_text('MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n')
+    card = dict(name='v', family='deepseek_v41', config=str(config), set=keys, sparks=[])
+    assert cards.slot_needs(card)['tp_role'] == role
+    assert cards.slot_needs({**card, 'family': 'glm5_flash'})['tp_role'] is None
+
+
+def test_seal_check_reports_attested_roles_from_the_slot(tmp_path, monkeypatch):
+    import hashlib
+    root = tmp_path / 'wip-inst'
+    slot = _sealed_slot(root, role='spark-expert')
+    art = slot / 'workspace/.cuteafd-wip'
+    (art / 'libcuteafd_native.so').write_bytes(b'lib')
+    manifest = json.dumps(dict(schema=1, spark_tp_roles=['tp3'], symbols_verified=True,
+                               native_library_sha256=hashlib.sha256(b'lib').hexdigest(),
+                               nvfp4_spark_tp_roles=[])).encode()
+    (art / 'V41_EXPERT_TP_AOT.json').write_bytes(manifest)
+    meta = json.loads((slot / 'META.json').read_text())
+    meta.update(spark_tp_roles=['tp3'], v41_expert_tp_manifest_sha256=hashlib.sha256(manifest).hexdigest())
+    data = json.dumps(meta).encode()
+    (slot / 'META.json').write_bytes(data)
+    (slot / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+    # Spark hosts read the spark-expert role; run the seal script as each host does.
+    script = cards.SLOT_SEAL_CHECK
+    result = subprocess.run(['python3', '-c', script, 's', 'spark-expert', 'inst', 'none', str(root)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    roles = json.loads(result.stdout)['contents']['tp_roles']
+    assert roles == dict(roles=['tp3'], verified=True, nvfp4=[], error=None)
+    # Every seal check reports the field, so preflight can never skip it.
+    (art / 'V41_EXPERT_TP_AOT.json').unlink()
+    result = subprocess.run(['python3', '-c', script, 's', 'spark-expert', 'inst', 'none', str(root)],
+                            capture_output=True, text=True)
+    assert json.loads(result.stdout)['contents']['tp_roles'] is None
+    (art / 'V41_EXPERT_TP_AOT.json').write_bytes(manifest)
+    # A library that no longer matches its manifest cannot attest a role.
+    (art / 'libcuteafd_native.so').write_bytes(b'other')
+    result = subprocess.run(['python3', '-c', script, 's', 'spark-expert', 'inst', 'none', str(root)],
+                            capture_output=True, text=True)
+    assert json.loads(result.stdout)['contents']['tp_roles']['error'] == 'native library hash mismatch'

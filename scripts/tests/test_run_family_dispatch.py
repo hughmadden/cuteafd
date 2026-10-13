@@ -57,11 +57,16 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--restart", "--all")
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --all\n"
-    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--all")
-    assert result.returncode != 0 and "--all requires --restart" in result.stderr
-    # DeepSeek V4.1 options do not apply to other families.
+    # run-family.sh owns the option rules (--all needs --restart).
+    real = subprocess.run(["bash", str(ROOT / "scripts/launch/run-family.sh"), "--config", str(repo / "glmf.config"), "--all"],
+                          capture_output=True, text=True, env={**os.environ, "HF_HOME": str(hf)})
+    assert real.returncode != 0 and "--all requires --restart" in real.stderr
+    # The former DeepSeek V4.1 options are configuration keys now, for every family.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--concurrency", "4")
-    assert result.returncode != 0 and "take --config, --restart, --wip and --embedding-placement" in result.stderr
+    assert result.returncode != 0 and "use --set CONCURRENCY=VALUE" in result.stderr
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--set", "CONCURRENCY=4", "--restart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --set CONCURRENCY=4 --restart\n"
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--embedding-placement", "host")
     assert result.returncode == 0, result.stderr
     assert "--embedding-placement host" in result.stdout
@@ -72,7 +77,26 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     # A ./wip.sh slot reaches run-family.sh, which serves it from the development images.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--wip", "s1", "--restart")
     assert result.returncode == 0, result.stderr
-    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --wip s1\n"
+    assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --wip s1 --restart\n"
+
+
+def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> None:
+    """run.sh is the same thin dispatcher for DeepSeek V4.1 (#82)."""
+    repo, hf = _repo(tmp_path), tmp_path / "hf"
+    _snapshot(hf, "deepseek-ai/DeepSeek-V4.1-Flash", {"model_type": "deepseek_v41"})
+    (repo / "v41.config").write_text("MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n")
+    result = _run(repo, hf, "--config", str(repo / "v41.config"), "--set", "DSPARK_DRAFT_LIMIT=7",
+                  "--wip", "gate", "--restart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (f"run-family --config {repo / 'v41.config'} --family deepseek_v41 "
+                             "--set DSPARK_DRAFT_LIMIT=7 --wip gate --restart\n")
+    result = _run(repo, hf, "--config", str(repo / "v41.config"), "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.endswith("--family deepseek_v41 --dry-run\n")
+    run_sh = (ROOT / "run.sh").read_text()
+    # No private launch path is left in run.sh.
+    for private in ("serve-native", "expertd-native", "docker run", "release_load_config"):
+        assert private not in run_sh, private
 
 
 @pytest.mark.parametrize("value", [None, "on", "off"])
@@ -1785,7 +1809,7 @@ def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
     result = subprocess.run(["bash", "-c", 'source "$1"; release_load_config "$2" stop; printf "%s" "$COORDINATOR_GPU_BUDGET_GIB"',
         "bash", str(ROOT / "scripts/lib/release-common.sh"), str(config)], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0 and result.stdout == "32", result.stderr
-    for file in ("run.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
+    for file in ("scripts/launch/run-family.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
         assert 'args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")' in (ROOT / file).read_text()
 
 
@@ -2577,3 +2601,28 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if " --snapshot " in line and "serve-" in line)
     assert f"--max-context {context or 0}" in launch
+
+
+def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
+    """#111: binaries sealed before #108 resolve drafter snapshots under HF_HOME (falling
+    back to a root-only default otherwise). Every planner and serving container the
+    launcher starts sets HF_HOME=/hf with the hub at /hf/hub, so such a seal plans and
+    serves instead of being reported unsupported. Measured on wip-glmf65final:final1
+    (9968af44, no #108 ancestry): its `cuteafd plan` refused Spark count 2 without
+    HF_HOME and fit with HF_HOME=/hf."""
+    _snapshot(tmp_path / "hf", "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    family_config, model = GLMF_TWO_LAYER, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
+    result = _family_launch_result(tmp_path, family_config, model, "VISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                   extra_args=("--wip", "pre108"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinator = [line for line in lines if "serve-glmf --snapshot" in line]
+    assert plans and coordinator
+    for line in plans + coordinator:
+        assert "HF_HOME=/hf" in line and ":/hf/hub:ro" in line, line
+        assert "/root/" not in line, line
+    # The default drafter is passed as a /hf/hub snapshot the old binary resolves too.
+    assert "--draft /hf/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/" in coordinator[0]
+    worker = result.stderr.split("release_serving_docker_args ()", 1)[1]
+    assert "HF_HOME=/hf" in worker and ":/hf/hub:ro" in worker
