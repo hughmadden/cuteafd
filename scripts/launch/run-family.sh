@@ -284,6 +284,11 @@ fi
 shared_api_state() {
 local image="$1" api_instance="$2"
 bench_dir="$HOME/.cache/cuteafd/bench"
+# The dashboard's fidelity panels resolve their reference under $HOME, which is
+# /tmp/cuteafd-home in the container: share the host cache so a launch reuses
+# checksum-verified references instead of re-downloading them (HF 429s).
+fidelity_cache="$HOME/.cache/cuteafd/fidelity"
+mkdir -p "$fidelity_cache"
 mkdir -p "$bench_dir"
 release_require_writable_state "$bench_dir"
 api_args=() api_mount_args=()
@@ -944,7 +949,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
   "${shared_env_args[@]}" "${thermal_args[@]}" "${probe_args[@]}" \
   "${wip_mount_args[@]}" \
-  "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" \
+  "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/tmp/cuteafd-home/.cache/cuteafd/fidelity" \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
   -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
@@ -2407,7 +2412,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
-  -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" \
+  -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/tmp/cuteafd-home/.cache/cuteafd/fidelity" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY "$default_concurrency")" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
