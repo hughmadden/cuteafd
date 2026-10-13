@@ -30,6 +30,8 @@ _cdi_spec = importlib.util.spec_from_file_location('cdi_gpus', REPO / 'scripts/l
 _cdi = importlib.util.module_from_spec(_cdi_spec)
 _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
+sys.path.insert(0, str(REPO / 'scripts/lib'))
+from wip_aot_scopes import family_scopes
 # PROFILE switches that wrap the coordinator in a profiler, and their report suffix.
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
@@ -1204,56 +1206,8 @@ NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 
 def build_scopes(cards):
-    # Derived per card: a card with no Sparks (local experts) contributes only
-    # coordinator scopes, and a Spark card's TP count is keyed to its own family
-    # (FAMILY=COUNT, read by native/cmake/shared/{exl3,fp8_moe}.cmake), so one
-    # card's geometry is never exported at another card's TP.
-    scopes, spark_scopes, roles, counts, env = set(), set(), set(), set(), {}
-    for card in cards:
-        family = card.get('family')
-        values = {**config(card['config']), **card.get('set', {})}
-        count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-        scopes_before = set(scopes)
-        scopes = set()
-        if family == 'deepseek_v41' and count in (2, 3, 6):
-            roles.add('tp' + str(count))
-        if family == 'deepseek_v4':
-            tag = 'dsv4p' if 'pro' in card['name'] else 'dsv4f'
-            scopes.update({tag + ':rtx_backbone', tag + (':spark_tp2' if count == 2 else ':spark')})
-            if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
-                scopes.add(tag + ':rtx_tp2')
-            env['CUTEAFD_WIP_DSV4_AOT'] = 'ON'
-            if 'exl3' in card['name']:
-                scopes.add(tag + ':exl3-k23')
-        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4')]:
-            if family == fam:
-                env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
-                if count:
-                    counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
-                # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
-                # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
-                # (fp8_moe.cmake), as the release image ships them.
-                checkpoint_id = values.get('MODEL_ID', values.get('MODEL', ''))
-                nvfp4 = any('nvfp4' in str(value).lower() for value in
-                            (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
-                scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
-                if fam == 'glm5_flash' and nvfp4:
-                    scopes.add('glmfdense:nvfp4')
-                if 'exl3' in card['name'] or 'tr3' in card['name']:
-                    scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
-                if fam == 'mimo_v2':
-                    # MiMo places its audio tower unless the card turns audio off.
-                    if values.get('AUDIO', 'auto') != 'off':
-                        env['CUTEAFD_WIP_AUDIO_AOT'] = 'ON'
-                    # Two RTX cards run the head-split programs (mimof2/mimop2).
-                    wanted = {tag, tag + '2'} if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2 else {tag}
-                    env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
-        card_scopes, scopes = scopes, scopes_before | scopes
-        if count:
-            spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
-    env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
-               CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)))
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
+    env = family_scopes(cards, config)
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
     return env
 
 

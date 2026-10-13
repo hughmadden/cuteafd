@@ -27,6 +27,11 @@ wip_build_key="${CUTEAFD_WIP_BUILD_KEY:-}"
   echo "WIP build output is incomplete: $build_output" >&2
   exit 2
 }
+# Direct WIP builds must not seal a coordinator that cannot serve its config.
+if [[ "$role" == coordinator && -n "${CUTEAFD_WIP_PROGRAM_FAMILY:-}" ]]; then
+  python3 "$source_dir/scripts/lib/wip_aot_scopes.py" \
+    --family "$CUTEAFD_WIP_PROGRAM_FAMILY" --check-programs "$build_output/PROGRAMS.json"
+fi
 (
   cd "$build_output"
   sha256sum -c ARTIFACT_SHA256SUMS
