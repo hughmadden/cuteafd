@@ -412,7 +412,8 @@ pub(crate) fn with_engine<T>(
     let shape = pool::PoolShape::new(
         args.max_sequences,
         caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
-        pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?, args.max_sequences),
+        pool::PoolShape::context_units(pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?,
+            args.max_sequences), context_mode.is_some()),
     );
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)

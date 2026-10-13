@@ -37,6 +37,13 @@ impl PoolShape {
         pool_tokens.div_ceil(SOURCE_PAGE_TOKENS) + sequences
     }
 
+    /// `units` rounded up to an even count under C4 context attention (two equal parity halves).
+    /// The extra unit is within admission: the solver charges every sequence's partial unit at its
+    /// full replicated bytes on each GPU, of which a context unit costs half.
+    pub fn context_units(units: usize, context: bool) -> usize {
+        if context { units.next_multiple_of(2) } else { units }
+    }
+
     pub fn window_pages(&self) -> usize {
         self.sequences * self.ring_pages
     }
@@ -181,6 +188,9 @@ mod tests {
         pool.release(a);
         assert_eq!(pool.free_states(), 3);
         assert_eq!(PoolShape::units_for(262_144, 8), 1032);
+        // 262,144 tokens over three sequences is 1,027 units: context needs two equal halves.
+        assert_eq!(PoolShape::context_units(PoolShape::units_for(262_144, 3), true), 1028);
+        assert_eq!(PoolShape::context_units(1027, false), 1027);
         Ok(())
     }
 }
