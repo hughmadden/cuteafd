@@ -2166,7 +2166,7 @@ elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
 ' "$family" <<<"$plan_json")"
   read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
-  if [[ "$family" == qwen4 && "$head_split" == 1 ]]; then
+  if [[ "$head_split" == 1 ]]; then
     vision="$(dual_owner_media_device "$vision" "$((gpu == lower ? 0 : 1))" "$((gpu == lower ? 1 : 0))")"
   fi
   if [[ "$vision" == spark:* ]]; then
@@ -2193,6 +2193,9 @@ elif kind=="off" and sys.argv[1]=="auto":
 else: raise ValueError("enabled audio has no launchable admitted owner")
 ' "$audio" <<<"$plan_json")"
     read -r audio audio_encoder_hash audio_rank_csv <<<"$selected_audio"
+    if [[ "$head_split" == 1 ]]; then
+      audio="$(dual_owner_media_device "$audio" "$((gpu == lower ? 0 : 1))" "$((gpu == lower ? 1 : 0))")"
+    fi
     if [[ "$audio" == spark:* ]]; then
       IFS=, read -r -a audio_encoder_ranks <<<"$audio_rank_csv"
       for audio_rank in "${audio_encoder_ranks[@]}"; do
