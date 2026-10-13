@@ -27,7 +27,7 @@ enhanced build.
 |---|---|---|
 | **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
-| **Astra 6** | Critical minimum, like Fable: a key kernel design or a fresh insight after Sol and Opus have stalled | Investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
+| **Astra 6** (`high`) | Kernel and optimization concepts: new kernel structures, tiling and fusion ideas, roofline gaps | Investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
 | **DeepSeek 4.1 Flash** | Fast structural work: renames, mechanical refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts | Numerics, kernels, judgment calls |
 | **Claude Opus subagents** | Judgment-heavy cross-cutting work: engine design changes (e.g. the device-driven exchange), hard merges, investigations needing many decisions, independent reviews | Work Sol can do from a clear brief |
 | **Claude Fable** | Extremely rarely: important design or planning, front-end design, a special kernel insight | Anything else |
@@ -51,7 +51,7 @@ but bounded engineering still goes to Sol.
 |---|---|---|
 | Default engineering, measurement, A/B, release smoke | Sol 6.1 | `high` |
 | Subtle numerics, kernels, root-cause investigations | Sol 6.1 | `xhigh` |
-| Critical kernel design only, after Sol `xhigh` and Opus have stalled | Astra 6 | `medium`; a short, design-only task that ends with a written design, then Sol builds it |
+| Kernel and optimization concepts: a new kernel structure, a tiling or fusion idea, why a kernel misses its roofline | Astra 6 | `high`; a design-only task that ends with a written design and expected numbers, then Sol builds it |
 | Structural or simple work, fast turnaround | DeepSeek Flash | `high`, `max` for larger sweeps |
 | Design changes, hard merges, independent review, decisions | Claude Opus | default |
 | Shared build/run tooling answering an agent's tooling request (wip.sh, wip-cards, hwlock, smoke, launchers, cpu-gate) | Claude Opus, or Sonnet for a narrow, well-specified fix | default |
@@ -59,7 +59,8 @@ but bounded engineering still goes to Sol.
 | Everything else exhausted | MiMo | default |
 
 - **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol `-backup` stays the default for everything else.
-- **Astra and Fable are rare.** Both cost far more per task; use them at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Astra for kernel concepts (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts. Give it the concept work (design, roofline reasoning, a written plan with expected numbers), not the probes, harnesses or integration, which Sol does. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Fable is rare.** It costs far more per task; use it at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems.
 - **Codex subscriptions:** start new agents on the `-backup` models (TJ's
   second subscription); when backup hits its weekly limit, start new agents
   on primary. TJ can reset backup's usage; after a reset, new agents go
