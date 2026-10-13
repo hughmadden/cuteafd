@@ -513,8 +513,11 @@ impl Locks {
             "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
             "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
         });
-        // A deep shared queue can hold the pool for hours; CUTEAFD_SMOKE_LOCK_WAIT_S raises the bound.
-        let wait = std::env::var("CUTEAFD_SMOKE_LOCK_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
+        // A deep shared queue holds the pool for hours, and a fair-queue ticket holds no
+        // lock while it waits: default to the same 6 h bound as golden-run and hwlock.py.
+        // CUTEAFD_SMOKE_LOCK_WAIT_S, then CUTEAFD_HW_LOCK_WAIT_S, override it.
+        let wait = ["CUTEAFD_SMOKE_LOCK_WAIT_S", "CUTEAFD_HW_LOCK_WAIT_S"].iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|s| s.parse().ok())).unwrap_or(21600);
         let deadline = Instant::now() + Duration::from_secs(wait);
         // A parent `hwlock.py` already holding a lock for us names it here; taking it
         // again would deadlock on our own parent.
