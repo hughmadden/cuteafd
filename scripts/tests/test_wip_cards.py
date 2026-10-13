@@ -250,7 +250,7 @@ def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, ta
     matrix_entry = {**entry, 'name': name, 'family': family, 'set': values}
     build = cards.build_scopes([matrix_entry])
     built = set(build['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
-    assert str(count) in build['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')
+    assert f'{tag}={count}' in build['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')
     # native/cmake/shared/fp8_moe.cmake expands nvfp4 to both historical
     # nvfp4 and mandatory all-row nvfp4a4 packages at supported TP layouts.
     cmake = (ROOT / 'native/cmake/shared/fp8_moe.cmake').read_text()
@@ -268,14 +268,15 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     # A revision whose wip.sh predates build slots keeps the outer build.lock.
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
+    monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: True)
     cards.build_arms(['base=HEAD', 'candidate=HEAD'], arms, [entry, other], tmp_path, 'task', True)
     for arm in ('base', 'candidate'):
         cfg = cards.config(tmp_path / ('build-' + arm + '.config'))
-        hosts = {cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))}
-        # The default seed (build-only kakapo) leads; the union's serving hosts follow
-        # (six ranks already, so no padding host).
-        assert hosts == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', cards.DEFAULT_SEED}
-        assert cfg['SPARK_0_HOST'] == cards.DEFAULT_SEED
+        hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+        # The union's five serving hosts, padded to six ranks with a pool Spark; the
+        # default seed (build-only kakapo) is wip.sh's WIP_SEED_HOST, never a rank (#117).
+        assert set(hosts) == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', 'kiwi'} and len(hosts) == 6
+        assert cards.DEFAULT_SEED not in hosts
     output = capsys.readouterr().out
     assert output.count('identical build scopes') == 2
     assert 'build.lock' in output and 'gpu1.lock' not in output
@@ -284,8 +285,12 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
     # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
     qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
-    families = cards.build_scopes([qwen, other])['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
-    assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
+    built = cards.build_scopes([qwen, other])
+    families = built['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+    # A 0-Spark card adds coordinator scopes only (per-card derivation).
+    assert 'qwen4:nvfp4' not in families and 'glmf:fp8' in families
+    coordinator = built['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert 'qwen4:nvfp4' in coordinator and 'qwen4:fp8' not in coordinator
     nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
              {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
     scopes = cards.build_scopes(nvfp4)
@@ -318,11 +323,14 @@ def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, g
 def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
     arms = cards.arms_from(['base=b:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
-    cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
-    cfg = cards.config(tmp_path / 'build-base.config')
-    assert cfg['SPARK_0_HOST'] == 'rhea'
-    hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
-    assert hosts.count('rhea') == 1 and set(entry['sparks']) <= set(hosts)
+    for separate in (False, True):
+        monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: separate)
+        cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
+        cfg = cards.config(tmp_path / 'build-base.config')
+        hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+        # Legacy wip.sh builds on SPARK_0_HOST; a separate seed is passed as WIP_SEED_HOST.
+        assert (hosts[0] == 'rhea') == (not separate)
+        assert set(entry['sparks']) <= set(hosts) and hosts.count('rhea') == (0 if separate else 1)
 
 
 def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, capsys):
@@ -972,7 +980,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     assert cfg['COORDINATOR_DOCKER_DEV'] == 'cuteafd-coordinator-dev:' + tag
     assert cfg['SPARK_EXPERT_DOCKER_DEV'] == 'cuteafd-spark-expert-dev:' + tag
     scopes = cards.build_scopes([card])
-    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == '4'
+    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'mimof=4'
     assert scopes['CUTEAFD_WIP_AUDIO_AOT'] == 'ON'
     assert cards.slot_needs(card) == {'coordinator': ['fp8/fp8-mimof'], 'spark': ['fp8/fp8-mimof'], 'audio': True}
 
@@ -1195,3 +1203,19 @@ def test_prefill_sweep_rows(entry, tmp_path):
     sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8170, 'tok_s': 9000.0, 'ttft_s': 0.91}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass' and row['prefill 8192'] == 9000.0 and row['prefill 8192 TTFT s'] == 0.91
+
+
+def test_build_scopes_are_per_card_zero_spark_and_family_counts():
+    base = {'config': '/dev/null'}
+    local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
+    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    mixed = cards.build_scopes([glm, local])
+    spark = set(mixed['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    assert not any(scope.startswith('qwen4:') for scope in spark)
+    assert 'qwen4:exl3-k45' in mixed['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert mixed['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6'
+    assert mixed['CUTEAFD_WIP_QWEN4_AOT'] == 'ON'
+    qwen4 = {**local, 'sparks': list(cards.HOSTS[:4]), 'set': {'SPARK_COUNT': '4'}}
+    both = cards.build_scopes([glm, qwen4])
+    assert 'qwen4:exl3-k45' in both['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+    assert both['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6;qwen4=4'

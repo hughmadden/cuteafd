@@ -120,3 +120,37 @@ def test_benches_flag_runs_only_the_bench_suite(tmp_path, monkeypatch):
         monkeypatch.setattr(gate, name, lambda s, r, a, e, n=name: seen.append(n) or {'suite': n, 'status': 'pass'})
     args = SimpleNamespace(**{**vars(ARGS), 'cargo': False, 'scripts': False, 'benches': True})
     assert gate.gate(ROOT, tmp_path, args)['status'] == 'pass' and seen == ['benches']
+
+
+def _git(cwd, *args):
+    subprocess.run(['git', '-C', str(cwd), *args], check=True, capture_output=True,
+                   env={**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                        'GIT_COMMITTER_EMAIL': 't@t', 'GIT_ALLOW_PROTOCOL': 'file'})
+
+
+def test_pin_changes_refuses_an_uncommitted_submodule_bump(tmp_path):
+
+    sub = tmp_path / 'sub'
+    sub.mkdir()
+    _git(sub, 'init', '-q')
+    (sub / 'f').write_text('1')
+    _git(sub, 'add', 'f')
+    _git(sub, 'commit', '-qm', 'one')
+    top = tmp_path / 'top'
+    top.mkdir()
+    _git(top, 'init', '-q')
+    _git(top, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(sub), 'third_party/sub')
+    _git(top, 'commit', '-qm', 'pin')
+    assert gate.pin_changes(top) == []
+    # Edits inside the submodule with the same commit are not a pin change.
+    (top / 'third_party/sub/f').write_text('dirty')
+    assert gate.pin_changes(top) == []
+    _git(top / 'third_party/sub', 'checkout', '-q', 'f')
+    # A checked-out newer commit (unstaged) and a staged bump are both refused.
+    (top / 'third_party/sub/f').write_text('2')
+    _git(top / 'third_party/sub', 'commit', '-qam', 'two')
+    assert gate.pin_changes(top) == ['third_party/sub']
+    _git(top, 'add', 'third_party/sub')
+    assert gate.pin_changes(top) == ['third_party/sub']
+    _git(top, 'commit', '-qm', 'bump')
+    assert gate.pin_changes(top) == []

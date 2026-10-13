@@ -75,10 +75,31 @@ def prepare(source, root):
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(root)])
     for path in (root / 'tmp', root / 'logs'):
         path.mkdir(parents=True, exist_ok=True)
+    # `submodule update` checks out the commit HEAD records, so an uncommitted pin bump (a gitlink
+    # staged or changed but not committed) would be silently reset and the gate would test the old
+    # kernels. Refuse instead: commit the pin bump, then gate.
+    moved = pin_changes(source)
+    if moved:
+        raise SystemExit('cpu-gate: submodule pins differ from HEAD (commit the bump first): ' + ', '.join(moved))
     log(f'submodules at their pinned commits ({source})')
     checked(['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive'], timeout=1800)
     checked([sys.executable, str(source / 'scripts/build/verify-sparkinfer-source.py'), '--source',
              str(source / 'third_party/sparkinfer'), '--lock', str(source / 'third_party/sparkinfer.lock.json')])
+
+
+def pin_changes(source):
+    """Submodule paths whose staged or checked-out commit differs from the one HEAD records."""
+    moved = set()
+    for cached in (True, False):
+        # --ignore-submodules=dirty: only a moved commit counts, not edits inside a submodule.
+        cmd = ['git', '-C', str(source), 'diff', '--raw', '--ignore-submodules=dirty']
+        out = subprocess.run(cmd + (['--cached'] if cached else []) + ['HEAD'],
+                             capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            meta, _, path = line.partition('\t')
+            if '160000' in meta.split()[:2]:
+                moved.add(path)
+    return sorted(moved)
 
 
 def run_logged(cmd, log_path, env, cwd, timeout):

@@ -479,6 +479,7 @@ impl Bench {
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
         let info = self.server_info(&client.model);
         let fingerprint = crate::server::fingerprint(&info);
+        let run_mark = client.thermal_mark();
         {
             let mut r = report.lock().expect("report lock");
             r.server = info.clone();
@@ -513,6 +514,7 @@ impl Bench {
             }
         };
         report.lock().expect("report lock").baseline = baseline.clone();
+        Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
         let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
         for (index, planned) in plan.iter().enumerate() {
@@ -568,6 +570,7 @@ impl Bench {
                     }
                 }
                 drop(r);
+                Self::record_power(&client, run_mark, report);
                 self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
             }
             let mut r = report.lock().expect("report lock");
@@ -581,6 +584,15 @@ impl Bench {
             }
         }
         Ok(())
+    }
+
+    /// Record the GPU power limits the run actually got (whole-run throttle window, so the
+    /// label reflects what gpu-powerd or the static cap delivered, not a one-time read).
+    fn record_power(client: &Client, mark: Option<f64>, report: &Arc<Mutex<Report>>) {
+        let Some(window) = client.thermal_since(mark) else { return };
+        if let Some(power) = crate::report::Power::from_json(&[&window]) {
+            report.lock().expect("report lock").server.hardware.power = Some(power);
+        }
     }
 
     /// A panel (or the baseline) starts a pass: reset its progress and the ETA base.

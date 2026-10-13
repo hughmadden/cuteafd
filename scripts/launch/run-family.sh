@@ -777,6 +777,24 @@ if [[ $family == glm5_flash ]]; then
     wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
     *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_TARGET_HEAD: the target's logits through the BF16 head. auto (default) forwards
+  # nothing and the engine resolves it: tensor with the BF16 head (GLM5_FLASH_FP8_HEAD=off; steps of
+  # up to 8 rows on the pedantic FP32 GEMM, wider ones on BF16 tensor cores with FP32 accumulation,
+  # KL-gated against exact), not applicable with the FP8 head (its own program). exact
+  # (diagnostic) keeps the pedantic GEMM at every row count; an explicit tensor with the FP8 head
+  # is refused.
+  target_head="$(get GLM5_FLASH_TARGET_HEAD auto)"
+  case "$target_head" in
+    ""|auto) ;;
+    exact) family_args+=(--target-head exact) ;;
+    tensor)
+      if [[ $fp8_head == on ]]; then
+        echo "GLM5_FLASH_TARGET_HEAD=tensor runs the BF16 head; set GLM5_FLASH_FP8_HEAD=off" >&2
+        exit 2
+      fi
+      family_args+=(--target-head tensor) ;;
+    *) echo "GLM5_FLASH_TARGET_HEAD must be auto, exact or tensor" >&2; exit 2 ;;
+  esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
   if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
     case ",$fp8_prefill," in

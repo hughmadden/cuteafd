@@ -253,6 +253,10 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     env = dict(os.environ)
     env["PATH"] = f"{shims}:{env['PATH']}"
     env["CARGO_TARGET_DIR"] = str(relocated)
+    # This stub proves relocation, not compiler-cache target suffixing.
+    env["CUTEAFD_BUILD_CACHES"] = "off"
+    env.pop("CUTEAFD_KACHE", None)
+    env.pop("CUTEAFD_SCCACHE_CUDA", None)
     env.pop("CUTEAFD_RELEASE_SPARK_TP_ROLES", None)
     # The build root parent is relocated to the same probeable filesystem: with the
     # hook unset the script guards its literal /tmp default, which a private or
