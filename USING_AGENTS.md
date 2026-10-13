@@ -60,6 +60,7 @@ but bounded engineering still goes to Sol.
 
 - **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol `-backup` stays the default for everything else.
 - **Astra for hard kernels (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts and can code those kernels itself. Don't spend it on simple kernels or on probes, harnesses and integration, which Sol does. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Rotate models on repeated kernel ideas (TJ, 2026-10-13):** when a kernel or optimization idea needs several iterations, don't give every round to the same model. Rotate the strong models (Astra `high`, Opus, Fable, Sol `xhigh`), each taking a turn with the previous rounds' results and measurements, and pick who goes first at random. Different smart friends see different things. One round per model per turn, then the measured result goes to the next.
 - **Fable is rare.** It costs far more per task; use it at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems.
 - **Codex subscriptions:** start new agents on the `-backup` models (TJ's
   second subscription); when backup hits its weekly limit, start new agents
