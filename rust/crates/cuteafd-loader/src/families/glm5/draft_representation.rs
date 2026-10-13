@@ -218,7 +218,8 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
         rows * 2 * g.intermediate * 2, rows * g.intermediate * 2, rows * g.vocab * 4,
         drafted * 16 * 4, drafted * 16 * 4, rows * g.selector_rank * 2, sequences * 4,
         rows * 4, drafted * 4, drafted * 16, rows * 8, 3 * sequences * 4,
-        sequences * g.kv_heads * (2048 + block).div_ceil(128) * 64 * 130 * 4,
+        crate::serving_capacity::draft_attention_workspace_bytes(sequences, g.kv_heads, 2,
+            2048 + block, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?,
         drafted * 64 * 16 * 8].into_iter().map(allocation).sum::<u64>();
     let scratch = if fp8 {
         let layout = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, capacity, 2048)?;
@@ -300,7 +301,9 @@ fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: us
         (sequences as u64,1,4),(rows,1,4),(rows,1,4),(rows,1,4),(rows,1,8),(sequences as u64,3,4)];
     let mut workspace = 4 << 20;
     for (a,b,c) in terms { workspace = add(workspace,mul(mul(a,b)?,c)?.max(256))?; }
-    workspace = add(workspace,mul(mul(mul(sequences as u64,kvh)?,add(2048,block)?.div_ceil(128))?,32*66*4)?.max(256))?;
+    workspace = add(workspace,crate::serving_capacity::draft_attention_workspace_bytes(
+        sequences as u64, kvh, 1, add(2048,block)?, 64, sms)
+        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256))?;
     workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
     let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
@@ -327,7 +330,11 @@ mod tests {
         let capacity = GlmDraftCapacity::new(8,8,8).unwrap();
         let layout = GlmDraftRuntimeLayout::new(g,GlmDraftRepresentation::Fp8Only,capacity,2048).unwrap();
         let (arenas,scratch) = draft_workspace_bytes(g,capacity,8,true,188,2).unwrap();
-        assert_eq!(layout.weights.resident_bytes().unwrap() + arenas, 1_835_700_096);
+        let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
+        let new_attention = crate::serving_capacity::draft_attention_workspace_bytes(8, 8, 2,
+            2056, 128, 188).unwrap();
+        assert_eq!(layout.weights.resident_bytes().unwrap() + arenas,
+            1_835_700_096 - old_attention + new_attention);
         // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
         assert_eq!(scratch,30_491_648 + 128 * 80 * 4);
         let mut invalid = g; invalid.conv_group = 0;

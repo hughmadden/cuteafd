@@ -402,13 +402,15 @@ pub fn draft_scratch_bytes(shape: DraftScratch, sm_count: usize) -> Result<usize
             let kbs = k / 128;
             let wanted = (sm_count * 16).div_ceil(tiles).clamp(1, kbs);
             let splits = kbs.div_ceil(kbs.div_ceil(wanted));
-            align(2 * 64 * 4) + align(k * 64 * 2)
+            align(2 * 64 * 4) + align(k.div_ceil(256) * 64 * 4) + align(k * 64 * 2)
                 + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 }
         }
         DraftScratch::Attention { sequences, heads, kv_heads, block, keys } => {
-            ensure!(kv_heads > 0 && heads % kv_heads == 0, "invalid draft attention geometry");
-            usize::try_from(tensor_bytes("DFlash attention scratch", &[sequences, kv_heads,
-                (heads / kv_heads * block).div_ceil(64), keys.div_ceil(128), 64, 130, 4])?)?
+            ensure!(kv_heads > 0 && heads > 0 && heads % kv_heads == 0, "invalid draft attention geometry");
+            let queries = (heads / kv_heads).checked_mul(block).context("draft query extent")?;
+            usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
+                sequences as u64, kv_heads as u64, queries.div_ceil(32) as u64, keys as u64,
+                128, sm_count as u64)?)?
         }
         DraftScratch::Topk { rows } => usize::try_from(tensor_bytes("DFlash topk scratch", &[rows, 64, 16, 8])?)?,
     })

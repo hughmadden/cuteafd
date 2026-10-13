@@ -103,3 +103,22 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     # GLM 5.3 switches only after qualifying its own hidden-6144 real inputs.
     assert '.draft_device_diagnostic(' in (source / 'glm5/serve.rs').read_text()
     assert 'GLM5_FLASH_DRAFT_HEAD' not in (ROOT / 'scripts/launch/run-family.sh').read_text()
+
+
+def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
+    native = ROOT / 'native'
+    for path in ['families/mimo_v2/cuda/mimo_dflash.cu', 'families/glm5/cuda/glm_dflash.cu',
+                 'families/glm5_flash/cuda/glmf_dspark.cu']:
+        text = (native / path).read_text()
+        assert 'cuteafd::draft_attention::workspace(' in text
+        assert 'cuteafd::draft_attention::launch(' in text
+        assert 'attention_partial_kernel' not in text and 'attention_merge_kernel' not in text
+    assert 'shared/cuda/draft_attention.cu' in (native / 'CMakeLists.txt').read_text()
+    path = native / 'tests/glm_draft_kernels_selftest.py'
+    tree = ast.parse(path.read_text())
+    attention = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == 'attention_check')
+    names = {node.func.id for node in ast.walk(attention)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert 'timed' in names and 'elapsed' not in names
+    assert 'checked_launch' in names

@@ -184,6 +184,58 @@ pub enum CacheGeometryError {
     },
 }
 
+/// Shared WMMA draft-attention arena. Capacity partitions are sized for one
+/// sequence; launches can reduce them as the batch grows, so this arena also
+/// covers every smaller launch made through a maximum-capacity workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u64,
+    max_keys: u64, head_dim: u64, sms: u64) -> Result<u64, CacheGeometryError> {
+    if [sequences, kv_heads, slices, max_keys, sms].contains(&0)
+        || !matches!(head_dim, 64 | 128) {
+        return Err(CacheGeometryError::Unsupported {
+            family: "draft attention", what: "invalid arena geometry",
+        });
+    }
+    let overflow = || CacheGeometryError::Overflow("draft attention workspace");
+    let base = kv_heads.checked_mul(slices).ok_or_else(overflow)?;
+    let partitions = max_keys.div_ceil(32).min(sms.checked_mul(2).ok_or_else(overflow)?.div_ceil(base));
+    [kv_heads, slices, partitions, 32, head_dim + 2, 4].into_iter()
+        .try_fold(sequences, |bytes, n| bytes.checked_mul(n).ok_or_else(overflow))
+}
+
+#[cfg(test)]
+mod draft_attention_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_covers_every_sm_sized_smaller_launch() {
+        for sms in [170u64, 188, 48] {
+            for (heads, slices, dim) in [(8u64, 2u64, 128u64), (8, 4, 128), (64, 1, 64)] {
+                for keys in [8u64, 31, 32, 33, 1024, 2056] {
+                    let arena = draft_attention_workspace_bytes(16, heads, slices, keys, dim, sms).unwrap();
+                    for sequences in 1u64..=16 {
+                        let tiles = keys.div_ceil(32);
+                        let capacity = tiles.min((2 * sms).div_ceil(heads * slices));
+                        let wanted = capacity.min((2 * sms).div_ceil(sequences * heads * slices).max(1));
+                        let partitions = tiles.div_ceil(tiles.div_ceil(wanted));
+                        let used = sequences * heads * slices * partitions * 32 * (dim + 2) * 4;
+                        assert!(used <= arena);
+                    }
+                }
+            }
+        }
+        assert_eq!(draft_attention_workspace_bytes(8, 8, 2, 2056, 128, 188).unwrap(),
+            8 * 8 * 2 * 24 * 32 * 130 * 4);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_arenas_are_named_errors() {
+        assert!(draft_attention_workspace_bytes(0, 8, 2, 1024, 128, 188).is_err());
+        assert!(draft_attention_workspace_bytes(1, 8, 2, 1024, 80, 188).is_err());
+        assert!(draft_attention_workspace_bytes(u64::MAX, 8, 2, 1024, 128, 188).is_err());
+    }
+}
+
 /// Read the text checkpoint's limit once. A missing limit is not replaced
 /// with a small engine literal; automatic capacity planning must name it.
 pub fn checkpoint_context_limit(root: &Value) -> Result<Option<u64>, CacheGeometryError> {

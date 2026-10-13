@@ -125,11 +125,11 @@ class Drafter:
             k = rope(rms(k, self.w[a + "k_norm.weight"], self.eps), positions, self.theta)
             kc, vc = ctx[l]
             keys, values = torch.cat([kc, k]), torch.cat([vc, v])
-            # FP32 softmax over BF16 scores, as the engine's kernel.
+            # HF Qwen3 casts FP32 softmax probabilities to the query dtype before PV.
             scores = torch.einsum("qhd,khd->hqk", q.float(), keys.float()) / math.sqrt(self.head_dim)
             scores = scores.masked_fill(~mask[None], -math.inf)
-            probs = scores.softmax(-1)
-            attn = torch.einsum("hqk,khd->qhd", probs, values.float()).to(h.dtype).reshape(b, -1)
+            probs = scores.softmax(-1).to(q.dtype)
+            attn = torch.einsum("hqk,khd->qhd", probs, values).to(h.dtype).reshape(b, -1)
             h = h + F.linear(attn, self.w[a + "o_proj.weight"])
             n = rms(h, self.w[p + "post_attention_layernorm.weight"], self.eps)
             m = p + "mlp."

@@ -715,6 +715,120 @@ def mimo_forward_check(lib, args):
             assert lib.cuteafd_v41_markov_destroy(head_handle) == 0
 
 
+def attention_check(lib, args):
+    """Shared attention masks/tails and max-capacity arena versus an FP64 oracle."""
+    signatures = {
+        "cuteafd_mimo_dflash_attention_workspace": ([C.c_int32] * 5, C.c_uint64),
+        "cuteafd_mimo_dflash_attention": ([P] * 11 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
+        "cuteafd_glm_dflash_attention_workspace": ([C.c_int32] * 3, C.c_uint64),
+        "cuteafd_glm_dflash_attention": ([P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
+        "cuteafd_glmf_dspark_attention_workspace": ([C.c_int32] * 3, C.c_uint64),
+        "cuteafd_glmf_dspark_attention": ([P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
+    }
+    baseline = C.CDLL(args.fp8_baseline) if args.fp8_baseline else None
+    for native in [lib] + ([baseline] if baseline else []):
+        for name, (types, result) in signatures.items():
+            getattr(native, name).argtypes = types
+            getattr(native, name).restype = result
+    torch.manual_seed(197)
+    stream = torch.cuda.current_stream().cuda_stream
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    cases = [
+        ("mimo", 128, 8, 4, 8, 0, 0, False, True),
+        ("mimo", 128, 12, 4, 3, 17, 1, False, False),
+        ("mimo", 128, 16, 4, 8, 33, 17, False, True),
+        ("mimo", 128, 64, 4, 8, 129, 31, False, False),
+        ("glm", 128, 8, 4, 8, 31, 0, False, False),
+        ("glm", 128, 32, 4, 8, 33, 5, False, False),
+        ("glmf", 64, 8, 4, 8, 1, 0, True, False),
+        ("glmf", 64, 16, 4, 8, 129, 0, False, False),
+        ("mimo", 128, 64, 8, 8, 1024, 1024, False, True),
+        ("glm", 128, 32, 8, 8, 1024, 1024, False, False),
+        ("glmf", 64, 64, 64, 8, 1024, 0, True, False),
+    ]
+    for family, dim, heads, kvh, block, context, window, causal, sink in cases:
+        prefix = {"mimo": "cuteafd_mimo_dflash", "glm": "cuteafd_glm_dflash",
+                  "glmf": "cuteafd_glmf_dspark"}[family]
+        slices = ((heads // kvh * block + 31) // 32 if family == "mimo"
+                  else 2 if family == "glm" else 1)
+        ring = max(257, context + 17)
+        max_keys = context + block
+        partitions = min((max_keys + 31) // 32, (2 * sms + kvh * slices - 1) // (kvh * slices))
+        for sequences in (1, 8):
+            q = torch.randn(sequences, block, heads, dim, device="cuda").bfloat16()
+            k = torch.randn(sequences, block, kvh, dim, device="cuda").bfloat16()
+            v = torch.randn_like(k)
+            kr = torch.randn(sequences, ring, kvh, dim, device="cuda").bfloat16()
+            vr = torch.randn_like(kr)
+            slots = torch.arange(sequences, device="cuda", dtype=torch.int32).flip(0).contiguous()
+            lengths = torch.tensor([max(0, context - i % 3) for i in range(sequences)],
+                                   device="cuda", dtype=torch.int32)
+            ends = torch.tensor([ring + context + 13 + i for i in range(sequences)],
+                                device="cuda", dtype=torch.int32)
+            sinks = torch.linspace(-3., 2., heads, device="cuda").bfloat16() if sink else None
+            out = torch.empty_like(q)
+            workspace_fn = getattr(lib, prefix + "_attention_workspace")
+            arena = (workspace_fn(16, heads, kvh, block, max_keys) if family == "mimo"
+                     else workspace_fn(16, kvh, max_keys))
+            assert arena == 16 * kvh * slices * partitions * 32 * (dim + 2) * 4
+            # Smaller launches reuse the capacity arena; guard its exact admitted boundary.
+            scratch = torch.full((arena + 256,), 173, device="cuda", dtype=torch.uint8)
+
+            def launch(native, output, workspace):
+                pointers = [q.data_ptr(), k.data_ptr(), v.data_ptr(), kr.data_ptr(), vr.data_ptr(),
+                            slots.data_ptr(), lengths.data_ptr(), ends.data_ptr()]
+                if family == "mimo":
+                    pointers.append(sinks.data_ptr() if sinks is not None else None)
+                return getattr(native, prefix + "_attention")(*pointers, output.data_ptr(),
+                    workspace.data_ptr(), sequences, block, heads, kvh, ring, max_keys,
+                    int(causal) if family == "glmf" else window, dim ** -0.5, stream)
+
+            assert launch(lib, out, scratch) == 0
+            torch.cuda.synchronize()
+            assert torch.all(scratch[arena:] == 173), (family, "workspace overrun")
+            ref = torch.empty(q.shape, dtype=torch.float64, device="cuda")
+            for s in range(sequences):
+                ctx, end, slot = lengths[s].item(), ends[s].item(), slots[s].item()
+                indices = torch.arange(end - ctx, end, device="cuda")
+                keys = torch.cat((kr[slot, indices % ring], k[s])).double()
+                values = torch.cat((vr[slot, indices % ring], v[s])).double()
+                for h in range(heads):
+                    kvhead = h // (heads // kvh)
+                    score = q[s, :, h].double() @ keys[:, kvhead].T * dim ** -0.5
+                    mask = torch.ones((block, ctx + block), device="cuda", dtype=torch.bool)
+                    if window:
+                        mask[:, :ctx] = indices[None, :] >= end + torch.arange(block, device="cuda")[:, None] - window + 1
+                    if causal:
+                        mask[:, ctx:] = torch.arange(block, device="cuda")[None, :] <= torch.arange(block, device="cuda")[:, None]
+                    score.masked_fill_(~mask, -torch.inf)
+                    if sinks is not None:
+                        score = torch.cat((score, sinks[h].double().expand(block, 1)), dim=1)
+                    probability = score.softmax(-1)[:, :ctx + block]
+                    ref[s, :, h] = probability @ values[:, kvhead]
+            delta = out.double() - ref
+            maximum = delta.abs().amax().item()
+            relative_rms = (delta.square().mean() / ref.square().mean().clamp_min(1e-20)).sqrt().item()
+            assert torch.isfinite(out).all() and maximum < 0.025 and relative_rms < 0.01, (
+                family, sequences, context, maximum, relative_rms)
+            def checked_launch(native, output, workspace):
+                status = launch(native, output, workspace)
+                assert status == 0, (family, sequences, context, status)
+
+            median = timed(lambda: checked_launch(lib, out, scratch), 5)
+            old_median = None
+            if baseline is not None:
+                old_fn = getattr(baseline, prefix + "_attention_workspace")
+                old_bytes = (old_fn(sequences, heads, kvh, block, max_keys) if family == "mimo"
+                             else old_fn(sequences, kvh, max_keys))
+                old_workspace = torch.empty(old_bytes, device="cuda", dtype=torch.uint8)
+                old_out = torch.empty_like(q)
+                old_median = timed(lambda: checked_launch(baseline, old_out, old_workspace), 5)
+            print(f"attention {family} dim={dim} heads={heads}/{kvh} sequences={sequences} "
+                  f"context={context} window={window} causal={causal} sink={sink} "
+                  f"max_abs={maximum:.3e} rel_rms={relative_rms:.3e} "
+                  f"median_ms={median:.6f} baseline_ms={old_median} arena_bytes={arena}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
@@ -739,6 +853,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--skip-head", action="store_true")
     group.add_argument("--head-only", action="store_true", help="skip unrelated FP8 checks")
+    group.add_argument("--attention-only", action="store_true", help="shared attention FP64 masks/tails and capacity gate")
     args = parser.parse_args()
     try:
         args.head_rows = [int(value) for value in args.head_rows.split(",")]
@@ -749,6 +864,8 @@ def main():
     vocab, width = args.head_shape
     if vocab < 1 or vocab > 64 * 12 * 256 or width < 256 or width > 6336 or width % 256:
         parser.error("head shape requires a supported vocabulary and width: multiple of 256, at most 6336")
+    if args.attention_only and (args.profile_head or args.profile_fp8 or args.profile_mimo or args.mimo_forward):
+        parser.error("--attention-only cannot combine with another profile or forward gate")
     if args.profile_head and args.skip_head:
         parser.error("--profile-head requires head checks")
     if args.profile_fp8 and (args.head_only or args.profile_head or not args.skip_head):
@@ -770,7 +887,9 @@ def main():
         parser.error("--mimo-forward has its own profile range and cannot run separate head/FP8 checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
-    if args.mimo_forward:
+    if args.attention_only:
+        attention_check(lib, args)
+    elif args.mimo_forward:
         mimo_forward_check(lib, args)
     else:
         if not args.skip_head:
