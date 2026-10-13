@@ -166,6 +166,9 @@ impl<'a> Engine<'a> {
             }
             for link in transports { link.intake.terminal_drain_copies()?; }
             if let Some(link) = &self.device_link { link.terminal_drain_copies()?; }
+            if self.exchange.is_none() {
+                self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
+            }
             Ok(())
         })();
         crate::shared::decode_graph::fatal_drain(result, "V4 submission shutdown");
