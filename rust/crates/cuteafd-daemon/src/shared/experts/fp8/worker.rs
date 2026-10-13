@@ -66,6 +66,11 @@ impl<'a> Fp8Worker<'a> {
         })
     }
 
+    pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        self.experts.installed_grouping(loaded, rank, self.capacity)
+    }
+
     pub(crate) fn bind_layer(&mut self, layer: usize) -> Result<()> {
         ensure!(layer < self.experts.layers.len(), "requested FP8 layer is not resident");
         self.layer = layer;

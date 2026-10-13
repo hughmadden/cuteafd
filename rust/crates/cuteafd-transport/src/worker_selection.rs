@@ -115,13 +115,31 @@ pub struct InstalledExpertVariant {
     capacity: usize,
     group_rows: usize,
     compact_live_rows: usize,
+    segments: Vec<ExpertGroupingSegment>,
+    contract: ExpertTrafficContract,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertTrafficContract { ExactGrouping, ConservativeRouteUpperBound }
+
+impl ExpertTrafficContract {
+    pub fn label(self) -> &'static str {
+        match self { Self::ExactGrouping => "exact_grouping",
+            Self::ConservativeRouteUpperBound => "conservative_route_upper_bound" }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertGroupingSegment { end_rows: usize, group_rows: usize }
 
 impl InstalledExpertVariant {
     /// Read the loaded execution once at startup, never from a coordinator-side manifest.
     pub fn from_queries(capacity: usize, mut query: impl FnMut(usize) -> Result<usize>) -> Result<Self> {
         ensure!((1..=4096).contains(&capacity), "invalid installed expert variant capacity");
         let group_rows = query(0)?;
+        ensure!(matches!(group_rows, 1 | 8 | 16 | 32 | 64 | 128), "invalid native installed expert group");
         let mut compact_live_rows = 0;
         let mut grouped = false;
         for rows in 1..=capacity {
@@ -133,29 +151,65 @@ impl InstalledExpertVariant {
                 compact_live_rows = rows;
             }
         }
-        let variant = Self { capacity, group_rows, compact_live_rows };
+        let variant = Self { capacity, group_rows, compact_live_rows,
+            segments: Vec::new(), contract: ExpertTrafficContract::ExactGrouping };
+        variant.validate()?;
+        Ok(variant)
+    }
+
+    /// Piecewise groups from the actual loaded FP8-family capacity/form.
+    pub fn from_piecewise_queries(capacity: usize, contract: ExpertTrafficContract,
+        mut query: impl FnMut(usize) -> Result<usize>) -> Result<Self> {
+        ensure!((1..=4096).contains(&capacity), "invalid installed expert variant capacity");
+        let group_rows = query(0)?;
+        let mut segments = Vec::<ExpertGroupingSegment>::new();
+        for rows in 1..=capacity {
+            let group = query(rows)?;
+            if let Some(last) = segments.last_mut().filter(|last| last.group_rows == group) {
+                last.end_rows = rows;
+            } else { segments.push(ExpertGroupingSegment { end_rows: rows, group_rows: group }); }
+        }
+        let variant = Self { capacity, group_rows, compact_live_rows: 0, segments, contract };
         variant.validate()?;
         Ok(variant)
     }
 
     fn validate(&self) -> Result<()> {
         ensure!((1..=4096).contains(&self.capacity)
-            && matches!(self.group_rows, 1 | 8 | 16 | 32 | 64 | 128)
+            && (1..=4096).contains(&self.group_rows)
             && self.compact_live_rows <= self.capacity,
             "invalid installed expert capacity/group/compact cutoff");
         ensure!(self.group_rows != 1 || self.compact_live_rows == 0,
             "group-one expert variant cannot have a separate compact prefix");
+        if !self.segments.is_empty() {
+            ensure!(self.compact_live_rows == 0 && self.segments.len() <= 16
+                && self.segments.iter().all(|segment| segment.end_rows > 0
+                    && segment.end_rows <= self.capacity && (1..=4096).contains(&segment.group_rows))
+                && self.segments.windows(2).all(|pair| pair[0].end_rows < pair[1].end_rows
+                    && pair[0].group_rows != pair[1].group_rows)
+                && self.segments.last().is_some_and(|last| last.end_rows == self.capacity
+                    && last.group_rows == self.group_rows), "invalid piecewise installed expert grouping");
+        }
+        if self.contract == ExpertTrafficContract::ConservativeRouteUpperBound {
+            ensure!(self.group_rows == 1 && self.compact_live_rows == 0
+                && self.segments.iter().all(|segment| segment.group_rows == 1),
+                "conservative expert traffic bound must charge every routed occurrence");
+        }
         Ok(())
     }
 
     fn group_rows(&self, rows: usize) -> usize {
+        if rows > 0 && !self.segments.is_empty() {
+            return self.segments.iter().find(|segment| rows <= segment.end_rows)
+                .expect("validated segment covers installed capacity").group_rows;
+        }
         if rows > 0 && rows <= self.compact_live_rows { 1 } else { self.group_rows }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64 }
+pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64, Fp8Nearest }
 
 /// The exact loaded worker, its resident layers and its immutable launch selector.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,18 +220,34 @@ pub struct InstalledExpertGrouping {
     capacity: usize,
     selector: ExpertGroupingSelector,
     variants: Vec<InstalledExpertVariant>,
+    bf16_variants: Option<Vec<InstalledExpertVariant>>,
 }
 
 impl InstalledExpertGrouping {
     pub fn new(loaded: WorkerSelection, rank: usize, capacity: usize,
         selector: ExpertGroupingSelector, mut variants: Vec<InstalledExpertVariant>) -> Result<Self> {
         variants.sort_by_key(|variant| variant.capacity);
-        let report = Self { loaded, rank, capacity, selector, variants };
+        let report = Self { loaded, rank, capacity, selector, variants, bf16_variants: None };
         report.validate()?;
         Ok(report)
     }
 
+    pub fn with_bf16_variants(mut self, mut variants: Vec<InstalledExpertVariant>) -> Result<Self> {
+        ensure!(self.selector == ExpertGroupingSelector::Fp8Nearest, "BF16 sibling requires FP8 selector");
+        variants.sort_by_key(|variant| variant.capacity);
+        self.bf16_variants = Some(variants);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
+
+    pub fn traffic_contract(&self) -> ExpertTrafficContract {
+        if self.variants.iter().chain(self.bf16_variants.iter().flatten())
+            .any(|variant| variant.contract == ExpertTrafficContract::ConservativeRouteUpperBound) {
+            ExpertTrafficContract::ConservativeRouteUpperBound
+        } else { ExpertTrafficContract::ExactGrouping }
+    }
 
     fn validate(&self) -> Result<()> {
         self.loaded.validate()?;
@@ -186,6 +256,12 @@ impl InstalledExpertGrouping {
         ensure!((1..=4096).contains(&self.capacity) && (1..=6).contains(&self.variants.len()),
             "invalid installed expert report capacity/variant count");
         for variant in &self.variants { variant.validate()?; }
+        if self.selector != ExpertGroupingSelector::Fp8Nearest {
+            ensure!(self.variants.iter().all(|variant| variant.segments.is_empty()
+                && variant.contract == ExpertTrafficContract::ExactGrouping
+                && matches!(variant.group_rows, 1 | 8 | 16 | 32 | 64 | 128)),
+                "non-FP8 installed grouping must retain its native group contract");
+        }
         ensure!(self.variants.windows(2).all(|pair| pair[0].capacity < pair[1].capacity),
             "installed expert capacities must be distinct and ascending");
         let capacities: Vec<_> = self.variants.iter().map(|variant| variant.capacity).collect();
@@ -196,6 +272,11 @@ impl InstalledExpertGrouping {
                     "native report must name its actual main and optional m1/m80 executions");
                 capacities.clone()
             }
+            ExpertGroupingSelector::Fp8Nearest => {
+                ensure!(capacities.last().is_some_and(|&last| last >= self.capacity),
+                    "FP8 report must cover its admitted capacity with installed programs");
+                capacities.clone()
+            }
             ExpertGroupingSelector::Exl3Nearest | ExpertGroupingSelector::Exl3GlmFlashK64 => {
                 let policy = if self.selector == ExpertGroupingSelector::Exl3Nearest {
                     cuteafd_core::Exl3RowPolicy::Nearest
@@ -204,17 +285,31 @@ impl InstalledExpertGrouping {
             }
         };
         ensure!(capacities == expected, "installed expert capacities disagree with launch selector");
+        if let Some(variants) = &self.bf16_variants {
+            ensure!(self.selector == ExpertGroupingSelector::Fp8Nearest && (1..=6).contains(&variants.len())
+                && variants.windows(2).all(|pair| pair[0].capacity < pair[1].capacity)
+                && variants.last().is_some_and(|last| last.capacity >= self.capacity),
+                "invalid installed BF16 sibling capacities");
+            for variant in variants { variant.validate()?; }
+        }
         Ok(())
     }
 
     /// Zero is the main compiled tile; positive rows follow the installed selector.
     pub fn group_rows(&self, rows: usize) -> Result<usize> {
+        self.group_rows_for_input(rows, false)
+    }
+
+    /// Select the same loaded BF16 sibling as the worker request adapter.
+    pub fn group_rows_for_input(&self, rows: usize, bf16: bool) -> Result<usize> {
+        let variants = if bf16 { self.bf16_variants.as_ref().unwrap_or(&self.variants) }
+            else { &self.variants };
         ensure!(rows <= self.capacity, "expert rows {rows} exceed installed capacity {}", self.capacity);
         let required = if self.selector == ExpertGroupingSelector::Exl3GlmFlashK64 {
             cuteafd_core::Exl3RowPolicy::GlmFlashK64.required_capacity(rows)
         } else { rows };
-        let variant = if rows == 0 { self.variants.last() } else {
-            self.variants.iter().find(|variant| variant.capacity >= required)
+        let variant = if rows == 0 { variants.last() } else {
+            variants.iter().find(|variant| variant.capacity >= required)
         }.context("missing installed expert grouping capacity")?;
         Ok(variant.group_rows(rows))
     }
@@ -253,7 +348,8 @@ impl InstalledExpertGrouping {
                 let overlap = report.layers().iter().any(|a| previous.layers().iter()
                     .any(|b| a.first < b.end && b.first < a.end));
                 ensure!(!overlap || (report.capacity == previous.capacity
-                    && report.selector == previous.selector && report.variants == previous.variants),
+                    && report.selector == previous.selector && report.variants == previous.variants
+                    && report.bf16_variants == previous.bf16_variants),
                     "installed expert grouping differs across ranks {} and {rank} for the same layer (mixed packages)",
                     previous.rank);
             }
@@ -463,6 +559,67 @@ mod tests {
         assert_eq!(nearest.group_rows(16).unwrap(), 16);
         assert!(InstalledExpertGrouping::new(loaded, 0, 16,
             ExpertGroupingSelector::Exl3Nearest, variants[..2].to_vec()).is_err());
+    }
+
+    #[test]
+    fn fp8_loaded_capacities_and_input_forms_follow_piecewise_groups() {
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variants = [1, 16, 80, 4096].into_iter().map(|capacity|
+            InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
+                |rows| Ok(if capacity == 1 || capacity == 16 { 16 }
+                    else if capacity == 80 || (1..=80).contains(&rows) { 64 } else { 128 })).unwrap()).collect();
+        let bf16 = [16, 4096].into_iter().map(|capacity|
+            InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
+                |_| Ok(if capacity == 16 { 16 } else { 64 })).unwrap()).collect();
+        let report = InstalledExpertGrouping::new(loaded, 0, 128, ExpertGroupingSelector::Fp8Nearest, variants)
+            .unwrap().with_bf16_variants(bf16).unwrap();
+        let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        for (rows, expected) in [(1, 16), (16, 16), (17, 64), (80, 64), (81, 128), (128, 128)] {
+            assert_eq!(restored.group_rows(rows).unwrap(), expected);
+        }
+        assert_eq!(restored.group_rows_for_input(81, true).unwrap(), 64);
+        assert_eq!(restored.traffic_contract(), ExpertTrafficContract::ExactGrouping);
+    }
+
+    #[test]
+    fn fp8_grouping_rejects_malformed_segments_and_companions_at_admission() {
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variant = InstalledExpertVariant::from_piecewise_queries(80,
+            ExpertTrafficContract::ExactGrouping, |_| Ok(48)).unwrap();
+        let report = InstalledExpertGrouping::new(loaded, 0, 80,
+            ExpertGroupingSelector::Fp8Nearest, vec![variant]).unwrap();
+        assert_eq!(report.group_rows(17).unwrap(), 48);
+        for segments in [
+            serde_json::json!([{"end_rows":79,"group_rows":48}]),
+            serde_json::json!([{"end_rows":80,"group_rows":0}]),
+            serde_json::json!([{"end_rows":80,"group_rows":16},{"end_rows":80,"group_rows":48}]),
+        ] {
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["variants"][0]["segments"] = segments;
+            let malformed: InstalledExpertGrouping = serde_json::from_value(value).unwrap();
+            assert!(malformed.validate_for(&identity(), 0, 80, 13..14).is_err());
+        }
+        let mut value = serde_json::to_value(&report).unwrap();
+        value["variants"][0]["contract"] = "conservative_route_upper_bound".into();
+        let malformed: InstalledExpertGrouping = serde_json::from_value(value).unwrap();
+        assert!(malformed.validate_for(&identity(), 0, 80, 13..14).is_err());
+        let companion = InstalledExpertVariant::from_piecewise_queries(16,
+            ExpertTrafficContract::ExactGrouping, |_| Ok(16)).unwrap();
+        assert!(report.with_bf16_variants(vec![companion]).is_err());
+    }
+
+    #[test]
+    fn nvfp4_installed_bound_admits_without_claiming_an_exact_tile() {
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variant = InstalledExpertVariant::from_piecewise_queries(4096,
+            ExpertTrafficContract::ConservativeRouteUpperBound, |_| Ok(1)).unwrap();
+        let report = InstalledExpertGrouping::new(loaded, 0, 128, ExpertGroupingSelector::Fp8Nearest,
+            vec![variant]).unwrap();
+        report.validate_for(&identity(), 0, 128, 13..14).unwrap();
+        assert_eq!(report.group_rows(128).unwrap(), 1);
+        assert_eq!(report.traffic_contract().label(), "conservative_route_upper_bound");
+        assert!(InstalledExpertVariant::from_piecewise_queries(16,
+            ExpertTrafficContract::ConservativeRouteUpperBound, |_| Ok(16)).is_err());
     }
 
     #[test]

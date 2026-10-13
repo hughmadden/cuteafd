@@ -81,8 +81,7 @@ impl<'w, 'a> Execution<'w, 'a> {
         match self {
             Self::Full(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
-            // FP8 reports no claim until it exposes the same installed contract.
-            Self::Fp8(_) => Ok(None),
+            Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
