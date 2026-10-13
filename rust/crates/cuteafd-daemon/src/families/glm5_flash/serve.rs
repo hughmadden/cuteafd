@@ -383,27 +383,17 @@ struct SharedPolicy {
 }
 
 impl SharedPolicy {
-    fn new(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path, drafter: &super::dspark::Drafter<'_>,
+    fn new(engine: &GlmfEngine<'_>, opened: &Opened, drafter: &super::dspark::Drafter<'_>,
         ranks: Option<usize>) -> Result<Self> {
-        let source = opened.experts.as_ref();
-        let homes = super::draft_binding::homes(&engine.cfg.dense[..engine.weights.layers.len()], source, snapshot,
-            ranks)?;
-        let extension = super::draft_binding::COPY_EXTENSION;
-        let geometry = super::draft_binding::geometry(&homes, engine.cfg.experts, engine.cfg.topk, engine.verify_rows,
-            drafter.drafts(), extension)?;
-        let classes: Vec<_> = homes.iter().map(|home| match home {
-            super::draft_binding::LayerHome::Dense => "dense",
-            super::draft_binding::LayerHome::Local { .. } => "local",
-            super::draft_binding::LayerHome::Remote { .. } => "remote",
-        }).collect();
-        let slice = homes.iter().find_map(|home| match home {
-            super::draft_binding::LayerHome::Local { slice_bytes } | super::draft_binding::LayerHome::Remote { slice_bytes } =>
-                Some(*slice_bytes),
-            super::draft_binding::LayerHome::Dense => None,
-        });
-        tracing::info!(layers = homes.len(), dense = classes.iter().filter(|c| **c == "dense").count(),
-            local = classes.iter().filter(|c| **c == "local").count(), remote = classes.iter().filter(|c| **c == "remote").count(),
+        let geometry = engine.draft_geometry(opened.experts.as_ref(), drafter.drafts(),
+            super::draft_binding::COPY_EXTENSION)?;
+        let layers = &geometry.layers;
+        let slice = layers.iter().find(|layer| layer.class.is_some()).map(|layer| layer.slice_bytes);
+        tracing::info!(layers = layers.len(), dense = layers.iter().filter(|l| l.class.is_none()).count(),
+            local = layers.iter().filter(|l| l.class == Some(0)).count(),
+            remote = layers.iter().filter(|l| l.class == Some(1)).count(),
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
+            installed_group_rows = ?layers.iter().map(|l| l.group_rows).collect::<Vec<_>>(),
             "GLM Flash shared draft policy geometry");
         let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
         crate::shared::draft::apply_length_rule(&mut policy);
@@ -930,7 +920,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // cost verify policy; a fixed count and the chain cut keep their own.
     let mut shared = match drafter {
         Some(drafter) if policy.fixed.is_none() && policy.verify == VerifyPolicy::Cost =>
-            Some(SharedPolicy::new(engine, opened, snapshot, drafter, ranks)?),
+            Some(SharedPolicy::new(engine, opened, drafter, ranks)?),
         _ => None,
     };
     let mut active: Vec<Active<'_>> = Vec::new();

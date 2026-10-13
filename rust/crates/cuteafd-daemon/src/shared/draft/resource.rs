@@ -151,12 +151,18 @@ pub(crate) fn geometry_with_grouping(homes: &[LayerHome], experts: usize, topk: 
 /// All installed ranks serving a layer must attest the same execution grouping.
 pub(crate) fn worker_group_rows(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
     layer: usize, rows: usize) -> Result<usize> {
+    worker_group_rows_for_input(reports, layer, rows, false)
+}
+
+/// Match the worker request's input form, including its loaded BF16 sibling.
+pub(crate) fn worker_group_rows_for_input(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
+    layer: usize, rows: usize, bf16: bool) -> Result<usize> {
     let mut groups = reports.iter().filter(|report| report.layers().iter()
         .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-        .map(|report| report.group_rows(rows));
+        .map(|report| report.group_rows_for_input(rows, bf16));
     let group = groups.next().with_context(|| format!("installed worker report missing layer {layer}"))??;
     for other in groups {
-        ensure!(other? == group, "installed workers disagree on layer {layer} grouping");
+        ensure!(other? == group, "installed workers disagree on layer {layer} grouping for bf16={bf16}");
     }
     Ok(group)
 }
@@ -631,6 +637,39 @@ mod tests {
         assert!(worker_group_rows(&mixed, 3, 16).is_err());
         assert!(geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION, |_, _| Ok(0)).is_err());
         assert!(geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION, |_, _| Ok(256)).is_err());
+        DraftPolicy::seeded(geometry, seed()).unwrap();
+    }
+
+    #[test]
+    fn installed_fp8_geometry_matches_live_input_and_rank_groups() {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+            InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
+            "world": 2, "topology": null,
+        })).unwrap();
+        let loaded = WorkerSelection::new(identity, &[3]).unwrap();
+        let report = |rank, bf16_group| {
+            let variant = InstalledExpertVariant::from_piecewise_queries(256,
+                ExpertTrafficContract::ExactGrouping, |rows| Ok(if (1..=80).contains(&rows) { 64 } else { 128 })).unwrap();
+            let bf16 = InstalledExpertVariant::from_piecewise_queries(256,
+                ExpertTrafficContract::ExactGrouping, |_| Ok(bf16_group)).unwrap();
+            InstalledExpertGrouping::new(loaded.clone(), rank, 128,
+                ExpertGroupingSelector::Fp8Nearest, vec![variant]).unwrap().with_bf16_variants(vec![bf16]).unwrap()
+        };
+        let mut reports = vec![report(0, 16), report(1, 16)];
+        let homes = [LayerHome::Dense, LayerHome::Dense, LayerHome::Dense,
+            LayerHome::Remote { slice_bytes: 1e6 }];
+        let geometry = geometry_with_grouping(&homes, 288, 8, 128, 7, 0,
+            |layer, rows| worker_group_rows_for_input(&reports, layer, rows, true)).unwrap();
+        for rows in 0..=128 { assert_eq!(geometry.group_rows(3, rows), 16); }
+        assert_eq!(worker_group_rows(&reports, 3, 80).unwrap(), 64);
+        assert_eq!(worker_group_rows(&reports, 3, 81).unwrap(), 128);
+        assert!(worker_group_rows_for_input(&reports, 2, 16, true).is_err());
+        assert!(worker_group_rows_for_input(&reports, 3, 129, true).is_err());
+        reports[1] = report(1, 32);
+        assert!(worker_group_rows_for_input(&reports, 3, 81, true).is_err());
+        assert_eq!(worker_group_rows(&reports, 3, 81).unwrap(), 128);
         DraftPolicy::seeded(geometry, seed()).unwrap();
     }
 

@@ -2017,6 +2017,53 @@ impl<'a> GlmfEngine<'a> {
         self.tp2.as_ref().is_some_and(|t| t.layers.contains(&layer))
     }
 
+    /// Bind the actual admitted TP1/TP2/Spark homes, not catalog availability.
+    pub(crate) fn draft_geometry(&self, catalog: Option<&cuteafd_loader::OfficialV41Catalog>, width: usize,
+        extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::draft::resource::{self, LayerHome};
+        let remote = match &self.experts {
+            Some(Experts::Spark { transports, .. }) => transports.borrow().first()
+                .context("no installed GLM Flash Spark transport")?.transport.installed_grouping()?,
+            _ => Vec::new(),
+        };
+        let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
+            if weights.dense { return Ok(LayerHome::Dense); }
+            let tp = if self.tp2_layer(layer) { 2 } else {
+                match self.routed_experts(layer) {
+                    Some(Experts::Local(_) | Experts::LocalExl3(_)) => 1,
+                    Some(Experts::Spark { .. }) => remote.len(),
+                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert home"),
+                }
+            };
+            ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
+            let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
+            let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
+                (Some(tensors), _) => resource::fp8_slice_bytes(tensors, tp)?,
+                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
+                _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
+            };
+            Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
+                LayerHome::Remote { slice_bytes }
+            } else { LayerHome::Local { slice_bytes } })
+        }).collect::<Result<Vec<_>>>()?;
+        resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk, self.verify_rows, width,
+            extension, |layer, rows| {
+                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                    let group = tp2.ranks[0].borrow().group_rows(rows)?;
+                    ensure!(tp2.ranks[1].borrow().group_rows(rows)? == group,
+                        "GLM Flash installed TP2 ranks disagree on layer {layer} grouping");
+                    return Ok(group);
+                }
+                match self.routed_experts(layer) {
+                    Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
+                    Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
+                        .context("GLM Flash installed EXL3 window missing")?.1.group_rows(rows),
+                    Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
+                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert grouping"),
+                }
+            })
+    }
+
     fn record_exchange(&self, rank: usize, name: &'static str, slot: usize, push: bool) {
         let Some(tp2) = &self.tp2 else { return };
         let mut recorded = tp2.schedule.borrow_mut();
