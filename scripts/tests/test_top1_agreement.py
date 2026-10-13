@@ -113,8 +113,9 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
         assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text
     flash = (source / 'glm5_flash/serve.rs').read_text()
     assert '.draft_device(' in flash and '.draft_device_diagnostic(' not in flash
-    # GLM 5.3 switches only after qualifying its own hidden-6144 real inputs.
-    assert '.draft_device_diagnostic(' in (source / 'glm5/serve.rs').read_text()
+    glm = (source / 'glm5/serve.rs').read_text()
+    assert '.draft_device(' in glm and '.draft_device_diagnostic(' not in glm
+    assert 'draft_head = "tensor", "DFlash2 drafter resident"' in (source / 'glm5/mod.rs').read_text()
     assert 'GLM5_FLASH_DRAFT_HEAD' not in (ROOT / 'scripts/launch/run-family.sh').read_text()
 
 

@@ -397,7 +397,8 @@ impl Opened {
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
                 mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16)?;
             engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                draft_head = "tensor", "DFlash2 drafter resident");
         }
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
             let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;

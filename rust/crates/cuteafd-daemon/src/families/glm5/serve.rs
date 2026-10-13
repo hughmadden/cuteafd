@@ -765,8 +765,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     .take(drafter.max_batch_sequences())
                     .collect();
                 drafted_requests = seqs.len();
-                // GLM 5.3's own 6144-wide head qualification is still pending.
-                let drafts = round_clock.draft(|| drafter.draft_device_diagnostic(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
+                let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     super::dflash::TargetHead::Bf16(&engine.weights.head)));
                 drafted_width = drafter.cfg.drafts();
 
