@@ -191,6 +191,7 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
     fn group_rows(&self, rows: usize) -> Result<usize> { Ok(self.weight_read_group(rows)?.0) }
+    fn weight_read_bytes(&self) -> Result<usize> { Ok(Fp8MoeTp2::weight_read_bytes(self)) }
 
     unsafe fn prime(&mut self, input: ExpertInput, routes: Routes, stream: *mut c_void) -> Result<()> {
         // SAFETY: the trait's startup buffer/stream contract is the inherent method's.

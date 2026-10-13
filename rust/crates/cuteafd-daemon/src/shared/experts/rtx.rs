@@ -81,6 +81,10 @@ pub(crate) trait RtxExpertLayer {
     fn group_rows(&self, _rows: usize) -> Result<usize> {
         anyhow::bail!("expert backend does not publish installed grouping metadata")
     }
+    /// One expert's installed FP8-family weight and scale read extent, excluding scratch.
+    fn weight_read_bytes(&self) -> Result<usize> {
+        anyhow::bail!("expert backend does not publish installed read-byte metadata")
+    }
     /// This rank's routed partial `[rows, hidden]` of [`Self::partial`],
     /// valid after the last [`Self::enqueue`] completes on its stream and
     /// until the next one.

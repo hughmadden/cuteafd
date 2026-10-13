@@ -27,7 +27,7 @@ use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixC
 use super::{open, Opened};
 use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::chat::glm5::{GlmEncoding, GlmThinkingOff};
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
@@ -434,12 +434,25 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     use crate::shared::draft::{resource, runtime::SharedPolicy};
     let mut shared = drafter.map(|d| {
-        let homes = resource::homes_with_local_tp2(
-            &engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
-            None, &opened.snapshot, Some(ranks), engine.tp2_layers())?;
-        let remote = if homes.iter().any(|home| matches!(home, resource::LayerHome::Remote { .. })) {
+        let tp2 = engine.tp2_layers();
+        let remote = if engine.weights.layers.iter().enumerate().any(|(layer, weights)|
+            !weights.dense && !tp2.as_ref().is_some_and(|layers| layers.contains(&layer))) {
             transport.as_ref().context("GLM installed Spark transport missing")?.transport.installed_grouping()?
         } else { Vec::new() };
+        let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
+        let homes = engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
+            if weights.dense { return Ok(resource::LayerHome::Dense); }
+            let local = tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
+            let tp = if local { 2 } else { remote.len() };
+            ensure!(tp > 0, "GLM layer {layer} has no installed expert ranks");
+            let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
+                (Some(_), _) => engine.draft_weight_read_bytes(layer, &remote)? as f64,
+                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
+                _ => anyhow::bail!("GLM routed expert format cannot be priced"),
+            };
+            Ok(if local { resource::LayerHome::Local { slice_bytes } }
+                else { resource::LayerHome::Remote { slice_bytes } })
+        }).collect::<Result<Vec<_>>>()?;
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;

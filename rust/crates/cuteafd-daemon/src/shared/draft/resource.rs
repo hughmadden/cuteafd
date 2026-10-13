@@ -109,8 +109,8 @@ pub(crate) enum LayerHome {
 /// GLM Flash's policy geometry from each layer's home, the router's expert
 /// count and top-k, the step's row budget, the drafter's block and the copy
 /// positions that may extend it.
-// Synthetic grouping for legacy constructor replay and CPU fixtures only.
-// Production callers migrate to geometry_with_grouping before this is cfg(test).
+// Synthetic grouping is confined to legacy constructor replay and CPU fixtures.
+#[cfg(test)]
 pub(crate) fn geometry(homes: &[LayerHome], experts: usize, topk: usize, rows: usize, drafts: usize,
     extension: usize) -> Result<PolicyGeometry> {
     let mut geometry = geometry_with_grouping(homes, experts, topk, rows, drafts, extension, |_, _| Ok(16))?;
@@ -167,15 +167,13 @@ pub(crate) fn worker_group_rows_for_input(reports: &[cuteafd_transport::worker_s
     Ok(group)
 }
 
-/// Per-device bytes of one expert of an FP8/NVFP4 checkpoint at `tp` ranks:
-/// the busiest rank's layer slice over the experts (`Fp8Layer::bytes_for`).
-pub(crate) fn fp8_slice_bytes(tensors: &cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors, tp: usize)
-    -> Result<f64> {
-    use cuteafd_loader::formats::fp8_experts::Slicing;
-    let experts = tensors.shape().experts.max(1) as f64;
-    let widest = (0..tp).map(|rank| crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, tp, rank, Slicing::Padded))
-        .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    Ok(widest as f64 / experts)
+/// Price the busiest actual installed worker slice, which may differ by rank.
+pub(crate) fn worker_weight_read_bytes(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
+    layer: usize) -> Result<usize> {
+    let bytes = reports.iter().filter(|report| report.layers().iter()
+        .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
+        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
+    bytes.into_iter().max().with_context(|| format!("installed worker read-byte report missing layer {layer}"))
 }
 
 /// Per-device bytes of one expert of `layer` from an EXL3 manifest at `tp`
@@ -205,38 +203,6 @@ fn exl3_bytes(hidden: usize, intermediate: usize, experts: usize, tp: usize,
         }
     }
     Ok(total as f64 / experts.max(1) as f64)
-}
-
-/// Layer homes of a deployment: `local` experts on this GPU (FP8 or EXL3
-/// catalog), else `spark_ranks` Spark ranks serving `snapshot`'s experts.
-pub(crate) fn homes(dense: &[bool], catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
-    snapshot: &std::path::Path, spark_ranks: Option<usize>) -> Result<Vec<LayerHome>> {
-    homes_with_local_tp2(dense, catalog, snapshot, spark_ranks, None)
-}
-
-/// Price a mixed routed deployment at each home's actual tensor-parallel width.
-pub(crate) fn homes_with_local_tp2(dense: &[bool], catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
-    snapshot: &std::path::Path, spark_ranks: Option<usize>, local_tp2: Option<std::ops::Range<usize>>)
-    -> Result<Vec<LayerHome>> {
-    let owned;
-    let catalog_local = catalog.is_some();
-    let catalog = match catalog {
-        Some(catalog) => catalog,
-        None => { owned = cuteafd_loader::read_expert_catalog(snapshot)?; &owned }
-    };
-    dense.iter().enumerate().map(|(layer, &dense)| {
-        if dense { return Ok(LayerHome::Dense); }
-        let tp2 = local_tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
-        let local = tp2 || catalog_local || spark_ranks.is_none();
-        let tp = if tp2 { 2 } else if local { 1 } else { spark_ranks.unwrap() };
-        ensure!(tp > 0, "routed layer {layer} has no expert home");
-        let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
-            (Some(tensors), _) => fp8_slice_bytes(tensors, tp)?,
-            (None, Some(manifest)) => exl3_slice_bytes(manifest, layer, tp)?,
-            (None, None) => anyhow::bail!("routed experts are neither FP8/NVFP4 nor EXL3"),
-        };
-        Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
-    }).collect()
 }
 
 /// One sequence's draft this round, as the binding prices it.
@@ -671,6 +637,34 @@ mod tests {
         assert!(worker_group_rows_for_input(&reports, 3, 81, true).is_err());
         assert_eq!(worker_group_rows(&reports, 3, 81).unwrap(), 128);
         DraftPolicy::seeded(geometry, seed()).unwrap();
+    }
+
+    #[test]
+    fn worker_read_bytes_use_only_installed_layer_ranks_and_require_every_descriptor() {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+            InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
+            "world": 6, "topology": null,
+        })).unwrap();
+        let report = |rank, layers: &[usize], bytes| {
+            let loaded = WorkerSelection::new(identity.clone(), layers).unwrap();
+            let variant = InstalledExpertVariant::from_piecewise_queries(80,
+                ExpertTrafficContract::ExactGrouping, |_| Ok(48)).unwrap();
+            InstalledExpertGrouping::new(loaded, rank, 80, ExpertGroupingSelector::Fp8Nearest,
+                vec![variant]).unwrap().with_weight_read_bytes(bytes).unwrap()
+        };
+        let mut reports = vec![report(0, &[3], 9_216_024), report(5, &[3], 6_144_024),
+            report(1, &[4], 12_288_024)];
+        assert_eq!(worker_weight_read_bytes(&reports, 3).unwrap(), 9_216_024);
+        assert_eq!(worker_weight_read_bytes(&reports, 4).unwrap(), 12_288_024);
+        assert!(worker_weight_read_bytes(&reports, 2).is_err());
+        let loaded = WorkerSelection::new(identity, &[3]).unwrap();
+        let variant = InstalledExpertVariant::from_piecewise_queries(80,
+            ExpertTrafficContract::ExactGrouping, |_| Ok(48)).unwrap();
+        reports[1] = InstalledExpertGrouping::new(loaded, 5, 80, ExpertGroupingSelector::Fp8Nearest,
+            vec![variant]).unwrap();
+        assert!(worker_weight_read_bytes(&reports, 3).is_err());
     }
 
     #[test]
