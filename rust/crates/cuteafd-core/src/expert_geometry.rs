@@ -125,7 +125,8 @@ impl Exl3RowPolicy {
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
-        let required = max_live_rows.max(self.required_capacity(max_live_rows));
+        // Keep a canonical-reduction decode export available even at narrow admission.
+        let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
         let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
         Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
     }
@@ -162,7 +163,7 @@ mod tests {
         for rows in 2..=16 {
             assert_eq!(policy.required_capacity(rows), 80);
             assert_eq!(policy.capacities(rows).unwrap(), [1, 16, 80]);
-            assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16]);
+            assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
         assert_eq!(policy.capacities(4096).unwrap(), [1, 16, 80, 256, 1024, 4096]);
     }

@@ -471,9 +471,11 @@ pub fn image_lib(manifest: Option<&std::path::Path>) -> std::path::PathBuf {
 
 /// The EXL3 capacities a local executor compiles for at most `rows` live rows:
 /// every exported capacity up to the first at or above `rows`, each once.
+/// Multi-row decode also admits m80 for canonical m1 reduction geometry.
 pub fn exl3_capacities(rows: u64) -> Vec<u64> {
     const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
-    let top = CAPACITIES.into_iter().find(|&c| c >= rows.max(1)).unwrap_or(4096);
+    let required = if rows > 1 { rows.max(80) } else { 1 };
+    let top = CAPACITIES.into_iter().find(|&c| c >= required).unwrap_or(4096);
     CAPACITIES.into_iter().filter(|&c| c <= top).collect()
 }
 
@@ -555,6 +557,8 @@ mod tests {
         assert_eq!(exl3_capacities(4096), [1, 16, 80, 256, 1024, 4096]);
         assert_eq!(exl3_capacities(64), [1, 16, 80]);
         assert_eq!(exl3_capacities(1), [1]);
+        assert_eq!(exl3_capacities(2), [1, 16, 80]);
+        assert_eq!(exl3_capacities(16), [1, 16, 80]);
     }
 
     #[test]

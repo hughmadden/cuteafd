@@ -186,7 +186,8 @@ mod tests {
                     .join(format!("rtx-tp2-rank{rank}/m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false},
                         "state": {"allocation": "state", "bytes": 16, "zero_on_create": true}}});
