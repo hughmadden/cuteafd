@@ -1941,7 +1941,7 @@ impl Opened {
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
         // Drained and destroyed on every way out, before the transports drop.
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(&self.library)?;
+        let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
         for (index, transport) in transports[..warmed].iter_mut().enumerate() {
             runtime.block_on(async {
                 let wave = transport.dispatch(&warm)?;

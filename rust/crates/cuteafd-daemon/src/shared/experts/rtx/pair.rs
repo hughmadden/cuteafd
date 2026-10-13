@@ -524,7 +524,8 @@ impl SubmissionOwners for TestSubmission<'_> {
     fn drain_ranks(&mut self) -> Result<()> {
         self.phase("ranks", Some("abort"))?;
         if let Some(schedule) = self.schedule {
-            crate::shared::peer_split::order::check_terminal(schedule, self.events.contains(&"abort"))?;
+            crate::shared::peer_split::order::check_terminal(schedule, self.events.contains(&"abort"))
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(())
     }
@@ -601,12 +602,13 @@ mod tests {
             (include_str!("../../../families/glm5_flash/engine.rs"), "step_lanes", "replay_on"),
             (include_str!("../../../families/glm5/engine.rs"), "step", "replay_on"),
             (include_str!("../../../families/glm5/engine.rs"), "step_lanes", "replay_on"),
+            (include_str!("../../../families/qwen4/engine.rs"), "step", "replay"),
         ] {
             let start = source.find(&format!("    fn {step}(")).unwrap();
             let end = source[start..].find(&format!("    fn {step}_inner(")).unwrap() + start;
             assert!(source[start..end].contains("crate::shared::experts::rtx::pair::submit("));
             let start = source.find(&format!("    fn {graph}(")).unwrap();
-            let body = &source[start..source[start..].find("let graphs").unwrap() + start];
+            let body = &source[start..source[start..].find(if graph == "replay" { "if let Some(graph)" } else { "let graphs" }).unwrap() + start];
             assert!(body.contains("self.require_live()?;"), "{graph} bypasses liveness");
         }
         let mimo = include_str!("../../../families/mimo_v2/engine.rs");

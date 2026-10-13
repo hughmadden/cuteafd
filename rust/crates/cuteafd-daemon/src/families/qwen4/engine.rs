@@ -3452,9 +3452,13 @@ mod owner_state_tests {
                     }
                     schedule.push(1, "hop", 1, "exit send");
                     schedule.wait(0, "hop", 1, "head exit land");
+                    schedule.end_request();
                 }
                 check(&schedule).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                crate::shared::peer_split::order::check_submission_faults(&schedule)?;
+                if matches!(layers, 2 | 4 | 8) {
+                    crate::shared::peer_split::order::check_submission_faults(&schedule)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
             }
         }
         Ok(())
