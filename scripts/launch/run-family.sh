@@ -1395,8 +1395,9 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 #                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
-#                     PROFILE_NSYS_GPU_METRICS=0 (or 0,1) also samples those GPUs'
-#                     clocks, power and DRAM/SM activity into the same report.
+#                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
+#                     power and DRAM/SM activity into the same report (an index
+#                     list uses nsys's device order, not CUDA's).
 #   ncu               the coordinator runs under `ncu`, replaying the first
 #                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
 #                     required regex PROFILE_NCU_KERNEL, collecting section set

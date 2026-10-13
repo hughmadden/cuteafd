@@ -67,6 +67,8 @@ def test_nsys_gpu_metrics_samples_the_named_devices():
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
     assert out.returncode == 0, out.stderr
     assert '--gpu-metrics-devices=0,1' in wrapper
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', 'all')
+    assert '--gpu-metrics-devices=all' in wrapper
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
     assert not [flag for flag in wrapper if flag.startswith('--gpu-metrics')]
 
