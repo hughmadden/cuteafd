@@ -162,7 +162,11 @@ impl<'a> Engine<'a> {
         let result = teardown(&mut Teardown {
             abort: || {
                 let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
-                home.run(|| self.publish_tp2_abort())
+                home.run(|| self.publish_tp2_abort())?;
+                // The proxy cannot abort its completion waits yet. Refuse before
+                // rank drainage rather than blocking on an unprovable consumer.
+                ensure!(self.device_link.is_none(), "device Spark proxy requires terminal owner retention");
+                Ok(())
             },
             ranks: || {
                 let mut failures = Vec::new();
@@ -175,9 +179,6 @@ impl<'a> Engine<'a> {
                 ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
             },
             links: || {
-                // The proxy has no terminal QP/owner contract yet. Never pretend
-                // a copy-stream synchronization makes failed proxy work safe.
-                ensure!(self.device_link.is_none(), "device Spark proxy requires terminal owner retention");
                 let mut failures = Vec::new();
                 for link in transports.borrow_mut().iter_mut() {
                     if let Err(error) = link.terminal_quiesce() { failures.push(format!("{error:#}")); }

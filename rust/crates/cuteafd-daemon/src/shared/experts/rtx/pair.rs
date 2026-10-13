@@ -584,6 +584,18 @@ mod tests {
     }
 
     #[test]
+    fn v4_unabortable_device_proxy_is_refused_before_rank_drainage() {
+        let source = include_str!("../../../families/deepseek_v4/engine/tp2.rs");
+        let start = source.find("pub(crate) fn shutdown_submission(").unwrap();
+        let source = &source[start..];
+        let abort = source.find("abort: ||").unwrap();
+        let publication = source.find("home.run(|| self.publish_tp2_abort())?;").unwrap();
+        let refusal = source.find("ensure!(self.device_link.is_none()").unwrap();
+        let ranks = source.find("ranks: ||").unwrap();
+        assert!(abort < publication && publication < refusal && refusal < ranks);
+    }
+
+    #[test]
     fn submission_preserves_primary_cause_and_reports_retained_owners() {
         let error = submit(
             || Ok(()), || anyhow::bail!("copy drain failed; owners quarantined"),
