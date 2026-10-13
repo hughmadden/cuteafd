@@ -172,8 +172,8 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                     'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
                     'family="$1"; attention_placement="$2"; ' + block,
                     'test', family, mode], cwd=ROOT, text=True, capture_output=True)
-                # GLM 5.3 runs context (K3); every other non-heads mode is refused.
-                runs = mode in ['auto', 'heads'] or (family, mode) == ('glm5', 'context')
+                # GLM 5.3 (K3) and GLM 5.3 Flash (#57) run context; every other non-heads mode is refused.
+                runs = mode in ['auto', 'heads'] or (family, mode) in [('glm5', 'context'), ('glm5_flash', 'context')]
                 self.assertEqual(result.returncode == 0, runs, result.stderr)
                 if mode in ['context', 'layers'] and not runs:
                     self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)

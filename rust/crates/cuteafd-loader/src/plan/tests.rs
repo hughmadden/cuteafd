@@ -2861,8 +2861,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
-            // This fixture has no context programs; GLM's build-specific default is heads.
-            let default = if gpus == 1 || auto.family.as_deref() == Some("glm5") {
+            // This fixture has no context programs; GLM's and GLM Flash's build-specific default is heads.
+            let default = if gpus == 1 || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
@@ -2878,6 +2878,12 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             assert_eq!(auto.placement_supported, explicit_default.placement_supported);
             for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
                 let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
+                // GLM Flash's explicit context needs the build's programs, which this fixture lacks:
+                // the placement refuses it (the executor runs it where built).
+                if auto.family.as_deref() == Some("glm5_flash") && mode == AttentionPlacement::Context && gpus == 2 {
+                    assert!(unsupported.config_error.is_none() && !unsupported.placement_supported, "{}", render(&unsupported));
+                    continue;
+                }
                 if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
                     assert!(unsupported.config_error.is_none());
                 } else {

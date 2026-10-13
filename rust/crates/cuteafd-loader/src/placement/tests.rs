@@ -404,8 +404,10 @@ fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
 #[test]
 fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
-        // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3), heads on one.
-        let recorded = if executor.family == "glm5" { AttentionPlacement::Context } else { AttentionPlacement::Heads };
+        // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
+        // #57), heads on one.
+        let recorded = if ["glm5", "glm5_flash"].contains(&executor.family) { AttentionPlacement::Context }
+            else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
         assert_eq!(executor.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
