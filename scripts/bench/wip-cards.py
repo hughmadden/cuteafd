@@ -1092,13 +1092,17 @@ NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 
 def build_scopes(cards):
-    scopes, roles, counts, env = set(), set(), set(), {}
+    # Derived per card: a card with no Sparks (local experts) contributes only
+    # coordinator scopes, and a Spark card's TP count is keyed to its own family
+    # (FAMILY=COUNT, read by native/cmake/shared/{exl3,fp8_moe}.cmake), so one
+    # card's geometry is never exported at another card's TP.
+    scopes, spark_scopes, roles, counts, env = set(), set(), set(), set(), {}
     for card in cards:
         family = card.get('family')
         values = {**config(card['config']), **card.get('set', {})}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-        if count and family in ('glm5', 'glm5_flash', 'mimo_v2', 'qwen4'):
-            counts.add(str(int(values.get('SPARK_TP', count))))
+        scopes_before = set(scopes)
+        scopes = set()
         if family == 'deepseek_v41' and count in (2, 3, 6):
             roles.add('tp' + str(count))
         if family == 'deepseek_v4':
@@ -1112,6 +1116,8 @@ def build_scopes(cards):
         for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
+                if count:
+                    counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
                 # (fp8_moe.cmake), as the release image ships them.
@@ -1130,9 +1136,11 @@ def build_scopes(cards):
                     # Two RTX cards run the head-split programs (mimof2/mimop2).
                     wanted = {tag, tag + '2'} if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2 else {tag}
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
-    spark_scopes = {scope for scope in scopes if not scope.startswith('glmfdense:')}
+        card_scopes, scopes = scopes, scopes_before | scopes
+        if count:
+            spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
     env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
-               CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts, key=int)))
+               CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)))
     env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
     return env
 
