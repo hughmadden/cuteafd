@@ -775,7 +775,9 @@ def attention_check(lib, args):
             workspace_fn = getattr(lib, prefix + "_attention_workspace")
             arena = (workspace_fn(16, heads, kvh, block, max_keys) if family == "mimo"
                      else workspace_fn(16, kvh, max_keys))
-            assert arena == 16 * kvh * slices * partitions * 32 * (dim + 2) * 4
+            scalar_chunks = (min(max_keys, 1024 + 16) + 127) // 128
+            arena_rows = max(slices * partitions * 32, scalar_chunks * 16)
+            assert arena == 16 * kvh * arena_rows * (dim + 2) * 4
             # Smaller launches reuse the capacity arena; guard its exact admitted boundary.
             scratch = torch.full((arena + 256,), 173, device="cuda", dtype=torch.uint8)
 
@@ -828,7 +830,10 @@ def attention_check(lib, args):
                 old_workspace = torch.empty(old_bytes, device="cuda", dtype=torch.uint8)
                 old_out = torch.empty_like(q)
                 old_median = timed(lambda: checked_launch(baseline, old_out, old_workspace), 5)
-            print(f"attention {family} dim={dim} heads={heads}/{kvh} sequences={sequences} "
+                if family == "glmf" and heads // kvh * block <= 16 and context <= 1024:
+                    assert torch.equal(out, old_out), (family, sequences, context, "scalar arithmetic changed")
+            route = "scalar" if heads // kvh * block <= 16 and context <= 1024 else "wmma"
+            print(f"attention {family} route={route} dim={dim} heads={heads}/{kvh} sequences={sequences} "
                   f"context={context} window={window} causal={causal} sink={sink} "
                   f"max_abs={maximum:.3e} rel_rms={relative_rms:.3e} "
                   f"median_ms={median:.6f} baseline_ms={old_median} arena_bytes={arena}")

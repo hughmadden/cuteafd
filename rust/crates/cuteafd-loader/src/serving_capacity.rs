@@ -184,9 +184,9 @@ pub enum CacheGeometryError {
     },
 }
 
-/// Shared WMMA draft-attention arena. Capacity partitions are sized for one
-/// sequence; launches can reduce them as the batch grows, so this arena also
-/// covers every smaller launch made through a maximum-capacity workspace.
+/// Shared scalar/WMMA draft-attention arena. WMMA capacity partitions are
+/// sized for one sequence; the scalar floor admits 128-key chunks for up to
+/// 16 queries and 1024 resident keys, including the new block.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u64,
     max_keys: u64, head_dim: u64, sms: u64) -> Result<u64, CacheGeometryError> {
@@ -199,7 +199,10 @@ pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u6
     let overflow = || CacheGeometryError::Overflow("draft attention workspace");
     let base = kv_heads.checked_mul(slices).ok_or_else(overflow)?;
     let partitions = max_keys.div_ceil(32).min(sms.checked_mul(2).ok_or_else(overflow)?.div_ceil(base));
-    [kv_heads, slices, partitions, 32, head_dim + 2, 4].into_iter()
+    let wmma_rows = slices.checked_mul(partitions).and_then(|n| n.checked_mul(32))
+        .ok_or_else(overflow)?;
+    let scalar_rows = max_keys.min(1024 + 16).div_ceil(128) * 16;
+    [kv_heads, wmma_rows.max(scalar_rows), head_dim + 2, 4].into_iter()
         .try_fold(sequences, |bytes, n| bytes.checked_mul(n).ok_or_else(overflow))
 }
 
@@ -211,7 +214,7 @@ mod draft_attention_tests {
     fn capacity_covers_every_sm_sized_smaller_launch() {
         for sms in [170u64, 188, 48] {
             for (heads, slices, dim) in [(8u64, 2u64, 128u64), (8, 4, 128), (64, 1, 64)] {
-                for keys in [8u64, 31, 32, 33, 1024, 2056] {
+                for keys in [8u64, 31, 32, 33, 1024, 1032, 1040, 1041, 2056] {
                     let arena = draft_attention_workspace_bytes(16, heads, slices, keys, dim, sms).unwrap();
                     for sequences in 1u64..=16 {
                         let tiles = keys.div_ceil(32);
@@ -220,19 +223,21 @@ mod draft_attention_tests {
                         let partitions = tiles.div_ceil(tiles.div_ceil(wanted));
                         let used = sequences * heads * slices * partitions * 32 * (dim + 2) * 4;
                         assert!(used <= arena);
-                        // m16 uses compact partials and can keep at least one split per four key tiles.
-                        let compact_capacity = tiles.min(capacity * slices * 2);
-                        let compact_wanted = compact_capacity.min(
-                            (2 * sms).div_ceil(sequences * heads).max(tiles.div_ceil(4)));
-                        let compact_partitions = tiles.div_ceil(tiles.div_ceil(compact_wanted));
-                        let compact_used = sequences * heads * compact_partitions * 16 * (dim + 2) * 4;
-                        assert!(compact_used <= arena);
+                        // A capacity-sized arena also covers every skinny scalar launch.
+                        for launch_keys in [1u64, 32, 128, 129, 1032, 1040] {
+                            if launch_keys > keys { continue; }
+                            let scalar_used = sequences * heads * launch_keys.div_ceil(128)
+                                * 16 * (dim + 2) * 4;
+                            assert!(scalar_used <= arena);
+                        }
                     }
                 }
             }
         }
         assert_eq!(draft_attention_workspace_bytes(8, 8, 2, 2056, 128, 188).unwrap(),
             8 * 8 * 2 * 24 * 32 * 130 * 4);
+        assert_eq!(draft_attention_workspace_bytes(8, 64, 1, 1032, 64, 48).unwrap(),
+            8 * 64 * 9 * 16 * 66 * 4);
     }
 
     #[test]

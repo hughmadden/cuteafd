@@ -5,8 +5,8 @@
 namespace cuteafd::draft_attention {
 constexpr int queries_per_slice = 32;
 
-// The capacity arena covers every smaller launch: partitions are sized for
-// one sequence, while launches reduce splitting as the batch grows.
+// One arena covers scalar 128-key chunks and SM-sized WMMA partitions;
+// smaller launches reuse it without allocating or changing pointer lifetimes.
 uint64_t workspace(int sequences, int kv_heads, int slices, int max_keys, int head_dim);
 int launch(const void* q, const void* k_block, const void* v_block,
            const void* k_ring, const void* v_ring, const void* seq_slots,

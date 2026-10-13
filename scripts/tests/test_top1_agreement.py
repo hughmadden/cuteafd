@@ -127,6 +127,15 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
         assert 'cuteafd::draft_attention::launch(' in text
         assert 'attention_partial_kernel' not in text and 'attention_merge_kernel' not in text
     assert 'shared/cuda/draft_attention.cu' in (native / 'CMakeLists.txt').read_text()
+    shared = (native / 'shared/cuda/draft_attention.cu').read_text()
+    assert 'constexpr int scalar_queries = 16;' in shared
+    assert 'constexpr int scalar_context = 1024;' in shared
+    assert 'queries <= scalar_queries && max_keys - block_rows <= scalar_context' in shared
+    assert 'scalar_partial_kernel<dim>' in shared and 'dispatch_wmma<dim>' in shared
+    assert 'query_rows == 16' not in shared and 'bool direct' not in shared
+    # Real MiMo/GLM Flash checkpoint geometry never enters the skinny route.
+    for heads, kv_heads, block in [(64, 8, 8), (32, 8, 8)]:
+        assert heads // kv_heads * block > 16
     path = native / 'tests/glm_draft_kernels_selftest.py'
     tree = ast.parse(path.read_text())
     attention = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
