@@ -340,6 +340,19 @@ dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
 [[ -z "$dspark_draft_limit" || "$DSPARK" == on ]] ||
   release_die "DSPARK_DRAFT_LIMIT requires dSpark"
 release_validate_verbs_device_map
+# V41_FP8_HEAD: which vocabulary heads run from one resident E4M3 copy: all
+# (target and dSpark draft), draft (the draft only; the target keeps its BF16
+# head) or off. Unset passes nothing: the engine default is all. Planner and
+# server read the same CUTEAFD_V41_FP8_HEAD, so both get it.
+v41_fp8_head_args=()
+case "${V41_FP8_HEAD:-}" in
+  "") ;;
+  off|draft|all)
+    [[ -z "${CUTEAFD_V41_FP8_HEAD:-}" || "$CUTEAFD_V41_FP8_HEAD" == "$V41_FP8_HEAD" ]] ||
+      release_die "V41_FP8_HEAD=$V41_FP8_HEAD conflicts with CUTEAFD_V41_FP8_HEAD=$CUTEAFD_V41_FP8_HEAD in the environment; set one"
+    v41_fp8_head_args=(-e "CUTEAFD_V41_FP8_HEAD=$V41_FP8_HEAD") ;;
+  *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
+esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] || release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
 [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
@@ -510,7 +523,7 @@ fi
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-count_mounts=(-e HF_HOME=/hf -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
+count_mounts=(-e HF_HOME=/hf ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -793,8 +806,11 @@ rdma_env_args=()
 # Optional V4.1 coordinator switches from the operator's environment, forwarded only when set.
 # (CONSOLE_TEXT and THERMAL are configuration keys, as for every family.)
 for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_TP2_TOKEN_SUMS CUTEAFD_V41_DEVICE CUTEAFD_V41_DEVICE_LANES CUTEAFD_SPARK_WRITE CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_STAGING_FENCE; do
+  # The V41_FP8_HEAD key (validated above) takes the place of its environment spelling.
+  [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
+rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"})
 # RDMA_BOND_BALANCE (off, labels or probe): the coordinator's RoCE flow labels on a
 # bonded port; see the generic launch below.
 case "${RDMA_BOND_BALANCE:-off}" in

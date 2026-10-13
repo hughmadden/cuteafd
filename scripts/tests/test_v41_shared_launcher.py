@@ -76,7 +76,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         role = "coordinator" if old["host"] == "raptor" else "worker"
         where = f"{case} {old['host']}"
         assert after["options"] == before["options"], where
-        assert after["mounts"] == before["mounts"], where
+        # shared_thermal_args also mounts the host power governor's state read-only
+        # when gpu-powerd runs on this host (#114).
+        governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []
+        assert after["mounts"] == sorted(before["mounts"] + governor), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}
         assert added == INTENDED[role], where
@@ -144,3 +147,55 @@ def test_serving_containers_run_as_the_host_user_with_the_hub_at_hf() -> None:
             assert run["env"]["HF_HOME"] == "/hf", case
             assert any(mount.endswith(":/hf/hub:ro") for mount in run["mounts"]), case
             assert not any("/root/" in mount for mount in run["mounts"]), case
+
+
+@pytest.mark.parametrize("value", [None, "off", "draft", "all"])
+def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value) -> None:
+    """V41_FP8_HEAD=off|draft|all forwards CUTEAFD_V41_FP8_HEAD to the coordinator and
+    the planner (both read it); unset forwards nothing (the engine default, all)."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"V41_FP8_HEAD={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])["env"]
+    plan = result["plans"][0]
+    if value is None:
+        assert "CUTEAFD_V41_FP8_HEAD" not in coordinator
+        assert not any("CUTEAFD_V41_FP8_HEAD" in arg for arg in plan)
+    else:
+        assert coordinator["CUTEAFD_V41_FP8_HEAD"] == value
+        assert f"CUTEAFD_V41_FP8_HEAD={value}" in plan
+        assert result["containers"][0]["argv"].count(f"CUTEAFD_V41_FP8_HEAD={value}") == 1
+    for worker in result["containers"][1:]:
+        assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
+
+
+def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeypatch) -> None:
+    import subprocess
+    from v41_launch_capture import example_config
+    config = example_config("deepseek-v41-mxfp4-max", tmp_root)
+    config.write_text(config.read_text() + "V41_FP8_HEAD=bf16\n")
+    env = {**os.environ, "HOME": str(tmp_root), "PATH": "/usr/bin:/bin"}
+    hf = tmp_root / "hf" / "hub" / "models--deepseek-ai--DeepSeek-V4.1-Flash" / "snapshots" / "dba1be0a40aa45a94ad051997016db3960a90277"
+    hf.mkdir(parents=True, exist_ok=True)
+    (hf / "config.json").write_text('{"model_type": "deepseek_v41"}')
+    env["HF_HOME"] = str(tmp_root / "hf")
+    result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--dry-run"],
+                            capture_output=True, text=True, env=env)
+    assert result.returncode == 2 and "V41_FP8_HEAD must be off, draft or all" in result.stderr
+    result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--set", "V41_FP8_HEAD=off",
+                             "--dry-run"], capture_output=True, text=True,
+                            env={**env, "CUTEAFD_V41_FP8_HEAD": "draft"})
+    assert result.returncode == 2 and "conflicts with CUTEAFD_V41_FP8_HEAD=draft" in result.stderr
+    # The key belongs to the shared key grammar.
+    known = subprocess.run(["bash", "-c", "source scripts/lib/release-common.sh; release_known_key V41_FP8_HEAD"],
+                           cwd=ROOT)
+    assert known.returncode == 0
