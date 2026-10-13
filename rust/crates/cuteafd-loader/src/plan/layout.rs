@@ -1441,14 +1441,23 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
         Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
+    let exchange_f32 = glm::local_exchange_f32()?;
+    let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let local = glm::select_local_inventory(&catalog, manifest_path, cfg.layers, devices.len(),
+        rows, lanes, exchange_f32, onboard, false)?;
+    let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
+    let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
-        experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: options.pool_tokens,
+        experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
+        tp2_workspace, requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits,
         context: manifest.and_then(glm::manifest_context) };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
-    Ok(glm::solve_working_set(&inputs, [0; 2], report.requested_attention)?)
+    Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }
 
 struct V4PlanShape {

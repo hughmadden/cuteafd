@@ -90,7 +90,7 @@ fn exl3_route_dump_records_match_the_benchmark_format() -> Result<()> {
 #[test]
 fn exl3_worker_capacity_bounds() -> Result<()> {
     assert_eq!(Exl3Worker::capacities(1)?, vec![1]);
-    assert_eq!(Exl3Worker::capacities(16)?, vec![1, 16]);
+    assert_eq!(Exl3Worker::capacities(16)?, vec![1, 16, 80]);
     assert_eq!(Exl3Worker::capacities(40)?, vec![1, 16, 80]);
     assert_eq!(
         Exl3Worker::capacities(4096)?,
@@ -294,7 +294,7 @@ fn paired_worker_loading_rejects_wrong_rank_and_mixed_capacities() -> Result<()>
         }
         write(80, &original)?;
         assert!(Exl3Worker::partition(root.path(), 80, ranks[0], Exl3Schedule::Default).is_err());
-        assert_eq!(Exl3Worker::partition(root.path(), 16, ranks[0], Exl3Schedule::Default)?, V41Exl3Partition::PairedTp4);
+        assert!(Exl3Worker::partition(root.path(), 16, ranks[0], Exl3Schedule::Default).is_err());
     }
     assert!(Exl3Worker::partition(root.path(), 80, 4, Exl3Schedule::Default).is_err());
     Ok(())

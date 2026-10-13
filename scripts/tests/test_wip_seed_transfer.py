@@ -179,7 +179,8 @@ stream_between_hosts kakapo 'tar -cf - .' ostrich 'tar -xf -'
 '''
     result, trace = _bash(script, tmp_path, {'ssh': 'printf "ssh %s\\n" "$*" >> "$TRACE"'})
     assert result.returncode == 0, result.stderr
-    first, second = trace.splitlines()
+    # The two ends of the pipe trace concurrently, so their lines arrive in either order.
+    first, second = sorted(trace.splitlines(), key=lambda line: 'ostrich' in line.split(' zstd')[0])
     assert '-c aes128-gcm@openssh.com -o Compression=no' in first
     assert '-o HostName=172.22.2.7 -o HostKeyAlias=kakapo kakapo' in first and first.endswith('tar -cf - . | zstd -T8 -3 -q')
     assert second.startswith('ssh -o BatchMode=yes ostrich zstd -d -q | tar -xf -')

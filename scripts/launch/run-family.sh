@@ -1940,13 +1940,14 @@ fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
 # cuteafd-coordinator-INSTANCE; empty keeps the one cuteafd-coordinator.
-# SPARK_COUNT=0: the routed experts run on the coordinator GPU (--local-experts;
-# GLM 5.3 Flash, MiMo V2 and Qwen 3.8), the natural minimum for checkpoints
-# that fit one RTX.
+# SPARK_COUNT=0: routed experts fit the selected coordinator GPUs. GLM 5.3
+# uses solver-selected TP2 (--rtx-expert-layers); the other families use
+# --local-experts.
 if [[ "$ranks" == 0 ]]; then
   case "$family" in
+    glm5) ;;
     glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
-    *) echo "SPARK_COUNT=0 (local experts) serves GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
+    *) echo "SPARK_COUNT=0 serves GLM 5.3, GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
   esac
 fi
 # Match persistent connections owned by the selected family's transport, not
@@ -1957,8 +1958,13 @@ case "$family" in
   glm5)
     selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
-    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes")
-    rdma_endpoints=$((1 + (selected_lanes > 1 ? selected_lanes : 0))) ;;
+    if [[ "$ranks" == 0 ]]; then
+      selected_lanes=1
+      rdma_endpoints=0
+    else
+      rdma_endpoints=$((1 + (selected_lanes > 1 ? selected_lanes : 0)))
+    fi
+    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
   glm5_flash)
     rdma_endpoints="${prefill_lanes:-2}"
     if [[ "${CUTEAFD_GLMF_PREFILL_LANES:-}" == 1 ]]; then rdma_endpoints=1; fi

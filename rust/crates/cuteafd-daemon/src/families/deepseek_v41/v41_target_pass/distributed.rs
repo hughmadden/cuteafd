@@ -248,6 +248,16 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 else { clock.since_entry(layer) })).ok().flatten()
         }).collect()
     }
+    pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
+        for lane in &mut self.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().install_attention_plan(plan))?;
+        }
+        Ok(())
+    }
+    pub fn set_attention_decode(&mut self, decode: bool) {
+        for lane in &mut self.lanes { lane.get_mut().set_attention_decode(decode); }
+    }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         for lane in &mut self.lanes {
             let device = lane.device;
@@ -296,8 +306,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     ) -> Result<()> {
         // Verification passes run with device-ordered stages. Peer-projection
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
-        let chained = std::mem::replace(&mut self.verification, false)
-            && !self.lanes.iter().any(|lane| lane.uses_peer_projection());
+        let verification = std::mem::replace(&mut self.verification, false);
+        self.set_attention_decode(verification);
+        let chained = verification && !self.lanes.iter().any(|lane| lane.uses_peer_projection());
         if let Some(chain) = &self.chain {
             chain.set_device_order(std::mem::replace(&mut self.device_order, true));
         }

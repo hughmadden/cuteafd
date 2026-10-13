@@ -52,6 +52,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         transports: [&mut NativeTp4Wave<'a>; 2], suffix: &mut EncoderSuffix<'a>,
         keep_running: &dyn Fn() -> bool, before_chunk: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        self.set_attention_decode(false);
+        other.set_attention_decode(false);
         ensure!(!chunks.is_empty(), "empty encoder stream");
         let requests = RefCell::new(requests);
         let suffix = RefCell::new(suffix);

@@ -71,6 +71,88 @@ impl Exl3Schedule {
     }
 }
 
+/// Frozen at load: all decode widths use the m1 export's reduction geometry.
+/// Capacity and scheduling may differ, but not the products or their grouping.
+#[derive(Debug)]
+pub(crate) struct Exl3ReductionPlan {
+    decode: Vec<(usize, usize)>,
+}
+
+impl Exl3ReductionPlan {
+    pub(crate) fn new(directories: &[PathBuf]) -> Result<Self> {
+        let package = directories.first().context("empty EXL3 reduction package")?;
+        let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
+            let path = directory.join("v41_exl3.json");
+            serde_json::from_slice(&std::fs::read(&path)
+                .with_context(|| format!("EXL3 reduction manifest {}", path.display()))?)
+                .with_context(|| format!("invalid EXL3 reduction manifest {}", path.display()))
+        }).collect::<Result<Vec<_>>>()?;
+        let signature = |meta: &serde_json::Value| -> Result<Vec<serde_json::Value>> {
+            let tile = meta["tile"].as_array().context("EXL3 export lacks reduction tile")?;
+            ensure!(tile.len() == 4 && tile.iter().all(|v| v.as_u64().is_some_and(|n| n > 0)),
+                "EXL3 export has invalid reduction tile");
+            let mut threads = Vec::new();
+            for projection in tile.chunks_exact(2) {
+                let (k, n) = (projection[0].as_u64().unwrap(), projection[1].as_u64().unwrap());
+                let nk = n.checked_mul(k).context("EXL3 reduction tile overflow")?;
+                ensure!(k % 16 == 0 && n % 16 == 0 && nk % 64 == 0,
+                    "EXL3 export has unsupported reduction tile");
+                // Pinned W4A16 kernel: CTA=N*K/64, shared stride=N/2;
+                // the cross-warp fold is CTA/stride/2 (kernel.py).
+                let cta = nk / 64;
+                ensure!(cta == 128 || cta == 256, "EXL3 export has unsupported CTA thread count");
+                threads.extend([cta.into(), (n / 2).into(), (cta / (n / 2) / 2).into()]);
+            }
+            let route_block = match meta.get("route_block") {
+                Some(value) => value.as_u64().context("EXL3 export has invalid route block")?,
+                None => 8,
+            };
+            ensure!(route_block == 8 || (route_block > 0 && route_block % 16 == 0),
+                "EXL3 export has unsupported route block");
+            let mut result = vec![meta["tile"].clone(), serde_json::Value::Array(threads),
+                route_block.into(),
+                meta["input_format"].as_str().unwrap_or("bf16").into()];
+            for key in ["direct", "warp_specialized", "fused_input_rotation", "token_major_rotation"] {
+                result.push(meta[key].as_bool().unwrap_or(false).into());
+            }
+            for key in ["paired_boundary", "bits", "swiglu_limit", "output_dtype",
+                "hidden", "intermediate", "experts", "top_k", "sparkinfer_revision"] {
+                result.push(meta[key].clone());
+            }
+            Ok(result)
+        };
+        let canonical = manifests.iter().find(|m| m["capacity"].as_u64() == Some(1))
+            .with_context(|| format!("EXL3 package {} needs the canonical m1 export", package.display()))?;
+        let canonical = signature(canonical)
+            .with_context(|| format!("EXL3 package {} canonical reduction", package.display()))?;
+        let mut decode = Vec::new();
+        let mut maximum = 0;
+        for (index, meta) in manifests.iter().enumerate() {
+            let capacity = meta["capacity"].as_u64().context("EXL3 export lacks capacity")? as usize;
+            maximum = maximum.max(capacity);
+            if capacity <= 80 && signature(meta)
+                .with_context(|| format!("EXL3 reduction export {}", directories[index].display()))? == canonical {
+                decode.push((capacity, index));
+            }
+        }
+        decode.sort_unstable();
+        ensure!(decode.last().is_some_and(|&(capacity, _)| capacity >= maximum.min(80)),
+            "EXL3 package {} has no export covering {} decode rows with canonical m1 K tile, CTA threads and route reduction; export a matching capacity",
+            package.display(), maximum.min(80));
+        Ok(Self { decode })
+    }
+
+    pub(crate) fn execution_index(&self, rows: usize, required: usize, capacities: impl Iterator<Item = usize>) -> Result<usize> {
+        ensure!(rows > 0, "EXL3 live rows must be positive");
+        if rows <= 80 {
+            return self.decode.iter().find(|&&(capacity, _)| capacity >= rows)
+                .map(|&(_, index)| index).context("EXL3 decode exceeds fixed reduction plan");
+        }
+        capacities.enumerate().find(|&(_, capacity)| capacity >= required)
+            .map(|(index, _)| index).context("no EXL3 execution for admitted rows")
+    }
+}
+
 #[derive(Deserialize)]
 struct Buffer {
     bytes: usize,
@@ -823,6 +905,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixed_reduction_plan_follows_m1_not_live_width() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for capacity in [1, 16, 80, 256] {
+            let directory = root.path().join(format!("m{capacity}"));
+            std::fs::create_dir(&directory)?;
+            let tile = if capacity == 16 { [128, 128, 128, 128] } else { [64, 128, 64, 128] };
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                "capacity": capacity, "tile": tile, "direct": false
+            }))?)?;
+            paths.push(directory);
+        }
+        let plan = Exl3ReductionPlan::new(&paths)?;
+        let serial = Exl3ReductionPlan::new(&paths[..1])?;
+        assert_eq!(serial.execution_index(1, 1, [1].into_iter())?, 0);
+        assert!(serial.execution_index(2, 2, [1].into_iter()).is_err());
+        for rows in 1..=80 {
+            let index = plan.execution_index(rows, rows, [1, 16, 80, 256].into_iter())?;
+            assert_eq!(index, if rows == 1 { 0 } else { 2 });
+        }
+        assert_eq!(plan.execution_index(81, 81, [1, 16, 80, 256].into_iter())?, 3);
+        assert!(plan.execution_index(0, 0, [1, 16, 80, 256].into_iter()).is_err());
+        let error = Exl3ReductionPlan::new(&paths[..2]).unwrap_err().to_string();
+        assert!(error.contains(root.path().to_str().unwrap()));
+        assert!(error.contains("canonical m1 K tile, CTA threads"));
+        std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": 80, "tile": [64, 128, 64, 128], "direct": false, "route_block": 16
+        }))?)?;
+        assert!(Exl3ReductionPlan::new(&paths).is_err());
+        for (field, value) in [
+            ("tile", serde_json::json!([64, 64, 64, 128])),
+            ("route_block", serde_json::json!("8")),
+            ("input_format", serde_json::json!("e4m3_k32")),
+            ("warp_specialized", serde_json::json!(true)),
+        ] {
+            let mut meta = serde_json::json!({"capacity": 80, "tile": [64, 128, 64, 128], "direct": false});
+            meta[field] = value;
+            std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+            assert!(Exl3ReductionPlan::new(&paths).is_err(), "must reject {field}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn family_row_policy_admits_every_live_tail() -> Result<()> {
         use cuteafd_core::ExpertGeometry as G;
         for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO,
@@ -880,11 +1006,11 @@ mod tests {
             // Admission includes the shared arena and private state even though
             // the transport/input limit stays at the real declared maximum.
             assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 8320);
-            assert!(ordinary < 8320);
+            assert_eq!(ordinary, 8320);
         }
         std::fs::remove_file(root.path().join("m80/v41_exl3.json"))?;
         assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?, Exl3InputFormat::Fp8K32).is_err());
-        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_ok());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_err());
         Ok(())
     }
 

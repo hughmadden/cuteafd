@@ -3,7 +3,7 @@ use super::native::{output_bytes, validate_layers, RankCompletion};
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
 use crate::shared::experts::{
     exl3::{
-        execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
+        execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
         Exl3Weights,
     },
     layer::ExpertLayer,
@@ -27,6 +27,7 @@ pub(crate) struct Exl3Tp2<'a> {
     layers: Range<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
+    reduction_plan: Exl3ReductionPlan,
     max_rows: usize,
     workspace_bytes: usize,
     executions: Option<DeviceOwner<'a, Vec<Exl3Execution<'a>>>>,
@@ -91,6 +92,7 @@ impl<'a> Exl3Tp2<'a> {
                 "EXL3 TP2 manifest geometry/capacity mismatch"
             );
         }
+        Exl3ReductionPlan::new(&paths)?;
         Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?
             .checked_add(
                 max_rows
@@ -166,6 +168,7 @@ impl<'a> Exl3Tp2<'a> {
                 layers: layers.clone(),
                 geometry,
                 row_policy,
+                reduction_plan: Exl3ReductionPlan::new(&directories(packages[0], max_rows, row_policy)?)?,
                 max_rows,
                 workspace_bytes: workspace_bytes[0],
                 executions: None,
@@ -179,6 +182,7 @@ impl<'a> Exl3Tp2<'a> {
                 layers: layers.clone(),
                 geometry,
                 row_policy,
+                reduction_plan: Exl3ReductionPlan::new(&directories(packages[1], max_rows, row_policy)?)?,
                 max_rows,
                 workspace_bytes: workspace_bytes[1],
                 executions: None,
@@ -329,13 +333,10 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
             ];
             let required = self.row_policy.required_capacity(rows);
             self.device.run(|| {
-                let execution = self
-                    .executions
-                    .as_mut()
-                    .expect("initialized EXL3 rank")
-                    .iter_mut()
-                    .find(|e| e.capacity() >= required)
-                    .unwrap();
+                let executions = self.executions.as_mut().expect("initialized EXL3 rank");
+                let selected = self.reduction_plan.execution_index(rows, required,
+                    executions.iter().map(|e| e.capacity()))?;
+                let execution = &mut executions[selected];
                 // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
                 unsafe {
                     execution.launch_layer_into(
@@ -405,7 +406,7 @@ mod tests {
             std::fs::write(
                 directory.join("v41_exl3.json"),
                 serde_json::to_vec(&serde_json::json!({
-                    "capacity": capacity, "hidden": 8, "trellis_lut": {"bytes": 32}, "buffers": {
+                    "capacity": capacity, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                         "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": scratch, "zero_on_create": false},
                         "alias": {"allocation": "scratch", "dtype": "f32", "bytes": 99999, "zero_on_create": false},
                         "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
@@ -413,27 +414,21 @@ mod tests {
                 }))?,
             )?;
         }
-        let private = 2 * (32 + 16);
-        let wire_decode = (1 + 16) * 8 * 2;
-        assert_eq!(
-            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::Nearest)?,
-            1024 + private + wire_decode + 16 * 8 * 4
-        );
-        assert_eq!(
-            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 3, Exl3RowPolicy::Nearest)?,
-            1024 + private + wire_decode + 3 * 8 * 4
-        );
-        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 16, 16, Exl3RowPolicy::Nearest).is_err());
+        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::Nearest).is_err());
+        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 3, Exl3RowPolicy::Nearest).is_err());
         assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::GlmFlashK64).is_err());
         let directory = root.path().join("m80");
         std::fs::create_dir_all(&directory)?;
         std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": 80, "hidden": 8, "trellis_lut": {"bytes": 32}, "buffers": {
+            "capacity": 80, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                 "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
                 "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
             }
         }))?)?;
         for rows in [2, 3, 8, 16] {
+            assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 16, rows, Exl3RowPolicy::Nearest).is_err());
+            assert_eq!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::Nearest)?,
+                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4);
             assert_eq!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::GlmFlashK64)?,
                 2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4);
         }
@@ -472,7 +467,7 @@ mod tests {
             );
             assert_eq!(
                 paths.last().unwrap(),
-                &Path::new("rtx-tp2").join(format!("m{rows}"))
+                &Path::new("rtx-tp2").join(format!("m{}", if rows == 16 { 80 } else { rows }))
             );
         }
     }

@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
     Exl3Weights,
 };
 use crate::shared::experts::execution::HostExpertExchange;
@@ -116,6 +116,7 @@ pub(crate) struct Exl3Worker<'a> {
     worker_timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
     executions: Vec<Exl3Execution<'a>>,
     row_policy: Exl3RowPolicy,
+    reduction_plan: Exl3ReductionPlan,
     capacity: usize,
     inputs: [DeviceAllocation<'a>; 3],
     /// Pinned staging of a call's routes, laid out as `inputs[1]` and
@@ -176,6 +177,7 @@ impl<'a> Exl3Worker<'a> {
     pub(crate) fn plan(directory: &Path, capacity: u32, schedule: Exl3Schedule) -> Result<usize> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
             .map(|c| schedule.directory(directory, c)).collect();
+        Exl3ReductionPlan::new(&directories)?;
         let ownership_bytes = Exl3Execution::ownership_bytes(&directories[0])?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
@@ -220,6 +222,7 @@ impl<'a> Exl3Worker<'a> {
         let row_policy = Exl3RowPolicy::active();
         let capacities = Self::capacities(capacity)?;
         let directories: Vec<_> = capacities.iter().map(|&c| schedule.directory(directory, c)).collect();
+        let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let arena = Exl3Workspace::new(library, &directories)?;
         for c in capacities {
             let execution = unsafe {
@@ -279,6 +282,7 @@ impl<'a> Exl3Worker<'a> {
         };
         Ok(Self {
             row_policy,
+            reduction_plan,
             stream,
             timing,
             worker_timing: super::super::execution::timing::WorkerTiming::from_env(library, rank)?,
@@ -413,8 +417,9 @@ impl<'a> Exl3Worker<'a> {
         let hidden_bytes = request.hidden().len();
         ensure!(hidden_bytes <= self.inputs[0].buffer.bytes, "EXL3 request hidden rows exceed the input buffer");
         let required = self.row_policy.required_capacity(request.rows() as usize);
-        let decodes = self.executions.iter().find(|e| e.capacity() >= required)
-            .context("missing preloaded EXL3 worker capacity")?.decodes_wire_rows();
+        let selected = self.reduction_plan.execution_index(request.rows() as usize, required,
+            self.executions.iter().map(|e| e.capacity()))?;
+        let decodes = self.executions[selected].decodes_wire_rows();
         let device = self.inputs[0].buffer.device_id;
         let mut hidden = self.inputs[0].buffer;
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
@@ -464,11 +469,7 @@ impl<'a> Exl3Worker<'a> {
         let inputs = [hidden, self.inputs[1].buffer, self.inputs[2].buffer];
         // Modules and storage are resolved before accepting requests. This
         // bounded selection performs no allocation, loading or compilation.
-        let execution = self
-            .executions
-            .iter_mut()
-            .find(|e| e.capacity() >= required)
-            .context("missing preloaded EXL3 worker capacity")?;
+        let execution = &mut self.executions[selected];
         // SAFETY: worker events and stream stay live through the existing completion below.
         if let Some(timing) = &self.worker_timing {
             unsafe { timing.record(0, self.stream.raw)?; }

@@ -95,6 +95,21 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 impl<'a> GlmLoader<'a> {
+    /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
+    pub(crate) fn peer_routers(&self, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
+        let peer = *self.peers.first().context("TP2 router replica needs peer")?;
+        for index in range {
+            for (operand, suffix) in [("gate", "weight"), ("gate.bias", "e_score_correction_bias")] {
+                let allocation = crate::shared::peer_split::on_device(self.library, peer.device, self.device, || {
+                    let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
+                    self.one(&format!("model.layers.{index}.mlp.gate.{suffix}"))
+                })?;
+                layers[index].operands.insert(operand, allocation);
+            }
+        }
+        Ok(())
+    }
+
     fn raw(&self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let tensor = self.catalog.tensor(name)?;

@@ -980,6 +980,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value = "prompt,turn", env = "CUTEAFD_HOST_CACHE_KINDS")]
     pub host_cache_kinds: String,
 
+    /// Immutable decode/verify attention reduction width; auto uses active draft limit + 1.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
+    pub attention_plan_rows: Option<usize>,
+
     /// Enable greedy RTX dSpark proposal generation and target verification.
     #[arg(long)] pub dspark: bool,
     /// Draft width (tokens proposed per request). Defaults to the drafter's
