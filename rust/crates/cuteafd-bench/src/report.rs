@@ -201,6 +201,114 @@ pub struct Hardware {
     /// The rail plan's one-line summary.
     #[serde(default)]
     pub rails: Option<String>,
+    /// What the used GPUs' power limits actually were over the timed windows (absent in old
+    /// reports and without a throttle sampler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<Power>,
+}
+
+/// Measured power limits of the used GPUs over a run, summarized from the engine's
+/// throttle windows (`/v1/thermal`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Power {
+    /// `gpu-powerd` when a governor state was present in the windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_w: Option<f64>,
+    pub gpus: Vec<PowerGpu>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PowerGpu {
+    pub index: u32,
+    /// Time-weighted mean power limit over the windows.
+    pub mean_limit_w: f64,
+    pub min_limit_w: f64,
+    pub max_limit_w: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_draw_w: Option<f64>,
+    /// The governor's dominant plan bound (`max`, `budget`, `model`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<String>,
+}
+
+fn collect_windows<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("from_s") && map.get("gpus").is_some_and(Value::is_array) {
+                out.push(value);
+            } else {
+                map.values().for_each(|v| collect_windows(v, out));
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| collect_windows(v, out)),
+        _ => {}
+    }
+}
+
+impl Power {
+    /// Merge throttle windows (any JSON containing `thermal::window` objects) into one summary,
+    /// weighting each window by its seconds. `None` when no window carries a limit.
+    pub fn from_json(roots: &[&Value]) -> Option<Power> {
+        let mut windows = Vec::new();
+        roots.iter().for_each(|root| collect_windows(root, &mut windows));
+        // index -> (weight, limit*weight, draw weight, draw*weight, min, max, bound seconds)
+        #[derive(Default)]
+        struct Acc { w: f64, limit: f64, dw: f64, draw: f64, min: Option<f64>, max: Option<f64>, bounds: Vec<(String, f64)> }
+        let mut accs: std::collections::BTreeMap<u32, Acc> = Default::default();
+        let (mut governor, mut budget) = (false, None);
+        for window in windows {
+            let weight = window["seconds"].as_f64().unwrap_or(0.0).max(0.001);
+            if window.get("governor").is_some_and(|g| !g.is_null()) {
+                governor = true;
+                budget = window["governor_budget_w"].as_f64().or(budget);
+            }
+            for gpu in window["gpus"].as_array().into_iter().flatten() {
+                let (Some(index), Some(mean)) = (gpu["index"].as_u64(), gpu["power_limit_w"]["mean"].as_f64()
+                    .or_else(|| gpu["power_limit_w"]["max"].as_f64())) else { continue };
+                let acc = accs.entry(index as u32).or_default();
+                acc.w += weight;
+                acc.limit += mean * weight;
+                if let Some(draw) = gpu["power_w"]["mean"].as_f64() { acc.dw += weight; acc.draw += draw * weight; }
+                let lo = gpu["power_limit_w"]["min"].as_f64().unwrap_or(mean);
+                let hi = gpu["power_limit_w"]["max"].as_f64().unwrap_or(mean);
+                acc.min = Some(acc.min.map_or(lo, |m| m.min(lo)));
+                acc.max = Some(acc.max.map_or(hi, |m| m.max(hi)));
+                if let Some(bound) = gpu["governor_bound"].as_str() {
+                    match acc.bounds.iter_mut().find(|(b, _)| b == bound) {
+                        Some(entry) => entry.1 += weight,
+                        None => acc.bounds.push((bound.to_string(), weight)),
+                    }
+                }
+            }
+        }
+        if accs.is_empty() { return None; }
+        let gpus = accs.into_iter().map(|(index, a)| PowerGpu {
+            index, mean_limit_w: a.limit / a.w, min_limit_w: a.min.unwrap_or_default(), max_limit_w: a.max.unwrap_or_default(),
+            mean_draw_w: (a.dw > 0.0).then(|| a.draw / a.dw),
+            bound: a.bounds.into_iter().max_by(|x, y| x.1.total_cmp(&y.1)).map(|(b, _)| b),
+        }).collect();
+        Some(Power { governor: governor.then(|| "gpu-powerd".to_string()), budget_w: budget, gpus })
+    }
+
+    /// `gpu-powerd 450/450 W` or `325 W`, plus ` (380–600)` when a limit moved by more than 10 W.
+    pub fn label(&self) -> String {
+        let round5 = |w: f64| (w / 5.0).round() * 5.0;
+        let means: Vec<f64> = self.gpus.iter().map(|g| round5(g.mean_limit_w)).collect();
+        let shown: Vec<f64> = if self.governor.is_none() && means.windows(2).all(|p| p[0] == p[1]) {
+            means.iter().take(1).copied().collect()
+        } else { means };
+        let mut text = shown.iter().map(|w| format!("{w:.0}")).collect::<Vec<_>>().join("/");
+        text.push_str(" W");
+        if let Some(name) = &self.governor { text = format!("{name} {text}"); }
+        let lo = self.gpus.iter().map(|g| g.min_limit_w).fold(f64::INFINITY, f64::min);
+        let hi = self.gpus.iter().map(|g| g.max_limit_w).fold(f64::NEG_INFINITY, f64::max);
+        if self.gpus.iter().any(|g| g.max_limit_w - g.min_limit_w > 10.0) {
+            text.push_str(&format!(" ({:.0}–{:.0})", round5(lo), round5(hi)));
+        }
+        text
+    }
 }
 
 impl Hardware {
@@ -229,7 +337,9 @@ impl Hardware {
         let mut parts = Vec::new();
         if let Some(first) = used.first() {
             let mut part = format!("{}× {}", used.len(), short_gpu_name(&first.name));
-            if let Some(cap) = first.power_limit_w {
+            if let Some(power) = &self.power {
+                part.push_str(&format!(" @ {}", power.label()));
+            } else if let Some(cap) = first.power_limit_w {
                 part.push_str(&format!(" @ {cap:.0} W"));
             }
             parts.push(part);
@@ -812,6 +922,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn rfc3339_formats_known_instants() {
@@ -835,6 +946,53 @@ mod tests {
         assert_eq!(two.class(), HardwareClass::Maximum);
         let local = Hardware { gpus: vec![gpu(true)], ..Hardware::default() };
         assert_eq!(local.slug(), "1rtx");
+    }
+
+    fn window(seconds: f64, gov: bool, gpus: &[(u32, f64, f64, f64, &str)]) -> Value {
+        let gpus: Vec<Value> = gpus.iter().map(|&(i, mean, lo, hi, bound)| json!({
+            "index": i, "governor_bound": if gov { json!(bound) } else { Value::Null },
+            "power_w": {"mean": mean - 20.0},
+            "power_limit_w": {"mean": mean, "min": lo, "max": hi}})).collect();
+        let mut w = json!({"from_s": 0.0, "to_s": seconds, "seconds": seconds, "gpus": gpus});
+        if gov { w["governor"] = json!({"budget_w": 900.0}); w["governor_budget_w"] = json!(900.0); }
+        w
+    }
+
+    fn labelled(windows: &[Value], gpus: usize) -> String {
+        let mut hw = Hardware { gpus: (0..gpus).map(|i| Gpu { index: i as u32, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition".into(),
+            used: true, power_limit_w: Some(325.0), ..Gpu::default() }).collect(), ..Hardware::default() };
+        hw.power = Power::from_json(&windows.iter().collect::<Vec<_>>());
+        hw.line()
+    }
+
+    #[test]
+    fn power_label_formats() {
+        // No governor: the plain form with the mean limit.
+        let w = window(10.0, false, &[(0, 325.0, 325.0, 325.0, ""), (1, 325.0, 325.0, 325.0, "")]);
+        assert_eq!(labelled(&[w], 2), "2× RTX PRO 6000 @ 325 W");
+        // gpu-powerd at the ceiling.
+        let w = window(10.0, true, &[(0, 450.0, 450.0, 450.0, "budget"), (1, 450.0, 450.0, 450.0, "budget")]);
+        assert_eq!(labelled(&[w], 2), "2× RTX PRO 6000 @ gpu-powerd 450/450 W");
+        // One card throttled: the limit moved more than 10 W.
+        let w = window(10.0, true, &[(0, 522.0, 380.0, 600.0, "model"), (1, 408.0, 405.0, 410.0, "budget")]);
+        assert_eq!(labelled(&[w], 2), "2× RTX PRO 6000 @ gpu-powerd 520/410 W (380–600)");
+        // A single card, two windows weighted by seconds.
+        let a = window(30.0, true, &[(0, 600.0, 600.0, 600.0, "max")]);
+        let b = window(10.0, true, &[(0, 600.0, 600.0, 600.0, "max")]);
+        assert_eq!(labelled(&[a, b], 1), "1× RTX PRO 6000 @ gpu-powerd 600 W");
+    }
+
+    #[test]
+    fn power_merge_weights_windows_and_old_reports_render_plain() {
+        let a = window(30.0, true, &[(0, 600.0, 600.0, 600.0, "max")]);
+        let b = window(10.0, true, &[(0, 400.0, 400.0, 400.0, "budget")]);
+        let p = Power::from_json(&[&json!({"x": [a, b]})]).unwrap();
+        assert_eq!(p.gpus[0].mean_limit_w, 550.0);
+        assert_eq!(p.gpus[0].bound.as_deref(), Some("max"));
+        assert_eq!(p.budget_w, Some(900.0));
+        let old: Hardware = serde_json::from_value(json!({"gpus": [{"index": 0, "name": "RTX PRO 6000",
+            "power_limit_w": 325.0, "used": true}]})).unwrap();
+        assert_eq!(old.line(), "1× RTX PRO 6000 @ 325 W");
     }
 
     #[test]

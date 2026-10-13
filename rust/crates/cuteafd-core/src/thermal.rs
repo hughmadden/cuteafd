@@ -79,6 +79,8 @@ struct Gpu {
     samples: VecDeque<Sample>,
     /// The newest slow-tier values (margin, memory temperature), carried into `current`.
     slow: Reading,
+    /// The governor's dominant plan bound per slow tick: (time, bound), oldest first.
+    bounds: VecDeque<(f64, String)>,
 }
 
 #[derive(Default)]
@@ -107,7 +109,7 @@ fn state() -> &'static Mutex<State> {
 pub fn install(gpus: Vec<GpuInfo>) {
     let _ = epoch();
     if let Ok(mut state) = state().lock() {
-        state.gpus = gpus.into_iter().map(|info| Gpu { info, samples: VecDeque::new(), slow: Reading::default() }).collect();
+        state.gpus = gpus.into_iter().map(|info| Gpu { info, samples: VecDeque::new(), slow: Reading::default(), bounds: VecDeque::new() }).collect();
     }
 }
 
@@ -129,9 +131,40 @@ pub fn push(t: f64, readings: &[Reading]) {
 }
 
 /// Attach a note (e.g. the host power governor's current limit and reason) to every report.
+///
+/// Also records each GPU's `plan.bound` from the note (`gpus[]`, matched by `index`, else by
+/// position) so a window can report the dominant bound.
 pub fn set_note(note: Option<Value>) {
-    if let Ok(mut state) = state().lock() { state.note = note; }
+    let Ok(mut state) = state().lock() else { return };
+    let t = now_s();
+    if let Some(entries) = note.as_ref().and_then(|n| n["gpus"].as_array()) {
+        for (position, gpu) in state.gpus.iter_mut().enumerate() {
+            let entry = entries.iter().find(|e| e["index"].as_u64() == Some(u64::from(gpu.info.index)))
+                .or_else(|| entries.get(position));
+            if let Some(bound) = entry.and_then(|e| e["plan"]["bound"].as_str()) {
+                if gpu.bounds.len() == KEEP { gpu.bounds.pop_front(); }
+                gpu.bounds.push_back((t, bound.to_string()));
+            }
+        }
+    }
+    state.note = note;
 }
+
+/// Mean of `(t, value)` points weighted by the time each value held (until the next point,
+/// at most [`MAX_HOLD_S`]; the last point holds one sample period).
+pub fn time_weighted_mean(points: &[(f64, f64)]) -> Option<f64> {
+    let last = points.len().checked_sub(1)?;
+    let (mut sum, mut weight) = (0.0, 0.0);
+    for (i, &(t, v)) in points.iter().enumerate() {
+        let hold = if i < last { points[i + 1].0 - t } else { 1.0 / f64::from(SAMPLE_HZ) };
+        let hold = hold.clamp(0.0, MAX_HOLD_S);
+        sum += v * hold;
+        weight += hold;
+    }
+    if weight > 0.0 { Some(sum / weight) } else { Some(points[0].1) }
+}
+
+const MAX_HOLD_S: f64 = 2.5 / SAMPLE_HZ as f64;
 
 fn watts(mw: Option<u32>) -> Option<f64> { mw.map(|mw| f64::from(mw) / 1e3) }
 
@@ -206,6 +239,7 @@ fn summarize_gpu(gpu: &Gpu, from: f64, to: f64) -> Value {
     let window = samples.range(start..end);
     let (mut temp, mut margin, mut memory, mut power, mut limit, mut clock, mut busy_clock) =
         (Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default());
+    let mut limit_points: Vec<(f64, f64)> = Vec::new();
     let mut reason_hits = [0u32; 4];
     let mut reason_samples = 0u32;
     let (mut n, mut busy) = (0u32, 0u32);
@@ -221,6 +255,7 @@ fn summarize_gpu(gpu: &Gpu, from: f64, to: f64) -> Value {
         memory.add(r.memory_temperature_c.map(f64::from));
         power.add(watts(r.power_mw));
         limit.add(watts(r.power_limit_mw));
+        if let Some(w) = watts(r.power_limit_mw) { limit_points.push((sample.t, w)); }
         clock.add(r.sm_clock_mhz.map(f64::from));
         if r.utilization_pct.is_some_and(|u| u >= BUSY_PCT) {
             busy += 1;
@@ -248,8 +283,17 @@ fn summarize_gpu(gpu: &Gpu, from: f64, to: f64) -> Value {
         reason_fraction.insert((*name).into(),
             round3((reason_samples > 0).then(|| f64::from(reason_hits[index]) / f64::from(reason_samples))));
     }
+    let mut tally: Vec<(&str, u32)> = Vec::new();
+    for (_, bound) in gpu.bounds.iter().filter(|(t, _)| *t >= from && *t <= to) {
+        match tally.iter_mut().find(|(b, _)| b == bound) {
+            Some(entry) => entry.1 += 1,
+            None => tally.push((bound, 1)),
+        }
+    }
+    let dominant = tally.iter().max_by_key(|(_, n)| *n).map(|(b, _)| *b);
     json!({
         "index": gpu.info.index, "uuid": gpu.info.uuid, "pci_bus_id": gpu.info.pci_bus_id,
+        "governor_bound": dominant,
         "samples": n,
         "covered_s": round3(first_t.zip(last_t).map(|(a, b)| b - a)),
         "throttle_s": throttle_s,
@@ -261,7 +305,8 @@ fn summarize_gpu(gpu: &Gpu, from: f64, to: f64) -> Value {
         "tlimit_margin_c": {"min": round1(margin.min()), "mean": round1(margin.mean())},
         "memory_temperature_c": {"max": round1(memory.max())},
         "power_w": {"mean": round1(power.mean()), "max": round1(power.max())},
-        "power_limit_w": {"min": round1(limit.min()), "max": round1(limit.max())},
+        "power_limit_w": {"min": round1(limit.min()), "max": round1(limit.max()),
+            "mean": round1(time_weighted_mean(&limit_points))},
     })
 }
 
@@ -272,7 +317,11 @@ pub fn window(from: f64, to: f64) -> Value {
     let gpus: Vec<Value> = state.gpus.iter().map(|gpu| summarize_gpu(gpu, from, to)).collect();
     let mut value = json!({"from_s": round3(Some(from)), "to_s": round3(Some(to)),
         "seconds": round3(Some((to - from).max(0.0))), "gpus": gpus});
-    if let Some(note) = &state.note { value["governor"] = note.clone(); }
+    if let Some(note) = &state.note {
+        value["governor"] = note.clone();
+        value["governor_name"] = json!("gpu-powerd");
+        value["governor_budget_w"] = note["budget_w"].clone();
+    }
     value
 }
 
@@ -293,7 +342,7 @@ mod tests {
 
     fn gpu(samples: &[(f64, Reading)]) -> Gpu {
         Gpu { info: GpuInfo { index: 1, uuid: "GPU-x".into(), ..GpuInfo::default() },
-            samples: samples.iter().map(|&(t, reading)| Sample { t, reading }).collect(), slow: Reading::default() }
+            samples: samples.iter().map(|&(t, reading)| Sample { t, reading }).collect(), slow: Reading::default(), bounds: VecDeque::new() }
     }
 
     fn fast(temp: i32, clock: u32, util: u32, watts: u32, bits: u64) -> Reading {
@@ -355,5 +404,35 @@ mod tests {
         assert_eq!(active_reasons(REASON_SW_POWER_CAP | REASON_HW_SLOWDOWN | REASON_HW_THERMAL),
             vec!["sw_power_cap", "hw_thermal"]);
         assert_eq!(active_reasons(REASON_HW_SLOWDOWN), vec!["hw_slowdown"]);
+    }
+
+    #[test]
+    fn time_weighted_mean_weights_by_hold_time() {
+        assert_eq!(time_weighted_mean(&[]), None);
+        assert_eq!(time_weighted_mean(&[(0.0, 400.0)]), Some(400.0));
+        // 600 W held 1 s, 300 W held for the one sample period the last sample covers.
+        let m = time_weighted_mean(&[(0.0, 600.0), (1.0, 300.0)]).unwrap();
+        assert!((m - 450.0).abs() < 1e-9, "{m}");
+        // Uneven spacing: 600 W for 2 s, 300 W for 1 s.
+        let m = time_weighted_mean(&[(0.0, 600.0), (2.0, 300.0)]).unwrap();
+        assert!((m - 500.0).abs() < 1e-9, "{m}");
+        // A gap longer than MAX_HOLD_S is capped (2.5 s of 600 W, 1 s of 300 W).
+        let m = time_weighted_mean(&[(0.0, 600.0), (100.0, 300.0)]).unwrap();
+        assert!((m - (600.0 * 2.5 + 300.0) / 3.5).abs() < 1e-9, "{m}");
+    }
+
+    #[test]
+    fn window_reports_mean_limit_and_dominant_bound() {
+        let mut g = gpu(&[]);
+        for i in 0..10 {
+            let mut r = fast(60, 2000, 100, 400, 0);
+            r.power_limit_mw = Some(if i < 5 { 600_000 } else { 400_000 });
+            g.samples.push_back(Sample { t: f64::from(i), reading: r });
+        }
+        g.bounds = VecDeque::from([(0.0, "max".to_string()), (2.0, "budget".to_string()), (4.0, "budget".to_string())]);
+        let w = summarize_gpu(&g, 0.0, 10.0);
+        assert_eq!(w["power_limit_w"]["mean"], 500.0);
+        assert_eq!(w["power_limit_w"]["min"], 400.0);
+        assert_eq!(w["governor_bound"], "budget");
     }
 }

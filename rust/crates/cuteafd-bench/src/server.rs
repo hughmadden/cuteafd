@@ -147,7 +147,7 @@ pub fn hardware(settings: &[Setting]) -> Hardware {
     Hardware {
         host: std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string())
             .or_else(|| std::env::var("HOSTNAME").ok()),
-        gpus, driver, cuda, sparks: sparks(settings), fabric, rails,
+        gpus, driver, cuda, sparks: sparks(settings), fabric, rails, power: None,
     }
 }
 
