@@ -198,8 +198,8 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
         return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
     }
-    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0 || i.requested_pool.is_some()) {
-        return Err(PlacementError::Inventory("GLM Flash shared replay needs single-GPU automatic Spark admission"));
+    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0) {
+        return Err(PlacementError::Inventory("GLM Flash --replay-records shared needs one coordinator GPU and Spark experts (independent of --pool-tokens)"));
     }
     let geometry = cache::glm_flash_rank_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
         i.kda_state_bytes, i.decode_rows).map_err(|_| PlacementError::Inventory("GLM Flash cache geometry"))?;
