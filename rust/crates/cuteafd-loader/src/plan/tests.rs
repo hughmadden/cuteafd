@@ -2242,6 +2242,7 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
         (1, true, 0, AttentionPlacement::Heads),
         (2, false, 0, AttentionPlacement::Heads),
         (2, true, 1, AttentionPlacement::Heads),
+        (2, true, 4, AttentionPlacement::Heads),
     ] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions {
             rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
@@ -2916,6 +2917,15 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
+            if auto.family.as_deref() == Some("qwen4") {
+                assert_eq!(auto.spark_ranks, 4);
+                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
+                if gpus == 2 {
+                    let layout = auto.memory_layout.as_ref().unwrap();
+                    assert!(layout.devices[1].items.is_empty(), "{}", layout.render());
+                    assert_eq!(layout.devices[1].kv_tokens, 0);
+                }
+            }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
                 assert!(auto.placement_supported, "{}", render(&auto));
