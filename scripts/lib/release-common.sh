@@ -576,15 +576,20 @@ release_profile_docker_args() {
 # worker asked to wrap fails closed (Spark workers still get the environment
 # switches from release_profile_docker_args). Call after that helper, which has
 # validated PROFILE and PROFILE_DIR.
-# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET.
+# PROFILE_NSYS_GPU_METRICS adds nsys GPU metrics sampling (clocks, power, DRAM
+# and SM activity): `all` samples every GPU the container sees (use this), or an
+# index list in nsys's own device order, which is not CUDA's or nvidia-smi's
+# (`nsys profile --gpu-metrics-devices=help` lists it).
+# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS.
 release_profile_wrapper() {
-  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}"
+  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}"
   RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
   local wrapped=
   [[ ",$profile," == *,nsys,* ]] && wrapped=nsys
   [[ ",$profile," == *,ncu,* ]] && wrapped=ncu
   if [[ -z "$wrapped" ]]; then
     [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+    [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
     return 0
   fi
   [[ "$role" == coordinator ]] ||
@@ -599,8 +604,14 @@ release_profile_wrapper() {
     RELEASE_PROFILE_WRAPPER=(/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node
       --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
       "--output=$dir/nsys-$host" --force-overwrite=true)
+    if [[ -n "$metrics" ]]; then
+      [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+        release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
+      RELEASE_PROFILE_WRAPPER+=("--gpu-metrics-devices=$metrics")
+    fi
     return 0
   fi
+  [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
   [[ -n "$kernel" ]] || release_die "PROFILE=ncu needs PROFILE_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
   [[ "$kernel" != *[[:space:]]* ]] || release_die "PROFILE_NCU_KERNEL must not contain whitespace"
   count="${count:-20}" set="${set:-full}"
@@ -614,7 +625,7 @@ release_profile_wrapper() {
 release_known_key() {
   case "$1" in
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE|DRAFT_MODEL_ID|DRAFT_MODEL_REVISION|DRAFT_FP8|DFLASH|MTP|COORDINATOR_TRACE) return 0 ;;
-    DRAFT_COST_BUCKETS|DRAFT_CONFIDENCE|COPY_DRAFT_POLICY) return 0 ;;
+    DRAFT_COST_BUCKETS|DRAFT_CONFIDENCE|COPY_DRAFT_POLICY|DRAFT_SURVIVAL_LENGTHS) return 0 ;;
     FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|API_KEY_FILE|ENABLE_BENCH|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_COPY_WINDOWS|MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
@@ -629,9 +640,9 @@ release_known_key() {
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
-    GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE) return 0 ;;
+    GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_DRAFT_TRACE|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -860,6 +871,7 @@ release_load_config() {
   PROFILE_NCU_KERNEL=
   PROFILE_NCU_COUNT=
   PROFILE_NCU_SET=
+  PROFILE_NSYS_GPU_METRICS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev

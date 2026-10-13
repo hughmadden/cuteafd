@@ -202,8 +202,10 @@ impl<'a> TokenEmbedding<'a> {
         self.check(tokens)?;
         ensure!(ids.bytes >= tokens.len() * 4, "token id buffer of {} bytes for {} ids", ids.bytes, tokens.len());
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..ids }, &bytes)?;
-        // SAFETY: `ids` holds the ids (the copy above completed), `out` holds the rows.
+        // SAFETY: the supplied stream owns ids and its gather; the helper keeps
+        // pinned input live and orders replacement after previous consumers.
+        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..ids }, &bytes, stream)?; }
+        // SAFETY: `ids` becomes initialized before the gather on this stream; out holds the rows.
         unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, stream) }
     }
 

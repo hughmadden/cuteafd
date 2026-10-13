@@ -47,6 +47,7 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use std::path::PathBuf;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -388,7 +389,8 @@ impl SharedPolicy {
             local = classes.iter().filter(|c| **c == "local").count(), remote = classes.iter().filter(|c| **c == "remote").count(),
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
             "GLM Flash shared draft policy geometry");
-        let policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
+        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
+        crate::shared::draft::apply_length_rule(&mut policy);
         engine.arm_draft_probe(engine.decode_rows)?;
         let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
         let trace = crate::shared::draft_policy::enabled("CUTEAFD_GLMF_DRAFT_TRACE");
@@ -590,6 +592,29 @@ fn cold_replay_plan(probe: &probe::ProbeRef, plan: PointPlan, retained_logits: b
 
 fn cold_replay_decode(probe: &probe::ProbeRef, chunk: usize) -> bool {
     probe.as_ref().and_then(|p| p.spec.cold_steps.get(chunk)).is_some_and(|step| step.decode)
+}
+
+// Opt-in raw-state diagnostics for authenticated probes, never ordinary requests.
+fn prefix_state_probe(engine: &GlmfEngine<'_>, family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
+    probe: &probe::ProbeRef, phase: &str) -> Result<()> {
+    let Some(probe) = probe.as_ref() else { return Ok(()) };
+    let Some(root) = std::env::var_os("CUTEAFD_GLMF_PREFIX_STATE_ROOT") else { return Ok(()) };
+    if ![513, 544, 560].contains(&placement.len) { return Ok(()) }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = PathBuf::from(root).join(format!("{id:03}-{phase}-{}", placement.len));
+    std::fs::create_dir(&dir)?;
+    let state = engine.slot_state(placement.slot)?;
+    let paged = super::prefix::paged_rows(family, placement, placement.len)?;
+    let record = probe.record();
+    let metadata = serde_json::json!({"phase": phase, "len": placement.len, "kda_len": placement.kda_len,
+        "slot": placement.slot, "units": placement.units, "state_bytes": state.len(), "paged_bytes": paged.len(),
+        "cold": record.cold, "cached_tokens": record.cached_tokens,
+        "prompt_ids": record.prompt_ids, "generated": record.generated});
+    std::fs::write(dir.join("state.bin"), state)?;
+    std::fs::write(dir.join("paged.bin"), paged)?;
+    std::fs::write(dir.join("metadata.json"), serde_json::to_vec(&metadata)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -895,6 +920,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
+    let mut trace = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_GLMF_TRACE")
+        .map(|(var, path)| {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)
+                .with_context(|| format!("{var}: opening speculation trace {path}"))
+        }).transpose()?;
+    let mut trace_round = 0u64;
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
     // Per request window: verify steps, and host seconds drafting, verifying
@@ -1038,6 +1070,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             };
             let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
             probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
+            prefix_state_probe(engine, &family, &admitted.placement, &job.probe, "admitted")?;
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
@@ -1264,7 +1297,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     }
                     // Drafts only speed decoding up; the step verifies the next tokens alone.
-                    Err(error) => tracing::warn!("{} draft failed: {error:#}", drafter.name()),
+                    Err(error) => {
+                        // A terminal peer bridge is not a reusable target-only fallback.
+                        drafter.require_live()?;
+                        tracing::warn!("{} draft failed: {error:#}", drafter.name());
+                    }
                 }
                 out
             }
@@ -1335,6 +1372,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 planned[i] = planned[i].min(kept);
             }
         }
+        let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)| {
+            let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
+                d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
+            serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})
+        }).collect::<Vec<_>>());
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let plan_us = console::us(plan_timer);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
@@ -1382,7 +1424,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // Per request: rows executed, accepted inputs and why verification stopped short of a miss.
         let mut verified: Vec<(usize, usize, Option<crate::shared::draft::evidence::Censor>)> =
             vec![(0, 0, None); active.len()];
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts.iter().copied()).enumerate()
             .map(|(i, ((request, rows), start))| {
             if let Some(error) = poisoned[i].take() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
@@ -1459,6 +1501,26 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let times = round_clock.observe();
             shared.observe(engine, &requests, times, drafted_width, predicted);
         }
+        if let Some(trace) = &mut trace {
+            trace_round += 1;
+            let line = serde_json::json!({
+                "round": trace_round, "spec": spec,
+                "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+                "starts": starts,
+                "prompt_ids": active.iter().zip(&starts).map(|(a, &start)|
+                    (a.counts[0] == 1).then(|| a.history[..start].to_vec())).collect::<Vec<_>>(),
+                "lengths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+                "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+                "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
+                "copy_windows": copy_windows,
+                "verify_tokens": sequences,
+                "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
+                "finished": finished,
+            });
+            if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
+                tracing::warn!(%error, "GLM Flash speculation trace write failed");
+            }
+        }
         for (i, request) in active.iter().enumerate() {
             let proposal = &sequences[i][1..];
             tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
@@ -1491,6 +1553,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
                 draft_ring_misses = ring_misses, "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
+            prefix_state_probe(engine, &family, &request.placement, &request.job.probe, "finished")?;
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, request.keys.spans())?;
@@ -1546,7 +1609,12 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
         let start = p.placement.len;
         let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
-            engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            // Text replay must use serving's captured/fused decode, not eager scoring arithmetic.
+            if p.media.spans().is_empty() {
+                engine.verify_device(&mut [(&mut p.placement, chunk.len())], chunk, false)?
+            } else {
+                engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            }
         } else {
             engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
         };
@@ -1586,6 +1654,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     p.busy += timer.elapsed().as_secs_f64();
     p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
     result?;
+    prefix_state_probe(engine, family, &p.placement, &p.job.probe, "prefilled")?;
     capture_points(family, cache, p);
     p.chunks += 1;
     Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })

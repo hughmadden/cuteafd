@@ -63,6 +63,26 @@ def test_nsys_wraps_the_coordinator_paused_into_profile_dir():
     assert docker == ['--stop-signal', 'SIGINT', '--stop-timeout', '300', '--label', 'cuteafd.graceful-stop=1']
 
 
+def test_nsys_gpu_metrics_samples_the_named_devices():
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
+    assert out.returncode == 0, out.stderr
+    assert '--gpu-metrics-devices=0,1' in wrapper
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', 'all')
+    assert '--gpu-metrics-devices=all' in wrapper
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert not [flag for flag in wrapper if flag.startswith('--gpu-metrics')]
+
+
+@pytest.mark.parametrize('args,message', [
+    (('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', 'all;rm'), 'GPU index list'),
+    (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '', '', '0'), 'needs PROFILE=nsys'),
+    (('', '', 'raptor', 'coordinator', '', '', '', '0'), 'needs PROFILE=nsys'),
+])
+def test_nsys_gpu_metrics_fails_closed(args, message):
+    out, _, _ = _wrapper(*args)
+    assert out.returncode != 0 and message in out.stderr
+
+
 def test_ncu_wraps_with_filter_count_and_set():
     out, wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm|moe', '', '')
     assert out.returncode == 0, out.stderr

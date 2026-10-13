@@ -1194,6 +1194,24 @@ extern "C" cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream) {
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_device_synchronize(void) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaDeviceSynchronize failed", err);
+  }
+  if (graph_census_enabled()) {
+    int device = -1;
+    cudaGetDevice(&device);
+    drain_census_spans(device);
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+              "CUDA device synchronization is unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_stream_synchronize(void* cuda_stream) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   cudaError_t err = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(cuda_stream));

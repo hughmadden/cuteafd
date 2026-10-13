@@ -1830,6 +1830,12 @@ impl<'a> GlmfEngine<'a> {
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
             2 * self.prefill_lane_count, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
+        routes.trace_identity("glmf-tp2-routes");
+        for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
+            RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
+            self.exchange()?.require_cooperative_producer_stream(rank, producer)?;
+            routes.require_cooperative_producer_stream(rank, producer)?;
+        }
         let combine = FusedCombine::new(self.library, ExchangeDtype::Bf16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok().map(|s| s.parse::<usize>())
             .transpose().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval")?.unwrap_or(0);
@@ -1848,6 +1854,9 @@ impl<'a> GlmfEngine<'a> {
                 _ => {}
             }
             if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
+        }
+        if let Some(drafter) = &self.drafter {
+            if let Err(error) = drafter.publish_abort() { failures.push(format!("draft bridge: {error:#}")); }
         }
         ensure!(failures.is_empty(), "GLM Flash TP2 abort publication: {}", failures.join("; "));
         Ok(())
@@ -2164,6 +2173,7 @@ impl<'a> GlmfEngine<'a> {
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
+        exchange.trace_identity("glmf-target-main");
         // Both GPUs run the indexer; per-rank index tails are not built yet.
         ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
@@ -2243,10 +2253,74 @@ impl<'a> GlmfEngine<'a> {
 
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
-        drain_ranks(self.ranks(), |rank| {
+        let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
+            if rank == self.ranks() { return self.drafter.as_ref().unwrap().synchronize_remote(); }
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
-        })
+        });
+        if let Some(drafter) = &self.drafter { drafter.finish_terminal(result.is_ok()); }
+        result
+    }
+
+    /// Replay-only discriminator: drain even streams outside the engine's inventory.
+    pub(crate) fn replay_device_sync(&self) -> Result<()> {
+        for rank in 0..self.ranks() {
+            self.on(rank, || self.library.cuda_device_synchronize())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_owner_ranges(&self) -> Result<serde_json::Value> {
+        let mut target = Vec::new();
+        for rank in 0..self.ranks() {
+            let device = if rank == 1 { self.peer()?.device } else { self.device };
+            let caches = self.caches_of(rank);
+            for (name, buffer) in [("kda_state", caches.kda_state.buffer),
+                ("kda_conv", caches.kda_conv.buffer), ("kda_replay", caches.kda_replay),
+                ("commit_tables", caches.commit_tables.buffer), ("pool_logical", caches.pool_logical.buffer)] {
+                target.push((device, format!("target/{name}"), buffer));
+            }
+            for (layer, buffer) in caches.kv.iter().enumerate() {
+                if let Some(buffer) = buffer {
+                    target.push((device, format!("target/layer{layer}/kv"), buffer.buffer));
+                }
+            }
+            for (layer, index) in caches.index.iter().enumerate() {
+                if let Some(index) = index {
+                    target.push((device, format!("target/layer{layer}/index_pool"), index.pools.buffer));
+                    if let Some(keys) = &index.keys {
+                        target.push((device, format!("target/layer{layer}/index_keys"), keys.buffer));
+                    }
+                }
+            }
+            if let Some((tails, records)) = &caches.index_tails {
+                target.push((device, "target/index_tails".into(), tails.buffer));
+                target.push((device, "target/index_replay".into(), records.buffer));
+            }
+        }
+        let writes = match &self.drafter {
+            Some(super::dspark::Drafter::RemoteDflash(d)) => d.replay_write_ranges(),
+            Some(super::dspark::Drafter::Dflash2(d)) => d.replay_write_ranges().into_iter()
+                .map(|(name, buffer)| (self.device, name, buffer)).collect(),
+            _ => Vec::new(),
+        };
+        let encode = |ranges: &[(i32, String, cuteafd_ffi::CuteafdDeviceBuffer)]| {
+            ranges.iter().map(|(device, name, buffer)| serde_json::json!({"device": device,
+                "name": name, "start": buffer.ptr as usize, "bytes": buffer.bytes})).collect::<Vec<_>>()
+        };
+        let mut overlaps = Vec::new();
+        for (device, name, buffer) in &writes {
+            let start = buffer.ptr as usize;
+            let end = start.checked_add(buffer.bytes).context("draft owner range overflow")?;
+            for (other_device, other_name, other) in &target {
+                let other_start = other.ptr as usize;
+                let other_end = other_start.checked_add(other.bytes).context("target owner range overflow")?;
+                if device == other_device && start < other_end && other_start < end {
+                    overlaps.push(serde_json::json!({"write": name, "target": other_name, "device": device}));
+                }
+            }
+        }
+        Ok(serde_json::json!({"target": encode(&target), "draft_writes": encode(&writes), "overlaps": overlaps}))
     }
 
     /// Before a sequence's first step: zeroes its KDA state and maps its pool pages.
@@ -2270,8 +2344,10 @@ impl<'a> GlmfEngine<'a> {
             // Entries other sequences' queued steps read keep their values.
             for rank in 0..self.ranks() {
                 let map = self.caches_of(rank).pool_logical.buffer;
-                self.on(rank, || self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
-                    bytes_of(&host[..])))?;
+                // SAFETY: each rank's map consumers run on its owned stream.
+                self.on(rank, || unsafe { self.library.copy_h2d_ordered(
+                    cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
+                    bytes_of(&host[..]), self.stream_of(rank)) })?;
             }
         }
         Ok(())
@@ -2625,7 +2701,8 @@ impl<'a> GlmfEngine<'a> {
         let t = tokens.len();
         let host = std::time::Instant::now();
         let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
-        self.library.copy_h2d(staged, &embed)?;
+        // SAFETY: embedding scratch is read/written only on the engine stream.
+        unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
         self.host_op("host: embedding upload", host);
         self.timed("stream expansion", || {
             for s in 0..HC {
@@ -2636,7 +2713,7 @@ impl<'a> GlmfEngine<'a> {
                     ..w.streams[0].buffer
                 };
                 // SAFETY: both buffers are live workspace buffers of at least `t` pitched
-                // rows; the upload above completed before the copies are queued.
+                // rows; the upload precedes these copies on the same stream.
                 unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
             }
             Ok(())
@@ -2645,7 +2722,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// The device table's rows of the `t` staged ids, four copies each, into stream buffer 0.
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
-        // SAFETY: the ids are on the device (a completed copy) and the streams hold t x 4 rows.
+        // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
             w.streams[0].buffer.ptr, self.stream) }
     }
@@ -2688,7 +2765,11 @@ impl<'a> GlmfEngine<'a> {
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
         let bytes = bytes_of(values);
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        let rank = usize::from(self.peer.as_ref().is_some_and(|p| p.device == dev.buffer.device_id));
+        // SAFETY: this engine owns the destination and its rank stream; uploads
+        // precede new consumers and follow previous consumers outside capture.
+        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
+            bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
@@ -2954,6 +3035,8 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
+    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
+
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
         if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
@@ -3055,11 +3138,8 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.pool_table, &tables.pool_table)
     }
 
-    /// Writes a step's tables into rank 1's `w1` after its stream drained (every wait on it is
-    /// matched by a push rank 0 queued earlier, so it drains).
+    /// Upload rank 1's tables after its prior consumers on the peer stream.
     fn peer_tables(&self, w1: &Workspace<'_>, tables: &StepTables) -> Result<()> {
-        // SAFETY: the engine owns the peer stream.
-        self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
         self.on(1, || self.put_tables(w1, tables))
     }
 

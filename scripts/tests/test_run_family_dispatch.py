@@ -77,7 +77,7 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
-    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE"]
+    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE", "DRAFT_SURVIVAL_LENGTHS"]
     keys = "".join(f"{name}={value}\n" for name in names) if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
@@ -180,6 +180,42 @@ def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None
         assert "self.peer_workspaces(" not in body
     header = (ROOT / "native/shared/include/cuteafd_experts.h").read_text()
     assert "No output/input overlap." in header
+
+
+def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
+    family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
+    remote = (family / "remote_dflash.rs").read_text()
+    shared = (family.parent / "glm5/dflash.rs").read_text()
+    update = shared.split("    pub(crate) fn update_with(", 1)[1].split("    fn put(", 1)[0]
+    assert update.index("self.put(&self.context_positions") < update.index("ready()?")
+    assert update.index("self.put(&self.context_slots") < update.index("ready()?") < update.index("self.linear(")
+    draft = shared.split("    fn draft_from(", 1)[1].split("let (s, l)", 1)[0]
+    for metadata in ("positions", "tables", "anchors"):
+        assert draft.index(f"self.put(&w.{metadata}") < draft.index("input(&ids, w.h.buffer")
+    transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
+    assert transport.index("self.synchronize()?") < transport.index("self.draft.update_with(")
+    assert transport.index("self.exchange.wait(0, TAPS)") < transport.index("self.exchange.push_planes(0, TAPS")
+    assert transport.index("self.exchange.wait(1, TAPS)") < transport.index("self.exchange.signal(1, TAPS)")
+    taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
+    assert "self.target.taps.buffer.ptr" in taps and "push_planes" not in taps
+    owner = remote.split("pub(crate) struct RemoteDflash", 1)[1].split("impl<'a>", 1)[0]
+    assert owner.index("pub draft:") < owner.index("exchange:") < owner.index("stream:")
+    drain = (family / "engine.rs").read_text().split("    pub(crate) fn synchronize(", 1)[1].split("    fn start(", 1)[0]
+    assert drain.index("drain_ranks(") < drain.index("drafter.finish_terminal(result.is_ok())")
+    assert "synchronize_remote()" in drain
+    serving = (family / "serve.rs").read_text()
+    assert "drafter.require_live()?;" in serving
+    prime = remote.split("    pub fn prime(", 1)[1].split("    fn launch_head(", 1)[0]
+    assert "self.draft.prime_remote()" in prime
+    assert "self.launch_head(&head, rows)?" in prime
+    assert "cuda_stream_synchronize(self.exchange.stream(0))" in prime
+    assert "self.exchange.wait(" not in prime and "self.exchange.push" not in prime
+    isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
+    assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
+    assert "self.draft_device_with(" in isolated
+    assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
+    startup = (family / "mod.rs").read_text().split("    pub fn with_engine<", 1)[1]
+    assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
 
 def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
@@ -369,6 +405,8 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
         for part in ("bin", "lib", "share"):
             assert f"wip-run/plan-test/slot-test/serve-default/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
+        # Draft snapshots resolve under HF_HOME; the hub is mounted at /hf/hub.
+        assert "HF_HOME=/hf" in preflight and ":/hf/hub:ro" in preflight
 
 
 @pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
@@ -988,6 +1026,7 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "GLM5_FLASH_DRAFT_TRACE must be"),
+    ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
@@ -1990,6 +2029,42 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
     if kind != "off":
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("setting,value,legacy", [("on", "1", "0"), ("off", "0", "1")])
+def test_glmf_remote_drafter_config_overrides_env_for_plan_and_server(tmp_path, setting, value, legacy):
+    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REMOTE_DRAFTER={setting}\n",
+                                  encoder_plan=plan, extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": legacy})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    server = next(line for line in lines if "cuteafd serve-glmf" in line)
+    for command in (planner, server):
+        assert command.count("-e CUTEAFD_GLMF_REMOTE_DFLASH=") == 1, command
+        assert f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}" in command, command
+    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
+
+
+@pytest.mark.parametrize("value", ["", "0", "1"])
+def test_glmf_remote_dflash_candidate_env_matches_plan_and_server(tmp_path, value):
+    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                  "RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\n", encoder_plan=plan,
+                                  extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": value})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    server = next(line for line in lines if "cuteafd serve-glmf" in line)
+    expected = f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}"
+    for command in (planner, server):
+        assert (expected in command) == bool(value), command
+    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),

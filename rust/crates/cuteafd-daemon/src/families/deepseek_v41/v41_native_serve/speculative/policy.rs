@@ -153,39 +153,19 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
     let stats = policy.stats();
     let geometry = policy.geometry();
     let (narrow, wide) = (policy.widths()[0], policy.widths()[policy.widths().len() - 1]);
+    let labels: Vec<_> = geometry.classes.iter().map(|class| class.label).collect();
+    // The regimes share one cost model; both keys stay for the stats readers.
     let fit = |shared: bool| {
-        let snapshot = policy.cost_snapshot(shared, 1);
-        let classes: Vec<_> = geometry.classes.iter()
-            .zip(snapshot.layers).map(|(class, c)| serde_json::json!({
-                "class": class.label,
-                "intercept_us": c[0], "us_per_row": c[1], "us_per_mb": c[2],
-                // µs per MB → GB/s: 1 MB / (c µs) = 1000 / c GB/s.
-                "effective_gb_per_s": if c[2] > 0. { 1000. / c[2] } else { f64::INFINITY },
-                "samples": c[3], "residual_scale_us": c[4],
-            })).collect();
         serde_json::json!({
             "warm": policy.warm(shared, 1),
             "concurrency_buckets": ([1, 4, 8, 16].into_iter().map(|requests| {
-                let fit = policy.cost_snapshot(shared, requests);
                 let (timed, error) = policy.prediction_health(shared, requests);
                 serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
                     "requests_up_to": if requests == 16 { None } else { Some(requests) },
                     "warm": policy.warm(shared, requests), "engaged": policy.engaged(shared, requests),
-                    "timed_rounds": timed, "relative_error": error, "round": fit.round, "draft": fit.draft,
-                    "round_local": fit.round_local, "round_pooled": fit.round_pooled,
-                    "round_identified": fit.round_identified, "draft_local": fit.draft_local,
-                    "draft_pooled": fit.draft_pooled, "draft_identified": fit.draft_identified,
-                    "layers_identified": fit.layers_identified, "row_knots": fit.row_knots,
-                    "layer_row_slopes": fit.layer_row_slopes, "layer_row_identified": fit.layer_row_identified,
-                    "round_row_slopes": fit.round_row_slopes, "round_row_identified": fit.round_row_identified})
+                    "timed_rounds": timed, "relative_error": error,
+                    "cost": policy.cost_snapshot(shared, requests).to_json(&labels)})
             }).collect::<Vec<_>>()),
-            "layers": classes,
-            "round": { "intercept_us": snapshot.round[0], "us_per_row": snapshot.round[1],
-                "us_per_request": snapshot.round[2], "samples": snapshot.round[3],
-                "residual_scale_us": snapshot.round[4] },
-            "draft": { "intercept_us": snapshot.draft[0], "us_per_request": snapshot.draft[1],
-                "wide_extra_us": snapshot.draft[2], "wide_extra_us_per_request": snapshot.draft[3],
-                "samples": snapshot.draft[4], "residual_scale_us": snapshot.draft[5] },
         })
     };
     let calibration = policy.calibration();
@@ -202,7 +182,7 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
             stats.position_accepted[p] as f64 / stats.position_reached[p] as f64 } else { 0. },
     })).collect();
     let value = serde_json::json!({
-        "mode": if policy.fixed() { "fixed" } else { "bandwidth" },
+        "mode": if policy.fixed() { "fixed" } else if policy.survival_lengths() { "survival" } else { "bandwidth" },
         "draft_limit": draft_limit,
         "local_layers": local_layers(geometry),
         "remote_expert_bytes": remote_expert_bytes(geometry),

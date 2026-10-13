@@ -194,6 +194,11 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
             "raw_confidence": raw, "calibrated_confidence": calibrated})
     }).collect();
     let fit = policy.cost_snapshot(record.shared, record.requests.len());
+    let labels: Vec<_> = geometry.classes.iter().map(|class| class.label).collect();
+    // The (bucket, regime) the policy used when it selected this round's
+    // shape, which differs from the round's own when grammar or admission
+    // changed the request set in between.
+    let selected = policy.selected_cell().map(|(bucket, shared)| serde_json::json!({"bucket": bucket, "shared": shared}));
     serde_json::json!({"type": "draft_round", "round": policy.stats().rounds,
         "shared": record.shared, "requests": requests, "rows": rows, "routes": routes,
         "route_layout": [geometry.layers.len(), rows, topk],
@@ -202,9 +207,9 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
         "megabytes": megabytes, "layer_us": record.layer_us,
         "total_us": record.times.total_us, "draft_us": record.times.draft_us,
         "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
-        "predicted_us": record.predicted, "row_knots": fit.row_knots,
-        "layer_row_slopes": fit.layer_row_slopes, "round_row_slopes": fit.round_row_slopes,
-        "layer_row_identified": fit.layer_row_identified, "round_row_identified": fit.round_row_identified})
+        "predicted_us": record.predicted, "bucket": cuteafd_core::draft_concurrency_bucket(record.requests.len()),
+        "selected": selected, "length_rule": if policy.survival_lengths() { "survival" } else { "priced" },
+        "cost": fit.to_json(&labels)})
 }
 
 /// What a lane carries from its draft pass and length selection to the
@@ -332,8 +337,10 @@ mod tests {
         }
         assert!(policy.engaged(false, 2));
         let fit = policy.cost_snapshot(false, 2);
-        assert_eq!(fit.layers[0][3], 320.);
-        assert_eq!(fit.round[3], 160.);
+        // Each round teaches the class (one per round, summed over its
+        // layers), the residual and the draft pass once.
+        assert_eq!(fit.layers[0][3], 160.);
+        assert!(fit.round[3] > 0.);
         assert_eq!(fit.draft[4], 160.);
         assert_eq!(policy.stats().emitted_requests, 320);
     }
@@ -371,8 +378,12 @@ mod tests {
         assert_eq!(request["verified_rows"], 3);
         assert_eq!(request["accepted_rows"], 2);
         assert_eq!(request["censor"], "Eos");
-        assert_eq!(value["layer_row_slopes"].as_array().unwrap().len(), 1);
-        assert_eq!(value["row_knots"].as_array().unwrap().len(), 10);
+        assert_eq!(value["cost"]["classes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["cost"]["classes"][0]["class"], "local");
+        assert!(value["cost"]["residual"]["us_per_row"].is_f64());
+        assert_eq!(value["bucket"], 0);
+        assert_eq!(value["selected"], serde_json::json!({"bucket": 0, "shared": false}));
+        assert_eq!(value["length_rule"], "priced");
     }
 
     #[test]

@@ -544,8 +544,10 @@ fi
 # the family variables, which are set too for one release.
 trace_args=()
 # Experimental shared policy changes stay off until emitted-throughput gates pass.
-for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE; do
-  if [[ $family == glm5 && -n "$(get "$policy_key")" ]]; then
+for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE DRAFT_SURVIVAL_LENGTHS; do
+  # DRAFT_SURVIVAL_LENGTHS (every shared-policy family, GLM 5.3 included):
+  # verify drafts while calibrated survival >= 0.5 instead of pricing rows.
+  if [[ $family == glm5 && $policy_key != DRAFT_SURVIVAL_LENGTHS && -n "$(get "$policy_key")" ]]; then
     echo "$policy_key was removed for GLM 5.3: it always runs the shared draft policy; delete the key" >&2
     exit 2
   fi
@@ -930,6 +932,11 @@ if [[ $family == glm5_flash ]]; then
     on) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_TRACE=1") ;;
     *) echo "GLM5_FLASH_DRAFT_TRACE must be on or off" >&2; exit 2 ;;
   esac
+  remote_drafter="$(get GLM5_FLASH_REMOTE_DRAFTER)"
+  case "$remote_drafter" in
+    ""|on|off) ;;
+    *) echo "GLM5_FLASH_REMOTE_DRAFTER must be on or off" >&2; exit 2 ;;
+  esac
   spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
   if [[ -n "$spec_tau" ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
@@ -961,7 +968,14 @@ case "$family" in
   glm5_flash)
     rdma_endpoints="${prefill_lanes:-2}"
     if [[ "${CUTEAFD_GLMF_PREFILL_LANES:-}" == 1 ]]; then rdma_endpoints=1; fi
-    [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES") ;;
+    [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES")
+    # Planner and server must offer the same conditional drafter homes.
+    # Explicit config overrides the legacy process-wide diagnostic switch.
+    case "$remote_drafter" in
+      on) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=1) ;;
+      off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
+      "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
+    esac ;;
   qwen4) rdma_endpoints=1 ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
@@ -1058,7 +1072,8 @@ audio_encoder_hash=""
       plan_draft_args+=("$flag" "$value")
     fi
   done
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
+  # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
     "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -1395,6 +1410,9 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 #                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
+#                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
+#                     power and DRAM/SM activity into the same report (an index
+#                     list uses nsys's device order, not CUDA's).
 #   ncu               the coordinator runs under `ncu`, replaying the first
 #                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
 #                     required regex PROFILE_NCU_KERNEL, collecting section set
@@ -1412,7 +1430,7 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
 release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
-  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)"
+  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
 profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 [[ -z "$(get PROFILE_DIR)" ]] || { mkdir -p "$(get PROFILE_DIR)"; release_require_writable_state "$(get PROFILE_DIR)"; }

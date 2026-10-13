@@ -110,6 +110,157 @@ def test_cuda_build_attests_real_header_and_always_wraps_registration():
     assert 'elapsed_ms = started.elapsed().as_secs_f64() * 1000.0' in constructor
 
 
+def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
+    native = (ROOT / "native/shared/cuda/peer_exchange.cu").read_text()
+    wait = native.split("__global__ void wait_flag_abortable", 1)[1].split(
+        "__global__ void publish_abort", 1)[0]
+    timeout = wait.split("global_ns() - start > kWaitTimeoutNs", 1)[1]
+    for field in ["flag=%p", "state=%p", "aborted=%p", "expected=%u", "observed=%u",
+                  "receive=%u", "abort=%u"]:
+        assert field in timeout
+    assert timeout.index("printf(") < timeout.index("__trap()")
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
+    identity = shared.split("pub fn trace_identity", 1)[1].split(
+        "pub fn terminal_state", 1)[0]
+    assert 'if self.ends[0].progress.is_none()' in identity
+    assert 'var("CUTEAFD_PEER_WAIT_DIAGNOSTICS")' in shared
+    for field in ["device =", "stream =", "flag_index =", "receive_state =", "abort ="]:
+        assert field in identity
+    assert "synchronize(" not in identity
+    assert "copy_d2h" not in identity
+    family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
+    engine = (family / "engine.rs").read_text()
+    assert 'routes.trace_identity("glmf-tp2-routes")' in engine
+    assert 'exchange.trace_identity("glmf-target-main")' in engine
+    assert 'exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits")' in (
+        family / "remote_dflash.rs").read_text()
+
+
+def test_peer_diagnostics_keep_graph_identity_and_dump_both_rank_frontiers(tmp_path):
+    native = (ROOT / "native/shared/cuda/peer_exchange.cu").read_text()
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/peer_exchange.rs").read_text()
+    assert "template<bool Diagnostic = false>" in native
+    for kernel in ["push_signal", "push_planes", "wait_flag_abortable"]:
+        assert f"reinterpret_cast<const void*>({kernel}<true>)" in native
+        assert f"{kernel}<false><<<" in native
+    dump = native.split("__device__ void diagnostic_dump", 1)[1].split(
+        "__device__ void diagnostic_push_enter", 1)[0]
+    for field in ["d.peer_control", "d.local_control", "d.peer", "d.local",
+                  "push_issue=%llu", "wait_issue=%llu", "published=%u", "observed=%u"]:
+        assert field in dump
+    issue = shared.split("fn diagnostic(&self", 1)[1].split("pub fn terminal_state", 1)[0]
+    assert "PEER_ISSUE.fetch_add" in issue
+    assert 'seq = "device-runtime"' in issue
+    assert '"peer host issue begin"' in issue
+    assert '"peer host issue returned"' in issue
+    assert "copy_d2h" not in issue and "synchronize(" not in issue
+    for symbol in ["peer_push_signal_diagnostic", "peer_push_planes_diagnostic", "peer_wait_diagnostic"]:
+        assert symbol in shared and symbol in ffi
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    source = tmp_path / "peer-abi.cc"
+    source.write_text('''#include "cuteafd_peer_exchange.h"
+#include <cstddef>
+static_assert(sizeof(cuteafd_peer_progress_t) == 48);
+static_assert(offsetof(cuteafd_peer_progress_t, published) == 24);
+static_assert(offsetof(cuteafd_peer_diagnostic_t, issue) == 32);
+static_assert(offsetof(cuteafd_peer_diagnostic_t, rank) == 48);
+static_assert(sizeof(cuteafd_peer_diagnostic_t) == 64);
+''')
+    result = subprocess.run([compiler, "-std=c++17", "-I", str(ROOT / "native/shared/include"),
+                             "-fsyntax-only", str(source)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
+    family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
+    remote = (family / "remote_dflash.rs").read_text()
+    update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
+    assert update.count("self.synchronize()?") == 1
+    ack = update.index("self.exchange.signal(1, TAPS)?")
+    assert update.index("self.synchronize()?") < ack < update.rindex("Ok(())")
+    event = update.index("cuda_event_record(self.target_ready.raw, self.target_peer.stream)")
+    wait = update.index("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)")
+    assert update.index("self.exchange.push_planes(0, TAPS") < event < wait
+    assert wait < update.index("self.exchange.wait(1, TAPS)") < ack
+    assert "chunk-N+1 waits" in update
+    assert "cuda_event_create_ordering" in remote
+    assert "target_ready: Event<'a>" in remote
+    assert remote.index("target_ready: Event<'a>", remote.index("pub(crate) struct RemoteDflash")) < remote.index(
+        "stream: Stream<'a>", remote.index("pub(crate) struct RemoteDflash"))
+    startup = (family / "mod.rs").read_text()
+    assert startup.index("engine.drafter = self.load_drafter") < startup.index("draft.validate_target_peer(")
+    engine = (family / "engine.rs").read_text()
+    assert "self.exchange()?.require_cooperative_producer_stream(rank, producer)?" in engine
+    assert "routes.require_cooperative_producer_stream(rank, producer)?" in engine
+    # Preserve intermediate context waves, and apply the same edge to decode.
+    draft_dispatch = (family / "dspark.rs").read_text()
+    assert "Self::RemoteDflash(d) => d.update(rows)" in draft_dispatch
+    bench = (family / "speculate.rs").read_text().split(
+        "draft_prefill_bench(args, &golden", 1)[1].split("fn draft_prefill_bench", 1)[0]
+    assert bench.index("engine.prefill_device(") < bench.index("drafter.update(")
+    assert "for chunk in prompt.chunks" in bench
+
+
+def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    helper = source.split("cuteafd_status_t cublas_handle(", 1)[1].split(
+        "cuteafd_status_t validate_linear_args", 1)[0]
+    mock = r'''
+#include <cassert>
+#include <unordered_map>
+using cuteafd_status_t = int;
+using cublasHandle_t = int*;
+using cublasStatus_t = int;
+using cudaError_t = int;
+constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
+constexpr int cudaSuccess = 0, CUBLAS_STATUS_SUCCESS = 0;
+static int device = 0, device_error = 0, create_error = 0, creates = 0, logs = 0;
+static int owners[8];
+int cudaGetDevice(int* out) { *out = device; return device_error; }
+int cublasCreate(cublasHandle_t* out) {
+  ++creates;
+  if (create_error) return create_error;
+  owners[creates] = device;
+  *out = &owners[creates];
+  return 0;
+}
+int status_from_cuda(int status) { return status; }
+int status_from_cublas(int status) { return status; }
+void log_blas_handle_created(const char*) { ++logs; }
+'''
+    main = r'''
+int main() {
+  cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
+  assert(cublas_handle(nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(creates == 0);
+  assert(cublas_handle(&first) == 0 && *first == 0);
+  device = 1; create_error = 7;
+  assert(cublas_handle(&second) == 7 && second == nullptr);
+  create_error = 0;
+  assert(cublas_handle(&second) == 0 && *second == 1 && first != second);
+  device = 0;
+  assert(cublas_handle(&again) == 0 && again == first);
+  device = 1;
+  assert(cublas_handle(&again) == 0 && again == second);
+  device_error = 19;
+  assert(cublas_handle(&again) == 19 && again == second);
+  assert(creates == 3 && logs == 2);
+}
+'''
+    fixture = tmp_path / "blas_handles.cc"
+    fixture.write_text(mock + "cuteafd_status_t cublas_handle(" + helper + main)
+    executable = tmp_path / "blas_handles"
+    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    str(fixture), "-o", str(executable)], check=True, capture_output=True)
+    subprocess.run([str(executable)], check=True, capture_output=True)
+
+
 def test_inventory_signature_matches_installed_toolkit_without_cuda_initialization(tmp_path):
     header = Path("/usr/local/cuda/include/crt/host_runtime.h")
     compiler = shutil.which("g++")

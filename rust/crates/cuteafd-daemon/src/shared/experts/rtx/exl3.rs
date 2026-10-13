@@ -1,9 +1,9 @@
 //! EXL3 TP2 rank execution: raw FP32 partials, without finish or re-quantization.
-use super::native::{kernel_capacities, output_bytes, validate_layers, RankCompletion};
+use super::native::{output_bytes, validate_layers, RankCompletion};
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
 use crate::shared::experts::{
     exl3::{
-        execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
+        execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
         Exl3Weights,
     },
     layer::ExpertLayer,
@@ -26,6 +26,7 @@ pub(crate) struct Exl3Tp2<'a> {
     rank: u8,
     layers: Range<usize>,
     geometry: ExpertGeometry,
+    row_policy: Exl3RowPolicy,
     max_rows: usize,
     workspace_bytes: usize,
     executions: Option<DeviceOwner<'a, Vec<Exl3Execution<'a>>>>,
@@ -48,8 +49,8 @@ fn load_layer_pairs<T, W>(
     Ok(ranks)
 }
 
-fn directories(package: &Path, max_rows: usize) -> Result<Vec<PathBuf>> {
-    Ok(kernel_capacities(max_rows)?
+fn directories(package: &Path, max_rows: usize, row_policy: Exl3RowPolicy) -> Result<Vec<PathBuf>> {
+    Ok(row_policy.capacities(max_rows)?
         .into_iter()
         .map(|c| package.join(format!("m{c}")))
         .collect())
@@ -66,7 +67,16 @@ impl<'a> Exl3Tp2<'a> {
         hidden: usize,
         max_rows: usize,
     ) -> Result<usize> {
-        let paths = directories(package, max_rows)?;
+        Self::workspace_bytes_for_policy(package, hidden, max_rows, Exl3RowPolicy::active())
+    }
+
+    fn workspace_bytes_for_policy(
+        package: &Path,
+        hidden: usize,
+        max_rows: usize,
+        row_policy: Exl3RowPolicy,
+    ) -> Result<usize> {
+        let paths = directories(package, max_rows, row_policy)?;
         for path in &paths {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
@@ -120,6 +130,7 @@ impl<'a> Exl3Tp2<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
         ensure!(geometry == expert_geometry(), "EXL3 TP2 geometry differs from native process geometry");
+        let row_policy = Exl3RowPolicy::for_geometry(geometry);
         ensure!(
             devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid EXL3 TP2 device pair"
@@ -154,6 +165,7 @@ impl<'a> Exl3Tp2<'a> {
                 rank: 0,
                 layers: layers.clone(),
                 geometry,
+                row_policy,
                 max_rows,
                 workspace_bytes: workspace_bytes[0],
                 executions: None,
@@ -166,6 +178,7 @@ impl<'a> Exl3Tp2<'a> {
                 rank: 1,
                 layers: layers.clone(),
                 geometry,
+                row_policy,
                 max_rows,
                 workspace_bytes: workspace_bytes[1],
                 executions: None,
@@ -205,12 +218,12 @@ impl<'a> Exl3Tp2<'a> {
             ranks
         };
         for (index, rank) in ranks.iter_mut().enumerate() {
-            let paths = directories(packages[index], max_rows)?;
+            let paths = directories(packages[index], max_rows, row_policy)?;
             rank.executions = Some(rank.device.own(|| {
                 let arena = Exl3Workspace::new(rank.device.library, &paths)?;
                 paths
                     .iter()
-                    .zip(kernel_capacities(max_rows)?)
+                    .zip(row_policy.capacities(max_rows)?)
                     .map(|(path, capacity)| {
                         // SAFETY: trusted pinned packages; capacities serialize on the rank stream.
                         let execution = unsafe {
@@ -306,13 +319,14 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
                 buffer(routes.ids, self.geometry.topk as usize * 4),
                 buffer(routes.weights, self.geometry.topk as usize * 4),
             ];
+            let required = self.row_policy.required_capacity(rows);
             self.device.run(|| {
                 let execution = self
                     .executions
                     .as_mut()
                     .expect("initialized EXL3 rank")
                     .iter_mut()
-                    .find(|e| e.capacity() >= rows)
+                    .find(|e| e.capacity() >= required)
                     .unwrap();
                 // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
                 unsafe {
@@ -394,21 +408,53 @@ mod tests {
         let private = 2 * (32 + 16);
         let wire_decode = (1 + 16) * 8 * 2;
         assert_eq!(
-            Exl3Tp2::workspace_bytes_for(root.path(), 8, 16)?,
+            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::Nearest)?,
             1024 + private + wire_decode + 16 * 8 * 4
         );
         assert_eq!(
-            Exl3Tp2::workspace_bytes_for(root.path(), 8, 3)?,
+            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 3, Exl3RowPolicy::Nearest)?,
             1024 + private + wire_decode + 3 * 8 * 4
         );
-        assert!(Exl3Tp2::workspace_bytes_for(root.path(), 16, 16).is_err());
+        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 16, 16, Exl3RowPolicy::Nearest).is_err());
+        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::GlmFlashK64).is_err());
+        let directory = root.path().join("m80");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": 80, "hidden": 8, "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
+                "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
+            }
+        }))?)?;
+        for rows in [2, 3, 8, 16] {
+            assert_eq!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::GlmFlashK64)?,
+                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_policy_selects_preloaded_tp2_capacities() -> Result<()> {
+        for policy in [Exl3RowPolicy::Nearest, Exl3RowPolicy::GlmFlashK64] {
+            for maximum in [1, 2, 8, 16, 17, 80, 256, 4096] {
+                let paths = directories(Path::new("rtx-tp2"), maximum, policy)?;
+                let capacities = policy.capacities(maximum)?;
+                assert_eq!(paths.len(), capacities.len());
+                for live in 1..=maximum {
+                    let selected = capacities.iter().find(|&&c| c as usize >= policy.required_capacity(live)).unwrap();
+                    if policy == Exl3RowPolicy::GlmFlashK64 && (2..=16).contains(&live) {
+                        assert_eq!(*selected, 80);
+                    }
+                    assert!(paths.contains(&Path::new("rtx-tp2").join(format!("m{selected}"))));
+                }
+            }
+        }
         Ok(())
     }
 
     #[test]
     fn capacity_paths_are_unique_at_exact_boundaries() {
         for rows in [1, 16, 80, 256, 1024, 4096] {
-            let paths = directories(Path::new("rtx-tp2"), rows).unwrap();
+            let paths = directories(Path::new("rtx-tp2"), rows, Exl3RowPolicy::Nearest).unwrap();
             assert_eq!(
                 paths
                     .iter()

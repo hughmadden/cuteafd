@@ -7,6 +7,53 @@ use super::*;
 use crate::native_library_lifetime_fixture::Fixture;
 
 #[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let mut a = library.alloc_device_buffer(4)?;
+    let mut b = library.alloc_device_buffer(4)?;
+    let stream = 1usize as *mut c_void;
+    // SAFETY: the CPU fixture owns both buffers and accepts a synthetic stream.
+    unsafe {
+        library.copy_h2d_ordered(a, &[1, 2, 3, 4], stream)?;
+        library.copy_h2d_ordered(b, &[5, 6, 7, 8], stream)?;
+        library.copy_h2d_ordered(a, &[9, 10, 11, 12], stream)?;
+        assert_eq!(std::slice::from_raw_parts(a.ptr.cast::<u8>(), 4), &[1, 2, 3, 4],
+            "reuse waits only through the previous upload before replacing its source");
+    }
+    library.release_ordered_h2d_staging()?;
+    // SAFETY: the completed fixture uploads initialized these live four-byte buffers.
+    unsafe {
+        assert_eq!(std::slice::from_raw_parts(a.ptr.cast::<u8>(), 4), &[9, 10, 11, 12]);
+        assert_eq!(std::slice::from_raw_parts(b.ptr.cast::<u8>(), 4), &[5, 6, 7, 8]);
+    }
+    assert!(fixture.events()?.contains("CAQR"));
+    library.free_device_buffer(&mut a)?;
+    library.free_device_buffer(&mut b)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let a = library.alloc_device_buffer(4)?;
+    // SAFETY: fixture-owned buffer and synthetic stream stay live for this test.
+    unsafe { library.copy_h2d_ordered(a, &[1, 2, 3, 4], 1usize as *mut c_void)?; }
+    fixture.configure_pack(&library, 0, 1)?;
+    // SAFETY: same fixture stream and destination as above.
+    assert!(unsafe { library.copy_h2d_ordered(a, &[9; 4], 1usize as *mut c_void) }.is_err());
+    assert!(library.is_quarantined_after_failed_drain());
+    let before = fixture.events()?;
+    drop(library);
+    assert_eq!(fixture.events()?, before, "failed fence retains pinned source and module");
+    assert!(fixture.resident()?);
+    Ok(())
+}
+
+#[test]
 #[ignore = "CPU-only budget fixture; requires an explicit NVMe fixture directory"]
 fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() -> Result<()> {
     // The process-wide ceiling is immutable; isolate this test from the other

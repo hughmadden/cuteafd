@@ -160,6 +160,20 @@ def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
         assert key in cache
 
 
+def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/serve.rs").read_text()
+    replay = source.split("let logits = if cold_replay_decode(", 1)[1].split(
+        "if end == p.tokens.len()", 1)[0]
+    text, media = replay.split("if p.media.spans().is_empty()", 1)[1].split("} else {", 1)
+    assert "engine.verify_device(" in text and "chunk, false)?" in text
+    assert "verify_media_device" not in text
+    assert "engine.verify_media_device(" in media
+    assert "engine.prefill_media_device(" in media
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    scoring = engine.split("pub fn verify_media_device(", 1)[1].split("fn decode_step(", 1)[0]
+    assert "Some(media), true)" in scoring, "teacher-forced scoring remains eager"
+
+
 def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     root = ROOT / "rust/crates/cuteafd-daemon/src/families"
     source = (root / "glm5_flash/engine.rs").read_text()
@@ -200,8 +214,13 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert opening.index("engine.prepare_scoring_prefill()") < startup
     assert startup < opening.index("|| body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
-    # Shared DFlash only gains an explicit API; all existing users keep lazy timing.
+    # Only the explicit remote startup primer opts into eager preparation.
     drafter = (root / "glm5/dflash.rs").read_text()
-    prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("fn workspace(", 1)[0]
+    prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("pub(crate) fn prime_remote(", 1)[0]
     assert "self.workspace(self.max_sequences)" in prepare
-    assert "prepare_workspace()" not in drafter
+    prime, existing = drafter.split("pub(crate) fn prime_remote(", 1)[1].split("fn workspace(", 1)
+    assert "self.prepare_workspace()?" in prime
+    assert "prepare_workspace()" not in existing
+    assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]
+    assert 'if let Some(dspark::Drafter::RemoteDflash(draft))' in opening
+    assert opening.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup

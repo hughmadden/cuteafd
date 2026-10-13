@@ -68,6 +68,14 @@ mod tests {
     }
 
     #[test]
+    fn trace_window_matches_runtime_copy_without_changing_selection() {
+        let history = [1, 2, 3, 4, 10, 11, 12, 13, 1, 2, 3, 4];
+        assert_eq!(trace_window(&history, 3), (Some(0), 4, vec![10, 11, 12]));
+        assert_eq!(trace_window(&history, 20).2, window(&history, 20).2);
+        assert_eq!(trace_window(&[], 3), (None, 0, Vec::new()));
+    }
+
+    #[test]
     fn uniform_agreement_replaces_low_confidence_for_every_width() {
         for width in [3, 5, 7] {
             let neural: Vec<_> = (20..20 + width as u32).collect();

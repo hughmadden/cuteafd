@@ -73,6 +73,7 @@ impl<'a> HopLink<'a> {
                 Ok(End {
                     recv: (0..slots).map(|_| zeroed(slot_bytes)).collect::<Result<_>>()?,
                     control: zeroed((flags + 1) * 16)?,
+                    progress: None,
                 })
             })
         };

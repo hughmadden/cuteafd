@@ -647,6 +647,17 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
         let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
             Some(&share.join("PROGRAMS.json")), 4096, tp).unwrap();
         assert_eq!(scratch, 4096*16 + 6*(32+256) + 4096*4096*if tp == 2 {4} else {2});
+        for rows in [2, 4, 9, 16] {
+            let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
+                Some(&share.join("PROGRAMS.json")), rows, tp).unwrap();
+            assert_eq!(scratch, 80*16 + 3*(32+256) + rows*4096*if tp == 2 {4} else {2});
+        }
+        // Narrow admission must require m80 even though m16 fits the live rows.
+        std::fs::remove_file(root.join(format!("rtx-tp{tp}/m80/v41_exl3.json"))).unwrap();
+        assert!(crate::placement::families::glm5_flash::expert_workspace(&catalog,
+            Some(&share.join("PROGRAMS.json")), 16, tp).is_err());
+        assert!(crate::placement::families::glm5_flash::expert_workspace(&catalog,
+            Some(&share.join("PROGRAMS.json")), 1, tp).is_ok());
     }
     assert!(crate::placement::families::glm5_flash::expert_workspace(&catalog,
         Some(&dir.path().join("PROGRAMS.json")), 4097, 2).is_err());
@@ -1536,7 +1547,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_scratch: vec![0; 2], requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let (placed, graphs, working) = glmf::solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
         assert_eq!(working.rtx_layers.len(), expected_rtx);
