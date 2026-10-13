@@ -305,7 +305,7 @@ impl<'a> Exl3Worker<'a> {
         rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping, InstalledExpertVariant};
         let variants = self.executions.iter().map(|execution| InstalledExpertVariant::from_queries(
-            execution.capacity(), |_| Ok(execution.group_rows())))).collect::<Result<Vec<_>>>()?;
+            execution.capacity(), |_| Ok(execution.group_rows()))).collect::<Result<Vec<_>>>()?;
         let selector = match self.row_policy {
             Exl3RowPolicy::Nearest => ExpertGroupingSelector::Exl3Nearest,
             Exl3RowPolicy::GlmFlashK64 => ExpertGroupingSelector::Exl3GlmFlashK64,
