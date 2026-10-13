@@ -4958,7 +4958,9 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            ("integration/cuteafd/glmf.py", 0x4949_583b_7962_90f6_u64),
+            // 1fac01ca adds owned index expansion only; decode projection shapes,
+            // arithmetic routes and thresholds are unchanged.
+            ("integration/cuteafd/glmf.py", 0x708f_0673_eb7e_87cd_u64),
             // 9769b043 adds GlmQueryRope query_row (default heads * latent, the prior stride; GLM
             // Flash decode never passes it), so projection shapes and routes are unchanged.
             ("integration/cuteafd/_glm_kernels.py", 0x3aa5_9169_9149_9ba0),
