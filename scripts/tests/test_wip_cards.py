@@ -562,7 +562,7 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
 # The fair turn as the only mode (off-queue modes: test_wip_coordinator_export_modes.py).
 CUTEAFD_WIP_COORDINATOR_EXPORT=turn
 '''
-    modes = _wip_function('wip_coordinator_export_modes() {', '\n# The SM count a coordinator export')
+    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
     subprocess.run(['bash', '-c', setup + modes + function + '\nbuild_coordinator'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()

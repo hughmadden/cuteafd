@@ -73,12 +73,6 @@ def test_wsl_admission_never_trusts_the_containers_view(tmp_path):
     assert 'mem_get_info' not in SCRIPT.read_text().split('"""', 2)[2]
 
 
-def test_sm_check_refuses_a_host_whose_sm_count_differs_from_the_target():
-    assert run('sm-check', '--live', '188', '--target', '188').returncode == 0
-    refused = run('sm-check', '--live', '188', '--target', '170')
-    assert refused.returncode == placement.NO_TURN and '#122' in refused.stderr
-
-
 def test_watch_passes_through_an_export_that_stays_under_its_cap(tmp_path):
     smi, _ = fake_smi(tmp_path, '0, GPU-o, 65600, 97887, 31000\n')
     done = run('watch', '--smi', str(smi), '--gpu', '0', '--cap-mib', '4000', '--baseline-mib', '65485',

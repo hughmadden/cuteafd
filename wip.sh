@@ -1004,12 +1004,6 @@ wip_coordinator_export_modes() {
   esac
 }
 
-# The SM count a coordinator export is built for (interim #122 check).
-wip_target_sms() {
-  nvidia-smi --query-gpu=uuid,name --format=csv,noheader |
-    awk -F', ' -v u="$RELEASE_COORDINATOR_GPU_UUID" '$1 == u {print $2}' | grep -q '5090' && echo 170 || echo 188
-}
-
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
@@ -1022,7 +1016,7 @@ wip_remote_export() {
   printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
   echo "WIP coordinator export: remote on $host"
   if ! "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
-      "$COORDINATOR_DOCKER_DEV" "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")" "$(wip_target_sms)"; then
+      "$COORDINATOR_DOCKER_DEV" "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"; then
     rm -f "$env_file"
     echo "WIP coordinator export: $host unavailable; next mode" >&2
     return 75

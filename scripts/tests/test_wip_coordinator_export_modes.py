@@ -88,8 +88,8 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.
     assert 'nest replicate --hosts "$host"' in remote and 'wip-native/x86_64/coordinator-120' in remote
-    # Interim #122 guard, marked for removal.
-    assert 'remove once #122 lands' in remote and 'sm-check' in remote
+    # The interim SM-count guard went with #130: no export carries the card's SM count.
+    assert 'sm-check' not in remote and 'sm-check' not in (ROOT / 'scripts/build/export-placement.py').read_text()
 
 
 def test_capped_export_runs_the_native_phase_in_a_one_off_container_on_the_held_gpu(tmp_path):

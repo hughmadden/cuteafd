@@ -13,10 +13,6 @@ export can share a GPU with serving, or with someone else's job, under a cap.
       Read the HOST's nvidia-smi (on WSL2 /usr/lib/wsl/lib/nvidia-smi: a
       container's cudaMemGetInfo cannot see the host's other processes) and
       print `cap_mib jobs used_mib` when the export fits, else exit 75.
-  export-placement.py sm-check --live N --target N
-      INTERIM, remove once #122 lands: exit 75 unless the export host's SM
-      count equals the target card's. AOT exports still bake the live SM count
-      into compiled code (#122), on every export host alike (raptor included).
   export-placement.py hold --gpus 1,0 -- CMD...
       Take the first of those GPUs' hardware locks that is free right now
       (non-blocking flock on ~/.cache/cuteafd/gpuN.lock, never a wait, so no
@@ -170,9 +166,6 @@ def main(argv=None) -> int:
     h = sub.add_parser('hold')
     h.add_argument('--gpus', default='1,0')
     h.add_argument('command', nargs=argparse.REMAINDER)
-    s = sub.add_parser('sm-check')
-    s.add_argument('--live', type=int, required=True)
-    s.add_argument('--target', type=int, required=True)
     w = sub.add_parser('watch')
     w.add_argument('--smi', default='nvidia-smi')
     w.add_argument('--gpu', required=True)
@@ -191,12 +184,6 @@ def main(argv=None) -> int:
                   f'{MIN_CAP_MIB + args.headroom_mib} MiB', file=sys.stderr)
             return NO_TURN
         print(decision[0], decision[1], row[2])
-        return 0
-    if args.action == 'sm-check':  # INTERIM: remove once #122 lands.
-        if args.live != args.target:
-            print(f'export-placement: export host has {args.live} SMs, target card {args.target}; '
-                  'AOT exports bake the live SM count (#122), so this host cannot export for it', file=sys.stderr)
-            return NO_TURN
         return 0
     if args.command[:1] == ['--']:
         args.command = args.command[1:]

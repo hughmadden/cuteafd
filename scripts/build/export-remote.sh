@@ -2,7 +2,7 @@
 # Coordinator native/AOT export on a remote SM120 export host (oliver), with no
 # GPU turn on raptor. Run from raptor by wip.sh's coordinator native phase.
 #
-#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_ID TARGET_SMS
+#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_ID
 #
 # STAGING_DIR is wip.sh's frozen source tree; KEY the native key raptor's Rust
 # phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines).
@@ -15,10 +15,11 @@
 # On HOST: admission reads the HOST's nvidia-smi (on WSL2 a container's
 # cudaMemGetInfo cannot see the host's other processes, e.g. TJ's own jobs);
 # the export runs in a throwaway container of the pinned dev image under a
-# memory watchdog; the interim SM check (#122) refuses a host whose SM count
-# differs from the target card's. Exit 75 means "not here": wip.sh falls back.
+# memory watchdog. Exports carry no exporting-card SM count (#130) and pin
+# their host target (#127), so any SM120 host's export is the same bytes.
+# Exit 75 means "not here": wip.sh falls back.
 set -euo pipefail
-host="$1" staging="$2" key="$3" env_file="$4" image="$5" image_id="$6" target_sms="$7"
+host="$1" staging="$2" key="$3" env_file="$4" image="$5" image_id="$6"
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
 NO_TURN=75
 fqdn="${CUTEAFD_EXPORT_HOST_ADDR:-$host}"
@@ -50,9 +51,9 @@ if [[ ! -f "$archive" ]]; then
   timeout 900 nest replicate --hosts "$host" --wait "$area" >/dev/null
   echo "export-remote: staged source on $host in $((SECONDS - started))s"
   set +e
-  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$target_sms" "$archive" <<'REMOTE'
+  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" <<'REMOTE'
 set -euo pipefail
-area="$1" image="$2" key="$3" target_sms="$4" archive="$5"
+area="$1" image="$2" key="$3" archive="$4"
 NO_TURN=75
 smi=/usr/lib/wsl/lib/nvidia-smi
 [[ -x "$smi" ]] || smi=nvidia-smi
@@ -61,10 +62,6 @@ rm -rf "$root"; mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
 placement="$root/src/scripts/build/export-placement.py"
 python3 "$root/src/scripts/build/assert-build-filesystem.py" "$root"
-# Interim, remove once #122 lands: exports bake the live SM count.
-live_sms="$(docker run --rm --gpus all --entrypoint python3 "$image" -c \
-  'import torch; print(torch.cuda.get_device_properties(0).multi_processor_count)' 2>/dev/null | tail -1)"
-python3 "$placement" sm-check --live "${live_sms:-0}" --target "$target_sms" || exit "$NO_TURN"
 read -r cap jobs baseline < <(python3 "$placement" admit --smi "$smi" --gpu 0) || exit "$NO_TURN"
 echo "export-remote: admitted cap ${cap} MiB, ${jobs} jobs, device ${baseline} MiB in use"
 status=0
