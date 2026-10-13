@@ -88,8 +88,8 @@ impl<'a> WindowState<'a> {
             "window state exceeds budget"
         );
         let value = Self {
-            values: DeviceAllocation::new(library, slots * 128 * 512)?,
-            scales: DeviceAllocation::new(library, slots * 128 * 16)?,
+            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values")?,
+            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales")?,
             ends: DeviceAllocation::new(library, slots * 8)?,
             slots: [Slot::default(); 16],
             writing: Default::default(),
@@ -309,8 +309,8 @@ impl<'a> WindowWeights<'a> {
             normalized: DeviceAllocation::new(self.library, rows * 1024)?,
             positions: DeviceAllocation::new(self.library, rows * 8)?,
             frequencies: DeviceAllocation::new(self.library, rows * 256)?,
-            values: DeviceAllocation::new(self.library, rows * 512)?,
-            scales: DeviceAllocation::new(self.library, rows * 16)?,
+            values: DeviceAllocation::attention_plane(self.library, rows, 512, "window proposal values")?,
+            scales: DeviceAllocation::attention_plane(self.library, rows, 16, "window proposal scales")?,
             destinations: DeviceAllocation::new(self.library, rows * 8)?,
             staging: HostAllocation::new(self.library, rows * 8 + 128)?,
             capacity: rows,

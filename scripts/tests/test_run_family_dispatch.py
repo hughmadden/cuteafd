@@ -26,14 +26,14 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _snapshot(hf: Path, model: str, config: dict) -> None:
+def _snapshot(hf: Path, model: str, config: dict, revision: str = "abc") -> None:
     root = hf / "hub" / f"models--{model.replace('/', '--')}"
     (root / "refs").mkdir(parents=True)
-    (root / "refs" / "main").write_text("abc")
-    (root / "snapshots" / "abc").mkdir(parents=True)
-    (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
+    (root / "refs" / "main").write_text(revision)
+    (root / "snapshots" / revision).mkdir(parents=True)
+    (root / "snapshots" / revision / "config.json").write_text(json.dumps(config))
     if config.get("audio_config"):
-        audio = root / "snapshots" / "abc" / "audio_tokenizer"
+        audio = root / "snapshots" / revision / "audio_tokenizer"
         audio.mkdir()
         (audio / "config.json").write_text("{}")
         (audio / "model.safetensors").write_bytes(b"stub")
@@ -132,10 +132,17 @@ def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: s
 
 
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
-def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value) -> None:
-    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
-                                            "first_k_dense_replace": 3}, "zai-org/GLM-5.3",
-                                  f"ATTENTION_PLAN_ROWS={value}\n" if value else "")
+@pytest.mark.parametrize("config,model", [
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "zai-org/GLM-5.3"),
+    ({"model_type": "deepseek_v41"}, "deepseek-ai/DeepSeek-V4.1-Flash"),
+])
+def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value, config, model) -> None:
+    keys = f"ATTENTION_PLAN_ROWS={value}\n" if value else ""
+    if config["model_type"] == "deepseek_v41":
+        keys += ("MODEL_REVISION=\nDSPARK=off\nVISION=off\nRTX_GPUS=1\n"
+                 "RTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\n"
+                 "SPARK_1_LANE_A=10.0.0.2\n")
+    result = _family_launch_result(tmp_path, config, model, keys)
     assert result.returncode == 0, result.stderr
     launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
     if value in (None, "auto"):
@@ -350,6 +357,14 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
+    native_v41 = family_config.get("model_type") == "deepseek_v41"
+    if native_v41:
+        programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
+        (repo / programs.parent).mkdir(parents=True)
+        shutil.copy(ROOT / programs, repo / programs)
+        shutil.copy(ROOT / "scripts" / "launch" / "select-release-gpus.py", repo / "scripts" / "launch")
+        (repo / "scripts" / "build").mkdir(exist_ok=True)
+        (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     wip = "--wip" in extra_args
     exact_count = 0 if "EXPERT_BACKEND=local" in keys else 1
     for line in keys.splitlines():
@@ -358,10 +373,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if encoder_plan is not None:
         encoder_plan = {**encoder_plan, "spark_ranks": exact_count}
     if wip:
-        (repo / "scripts" / "build").mkdir()
+        (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
-    _snapshot(hf, model, family_config)
+    _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
     if family_config.get("model_type") == "glm_moe_dsa":
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
@@ -382,7 +397,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     ('case "$*" in *"cuteafd plan"*) n=1; prev=""; for a in "$@"; do '
                                      '[[ "$prev" != --spark-ranks ]] || n="$a"; prev="$a"; done; '
                                      'printf \'{"spark_ranks":%s}\\n\' "$n" ;; esac\n'
-                                     if tool == "docker" and preferred_ranks is None and encoder_plan is None else '') +
+                                     if tool == "docker" and preferred_ranks is None and encoder_plan is None and not native_v41 else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(encoder_plan)}' ;; esac\n"
                                      if tool == "docker" and encoder_plan is not None else '') +
                                     ("case \"$*\" in top*) printf '%s\\n' PID " +
@@ -390,8 +405,15 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and container_pids else '') +
                                     (f"case \"$*\" in inspect*) echo '[\"serve-qwen4\",\"--peers\",\"{previous_peers}\"]' ;; esac\n"
                                      if tool == "docker" and previous_peers is not None else ''))
+        if tool == "ssh" and native_v41:
+            with (bin_dir / tool).open("a") as stream:
+                stream.write('case "$*" in *spark_tp_roles*) echo tp2 ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
+            if native_v41:
+                stub += ('case "$*" in container\\ inspect*|inspect\\ *) exit 1 ;; image\\ inspect*) echo test-pin ;; esac\n'
+                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_rows":4096}\\n\' '
+                         '"$STUB_SPARK_COUNT" ;; esac\n')
             if program_manifest is None:
                 stub += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
             else:
@@ -418,11 +440,21 @@ exec python3 -c "$code" "$@"
                                          " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
                                          ' ;; *) echo 0; echo 1 ;; esac\n')
     (bin_dir / "nvidia-smi").chmod(0o755)
+    if native_v41:
+        (bin_dir / "nvidia-smi").write_text(
+            '#!/usr/bin/env bash\ncase "$*" in '
+            '*index,uuid,pci.bus_id,memory.total,memory.free*) '
+            f'echo "0, GPU-00000000-0000-0000-0000-000000000000, 00000000:01:00.0, {gpu_total_mib}, {gpu_free_mib}" ;; '
+            '*index,uuid,pci.bus_id*) echo "0, GPU-00000000-0000-0000-0000-000000000000, 00000000:01:00.0" ;; '
+            f'*memory.total*) echo {gpu_total_mib} ;; *memory.free*) echo {gpu_free_mib} ;; *) echo 0 ;; esac\n')
+        (bin_dir / "curl").write_text(
+            '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}\'\n')
     config = repo / "f.config"
     initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
-           "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), **(extra_env or {})}
+           "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), "STUB_SPARK_COUNT": str(exact_count),
+           **(extra_env or {})}
     env["HOME"] = str(tmp_path / "home")
     if not with_nest:
         # Hide any nest the host has, keeping only the stub directory and the system tools.

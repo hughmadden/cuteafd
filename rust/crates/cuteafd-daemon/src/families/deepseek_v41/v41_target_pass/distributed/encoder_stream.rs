@@ -46,6 +46,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>,
         keep_running: &dyn Fn() -> bool,
     ) -> Result<()> {
+        self.set_attention_decode(false);
+        other.set_attention_decode(false);
         ensure!(
             !chunks.is_empty() && chunks.iter().all(|chunk| !chunk.is_empty()),
             "empty encoder stream"

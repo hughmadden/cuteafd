@@ -43,6 +43,16 @@ impl<'a> DualAttentionWave<'a> {
             tails: GraphBank::new(None),
         })
     }
+    pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
+        for half in &mut self.halves {
+            let device = half.device;
+            device.run(|| half.get_mut().install_attention_plan(plan))?;
+        }
+        Ok(())
+    }
+    pub fn set_decode(&mut self, decode: bool) {
+        for half in &mut self.halves { half.get_mut().set_decode(decode); }
+    }
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
         for half in &mut self.halves {
             let device=half.device;

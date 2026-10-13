@@ -148,6 +148,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn captured_layer_us(&self) -> Vec<Option<f64>> {
         self.lane.layer_clock().read()
     }
+    pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
+        self.lane.install_attention_plan(plan)
+    }
+    pub fn set_attention_decode(&mut self, decode: bool) { self.lane.set_attention_decode(decode); }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         self.lane.reserve_sparse_decode_rows(rows)
     }
@@ -198,7 +202,18 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         placement: u64,
         selected: &[usize],
     ) -> Result<TargetLogits<'_>> {
+        self.set_attention_decode(false);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "ordinary target execute requires full phase");
+        unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
+        self.head.output()
+    }
+    /// Full-logit decode uses the same fixed attention as device-scored verification.
+    /// # Safety
+    /// Same ownership and lifetime contract as `execute`.
+    pub async unsafe fn execute_decode(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize]) -> Result<TargetLogits<'_>> {
+        self.set_attention_decode(true);
+        ensure!(batch.cache()?.stage() == CacheStage::Full, "decode target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
         self.head.output()
     }
@@ -209,12 +224,14 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         requests: &std::cell::RefCell<&mut Requests<'a>>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],
     ) -> Result<TargetLogits<'_>> {
+        self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "shared target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
         self.head.output()
     }
     pub async unsafe fn execute_greedy(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize]) -> Result<Vec<(u32, f32)>> {
+        self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "greedy target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Greedy).await?; }
         self.head.greedy_output()
@@ -222,6 +239,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub async unsafe fn execute_shared_greedy(&mut self,
         requests: &std::cell::RefCell<&mut Requests<'a>>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize]) -> Result<Vec<(u32, f32)>> {
+        self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "shared greedy target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Greedy).await?; }
         self.head.greedy_output()
@@ -234,6 +252,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         batch: &mut RequestBatch, transport: &mut NativeTp4Wave<'a>, placement: u64,
         selected: &[usize], sampling: &[TargetSamplingRowRequest], masks: Option<&[u32]>,
         mask_words: usize, ordered_rows: bool) -> Result<()> {
+        self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "sampled target execute requires full phase");
         let terminal = HeadTerminal::Sampled { requests: sampling, masks, mask_words, ordered_rows };
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, terminal).await?; }
@@ -247,6 +266,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         sampling: &[TargetSamplingRowRequest], masks: Option<&[u32]>, mask_words: usize,
         ordered_rows: bool,
     ) -> Result<()> {
+        self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "shared sampled target execute requires full phase");
         let terminal = HeadTerminal::Sampled { requests: sampling, masks, mask_words, ordered_rows };
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, terminal).await?; }
@@ -264,6 +284,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
     pub async unsafe fn execute_encoder(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, suffix: &mut EncoderSuffix<'a>) -> Result<()> {
+        self.set_attention_decode(false);
         ensure!(batch.cache()?.stage() == CacheStage::Encoder, "encoder execute phase differs");
         unsafe { self.execute_phase(requests, batch, transport, placement, &[], Some(suffix), None, HeadTerminal::Regular).await }
     }
@@ -275,6 +296,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         placement: u64,
         suffix: &mut EncoderSuffix<'a>,
     ) -> Result<()> {
+        self.set_attention_decode(false);
         ensure!(
             batch.cache()?.stage() == CacheStage::EncoderReplay,
             "encoder replay phase differs"
@@ -302,6 +324,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         selected: &[usize],
         encoder: &BlockOutput<'_>,
     ) -> Result<TargetLogits<'_>> {
+        self.set_attention_decode(false);
         ensure!(
             batch.cache()?.stage() == CacheStage::Replay,
             "decoder execute phase differs"

@@ -70,8 +70,8 @@ impl<'a> WindowReplica<'a> {
         let ends=Allocation::new(device,state.ends.buffer.bytes)?;
         device.run(||device.library.copy_h2d(ends.buffer,&vec![0;ends.buffer.bytes]))?;
         Ok(Self { copy:device.run(||device.library.v41_peer_copy())?,
-            values:Allocation::new(device,state.values.buffer.bytes)?,
-            scales:Allocation::new(device,state.scales.buffer.bytes)?,ends,owner:state.owner })
+            values:Allocation::attention_plane(device,state.values.buffer.bytes/512,512,"peer window cache values")?,
+            scales:Allocation::attention_plane(device,state.scales.buffer.bytes/16,16,"peer window cache scales")?,ends,owner:state.owner })
     }
     /// # Safety
     /// The peer stream follows the source's accepted ring writes and end update.

@@ -341,6 +341,7 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()> {
+        self.set_attention_decode(false);
         if batch.cache()?.stage() == CacheStage::EncoderReplay {
             unsafe { self.execute_encoder_replay(requests, batch, transport, 0, suffix).await }
         } else { unsafe { self.execute_encoder(requests, batch, transport, 0, suffix).await } }
@@ -348,18 +349,23 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool) -> Result<()> {
+        self.set_attention_decode(false);
+        other.set_attention_decode(false);
         unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
     }
     async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
         lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
         suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
         before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
+        self.set_attention_decode(false);
+        other.set_attention_decode(false);
         unsafe { self.execute_encoder_stream_held(other, requests, lease, chunks, transports, suffix,
             keep_running, before_chunk).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
         suffix: Option<&Self::Suffix>) -> Result<Vec<u8>> {
+        self.set_attention_decode(false);
         let logits = if let Some(suffix) = suffix {
             let encoder = suffix.output()?;
             unsafe { self.execute_replay(requests, batch, transport, 0, selected, &encoder).await? }
@@ -381,16 +387,20 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()> {
+        self.set_attention_decode(false);
         unsafe { self.execute(&RefCell::new(requests), batch, transport, 0, &[], Some(suffix), None, false).await }
     }
     async unsafe fn encoder_stream(&mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
         chunks: &[&[u32]], transports: [&mut Self::Transport; 2], suffix: &mut Self::Suffix,
         keep_running: &dyn Fn() -> bool) -> Result<()> {
+        self.set_attention_decode(false);
+        other.set_attention_decode(false);
         unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
         suffix: Option<&Self::Suffix>) -> Result<Vec<u8>> {
+        self.set_attention_decode(false);
         let encoder = suffix.map(|suffix| suffix.output()).transpose()?;
         unsafe { self.execute(&RefCell::new(requests), batch, transport, 0, selected, None, encoder.as_ref(), false).await?; }
         self.download_logits(batch, &(0..selected.len()).collect::<Vec<_>>()).await

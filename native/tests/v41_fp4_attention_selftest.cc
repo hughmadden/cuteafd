@@ -32,11 +32,121 @@ static uint16_t BFloat16(float value) {
   return uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
 }
 
+// Nonuniform KV/query/sink catches arithmetic differences hidden by equal weights.
+static void WidthInvariantChecks(cudaStream_t stream, int heads) {
+  constexpr int rows=256, dim=512;
+  Buffer query(size_t(rows)*heads*dim*2), output(query.bytes), serial(query.bytes), sink(heads*4);
+  Buffer window(128*512), ws(128*16), proposal(rows*512), ps(rows*16);
+  Buffer source(768*256), ss(768*32), priv(3*256), pss(3*32);
+  Buffer alternate_window(window.bytes), alternate_source(source.bytes);
+  Buffer end(8), se(8), pages(8), meta(rows*80), ids(rows*2048), bounds(rows*8);
+  std::vector<uint16_t> q(query.bytes/2);
+  std::vector<float> sk(heads);
+  for(size_t i=0;i<q.size();++i)q[i]=BFloat16(float(int((i*17+i/512)%43)-21)/64.0f);
+  for(int h=0;h<heads;++h)sk[h]=float(h-32)/19.0f;
+  query.Copy(q);sink.Copy(sk);
+  auto values=[](size_t n,bool fp4) {
+    std::vector<uint8_t> v(n);
+    for(size_t i=0;i<n;++i) {
+      if(fp4)v[i]=uint8_t(((i*13+i/32)%16)|(((i*7+i/256)%16)<<4));
+      else { const uint8_t choices[]={0x28,0x38,0xb0,0x40,0x00,0xbc};v[i]=choices[(i*11+i/512)%6]; }
+    }
+    return v;
+  };
+  window.Copy(values(window.bytes,false));proposal.Copy(values(proposal.bytes,false));
+  source.Copy(values(source.bytes,true));priv.Copy(values(priv.bytes,true));
+  auto alternate=values(window.bytes,false);std::reverse(alternate.begin(),alternate.end());alternate_window.Copy(alternate);
+  alternate=values(source.bytes,true);std::reverse(alternate.begin(),alternate.end());alternate_source.Copy(alternate);
+  ws.Fill(127);ps.Fill(127);ss.Fill(0x38);pss.Fill(0x38);
+  end.Copy<uint64_t>({2048});se.Copy<uint64_t>({512});pages.Copy<uint32_t>({1,0});
+  std::vector<uint64_t> metadata;
+  std::vector<int32_t> selected(rows*512);
+  for(int r=0;r<rows;++r) {
+    const uint64_t fields[]={2048,0,rows,uint64_t(2048+r),0,514,512,2,0,1};
+    metadata.insert(metadata.end(),fields,fields+10);
+    for(int k=0;k<512;++k)selected[r*512+k]=(k%19==0)?-1:(k*37+r*11)%514;
+  }
+  meta.Copy(metadata);ids.Copy(selected);bounds.Copy(std::vector<uint64_t>(rows,0));
+  cuteafd_v41_sparse_kv_t v{};
+  v.values[0]=window.data;v.values[1]=proposal.data;v.values[2]=source.data;v.values[3]=priv.data;
+  v.scales[0]=ws.data;v.scales[1]=ps.data;v.scales[2]=ss.data;v.scales[3]=pss.data;
+  v.window_end=reinterpret_cast<const uint64_t*>(end.data);
+  v.source_end=reinterpret_cast<const uint64_t*>(se.data);v.pages=reinterpret_cast<const uint32_t*>(pages.data);
+  v.window_proposal_capacity=rows;v.source_capacity=768;v.source_proposal_capacity=3;v.page_stride=2;
+  const auto* qp=reinterpret_cast<const uint16_t*>(query.data);
+  const auto* sp=reinterpret_cast<const float*>(sink.data);
+  const auto* mp=reinterpret_cast<const uint64_t*>(meta.data);
+  const auto* ip=reinterpret_cast<const int32_t*>(ids.data);
+  const auto* bp=reinterpret_cast<const uint64_t*>(bounds.data);
+  auto* op=reinterpret_cast<uint16_t*>(output.data);
+  auto* rp=reinterpret_cast<uint16_t*>(serial.data);
+  for(int format : {0,2}) {
+    v.compressed=format;
+    const auto bounded=heads==64?cuteafd_v41_sparse_attention_bounded:cuteafd_v41_sparse_attention_heads32_bounded;
+    for(int r=0;r<rows;++r)
+      Check(static_cast<cudaError_t>(bounded(qp+size_t(r)*heads*dim,sp,
+          mp+r*10,format?ip+r*512:nullptr,rp+size_t(r)*heads*dim,1,0,&v,stream,bp+r,nullptr,0,1)));
+    Check(cudaStreamSynchronize(stream));
+    std::vector<uint16_t> expected(serial.bytes/2),actual(output.bytes/2);
+    Check(cudaMemcpy(expected.data(),serial.data,serial.bytes,cudaMemcpyDeviceToHost));
+    for(int width : {64,128,256}) {
+      Check(static_cast<cudaError_t>(bounded(qp,sp,mp,format?ip:nullptr,
+          op,width,0,&v,stream,bp,nullptr,0,1)));
+      Check(cudaStreamSynchronize(stream));
+      Check(cudaMemcpy(actual.data(),output.data,size_t(width)*heads*dim*2,cudaMemcpyDeviceToHost));
+      if(!std::equal(expected.begin(),expected.begin()+size_t(width)*heads*dim,actual.begin()))
+        throw std::runtime_error("nonuniform head-group 1/2/4 output is not byte invariant");
+    }
+    const int parts=format?10:2;
+    Buffer scratch(size_t(64)*parts*heads*514*4),descriptors(64*sizeof(v));
+    std::vector<cuteafd_v41_sparse_kv_t> views(64,v);
+    for(int r=0;r<64;++r) if((r/3)%2) {
+      views[r].values[0]=alternate_window.data;views[r].values[2]=alternate_source.data;
+    }
+    descriptors.Copy(views);
+    const auto* dp=reinterpret_cast<const cuteafd_v41_sparse_kv_t*>(descriptors.data);
+    auto* partial=reinterpret_cast<float*>(scratch.data);
+    auto launch=heads==64?cuteafd_v41_sparse_attention_batch:cuteafd_v41_sparse_attention_heads32_batch;
+#ifdef CUTEAFD_TEST_ATTENTION_AOT
+    if(format)launch=heads==64?cuteafd_v41_sparse_attention_batch_aot:cuteafd_v41_sparse_attention_heads32_batch_aot;
+#endif
+    const auto validate=heads==64?cuteafd_v41_sparse_attention_batch_validate:cuteafd_v41_sparse_attention_heads32_batch_validate;
+    Check(static_cast<cudaError_t>(validate(qp,sp,mp,format?ip:nullptr,
+        op,64,views.data(),dp,bp,partial,scratch.bytes,parts,format)));
+    for(int r=0;r<64;++r)
+      Check(static_cast<cudaError_t>(launch(qp+size_t(r)*heads*dim,sp,mp+r*10,format?ip+r*512:nullptr,
+          rp+size_t(r)*heads*dim,1,dp+r,stream,bp+r,partial,parts,format)));
+    Check(cudaStreamSynchronize(stream));
+    Check(cudaMemcpy(expected.data(),serial.data,64*heads*dim*2,cudaMemcpyDeviceToHost));
+    for(int width=1;width<=64;++width) {
+      Check(static_cast<cudaError_t>(launch(qp,sp,mp,format?ip:nullptr,op,width,dp,stream,bp,partial,parts,format)));
+      Check(cudaStreamSynchronize(stream));
+      Check(cudaMemcpy(actual.data(),output.data,size_t(width)*heads*dim*2,cudaMemcpyDeviceToHost));
+      if(!std::equal(expected.begin(),expected.begin()+size_t(width)*heads*dim,actual.begin()))
+        throw std::runtime_error("fixed descriptor decode differs from serial rows");
+      if(width==1 || width==16 || width==64) {
+        cudaGraph_t graph;cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+        Check(static_cast<cudaError_t>(launch(qp,sp,mp,format?ip:nullptr,op,width,dp,stream,bp,partial,parts,format)));
+        Check(cudaStreamEndCapture(stream,&graph));Check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+        output.Fill(0xcd);Check(cudaGraphLaunch(exec,stream));Check(cudaStreamSynchronize(stream));
+        Check(cudaMemcpy(actual.data(),output.data,size_t(width)*heads*dim*2,cudaMemcpyDeviceToHost));
+        if(!std::equal(expected.begin(),expected.begin()+size_t(width)*heads*dim,actual.begin()))
+          throw std::runtime_error("fixed attention graph replay differs from serial rows");
+        Check(cudaGraphExecDestroy(exec));Check(cudaGraphDestroy(graph));
+      }
+    }
+  }
+  std::cout << "PASS heads=" << heads << " nonuniform head groups, mixed descriptors widths 1..64 and graph replay" << std::endl;
+}
+
 int main() {
   Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_initialize()));
   Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_heads32_initialize()));
   cudaStream_t test_stream;
   Check(cudaStreamCreateWithFlags(&test_stream,cudaStreamNonBlocking));
+  WidthInvariantChecks(test_stream,64);
+  WidthInvariantChecks(test_stream,32);
   int checks = 0;
   for(int format : {0,1,2}) for (int rows : {1, 6, 128, 256}) {
     Buffer query(size_t(rows)*64*512*2), output(query.bytes), sink(64*4);

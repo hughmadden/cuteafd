@@ -31,6 +31,12 @@ impl AttentionReductionPlan {
     pub fn capacity_rows(self) -> usize { self.capacity_rows }
     pub fn active_drafts(self) -> Option<usize> { self.active_drafts }
 
+    /// Alignment is a load contract, never a reason to change the reduction.
+    pub fn sparse_recipe(self, compressed: bool) -> SparseAttentionRecipe {
+        SparseAttentionRecipe { parts: if compressed { 10 } else { 2 },
+            backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
+    }
+
     /// Admission may use validated checkpoint geometry before loading the drafter.
     /// Check raw geometry too: different widths can clamp to the same plan.
     pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
@@ -42,6 +48,15 @@ impl AttentionReductionPlan {
         }
         Ok(loaded)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseAttentionRecipe {
+    pub parts: usize,
+    pub backend: SparseAttentionBackend,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -211,6 +226,25 @@ pub struct CardPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_recipe_is_immutable_across_decode_verify_widths() {
+        for plan_rows in 1..=64 {
+            let plan = AttentionReductionPlan::new(64, Some(5), Some(plan_rows)).unwrap();
+            for compressed in [false, true] {
+                let expected = plan.sparse_recipe(compressed);
+                for _live_rows in 1..=64 {
+                    assert_eq!(plan.sparse_recipe(compressed), expected);
+                    assert_eq!(plan.validate_loaded(Some(5)).unwrap(), plan);
+                }
+                assert_eq!(expected.parts, if compressed { 10 } else { 2 });
+                assert_eq!(expected.backend, if compressed { SparseAttentionBackend::Bf16Aot }
+                    else { SparseAttentionBackend::NativeFp32 });
+            }
+            assert!(plan.validate_loaded(Some(7)).is_err());
+            assert_eq!(plan.rows(), plan_rows);
+        }
+    }
 
     #[test]
     fn attention_plan_uses_active_drafts_not_execution_width() {
