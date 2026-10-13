@@ -180,20 +180,27 @@ fn exl3_bytes(hidden: usize, intermediate: usize, experts: usize, tp: usize,
 /// catalog), else `spark_ranks` Spark ranks serving `snapshot`'s experts.
 pub(crate) fn homes(dense: &[bool], catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
     snapshot: &std::path::Path, spark_ranks: Option<usize>) -> Result<Vec<LayerHome>> {
+    homes_with_local_tp2(dense, catalog, snapshot, spark_ranks, None)
+}
+
+/// Price a mixed routed deployment at each home's actual tensor-parallel width.
+pub(crate) fn homes_with_local_tp2(dense: &[bool], catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
+    snapshot: &std::path::Path, spark_ranks: Option<usize>, local_tp2: Option<std::ops::Range<usize>>)
+    -> Result<Vec<LayerHome>> {
     let owned;
-    let (catalog, tp, local) = match (catalog, spark_ranks) {
-        (Some(catalog), _) => (catalog, 1, true),
-        (None, Some(ranks)) => {
-            owned = cuteafd_loader::read_expert_catalog(snapshot)?;
-            (&owned, ranks, false)
-        }
-        (None, None) => anyhow::bail!("no routed expert placement to price"),
+    let catalog_local = catalog.is_some();
+    let catalog = match catalog {
+        Some(catalog) => catalog,
+        None => { owned = cuteafd_loader::read_expert_catalog(snapshot)?; &owned }
     };
-    let fp8 = catalog.fp8().map(|tensors| fp8_slice_bytes(tensors, tp)).transpose()?;
     dense.iter().enumerate().map(|(layer, &dense)| {
         if dense { return Ok(LayerHome::Dense); }
-        let slice_bytes = match (fp8, catalog.exl3()) {
-            (Some(bytes), _) => bytes,
+        let tp2 = local_tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
+        let local = tp2 || catalog_local || spark_ranks.is_none();
+        let tp = if tp2 { 2 } else if local { 1 } else { spark_ranks.unwrap() };
+        ensure!(tp > 0, "routed layer {layer} has no expert home");
+        let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
+            (Some(tensors), _) => fp8_slice_bytes(tensors, tp)?,
             (None, Some(manifest)) => exl3_slice_bytes(manifest, layer, tp)?,
             (None, None) => anyhow::bail!("routed experts are neither FP8/NVFP4 nor EXL3"),
         };

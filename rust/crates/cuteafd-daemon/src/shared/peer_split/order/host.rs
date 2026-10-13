@@ -28,11 +28,19 @@ pub(crate) struct HostSchedule {
 
 impl HostSchedule {
     pub fn push(&mut self, gpu: usize, exchange: &'static str, slot: usize, label: impl Into<String>) {
-        self.ops.push(HostOp::Queue { gpu, op: Op::Push(Flag { exchange, slot }), label: label.into() });
+        self.ops.push(HostOp::Queue { gpu, op: Op::Push(Flag { exchange, slot, target: 0 }), label: label.into() });
     }
 
     pub fn wait(&mut self, gpu: usize, exchange: &'static str, slot: usize, label: impl Into<String>) {
-        self.ops.push(HostOp::Queue { gpu, op: Op::Wait(Flag { exchange, slot }), label: label.into() });
+        self.ops.push(HostOp::Queue { gpu, op: Op::Wait(Flag { exchange, slot, target: 0 }), label: label.into() });
+    }
+
+    pub fn push_to(&mut self, gpu: usize, exchange: &'static str, slot: usize, target: usize, label: impl Into<String>) {
+        self.ops.push(HostOp::Queue { gpu, op: Op::Push(Flag { exchange, slot, target }), label: label.into() });
+    }
+
+    pub fn wait_for(&mut self, gpu: usize, exchange: &'static str, slot: usize, target: usize, label: impl Into<String>) {
+        self.ops.push(HostOp::Queue { gpu, op: Op::Wait(Flag { exchange, slot, target }), label: label.into() });
     }
 
     pub fn sync(&mut self, gpu: usize, label: impl Into<String>) {
@@ -148,6 +156,7 @@ mod tests {
         s.push(0, "x", 0, "gpu0 pushes x");
         s.sync(0, "sync gpu0");
         s.push(0, "y", 0, "gpu0 pushes y");
+        s.wait(1, "x", 0, "gpu1 consumes x");
         assert_eq!(check_host(&s), Ok(()));
         let mut stuck = s.clone();
         stuck.wait(0, "z", 0, "gpu0 waits z");
@@ -271,11 +280,11 @@ pub(crate) mod glm {
         s.sync(0, "tables gpu0");
         s.sync(1, "tables gpu1");
         for lane in 0..lanes {
-            s.push(0, "main", DIRECT, format!("gpu0 direct push lane{lane}"));
+            s.push_to(0, "main", DIRECT, lane, format!("gpu0 direct push lane{lane}"));
         }
         let peer_attention = |s: &mut HostSchedule, index: usize, lane: usize| {
             if index == 0 {
-                s.wait(1, "main", DIRECT, format!("gpu1 direct wait lane{lane}"));
+                s.wait_for(1, "main", DIRECT, lane, format!("gpu1 direct wait lane{lane}"));
             }
             attention(s, 1, index, lane, false);
             s.push(1, "main", slot(index, true, lane), format!("gpu1 ffn push L{index} lane{lane}"));

@@ -474,11 +474,11 @@ mod tests {
             }
         };
         let front = |s: &mut Schedule, layer, lane| {
-            if layer == 0 { s.wait(1, "entry", DIRECT, "peer residual"); }
+            if layer == 0 { s.wait_for(1, "entry", DIRECT, lane, "peer residual"); }
             attention(s, 1, layer, lane);
             if !decode || layer >= local { experts(s, 1, layer, lane); }
         };
-        for lane in 0..lanes { s.push(0, "entry", DIRECT, "residual"); }
+        for lane in 0..lanes { s.push_to(0, "entry", DIRECT, lane, "residual"); }
         if !decode { for lane in 0..lanes { front(&mut s, 0, lane); } }
         for layer in 0..layers {
             for lane in 0..lanes {

@@ -277,7 +277,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         if gpus == 2 {
             let slots = 4 * inputs.prefill_lanes;
             let bytes = slots * inputs.prefill_rows.max(DECODE_ROWS) * cfg.hidden as u64 * 2
-                + ((slots + 1) * 16).max(FLOOR);
+                + ((slots + 1) * 16).max(FLOOR) + FLOOR;
             rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Transport, "peer exchange", bytes, Basis::Formula)));
         }
         if rank == 0 {
@@ -515,7 +515,7 @@ fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
             + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
     // These optional deltas open with the RTX arena; shared step/attention rows stay Always.
     let rows = [("local expert payloads", [payload; 2]), ("canonical route exchange", [routes; 2]),
-        ("FP32 exchange widening", [wide_exchange; 2]), ("route identity flag", [FLOOR; 2]),
+        ("FP32 exchange widening", [wide_exchange; 2]),
         ("peer local router rows", [0, peer_routes])];
     let mut extra = [0; 2];
     for (name, bytes) in rows {
@@ -594,7 +594,7 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
     let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
-        .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp2 package"))?;
+        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/rtx-tp2"))))?;
     let capacities = [1u64, 16, 80, 256, 1024, 4096];
     let max_rows = rows.max(DECODE_ROWS);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
@@ -615,8 +615,12 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
             .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing trellis LUT asset name"))?;
         anyhow::ensure!(directory.join(lut).is_file(), "GLM TP2 missing trellis LUT in {}", directory.display());
         if value["direct"].as_bool() != Some(true) {
-            for file in ["v41_exl3_routes.json", "libv41_exl3_routes.so"] {
-                anyhow::ensure!(directory.join(file).is_file(), "GLM TP2 missing {file} in {}", directory.display());
+            let route = value["route_preparation"]["manifest"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing packed route export manifest"))?;
+            let route_manifest = directory.join(route);
+            // Match Exl3Execution: route assets live beside the declared manifest.
+            for asset in [route_manifest.clone(), route_manifest.parent().unwrap().join("libv41_exl3_routes.so")] {
+                anyhow::ensure!(asset.is_file(), "GLM TP2 missing route asset {}", asset.display());
             }
         }
         // Runtime separately attests ELF geometry and LUT hashes before execution.
@@ -655,8 +659,8 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     let roots = [parent.join("fp8"), parent.join("../lib/fp8")];
     let find = |name: &str| roots.iter().map(|root| root.join(name).join("tp2")).find(|p| p.is_dir());
     anyhow::ensure!(a4, "checkpoint-declared GLM NVFP4 requires W4A4 at every row count");
-    let package = find("fp8-glm-nvfp4a4").ok_or_else(|| anyhow::anyhow!(
-        "missing calibrated GLM NVFP4 W4A4 tp2 package (fp8-glm-nvfp4a4/tp2)"))?;
+    let package = find("fp8-glm-nvfp4a4").ok_or_else(|| anyhow::Error::new(
+        MissingLocalPackage("calibrated GLM NVFP4 W4A4 tp2".into())))?;
     let w4a4 = true;
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
         package.parent().unwrap().join("manifest.json"))?)?;
@@ -711,6 +715,44 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, false) })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("missing {0} package")]
+struct MissingLocalPackage(String);
+
+/// Shared planner/runtime activation policy. Auto remains remote when the build lacks local exports.
+#[allow(clippy::too_many_arguments)]
+pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+    layers: usize, gpus: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    onboard: Onboard, skip: bool) -> anyhow::Result<Option<LocalInventory>> {
+    if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
+        || layers <= catalog.routed_experts().first_layer { return Ok(None); }
+    if gpus != 2 {
+        anyhow::ensure!(matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. }),
+            "GLM local experts require a two-GPU TP2 executor");
+        return Ok(None);
+    }
+    let automatic = matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. });
+    let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
+        t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
+    if automatic && !supported { return Ok(None); }
+    match local_inventory(catalog, manifest, layers, rows, lanes, exchange_f32) {
+        Ok(local) => Ok(Some(local)),
+        Err(error) if automatic && error.is::<MissingLocalPackage>() => {
+            tracing::info!(reason = %error, "GLM RTX TP2 package unavailable; automatic placement uses Sparks");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn local_exchange_f32() -> anyhow::Result<bool> {
+    match std::env::var("CUTEAFD_TP2_EXCHANGE").ok().as_deref() {
+        None | Some("") | Some("auto") | Some("bf16") => Ok(false),
+        Some("f32") => Ok(true),
+        Some(value) => anyhow::bail!("CUTEAFD_TP2_EXCHANGE must be auto, bf16 or f32, got {value:?}"),
+    }
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -1015,6 +1057,7 @@ mod tests {
             let value = json!({"hidden": 6144, "intermediate": 1024, "experts": 256,
                 "top_k": 8, "capacity": capacity, "bits": [4, 5], "output_dtype": "fp32",
                 "input_format": "e4m3_k32", "direct": false,
+                "route_preparation": {"manifest": "routes/v41_exl3_routes.json"},
                 "trellis_lut": {"file": "lut.bin", "bytes": 32}, "buffers": {
                     "scratch": {"allocation": "scratch", "bytes": capacity * 64,
                         "dtype": "f32", "zero_on_create": false},
@@ -1022,11 +1065,62 @@ mod tests {
                         "dtype": "i32", "zero_on_create": true}}});
             std::fs::write(package.join("v41_exl3.json"), serde_json::to_vec(&value).unwrap()).unwrap();
             // Header-only fixtures do not attest or execute these stand-in assets.
-            for file in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+            std::fs::create_dir_all(package.join("routes")).unwrap();
+            for file in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
                 std::fs::write(package.join(file), b"").unwrap();
             }
         }
         (dir, catalog, manifest)
+    }
+
+    #[test]
+    fn activation_policy_uses_exports_and_refuses_malformed_packages() {
+        let (dir, catalog, manifest) = local_fixture();
+        for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 65536 }, Onboard::Layers(1)] {
+            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+                .unwrap().is_some());
+        }
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false)
+            .unwrap().is_none());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true)
+            .unwrap().is_none());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false)
+            .unwrap().is_none());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false).is_err());
+        let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2");
+        std::fs::remove_file(package.join("m16/libcuteafd_exl3.so")).unwrap();
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false).is_err(),
+            "present but incomplete exports must fail closed");
+        std::fs::remove_dir_all(package).unwrap();
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false)
+            .unwrap().is_none());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false).is_err());
+    }
+
+    #[test]
+    fn activated_exl3_inventory_planner_equals_runtime() {
+        let (_dir, catalog, manifest) = local_fixture();
+        let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        for onboard in [Onboard::Auto, Onboard::Layers(1)] {
+            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+                .unwrap().unwrap();
+            let planned = GlmInputs { prefill_rows: 64, experts: local.experts.clone(),
+                expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
+                requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
+            let mut runtime = planned.clone();
+            for (total, baseline) in &mut runtime.gpus {
+                let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes };
+            }
+            let serial = local.workspace_for(&cfg, 64, 1, false);
+            let (p, pw) = solve_working_set(&planned, serial, None).unwrap();
+            let (r, rw) = solve_working_set(&runtime, serial, None).unwrap();
+            assert_eq!((p.clone(), pw.clone()), (r, rw));
+            assert_eq!(p.tp2.unwrap().first, 1);
+            assert_eq!(pw.spark.rtx_layers, vec![1]);
+            assert_eq!(pw.tp2_workspace, serial);
+            assert!(pw.spark.spark_layers.is_empty());
+        }
     }
 
     #[test]
@@ -1068,7 +1162,7 @@ mod tests {
                     let route_slots = 2 * lanes * (DECODE_ROWS * 8 * 8)
                         + ((2 * lanes + 1) * 16).max(FLOOR) + FLOOR;
                     let widened_exchange = if f32 { 4 * lanes * DECODE_ROWS * 6144 * 2 } else { 0 };
-                    assert_eq!(local.extra_workspace[0], payloads + route_slots + widened_exchange + FLOOR);
+                    assert_eq!(local.extra_workspace[0], payloads + route_slots + widened_exchange);
                     let peer_routes = [256 * 4, 8 * 4, 8 * 4, 6144 + 6144 / 32].into_iter().map(|width|
                         (DECODE_ROWS * width).max(FLOOR) - FLOOR
                             + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
@@ -1095,7 +1189,7 @@ mod tests {
             assert!(error.to_string().contains("capacity/geometry/tiers/output mismatch"), "{field}: {error:#}");
         }
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-        for asset in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+        for asset in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
             std::fs::remove_file(package.join(asset)).unwrap();
             let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
             assert!(error.to_string().contains("missing"), "{asset}: {error:#}");
@@ -1104,6 +1198,29 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
         let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
         assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
+    }
+
+    #[test]
+    fn local_inventory_resolves_declared_route_assets() {
+        use serde_json::json;
+        let (dir, catalog, manifest) = local_fixture();
+        let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2/m16");
+        let path = package.join("v41_exl3.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(package.join("routes"), package.join("packed")).unwrap();
+        value["route_preparation"]["manifest"] = json!("packed/v41_exl3_routes.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
+
+        value["route_preparation"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+        assert!(error.to_string().contains("missing packed route export manifest"), "{error:#}");
+
+        value["direct"] = json!(true);
+        std::fs::remove_dir_all(package.join("packed")).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
     }
 
     fn nvfp4_checkpoint_tensors() -> Vec<crate::plan::testing::Tensor> {

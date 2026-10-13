@@ -168,7 +168,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     };
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine, transport, runtime| {
-        anyhow::ensure!(transport.is_some() || engine.skip_routed(), "serve-glm needs --peers for the routed experts");
+        anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(engine.max_context));
         }
@@ -434,8 +434,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     use crate::shared::draft::{resource, runtime::SharedPolicy};
     let mut shared = drafter.map(|d| {
-        let homes = resource::homes(&engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
-            None, &opened.snapshot, Some(ranks))?;
+        let homes = resource::homes_with_local_tp2(
+            &engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
+            None, &opened.snapshot, Some(ranks), engine.tp2_layers())?;
         engine.arm_draft_probe()?;
         SharedPolicy::new(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS, d.cfg.drafts(),
             resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
@@ -452,6 +453,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
+        engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }

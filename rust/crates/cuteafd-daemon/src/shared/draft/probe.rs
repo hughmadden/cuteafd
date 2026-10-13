@@ -178,8 +178,8 @@ impl<'a> RoundProbe<'a> {
         }
         if self.error.is_none() {
             let rows = self.routes.rows();
-            if let Err(error) = settle(&mut self.routes, self.ring.bytes(), rows, self.topk, &self.ringed, &self.staged,
-                &mut self.ring_check) {
+            if let Err(error) = complete_routes(&mut self.routes, self.ring.bytes(), rows, self.topk, &self.ringed,
+                &self.staged, &mut self.ring_check) {
                 self.error = Some(error);
             }
         }
@@ -187,9 +187,15 @@ impl<'a> RoundProbe<'a> {
             tracing::debug!(%error, "draft policy round routes not observed");
             return None;
         }
-        self.routes.complete().ok()?;
         Some((&self.routes, self.clock.read()))
     }
+}
+
+/// A policy observation is valid only after both local rings and remote staging settle.
+fn complete_routes(routes: &mut RoundRoutes, ring: &[u8], rows: usize, topk: usize,
+    ringed: &[bool], staged: &[bool], check: &mut RingCheck) -> Result<(), RouteError> {
+    settle(routes, ring, rows, topk, ringed, staged, check)?;
+    routes.complete()
 }
 
 /// Decode the ringed layers of a round (`ring`: layer-major slots of
@@ -265,6 +271,44 @@ mod tests {
         settle(&mut again, &bytes, capacity, topk, &[false, true, false, true], &[false, false, true, true], &mut check)
             .unwrap();
         assert_eq!((check, again.flat()), (RingCheck { layers: 1, mismatched: 0 }, flat));
+    }
+
+    #[test]
+    fn glm_mixed_tp2_and_spark_round_yields_policy_observation() {
+        use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource, resource};
+        let (layers, rows, topk) = (78, 6, 8);
+        let local = 3..7;
+        let homes: Vec<_> = (0..layers).map(|layer| if layer < 3 { resource::LayerHome::Dense }
+            else if local.contains(&layer) { resource::LayerHome::Local { slice_bytes: 9_000_000. } }
+            else { resource::LayerHome::Remote { slice_bytes: 3_000_000. } }).collect();
+        let geometry = resource::geometry(&homes, 256, topk, 64, 7, 0).unwrap();
+        assert!(geometry.layers[local.clone()].iter().all(|layer| layer.class == Some(0)));
+        assert!(geometry.layers[7..].iter().all(|layer| layer.class == Some(1)));
+        let mut policy = cuteafd_core::DraftPolicy::new(geometry, cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        let ids: Vec<u32> = (0..rows * topk).map(|i| i as u32 % 256).collect();
+        let mut routes = RoundRoutes::new(layers, topk);
+        routes.begin(rows);
+        let mut staged = vec![false; layers];
+        for layer in 0..layers {
+            if layer < 3 { routes.dense(layer).unwrap(); }
+            else if !local.contains(&layer) { routes.push(layer, &ids, ROUTE_MASK).unwrap(); staged[layer] = true; }
+        }
+        let mut ringed = vec![false; layers];
+        let bytes = ring(layers, rows, topk, &local.clone().map(|layer| (layer, ids.clone())).collect::<Vec<_>>());
+        assert_eq!(complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
+            &mut RingCheck::default()), Err(RouteError::Missing(3)));
+        ringed[local].fill(true);
+        let observation = complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
+            &mut RingCheck::default()).ok().map(|()| {
+                let prior = [0.8; 5];
+                let request = [resource::Verified { id: 1, rows, accepted: 4, source: DraftSource::Neural,
+                    prior: Some(&prior), features: None, censor: None }];
+                let times = (0..layers).map(|layer| (layer > 0).then_some(800.)).collect::<Vec<_>>();
+                resource::observe_drafted(&mut policy, &request, &routes, &times,
+                    RoundTimes { total_us: 70_000, draft_us: Some(3_000) }, 7, None, Some(1))
+            });
+        observation.expect("mixed GLM routes must produce an observation").unwrap();
+        assert_eq!(policy.stats().rounds, 1);
     }
 
     /// A ring id past u16 is a route error, never a silent truncation.

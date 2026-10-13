@@ -248,8 +248,8 @@ mod tests {
 
     // Mirror eager peer_layer lookahead and the lane producer/post split.
     fn prefill(s: &mut Schedule, homes: &[Home], lanes: usize, broadcast: bool, ahead: bool) {
-        for _ in 0..lanes { s.push(0, "main", DIRECT, "embedded residual"); }
-        for lane in 0..lanes { s.wait(1, "main", DIRECT, format!("embedded lane {lane}")); }
+        for lane in 0..lanes { s.push_to(0, "main", DIRECT, lane, "embedded residual"); }
+        for lane in 0..lanes { s.wait_for(1, "main", DIRECT, lane, format!("embedded lane {lane}")); }
         let peer = |s: &mut Schedule, layer: usize, lane| {
             attention(s, 1, layer, lane);
             match homes[layer] {

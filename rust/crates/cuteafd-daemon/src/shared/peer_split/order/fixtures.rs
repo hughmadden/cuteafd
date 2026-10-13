@@ -154,12 +154,17 @@ pub(crate) fn context_decode(
             );
         }
         context_attention(s, gpu, layer, lane, full_indexer(layer), fault);
+        // The final layer is routed: rank0 sends its reduced sum only
+        // when another peer segment needs it (glm5/engine.rs decode_layers,
+        // deepseek_v4/engine.rs post_layer). Rank1 always supplies its half.
+        if gpu == 1 || layer + 1 < layers {
         s.push(
             gpu,
             "main",
             exchange_slot(layer, true, lane),
             format!("gpu{gpu} ffn push L{layer} lane{lane}"),
         );
+        }
     };
     for layer in 0..layers {
         match peer_queue {
@@ -316,7 +321,7 @@ mod tests {
                 assert_eq!(check(&s), Ok(()), "{queue:?} lane{lane}");
                 // Recycled flags, not unique layer flags: cover all 21 indexers
                 // and the terminal FFN consumption on rank 0.
-                assert_eq!(s.streams[0].len(), 8 * 78 + 2 * 21 + 1);
+                assert_eq!(s.streams[0].len(), 8 * 78 + 2 * 21);
                 assert_eq!(s.streams[1].len(), 8 * 78 + 2 * 21);
             }
         }
@@ -329,7 +334,7 @@ mod tests {
             for lane in 0..2 {
                 let s = context_decode(61, lane, v4_full, queue, ContextFault::None);
                 assert_eq!(check(&s), Ok(()), "{queue:?} lane{lane}");
-                assert_eq!(s.streams[0].len(), 8 * 61 + 2 * 30 + 1);
+                assert_eq!(s.streams[0].len(), 8 * 61 + 2 * 30);
                 assert_eq!(s.streams[1].len(), 8 * 61 + 2 * 30);
             }
         }
@@ -344,6 +349,7 @@ mod tests {
                     Op::Push(Flag {
                         exchange: "context-q",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} q push L6 lane1"),
                 ),
@@ -351,6 +357,7 @@ mod tests {
                     Op::Push(Flag {
                         exchange: "context-candidates",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} candidates push L6 lane1"),
                 ),
@@ -358,6 +365,7 @@ mod tests {
                     Op::Wait(Flag {
                         exchange: "context-candidates",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} candidates wait L6 lane1"),
                 ),
@@ -365,6 +373,7 @@ mod tests {
                     Op::Wait(Flag {
                         exchange: "context-q",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} q wait L6 lane1"),
                 ),
@@ -372,6 +381,7 @@ mod tests {
                     Op::Push(Flag {
                         exchange: "context-partial",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} partial push L6 lane1"),
                 ),
@@ -379,6 +389,7 @@ mod tests {
                     Op::Wait(Flag {
                         exchange: "context-partial",
                         slot: 2,
+                        target: 0,
                     }),
                     format!("gpu{gpu} partial wait L6 lane1"),
                 ),
@@ -386,6 +397,7 @@ mod tests {
                     Op::Push(Flag {
                         exchange: "main",
                         slot: 4,
+                        target: 0,
                     }),
                     format!("gpu{gpu} attn push L6 lane1"),
                 ),
@@ -393,6 +405,7 @@ mod tests {
                     Op::Wait(Flag {
                         exchange: "main",
                         slot: 4,
+                        target: 0,
                     }),
                     format!("gpu{gpu} attn wait L6 lane1"),
                 ),
@@ -400,6 +413,7 @@ mod tests {
                     Op::Push(Flag {
                         exchange: "main",
                         slot: 5,
+                        target: 0,
                     }),
                     format!("gpu{gpu} ffn push L6 lane1"),
                 ),
@@ -407,6 +421,7 @@ mod tests {
                     Op::Wait(Flag {
                         exchange: "main",
                         slot: 5,
+                        target: 0,
                     }),
                     format!("gpu{gpu} ffn wait L6 lane1"),
                 ),
@@ -417,6 +432,7 @@ mod tests {
             let direct = Flag {
                 exchange: "main",
                 slot: DIRECT,
+                        target: 0,
             };
             assert_eq!(
                 s.streams[gpu][0].0,
