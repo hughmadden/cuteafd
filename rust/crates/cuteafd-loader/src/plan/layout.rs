@@ -75,6 +75,9 @@ pub struct LayoutOptions {
     pub pool_tokens: Option<u64>,
     /// Upper bound for an automatically sized pool.
     pub target_pool_tokens: u64,
+    /// An automatic pool under a fixed onboard stops at its target instead of
+    /// growing to all free memory (it still shrinks to fit, down to its floor).
+    pub pool_ceiling_at_target: bool,
     /// External drafter resident bytes on the lead GPU (DFlash), if any.
     pub drafter_bytes: u64,
     /// Explicitly disable GLM Flash external speculation and its arenas.
@@ -169,6 +172,7 @@ impl Default for LayoutOptions {
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
+            pool_ceiling_at_target: false,
             drafter_bytes: 0,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
