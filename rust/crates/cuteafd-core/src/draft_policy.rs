@@ -116,9 +116,9 @@ pub struct PolicyGeometry {
     /// Draft positions per request.
     pub max_positions: usize,
     /// Draft widths the drafter can switch between, ascending: one entry is a
-    /// fixed width, two let the policy choose per round. The first is the
-    /// drafter's native block, past which a request's own outcomes are blended
-    /// into its confidence.
+    /// fixed width, two let the policy choose per round. The first is the narrow
+    /// draft-cost width and the default neural-confidence boundary. Bindings
+    /// may set a wider native boundary with `set_native_confidence_positions`.
     pub widths: Vec<usize>,
     /// Resource classes, fitted separately; [`LayerResource::class`] indexes them.
     pub classes: Vec<ResourceClass>,
