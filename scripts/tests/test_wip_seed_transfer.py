@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,18 +36,66 @@ def test_kakapo_is_a_seed_choice_but_never_a_serving_host():
     assert {'rhea', 'moa'} <= set(cards.SEEDS)
 
 
-def test_kakapo_seed_stages_on_its_lan_address_and_prepares_its_root(entry, tmp_path, monkeypatch, capsys):
-    arms = cards.arms_from(['base=b:s'])
+def _staged(cfg):
+    return [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+
+
+def _build(arms, cards_, tmp_path, monkeypatch, seed, separate=True):
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: True)
+    monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: separate)
+    monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
+    cards.build_arms(['base=HEAD'], arms, cards_, tmp_path, 'task', True, seed)
+    return cards.config(tmp_path / 'build-base.config')
+
+
+def test_kakapo_seed_is_never_a_staged_spark(entry, tmp_path, monkeypatch, capsys):
+    # #117: the four-Spark gate card with the build-only seed stages its own four
+    # Sparks; the seed goes to wip.sh as WIP_SEED_HOST, never as a SPARK_* rank.
+    cfg = _build(cards.arms_from(['base=b:s']), [entry], tmp_path, monkeypatch, 'kakapo')
+    assert _staged(cfg) == ['ostrich', 'dodo', 'emu', 'kiwi'] and cfg['SPARK_COUNT'] == '4'
+    assert 'kakapo' not in cfg.values() and '0.0.0.0' not in cfg.values()
+    assert cfg['SPARK_0_LANE_A'] == '10.55.0.1'
+    assert '# build seed base: kakapo (WIP_SEED_HOST); Spark targets (4): ostrich,dodo,emu,kiwi' in capsys.readouterr().out
+
+
+def test_six_spark_card_with_kakapo_stages_six_ranks(entry, tmp_path, monkeypatch):
+    six = {**entry, 'name': 'mimo26-pro-max', 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    cfg = _build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'kakapo')
+    assert cfg['SPARK_COUNT'] == '6' and _staged(cfg) == list(cards.HOSTS)
+    assert not any(k.startswith('SPARK_6_') for k in cfg)
+
+
+def test_seed_inside_the_union_is_one_host(entry, tmp_path, monkeypatch):
+    six = {**entry, 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    cfg = _build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'moa')
+    assert _staged(cfg).count('moa') == 1 and cfg['SPARK_COUNT'] == '6'
+
+
+def test_pool_seed_outside_the_union_fills_the_rank_count_first(entry, tmp_path, monkeypatch):
+    # A five-host union pads to six: a pool-Spark seed is the preferred filler, so it
+    # is one host that both builds and receives the slot.
+    five = {**entry, 'sparks': ['ostrich', 'dodo', 'emu', 'kiwi', 'moa'], 'set': {'SPARK_COUNT': '5'}}
+    cfg = _build(cards.arms_from(['base=b:s']), [five], tmp_path, monkeypatch, 'rhea')
+    assert sorted(_staged(cfg)) == sorted(cards.HOSTS)
+    assert cards.staging_hosts({'ostrich', 'dodo', 'emu', 'kiwi', 'moa'}, 'kakapo', True) == [
+        'ostrich', 'dodo', 'emu', 'kiwi', 'moa', 'rhea']
+
+
+def test_legacy_wip_sh_keeps_the_seed_as_rank_zero(entry, tmp_path, monkeypatch):
+    # A revision whose wip.sh predates WIP_SEED_HOST builds on SPARK_0_HOST.
     monkeypatch.setattr(cards, 'seed_lanes', lambda host, dry: ('172.22.2.7',) * 2 if host == 'kakapo'
                         else (f'10.55.0.{cards.HOSTS.index(host) + 1}', f'10.55.1.{cards.HOSTS.index(host) + 1}'))
-    cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'kakapo')
-    cfg = cards.config(tmp_path / 'build-base.config')
-    hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
-    assert hosts[0] == 'kakapo' and set(entry['sparks']) <= set(hosts[1:])
-    assert (cfg['SPARK_0_LANE_A'], cfg['SPARK_0_LANE_B']) == ('172.22.2.7', '172.22.2.7')
-    assert cfg['SPARK_1_LANE_A'].startswith('10.55.0.')
+    cfg = _build(cards.arms_from(['base=b:s']), [entry], tmp_path, monkeypatch, 'kakapo', separate=False)
+    assert _staged(cfg)[0] == 'kakapo' and set(entry['sparks']) <= set(_staged(cfg)[1:])
+    assert cfg['SPARK_0_LANE_A'] == '172.22.2.7'
+
+
+def test_seed_option_capability_detection(monkeypatch):
+    shown = iter(['seed_option="${WIP_SEED_HOST:-}"', 'seed_host="${wip_hosts[0]}"'])
+    monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout=next(shown)))
+    assert cards.seed_option_capable('new') and not cards.seed_option_capable('old')
+    assert 'WIP_SEED_HOST' in WIP
 
 
 def test_seed_lanes_resolve_pool_rails_without_ssh_and_dry_runs_never_probe(monkeypatch):
@@ -206,3 +255,82 @@ copy_spark_image ostrich dodo
     assert "docker image save 'img' | zstd -T8 -3 -q" in compressed
     assert '-o HostName=172.22.2.7 -o HostKeyAlias=kakapo kakapo zstd -d -q | docker image load' in compressed
     assert 'zstd' not in plain and 'aes128-gcm' not in plain
+
+
+def test_seed_env_passes_the_seed_and_its_lan_address_only_to_capable_spark_builds(monkeypatch):
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='172.22.2.7\n'))
+    both = dict(seed_separate=True, build_role='both')
+    assert cards.seed_env(both, 'kakapo', False) == {'WIP_SEED_HOST': 'kakapo', 'WIP_SEED_ADDR': '172.22.2.7'}
+    assert cards.seed_env(both, 'moa', False) == {'WIP_SEED_HOST': 'moa'}
+    assert cards.seed_env({**both, 'seed_separate': False}, 'kakapo', False) == {}
+    assert cards.seed_env({**both, 'build_role': 'coordinator'}, 'kakapo', False) == {}
+
+
+SIX = '\n'.join([f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A=10.55.0.{i + 1}\nSPARK_{i}_LANE_B=10.55.1.{i + 1}'
+                 for i, h in enumerate(cards.HOSTS)])
+
+
+def _wip_dry_run(tmp_path, spark_lines, count, extra_args=(), env=None):
+    config = tmp_path / 'build.config'
+    config.write_text(f'MODEL_ID=XiaomiMiMo/MiMo-V2.6-Pro\nSPARK_COUNT={count}\nCOORDINATOR_GPU=1\nRTX_GPUS=1\n{spark_lines}\n')
+    stub = tmp_path / 'bin'
+    stub.mkdir(exist_ok=True)
+    marker = tmp_path / 'called'
+    for name in ('docker', 'ssh', 'rsync', 'nvidia-smi'):
+        (stub / name).write_text(f'#!/usr/bin/env bash\necho "{name} $*" >>"{marker}"\nexit 1\n')
+        (stub / name).chmod(0o755)
+    run_env = {k: v for k, v in os.environ.items() if k not in ('WIP_SEED_HOST', 'WIP_SEED_ADDR')}
+    run_env.update(PATH=f'{stub}:{os.environ["PATH"]}', **(env or {}))
+    result = subprocess.run([str(ROOT / 'wip.sh'), '--config', str(config), '--dry-run', *extra_args],
+                            cwd=ROOT, capture_output=True, text=True, timeout=120, env=run_env)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), marker.read_text()
+    return result.stdout
+
+
+def test_wip_dry_run_six_targets_with_a_build_only_seed(tmp_path):
+    out = _wip_dry_run(tmp_path, SIX, 6, env={'WIP_SEED_HOST': 'kakapo', 'WIP_SEED_ADDR': '172.22.2.7'})
+    assert 'Spark hosts (6): ostrich,dodo,emu,kiwi,rhea,moa' in out
+    assert 'seed host: kakapo (build-only, transfer auto via 172.22.2.7)' in out
+    assert 'Spark targets (6): ostrich,dodo,emu,kiwi,rhea,moa' in out
+    # --seed is the same parameter as WIP_SEED_HOST.
+    assert 'seed host: kakapo (build-only' in _wip_dry_run(tmp_path, SIX, 6, ['--seed', 'kakapo'])
+
+
+def test_wip_dry_run_seed_inside_the_union_is_one_host(tmp_path):
+    out = _wip_dry_run(tmp_path, SIX, 6, ['--seed', 'moa'])
+    assert 'seed host: moa (serving' in out
+    assert 'Spark targets (5): ostrich,dodo,emu,kiwi,rhea' in out
+
+
+def test_wip_dry_run_legacy_seed_is_spark_zero(tmp_path):
+    four = '\n'.join(SIX.splitlines()[:12])
+    out = _wip_dry_run(tmp_path, four, 4)
+    assert 'Spark hosts (4): ostrich,dodo,emu,kiwi' in out
+    assert 'seed host: ostrich (serving' in out
+    assert 'Spark targets (3): dodo,emu,kiwi' in out
+
+
+def test_build_only_seed_gets_a_build_container_and_never_a_distribution():
+    hosts = WIP[WIP.index('# The seed builds the Spark slot; the configured Sparks'):WIP.index('# Opt-in replicated-group Spark expert roles')]
+    script = 'set -euo pipefail\nwip_hosts=(ostrich dodo)\nseed_option=kakapo\n' + hosts + '''
+printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_seed_serves"
+seed_option=dodo
+''' + hosts + '''
+printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_seed_serves"
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ['ostrich dodo|kakapo ostrich dodo|0', 'ostrich|ostrich dodo|1']
+    # Distribution and fingerprint checks iterate the targets; containers, process
+    # checks and --recreate cover the seed's build container too.
+    assert WIP.count('for host in "${wip_target_hosts[@]}"; do') == 3
+    assert WIP.count('"${wip_container_hosts[@]}"') == 6
+
+
+def test_legacy_wip_sh_with_a_six_spark_union_and_an_outside_seed_is_refused_early(entry, tmp_path, monkeypatch):
+    six = {**entry, 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    with pytest.raises(ValueError, match='predates WIP_SEED_HOST'):
+        _build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'kakapo', separate=False)
+    # A pool seed inside the union is still one of the six.
+    assert int(_build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'moa', separate=False)['SPARK_COUNT']) == 6
