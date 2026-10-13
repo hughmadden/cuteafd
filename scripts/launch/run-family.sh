@@ -177,6 +177,8 @@ layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
+# THERMAL (see the coordinator's arguments below) reaches every worker's sampler too.
+case "$(get THERMAL on)" in on|off) spark_worker_env+=" -e CUTEAFD_THERMAL=$(get THERMAL on)" ;; *) ;; esac
 # Options only the Spark expert workers take.
 spark_worker_args=""
 placement_handshake=0

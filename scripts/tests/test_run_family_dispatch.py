@@ -113,7 +113,9 @@ def test_thermal_report_key_defaults_on_and_reaches_the_coordinator(tmp_path: Pa
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
                                   f"THERMAL={value}\n" if value else "")
     assert result.returncode == 0, result.stderr
-    assert f"CUTEAFD_THERMAL={value or 'on'}" in result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert any("cuteafd-spark-expert" in line for line in launches)
+    assert all(f"CUTEAFD_THERMAL={value or 'on'}" in line for line in launches), launches
 
 
 def test_thermal_report_key_rejects_unknown_value(tmp_path: Path) -> None:
