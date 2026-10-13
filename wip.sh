@@ -112,6 +112,24 @@ wip_spark_leg=1
 [[ "$role" != coordinator || -n "$from_slot" ]] || wip_spark_leg=0
 
 release_load_config "$config"
+# Resolve once for direct builds too; explicit card/environment scopes win,
+# including an empty expert list or Spark role override.
+wip_scopes="$(python3 "$repo_root/scripts/lib/wip_aot_scopes.py" --config "$config" \
+  --set "SPARK_COUNT=$SPARK_COUNT" --set "SPARK_TP=$SPARK_TP" --set "RTX_GPUS=$RTX_GPUS")" ||
+  release_die "could not derive WIP AOT scopes from $config"
+wip_scope_summary=()
+while IFS='=' read -r key value; do
+  if [[ "$key" == CUTEAFD_WIP_PROGRAM_FAMILY ]]; then
+    wip_program_family="$value"
+    continue
+  fi
+  [[ -v "$key" ]] || printf -v "$key" '%s' "$value"
+  export "$key"
+  wip_scope_summary+=("$key=${!key}")
+done <<<"$wip_scopes"
+audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
+case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
+echo "WIP AOT scopes ($wip_program_family): ${wip_scope_summary[*]}"
 case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
 release_validate_wip_instance
 release_need docker
@@ -137,14 +155,14 @@ wip_hwlock() {
   python3 "$repo_root/scripts/hw/hwlock.py" --locks "$1" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-1800}" -- "${@:2}"
 }
 mapfile -t wip_hosts < <(release_spark_values HOST)
-((${#wip_hosts[@]})) || release_die "configuration has no active Spark hosts"
+((${#wip_hosts[@]} || !wip_spark_leg)) || release_die "configuration has no active Spark hosts"
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
   release_die "SPARK_COUNT=$SPARK_COUNT does not match ${#wip_hosts[@]} configured Spark hosts"
 # The seed builds the Spark slot; the configured Sparks (wip_hosts) serve it.
 # A seed outside them (kakapo) is a build host only: it gets the build
 # container, never a serving one, and is never a distribution target. Every
 # host that holds this instance's Spark WIP container is wip_container_hosts.
-seed_host="${seed_option:-${wip_hosts[0]}}"
+seed_host="${seed_option:-${wip_hosts[0]:-}}"
 wip_target_hosts=()
 wip_seed_serves=0
 for host in "${wip_hosts[@]}"; do
@@ -1169,7 +1187,8 @@ build_coordinator() {
     ((exported)) || release_die "no coordinator export mode succeeded"
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
-  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" "$coordinator_container" \
+  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" \
+    -e "CUTEAFD_WIP_PROGRAM_FAMILY=${wip_program_family:-}" "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
     "$COORDINATOR_DOCKER_DEV" "$image_id"

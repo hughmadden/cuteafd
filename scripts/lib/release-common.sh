@@ -631,6 +631,7 @@ release_profile_wrapper() {
 # Shared key grammar for release lifecycle scripts and the family launcher.
 release_known_key() {
   case "$1" in
+    FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE|DRAFT_MODEL_ID|DRAFT_MODEL_REVISION|DRAFT_FP8|DFLASH|MTP|COORDINATOR_TRACE) return 0 ;;
     DRAFT_COST_BUCKETS|DRAFT_CONFIDENCE|COPY_DRAFT_POLICY|DRAFT_SURVIVAL_LENGTHS) return 0 ;;
     FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|API_KEY_FILE|ENABLE_BENCH|USAGE|GATEWAY) return 0 ;;
