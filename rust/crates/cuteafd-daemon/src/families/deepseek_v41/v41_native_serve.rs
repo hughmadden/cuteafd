@@ -360,6 +360,9 @@ fn worker(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     if small_card { memory::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
+    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?;
     let lane = BackboneLane::new(
         &weights,
         capacity,
@@ -454,6 +457,8 @@ fn worker(
     if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     if small_card { memory::startup_phase(&lib, "v41/transport", device_total)?; }
+    pass.install_attention_plan(attention_plan)?;
+    prefill_pass.install_attention_plan(attention_plan)?;
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let draft_weights = if args.dspark {
@@ -478,6 +483,9 @@ fn worker(
         draft.set_draft_limit(args.dspark_draft_limit)?;
         draft.set_fixed(args.dspark_fixed);
     }
+    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
+    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
+        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
     if small_card { memory::startup_phase(&lib, "v41/drafter", device_total)?; }
     let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };

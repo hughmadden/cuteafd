@@ -132,9 +132,12 @@ def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: s
 
 
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
-def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value) -> None:
-    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
-                                            "first_k_dense_replace": 3}, "zai-org/GLM-5.3",
+@pytest.mark.parametrize("config,model", [
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "zai-org/GLM-5.3"),
+    ({"model_type": "deepseek_v41"}, "deepseek-ai/DeepSeek-V4.1-Flash"),
+])
+def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value, config, model) -> None:
+    result = _family_launch_result(tmp_path, config, model,
                                   f"ATTENTION_PLAN_ROWS={value}\n" if value else "")
     assert result.returncode == 0, result.stderr
     launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]

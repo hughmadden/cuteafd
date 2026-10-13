@@ -67,8 +67,8 @@ impl<'a> SourceReplica<'a> {
         device.run(|| device.library.copy_h2d(lengths.buffer, &vec![0; lengths.buffer.bytes]))?;
         Ok(Self {
             copy: device.run(|| device.library.v41_peer_copy())?,
-            values: Allocation::new(device, source.capacity*KV_VALUES)?,
-            scales: Allocation::new(device, source.capacity*KV_SCALES)?,
+            values: Allocation::attention_plane(device, source.capacity, KV_VALUES, "peer compressed cache values")?,
+            scales: Allocation::attention_plane(device, source.capacity, KV_SCALES, "peer compressed cache scales")?,
             pages: Allocation::new(device, source.page_table.buffer.bytes)?,
             lengths, pool: source.pool.clone(), capacity: source.capacity, stride: source.stride,
         })

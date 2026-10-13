@@ -145,6 +145,16 @@ impl NativeLibrary {
     }
 
 }
+fn planned_backend(plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
+    rows: usize, heads: usize, compressed: bool, aot_available: bool, aligned: bool) -> Result<bool> {
+    ensure!((1..=plan.capacity_rows()).contains(&rows), "sparse rows exceed admitted execution capacity");
+    let recipe = plan.sparse_recipe(compressed);
+    let aot = recipe.backend == cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot;
+    ensure!(!aot || (aot_available && aligned),
+        "V4.1 admitted BF16 AOT attention shape rows={rows} heads={heads} requires an aligned view and loaded AOT kernel; refusing backend switch");
+    Ok(aot)
+}
+
 impl V41SparseAttention<'_> {
     pub fn heads(&self) -> usize { self.heads }
 
@@ -268,6 +278,21 @@ impl V41SparseAttention<'_> {
         ensure!((1..=cuteafd_core::V41_VERIFY_ROWS).contains(&rows), "invalid sparse batch rows");
         Ok(rows * 120)
     }
+    /// Resolve required symbols at load, before any graph capture or readiness.
+    pub fn validate_plan(&self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
+        buffers: &[CuteafdDeviceBuffer]) -> Result<()> {
+        ensure!(plan.capacity_rows() <= cuteafd_core::V41_VERIFY_ROWS && self.supports_batch()
+            && self.batch_aot_launch.is_some(),
+            "V4.1 attention plan rows={} capacity={} heads={} requires BF16 AOT ten-part and native FP32 two-part batch kernels",
+            plan.rows(), plan.capacity_rows(), self.heads);
+        for buffer in buffers {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 16 == 0,
+                "V4.1 attention plan rows={} capacity={} heads={}: {}-byte workspace on GPU {} is not 16-byte aligned",
+                plan.rows(), plan.capacity_rows(), self.heads, buffer.bytes, buffer.device_id);
+        }
+        Ok(())
+    }
+
     /// Validate the complete batch before descriptor upload and EVERY graph replay.
     /// Host descriptor preparation does not read device memory or enqueue work.
     pub fn prepare_batch(
@@ -277,8 +302,31 @@ impl V41SparseAttention<'_> {
         output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
         bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer,
     ) -> Result<V41SparseBatch> {
-        ensure!(requests.len() > 1 && requests.len() <= 16, "invalid sparse batch requests");
-        ensure!(requests.iter().all(|(_, _, n)| (1..=16).contains(n)), "sparse batch requires split rows");
+        self.prepare_batch_inner(query, sink, metadata, selected, requests, output, descriptors,
+            bounds, scratch, None)
+    }
+    pub fn prepare_batch_planned(
+        &self, query: CuteafdDeviceBuffer, sink: CuteafdDeviceBuffer,
+        metadata: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>,
+        requests: &[(&V41SparseWindow, Option<&V41SparseSource>, usize)],
+        output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
+        bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer,
+        plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
+    ) -> Result<V41SparseBatch> {
+        self.prepare_batch_inner(query, sink, metadata, selected, requests, output, descriptors,
+            bounds, scratch, Some(plan))
+    }
+    fn prepare_batch_inner(
+        &self, query: CuteafdDeviceBuffer, sink: CuteafdDeviceBuffer,
+        metadata: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>,
+        requests: &[(&V41SparseWindow, Option<&V41SparseSource>, usize)],
+        output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
+        bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer,
+        plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
+    ) -> Result<V41SparseBatch> {
+        ensure!(!requests.is_empty() && requests.len() <= 16, "invalid sparse batch requests");
+        let limit = if plan.is_some() { cuteafd_core::V41_VERIFY_ROWS } else { 16 };
+        ensure!(requests.iter().all(|(_, _, n)| (1..=limit).contains(n)), "sparse batch requires split rows");
         let rows: usize = requests.iter().map(|(_, _, n)| n).sum();
         let descriptor_bytes = Self::batch_descriptor_bytes(rows)?;
         let compressed = if selected.is_some() { 2 } else { 0 };
@@ -299,10 +347,14 @@ impl V41SparseAttention<'_> {
             views.as_ptr(), descriptors.ptr.cast(), bounds.ptr.cast(), scratch.ptr.cast(),
             scratch.bytes as u64, parts as i32, compressed) };
         ensure!(status == 0, "native sparse batch validation status {status}");
-        let aot = self.batch_aot_launch.is_some() && compressed == 2
-            && scratch.ptr as usize % 16 == 0
+        let aligned = scratch.ptr as usize % 16 == 0
             && views.iter().all(|view| view.values.iter().chain(view.scales.iter())
                 .all(|pointer| *pointer as usize % 16 == 0));
+        let aot = if let Some(plan) = plan {
+            let recipe = plan.sparse_recipe(compressed != 0);
+            ensure!(parts == recipe.parts, "sparse attention plan split differs");
+            planned_backend(plan, rows, self.heads, compressed != 0, self.batch_aot_launch.is_some(), aligned)?
+        } else { self.batch_aot_launch.is_some() && compressed == 2 && aligned };
         Ok(V41SparseBatch { views, compressed, aot, heads: self.heads })
     }
     /// # Safety
@@ -417,6 +469,30 @@ mod tests {
 
     fn buffer(bytes: usize) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: 0x1000usize as *mut c_void, bytes, device_id: 0, flags: 0 }
+    }
+
+    #[test]
+    fn planned_backend_never_changes_with_live_width_or_request_packing() -> Result<()> {
+        use cuteafd_core::coordinator_programs::AttentionReductionPlan;
+        for plan_rows in 1..=64 {
+            let plan = AttentionReductionPlan::new(64, Some(5), Some(plan_rows))?;
+            for heads in [32, 64] {
+                for rows in 1..=64 {
+                    assert!(planned_backend(plan, rows, heads, true, true, true)?);
+                    assert!(!planned_backend(plan, rows, heads, false, true, true)?);
+                    assert!(planned_backend(plan, rows, heads, true, false, true).is_err());
+                    assert!(planned_backend(plan, rows, heads, true, true, false).is_err());
+                    // Unequal request packing preserves every plane's alignment.
+                    for stride in [512, 16, 256, 32, heads*1024] {
+                        assert_eq!((0x1000 + rows*stride) % 16, 0);
+                    }
+                    assert_eq!((0x1000 + rows*120) % 8, 0);
+                }
+            }
+            assert!(planned_backend(plan, 0, 64, true, true, true).is_err());
+            assert!(planned_backend(plan, 65, 64, true, true, true).is_err());
+        }
+        Ok(())
     }
 
     #[test]

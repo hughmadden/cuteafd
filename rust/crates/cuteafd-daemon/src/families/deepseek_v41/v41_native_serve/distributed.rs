@@ -271,6 +271,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             Duration::from_secs(120),
         )
     };
+    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?;
     let mut pass = make_pass(capacity).context("constructing first distributed target lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     memory_checkpoint("first target lane")?;
@@ -281,6 +284,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // TP2 expert workspaces remain full capacity on both GPUs and lanes.
     let mut second = make_pass(80).context("constructing second distributed target lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    pass.install_attention_plan(attention_plan)?;
+    second.install_attention_plan(attention_plan)?;
     memory_checkpoint("second target lane")?;
     let draft_weights = if args.dspark {
         let width=if args.dspark_draft_limit>5 {7} else {5};
@@ -300,6 +305,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         draft.set_draft_limit(args.dspark_draft_limit)?;
         draft.set_fixed(args.dspark_fixed);
     }
+    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
+    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
+        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     memory_checkpoint("draft runtime")?;
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;

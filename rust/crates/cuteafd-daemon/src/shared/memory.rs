@@ -25,6 +25,17 @@ pub(crate) struct DeviceAllocation<'a> {
     pub(crate) buffer: CuteafdDeviceBuffer,
 }
 impl<'a> DeviceAllocation<'a> {
+    /// Attention value/scale planes retain 16-byte alignment under every row slice.
+    pub(crate) fn attention_plane(library: &'a NativeLibrary, rows: usize, stride: usize,
+        name: &str) -> Result<Self> {
+        let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
+        let allocation = Self::new(library, bytes)?;
+        anyhow::ensure!(allocation.buffer.ptr as usize % 16 == 0 && stride % 16 == 0,
+            "V4.1 BF16 AOT attention load: {name} shape=[{rows},{stride}] on GPU {} requires 16-byte aligned base and row stride",
+            allocation.buffer.device_id);
+        Ok(allocation)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
         Ok(Self {
             library,

@@ -72,6 +72,8 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     replay_staging: LayerStaging<'a>,
     capacity: usize,
     batch_rows: usize,
+    attention_plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
+    decode: bool,
     // Batched keys retain row count and stable wave/selection/sink storage;
     // current descriptors are validated and uploaded before EVERY replay.
     // For other paths, complete external-pointer and launch-geometry fingerprints are checked
@@ -102,6 +104,14 @@ struct ColdSparse {
     needed: u16,
     tail_identity: Option<Vec<usize>>,
 }
+fn validate_plan_installation(installed: bool, graph_count: usize, pending: bool,
+    batch_rows: usize, capacity_rows: usize) -> Result<()> {
+    ensure!(!installed && graph_count == 0 && !pending,
+        "attention reduction plan is immutable after load");
+    ensure!(batch_rows >= capacity_rows, "attention scratch must cover full execution capacity");
+    Ok(())
+}
+
 fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
     b.ptr = unsafe { b.ptr.cast::<u8>().add(offset).cast() };
@@ -142,12 +152,24 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
             capacity,
             batch_rows: capacity.min(cuteafd_core::V41_VERIFY_ROWS),
+            attention_plan: None,
+            decode: false,
             graphs: GraphBank::new(None),
             graph_limit: 1,
             warmed_kernels: 0,
             cold: None,
         })
     }
+    pub fn install_attention_plan(&mut self,
+        plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
+        validate_plan_installation(self.attention_plan.is_some(), self.graphs.len(), self.cold.is_some(),
+            self.batch_rows, plan.capacity_rows())?;
+        self.kernel.validate_plan(plan, &[self.query.buffer, self.output.buffer, self.split_scratch.buffer,
+            self.descriptors.buffer, self.replay_begins.buffer, self.metadata.buffer])?;
+        self.attention_plan = Some(plan);
+        Ok(())
+    }
+    pub fn set_decode(&mut self, decode: bool) { self.decode = decode; }
     /// Reserve wider decode batching before any execution and before KV sizing.
     /// Serving allocates the full verifier extent regardless of neural width.
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
@@ -156,6 +178,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         ensure!(self.cold.is_none() && self.graphs.len() == 0,
             "sparse decode reservation requires an unused wave");
         if rows <= self.batch_rows { return Ok(()); }
+        ensure!(self.attention_plan.is_none(), "attention workspace is immutable after plan admission");
         let library = self.stream.library;
         let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
@@ -580,15 +603,21 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         } else {
             None
         };
-        // Only small multi-request split launches use descriptor batching. C1
-        // and large prefill retain their existing arithmetic and dispatch.
-        let batch = if self.kernel.supports_batch() && launches.len() > 1 && rows <= self.batch_rows
-            && launches.iter().all(|launch| launch.rows <= 16) {
+        let fixed_plan = self.decode.then_some(self.attention_plan).flatten();
+        ensure!(fixed_plan.is_none() || rows <= self.batch_rows,
+            "decode rows exceed admitted attention execution capacity");
+        // Decode always uses descriptors, including C1; prefill remains explicit legacy dispatch.
+        let batch = if fixed_plan.is_some() || (self.kernel.supports_batch() && launches.len() > 1
+            && rows <= self.batch_rows && launches.iter().all(|launch| launch.rows <= 16)) {
             let bindings: Vec<_> = launches.iter()
                 .map(|launch| (&launch.window, launch.source.as_ref(), launch.rows)).collect();
-            let batch = self.kernel.prepare_batch(self.query.buffer, sink, self.metadata.buffer,
+            let batch = if let Some(plan) = fixed_plan {
+                self.kernel.prepare_batch_planned(self.query.buffer, sink, self.metadata.buffer,
+                    selected, &bindings, self.output.buffer, self.descriptors.buffer,
+                    self.replay_begins.buffer, self.split_scratch.buffer, plan)?
+            } else { self.kernel.prepare_batch(self.query.buffer, sink, self.metadata.buffer,
                 selected, &bindings, self.output.buffer, self.descriptors.buffer,
-                self.replay_begins.buffer, self.split_scratch.buffer)?;
+                self.replay_begins.buffer, self.split_scratch.buffer)? };
             let (host, bytes) = self.descriptor_staging.region(layer);
             bytes[..batch.bytes().len()].copy_from_slice(batch.bytes());
             unsafe { self.stream.library.copy_host_buffer_h2d_async(self.descriptors.buffer,
@@ -773,3 +802,16 @@ impl<const HEADS:usize> Drop for LocalSparseAttentionWave<'_,HEADS> {
 #[cfg(test)]
 #[path = "v41_sparse_attention/prefix_tests.rs"]
 mod prefix_tests;
+
+#[cfg(test)]
+mod plan_installation_tests {
+    use super::validate_plan_installation;
+    #[test]
+    fn plan_is_load_only_and_reserves_full_execution_capacity() {
+        assert!(validate_plan_installation(false, 0, false, 64, 64).is_ok());
+        assert!(validate_plan_installation(true, 0, false, 64, 64).is_err());
+        assert!(validate_plan_installation(false, 1, false, 64, 64).is_err());
+        assert!(validate_plan_installation(false, 0, true, 64, 64).is_err());
+        assert!(validate_plan_installation(false, 0, false, 6, 64).is_err());
+    }
+}

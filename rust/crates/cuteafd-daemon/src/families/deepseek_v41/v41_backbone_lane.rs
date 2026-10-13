@@ -976,6 +976,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }
     }
     pub fn route_capture_enabled(&self) -> bool { self.capture_routes }
+    pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
+        if let Some(dual) = &mut self.dual_sparse { dual.install_attention_plan(plan) }
+        else { self.sparse.as_mut().context("attention wave absent")?.install_attention_plan(plan) }
+    }
+    pub fn set_attention_decode(&mut self, decode: bool) {
+        if let Some(dual) = &mut self.dual_sparse { dual.set_decode(decode); }
+        else if let Some(sparse) = &mut self.sparse { sparse.set_decode(decode); }
+    }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         if let Some(dual)=&mut self.dual_sparse { dual.reserve_decode_rows(rows) }
         else { self.sparse.as_mut().context("attention wave absent")?.reserve_decode_rows(rows) }

@@ -33,8 +33,8 @@ impl<'a> ProposalReplica<'a> {
             "proposal replica requires peer devices from one library");
         destination.run(||destination.library.cuda_enable_peer(source.id))?;
         let (values,scales)=format.widths();
-        Ok(Self { values:Allocation::new(destination,capacity*values)?,
-            scales:Allocation::new(destination,capacity*scales)?,
+        Ok(Self { values:Allocation::attention_plane(destination,capacity,values,"peer proposal values")?,
+            scales:Allocation::attention_plane(destination,capacity,scales,"peer proposal scales")?,
             copy:destination.run(||destination.library.v41_peer_copy())?,source,format,capacity })
     }
     /// # Safety

@@ -141,6 +141,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         Ok(())
     }
     pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
+    pub fn attention_drafts(&self) -> usize { self.draft_limit.min(self.draft_width) }
     pub fn set_draft_limit(&mut self, limit: u8) -> Result<()> {
         ensure!((1..=self.draft_width as u8).contains(&limit), "draft limit exceeds generated width");
         self.draft_limit = limit as usize;
