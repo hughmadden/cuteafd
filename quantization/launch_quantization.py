@@ -52,7 +52,7 @@ def command(manifest_path, manifest, image, hf_home, attempt, *, resume=False):
         raise ValueError("HF token must exist with private permissions")
     label = hashlib.sha256(str(root).encode()).hexdigest()
     args = ["docker", "run", "--detach", "--name", "cuteafd-quant-" + attempt,
-            "--label", "cuteafd.quant.run=" + label, "--restart=no", "--gpus", "all",
+            "--label", "cuteafd.quant.run=" + label, "--restart=no", "--device", "nvidia.com/gpu=all",
             "--network=host", "--shm-size=16g", "--memory=170g", "--memory-swap=170g",
             "--log-driver=local", "--log-opt=max-size=20m", "--log-opt=max-file=5",
             "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "HF_HOME=" + str(hf_home),

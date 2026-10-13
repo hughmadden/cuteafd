@@ -1,0 +1,58 @@
+import importlib.util
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location('cdi_gpus', ROOT / 'scripts/lib/cdi_gpus.py')
+cdi = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(cdi)
+SH = ROOT / 'scripts/lib/cdi-gpus.sh'
+YAML = 'devices:\n    - name: "0"\n    - name: "1"\n    - name: GPU-abc-123\n    - name: all\n'
+
+
+@pytest.fixture
+def spec(tmp_path):
+    path = tmp_path / 'nvidia.yaml'
+    path.write_text(YAML)
+    return path
+
+
+def test_python_args(spec):
+    assert cdi.cdi_gpu_args('all', [spec]) == ['--device', 'nvidia.com/gpu=all']
+    assert cdi.cdi_gpu_args([1, 0], [spec]) == ['--device', 'nvidia.com/gpu=1', '--device', 'nvidia.com/gpu=0']
+    assert cdi.cdi_gpu_args('GPU-abc-123', [spec]) == ['--device', 'nvidia.com/gpu=GPU-abc-123']
+
+
+def test_python_missing_name_or_spec_fails(spec, tmp_path):
+    with pytest.raises(RuntimeError, match='nvidia-ctk cdi generate'):
+        cdi.cdi_gpu_args('2', [spec])
+    with pytest.raises(RuntimeError, match='nvidia-ctk cdi generate'):
+        cdi.cdi_gpu_args('0', [tmp_path / 'absent.yaml'])
+    with pytest.raises(ValueError):
+        cdi.cdi_gpu_args('', [spec])
+
+
+def run_sh(spec, request):
+    script = f'source "{SH}"; cuteafd_cdi_gpu_args "{request}" && printf "%s\\n" "${{CUTEAFD_CDI_ARGS[@]}}"'
+    return subprocess.run(['bash', '-c', script], text=True, capture_output=True, env={**os.environ, 'CUTEAFD_CDI_SPECS': str(spec)})
+
+
+def test_shell_args_and_failure(spec):
+    ok = run_sh(spec, '0,GPU-abc-123')
+    assert ok.stdout.split() == ['--device', 'nvidia.com/gpu=0', '--device', 'nvidia.com/gpu=GPU-abc-123']
+    bad = run_sh(spec, '7')
+    assert bad.returncode != 0 and 'nvidia-ctk cdi generate' in bad.stderr
+
+
+def test_no_legacy_gpus_flag_in_launchers():
+    for name in ('build.sh', 'run.sh', 'wip.sh', 'scripts/launch/run-family.sh', 'scripts/build/cuteafd-dev.sh',
+                 'scripts/bench/wip-cards.py', 'scripts/bench/golden-run.py', 'scripts/bench/ab-spark-intake.sh',
+                 'scripts/bench/glm5/ab-glm-weighted.sh', 'scripts/build/verify-nvfp4-modelopt-container.sh',
+                 'scripts/build/configure-docker-nvidia-runtime.sh', 'quantization/deploy_workers.py',
+                 'quantization/launch_quantization.py'):
+        text = (ROOT / name).read_text()
+        assert not any(' --gpus ' in line or "'--gpus'" in line and 'add_argument' not in line
+                       for line in text.splitlines() if not line.lstrip().startswith('#')), name

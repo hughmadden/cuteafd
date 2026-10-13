@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 cuteafd_build_cache_defaults
@@ -723,8 +724,9 @@ coordinator_export_status=0
 compiler_cache_args=()
 cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
 mapfile -t compiler_cache_args <<<"$cache_plan"
+cuteafd_cdi_gpu_args "$export_gpu_uuid" || exit 2
 timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container" \
-  --gpus "device=$export_gpu_uuid" \
+  "${CUTEAFD_CDI_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1:-1 \
   -e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid" \
@@ -883,6 +885,7 @@ export CUTEAFD_BUILD_CACHES="${22:-on}"
 [[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
 export CUTEAFD_SCCACHE_CUDA="${19:-1}"
 source scripts/build/build-caches.sh
+source scripts/lib/cdi-gpus.sh
 cuteafd_build_cache_defaults
 phase="${13:?}"
 # The audio tower switch reaches the remote leg as its own argument (ON/OFF).
@@ -955,7 +958,8 @@ while :; do
   if [[ -n "$spark_serving" ]]; then
     spark_wait_reason="serving container(s) running: $(tr '\n' ' ' <<<"$spark_serving")"
   else
-    spark_cuda_free="$(docker run --rm --name "$export_container-probe" --gpus all \
+    cuteafd_cdi_gpu_args all || exit 2
+    spark_cuda_free="$(docker run --rm --name "$export_container-probe" "${CUTEAFD_CDI_ARGS[@]}" \
       -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e HOME=/tmp/home \
       -e TORCHINDUCTOR_CACHE_DIR=/tmp/home/torchinductor -e TRITON_CACHE_DIR=/tmp/home/triton \
       --entrypoint python3 "$dev_image" \
@@ -985,6 +989,7 @@ mapfile -t compiler_cache_args <<<"$cache_plan"
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
+cuteafd_cdi_gpu_args all || exit 2
 docker run --rm --name "$export_container" \
   "${compiler_cache_args[@]}" \
   --user "$(id -u):$(id -g)" \
@@ -993,7 +998,7 @@ docker run --rm --name "$export_container" \
   -e "LOGNAME=$(id -un)" \
   -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor" \
   -e "CARGO_HOME=$container_home/cargo" \
-  --gpus all \
+  "${CUTEAFD_CDI_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1:-1 \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \

@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 cuteafd_build_cache_defaults
@@ -521,12 +522,13 @@ ensure_local_container() {
     echo "WIP: $coordinator_container lost GPU access (nvidia-smi -L failed); recreating it" >&2
     docker rm -f "$coordinator_container" >/dev/null
   fi
+  cuteafd_cdi_gpu_args "$RELEASE_COORDINATOR_GPU_UUID" || exit 2
   local -a args=(
     run -d --name "$coordinator_container" --restart no
     --label "io.cuteafd.build-caches=${CUTEAFD_BUILD_CACHES:-on}:$wip_toolchain_hash"
     --user "$(id -u):$(id -g)"
     -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)"
-    --gpus device="$RELEASE_COORDINATOR_GPU_UUID"
+    "${CUTEAFD_CDI_ARGS[@]}"
     --net=host --ipc=host --security-opt seccomp=unconfined
     --ulimit memlock=-1:-1 --cap-add IPC_LOCK
     -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
@@ -555,7 +557,7 @@ ensure_remote_container() {
     if cache_staging="$(ssh -o BatchMode=yes "$host" 'printf "%s/.cache/cuteafd/kache-helper" "$HOME"')${WIP_INSTANCE:+-$WIP_INSTANCE}"; then
       printf -v cache_helper_dir '%q' "$cache_staging/scripts/build"
       if ! ssh -o BatchMode=yes "$host" "mkdir -p $cache_helper_dir" ||
-         ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$repo_root/scripts/build/build-caches.sh" "$repo_root/scripts/build/build-cache-plan.py" "$host:$cache_staging/scripts/build/"; then
+         ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$repo_root/scripts/build/build-caches.sh" "$repo_root/scripts/build/build-cache-plan.py" "$repo_root/scripts/lib/cdi-gpus.sh" "$host:$cache_staging/scripts/build/"; then
         cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
         cache_staging=
       fi
@@ -589,6 +591,8 @@ export CUTEAFD_BUILD_CACHES="${11:-on}" CUTEAFD_SCCACHE_CUDA="${10:-1}"
 [[ "${5:-__unset__}" == __unset__ ]] || export CUTEAFD_KACHE_CACHE_DIR="$5"
 [[ -f "$6/scripts/build/build-caches.sh" ]] || { echo "Spark cache helper not staged" >&2; exit 2; }
 source "$6/scripts/build/build-caches.sh"
+[[ -f "$6/scripts/build/cdi-gpus.sh" ]] || { echo "Spark CDI helper not staged" >&2; exit 2; }
+source "$6/scripts/build/cdi-gpus.sh"
 cuteafd_build_cache_defaults
 cache_plan="$(cuteafd_build_cache_docker_args "$root" /wip/home "${12:?}")" || exit 2
 mapfile -t cache_args <<<"$cache_plan"
@@ -618,12 +622,13 @@ if [[ ! -w "$root" || -n "$bad_owner" ]]; then
 fi
 mkdir -p "$root/home"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+cuteafd_cdi_gpu_args all || exit 2
 args=(
   run -d --name "$container" --restart no
   --label "io.cuteafd.build-caches=${CUTEAFD_BUILD_CACHES:-on}:${12:?}"
   --user "$(id -u):$(id -g)"
   -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)"
-  --gpus all --net=host --ipc=host --security-opt seccomp=unconfined
+  "${CUTEAFD_CDI_ARGS[@]}" --net=host --ipc=host --security-opt seccomp=unconfined
   --ulimit memlock=-1:-1 --cap-add IPC_LOCK
   -v "$hf_home:$hf_home:ro" -v "$hf_home:/root/.cache/huggingface:ro"
   -e "WIP_INSTANCE=$instance" -e "WIP_ROOT=$root"

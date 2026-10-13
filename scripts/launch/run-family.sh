@@ -11,6 +11,7 @@ set -euo pipefail
 launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/cdi-gpus.sh"
 config="$repo_root/cuteafd.config"
 restart=0
 restart_all=0
@@ -1597,7 +1598,7 @@ if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
-gpus="device=$gpu"
+gpus="$gpu"
 head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
   [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
@@ -1608,7 +1609,7 @@ if [[ -n "$second" && "$split" != off ]]; then
         { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
     done
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
-    gpus="\"device=$lower,$upper\""
+    gpus="$lower,$upper"
     head_split=1
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
   elif [[ "$explicit_split" != 1 ]]; then
@@ -2265,7 +2266,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   worker_profile="" worker_prep=""
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
-  ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state); release_serving_docker_args; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
+  ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info ${shared_worker_env_args[*]}$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
@@ -2323,7 +2324,8 @@ for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
   [[ -z "${!key:-}" ]] || tp2_env_args+=(-e "$key=${!key}")
 done
 release_serving_docker_args
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
+cuteafd_cdi_gpu_args "$gpus" || exit 2
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \

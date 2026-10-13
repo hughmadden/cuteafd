@@ -8,7 +8,7 @@
 
 Coordinator-only: each arm runs its slot's `cuteafd`, `libcuteafd_native.so`,
 `PROGRAMS.json` and expert packages, mounted read-only as /opt/cuteafd/{bin,lib,share}
-in the slot's own dev image (META base_image_id), with `--gpus device=...`,
+in the slot's own dev image (META base_image_id), with CDI `--device nvidia.com/gpu=N`,
 `--ipc host`, memlock unlimited, the host uid (release_serving_docker_args), the
 hub read-only at /hf/hub (HF_HOME=/hf) and /mnt/sparknest read-only. GOLDEN ARGS
 pass through verbatim except two placeholders: `{snapshot}` (the checkpoint's
@@ -352,7 +352,7 @@ def docker_command(state, name, arm, slot, out_dir, golden):
     mounts += [(p, p) for p in state['extra_mounts']]
     cmd = ['docker', 'run', '--rm', '--name', container_name(state['task'], name),
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
-           *state['serving_args'], '--gpus', f'"device={",".join(map(str, gpus))}"', '--ipc', 'host',
+           *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']

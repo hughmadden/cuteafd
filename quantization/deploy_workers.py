@@ -56,7 +56,7 @@ def deploy(host, repo, root, token):
         if f"CUTEAFD_EXL3_WORKER_TOKEN={token}" not in status["Config"]["Env"]:
             raise RuntimeError(f"{host}: existing worker uses a different authentication token")
     else:
-        command = ("read -r cuteafd_worker_token; docker run -d --name cuteafd-quant-worker --gpus all "
+        command = ("read -r cuteafd_worker_token; docker run -d --name cuteafd-quant-worker --device nvidia.com/gpu=all "
                    "--restart=no -p 17841:17841 -v cuteafd-quant-jit:/root/.cache/gptqmodel "
                    "-v cuteafd-quant-worker-state:/state "
                    '-e CUTEAFD_EXL3_WORKER_TOKEN="$cuteafd_worker_token" '

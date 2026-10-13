@@ -188,6 +188,7 @@ def test_tampered_artifact_is_refused(env, capsys):
 
 
 def test_env_per_arm_and_container_mounts(env, monkeypatch):
+    monkeypatch.setattr(golden.cards._cdi, 'cdi_names', lambda specs=(): {'0', '1', 'all'})
     write_slot(env['home'], 'i1')
     order = []
     real_hold = golden.hwlock.hold
@@ -207,7 +208,9 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         envs = [call[i + 1] for i, a in enumerate(call) if a == '-e']
         assert f'CUTEAFD_ATTENTION_PLACEMENT={mode}' in envs and 'RUST_LOG=warn' in envs
         assert call[call.index('--user') + 1] == f'{os.getuid()}:{os.getgid()}'
-        assert call[call.index('--gpus') + 1] == '"device=0,1"'
+        assert '--gpus' not in call
+        assert [call[i + 1] for i, a in enumerate(call) if a == '--device'
+                and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
         assert f"{env['tmp']}/hub:/hf/hub:ro" in mounts

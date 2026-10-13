@@ -128,7 +128,9 @@ verify_gpu_passthrough() {
     exit 1
   fi
 
-  docker run --rm --gpus device=0 \
+  source "$(dirname "${BASH_SOURCE[0]}")/../lib/cdi-gpus.sh"
+  cuteafd_cdi_gpu_args 0 || exit 1
+  docker run --rm "${CUTEAFD_CDI_ARGS[@]}" \
     -e CUDA_VISIBLE_DEVICES=0 -e NVIDIA_VISIBLE_DEVICES=0 "$image" \
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 }

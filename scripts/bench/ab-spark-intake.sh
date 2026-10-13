@@ -28,6 +28,7 @@
 # PROMPT_FILE (text for the 8K prompt, default this repo's PLAN.md).
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo/scripts/lib/cdi-gpus.sh"
 OUT="${OUT:-$HOME/.cache/cuteafd/builds/intake-ab}"
 OVERLAY_FROM="${OVERLAY_FROM:-ghcr.io/tpurtell/cuteafd-coordinator:p7}"
 SPARK_IMAGE="${SPARK_IMAGE:-ghcr.io/tpurtell/cuteafd-spark-expert:p7}"
@@ -86,7 +87,8 @@ build_arm() { # build_arm NAME REV
   rm -rf "$art" "$root"; mkdir -p "$art" "$root"
   python3 "$repo/scripts/build/assert-build-filesystem.py" "$art" "$root"
   echo "== $name ($rev): coordinator release artifacts"
-  docker run --rm --gpus "device=${BUILD_GPU:-0}" --ipc=host --ulimit memlock=-1:-1 \
+  cuteafd_cdi_gpu_args "${BUILD_GPU:-0}" || exit 2
+  docker run --rm "${CUTEAFD_CDI_ARGS[@]}" --ipc=host --ulimit memlock=-1:-1 \
     -e CUTEAFD_RELEASE_BUILD_ROOT="$root" -v "$root:$root" \
     -e CUTEAFD_RELEASE_EXPERT_FAMILIES -e CUTEAFD_RELEASE_DSV4_AOT -e CUTEAFD_RELEASE_GLM_AOT \
     -e CUTEAFD_RELEASE_MIMO_AOT -e CUTEAFD_RELEASE_MIMO_GEOMETRIES -e CUTEAFD_RELEASE_GLMF_AOT \
