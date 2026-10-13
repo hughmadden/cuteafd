@@ -117,3 +117,45 @@ def test_watch_ignores_a_failed_reading(tmp_path, monkeypatch):
     args = placement.argparse.Namespace(smi='x', gpu='0', cgroup=None, baseline_mib=0, cap_mib=100,
                                         interval=0.05, command=['bash', '-c', 'sleep 0.3'])
     assert placement.watch(args) == 0
+
+
+def _hold(tmp_path, held=(), env_held='', gpus='1,0'):
+    """Run `hold` with `held` GPU locks taken by another process; report the GPU used."""
+    locks = tmp_path / 'locks'
+    locks.mkdir(exist_ok=True)
+    holders = []
+    for gpu in held:
+        holders.append(subprocess.Popen(['flock', str(locks / f'gpu{gpu}.lock'), 'sleep', '30']))
+    try:
+        import time
+        time.sleep(0.3)
+        probe = ('import fcntl,os,sys; g=os.environ["CUTEAFD_EXPORT_GPU"]; '
+                 'print(g, os.environ.get("CUTEAFD_HW_LOCKS_HELD",""))')
+        env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'CUTEAFD_HW_LOCKS_HELD': env_held}
+        return subprocess.run([sys.executable, str(SCRIPT), 'hold', '--gpus', gpus, '--', sys.executable, '-c', probe],
+                              capture_output=True, text=True, timeout=30, env=env)
+    finally:
+        for holder in holders:
+            holder.kill()
+
+
+def test_hold_uses_a_gpu_the_caller_already_holds_without_probing(tmp_path):
+    # The caller holds gpu0 for its own run (an export beside it); even with
+    # gpu0.lock held (by the caller) that GPU is the one used.
+    result = _hold(tmp_path, held=('0',), env_held='gpu0')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[0] == '0' and 'already holds gpu0' in result.stderr
+
+
+def test_hold_probes_gpu1_then_gpu0_and_holds_the_one_it_gets(tmp_path):
+    first = _hold(tmp_path)
+    assert first.returncode == 0 and first.stdout.split() == ['1', 'gpu1']
+    second = _hold(tmp_path, held=('1',))
+    assert second.returncode == 0 and second.stdout.split() == ['0', 'gpu0']
+
+
+def test_hold_never_uses_a_gpu_someone_else_holds(tmp_path):
+    # Both locks held (another job, or TJ's interactive gpu0): exit 75 so wip.sh
+    # moves on to the export host or the fair queue.
+    result = _hold(tmp_path, held=('1', '0'))
+    assert result.returncode == placement.NO_TURN and 'every candidate GPU lock is held' in result.stderr

@@ -17,6 +17,13 @@ export can share a GPU with serving, or with someone else's job, under a cap.
       INTERIM, remove once #122 lands: exit 75 unless the export host's SM
       count equals the target card's. AOT exports still bake the live SM count
       into compiled code (#122), on every export host alike (raptor included).
+  export-placement.py hold --gpus 1,0 -- CMD...
+      Take the first of those GPUs' hardware locks that is free right now
+      (non-blocking flock on ~/.cache/cuteafd/gpuN.lock, never a wait, so no
+      queued job is overtaken), run CMD holding it with CUTEAFD_EXPORT_GPU=N,
+      and release it after. A GPU named in CUTEAFD_HW_LOCKS_HELD (the caller
+      already holds it) is used without probing. Exit 75 when all are held:
+      a held lock means the GPU is not ours (TJ's interactive gpu0 use too).
   export-placement.py watch --smi SMI --gpu G --cap-mib N (--cgroup ID | --baseline-mib N) -- CMD...
       Run CMD; kill it and exit 75 as soon as the export's device memory goes
       over the cap. --cgroup sums the processes in that container's cgroup
@@ -121,6 +128,37 @@ def watch(args) -> int:
     return process.returncode
 
 
+def held_by_caller() -> list[str]:
+    return [lock for lock in os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(',') if lock]
+
+
+def hold(gpus: list[str], command: list[str], lock_dir: Path) -> int:
+    import fcntl
+
+    held = held_by_caller()
+    for gpu in gpus:
+        if f'gpu{gpu}' in held:
+            print(f'export-placement: caller already holds gpu{gpu}.lock', file=sys.stderr)
+            return subprocess.run(command, env={**os.environ, 'CUTEAFD_EXPORT_GPU': gpu}).returncode
+    for gpu in gpus:
+        handle = open(lock_dir / f'gpu{gpu}.lock', 'a')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            continue
+        try:
+            print(f'export-placement: holding gpu{gpu}.lock for the export', file=sys.stderr)
+            env = {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu,
+                   'CUTEAFD_HW_LOCKS_HELD': ','.join([*held, f'gpu{gpu}'])}
+            return subprocess.run(command, env=env).returncode
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+    print(f'export-placement: every candidate GPU lock is held ({",".join("gpu" + g for g in gpus)})', file=sys.stderr)
+    return NO_TURN
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -129,6 +167,9 @@ def main(argv=None) -> int:
     a.add_argument('--gpu', required=True)
     a.add_argument('--max-cap-mib', type=int, default=MAX_CAP_MIB)
     a.add_argument('--headroom-mib', type=int, default=HEADROOM_MIB)
+    h = sub.add_parser('hold')
+    h.add_argument('--gpus', default='1,0')
+    h.add_argument('command', nargs=argparse.REMAINDER)
     s = sub.add_parser('sm-check')
     s.add_argument('--live', type=int, required=True)
     s.add_argument('--target', type=int, required=True)
@@ -160,7 +201,10 @@ def main(argv=None) -> int:
     if args.command[:1] == ['--']:
         args.command = args.command[1:]
     if not args.command:
-        parser.error('watch needs a command')
+        parser.error(f'{args.action} needs a command')
+    if args.action == 'hold':
+        lock_dir = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+        return hold([g for g in args.gpus.split(',') if g], args.command, lock_dir)
     return watch(args)
 
 

@@ -988,15 +988,17 @@ wip_seed_lease_release() {
   unset CUTEAFD_WIP_SEED_LEASE
 }
 # Coordinator export modes, in order (CUTEAFD_WIP_COORDINATOR_EXPORT):
-#   auto    remote (when CUTEAFD_EXPORT_HOST names one), capped, turn
-#   remote  an SM120 export host (oliver) through sparknest, then capped, turn
-#   capped  raptor's GPU with the most free memory, beside serving, then turn
+#   auto    capped, then remote (when CUTEAFD_EXPORT_HOST names one), then turn
+#   capped  a raptor GPU whose lock we hold or get at once, then turn
+#   remote  the SM120 export host (oliver) through sparknest, then turn
 #   turn    the fair turn on gpu${COORDINATOR_GPU} only (the old behavior)
+# Never a GPU whose lock someone else holds; exports are pinned (#127), so a
+# raptor and an oliver export of the same inputs are the same bytes.
 wip_coordinator_export_modes() {
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
-    auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote '; printf 'capped turn\n' ;;
-    remote) printf 'remote capped turn\n' ;;
+    auto) printf 'capped '; [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote '; printf 'turn\n' ;;
     capped) printf 'capped turn\n' ;;
+    remote) printf 'remote turn\n' ;;
     turn) printf 'turn\n' ;;
     *) release_die "CUTEAFD_WIP_COORDINATOR_EXPORT must be auto, remote, capped or turn" ;;
   esac
@@ -1032,39 +1034,48 @@ wip_remote_export() {
   echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
 }
 
-# wip_capped_export BUILD...: the native phase on raptor's GPU with the most
-# free memory right now, in a one-off container (the WIP container is bound to
-# COORDINATOR_GPU), admitted by the host's nvidia-smi and stopped by the
-# watchdog if it outgrows its cap. Serving keeps its memory and the GPU.
+# wip_capped_export BUILD...: the native phase on a raptor GPU we hold: one
+# whose lock the caller already holds, else gpu1 then gpu0 if its lock is free
+# right now (non-blocking; held only for the export). A one-off container on
+# that GPU (the WIP container is bound to COORDINATOR_GPU), admitted by the
+# host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
 wip_capped_export() {
-  local placement="$repo_root/scripts/build/export-placement.py" gpu cap jobs used name started=$SECONDS
-  gpu="$(nvidia-smi --query-gpu=uuid,memory.free --format=csv,noheader,nounits | sort -t, -k2 -nr | head -1 | cut -d, -f1)"
+  local status=0
+  CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
+    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" -- \
+    bash -c "$(declare -f wip_capped_export_on); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
+    status=$?
+  ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
+}
+
+# wip_capped_export_on: runs under export-placement.py hold, CUTEAFD_EXPORT_GPU set.
+wip_capped_export_on() {
+  local placement="$repo_root/scripts/build/export-placement.py" gpu cap jobs used started=$SECONDS
+  gpu="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v i="$CUTEAFD_EXPORT_GPU" '$1 == i {print $2}')"
+  [[ -n "$gpu" ]] || return 75
   read -r cap jobs used < <(python3 "$placement" admit --gpu "$gpu" --headroom-mib "${CUTEAFD_WIP_EXPORT_HEADROOM_MIB:-4096}") ||
-    { echo "WIP coordinator export: no GPU has room for a capped export; next mode" >&2; return 75; }
-  name="${coordinator_container}-export-$$"
-  echo "WIP coordinator export: capped on $gpu (${cap} MiB, ${jobs} jobs; ${used} MiB in use)"
+    { echo "WIP coordinator export: gpu$CUTEAFD_EXPORT_GPU has no room for a capped export" >&2; return 75; }
+  echo "WIP coordinator export: capped on gpu$CUTEAFD_EXPORT_GPU (${cap} MiB, ${jobs} jobs; ${used} MiB in use)"
   # The coordinator build's environment (its -e pairs), in a one-off container
   # on that GPU sharing the WIP container's /wip and cache mounts.
-  local -a env_args=()
+  local -a build env_args=()
+  eval "build=($CUTEAFD_CAPPED_BUILD)"
   local i
-  for ((i = 2; i < $#; i++)); do
-    [[ "${!i}" == -e ]] || continue
-    local next=$((i + 1))
-    env_args+=(-e "${!next}")
+  for ((i = 2; i < ${#build[@]}; i++)); do
+    [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
   done
-  local -a run_args=(run -d --name "$name" --user "$(id -u):$(id -g)" --gpus "device=$gpu"
-    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}"
-    -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu"
-    --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)
   local id status=0
-  id="$(docker "${run_args[@]}")" || return 75
+  id="$(docker run -d --name "${coordinator_container}-export-$$" --user "$(id -u):$(id -g)" --gpus "device=$gpu" \
+    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}" \
+    -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
+    --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
   # The watchdog counts only this container's processes (its cgroup carries the ID).
   python3 "$placement" watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id" -- \
     docker exec "$id" /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator native || status=$?
   docker rm -f "$id" >/dev/null 2>&1 || true
-  ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
-  echo "WIP phase coordinator export-capped: $((SECONDS - started))s"
+  ((status == 0)) || return "$status"
+  echo "WIP phase coordinator export-capped: $((SECONDS - started))s (gpu$CUTEAFD_EXPORT_GPU)"
 }
 
 build_coordinator() {

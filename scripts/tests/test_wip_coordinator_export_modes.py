@@ -22,8 +22,8 @@ def _dispatch():
 
 @pytest.mark.parametrize('setting,host,expected', [
     ('auto', '', 'capped turn'),
-    ('auto', 'oliver', 'remote capped turn'),
-    ('remote', '', 'remote capped turn'),
+    ('auto', 'oliver', 'capped remote turn'),
+    ('remote', '', 'remote turn'),
     ('capped', 'oliver', 'capped turn'),
     ('turn', 'oliver', 'turn'),
 ])
@@ -42,16 +42,16 @@ def test_unknown_mode_is_refused():
     assert result.returncode == 9 and 'must be auto, remote, capped or turn' in result.stdout
 
 
-@pytest.mark.parametrize('remote,capped,expected_done,expected_calls', [
-    (0, 0, 'remote', ['remote']),
-    (75, 0, 'capped', ['remote', 'capped']),
-    (75, 75, 'turn', ['remote', 'capped', 'turn']),
+@pytest.mark.parametrize('capped,remote,expected_done,expected_calls', [
+    (0, 0, 'capped', ['capped']),
+    (75, 0, 'remote', ['capped', 'remote']),
+    (75, 75, 'turn', ['capped', 'remote', 'turn']),
 ])
-def test_dispatch_falls_through_to_the_fair_turn(tmp_path, remote, capped, expected_done, expected_calls):
+def test_dispatch_falls_through_to_the_fair_turn(tmp_path, capped, remote, expected_done, expected_calls):
     trace = tmp_path / 'trace'
     script = f'''
 release_die() {{ echo "DIE $*"; exit 9; }}
-wip_coordinator_export_modes() {{ printf 'remote capped turn\\n'; }}
+wip_coordinator_export_modes() {{ printf 'capped remote turn\\n'; }}
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
 wip_hwlock() {{ echo turn >> {trace}; }}
@@ -67,13 +67,14 @@ run
     assert trace.read_text().split() == expected_calls
 
 
-def test_capped_export_takes_no_hardware_lock_and_is_watched():
+def test_capped_export_runs_only_on_a_gpu_whose_lock_it_holds_and_is_watched():
     capped = _function('wip_capped_export')
-    assert 'wip_hwlock' not in capped and 'flock' not in capped
-    assert 'export-placement.py' in WIP and '"$placement" admit' in capped
-    assert 'watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id"' in capped
-    # The GPU with the most free memory at that moment, read from the host smi.
-    assert "sort -t, -k2 -nr | head -1" in capped
+    # Never queues (no fair-turn wait) and never picks a GPU across locks.
+    assert 'wip_hwlock' not in capped
+    assert 'export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}"' in capped
+    on = _function('wip_capped_export_on')
+    assert 'CUTEAFD_EXPORT_GPU' in on and 'memory.free' not in on and 'sort -t,' not in on
+    assert '"$placement" admit' in on and 'watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id"' in on
     remote = _function('wip_remote_export')
     assert 'wip_hwlock' not in remote and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in remote
 
@@ -89,3 +90,35 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     assert 'nest replicate --hosts "$host"' in remote and 'wip-native/x86_64/coordinator-120' in remote
     # Interim #122 guard, marked for removal.
     assert 'remove once #122 lands' in remote and 'sm-check' in remote
+
+
+def test_capped_export_runs_the_native_phase_in_a_one_off_container_on_the_held_gpu(tmp_path):
+    trace = tmp_path / 'trace'
+    locks = tmp_path / 'locks'
+    locks.mkdir()
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    (bindir / 'nvidia-smi').write_text('''#!/usr/bin/env bash
+case "$1" in
+  --query-gpu=index,uuid) printf '0, GPU-zero\\n1, GPU-one\\n' ;;
+  --query-gpu=*) printf '0, GPU-zero, 90000, 97887, 7887\\n1, GPU-one, 500, 97887, 97387\\n' ;;
+  --query-compute-apps=*) ;;
+esac
+''')
+    (bindir / 'docker').write_text(f'#!/usr/bin/env bash\necho "docker $*" >> {trace}\n[[ "$1" == run ]] && echo cid123\nexit 0\n')
+    for tool in ('nvidia-smi', 'docker'):
+        (bindir / tool).chmod(0o755)
+    script = _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
+repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
+wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
+'''
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + script], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, 'PATH': f'{bindir}:{os.environ["PATH"]}', 'CUTEAFD_LOCK_DIR': str(locks),
+                                 'CUTEAFD_HW_LOCKS_HELD': ''})
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = trace.read_text()
+    run = next(line for line in calls.splitlines() if line.startswith('docker run'))
+    assert '--gpus device=GPU-one' in run and '--volumes-from wipc' in run
+    assert '-e CUTEAFD_WIP_DSV4_AOT=ON' in run and '-e CUTEAFD_WIP_EXPERT_FAMILIES=a;b' in run
+    assert 'docker exec cid123 /wip/source/scripts/build/build-wip-artifacts.sh' in calls and calls.rstrip().endswith('rm -f cid123')
+    assert 'capped on gpu1' in result.stdout
