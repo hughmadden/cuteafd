@@ -605,8 +605,11 @@ mod tests {
     fn installed_exl3_geometry_prices_route_blocks_not_program_capacity() {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping,
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
-        let loaded = WorkerSelection::new(WorkerIdentity { checkpoint: "0".repeat(64),
-            geometry: [4096, 288, 8, 2048, 45], world: 2, topology: None }, &[3, 4]).unwrap();
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
+            "world": 2, "topology": null,
+        })).unwrap();
+        let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
             ExpertGroupingSelector::Exl3GlmFlashK64, [1, 16, 80, 256].into_iter().map(|capacity|
                 InstalledExpertVariant::from_queries(capacity, |_| Ok(8)).unwrap()).collect()).unwrap()).collect();
