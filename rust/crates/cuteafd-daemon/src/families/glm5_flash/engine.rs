@@ -4867,15 +4867,25 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            ("integration/cuteafd/glmf.py", 0x4949_583b_7962_90f6_u64),
+            // The A/B pin (SparkInfer hugh/glmf-kda-5090-ab) adds two options to compile_glmf_kda_aot, both
+            // off by default: seq_ctas (the recurrence's CTAs per head block; no projection) and decode_tiles
+            // (KDA_DECODE_TILES: past the 8 skinny rows the BF16 KDA projections pick their TMA tiles by live
+            // rows, switching at 32 and 64 rows). The skinny crossovers and every FP8 route are unchanged. The
+            // tile entries keep each output's K order and are expected bit-identical to the default TMA route
+            // (SparkInfer tests/integration/test_cuteafd_glmf_kda_decode_tiles.py, a GPU test), so 32 and 64
+            // are not registered as arithmetic crossovers; both are boundaries of every decode bucket set here.
+            ("integration/cuteafd/glmf.py", 0xeec9_1168_31e0_2a6d_u64),
             // 9769b043 adds GlmQueryRope query_row (default heads * latent, the prior stride; GLM
             // Flash decode never passes it), so projection shapes and routes are unchanged.
-            ("integration/cuteafd/_glm_kernels.py", 0x3aa5_9169_9149_9ba0),
+            // The A/B pin adds glm_projection's row_tiles (default none; WIDE_SKINNY_MAX_ROWS is unchanged).
+            ("integration/cuteafd/_glm_kernels.py", 0x2d8c_7a79_391b_2859),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
             ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
-            ("gemm/bf16_gemv/_skinny.py", 0x26cd_c0f9_cb63_d3a9),
+            // The A/B pin adds RowTiledBf16Projection and RoutedBf16Projection's row_tiles (default none): the
+            // skinny route, its row limits and the 128 x 128 prefill route are unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0x3372_5465_4e23_fa82),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
