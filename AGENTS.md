@@ -323,6 +323,8 @@ facts recorded somewhere for agents working on it.
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
   10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
   first four is the qualified V4.1 default until a six-rank layout wins.
+- `kakapo` (GB10, 172.22.2.7): build seed only, never serves; 10 GbE, no
+  RoCE. Its sealed slots reach the Sparks through sparknest; `kakapo.lock`.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

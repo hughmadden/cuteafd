@@ -272,8 +272,10 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     for arm in ('base', 'candidate'):
         cfg = cards.config(tmp_path / ('build-' + arm + '.config'))
         hosts = {cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))}
-        assert hosts == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', 'kiwi'}
-        assert cfg['SPARK_0_HOST'] == 'moa'
+        # The default seed (build-only kakapo) leads; the union's serving hosts follow
+        # (six ranks already, so no padding host).
+        assert hosts == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', cards.DEFAULT_SEED}
+        assert cfg['SPARK_0_HOST'] == cards.DEFAULT_SEED
     output = capsys.readouterr().out
     assert output.count('identical build scopes') == 2
     assert 'build.lock' in output and 'gpu1.lock' not in output

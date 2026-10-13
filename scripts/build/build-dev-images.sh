@@ -5,18 +5,21 @@ source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/build-supervision.sh"
 usage() {
   printf '%s\n' 'Usage: build-dev-images.sh [--config FILE] [--spark-hosts HOST,...]' \
-    '  [--role coordinator|expert|both] [--publish] [--dry-run]' \
+    '  [--seed-hosts HOST,...] [--role coordinator|expert|both] [--publish] [--dry-run]' \
     'Build toolchain-only dev images natively, independent of SparkInfer pins.' \
     '--publish uses only ghcr.io/tpurtell/cuteafd-dev:tc-HASH{-amd64,-arm64} and latest.' \
-    'Publishing never retags local development defaults. Use rhea as the Spark seed.' \
+    'Publishing never retags local development defaults. Use rhea or kakapo as the Spark seed.' \
+    '--seed-hosts: build-only Spark seeds that also receive the Spark image (default kakapo; empty for none).' \
+    'A copy to or from a host without RoCE goes zstd-compressed over AES-GCM ssh on its LAN address.' \
     'Both architectures build concurrently; CUTEAFD_DEV_IMAGE_SEQUENTIAL=1 restores coordinator-first order.' \
     'Hold build.lock and the Spark seed host lock around actual builds.'
 }
-config="$repo_root/cuteafd.config"; hosts_csv=; role=both; dry_run=0; publish=0
+config="$repo_root/cuteafd.config"; hosts_csv=; seed_hosts_csv=kakapo; role=both; dry_run=0; publish=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?}"; shift 2 ;;
     --spark-hosts) hosts_csv="${2:?}"; shift 2 ;;
+    --seed-hosts) seed_hosts_csv="${2-}"; shift 2 ;;
     --role) role="${2:?}"; shift 2 ;;
     --publish) publish=1; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -50,9 +53,15 @@ else
   spark_hosts=()
   for i in 0 1 2 3 4 5; do name="SPARK_${i}_HOST"; [[ -z "${!name:-}" ]] || spark_hosts+=("${!name}"); done
 fi
+seed_only_hosts=()
+[[ -z "$seed_hosts_csv" ]] || IFS=, read -ra seed_only_hosts <<<"$seed_hosts_csv"
 if [[ "$role" != coordinator ]]; then
   ((${#spark_hosts[@]})) || release_die 'no Spark build host'
   seed_host="${spark_hosts[0]}"
+  # Build-only seeds receive the image too (each once, never the seed itself).
+  for host in ${seed_only_hosts[@]+"${seed_only_hosts[@]}"}; do
+    [[ " ${spark_hosts[*]} " == *" $host "* ]] || spark_hosts+=("$host")
+  done
 fi
 printf 'Toolchain: tc-%s\n  amd64: %s\n  arm64: %s\n' "$hash" "$coordinator_tag" "$spark_tag"
 ((!publish)) || printf '  index: %s:tc-%s\n  latest: %s:latest\n' "$package" "$hash" "$package"
@@ -61,6 +70,7 @@ case "$role:$sequential" in
   both:1) printf 'Plan: sequential: coordinator then expert (CUTEAFD_DEV_IMAGE_SEQUENTIAL=1); shared steps wait for both.\n' ;;
   *) printf 'Plan: %s leg only.\n' "$role" ;;
 esac
+[[ "$role" == coordinator ]] || printf 'Spark seed: %s; receives the image: %s\n' "$seed_host" "${spark_hosts[*]:1}"
 if ((dry_run)); then printf 'Dry run: nothing built or pushed.\n'; exit 0; fi
 # Preserve old si-* images for campaigns, and old tc-* images before moving a local default.
 retag_body='set -euo pipefail
@@ -147,6 +157,21 @@ fi
 rm -f "$process_dir/$1.pid"
 CANCEL
 }
+# copy_spark_image SRC DST: the Spark image from SRC to DST, relayed through this
+# host. Between RoCE hosts it streams as is; when either end has no RDMA (a
+# 10 GbE build seed) it goes zstd-compressed over AES-GCM on that end's LAN address.
+copy_spark_image() {
+  local src="$1" dst="$2" src_addr= dst_addr=
+  if release_host_has_rdma "$src" && release_host_has_rdma "$dst"; then
+    ssh -o BatchMode=yes "$src" "docker image save '$spark_tag'" | ssh -o BatchMode=yes "$dst" 'docker image load'
+    return
+  fi
+  release_host_has_rdma "$src" || src_addr="$(python3 "$repo_root/scripts/build/seed-transfer.py" lan-addr "$src")"
+  release_host_has_rdma "$dst" || dst_addr="$(python3 "$repo_root/scripts/build/seed-transfer.py" lan-addr "$dst")"
+  printf 'Copying %s %s -> %s compressed\n' "$spark_tag" "$src" "$dst"
+  release_bulk_ssh "$src" "$src_addr" "docker image save '$spark_tag' | zstd -T8 -3 -q" |
+    release_bulk_ssh "$dst" "$dst_addr" 'zstd -d -q | docker image load'
+}
 case "$role" in
   both) build_supervise 'dev image build' "$leg_log_dir" "$sequential" \
     coordinator build_coordinator_dev cancel_coordinator_dev amd64.log \
@@ -164,7 +189,7 @@ if ((!publish)); then
   if [[ "$role" != coordinator ]]; then
     ssh -o BatchMode=yes "$seed_host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"
     for host in "${spark_hosts[@]:1}"; do
-      ssh -o BatchMode=yes "$seed_host" "docker image save '$spark_tag'" | ssh -o BatchMode=yes "$host" 'docker image load'
+      copy_spark_image "$seed_host" "$host"
       ssh -o BatchMode=yes "$host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"
     done
   fi

@@ -136,9 +136,11 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.
-- **Builds:** `--build` arms seed on rhea or moa (`--seed-host`). Both serve
-  cards too, so wait for an idle one without holding locks; never wrap
-  `wip.sh` in a Spark lock yourself.
+- **Builds:** `--build` arms seed on kakapo by default (`--seed rhea|moa` to
+  override). kakapo only builds (10 GbE; its slots reach the Sparks through
+  sparknest), so its CPU load never skews a serving card; rhea and
+  moa serve cards too, so wait for an idle one without holding locks; never
+  wrap `wip.sh` in a Spark lock yourself.
 - **Page cache:** GB10 doesn't reclaim it, and a full one OOMs expert
   packing. The launchers already drop Spark caches through `nest
   drop-caches` (SparkNest's installed setuid helper, no approval needed), so

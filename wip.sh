@@ -145,7 +145,7 @@ if ((dry_run)); then
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
   echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
-  echo "  seed host: $seed_host"
+  echo "  seed host: $seed_host (transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto})"
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
@@ -299,6 +299,22 @@ rm -f "$process_dir/$1.pid"
 CANCEL
 }
 release_configure_ssh_transport
+# The seed's transport. A seed on the RoCE fabric streams directly (rdmasync,
+# rdmapipe). A seed without RDMA (a 10 GbE build seed such as kakapo) moves bulk
+# data over its configured SPARK_0_LANE_A address (its directly attached LAN
+# address, not a slower name route) with release_bulk_ssh, compresses what
+# crosses that link, and hands sealed slots to the serving Sparks through
+# sparknest (CUTEAFD_WIP_SEED_TRANSFER: auto, nest or stream; see
+# wip_slot_transfer_mode).
+wip_seed_rdma=1
+wip_seed_addr=""
+wip_seed_transfer="${CUTEAFD_WIP_SEED_TRANSFER:-auto}"
+case "$wip_seed_transfer" in auto|nest|stream) ;; *) release_die "CUTEAFD_WIP_SEED_TRANSFER must be auto, nest or stream" ;; esac
+if ((wip_spark_leg)) && ! release_host_has_rdma "$seed_host"; then
+  wip_seed_rdma=0
+  wip_seed_addr="$SPARK_0_LANE_A"
+  echo "WIP seed $seed_host has no RDMA: bulk transfers over $wip_seed_addr"
+fi
 if ((wip_spark_leg)); then
   build_supervise 'WIP dev image' "$dev_image_logs" 0 \
     coordinator ensure_local_image cancel_local_dev_image coordinator.log \
@@ -313,7 +329,11 @@ fi
 # fallback scripts/build/build-dev-images.sh uses for the development images).
 stream_between_hosts() {
   local src="$1" src_cmd="$2" dst="$3" dst_cmd="$4"
-  if ssh -o BatchMode=yes "$src" 'command -v rdmapipe >/dev/null' &&
+  if [[ "$src" == "$seed_host" && "${wip_seed_rdma:-1}" == 0 ]]; then
+    # The seed's leg crosses 10 GbE: compress it, fast cipher, LAN address.
+    release_bulk_ssh "$src" "$wip_seed_addr" "$src_cmd | zstd -T8 -3 -q" |
+      ssh -o BatchMode=yes "$dst" "zstd -d -q | $dst_cmd"
+  elif ssh -o BatchMode=yes "$src" 'command -v rdmapipe >/dev/null' &&
     ssh -o BatchMode=yes "$dst" 'command -v rdmapipe >/dev/null'; then
     ssh -o BatchMode=yes "$src" "$src_cmd | rdmapipe --send" | ssh -o BatchMode=yes "$dst" "rdmapipe --recv | $dst_cmd"
   else
@@ -331,12 +351,24 @@ distribute_spark_dev_image() {
     [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
   done
   ((${#targets[@]})) || return 0
-  echo "== concurrently distributing Spark development image from $seed_host =="
+  local source="$seed_host"
+  if [[ "$wip_seed_rdma" == 0 ]]; then
+    # One compressed crossing of the seed's 10 GbE link, then fan out on RoCE.
+    echo "== distributing Spark development image from $seed_host to ${targets[0]} =="
+    (
+      set -o pipefail
+      stream_between_hosts "$seed_host" "docker image save '$SPARK_EXPERT_DOCKER_DEV'" "${targets[0]}" 'docker image load'
+    ) || release_die "Spark development image distribution to ${targets[0]} failed"
+    source="${targets[0]}"
+    targets=("${targets[@]:1}")
+    ((${#targets[@]})) || return 0
+  fi
+  echo "== concurrently distributing Spark development image from $source =="
   local -a pids=()
   for host in "${targets[@]}"; do
     (
       set -o pipefail
-      stream_between_hosts "$seed_host" "docker image save '$SPARK_EXPERT_DOCKER_DEV'" "$host" 'docker image load'
+      stream_between_hosts "$source" "docker image save '$SPARK_EXPERT_DOCKER_DEV'" "$host" 'docker image load'
     ) &
     pids+=("$!")
   done
@@ -734,16 +766,21 @@ sync_seed_source() {
   else
     remote_staging="$(ssh -o BatchMode=yes "$seed_host" 'printf "%s/.cuteafd-wip-source-staging" "$HOME"')${WIP_INSTANCE:+-$WIP_INSTANCE}"
   fi
-  local sync=rsync
-  if command -v rdmasync >/dev/null 2>&1 && ssh -o BatchMode=yes "$seed_host" 'command -v rdmasync >/dev/null'; then
+  local sync=rsync started=$SECONDS
+  if [[ "$wip_seed_rdma" == 1 ]] && command -v rdmasync >/dev/null 2>&1 && ssh -o BatchMode=yes "$seed_host" 'command -v rdmasync >/dev/null'; then
     sync=rdmasync
   fi
   ssh -o BatchMode=yes "$seed_host" "mkdir -p '$remote_staging'"
   if [[ "$sync" == rdmasync ]]; then
     rdmasync -a --delete --rdma=required --rdma-show-config "$staging_dir/" "$seed_host:$remote_staging/"
+  elif [[ "$wip_seed_rdma" == 0 ]]; then
+    # 10 GbE seed: its LAN address, AES-GCM and no ssh compression.
+    rsync -a --delete -e "$release_rsh ${release_bulk_ssh_opts[*]} -o HostName=$wip_seed_addr -o HostKeyAlias=$seed_host" \
+      "$staging_dir/" "$seed_host:$remote_staging/"
   else
     rsync -a --delete "$staging_dir/" "$seed_host:$remote_staging/"
   fi
+  echo "WIP phase expert source-sync: $((SECONDS - started))s ($sync${wip_seed_addr:+ via $wip_seed_addr})"
   ssh -o BatchMode=yes "$seed_host" \
     "docker exec '$spark_container' rm -rf /wip/source.next && docker cp -a '$remote_staging/.' '$spark_container:/wip/source.next' && docker exec '$spark_container' bash -lc 'rm -rf /wip/source && mv /wip/source.next /wip/source'"
 }
@@ -792,6 +829,72 @@ fi
   fi
 }
 
+# A cluster tier for Spark native entries on sparknest, so every seed (and a
+# fresh one such as kakapo) reuses an export any seed already built: one sealed
+# zstd tar per key at build-cache/wip-native/<arch>/<scope>/<key>.tar.zst,
+# imported into the host store before the host-to-instance import and published
+# after the host publish. The newest CUTEAFD_WIP_NEST_NATIVE_KEEP (8) per scope
+# survive (CUTEAFD_WIP_NEST_NATIVE=off skips the tier). Entries are re-verified
+# against NATIVE_SHA256SUMS before reuse.
+# native_store_nest HOST ARCH ROOT OUTPUT import|publish
+wip_nest_settle_script='
+nest_settle() {
+  # A file written through the mount commits shortly after close; seal and
+  # replicate need the committed object.
+  local i
+  for ((i = 0; i < 600; i++)); do
+    [[ "$(nest where --json "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[\"writing\"])")" == 0 ]] && return 0
+    sleep 0.5
+  done
+  echo "sparknest never committed $1" >&2
+  return 1
+}
+'
+native_store_nest() {
+  local host="$1" arch="$2" root="$3" output="$4" direction="$5"
+  [[ "${CUTEAFD_WIP_NEST_NATIVE:-on}" == on ]] || return 0
+  local script="$wip_nest_settle_script"'
+set -euo pipefail
+arch="$1"; root="$2"; output="$3"; direction="$4"; keep="$5"
+mountpoint -q /mnt/sparknest && command -v nest >/dev/null || exit 0
+[[ -s "$root/output/$output/.native-cache-key" ]] || exit 0
+read -r scope key <"$root/output/$output/.native-cache-key"
+[[ "$scope" =~ ^[a-z-]+-[0-9]+$ && "$key" =~ ^[0-9a-f]{64}$ ]] || exit 0
+nest_root="/mnt/sparknest/build-cache/wip-native/$arch/$scope"
+archive="$nest_root/$key.tar.zst"
+global_root="$HOME/.cache/cuteafd/native-store/$arch/$scope"
+global_entry="$global_root/$key"
+if [[ "$direction" == import ]]; then
+  [[ -f "$archive" && ! -f "$global_entry/COMPLETE" && ! -f "$root/cache/native-store/$scope/$key/COMPLETE" ]] || exit 0
+  mkdir -p "$global_root"
+  stage="$global_root/.nest-$key-$$"
+  rm -rf "$stage"; mkdir -p "$stage"
+  if zstd -d -q <"$archive" | tar -C "$stage" -xf - && [[ -f "$stage/COMPLETE" ]]; then
+    mv -T "$stage" "$global_entry" 2>/dev/null || rm -rf "$stage"
+    touch "$archive" 2>/dev/null || true
+    echo "native cache: imported $scope/$key from sparknest"
+  else
+    rm -rf "$stage"
+  fi
+else
+  [[ -f "$global_entry/COMPLETE" ]] || exit 0
+  if [[ -f "$archive" ]]; then touch "$archive" 2>/dev/null || true; exit 0; fi
+  mkdir -p "$nest_root"
+  partial="$nest_root/.$key.partial-$$"
+  tar -C "$global_entry" -cf - . | zstd -T0 -3 -q >"$partial"
+  mv -T "$partial" "$archive"
+  nest_settle "$archive" && nest seal "$archive" >/dev/null
+  echo "native cache: published $scope/$key to sparknest"
+  # Bound the tier: the most recently used entries per scope.
+  ls -1t "$nest_root"/*.tar.zst 2>/dev/null | tail -n +"$((keep + 1))" |
+    while IFS= read -r stale; do nest rm "$stale" >/dev/null || true; done
+  rm -f "$nest_root"/.*.partial-* 2>/dev/null || true
+fi
+'
+  timeout --kill-after=10 900 ssh -o BatchMode=yes "$host" bash -s -- "$arch" "$root" "$output" "$direction" \
+    "${CUTEAFD_WIP_NEST_NATIVE_KEEP:-8}" <<<"$script" || true
+}
+
 # native_store_has HOST ROOT OUTPUT: the per-instance store holds a complete entry
 # for the key the rust phase recorded.
 native_store_has() {
@@ -803,9 +906,10 @@ native_store_has() {
   fi
 }
 
-# The seed Spark's lock: rhea and moa have their own; a pool Spark is under sparks.
+# The seed Spark's lock: rhea, moa and the out-of-pool build seed kakapo have
+# their own; a pool Spark is under sparks.
 wip_seed_lock() {
-  case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
+  case "$1" in rhea|moa|kakapo) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
 }
 # A lease holds the seed's lock (one fair turn through hwlock) across the whole
 # Spark build leg: source sync, Cargo, native/export, finalize. Spark CPU work
@@ -961,6 +1065,7 @@ build_expert() (
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
   seed_root="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
+  native_store_nest "$seed_host" aarch64 "$seed_root" expert import
   native_store_sync "$seed_host" "$seed_root" aarch64 expert import
   if [[ "${wip_export_locks:-off}" != on ]]; then
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
@@ -975,6 +1080,7 @@ build_expert() (
       release_die "Spark WIP export on $seed_host failed"
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
+  native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
   timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
@@ -1064,6 +1170,110 @@ CONTAINER
 fi
 # wip-slot-readiness:end
 
+# How a sealed Spark slot reaches the serving Sparks. A seed on the RoCE fabric
+# streams to each (rdmapipe). A seed without RDMA writes one sealed zstd tar to
+# sparknest, which replicates it to one serving Spark over its 10 GbE link and
+# then on to the rest over RoCE; each Spark extracts from its local copy. With
+# sparknest unmounted (or CUTEAFD_WIP_SEED_TRANSFER=stream) that seed relays one
+# compressed stream to the first target, which fans out.
+wip_slot_transfer_mode() {
+  case "$wip_seed_transfer" in
+    nest) printf 'nest\n'; return ;;
+    stream) [[ "$wip_seed_rdma" == 1 ]] && printf 'stream\n' || printf 'relay\n'; return ;;
+  esac
+  [[ "$wip_seed_rdma" == 0 ]] || { printf 'stream\n'; return; }
+  local host
+  for host in "$seed_host" "${wip_target_hosts[@]}"; do
+    ssh -o BatchMode=yes "$host" 'mountpoint -q /mnt/sparknest && command -v nest >/dev/null' ||
+      { printf 'relay\n'; return; }
+  done
+  printf 'nest\n'
+}
+
+# distribute_expert_slot_from SRC HOST...: stream SRC's sealed slot to each HOST.
+distribute_expert_slot_from() {
+  local src="$1" host
+  shift
+  local -a pids=()
+  for host in "$@"; do
+    (
+      set -o pipefail
+      ssh -o BatchMode=yes "$host" \
+        "docker exec '$spark_container' bash -lc 'rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert'"
+      stream_between_hosts "$src" "docker exec '$spark_container' tar -C '/wip/slots/$slot/spark-expert' -cf - ." \
+        "$host" "docker exec -i '$spark_container' tar -C '/wip/incoming/$slot.spark-expert' -xf -"
+      ssh -o BatchMode=yes "$host" \
+        "docker exec '$spark_container' bash -lc 'mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert'"
+    ) &
+    pids+=("$!")
+  done
+  local failed=0 pid
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  ((failed == 0)) || release_die "Spark WIP slot distribution from $src failed"
+}
+
+# The instance's sparknest build area; wip-cards --cleanup removes it with the instance.
+wip_nest_slot_dir() {
+  printf '/mnt/sparknest/build-cache/wip/%s/%s\n' "${WIP_INSTANCE:-_default}" "$slot"
+}
+
+# distribute_expert_slot_nest FINGERPRINT HOST...
+distribute_expert_slot_nest() {
+  local fingerprint="$1" dir archive
+  shift
+  dir="$(wip_nest_slot_dir)"
+  archive="$dir/$fingerprint.tar.zst"
+  local started=$SECONDS
+  # One archive per slot: an earlier fingerprint's copies go first.
+  timeout --kill-after=10 1800 ssh -o BatchMode=yes "$seed_host" bash -s -- "$dir" "$archive" "$spark_container" "$slot" \
+    <<<"$wip_nest_settle_script"'
+set -euo pipefail
+dir="$1"; archive="$2"; container="$3"; slot="$4"
+mkdir -p "$dir"
+for old in "$dir"/*.tar.zst; do
+  [[ -e "$old" && "$old" != "$archive" ]] || continue
+  nest rm "$old" >/dev/null
+done
+if [[ ! -f "$archive" ]]; then
+  partial="$dir/.$(basename "$archive").partial-$$"
+  docker exec "$container" tar -C "/wip/slots/$slot/spark-expert" -cf - . | zstd -T0 -1 -q >"$partial"
+  mv -T "$partial" "$archive"
+fi
+nest_settle "$archive"
+nest seal "$archive" >/dev/null
+' || release_die "could not write the Spark WIP slot to sparknest from $seed_host"
+  echo "WIP phase expert nest-write: $((SECONDS - started))s ($(ssh -o BatchMode=yes "$seed_host" "stat -c %s '$archive'") bytes)"
+  started=$SECONDS
+  # The first copy crosses the seed's link; the rest source from a RoCE host.
+  timeout --kill-after=10 1800 ssh -o BatchMode=yes "$seed_host" "nest replicate --hosts '$1' --wait '$archive' >/dev/null" ||
+    release_die "sparknest could not replicate $archive to $1"
+  echo "WIP phase expert nest-first-copy: $((SECONDS - started))s ($1)"
+  if (($# > 1)); then
+    started=$SECONDS
+    timeout --kill-after=10 1800 ssh -o BatchMode=yes "$seed_host" \
+      "nest replicate --hosts '$(IFS=,; echo "${*:2}")' --wait '$archive' >/dev/null" ||
+      release_die "sparknest could not replicate $archive to ${*:2}"
+    echo "WIP phase expert nest-fanout: $((SECONDS - started))s (${*:2})"
+  fi
+  started=$SECONDS
+  local host
+  local -a pids=()
+  for host in "$@"; do
+    ssh -o BatchMode=yes "$host" bash -s -- "$archive" "$spark_container" "$slot" <<'EXTRACT' &
+set -euo pipefail
+archive="$1"; container="$2"; slot="$3"
+docker exec "$container" bash -lc "rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert"
+zstd -d -q <"$archive" | docker exec -i "$container" tar -C "/wip/incoming/$slot.spark-expert" -xf -
+docker exec "$container" bash -lc "mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert"
+EXTRACT
+    pids+=("$!")
+  done
+  local failed=0 pid
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  ((failed == 0)) || release_die "Spark WIP slot extraction from sparknest failed"
+  echo "WIP phase expert nest-extract: $((SECONDS - started))s"
+}
+
 distribute_expert_slot() {
   ssh -o BatchMode=yes "$seed_host" \
     "docker exec '$spark_container' test -s '/wip/slots/$slot/spark-expert/FINGERPRINT'" ||
@@ -1076,23 +1286,19 @@ distribute_expert_slot() {
       targets+=("$host")
   done
   ((${#targets[@]})) || { echo "Spark WIP slot $slot is already on every target host"; return 0; }
-  echo "== concurrently distributing Spark WIP slot $slot from $seed_host to ${targets[*]} =="
-  local -a pids=()
-  for host in "${targets[@]}"; do
-    (
-      set -o pipefail
-      ssh -o BatchMode=yes "$host" \
-        "docker exec '$spark_container' bash -lc 'rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert'"
-      stream_between_hosts "$seed_host" "docker exec '$spark_container' tar -C '/wip/slots/$slot/spark-expert' -cf - ." \
-        "$host" "docker exec -i '$spark_container' tar -C '/wip/incoming/$slot.spark-expert' -xf -"
-      ssh -o BatchMode=yes "$host" \
-        "docker exec '$spark_container' bash -lc 'mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert'"
-    ) &
-    pids+=("$!")
-  done
-  local failed=0 pid
-  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
-  ((failed == 0)) || release_die "Spark WIP slot distribution failed"
+  local started=$SECONDS mode
+  mode="$(wip_slot_transfer_mode)"
+  echo "== distributing Spark WIP slot $slot from $seed_host to ${targets[*]} ($mode) =="
+  case "$mode" in
+    nest) distribute_expert_slot_nest "$seed_fingerprint" "${targets[@]}" ;;
+    relay)
+      # One compressed crossing of the seed's 10 GbE link, then fan out on RoCE.
+      distribute_expert_slot_from "$seed_host" "${targets[0]}"
+      ((${#targets[@]} == 1)) || distribute_expert_slot_from "${targets[0]}" "${targets[@]:1}"
+      ;;
+    stream) distribute_expert_slot_from "$seed_host" "${targets[@]}" ;;
+  esac
+  echo "WIP phase expert distribute: $((SECONDS - started))s ($mode, ${#targets[@]} hosts)"
   local expected actual
   expected="$(ssh -o BatchMode=yes "$seed_host" "docker exec '$spark_container' cat '/wip/slots/$slot/spark-expert/FINGERPRINT'")"
   for host in "${wip_target_hosts[@]}"; do
