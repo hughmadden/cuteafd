@@ -84,6 +84,11 @@ pub(crate) struct EngineArgs {
     pub skip_routed_experts: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+    /// Attention over the two GPUs: auto (the recorded default, heads), context (the C4
+    /// layers' compressed records split by 256-token unit parity with a q/candidate/partial
+    /// exchange per C4 layer; C128 and window state stay replicated), or heads.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
+    pub attention_placement: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -173,19 +178,28 @@ impl EngineArgs {
     }
 }
 
-/// The engine runs one shape: every layer head-split under `--split-device`,
-/// every layer whole on GPU0 otherwise, and no hop but the step-start
-/// streams push. Anything else the solver hands it is refused before any
-/// cache or expert is allocated.
-fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool) -> Result<()> {
+/// The engine runs three shapes: every layer head-split under `--split-device` (`heads`), the
+/// same with every C4 layer token-split (`context`: all or none of them, C128 and window layers
+/// head-split), or every layer whole on GPU0, and no hop but the step-start streams push.
+/// Anything else the solver hands it is refused before any cache or expert is allocated.
+/// Returns whether the C4 layers run `context`.
+fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool, cfg: &DeepseekV4Config)
+    -> Result<bool> {
     use cuteafd_loader::placement::{families::DEEPSEEK_V4, FfnMode, LayerMode};
     DEEPSEEK_V4.check(placement).map_err(|error| anyhow::anyhow!("DeepSeek V4 placement: {error}"))?;
-    let engine = if split { LayerMode::HeadSplit } else { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } };
-    if let Some((layer, assignment)) = placement.layers.iter().enumerate().find(|(_, a)| a.mode != engine) {
-        anyhow::bail!("DeepSeek V4 runs every layer as {engine:?}; the placement has layer {layer} as {:?}",
+    let context = split && placement.layers.iter().any(|a| a.mode == LayerMode::ContextSplit);
+    ensure!(placement.layers.len() == cfg.n_layers, "DeepSeek V4 placement covers {} of {} layers",
+        placement.layers.len(), cfg.n_layers);
+    for (layer, (assignment, &ratio)) in placement.layers.iter().zip(&cfg.compress_ratios).enumerate() {
+        let engine = match (split, context && ratio == 4) {
+            (true, true) => LayerMode::ContextSplit,
+            (true, false) => LayerMode::HeadSplit,
+            (false, _) => LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+        };
+        ensure!(assignment.mode == engine, "DeepSeek V4 runs layer {layer} (C{ratio}) as {engine:?}; the placement has {:?}",
             assignment.mode);
     }
-    Ok(())
+    Ok(context)
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -375,7 +389,7 @@ pub(crate) fn with_engine<T>(
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
-        check_modes(&placement, split_device.is_some())?;
+        check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
@@ -386,6 +400,13 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
         placement
     };
+    let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
+        Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
+            loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
+            .context("context placement without the build's C4 context programs")?)
+    } else { None };
+    // The solver charged staging over the compiled extent it was given.
+    let context_extent = max_context;
     max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
         usize::try_from(placement.pool_tokens)?, 256)?;
     let shape = pool::PoolShape::new(
@@ -417,6 +438,7 @@ pub(crate) fn with_engine<T>(
         shape,
         embedding,
         skip_routed: skip,
+        context: context_mode,
     })?;
     // Startup and inference share retirement: an error must not drop a rank
     // owner while the other rank is waiting for its missing publication.
@@ -425,6 +447,9 @@ pub(crate) fn with_engine<T>(
     let result = (|| -> Result<T> {
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
+        }
+        if context_mode.is_some() {
+            engine.attach_context(context_extent, &loaded.manifest)?;
         }
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
@@ -550,7 +575,7 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
     ensure!(chunk > 0, "prefill chunk must be positive");
@@ -630,7 +655,7 @@ fn golden_run(
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
     let mut logits = Vec::new();
@@ -746,7 +771,7 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
     if let Some(p) = args.prefill {
         tokens.truncate(p);
     }
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let chunks: Vec<&[u32]> = tokens.chunks(engine.prefill_capacity()).collect();
     let mut last = None;

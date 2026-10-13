@@ -94,6 +94,11 @@ impl PoolAllocator {
             units: RefPagePool::parity(shape.units, SOURCE_PAGE_TOKENS, 0) })
     }
 
+    /// `engine`'s allocator: parity units under C4 context attention.
+    pub fn for_engine(engine: &super::engine::Engine<'_>) -> Result<Self> {
+        if engine.context_kv() { Self::context(engine.shape) } else { Ok(Self::new(engine.shape)) }
+    }
+
     pub fn free_states(&self) -> usize {
         self.free_states.len()
     }

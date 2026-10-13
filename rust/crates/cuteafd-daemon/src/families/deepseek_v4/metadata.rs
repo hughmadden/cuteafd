@@ -92,6 +92,28 @@ pub(crate) struct StepTables {
     pub c128_lengths: Vec<i32>,
 }
 
+/// One rank's C4 fields of a step under token-split (`context`) attention: everything else
+/// in [`StepTables`] (window, C128, positions, carry) stays replicated and is uploaded as is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct C4Shard {
+    pub c4_tables: Vec<(&'static str, Vec<i32>)>,
+    pub c4_page_table: Vec<i32>,
+    pub c4_table_width: usize,
+    pub c4_table_stride: usize,
+    pub c4_visible: Vec<i32>,
+}
+
+impl C4Shard {
+    fn of(tables: &StepTables) -> Self {
+        Self { c4_tables: tables.c4_tables.clone(), c4_page_table: Vec::new(), c4_table_width: tables.c4_table_width,
+            c4_table_stride: tables.c4_table_stride, c4_visible: tables.c4_visible.clone() }
+    }
+}
+
+/// Scratch C4 pages per GPU under `context`, past its local units: non-owner compressor rows of
+/// one decode/verify step write distinct rows there (`context_scratch_units` at 64 decode rows).
+pub(crate) const C4_SCRATCH_UNITS: usize = 1;
+
 /// Tables for a prefill chunk of one sequence: rows are positions
 /// `start..start + tokens`; the caches already hold `start` tokens. The first
 /// chunk uses the prefill compressor, later chunks its continuation.
@@ -373,16 +395,17 @@ mod tests {
         for tables in [decode_step(&[(&placement, 255), (&placement, 259), (&placement, 771)],
             &shape, 512, 8)?, verify_step(&[(&placement, 250, 16)], &shape, 512, 8)?] {
             for rank in 0..2 {
-                let shard = c4_context_tables(&tables, rank, shape.units, 1)?;
-                assert_eq!(shard.c128_tables, tables.c128_tables);
-                assert_eq!(shard.c128_indices, tables.c128_indices);
-                assert_eq!(shard.main_slots, tables.main_slots);
-                assert_eq!(shard.swa_indices, tables.swa_indices);
-                assert_eq!(shard.positions, tables.positions);
+                let shard = c4_context_tables(&tables, rank, shape.units)?;
+                // Only the C4 fields shard; every other table stays as the step built it.
+                for ((name, before), (shard_name, after)) in tables.c4_tables.iter().zip(&shard.c4_tables) {
+                    assert_eq!(name, shard_name);
+                    if *name != "compressed_slots" { assert_eq!(before, after); }
+                }
+                assert_eq!((shard.c4_table_stride, shard.c4_page_table.len()),
+                    (tables.c4_table_stride.div_ceil(2), tables.rows * tables.c4_table_stride.div_ceil(2)));
                 for row in 0..tables.rows {
                     assert_eq!(shard.c4_visible[row] as usize,
                         crate::shared::peer_split::context::shard_rows(tables.c4_visible[row] as usize, 64, rank));
-                    assert_eq!(shard.swa_lengths[row], if rank == 1 { tables.swa_lengths[row] } else { 0 });
                 }
                 let name = if tables.chunked { "group_source_positions" } else { "positions" };
                 let positions = &tables.c4_tables.iter().find(|(n, _)| *n == name).unwrap().1;
@@ -403,11 +426,11 @@ mod tests {
         let short = super::super::pool::Placement::new(0, vec![4]);
         let tables = decode_step(&[(&short, 256)], &shape, 512, 8)?;
         for rank in 0..2 {
-            assert!(c4_context_tables(&tables, rank, shape.units, 0).is_ok());
+            assert!(c4_context_tables(&tables, rank, shape.units).is_ok());
         }
         let invalid = super::super::pool::Placement::new(0, vec![5]);
         let tables = decode_step(&[(&invalid, 3)], &shape, 512, 8)?;
-        assert!(c4_context_tables(&tables, 0, shape.units, 0).is_err());
+        assert!(c4_context_tables(&tables, 0, shape.units).is_err());
         Ok(())
     }
 
@@ -420,14 +443,7 @@ mod tests {
             let gathered = c4_context_prefill_tables(&tables)?;
             assert_eq!(gathered.c4_page_table, vec![0, 1, 2, 3]);
             assert_eq!(gathered.c4_visible, tables.c4_visible);
-            assert_eq!(gathered.c4_indexed_lengths, tables.c4_indexed_lengths);
-            assert_eq!(gathered.c4_table_width, tables.c4_table_width);
-            assert_eq!(gathered.c128_tables, tables.c128_tables);
-            assert_eq!(gathered.c128_indices, tables.c128_indices);
-            assert_eq!(gathered.c128_lengths, tables.c128_lengths);
-            assert_eq!(gathered.main_slots, tables.main_slots);
-            assert_eq!(gathered.swa_indices, tables.swa_indices);
-            assert_eq!(gathered.swa_lengths, tables.swa_lengths);
+            assert_eq!((gathered.c4_table_width, gathered.c4_table_stride), (tables.c4_table_width, tables.c4_table_stride));
             for ((name, before), (_, after)) in tables.c4_tables.iter().zip(&gathered.c4_tables) {
                 if *name == "compressed_slots" {
                     let groups = (start + rows) / 4 - start / 4;
@@ -451,7 +467,7 @@ mod tests {
         let tables = verify_step(&[(&a, 0, 268), (&b, 0, 268)], &shape, 512, 8)?;
         let scratch = shape.units / 2 * 64;
         for rank in 0..2 {
-            let shard = c4_context_tables(&tables, rank, shape.units, 0)?;
+            let shard = c4_context_tables(&tables, rank, shape.units)?;
             let active = tables.c4_tables.iter().find(|(n, _)| *n == "active_groups").unwrap().1[0] as usize;
             let slots = &shard.c4_tables.iter().find(|(n, _)| *n == "compressed_slots").unwrap().1;
             let discarded: Vec<_> = slots.iter().take(active).copied().filter(|&s| s as usize >= scratch).collect();
@@ -500,7 +516,7 @@ mod tests {
 
 /// Commit only newly completed C4 rows from a gathered prefill view. V4
 /// records and index keys/scales are planar, not interleaved 584-byte rows.
-fn c4_context_commits(rank: usize, first_group: usize, groups: usize, units: &[u32], limit: usize)
+pub(crate) fn c4_context_commits(rank: usize, first_group: usize, groups: usize, units: &[u32], limit: usize)
     -> anyhow::Result<crate::shared::peer_split::context::CommitBlocks> {
     use crate::shared::peer_split::context::{commit_blocks, CommitPlane};
     let rows_per_unit = compressed_page_rows(4);
@@ -515,9 +531,9 @@ fn c4_context_commits(rank: usize, first_group: usize, groups: usize, units: &[u
 
 /// Head-split prefill over a logical, gathered C4 view. Only C4 output slots
 /// and its index page table change; window rings, C128 and carry remain physical.
-fn c4_context_prefill_tables(tables: &StepTables) -> anyhow::Result<StepTables> {
+pub(crate) fn c4_context_prefill_tables(tables: &StepTables) -> anyhow::Result<C4Shard> {
     anyhow::ensure!(!tables.decode && !tables.chunked, "C4 gathered tables need prefill");
-    let mut out = tables.clone();
+    let mut out = C4Shard::of(tables);
     let positions_name = if tables.start == 0 { "group_source_starts" } else { "group_source_positions" };
     let positions = tables.c4_tables.iter().find(|(name, _)| *name == positions_name)
         .ok_or_else(|| anyhow::anyhow!("C4 compressor lacks {positions_name}"))?.1.clone();
@@ -541,13 +557,14 @@ fn c4_context_prefill_tables(tables: &StepTables) -> anyhow::Result<StepTables> 
 }
 
 /// Decode/verify metadata for one C4 token shard. C128, the window ring and
-/// compressor carry stay replicated. Non-owner compressed writes land in a
-/// scratch row per active compressor CTA; exactly one rank contributes the
-/// window union. Both C4 caches need `ceil(rows / 64)` extra scratch pages.
-fn c4_context_tables(tables: &StepTables, rank: usize, units: usize, window_rank: usize)
-    -> anyhow::Result<StepTables> {
+/// compressor carry stay replicated (the window lengths too: C128 and window
+/// layers read them on both ranks; a C4 layer's partial passes empty lengths on
+/// the rank that does not contribute the window). Non-owner compressed writes
+/// land in a scratch row per active compressor CTA. Both C4 caches need
+/// `ceil(rows / 64)` extra scratch pages.
+pub(crate) fn c4_context_tables(tables: &StepTables, rank: usize, units: usize) -> anyhow::Result<C4Shard> {
     use crate::shared::peer_split::context::{local_pages, page_owner, shard_rows};
-    anyhow::ensure!(tables.decode && rank < 2 && window_rank < 2 && units > 0 && units % 2 == 0,
+    anyhow::ensure!(tables.decode && rank < 2 && units > 0 && units % 2 == 0,
         "C4 context metadata needs decode/verify, two ranks and an even parity pool");
     let rows_per_unit = compressed_page_rows(4);
     let local_units = units / 2;
@@ -558,8 +575,7 @@ fn c4_context_tables(tables: &StepTables, rank: usize, units: usize, window_rank
     i32::try_from(scratch_end)?;
     let pool_slots = units.checked_mul(rows_per_unit)
         .ok_or_else(|| anyhow::anyhow!("C4 pool slot overflow"))?;
-    let mut out = tables.clone();
-    out.c4_page_table.clear();
+    let mut out = C4Shard::of(tables);
     out.c4_table_stride = tables.c4_table_stride.div_ceil(2).max(1);
     out.c4_table_width = tables.c4_table_width.div_ceil(2).max(1);
     anyhow::ensure!(tables.c4_visible.len() == tables.rows && tables.c4_table_stride > 0
@@ -610,7 +626,6 @@ fn c4_context_tables(tables: &StepTables, rank: usize, units: usize, window_rank
             *slot = i32::try_from(scratch_slot + group)?;
         }
     }
-    if rank != window_rank { out.swa_lengths.fill(0); }
     Ok(out)
 }
 
