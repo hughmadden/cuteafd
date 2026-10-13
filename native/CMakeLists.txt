@@ -89,6 +89,48 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Host CPU targets for the native library's own C/C++ (not the exported AOT
+# objects, whose host stubs the exporters pin). The first entry is the base
+# libcuteafd_native.so; each further entry also links <isa>/libcuteafd_native.so
+# from the same CUDA objects and AOT exports, recompiling only the host C/C++
+# (the daemon's host_isa resolver loads the matching one). Empty keeps the
+# compiler default. Values: x86-64-v2, x86-64-v4 (coordinator) and grace (GB10:
+# Armv9 SVE2/BF16/I8MM/crypto with Neoverse V2 tuning; gcc 13 has no
+# cortex-x925, and grace leaves out the RNG and MTE that GB10 lacks).
+set(CUTEAFD_HOST_ISA "" CACHE STRING
+  "Host CPU targets for native C/C++: base first, then extra variants (x86-64-v2;x86-64-v4 or grace)")
+set(CUTEAFD_HOST_ISA_FLAGS_x86-64-v2 -march=x86-64-v2 -mtune=znver4)
+set(CUTEAFD_HOST_ISA_FLAGS_x86-64-v4 -march=x86-64-v4 -mtune=znver4)
+set(CUTEAFD_HOST_ISA_FLAGS_grace -mcpu=grace)
+foreach(isa IN LISTS CUTEAFD_HOST_ISA)
+  if(NOT DEFINED CUTEAFD_HOST_ISA_FLAGS_${isa})
+    message(FATAL_ERROR "CUTEAFD_HOST_ISA: unknown host target ${isa} (x86-64-v2, x86-64-v4, grace)")
+  endif()
+endforeach()
+set(CUTEAFD_HOST_ISA_BASE "")
+set(CUTEAFD_HOST_ISA_VARIANTS "")
+if(CUTEAFD_HOST_ISA)
+  list(GET CUTEAFD_HOST_ISA 0 CUTEAFD_HOST_ISA_BASE)
+  set(CUTEAFD_HOST_ISA_VARIANTS ${CUTEAFD_HOST_ISA})
+  list(REMOVE_AT CUTEAFD_HOST_ISA_VARIANTS 0)
+endif()
+# Host C/C++ flags for one target (an empty ISA adds nothing). FP contraction
+# stays off so FMA availability never changes host floating-point results
+# between the variants.
+function(cuteafd_host_isa_options target isa)
+  if(isa STREQUAL "")
+    return()
+  endif()
+  target_compile_options(${target} PRIVATE
+    "$<$<COMPILE_LANGUAGE:C,CXX>:${CUTEAFD_HOST_ISA_FLAGS_${isa}};-ffp-contract=off>")
+  get_target_property(type ${target} TYPE)
+  if(CMAKE_CUDA_COMPILER AND NOT type STREQUAL "STATIC_LIBRARY")
+    # nvcc's host compilation of .cu files (only the base library has them).
+    string(REPLACE ";" "," cuda_host "${CUTEAFD_HOST_ISA_FLAGS_${isa}};-ffp-contract=off")
+    target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${cuda_host}>")
+  endif()
+endfunction()
+
 set(CUTEAFD_NATIVE_SOURCES shared/src/cuteafd_native.cc)
 # Headers live beside their code: shared/ and one families/<id>/ tree per
 # family. Kernels include common.h/expert_hidden.cuh and the expert family
@@ -633,6 +675,61 @@ if(CUTEAFD_ENABLE_CUDA)
   add_test(NAME cuteafd_glm_mla_prefill_selftest_528 COMMAND cuteafd_glm_mla_prefill_selftest 512 528 64 2)
 endif()
 
+# Host-ISA variants (CUTEAFD_HOST_ISA beyond its first entry): the base library
+# and its static xgrammar get the base flags; each variant is a copy of the
+# finished cuteafd_native target -- same sources, AOT objects and archives,
+# definitions, includes, links and export dependencies -- whose host code is
+# compiled for that ISA and written to <isa>/libcuteafd_native.so. Deferred, so
+# the copy sees every property the family includes and options above set.
+function(cuteafd_host_isa_copy_target base variant type isa)
+  get_target_property(sources ${base} SOURCES)
+  if(type STREQUAL "STATIC_LIBRARY")
+    add_library(${variant} STATIC ${sources})
+  else()
+    add_library(${variant} SHARED ${sources})
+  endif()
+  foreach(property IN ITEMS COMPILE_DEFINITIONS COMPILE_OPTIONS INCLUDE_DIRECTORIES
+      INTERFACE_COMPILE_DEFINITIONS INTERFACE_INCLUDE_DIRECTORIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+      INTERFACE_LINK_LIBRARIES LINK_LIBRARIES LINK_OPTIONS BUILD_RPATH CUDA_ARCHITECTURES
+      POSITION_INDEPENDENT_CODE)
+    get_target_property(value ${base} ${property})
+    if(NOT value STREQUAL "value-NOTFOUND")
+      set_property(TARGET ${variant} PROPERTY ${property} "${value}")
+    endif()
+  endforeach()
+  get_target_property(dependencies ${base} MANUALLY_ADDED_DEPENDENCIES)
+  if(dependencies)
+    add_dependencies(${variant} ${dependencies})
+  endif()
+  # Per-source options (e.g. v41_sparse_attention.cu's sm_120a code) are source
+  # properties, so they follow the sources into the variant unchanged.
+  cuteafd_host_isa_options(${variant} "${isa}")
+endfunction()
+
+function(cuteafd_host_isa_variants)
+  # Copy the variants from the base targets first, so they inherit no base ISA flags.
+  foreach(isa IN LISTS CUTEAFD_HOST_ISA_VARIANTS)
+    string(MAKE_C_IDENTIFIER "${isa}" suffix)
+    if(TARGET cuteafd_xgrammar)
+      cuteafd_host_isa_copy_target(cuteafd_xgrammar cuteafd_xgrammar_${suffix} STATIC_LIBRARY "${isa}")
+    endif()
+    cuteafd_host_isa_copy_target(cuteafd_native cuteafd_native_${suffix} SHARED_LIBRARY "${isa}")
+    if(TARGET cuteafd_xgrammar)
+      get_target_property(links cuteafd_native_${suffix} LINK_LIBRARIES)
+      list(TRANSFORM links REPLACE "^cuteafd_xgrammar$" "cuteafd_xgrammar_${suffix}")
+      set_property(TARGET cuteafd_native_${suffix} PROPERTY LINK_LIBRARIES "${links}")
+    endif()
+    set_target_properties(cuteafd_native_${suffix} PROPERTIES
+      OUTPUT_NAME cuteafd_native
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${isa}")
+  endforeach()
+  if(TARGET cuteafd_xgrammar)
+    cuteafd_host_isa_options(cuteafd_xgrammar "${CUTEAFD_HOST_ISA_BASE}")
+  endif()
+  # The base library's own ISA; self-tests link it and inherit nothing from this.
+  cuteafd_host_isa_options(cuteafd_native "${CUTEAFD_HOST_ISA_BASE}")
+endfunction()
+cmake_language(DEFER CALL cuteafd_host_isa_variants)
 # Reproducible CUDA objects (#127): nvcc embeds its temp file name
 # (tmpxft_<pid>_...) and random per-TU IDs into every object, so two builds of
 # the same source never matched, on one host or across hosts. -objtemp gives

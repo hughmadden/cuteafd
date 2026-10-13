@@ -28,6 +28,7 @@ pub use shared::v41_experts::{
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 mod cuda_runtime;
+pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
 
@@ -1654,8 +1655,10 @@ fn sync_expert_hidden(lib: &Library) -> Result<()> {
 
 impl NativeLibrary {
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let lib = unsafe { Library::new(path.as_ref()) }
-            .with_context(|| format!("loading native library {}", path.as_ref().display()))?;
+        // The host-ISA variant beside `path` when one is installed (host_isa.rs).
+        let path = host_isa::native_library(path.as_ref());
+        let lib = unsafe { Library::new(&path) }
+            .with_context(|| format!("loading native library {}", path.display()))?;
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;

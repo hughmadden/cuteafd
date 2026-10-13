@@ -67,12 +67,16 @@ sys.exit(0)
 '''
 
 
-def write_slot(home, instance, slot='s1', tamper=False):
+def write_slot(home, instance, slot='s1', tamper=False, variants=()):
     root = home / '.cache/cuteafd/builds' / f'wip-{instance}' / 'slots' / slot / 'coordinator'
     art = root / 'workspace/.cuteafd-wip'
     (art / 'fp8/fp8-glm').mkdir(parents=True)
     files = {'cuteafd': b'bin', 'libcuteafd_native.so': b'lib', 'PROGRAMS.json': b'{}'}
+    for variant in variants:
+        files[f'bin-variants/{variant}/cuteafd'] = b'variant-bin'
+        files[f'lib-variants/{variant}/libcuteafd_native.so'] = b'variant-lib'
     for name, data in files.items():
+        (art / name).parent.mkdir(parents=True, exist_ok=True)
         (art / name).write_bytes(data)
     sums = ''.join(f'{hashlib.sha256(d).hexdigest()}  {n}\n' for n, d in files.items()).encode()
     (art / 'ARTIFACT_SHA256SUMS').write_bytes(sums)
@@ -185,6 +189,25 @@ def test_tampered_artifact_is_refused(env, capsys):
     (root / 'workspace/.cuteafd-wip/libcuteafd_native.so').write_bytes(b'other')
     assert golden.main(BASE + ['--arm', 'a=i1:s1'] + GOLDEN) == 2
     assert 'does not match ARTIFACT_SHA256SUMS' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('variants', [(), ('x86-64-v4',)])
+def test_host_isa_variants_are_mounted_and_overrides_forwarded(env, variants):
+    root = write_slot(env['home'], 'i1', variants=variants)
+    argv = BASE + ['--arm', 'v2=i1:s1', '--arm', 'v4=i1:s1',
+                   '--arm-env', 'v2:CUTEAFD_HOST_ISA=x86-64-v2',
+                   '--arm-env', 'v4:CUTEAFD_HOST_ISA=x86-64-v4'] + GOLDEN
+    assert golden.main(argv) == 0
+    for call, isa in zip(runs(env), ('x86-64-v2', 'x86-64-v4')):
+        envs = [call[i + 1] for i, arg in enumerate(call) if arg == '-e']
+        assert f'CUTEAFD_HOST_ISA={isa}' in envs
+        mounts = [call[i + 1] for i, arg in enumerate(call) if arg == '-v']
+        variant_mounts = [mount for mount in mounts if '-variants/' in mount]
+        assert len(variant_mounts) == 2 * len(variants)
+        for variant in variants:
+            art = root / 'workspace/.cuteafd-wip'
+            assert f'{art}/bin-variants/{variant}:/opt/cuteafd/bin/{variant}:ro' in mounts
+            assert f'{art}/lib-variants/{variant}:/opt/cuteafd/lib/{variant}:ro' in mounts
 
 
 def test_env_per_arm_and_container_mounts(env, monkeypatch):

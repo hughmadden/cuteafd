@@ -56,6 +56,11 @@ install -m 0644 \
   "$build_output/V41_EXPERT_TP_AOT.json" \
   "$incoming/workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json"
 install -m 0644 "$build_output/V41_FP8_AOT.json" "$incoming/workspace/.cuteafd-wip/V41_FP8_AOT.json"
+# Host-ISA variants of the daemon and library (scripts/build/host-isa.sh), in
+# ARTIFACT_SHA256SUMS like the base files.
+for variants in bin-variants lib-variants; do
+  [[ ! -d "$build_output/$variants" ]] || cp -a "$build_output/$variants" "$incoming/workspace/.cuteafd-wip/$variants"
+done
 install -m 0644 "$build_output/PROGRAMS.json" "$incoming/workspace/.cuteafd-wip/PROGRAMS.json"
 if [[ -d "$build_output/exl3" ]]; then
   mkdir -p "$incoming/workspace/.cuteafd-wip"

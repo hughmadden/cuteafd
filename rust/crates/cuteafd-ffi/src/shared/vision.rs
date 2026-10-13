@@ -142,7 +142,7 @@ impl NativeVision {
     pub fn required(path: &Path, spec: &VisionSpec) -> Result<VisionLedger, VisionError> {
         // SAFETY: trusted library and versioned header ABI; query initializes no CUDA state.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Library::new(crate::host_isa::native_library(path))?;
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
             check(required(spec, &mut ledger))?;
@@ -166,7 +166,7 @@ impl NativeVision {
         // SAFETY: caller selects a trusted native library. Every symbol has the
         // versioned header's exact ABI; the library outlives the native owner.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Library::new(crate::host_isa::native_library(path))?;
             let required = *library.get::<Required>(b"cuteafd_vision_required")?;
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_vision_upload")?;

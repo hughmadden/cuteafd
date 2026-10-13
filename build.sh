@@ -1110,6 +1110,12 @@ coordinator_container="$(docker create "$COORDINATOR_DOCKER_INFERENCE")"
 trap 'docker rm -f "$coordinator_container" >/dev/null 2>&1 || true' EXIT
 docker cp "$coordinator_container:/opt/cuteafd/bin/cuteafd" "$repo_root/dist/coordinator/cuteafd"
 docker cp "$coordinator_container:/opt/cuteafd/lib/libcuteafd_native.so" "$repo_root/dist/coordinator/libcuteafd_native.so"
+# Host-ISA variants (scripts/build/host-isa.sh): dist/coordinator/x86-64-v4/{cuteafd,libcuteafd_native.so}.
+for host_isa in x86-64-v4; do
+  mkdir -p "$repo_root/dist/coordinator/$host_isa"
+  docker cp "$coordinator_container:/opt/cuteafd/bin/$host_isa/cuteafd" "$repo_root/dist/coordinator/$host_isa/cuteafd"
+  docker cp "$coordinator_container:/opt/cuteafd/lib/$host_isa/libcuteafd_native.so" "$repo_root/dist/coordinator/$host_isa/libcuteafd_native.so"
+done
 docker cp "$coordinator_container:/opt/cuteafd/lib/exl3" "$repo_root/dist/coordinator/exl3"
 docker cp "$coordinator_container:/opt/cuteafd/lib/fp8" "$repo_root/dist/coordinator/fp8"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_AOT.json"
@@ -1224,7 +1230,7 @@ done
 (
   cd "$repo_root/dist"
   sha256sum \
-    coordinator/cuteafd coordinator/libcuteafd_native.so coordinator/V41_EXPERT_AOT.json coordinator/V41_EXPERT_TP_AOT.json coordinator/V41_FP8_AOT.json \
+    coordinator/cuteafd coordinator/libcuteafd_native.so coordinator/x86-64-v4/cuteafd coordinator/x86-64-v4/libcuteafd_native.so coordinator/V41_EXPERT_AOT.json coordinator/V41_EXPERT_TP_AOT.json coordinator/V41_FP8_AOT.json \
     coordinator/THIRD_PARTY_NOTICES.md \
     coordinator/SPARKINFER_PROVENANCE.json \
     coordinator/SPARKINFER_LICENSE \

@@ -219,8 +219,10 @@ def test_cargo_offline_probe_and_locked_builds(tmp_path):
     cargo.write_text('#!/bin/sh\nexit 1\n')
     result = subprocess.run(['bash', '-c', script], env=env, text=True, capture_output=True, check=True)
     assert result.stdout.endswith('unset')
+    # Both artifact scripts build every host-ISA daemon through one locked helper.
+    assert re.search(r'cargo build --locked ', (ROOT/'scripts/build/host-isa.sh').read_text())
     for name in ('build-release-artifacts.sh', 'build-wip-artifacts.sh'):
-        assert re.search(r'cargo build \\\n\s+--locked', (ROOT/'scripts/build'/name).read_text())
+        assert 'cuteafd_host_isa_cargo_build ' in (ROOT/'scripts/build'/name).read_text()
 
 
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])

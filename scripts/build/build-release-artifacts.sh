@@ -209,11 +209,25 @@ mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$bui
 cargo_target_dir+="$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
 export CARGO_TARGET_DIR="$cargo_target_dir"
 cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
-cargo build \
-  --locked \
-  --manifest-path "$build_root/source/rust/Cargo.toml" \
-  -p cuteafd-daemon \
-  --release
+# Host CPU targets (scripts/build/host-isa.sh): GB10-tuned on the Spark leg; the
+# coordinator ships a portable x86-64-v2 base plus an x86-64-v4 variant. Each
+# daemon builds into its own target directory; the variants build side by side.
+source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+host_isa_text="$(cuteafd_host_isa_list release "${CUTEAFD_RELEASE_HOST_ISA:-}")"
+mapfile -t host_isas <<<"$host_isa_text"
+host_isa_cmake="${host_isa_text//$'\n'/;}"
+echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
+# Cargo's release profile by default: thin LTO with one codegen unit cost 3.0x
+# the daemon build (84 -> 249 s) for ~0.3% on the host policy bench (2026-10-13).
+# CUTEAFD_RELEASE_RUST_LTO / _CODEGEN_UNITS opt in (e.g. thin / 1).
+[[ -z "${CUTEAFD_RELEASE_RUST_LTO:-}" ]] || export CARGO_PROFILE_RELEASE_LTO="$CUTEAFD_RELEASE_RUST_LTO"
+[[ -z "${CUTEAFD_RELEASE_RUST_CODEGEN_UNITS:-}" ]] || export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CUTEAFD_RELEASE_RUST_CODEGEN_UNITS"
+host_isa_jobs=()
+for host_isa in "${host_isas[@]}"; do
+  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" &
+  host_isa_jobs+=("$!")
+done
+for host_isa_job in "${host_isa_jobs[@]}"; do wait "$host_isa_job"; done
 
 # Release images serve the native V4.1 path. The DS4 Flash/Pro AOT bridge is
 # retained for development commands, but must not add legacy generated kernels
@@ -252,6 +266,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
+  -DCUTEAFD_HOST_ISA="${host_isa_cmake:-}" \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$build_root/source/third_party/sparkinfer" \
   -DCUTEAFD_SPARKINFER_LOCK_FILE="$build_root/source/third_party/sparkinfer.lock.json" \
   -DCUTEAFD_ENABLE_NCCL=OFF \
@@ -263,12 +278,11 @@ cmake \
 cmake --build "$build_root/native"
 
 install -d "$output_dir"
-install -m 0755 "$cargo_target_dir/release/cuteafd" "$output_dir/cuteafd"
+cuteafd_host_isa_install "$output_dir" "$build_root/native" "$cargo_target_dir" "${host_isas[@]}"
 if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 fi
-install -m 0755 "$build_root/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 exl3_family_tags=()
 IFS=';' read -ra exl3_family_list <<<"$exl3_bit_families"
 for exl3_family in "${exl3_family_list[@]}"; do
