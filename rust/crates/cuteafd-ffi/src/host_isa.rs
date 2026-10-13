@@ -188,6 +188,8 @@ pub fn plan_exec(exe: &Path, selection: &Selection, built_for: &str) -> std::res
     }
     match variant_path(exe, isa) {
         Some(candidate) if candidate.is_file() => Ok(Some(candidate)),
+        // A development build (not one of the image variants) has no siblings to expect.
+        _ if built_for != X86_64_V2 && built_for != X86_64_V4 => Ok(None),
         _ => Err(format!("no {isa} daemon beside {}, running the {built_for} build", exe.display())),
     }
 }
@@ -324,6 +326,10 @@ mod tests {
         assert_eq!(plan_exec(&exe, &v4, X86_64_V4).unwrap(), None);
         assert_eq!(plan_exec(&exe, &v2, X86_64_V2).unwrap(), None);
         assert_eq!(plan_exec(&exe, &select(false, None, None).unwrap(), "aarch64-sve2").unwrap(), None);
+        // A generic development build execs a variant when one is installed, else runs quietly.
+        assert_eq!(plan_exec(&exe, &v4, "x86-64").unwrap(), Some(dir.path().join("x86-64-v4/cuteafd")));
+        std::fs::remove_file(dir.path().join(X86_64_V4).join("cuteafd")).unwrap();
+        assert_eq!(plan_exec(&exe, &v4, "x86-64").unwrap(), None);
     }
 
     #[test]
