@@ -636,6 +636,22 @@ mod tests {
     }
 
     #[test]
+    fn dsv4_attention_plan_rows_default_auto_and_accept_a_row_count() {
+        use clap::Parser;
+        let base = ["cuteafd", "dsv4-golden", "--snapshot", "/model", "--native-lib", "/native.so", "--golden", "/golden"];
+        let parse = |extra: &[&str]| super::Cli::try_parse_from(base.into_iter().chain(extra.iter().copied()));
+        let rows = |extra: &[&str]| match parse(extra).unwrap().command {
+            super::Commands::Dsv4Golden(args) => args.engine.attention_plan_rows.0,
+            _ => panic!("expected DeepSeek V4 golden"),
+        };
+        assert_eq!(rows(&[]), None);
+        assert_eq!(rows(&["--attention-plan-rows", "auto"]), None);
+        assert_eq!(rows(&["--attention-plan-rows", "48"]), Some(48));
+        assert!(parse(&["--attention-plan-rows", "0"]).is_err());
+        assert!(parse(&["--attention-plan-rows", "wide"]).is_err());
+    }
+
+    #[test]
     fn dsv4_quantizer_defaults_to_device_geometry_and_keeps_tuning_optional() {
         use clap::Parser;
         let base = ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"];

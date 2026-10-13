@@ -181,7 +181,8 @@ impl<'a> Engine<'a> {
 
     /// Allocates the token-split buffers and exchange once the peer is attached; `extent`: the
     /// admitted compiled context (the staging the solver charged).
-    pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value) -> Result<()> {
+    pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value, plan_rows: Option<usize>)
+        -> Result<()> {
         let context = self.context_mode.context("this engine was built without context attention")?;
         let exchange = self.exchange()?;
         let abort = match (exchange.abort_word(0)?, exchange.abort_word(1)?) {
@@ -191,7 +192,7 @@ impl<'a> Engine<'a> {
         // One reduction plan for every step, after the drafter loaded: each sequence verifies
         // draft_block() + 1 rows (C1), plain decode one.
         let block = self.draft_block();
-        let plan = AttentionReductionPlan::new(self.decode_rows, (block > 0).then_some(block), None)
+        let plan = AttentionReductionPlan::new(self.decode_rows, (block > 0).then_some(block), plan_rows)
             .map_err(|error| anyhow::anyhow!("V4 attention reduction plan: {error:?}"))?;
         let split = V4ContextSplit::new(self, context, extent, manifest, abort, &plan)?;
         tracing::info!(bytes = ?split.bytes(), exchange = split.exchange.bytes(), plan_rows = plan.rows(),

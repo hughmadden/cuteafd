@@ -89,6 +89,22 @@ pub(crate) struct EngineArgs {
     /// exchange per C4 layer; C128 and window state stay replicated), or heads.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
     pub attention_placement: String,
+    /// Rows the context split's partial reduction plan is tuned for, fixed at startup: auto
+    /// (dSpark's verify width, draft block + 1; one row without a drafter) or 1..=decode rows.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS", default_value = "auto", value_parser = parse_plan_rows)]
+    pub attention_plan_rows: PlanRows,
+}
+
+/// `--attention-plan-rows`: `auto` or an explicit row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PlanRows(pub Option<usize>);
+
+fn parse_plan_rows(text: &str) -> std::result::Result<PlanRows, String> {
+    match text {
+        "auto" => Ok(PlanRows(None)),
+        n => n.parse::<usize>().ok().filter(|&n| n > 0).map(|n| PlanRows(Some(n)))
+            .ok_or_else(|| format!("attention plan rows must be auto or a positive integer (got {n:?})")),
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -452,7 +468,7 @@ pub(crate) fn with_engine<T>(
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
         if context_mode.is_some() {
-            engine.attach_context(context_extent, &loaded.manifest)?;
+            engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
         }
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
