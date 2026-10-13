@@ -228,7 +228,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     options = dict(size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
         tier0_num_experts=experts, tier1_num_experts=experts, top_k=topk,
         route_num_experts=experts, max_m_blocks=route_blocks,
-        sms=props.multi_processor_count, workspace_sms=workspace_sms,
+        sms=workspace_sms, workspace_sms=workspace_sms,
         max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=_projection_mixed_tile_config(tile, hidden_size=hidden,
             intermediate_size=intermediate, token_count=capacity, direct_topk_routes=direct),
@@ -272,7 +272,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Compile-only qualification needs the same shapes/aliasing, not CUDA storage.
     buffers = make_mixed_trellis_buffers(launch,
         device=torch.device("meta") if compile_only else torch.device("cuda", 0),
-        sms=props.multi_processor_count)
+        sms=workspace_sms)
     lut_bytes = launch.trellis_lut.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     (output / 'trellis_lut.bin').write_bytes(lut_bytes)
     layouts = {}
