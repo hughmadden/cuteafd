@@ -92,8 +92,8 @@ impl Observation<'_> {
     }
 }
 
-/// Build one round's observation. `native_width` is the drafter's native
-/// block (`policy.widths()[0]`); a pass wider than it is the wide width.
+/// Build one round's observation. `native_width` is the narrow draft-cost
+/// width (`policy.widths()[0]`), independent of the neural-confidence boundary.
 pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result<Observation<'a>, ObserveError> {
     let rows: usize = record.requests.iter().map(|request| request.rows).sum();
     record.routes.complete()?;
@@ -544,8 +544,8 @@ mod tests {
             group_rows_by_rows: (0..=16).map(|rows| vec![if rows == 1 { 1 } else { 8 }; 2]).collect(), regimes: 1 };
         let policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
         let requests = [request(1, 16, 1, DraftSource::Undrafted, None, None)];
-        let routes = routes(16);
-        let value = round_trace_value(&policy, &record(&requests, &routes, None));
+        let wide_routes = routes(16);
+        let value = round_trace_value(&policy, &record(&requests, &wide_routes, None));
         assert_eq!(value["geometry"][0]["group_rows"], 8);
         assert_eq!(value["executed_group_rows"], serde_json::json!([8, 8]));
         // Two experts each appear sixteen times: two M8 reads each, not one M16 read.
