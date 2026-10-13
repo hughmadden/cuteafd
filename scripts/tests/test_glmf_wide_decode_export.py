@@ -145,10 +145,10 @@ def test_the_wide_programs_are_new_m128_stems(exporter):
 def test_the_wide_programs_keep_the_decode_routes(exporter):
     calls = {stem: thunk() for stem, _, _, thunk in exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 131072)}
     kwargs = {stem: call[3] for stem, call in calls.items()}
-    assert kwargs["kda_m128"] == {"max_rows": 128, "fp8": True}
+    assert kwargs["kda_m128"] == {"max_rows": 128, "fp8": True, "seq_ctas": 8, "decode_tiles": True}
     assert kwargs["kda_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["kda_s16_m128"] == {"max_rows": 128, "fp8": True, "state_dtype": "bfloat16",
-                                      "state_rounding": "window"}
+                                      "state_rounding": "window", "seq_ctas": 8, "decode_tiles": True}
     assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
     # The 128-row bucket keeps one split where the planner would split it maximally.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
@@ -164,6 +164,30 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
         assert kwargs[stem] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i2048_m128"] == {"inter": 2048, "max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i12288_m128"] == {"inter": 12288, "max_rows": 128, "fp8_only": "decode"}
+
+
+def test_only_five_bf16_decode_stems_use_parallel_tiled_kda(exporter):
+    groups = {
+        "glmf": exporter.glmf_programs(GEOMETRY, 64, 4096, 1048576)
+                + exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 1048576),
+        "glmf2": exporter.glmf_head_split_programs(GEOMETRY, 64, 4096, 1048576),
+    }
+    qualified = {"glmf_kda_m64", "glmf_kda_m128", "glmf_kda_s16_m64",
+                 "glmf_kda_s16_m128", "glmf2_kda_m64"}
+    changed = set()
+    for prefix, programs in groups.items():
+        for stem, _, params, thunk in programs:
+            kwargs = thunk()[3]
+            name = f"{prefix}_{stem}"
+            for key in ("seq_ctas", "decode_tiles"):
+                assert (key in params) == (key in kwargs), name
+            if name in qualified:
+                assert params["seq_ctas"] == kwargs["seq_ctas"] == 8, name
+                assert params["decode_tiles"] is kwargs["decode_tiles"] is True, name
+                changed.add(name)
+            else:
+                assert "seq_ctas" not in kwargs and "decode_tiles" not in kwargs, name
+    assert changed == qualified
 
 
 def test_no_wide_programs_unless_wider_than_the_decode_programs(exporter):

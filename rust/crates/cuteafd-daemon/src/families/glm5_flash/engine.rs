@@ -1502,6 +1502,17 @@ fn startup_tables(rows: usize, spec: bool, geometry: GraphGeometry) -> StepTable
     tables
 }
 
+fn check_decode_slots(sequences: impl IntoIterator<Item = i32>) -> Result<()> {
+    let mut slots = std::collections::HashSet::new();
+    for slot in sequences {
+        // Parallel KDA CTAs require each stored slot to have one contiguous row run.
+        if slot >= 0 {
+            ensure!(slots.insert(slot), "decode step repeats recurrent slot {slot} across sequences");
+        }
+    }
+    Ok(())
+}
+
 fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
     while tables.kv_slots.len() < bucket {
         let row = masked_row(tables.kv_slots.len());
@@ -3112,6 +3123,7 @@ impl<'a> GlmfEngine<'a> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
             "decode step of {rows} rows (--decode-rows {})", self.decode_rows);
+        check_decode_slots(sequences.iter().map(|(placement, _)| placement.slot))?;
         // Power-of-two strides and widths bound the graphs a growing batch captures.
         let live_tokens = sequences.iter().map(|(p, count)| p.len + count).max().unwrap_or(1);
         let allocated = |n, unit| crate::shared::context::decode_allocation_units(n, live_tokens, unit);
@@ -5448,6 +5460,15 @@ mod prefill_lane_tests {
         }
         assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
         assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
+    }
+
+    #[test]
+    fn decode_slots_require_one_run_per_stored_sequence() {
+        assert!(super::check_decode_slots([3, 10, 17]).is_ok());
+        let error = super::check_decode_slots([3, 10, 3]).unwrap_err();
+        assert!(error.to_string().contains("recurrent slot 3"));
+        assert!(super::check_decode_slots([3, -1, -1]).is_ok());
+        assert!(super::check_decode_slots([]).is_ok());
     }
 
     #[test]

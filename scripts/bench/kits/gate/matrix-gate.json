@@ -183,6 +183,26 @@
     "SPARK_4_HOST": "rhea",
     "SPARK_5_HOST": "moa"
    }
+  },
+  {
+   "name": "glmf-exl3-min",
+   "family": "glm5_flash",
+   "config": "examples/configs/glm53-flash-exl3-min.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8736",
+    "EXPERT_PORT": "19836",
+    "COORDINATOR_GPU": "1",
+    "SPARK_COUNT": "2",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo"
+   }
   }
  ]
 }
