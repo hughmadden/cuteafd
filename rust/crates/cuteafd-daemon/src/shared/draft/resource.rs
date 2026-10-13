@@ -132,7 +132,7 @@ pub(crate) fn geometry(homes: &[LayerHome], experts: usize, topk: usize, rows: u
         max_positions: width + extension,
         widths: vec![width],
         classes: vec![ResourceClass::rtx(), spark_class()],
-        regimes: 1,
+        group_rows_by_rows: Vec::new(), regimes: 1,
     })
 }
 

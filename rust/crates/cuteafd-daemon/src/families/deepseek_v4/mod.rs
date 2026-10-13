@@ -521,8 +521,19 @@ pub(crate) fn with_engine<T>(
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
+        let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+            &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, peers.len(), None)?) };
+        let mut installed = None;
         for transport in &mut transports {
             engine.warm_transport(transport, &runtime)?;
+            let reports = transport.transport.installed_grouping()?;
+            for (rank, report) in reports.iter().enumerate() {
+                report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
+                    engine.decode_rows, engine.local_layers()..loaded.cfg.n_layers)?;
+            }
+            if let Some(previous) = &installed {
+                ensure!(previous == &reports, "Spark prefill lanes report different installed expert packages");
+            } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         if crate::shared::spark_intake::device_exchange_enabled() && !skip

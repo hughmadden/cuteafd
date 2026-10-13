@@ -173,7 +173,7 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
         for &expert in &routes[layer * rows * topk..(layer + 1) * rows * topk] {
             if let Some(count) = counts.get_mut(usize::from(expert)) { *count += 1; }
         }
-        counts.into_iter().map(|n| n.div_ceil(usize::from(resource.group_rows)) as f64).sum::<f64>()
+        counts.into_iter().map(|n| n.div_ceil(usize::from(geometry.group_rows(layer, rows))) as f64).sum::<f64>()
             * resource.slice_bytes / 1e6
     }).collect();
     let requests: Vec<_> = record.requests.iter().map(|request| {
@@ -195,6 +195,7 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
         "route_layout": [geometry.layers.len(), rows, topk],
         "geometry": geometry.layers.iter().map(|l| serde_json::json!({"class": l.class,
             "slice_bytes": l.slice_bytes, "group_rows": l.group_rows, "timed": l.timed})).collect::<Vec<_>>(),
+        "group_rows_by_rows": geometry.group_rows_by_rows,
         "megabytes": megabytes, "layer_us": record.layer_us,
         "total_us": record.times.total_us, "draft_us": record.times.draft_us,
         "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
@@ -310,7 +311,7 @@ mod tests {
         let geometry = PolicyGeometry { layers: vec![LayerResource {
             class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
             experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx()], regimes: 1 };
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
         let mut policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
         let prior = [0.75; 4];
         let requests = [
@@ -336,7 +337,7 @@ mod tests {
         let geometry = PolicyGeometry { layers: vec![LayerResource {
             class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
             experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx()], regimes: 1 };
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
         let p = [0.9; 5];
         for _ in 0..160 {
@@ -368,7 +369,7 @@ mod tests {
         let geometry = PolicyGeometry { layers: vec![LayerResource {
             class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
             experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx()], regimes: 1 };
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
         let p = [0.9; 5];
         let requests = [request(1, 6, 4, DraftSource::Neural, Some(Evidence::Head(&p)), None)];
@@ -399,7 +400,7 @@ mod tests {
         let geometry = PolicyGeometry { layers: (0..2).map(|class| LayerResource {
             class: Some(class), slice_bytes: 1e6, group_rows: 16, timed: true }).collect(),
             experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 1 };
+            classes: vec![ResourceClass::rtx(), ResourceClass::spark()], group_rows_by_rows: Vec::new(), regimes: 1 };
         let every = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
         let mut policies = [every.clone(), every];
         let mut first_class = [[None; 2]; 2];
@@ -455,7 +456,7 @@ mod tests {
         let geometry = PolicyGeometry { layers: vec![LayerResource {
             class: Some(0), slice_bytes: 1e6, group_rows: 2, timed: true }; 2],
             experts: 8, topk: 2, max_requests: 4, max_positions: 5, widths: vec![5],
-            classes: vec![ResourceClass::rtx()], regimes: 1 };
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
         let p = [0.9; 5];
         let candidates = [DraftCandidate { id: 1, confidence: &p }];

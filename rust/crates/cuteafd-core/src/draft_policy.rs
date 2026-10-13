@@ -103,6 +103,10 @@ pub enum DraftPolicyError {
 pub struct PolicyGeometry {
     /// Every backbone layer, in order.
     pub layers: Vec<LayerResource>,
+    /// Installed grouping by total live verifier rows, then backbone layer.
+    /// Empty keeps the static fast path; row zero records the compiled tile.
+    /// A nonempty table covers every row through the verifier capacity.
+    pub group_rows_by_rows: Vec<Vec<u8>>,
     /// Routed experts per layer; route ids are `u16`.
     pub experts: u16,
     /// Routes per token and layer.
@@ -220,6 +224,15 @@ impl PolicyGeometry {
             || self.widths.iter().any(|&w| w > self.max_positions) {
             return invalid("draft widths must ascend within the draft positions");
         }
+        if !self.group_rows_by_rows.is_empty() {
+            if self.group_rows_by_rows.len() <= self.max_requests {
+                return invalid("grouping schedule must cover every verifier anchor");
+            }
+            if self.group_rows_by_rows.iter().any(|row| row.len() != self.layers.len()
+                || row.iter().any(|&group| group == 0)) {
+                return invalid("grouping schedule needs one positive group per layer and row");
+            }
+        }
         for layer in &self.layers {
             let Some(class) = layer.class else { continue };
             if usize::from(class) >= self.classes.len() { return invalid("layer names an unknown resource class"); }
@@ -229,6 +242,14 @@ impl PolicyGeometry {
             if layer.group_rows == 0 { return invalid("zero rows per weight-read group"); }
         }
         Ok(())
+    }
+    /// Effective installed grouping at an executed verifier shape.
+    pub fn group_rows(&self, layer: usize, rows: usize) -> u8 {
+        if self.group_rows_by_rows.is_empty() { self.layers[layer].group_rows }
+        else { self.group_rows_by_rows[rows][layer] }
+    }
+    fn verify_capacity(&self) -> usize {
+        if self.group_rows_by_rows.is_empty() { usize::MAX } else { self.group_rows_by_rows.len() - 1 }
     }
     fn priced(&self) -> Vec<Priced> {
         self.layers.iter().enumerate().filter(|(_, l)| l.timed).filter_map(|(layer, l)| l.class.map(|class|
@@ -737,7 +758,10 @@ pub struct DraftPolicy {
     since_width: [[u64; 2]; CONCURRENCY_BUCKETS],
     stats: DraftPolicyStats,
     /// Routes per (window, layer, expert) in the shape being evaluated.
-    counts: Vec<u8>,
+    counts: Vec<u16>,
+    /// Unknown stand-ins have fractional novelty, retained across grouping changes.
+    unknown_groups: Vec<f64>,
+    dynamic_grouping: bool,
     /// Routes per expert of one observed layer.
     scratch: Vec<u16>,
     /// Experts already in the shape being evaluated, one bit per (window,
@@ -785,6 +809,9 @@ impl DraftPolicy {
         Self::new(geometry, seed, false)
     }
     fn build(geometry: PolicyGeometry, fixed: bool, seed: PolicySeed) -> Self {
+        // Constant installed schedules retain their capacity but use the original selector.
+        let dynamic_grouping = geometry.group_rows_by_rows.iter().skip(1)
+            .any(|row| row.iter().zip(&geometry.layers).any(|(&group, layer)| group != layer.group_rows));
         let priced = geometry.priced();
         let positions = geometry.max_positions;
         Self {
@@ -807,6 +834,7 @@ impl DraftPolicy {
             raw_mean: vec![0.9; positions],
             stats: DraftPolicyStats::new(positions),
             counts: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts)],
+            unknown_groups: vec![0.; WINDOWS * geometry.layers.len()], dynamic_grouping,
             scratch: vec![0; usize::from(geometry.experts)],
             occupancy: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts).div_ceil(64)],
             saturated: false, geometry,
@@ -918,7 +946,8 @@ impl DraftPolicy {
     /// Price all verifier anchors with the actual drafter batch extent.
     pub fn predict_drafted(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize,
         drafted_requests: usize) -> Option<f64> {
-        if ids.is_empty() || ids.len() != lengths.len() || drafted_requests > ids.len() { return None; }
+        if ids.is_empty() || ids.len() != lengths.len() || drafted_requests > ids.len()
+            || ids.len().saturating_add(lengths.iter().sum::<usize>()) > self.geometry.verify_capacity() { return None; }
         let bucket = self.usable(ids.len())?;
         self.selected_cell = Some((bucket, shared));
         for &id in ids { self.selected_requests.insert(id, ids.len()); }
@@ -928,7 +957,12 @@ impl DraftPolicy {
     /// Forecast expert megabytes per resource class of explicit lengths,
     /// for diagnostics and traces. Does not touch the fits.
     pub fn forecast_megabytes(&mut self, ids: &[u64], lengths: &[usize]) -> Vec<f64> {
+        if ids.len() != lengths.len()
+            || ids.len().saturating_add(lengths.iter().sum::<usize>()) > self.geometry.verify_capacity() {
+            return vec![f64::NAN; self.geometry.classes.len()];
+        }
         self.clear_counts();
+        self.use_grouping(ids.len() + lengths.iter().sum::<usize>());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
             for row in 0..=length { add_bytes(&mut megabytes, self.add_row(id, row, index)); }
@@ -938,6 +972,7 @@ impl DraftPolicy {
 
     fn predict_bucket(&mut self, bucket: usize, ids: &[u64], lengths: &[usize], width: usize, drafted_requests: usize) -> f64 {
         self.clear_counts();
+        self.use_grouping(ids.len() + lengths.iter().sum::<usize>());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
             for row in 0..=length {
@@ -984,6 +1019,7 @@ impl DraftPolicy {
     fn evaluate_bucket(&mut self, bucket: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize, drafted_requests: usize)
         -> Option<(f64, f64)> {
         if candidates.len() != lengths.len()
+            || candidates.len().saturating_add(lengths.iter().sum::<usize>()) > self.geometry.verify_capacity()
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()
                 || n > self.geometry.max_positions) {
             return None;
@@ -1176,6 +1212,8 @@ impl DraftPolicy {
     /// `k` beats `ratio` under those bounds, no shape does.
     fn wide_cannot_win(&mut self, bucket: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64, ratio: f64)
         -> bool {
+        // More rows can switch from compact to grouped and reduce existing traffic.
+        if self.dynamic_grouping { return false; }
         let mut survivals: Vec<f64> = cumulative.iter().flatten().copied().collect();
         survivals.sort_by(|a, b| b.total_cmp(a));
         let anchors = vec![0; ids.len()];
@@ -1197,6 +1235,8 @@ impl DraftPolicy {
     fn select_core(&mut self, bucket: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64, max_rows: usize,
         recover: bool) -> DraftSelection {
         self.clear_counts();
+        let max_rows = max_rows.min(self.geometry.verify_capacity());
+        self.use_grouping(ids.len());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, &id) in ids.iter().enumerate() {
             add_bytes(&mut megabytes, self.add_row(id, 0, index));
@@ -1214,6 +1254,7 @@ impl DraftPolicy {
             overdue.sort_by_key(|&(_, age, id)| (std::cmp::Reverse(age), id));
             for (index, _, id) in overdue {
                 if rows >= max_rows { break; }
+                if self.use_grouping(rows + 1) { megabytes = self.counted_megabytes(); }
                 add_bytes(&mut megabytes, self.add_row(id, 1, index));
                 lengths[index] = 1;
                 rows += 1;
@@ -1232,6 +1273,10 @@ impl DraftPolicy {
             // and the best visited shape is returned.
             let mut choice: Option<(usize, f64, f64)> = None;
             if rows >= max_rows { break; }
+            if self.use_grouping(rows + 1) {
+                megabytes = self.counted_megabytes();
+                time = self.cost.predict(bucket, rows as f64, megabytes) + draft_us;
+            }
             for (index, &id) in ids.iter().enumerate() {
                 let next = lengths[index] + 1;
                 if next > cumulative[index].len() { continue; }
@@ -1247,7 +1292,7 @@ impl DraftPolicy {
             let Some((index, candidate_expected, candidate_time)) = choice else { break };
             lengths[index] += 1;
             rows += 1;
-            self.add_row(ids[index], lengths[index], index);
+            add_bytes(&mut megabytes, self.add_row(ids[index], lengths[index], index));
             expected = candidate_expected;
             time = candidate_time;
             // Prefer the longer shape on an exact tie.
@@ -1268,6 +1313,7 @@ impl DraftPolicy {
     /// probe row. The shape is priced with the same cost model.
     fn select_survival(&mut self, bucket: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64,
         max_rows: usize) -> DraftSelection {
+        let max_rows = max_rows.min(self.geometry.verify_capacity());
         let mut lengths: Vec<usize> = cumulative.iter().map(|c| c.iter().take_while(|&&s| s >= 0.5).count()).collect();
         for (index, &id) in ids.iter().enumerate() {
             if lengths[index] == 0 && !cumulative[index].is_empty()
@@ -1290,6 +1336,7 @@ impl DraftPolicy {
 
     fn predict_bucket_draft(&mut self, bucket: usize, ids: &[u64], lengths: &[usize], draft_us: f64) -> f64 {
         self.clear_counts();
+        self.use_grouping(ids.len() + lengths.iter().sum::<usize>());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
             for row in 0..=length { add_bytes(&mut megabytes, self.add_row(id, row, index)); }
@@ -1300,8 +1347,41 @@ impl DraftPolicy {
 
     fn clear_counts(&mut self) {
         self.counts.fill(0);
+        if self.dynamic_grouping { self.unknown_groups.fill(0.); }
         self.occupancy.fill(0);
         self.saturated = false;
+    }
+
+    /// Switch the precomputed grouping without querying a package on the hot path.
+    fn use_grouping(&mut self, rows: usize) -> bool {
+        if !self.dynamic_grouping { return false; }
+        let groups = &self.geometry.group_rows_by_rows[rows];
+        let mut changed = false;
+        for priced in &mut self.priced {
+            changed |= priced.group_rows != groups[priced.layer];
+            priced.group_rows = groups[priced.layer];
+        }
+        if changed {
+            // Counts, not occupancy, remain valid when a compact path changes tile.
+            self.saturated = true;
+        }
+        changed
+    }
+
+    /// Reprice the already-added shape only at an installed grouping boundary.
+    fn counted_megabytes(&self) -> ClassBytes {
+        let mut total = [0.; MAX_RESOURCE_CLASSES];
+        let experts = usize::from(self.geometry.experts);
+        for window in 0..WINDOWS {
+            for priced in &self.priced {
+                let at = (window * self.geometry.layers.len() + priced.layer) * experts;
+                let groups = self.counts[at..at + experts].iter()
+                    .map(|&count| f64::from(count.div_ceil(u16::from(priced.group_rows)))).sum::<f64>()
+                    + self.unknown_groups[window * self.geometry.layers.len() + priced.layer];
+                total[priced.class] += groups * priced.slice_bytes;
+            }
+        }
+        total.map(|bytes| bytes / WINDOWS as f64 / 1e6)
     }
 
     fn count_index(&self, window: usize, layer: usize, expert: u16) -> usize {
@@ -1353,7 +1433,7 @@ impl DraftPolicy {
             for priced in &self.priced {
                 let groups = match routes {
                     Some(routes) => routes[priced.layer * topk..][..topk].iter()
-                        .filter(|&&e| self.counts[self.count_index(window, priced.layer, e)] % priced.group_rows == 0)
+                        .filter(|&&e| self.counts[self.count_index(window, priced.layer, e)] % u16::from(priced.group_rows) == 0)
                         .count() as f64,
                     None if row == 0 => topk as f64,
                     None => self.novelty[priced.layer],
@@ -1368,7 +1448,15 @@ impl DraftPolicy {
         let delta = self.peek_row(id, row);
         let topk = usize::from(self.geometry.topk);
         for window in 0..WINDOWS {
-            let Some(token) = self.history.get(&id).and_then(|h| h.get(window + row)) else { continue };
+            let Some(token) = self.history.get(&id).and_then(|h| h.get(window + row)) else {
+                if self.dynamic_grouping {
+                    for priced in &self.priced {
+                        self.unknown_groups[window * self.geometry.layers.len() + priced.layer] +=
+                            if row == 0 { topk as f64 } else { self.novelty[priced.layer] };
+                    }
+                }
+                continue;
+            };
             for priced in &self.priced {
                 let words = usize::from(self.geometry.experts).div_ceil(64);
                 let slot = window * self.geometry.layers.len() + priced.layer;
@@ -1376,7 +1464,7 @@ impl DraftPolicy {
                     let index = slot * usize::from(self.geometry.experts) + usize::from(expert);
                     self.counts[index] = self.counts[index].saturating_add(1);
                     self.occupancy[slot * words + (usize::from(expert) >> 6)] |= 1 << (expert & 63);
-                    self.saturated |= self.counts[index] >= priced.group_rows;
+                    self.saturated |= self.counts[index] >= u16::from(priced.group_rows);
                 }
             }
         }
@@ -1403,6 +1491,7 @@ impl DraftPolicy {
         if round.routes.len() != layers * rows * topk {
             return Err(DraftPolicyError::RouteShape);
         }
+        if rows > self.geometry.verify_capacity() { return Err(DraftPolicyError::RequestExtent); }
         if round.requests.is_empty() || round.requests.len() > self.geometry.max_requests
             || round.requests.iter().any(|r| r.rows == 0 || r.accepted == 0 || r.accepted > r.rows)
             || round.drafted_requests.is_some_and(|n| n > round.requests.len()) {
@@ -1430,7 +1519,7 @@ impl DraftPolicy {
             let mut class_us = [0.; MAX_RESOURCE_CLASSES];
             for index in 0..self.priced.len() {
                 let priced = self.priced[index];
-                megabytes[priced.class] += self.route_groups(layer_routes(priced.layer), priced.group_rows)
+                megabytes[priced.class] += self.route_groups(layer_routes(priced.layer), self.geometry.group_rows(priced.layer, rows))
                     * priced.slice_bytes / 1e6;
                 class_us[priced.class] += round.layer_us[priced.layer].unwrap_or(0.);
             }
@@ -1586,9 +1675,94 @@ mod tests {
         PolicyGeometry {
             layers: (0..40).map(|l| LayerResource { class: Some(u8::from(!local(l))), slice_bytes: bytes(l),
                 group_rows: 16, timed: l > 0 }).collect(),
+            group_rows_by_rows: Vec::new(),
             experts: 384, topk: 6, max_requests: 16, max_positions: 7, widths,
             classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 2,
         }
+    }
+
+    fn hybrid_geometry() -> PolicyGeometry {
+        PolicyGeometry {
+            layers: vec![
+                LayerResource { class: Some(0), slice_bytes: 1e6, group_rows: 4, timed: false },
+                LayerResource { class: Some(0), slice_bytes: 1e6, group_rows: 4, timed: true },
+            ],
+            group_rows_by_rows: (0..=16).map(|rows| vec![if (1..=4).contains(&rows) { 1 } else { 4 }; 2]).collect(),
+            experts: 4, topk: 1, max_requests: 4, max_positions: 7, widths: vec![5, 7],
+            classes: vec![ResourceClass::rtx()], regimes: 1,
+        }
+    }
+
+    #[test]
+    fn installed_grouping_schedule_validates_full_rows_and_layers() {
+        let mut geometry = hybrid_geometry();
+        geometry.group_rows_by_rows.truncate(4);
+        assert!(DraftPolicy::seeded(geometry, PolicySeed::weak(5)).is_err());
+        for malformed in [vec![0, 4], vec![4]] {
+            let mut geometry = hybrid_geometry();
+            geometry.group_rows_by_rows[5] = malformed;
+            assert!(DraftPolicy::seeded(geometry, PolicySeed::weak(5)).is_err());
+        }
+    }
+
+    #[test]
+    fn live_grouping_reprices_existing_routes_across_compact_boundary() {
+        let mut policy = DraftPolicy::seeded(hybrid_geometry(), PolicySeed::weak(5)).unwrap();
+        policy.history.insert(1, (0..24).map(|_| vec![0u16; 2].into_boxed_slice()).collect());
+        assert_eq!(policy.forecast_megabytes(&[1], &[1]), vec![2.]);
+        assert_eq!(policy.forecast_megabytes(&[1], &[3]), vec![4.]);
+        assert_eq!(policy.forecast_megabytes(&[1], &[4]), vec![2.]);
+        assert_eq!(policy.forecast_megabytes(&[1], &[7]), vec![2.]);
+        // The forward-growth trajectory crosses the cheaper grouped boundary.
+        let selection = policy.select_core(0, &[1], &[vec![0.9; 7]], 100., 16, false);
+        let exact = policy.predict_bucket_draft(0, &[1], &selection.lengths, 100.);
+        assert!((selection.predicted_us - exact).abs() < 1e-9);
+        assert!(selection.lengths[0] >= 4);
+        assert!(!policy.wide_cannot_win(0, &[1], &[vec![0.9; 7]], 100., 100.));
+    }
+
+    #[test]
+    fn grouping_boundaries_preserve_unknown_novelty_and_observe_actual_rows() {
+        let mut policy = DraftPolicy::seeded(hybrid_geometry(), PolicySeed::weak(5)).unwrap();
+        let selection = policy.select_core(0, &[1, 2], &[vec![0.9; 7], vec![0.8; 7]], 100., 16, false);
+        let exact = policy.predict_bucket_draft(0, &[1, 2], &selection.lengths, 100.);
+        assert!((selection.predicted_us - exact).abs() < 1e-9);
+        let mut constant = policy.geometry.clone();
+        constant.group_rows_by_rows.clear();
+        let mut constant = DraftPolicy::seeded(constant, PolicySeed::weak(5)).unwrap();
+        let requests = [ObservedDraftRequest { id: 1, rows: 5, accepted: 1, confidence: None }];
+        let routes = vec![0; 10];
+        let round = DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
+            layer_us: &[None, Some(1000.)], total_us: 5000., draft_us: f64::NAN,
+            drafted_requests: Some(0), wide: false, predicted_us: None };
+        // Use fresh policies so the same pre-observation fits see the same true traffic.
+        policy = DraftPolicy::seeded(hybrid_geometry(), PolicySeed::weak(5)).unwrap();
+        policy.observe(round).unwrap();
+        constant.observe(round).unwrap();
+        assert_eq!(policy.cost_snapshot(false, 1), constant.cost_snapshot(false, 1));
+        let overflow = [ObservedDraftRequest { rows: 17, ..requests[0] }];
+        assert_eq!(policy.observe(DraftRoundObservation { requests: &overflow, routes: &[0; 34], ..round }),
+            Err(DraftPolicyError::RequestExtent));
+    }
+
+    #[test]
+    fn constant_installed_schedule_retains_static_decisions_and_capacity() {
+        let geometry = placement(8);
+        let mut scheduled = geometry.clone();
+        scheduled.group_rows_by_rows = vec![vec![16; 40]; 129];
+        let mut left = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
+        let mut right = DraftPolicy::seeded(scheduled, PolicySeed::weak(5)).unwrap();
+        assert!(!right.dynamic_grouping);
+        for policy in [&mut left, &mut right] {
+            policy.history.insert(1, (0..24).map(|_| vec![0; 40 * 6].into_boxed_slice()).collect());
+        }
+        for n in 0..8 {
+            assert_eq!(left.forecast_megabytes(&[1], &[n]), right.forecast_megabytes(&[1], &[n]));
+        }
+        let l = left.select_core(0, &[1], &[vec![0.9; 7]], 1000., 128, false);
+        let r = right.select_core(0, &[1], &[vec![0.9; 7]], 1000., 128, false);
+        assert_eq!(l, r);
+        assert!(right.forecast_megabytes(&[1], &[128])[0].is_nan());
     }
 
     fn placement(local: usize) -> PolicyGeometry {
