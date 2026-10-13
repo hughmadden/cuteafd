@@ -19,6 +19,7 @@
 # their host target (#127), so any SM120 host's export is the same bytes.
 # Exit 75 means "not here": wip.sh falls back.
 set -euo pipefail
+trap 'echo "export-remote: line $LINENO: \"$BASH_COMMAND\" exited $?" >&2' ERR
 host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
 # DEV_IMAGE_LAYERS is the sha256 of the image's RootFS layer list: its content
 # identity. A local image ID is not portable (docker save | load can give the

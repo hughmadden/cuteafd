@@ -1011,14 +1011,16 @@ wip_remote_export() {
   [[ -n "$host" ]] || return 75
   read -r _ key <"$state_dir/output/coordinator/.native-cache-key" || return 75
   env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
-  docker exec "$coordinator_container" true
   printf '%s\n' "${coordinator_build[@]}" | grep -E '^CUTEAFD_[A-Z0-9_]+=' >"$env_file"
   printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
-  echo "WIP coordinator export: remote on $host"
-  if ! "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
-      "$COORDINATOR_DOCKER_DEV" "$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"; then
+  echo "WIP coordinator export: remote on $host${CUTEAFD_EXPORT_HOST_ADDR:+ ($CUTEAFD_EXPORT_HOST_ADDR)}"
+  local layers status=0
+  layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
+  "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
+    "$COORDINATOR_DOCKER_DEV" "$layers" || status=$?
+  if ((status != 0)); then
     rm -f "$env_file"
-    echo "WIP coordinator export: $host unavailable; next mode" >&2
+    echo "WIP coordinator export: $host unavailable (export-remote exited $status); next mode" >&2
     return 75
   fi
   rm -f "$env_file"
