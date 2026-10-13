@@ -1327,3 +1327,77 @@ def test_seal_check_reports_attested_roles_from_the_slot(tmp_path, monkeypatch):
     result = subprocess.run(['python3', '-c', script, 's', 'spark-expert', 'inst', 'none', str(root)],
                             capture_output=True, text=True)
     assert json.loads(result.stdout)['contents']['tp_roles']['error'] == 'native library hash mismatch'
+
+
+def test_lossless_set_panel_and_file_reach_the_smoke_entry(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    cases = tmp_path / 'cases.json'
+    cases.write_text(json.dumps([{'id': 'glmf-v19-base', 'prompt': 'Write code.', 'nonce': '7ec2b2071ff95934-0000000026',
+                                  'source': 'drafter-efficiency-serving-v19', 'reconstructed': True}]))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'baseline,spec_lossless_set', '--lossless-set', str(cases), '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['profile'] == 'panels:baseline,spec_lossless_set' and e['lossless_set'] == str(cases.resolve())
+    assert 'baseline' not in e  # Listed baseline keeps the card's baseline (and its single spec_lossless).
+    # Without the panel the file has nothing to feed.
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 's2'), '--panels', 'baseline', '--lossless-set', str(cases), '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
+@pytest.mark.parametrize('cases, message', [
+    ([], '1 to 64 cases'),
+    ({'id': 'a'}, '1 to 64 cases'),
+    ([{'id': 'a', 'prompt': 'p'}], 'string id, prompt and nonce'),
+    ([{'id': 'a', 'prompt': 'p', 'nonce': 'n', 'extra': 1}], 'string id, prompt and nonce'),
+    ([{'id': 'a b', 'prompt': 'p', 'nonce': 'n'}], 'invalid or duplicate case id'),
+    ([{'id': 'a', 'prompt': 'p', 'nonce': 'n'}, {'id': 'a', 'prompt': 'q', 'nonce': 'm'}], 'invalid or duplicate case id'),
+    ([{'id': 'a', 'prompt': 'p', 'nonce': 'x]'}], 'brackets or control'),
+])
+def test_malformed_lossless_sets_are_refused_before_hardware(tmp_path, cases, message):
+    path = tmp_path / 'bad.json'
+    path.write_text(json.dumps(cases))
+    with pytest.raises(ValueError, match=message):
+        cards.load_lossless_set(path)
+
+
+def test_shipped_lossless_set_is_valid():
+    path = cards.REPO / 'scripts/bench/fixtures/spec-lossless-set-v1.json'
+    assert cards.load_lossless_set(path) == str(path)
+    cases = json.loads(path.read_text())
+    assert len({c['nonce'] for c in cases}) == len(cases)
+    assert next(c for c in cases if c['id'] == 'glmf-v19-base')['reconstructed'] is True
+
+
+def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:baseline,spec_lossless_set'}, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    rows = [{'id': 'code-1', 'pass': True}, {'id': 'code-2', 'pass': False}]
+    panel = {'id': 'spec_lossless_set', 'status': 'done', 'passes': [{'gate': 'fail', 'passed': 1, 'total': 2,
+             'summary': 'dflash: 1/2 lossless; code-2: ids identical, but 1 of 128 rows differ from token 40', 'rows': rows,
+             'set': {'name': 'spec-lossless-set-v1'}, 'evidence': {'code-2': {'nonce': '002888898b'}}}]}
+    report = {'baseline': {'quality': {'status': 'pass', 'checks': [{'id': 'spec_lossless', 'status': 'pass'}]}}, 'panels': [panel]}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'quality'
+    assert row['lossless_set']['failing'] == ['code-2'] and 'code-2: ids identical' in row['error']
+    assert 'evidence' not in row['lossless_set']
+    assert cards.spec_cell(row) == 'pass; set 1/2 fail (code-2)'
+    panel['passes'][0].update(gate='pass', passed=2)
+    rows[1]['pass'] = True
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass' and row['lossless_set']['status'] == 'pass'
+    # A panel that errored before any pass is a failure, not a silent skip.
+    panel.update(status='failed', passes=[], error='drafts on: HTTP 500')
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and 'HTTP 500' in row['error']
+    # No speculator: the server marks the panel unsupported.
+    panel.update(status='unsupported', error='no speculator: nothing to check')
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    assert cards.summarize_job(job, 0)['lossless_set']['status'] == 'skipped'

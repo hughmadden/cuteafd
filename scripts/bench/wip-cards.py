@@ -46,13 +46,32 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
+PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
 
 
 def short_instance(value):
     if not NAME.fullmatch(value):
         raise ValueError('invalid instance: ' + value)
     return value if len(value) <= 41 else value[:32] + '-' + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def load_lossless_set(path):
+    """An absolute, checked spec_lossless_set case file; the server re-validates."""
+    path = Path(path).expanduser().resolve()
+    cases = json.loads(path.read_text())
+    if not isinstance(cases, list) or not cases or len(cases) > 64:
+        raise ValueError(f'{path}: a lossless set is a JSON list of 1 to 64 cases')
+    ids = set()
+    for case in cases:
+        if not isinstance(case, dict) or set(case) - {'id', 'prompt', 'nonce', 'source', 'reconstructed'} \
+                or not all(isinstance(case.get(k), str) and case[k].strip() for k in ('id', 'prompt', 'nonce')):
+            raise ValueError(f'{path}: each case needs string id, prompt and nonce (optional source, reconstructed)')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', case['id']) or case['id'] in ids:
+            raise ValueError(f"{path}: invalid or duplicate case id {case['id']!r}")
+        if re.search(r'[\[\]\x00-\x1f]', case['nonce']):
+            raise ValueError(f"{path}: case {case['id']}: nonce has brackets or control characters")
+        ids.add(case['id'])
+    return str(path)
 
 
 def requested_panels(profile):
@@ -733,7 +752,7 @@ def classify(row, launched):
         return 'preflight'
     if not launched:
         return 'launch'
-    if row.get('quality') in ('fail', 'failed') or any(isinstance(row.get(k), dict) and row[k].get('status') in ('fail', 'failed') for k in ('cache', 'spec')):
+    if row.get('quality') in ('fail', 'failed') or any(isinstance(row.get(k), dict) and row[k].get('status') in ('fail', 'failed') for k in ('cache', 'spec', 'lossless_set')):
         return 'quality'
     return 'measurement'
 
@@ -782,6 +801,11 @@ def summarize_job(job, exit_code):
             fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
         elif report.get('status') in failed or quality.get('status') in failed:
             fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
+        lossless = lossless_set_result(report)
+        if lossless:
+            row['lossless_set'] = lossless
+            if lossless['status'] == 'fail':
+                fail(row, 'quality: spec_lossless_set: ' + lossless['summary'][:400], 'quality')
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
             row[metric] = None
@@ -844,6 +868,24 @@ def summarize_job(job, exit_code):
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
+
+
+def lossless_set_result(report):
+    """The spec_lossless_set panel's verdict: its gate over every case, or a
+    failure when the panel errored or produced no pass. Case evidence stays in
+    report.json."""
+    panel = next((p for p in report.get('panels', []) if p.get('id') == 'spec_lossless_set'), None)
+    if panel is None:
+        return None
+    passes = panel.get('passes') or []
+    if panel.get('status') == 'unsupported':
+        return {'status': 'skipped', 'summary': panel.get('error') or 'unsupported'}
+    if not passes:
+        return {'status': 'fail', 'summary': panel.get('error') or 'no pass recorded'}
+    last = passes[-1]
+    return {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
+            'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
+            'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
 
 
 def matched_requests(dest):
@@ -915,6 +957,17 @@ def status_cell(check):
     return str(check.get('status', '')) + (' (' + check['summary'][:60] + ')' if check.get('summary') and check.get('status') != 'pass' else '')
 
 
+def spec_cell(row):
+    """The baseline's single spec check, then the lossless set's k/N when it ran."""
+    text = status_cell(row.get('spec'))
+    lossless = row.get('lossless_set')
+    if isinstance(lossless, dict):
+        text = (text + '; ' if text else '') + f"set {lossless.get('passed', '?')}/{lossless.get('total', '?')} {lossless['status']}"
+        if lossless.get('failing'):
+            text += ' (' + ', '.join(lossless['failing'])[:80] + ')'
+    return text
+
+
 def write_summary(state, rows, arms):
     validate_matched_pairs(rows, list(arms))
     names = list(arms)
@@ -962,7 +1015,7 @@ def write_summary(state, rows, arms):
         profile_cell = f"{len(profile.get('files', []))} files" if profile else ''
         if profile.get('reports'):
             profile_cell += ': ' + ', '.join(f"{r['name']} ({r['bytes'] / 2**20:.1f} MiB)" for r in profile['reports'])
-        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(status_cell(r.get('spec')))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
+        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(spec_cell(r))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
     if failed:
         text += '\n## Failures\n\nlaunch = the server never served the card; quality = it served and a correctness check failed; measurement = it served and a measurement or evidence check failed; preflight = refused before hardware.\n\n'
         for r in failed:
@@ -1483,6 +1536,8 @@ def main():
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
+    parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
+                        '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
@@ -1597,7 +1652,14 @@ def main():
             card['profile'] = profile
             if listed and 'baseline' not in listed:
                 card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
+    lossless_set = None
+    if args.lossless_set is not None:
+        lossless_set = load_lossless_set(args.lossless_set)
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+            parser.error('--lossless-set needs --panels with spec_lossless_set')
     for card in cards:
+        if lossless_set:
+            card['lossless_set'] = lossless_set
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
         if levels:
@@ -1718,7 +1780,8 @@ def main():
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
-        (['window'] if any(job['entry'].get('window') for job in jobs) else [])
+        (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
+        (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else [])
     for job in jobs[:1]:
         binary_supports(args.binary, args.repo, job, fields)
     # Everything checkable without hardware, before any queue ticket.
