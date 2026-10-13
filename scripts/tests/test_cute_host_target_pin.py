@@ -128,3 +128,13 @@ def test_cuda_objects_are_seeded_per_translation_unit():
     assert '"-objtemp" "--frandom-seed=${target}/${relative}"' in block
     assert 'file(RELATIVE_PATH relative "${CMAKE_CURRENT_SOURCE_DIR}"' in block
     assert 'cmake_language(DEFER CALL cuteafd_reproducible_cuda_objects)' in cmake
+
+
+def test_export_manifests_never_iterate_directories_unsorted():
+    # Directory order is filesystem-specific: an unsorted iterdir/glob into a
+    # manifest dict made raptor's and oliver's identical exports differ (#127).
+    import re
+    for path in sorted((ROOT / 'python/tools/aot').glob('export_*.py')):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if re.search(r'for \w+ in [\w.]+\.(iterdir|glob|rglob)\(', line):
+                assert 'sorted(' in line, f'{path.name}:{number}: {line.strip()}'
