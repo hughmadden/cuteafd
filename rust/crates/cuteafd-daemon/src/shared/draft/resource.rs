@@ -207,6 +207,8 @@ pub(crate) enum DraftEvidence<'a> {
     Selector(&'a [[f32; 4]]),
     /// A dSpark confidence head's per-token acceptance.
     Head(&'a [f32]),
+    /// The pooled request-history prior of a token-only drafter.
+    History(&'a [f64]),
 }
 
 /// The keyed selector prior and dSpark head blend the binding evaluates.
@@ -214,6 +216,8 @@ pub(crate) enum Prior {
     Selector(crate::shared::draft_confidence::SelectorFit),
     /// dSpark: the head's weight against the history rate, in logit space.
     Head,
+    /// Token-only drafters use the bounded pooled request-history rates.
+    History,
 }
 
 /// Per-position `p0` of one draft: the prior evaluated on its evidence and the
@@ -228,7 +232,9 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
         }
         (_, DraftEvidence::Head(head)) =>
             crate::families::glm5::dflash_policy::head_confidence(history, &head[..head.len().min(MAX_POSITIONS)]),
-        (Prior::Head, DraftEvidence::Selector(features)) => history.conditional(features.len().min(MAX_POSITIONS)),
+        (Prior::Head | Prior::History, DraftEvidence::Selector(features)) =>
+            history.conditional(features.len().min(MAX_POSITIONS)),
+        (_, DraftEvidence::History(rates)) => rates[..rates.len().min(MAX_POSITIONS)].to_vec(),
     }
 }
 
