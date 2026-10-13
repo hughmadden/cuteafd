@@ -8,39 +8,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, ffi::c_void, path::{Path, PathBuf}, rc::Rc};
 
-/// Capacity selects the compiled reduction geometry, never the live row count.
-/// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Exl3RowPolicy {
-    Nearest,
-    GlmFlashK64,
-}
-
-impl Exl3RowPolicy {
-    pub(crate) fn for_geometry(geometry: cuteafd_core::ExpertGeometry) -> Self {
-        if geometry.same_shape(&cuteafd_core::ExpertGeometry::GLM5_FLASH) {
-            Self::GlmFlashK64
-        } else {
-            Self::Nearest
-        }
-    }
-
-    pub(crate) fn active() -> Self { Self::for_geometry(cuteafd_core::expert_geometry()) }
-
-    pub(crate) fn required_capacity(self, live_rows: usize) -> usize {
-        if self == Self::GlmFlashK64 && (2..=16).contains(&live_rows) { 80 } else { live_rows }
-    }
-
-    /// Used by artifact validation and workspace admission before weight reads,
-    /// including a narrow declared maximum that otherwise would only load m16.
-    pub(crate) fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>> {
-        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
-        ensure!((1..=4096).contains(&max_live_rows), "EXL3 live capacity must be 1..4096");
-        let required = max_live_rows.max(self.required_capacity(max_live_rows));
-        let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
-        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
-    }
-}
+pub(crate) use cuteafd_core::Exl3RowPolicy;
 
 /// Spark decode schedule of the EXL3 exports (`--exl3-schedule`). `Gb10`
 /// runs the `m<capacity>-gb10` siblings of the GLM 5.3 Flash TP4 decode
@@ -817,6 +785,12 @@ impl<'a> Exl3Execution<'a> {
         binding.core.bind(&inputs, rows);
         binding.sum.bind(&inputs, rows);
         binding.sum.pointers[binding.output_slot] = output.ptr;
+        // The packed core is a full-grid cooperative launch (SMs * blocks_per_sm):
+        // fork b12x/moe/_shared/kernels/w4a16/mixed_trellis.py:973-978;
+        // its grid barriers are at :1142/:1314. See stream-wait redesign #104.
+        // Every resident peer waiter on this device must run on this producer
+        // stream or behind its completion event; one independent spinner can
+        // prevent the entire cooperative grid from becoming resident forever.
         self.kernel
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
         self.kernel

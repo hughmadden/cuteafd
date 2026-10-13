@@ -24,8 +24,48 @@ __device__ __forceinline__ uint32_t load_acquire_sys(const uint32_t* address) {
   return value;
 }
 
+__device__ void diagnostic_dump(cuteafd_peer_diagnostic_t d) {
+  printf("peer_watchdog issue=%llu rank=%u slot=%u stream=0x%llx local=%p peer=%p\n",
+      (unsigned long long)d.issue, d.rank, d.slot, (unsigned long long)d.host_stream,
+      d.local_control, d.peer_control);
+  for (uint32_t r = 0; r < 2; ++r) {
+    const uint32_t* control = r ? d.peer_control : d.local_control;
+    const cuteafd_peer_progress_t* progress = r ? d.peer : d.local;
+    for (uint32_t slot = 0; slot < d.slots; ++slot) {
+      const uint32_t* c = control + uint64_t(slot) * 4;
+      const volatile cuteafd_peer_progress_t* p = progress + slot;
+      printf("peer_progress rank=%u slot=%u flag=%u send=%u arrivals=%u receive=%u "
+             "push_issue=%llu published_issue=%llu wait_issue=%llu published=%u observed=%u "
+             "expected=%u push_phase=%u wait_phase=%u\n",
+          r ? 1 - d.rank : d.rank, slot, load_acquire_sys(c), load_acquire_sys(c + 1),
+          load_acquire_sys(c + 2), load_acquire_sys(c + 3),
+          (unsigned long long)p->push_issue, (unsigned long long)p->published_issue, (unsigned long long)p->wait_issue,
+          p->published, p->observed, p->expected, p->push_phase, p->wait_phase);
+    }
+  }
+}
+
+__device__ void diagnostic_push_enter(cuteafd_peer_diagnostic_t d) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    volatile cuteafd_peer_progress_t* p = d.local + d.slot;
+    p->push_issue = d.issue;
+    p->push_phase = 1;
+    __threadfence_system();
+  }
+}
+
+__device__ void diagnostic_published(cuteafd_peer_diagnostic_t d, uint32_t sequence) {
+  volatile cuteafd_peer_progress_t* p = d.local + d.slot;
+  p->published_issue = d.issue;
+  p->published = sequence;
+  p->push_phase = 2;
+  __threadfence_system();
+}
+
+template<bool Diagnostic = false>
 __global__ void push_signal(uint4* destination, const uint4* source, uint64_t units, uint32_t* flag,
-    uint32_t* state) {
+    uint32_t* state, cuteafd_peer_diagnostic_t diagnostic = {}) {
+  if constexpr (Diagnostic) diagnostic_push_enter(diagnostic);
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride)
     destination[i] = source[i];
@@ -40,6 +80,7 @@ __global__ void push_signal(uint4* destination, const uint4* source, uint64_t un
       const uint32_t sequence = state[0] + 1;
       state[0] = sequence;
       store_release_sys(flag, sequence);
+      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
     }
   }
 }
@@ -53,7 +94,10 @@ struct Planes {
   uint32_t count;
 };
 
-__global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state) {
+template<bool Diagnostic = false>
+__global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state,
+    cuteafd_peer_diagnostic_t diagnostic = {}) {
+  if constexpr (Diagnostic) diagnostic_push_enter(diagnostic);
   const uint64_t units = planes.first_unit[planes.count];
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride) {
@@ -75,6 +119,7 @@ __global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state) {
       const uint32_t sequence = state[0] + 1;
       state[0] = sequence;
       store_release_sys(flag, sequence);
+      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
     }
   }
 }
@@ -156,21 +201,44 @@ __global__ void wait_written(const uint64_t* flags, uint32_t ranks, uint32_t str
   }
 }
 
-__global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const uint32_t* aborted) {
+template<bool Diagnostic = false>
+__global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const uint32_t* aborted,
+    cuteafd_peer_diagnostic_t diagnostic = {}) {
   if (threadIdx.x == 0) {
     const uint32_t expected = state[0] + 1;
     const uint64_t start = global_ns();
     uint32_t polls = 0;
+    if constexpr (Diagnostic) {
+      volatile cuteafd_peer_progress_t* p = diagnostic.local + diagnostic.slot;
+      p->wait_issue = diagnostic.issue;
+      p->expected = expected;
+      p->wait_phase = 3;
+      __threadfence_system();
+    }
     for (;;) {
       // The cancellation word is independent of push/wait sequence state.
       // Every later queued/captured wait also exits once it is published.
-      if (load_acquire_sys(aborted)) break;
-      if (int32_t(load_acquire_sys(flag) - expected) >= 0) {
+      if (aborted && load_acquire_sys(aborted)) {
+        if constexpr (Diagnostic) diagnostic.local[diagnostic.slot].wait_phase = 5;
+        break;
+      }
+      const uint32_t observed = load_acquire_sys(flag);
+      if constexpr (Diagnostic) {
+        volatile cuteafd_peer_progress_t* p = diagnostic.local + diagnostic.slot;
+        p->observed = observed;
+      }
+      if (int32_t(observed - expected) >= 0) {
         state[0] = expected;
+        if constexpr (Diagnostic) diagnostic.local[diagnostic.slot].wait_phase = 4;
         break;
       }
       if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
-        printf("peer_wait_abortable: missing push or terminal abort after 60 s\n");
+        printf("peer_wait_abortable: missing push or terminal abort after 60 s "
+               "flag=%p state=%p aborted=%p expected=%u observed=%u receive=%u abort=%u\n",
+               static_cast<const void*>(flag), static_cast<void*>(state),
+               static_cast<const void*>(aborted), expected, load_acquire_sys(flag),
+               state[0], aborted ? load_acquire_sys(aborted) : 0);
+        if constexpr (Diagnostic) diagnostic_dump(diagnostic);
         __trap();
       }
     }
@@ -267,7 +335,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   // Loads the exchange kernels on the current device now: a lazily loaded kernel's
   // first launch may wait for the device to idle, which a spinning wait never does.
   cudaFuncAttributes attributes{};
-  for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(push_planes),
+  for (const void* kernel : {reinterpret_cast<const void*>(push_signal<false>), reinterpret_cast<const void*>(push_planes<false>),
        reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
        reinterpret_cast<const void*>(wait_written)}) {
@@ -298,13 +366,13 @@ extern "C" int32_t cuteafd_peer_push_signal(void* destination, const void* sourc
       ((reinterpret_cast<uintptr_t>(destination) | reinterpret_cast<uintptr_t>(source)) & 15) || bytes > (1ull << 40))
     return cudaErrorInvalidValue;
   const uint64_t units = bytes / 16;
-  push_signal<<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  push_signal<false><<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<uint4*>(destination), static_cast<const uint4*>(source), units, flag, send_state);
   return cudaGetLastError();
 }
 
-extern "C" int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t count, uint32_t* flag,
-    uint32_t* send_state, uint32_t blocks, void* stream) {
+static int32_t launch_push_planes(const cuteafd_peer_plane_t* planes, uint32_t count, uint32_t* flag,
+    uint32_t* send_state, uint32_t blocks, void* stream, const cuteafd_peer_diagnostic_t* diagnostic) {
   if (!planes || !count || count > CUTEAFD_PEER_MAX_PLANES || !stream || (flag && !send_state) ||
       (!flag && send_state))
     return cudaErrorInvalidValue;
@@ -323,7 +391,55 @@ extern "C" int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, 
   }
   const uint64_t units = packed.first_unit[count];
   for (uint32_t p = count; p < CUTEAFD_PEER_MAX_PLANES; ++p) packed.first_unit[p + 1] = units;
-  push_planes<<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(packed, flag, send_state);
+  if (diagnostic)
+    push_planes<true><<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(packed, flag, send_state, *diagnostic);
+  else
+    push_planes<false><<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(packed, flag, send_state);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t count, uint32_t* flag,
+    uint32_t* send_state, uint32_t blocks, void* stream) {
+  return launch_push_planes(planes, count, flag, send_state, blocks, stream, nullptr);
+}
+
+static bool valid_diagnostic(const cuteafd_peer_diagnostic_t* d) {
+  return d && d->local && d->peer && d->local_control && d->peer_control &&
+      d->rank < 2 && d->slot < d->slots && d->host_stream && d->issue;
+}
+
+extern "C" int32_t cuteafd_peer_diagnostic_initialize() {
+  cudaFuncAttributes attributes{};
+  for (const void* kernel : {reinterpret_cast<const void*>(push_signal<true>),
+       reinterpret_cast<const void*>(push_planes<true>), reinterpret_cast<const void*>(wait_flag_abortable<true>)}) {
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_peer_push_signal_diagnostic(void* destination, const void* source, uint64_t bytes,
+    uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream,
+    const cuteafd_peer_diagnostic_t* diagnostic) {
+  if (!valid_diagnostic(diagnostic) || !destination || !source || !flag || !send_state || !stream || (bytes & 15) ||
+      ((reinterpret_cast<uintptr_t>(destination) | reinterpret_cast<uintptr_t>(source)) & 15) || bytes > (1ull << 40))
+    return cudaErrorInvalidValue;
+  push_signal<true><<<default_blocks(bytes / 16, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<uint4*>(destination), static_cast<const uint4*>(source), bytes / 16, flag, send_state, *diagnostic);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_peer_push_planes_diagnostic(const cuteafd_peer_plane_t* planes, uint32_t count,
+    uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream,
+    const cuteafd_peer_diagnostic_t* diagnostic) {
+  if (!valid_diagnostic(diagnostic) || !flag || !send_state) return cudaErrorInvalidValue;
+  return launch_push_planes(planes, count, flag, send_state, blocks, stream, diagnostic);
+}
+
+extern "C" int32_t cuteafd_peer_wait_diagnostic(const uint32_t* flag, uint32_t* recv_state,
+    const uint32_t* aborted, void* stream, const cuteafd_peer_diagnostic_t* diagnostic) {
+  if (!valid_diagnostic(diagnostic) || !flag || !recv_state || !stream) return cudaErrorInvalidValue;
+  wait_flag_abortable<true><<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, recv_state, aborted, *diagnostic);
   return cudaGetLastError();
 }
 
@@ -350,7 +466,7 @@ extern "C" int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ra
 
 extern "C" int32_t cuteafd_peer_abort_initialize() {
   cudaFuncAttributes attributes{};
-  for (const void* kernel : {reinterpret_cast<const void*>(wait_flag_abortable),
+  for (const void* kernel : {reinterpret_cast<const void*>(wait_flag_abortable<false>),
        reinterpret_cast<const void*>(publish_abort)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
@@ -361,7 +477,7 @@ extern "C" int32_t cuteafd_peer_abort_initialize() {
 extern "C" int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
     const uint32_t* aborted, void* stream) {
   if (!flag || !recv_state || !aborted || !stream) return cudaErrorInvalidValue;
-  wait_flag_abortable<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, recv_state, aborted);
+  wait_flag_abortable<false><<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, recv_state, aborted);
   return cudaGetLastError();
 }
 
@@ -416,20 +532,20 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
         return cudaStreamWaitEvent(sa.stream, sb.mark, 0);
       case 6: case 7:
         CHECK(cudaSetDevice(a));
-        push_signal<<<grid, 256, 0, sa.stream>>>(u4(sb.recv), u4(sa.buffer), units, sb.flag(), sa.send());
+        push_signal<false><<<grid, 256, 0, sa.stream>>>(u4(sb.recv), u4(sa.buffer), units, sb.flag(), sa.send());
         wait_flag<<<1, 32, 0, sa.stream>>>(sa.flag(), sa.waited());
         CHECK(cudaGetLastError());
         CHECK(cudaSetDevice(b));
         wait_flag<<<1, 32, 0, sb.stream>>>(sb.flag(), sb.waited());
-        push_signal<<<grid, 256, 0, sb.stream>>>(u4(sa.recv), u4(sb.buffer), units, sa.flag(), sb.send());
+        push_signal<false><<<grid, 256, 0, sb.stream>>>(u4(sa.recv), u4(sb.buffer), units, sa.flag(), sb.send());
         return cudaGetLastError();
       case 8: case 9:
         CHECK(cudaSetDevice(a));
-        push_signal<<<grid, 256, 0, sa.stream>>>(u4(sb.recv), u4(sa.buffer), units, sb.flag(), sa.send());
+        push_signal<false><<<grid, 256, 0, sa.stream>>>(u4(sb.recv), u4(sa.buffer), units, sb.flag(), sa.send());
         wait_flag<<<1, 32, 0, sa.stream>>>(sa.flag(), sa.waited());
         CHECK(cudaGetLastError());
         CHECK(cudaSetDevice(b));
-        push_signal<<<grid, 256, 0, sb.stream>>>(u4(sa.recv), u4(sb.buffer), units, sa.flag(), sb.send());
+        push_signal<false><<<grid, 256, 0, sb.stream>>>(u4(sa.recv), u4(sb.buffer), units, sa.flag(), sb.send());
         wait_flag<<<1, 32, 0, sb.stream>>>(sb.flag(), sb.waited());
         return cudaGetLastError();
     }
@@ -459,7 +575,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
         for (uint32_t i = 0; i < batch; ++i) {
           Side& peer = pass ? sa : sb;
           if (test == 7 && pass == 1) wait_flag<<<1, 32, 0, side.stream>>>(side.flag(), side.waited());
-          push_signal<<<grid, 256, 0, side.stream>>>(u4(peer.recv), u4(side.buffer), units, peer.flag(), side.send());
+          push_signal<false><<<grid, 256, 0, side.stream>>>(u4(peer.recv), u4(side.buffer), units, peer.flag(), side.send());
           if (!(test == 7 && pass == 1)) wait_flag<<<1, 32, 0, side.stream>>>(side.flag(), side.waited());
         }
         cudaGraph_t graph = nullptr;

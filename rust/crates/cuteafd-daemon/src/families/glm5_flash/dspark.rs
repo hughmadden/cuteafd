@@ -548,7 +548,9 @@ impl<'a> DsparkDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: metadata and its consumers share this drafter's owned stream.
+        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
+            bytes, self.stream) }
     }
 
     /// Explicit serving startup admission; other callers retain lazy allocation.
@@ -770,15 +772,33 @@ impl ReplayDrafter for DsparkDrafter<'_> {
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
     Dflash2(crate::families::glm5::dflash::GlmDrafter<'a>),
+    RemoteDflash(super::remote_dflash::RemoteDflash<'a>),
     Dspark(DsparkDrafter<'a>),
 }
 
 impl<'a> Drafter<'a> {
+    pub fn require_live(&self) -> Result<()> {
+        match self { Self::RemoteDflash(d) => d.require_live(), _ => Ok(()) }
+    }
+
+    pub fn publish_abort(&self) -> Result<()> {
+        match self { Self::RemoteDflash(d) => d.publish_abort(), _ => Ok(()) }
+    }
+
+    pub fn synchronize_remote(&self) -> Result<()> {
+        match self { Self::RemoteDflash(d) => d.synchronize(), _ => Ok(()) }
+    }
+
+    pub fn finish_terminal(&self, drained: bool) {
+        if let Self::RemoteDflash(d) = self { d.finish_terminal(drained); }
+    }
+
     /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
     /// dSpark confidence head blended with the history rate.
     pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
         Ok(match self {
             Self::Dflash2(d) => super::draft_binding::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
+            Self::RemoteDflash(d) => super::draft_binding::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
             Self::Dspark(_) => super::draft_binding::Prior::Head,
         })
     }
@@ -815,13 +835,14 @@ impl<'a> Drafter<'a> {
     pub fn prepare_workspace(&self) -> Result<()> {
         match self {
             Self::Dflash2(d) => d.prepare_workspace(),
+            Self::RemoteDflash(d) => d.draft.device.run(|| d.draft.prepare_workspace()),
             Self::Dspark(d) => d.prepare_workspace(),
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Dflash2(_) => "DFlash2",
+            Self::Dflash2(_) | Self::RemoteDflash(_) => "DFlash2",
             Self::Dspark(_) => "dSpark",
         }
     }
@@ -830,6 +851,7 @@ impl<'a> Drafter<'a> {
     pub fn max_batch_sequences(&self) -> usize {
         match self {
             Self::Dflash2(d) => d.max_batch_sequences(),
+            Self::RemoteDflash(d) => d.draft.max_batch_sequences(),
             Self::Dspark(d) => d.max_sequences,
         }
     }
@@ -838,6 +860,7 @@ impl<'a> Drafter<'a> {
     pub fn set_draft_head(&self, mode: DraftHead) {
         match self {
             Self::Dflash2(d) => d.set_draft_head(mode),
+            Self::RemoteDflash(d) => d.draft.set_draft_head(mode),
             Self::Dspark(d) => d.set_draft_head(mode),
         }
     }
@@ -846,6 +869,7 @@ impl<'a> Drafter<'a> {
     pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
         match self {
             Self::Dflash2(d) => d.set_draft_linear(mode),
+            Self::RemoteDflash(d) => d.draft.device.run(|| d.draft.set_draft_linear(mode)),
             Self::Dspark(d) => d.set_draft_linear(mode),
         }
     }
@@ -854,6 +878,7 @@ impl<'a> Drafter<'a> {
     pub fn slots(&self) -> usize {
         match self {
             Self::Dflash2(d) => d.slots,
+            Self::RemoteDflash(d) => d.draft.slots,
             Self::Dspark(d) => d.slots,
         }
     }
@@ -862,6 +887,7 @@ impl<'a> Drafter<'a> {
     pub fn drafts(&self) -> usize {
         match self {
             Self::Dflash2(d) => d.cfg.drafts(),
+            Self::RemoteDflash(d) => d.draft.cfg.drafts(),
             Self::Dspark(d) => d.cfg.drafts(),
         }
     }
@@ -870,6 +896,7 @@ impl<'a> Drafter<'a> {
     pub fn block(&self) -> usize {
         match self {
             Self::Dflash2(d) => d.cfg.block,
+            Self::RemoteDflash(d) => d.draft.cfg.block,
             Self::Dspark(d) => d.cfg.block,
         }
     }
@@ -878,6 +905,7 @@ impl<'a> Drafter<'a> {
     pub fn taps(&self) -> &[usize] {
         match self {
             Self::Dflash2(d) => &d.cfg.taps,
+            Self::RemoteDflash(d) => &d.draft.cfg.taps,
             Self::Dspark(d) => &d.cfg.taps,
         }
     }
@@ -890,6 +918,7 @@ impl<'a> Drafter<'a> {
         -> Result<()> {
         match self {
             Self::Dflash2(d) => d.tap_streams_at(layer, streams, hc, first, n, to),
+            Self::RemoteDflash(d) => d.tap_streams_at(layer, streams, hc, first, n, to),
             Self::Dspark(d) => d.tap_streams_at(layer, streams, hc, first, n, to),
         }
     }
@@ -897,6 +926,7 @@ impl<'a> Drafter<'a> {
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         match self {
             Self::Dflash2(d) => d.update(rows),
+            Self::RemoteDflash(d) => d.update(rows),
             Self::Dspark(d) => d.update(rows),
         }
     }
@@ -905,6 +935,7 @@ impl<'a> Drafter<'a> {
         -> Result<Vec<Draft>> {
         match self {
             Self::Dflash2(d) => d.draft_device(sequences, embedding, head),
+            Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head),
             Self::Dspark(d) => d.draft_device(sequences, embedding, head),
         }
     }
@@ -912,6 +943,7 @@ impl<'a> Drafter<'a> {
     pub fn put_taps(&self, rows: &[u8]) -> Result<()> {
         match self {
             Self::Dflash2(d) => d.put_taps(rows),
+            Self::RemoteDflash(d) => d.put_taps(rows),
             Self::Dspark(d) => d.put_taps(rows),
         }
     }
@@ -919,6 +951,7 @@ impl<'a> Drafter<'a> {
     pub fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>> {
         match self {
             Self::Dflash2(d) => d.last_hidden(sequences),
+            Self::RemoteDflash(d) => d.draft.device.run(|| d.draft.last_hidden(sequences)),
             Self::Dspark(d) => d.last_hidden(sequences),
         }
     }
@@ -927,6 +960,7 @@ impl<'a> Drafter<'a> {
     pub fn replay(&self) -> &dyn ReplayDrafter {
         match self {
             Self::Dflash2(d) => d,
+            Self::RemoteDflash(d) => d,
             Self::Dspark(d) => d,
         }
     }

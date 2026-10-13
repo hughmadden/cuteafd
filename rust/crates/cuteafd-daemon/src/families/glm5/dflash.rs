@@ -657,6 +657,10 @@ impl<'a> GlmDrafter<'a> {
         self.head_mode.set(mode);
     }
 
+    pub(crate) fn draft_head_mode(&self) -> super::DraftHead {
+        self.head_mode.get()
+    }
+
     /// `out` [rows,n] = `x` [rows,k] @ selected weight rows. This loaded
     /// matrix owns one representation for every row count.
     ///
@@ -725,8 +729,45 @@ impl<'a> GlmDrafter<'a> {
         }
     }
 
+    /// Mutable owners for the opt-in GLM Flash replay alias diagnostic.
+    pub(crate) fn replay_write_ranges(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
+        let mut ranges = Vec::new();
+        for (name, buffer) in [("taps", &self.taps), ("fused", &self.fused),
+            ("fused_norm", &self.fused_norm), ("context_kv", &self.context_kv),
+            ("context_positions", &self.context_positions), ("context_slots", &self.context_slots)] {
+            ranges.push((format!("drafter/{name}"), buffer.buffer));
+        }
+        for (layer, buffers) in self.layers.iter().enumerate() {
+            ranges.push((format!("drafter/layer{layer}/k_ring"), buffers.k_ring.buffer));
+            ranges.push((format!("drafter/layer{layer}/v_ring"), buffers.v_ring.buffer));
+        }
+        if let Some(buffer) = &self.fp8_workspace {
+            ranges.push(("drafter/fp8_workspace".into(), buffer.buffer));
+        }
+        if let Some(w) = self.workspace.borrow().as_ref() {
+            for (name, buffer) in [("h", &w.h), ("n", &w.n), ("conv", &w.conv),
+                ("dynamic", &w.dynamic), ("qkv", &w.qkv), ("q", &w.q), ("k", &w.k),
+                ("v", &w.v), ("attn", &w.attn), ("delta", &w.delta), ("gate_up", &w.gate_up),
+                ("act", &w.act), ("logits", &w.logits), ("unary", &w.unary),
+                ("candidates", &w.candidates), ("projected", &w.projected), ("anchors", &w.anchors),
+                ("ids", &w.ids), ("tokens", &w.tokens), ("features", &w.features),
+                ("positions", &w.positions), ("tables", &w.tables),
+                ("attention_workspace", &w.attention_workspace), ("topk_workspace", &w.topk_workspace),
+                ("head_workspace", &w._head_workspace)] {
+                ranges.push((format!("drafter/step/{name}"), buffer.buffer));
+            }
+        }
+        ranges
+    }
+
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
+        self.update_with(rows, || Ok(()))
+    }
+
+    /// Upload metadata before a remote tap wait is enqueued. `ready` orders
+    /// the tap producer before the first context reader on this stream.
+    pub(crate) fn update_with(&self, rows: &[ContextRow], ready: impl FnOnce() -> Result<()>) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -741,6 +782,7 @@ impl<'a> GlmDrafter<'a> {
         }
         self.put(&self.context_positions, bytes_of(&positions))?;
         self.put(&self.context_slots, bytes_of(&slots))?;
+        ready()?;
         let (h, kv) = (self.cfg.hidden, self.cfg.kv_width());
         let width = self.cfg.taps.len() * h;
         let s = self.stream;
@@ -765,13 +807,49 @@ impl<'a> GlmDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: metadata consumers and overwrites share the owned drafter
+        // stream; pinned staging survives through the upload completion event.
+        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
+            bytes, self.stream) }
     }
 
     /// Explicit serving startup admission; other callers retain lazy allocation.
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
         if self.workspace.borrow().is_none() {
             *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
+        }
+        Ok(())
+    }
+
+    /// Prime remote compute in isolation, before either device can queue a
+    /// bridge wait. Startup-only zero inputs/logits never use a private target
+    /// embedding or head, and the context rings return to their cold state.
+    pub(crate) fn prime_remote(&self) -> Result<()> {
+        self.prepare_workspace()?;
+        self.library.cuda_zero_bytes(self.taps.buffer, self.taps.buffer.bytes)?;
+        self.update(&(0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
+            position: tap_row }).collect::<Vec<_>>())?;
+        // SAFETY: this drafter owns its live startup stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        let input = |_: &[u32], out: CuteafdDeviceBuffer, stream: *mut c_void| {
+            // SAFETY: the draft workspace and its startup stream are live.
+            unsafe { self.library.cuda_zero_bytes_async(out, out.bytes, stream) }
+        };
+        for count in 1..=self.max_sequences {
+            let sequences = (0..count).map(|slot| DraftSeq { slot, anchor: self.cfg.mask_token,
+                position: TAP_ROWS, valid_from: TAP_ROWS }).collect::<Vec<_>>();
+            let head = |_: *const c_void, out: *mut f32, rows: usize, stream: *mut c_void| {
+                let bytes = rows * self.cfg.vocab * 4;
+                // SAFETY: initialized scratch logits precede selection on this stream.
+                unsafe { self.library.cuda_zero_bytes_async(CuteafdDeviceBuffer { ptr: out.cast(), bytes,
+                    ..Default::default() }, bytes, stream) }
+            };
+            self.draft_device_with(&sequences, &input, TargetHead::Launch(Box::new(head)))?;
+        }
+        for layer in &self.layers {
+            for ring in [&layer.k_ring, &layer.v_ring] {
+                self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
+            }
         }
         Ok(())
     }
@@ -880,6 +958,10 @@ impl<'a> GlmDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        self.put(&w.positions, bytes_of(&positions))?;
+        self.put(&w.tables, bytes_of(&tables))?;
+        let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
+        self.put(&w.anchors, bytes_of(&anchors))?;
         match input {
             DraftInput::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -900,10 +982,6 @@ impl<'a> GlmDrafter<'a> {
                 input(&ids, w.h.buffer, self.stream)?;
             }
         }
-        self.put(&w.positions, bytes_of(&positions))?;
-        self.put(&w.tables, bytes_of(&tables))?;
-        let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
-        self.put(&w.anchors, bytes_of(&anchors))?;
         let (s, l) = (self.stream, self.library);
         let (eps, group, inter) = (c.eps, c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
