@@ -420,8 +420,9 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
         out.pool_stride = tables.pool_stride;
         return Ok(out);
     }
+    // A short step's startup graph geometry keys no pool stride (0: masked warm-up rows only).
     let stride = tables.pool_stride;
-    ensure!(stride > 0 && tables.pool_table.len() == stride * tables.positions.len(), "decode pool table geometry");
+    ensure!(tables.pool_table.len() == stride * tables.positions.len(), "decode pool table geometry");
     // The compact unit table's stride follows the record-page stride, which every decode graph
     // keys (the pool stride only long steps key): units a row's pages span, this GPU's half.
     let half = (tables.page_stride / UNIT_PAGES).div_ceil(2);
@@ -443,6 +444,7 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
         let pools = if masked { 0 } else { tables.cache_lengths[row].max(0) as usize };
         let local = if masked { Vec::new() } else {
             let used = (position as usize + 1).div_ceil(UNIT_ROWS);
+            ensure!(stride > 0, "row {row}: a real decode row without a pool table");
             ensure!(used <= stride && used <= 2 * half, "row {row}: {used} units past the decode table strides");
             let ids: Vec<u32> = tables.pool_table[row * stride..][..used].iter().map(|&p| p as u32).collect();
             local_pages(&ids, rank)?
@@ -555,6 +557,29 @@ mod tests {
         let mut wrong = tables.clone();
         wrong.kv_slots[0] += UNIT_ROWS as i64;
         assert!(rank_tables(&wrong, 0, 64).is_err(), "a slot of the wrong parity is refused");
+    }
+
+    #[test]
+    fn masked_startup_rows_need_no_pool_table() {
+        // A short startup geometry keys no pool stride: every row masked, no pool columns.
+        let mut tables = StepTables { decode: true, page_stride: 64, ..Default::default() };
+        for row in 0..4 {
+            let r = crate::shared::decode_graph::masked_row(row);
+            tables.positions.push(r.position);
+            tables.kv_slots.push(r.kv_slot);
+            tables.pool_slots.push(r.pool_slot);
+            tables.cache_lengths.push(r.cache_length);
+            tables.kda_slots.push(r.state_slot);
+            tables.seq_first.push(r.seq_first);
+            tables.page_table.extend([0; 64]);
+        }
+        for rank in 0..2 {
+            let r = rank_tables(&tables, rank, 64).unwrap();
+            assert_eq!(r.context_stride, 8);
+            assert_eq!(r.pool_table, vec![0; 4 * 8]);
+            assert!(r.kv_slots.iter().chain(&r.pool_slots).all(|&s| s == -1));
+            assert!(r.cache_lengths.iter().all(|&n| n == 0));
+        }
     }
 
     #[test]
