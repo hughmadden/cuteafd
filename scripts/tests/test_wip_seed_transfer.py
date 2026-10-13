@@ -326,3 +326,11 @@ printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_
     # checks and --recreate cover the seed's build container too.
     assert WIP.count('for host in "${wip_target_hosts[@]}"; do') == 3
     assert WIP.count('"${wip_container_hosts[@]}"') == 6
+
+
+def test_legacy_wip_sh_with_a_six_spark_union_and_an_outside_seed_is_refused_early(entry, tmp_path, monkeypatch):
+    six = {**entry, 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    with pytest.raises(ValueError, match='predates WIP_SEED_HOST'):
+        _build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'kakapo', separate=False)
+    # A pool seed inside the union is still one of the six.
+    assert int(_build(cards.arms_from(['base=b:s']), [six], tmp_path, monkeypatch, 'moa', separate=False)['SPARK_COUNT']) == 6

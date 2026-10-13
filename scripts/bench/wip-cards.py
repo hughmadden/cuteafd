@@ -1281,6 +1281,10 @@ def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         union = {h for card in cards for h in card.get('sparks', [])}
         arm['seed_separate'] = seed_option_capable(revision)
         hosts = staging_hosts(union, seed, arm['seed_separate'])
+        if build_role == 'both' and len(hosts) > 6:
+            raise ValueError(f'{name}: {revision} predates WIP_SEED_HOST, so its wip.sh builds on SPARK_0_HOST and '
+                             f'{seed} plus the {len(union)}-Spark union makes {len(hosts)} ranks; use --seed rhea|moa '
+                             'for this arm or build a revision with the separate seed (#117)')
         if build_role == 'both':
             print(f"# build seed {name}: {seed} ({'WIP_SEED_HOST' if arm['seed_separate'] else 'legacy SPARK_0_HOST'}); "
                   f"Spark targets ({len(hosts)}): {','.join(hosts)}")
