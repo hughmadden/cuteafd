@@ -228,6 +228,11 @@ impl<'a> GlmEngine<'a> {
             Scalar::I32(rows as i32),
         )?;
         self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows)?;
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
+            // SAFETY: rank0's router ids are live on its stream until the next layer;
+            // the shared probe downloads once before the verifier's normal sync.
+            unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream)?; }
+        }
         self.tp2_rank(pair, 0, layer, lane, w, rows)?;
         self.tp2_rank(pair, 1, layer, lane, w1, rows)?;
         // Rank1 has no final norm/head, but must consume every publication
