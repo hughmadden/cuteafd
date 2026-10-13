@@ -74,11 +74,20 @@ pub(super) struct GlmfContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical units one staging view holds: the compiled extent's.
     staging_units: usize,
-    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)` by row cap.
-    partial: [[Vec<(usize, String)>; 2]; 2],
+    /// Per GPU, the partial program of heads `[0, H/2)` and `[H/2, H)`: one split plan for every
+    /// decode and verify row count ([`PARTIAL_ROWS`]).
+    partial: [[String; 2]; 2],
     /// `lse_combine2`'s sink operand (never read: GLM Flash has no sink).
     sink: [Dev<'a>; 2],
 }
+
+/// The row cap whose split plan every decode and verify step runs. Speculation must be lossless:
+/// a k-row verify and k single-row decodes of the same tokens must compute the same attention,
+/// and the partial's split count changes the LSE grouping and its BF16 partial roundings. A row
+/// bucket per step (GLM 5.3's C1 speedup) let a 1-row decode (33 splits) and a verify of up to 8
+/// rows (11 at 188 SMs) diverge by up to 0.13 nats a row and flip greedy tokens. The 8-row plan
+/// keeps a C1 verify's CTAs filling the GPU and serves 64-row steps too.
+pub(super) const PARTIAL_ROWS: usize = 8;
 
 /// A view of `bytes` at `offset` inside `dev`.
 fn view(dev: &Dev<'_>, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -101,10 +110,11 @@ impl<'a> GlmfContextSplit<'a> {
         ensure!(exchange.heads() == cfg.heads / 2 && exchange.topk() == cfg.index_topk / KPOOL, "context exchange geometry");
         let staging_units = extent.div_ceil(UNIT_ROWS);
         let list = context_workspace(cfg, extent as u64, rows, lanes, context);
-        let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [Vec<(usize, String)>; 2])> {
+        let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [String; 2])> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
-                let partial = [0, cfg.heads / 2].map(|begin| partial_programs(manifest, "glmf", begin, DECODE_ROWS, sms));
+                let partial = [0, cfg.heads / 2].map(|begin| partial_programs(manifest, "glmf", begin, DECODE_ROWS, sms)
+                    .map(|variants| pick_partial(&variants, PARTIAL_ROWS).to_string()));
                 let [a, b] = partial;
                 let partial = [a?, b?];
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
@@ -314,8 +324,7 @@ impl<'a> GlmfEngine<'a> {
                 let heads = e.cfg.heads / 2;
                 let lse = view(out, DECODE_ROWS * heads * 512 * 2, self.t * heads * 4)?.ptr;
                 let kv = e.caches_of(rank).kv[self.index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
-                let name = pick_partial(&split.partial[rank][heads_rank], self.t);
-                let name = name.strip_prefix("glmf_").context("partial program name")?;
+                let name = split.partial[rank][heads_rank].strip_prefix("glmf_").context("partial program name")?;
                 e.run_on(rank, false, name, &[("q", query), ("cache", kv),
                     ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
                     ("extra_cache", kv), ("extra_indices", w.indices.buffer.ptr),
