@@ -125,13 +125,7 @@ struct SentWave {
     sent: std::time::Instant,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("MiMo head-split submission failed permanently: {cause}; {drain}")]
-pub(crate) struct TerminalStepError {
-    #[source]
-    cause: anyhow::Error,
-    drain: String,
-}
+pub(crate) use crate::shared::experts::rtx::pair::TerminalStepError;
 
 /// Fewest rows per lane of a pipelined prefill: at least the DFlash tap ring
 /// (1024 rows) and the MTP hidden ring, which the last lane alone feeds.
@@ -795,22 +789,10 @@ impl<'a> MimoEngine<'a> {
     /// queues; serving also retains its sampler/prefix/host owners independently.
     /// A terminal engine can never execute another submission.
     pub(super) fn submit<T>(&self, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        if let Err(error) = self.require_live() {
-            self.submission_failed.set(true);
-            return Err(error);
-        }
-        let result = body();
-        match result {
-            Err(cause) => {
-                self.submission_failed.set(true);
-                let drain = match self.terminal_shutdown() {
-                    Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
-                    Err(error) => format!("queued owners retained: {error:#}"),
-                };
-                Err(TerminalStepError { cause, drain }.into())
-            }
-            result => result,
-        }
+        let result = crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.terminal_shutdown(), body);
+        if result.is_err() { self.submission_failed.set(true); }
+        result
     }
 
     /// Close the complete engine before its buffers are released, including
@@ -824,58 +806,46 @@ impl<'a> MimoEngine<'a> {
             TerminalState::Active=>self.terminal.set(TerminalState::Aborting),
             state=>return Err(TerminalPeerError::Closed(state).into()),
         }
-        let mut failures=Vec::new();
-        let mut published=match &self.exchange {
-            Some(exchange)=>match exchange.publish_abort() {
-                Ok(())=>true,
-                Err(error)=>{ failures.push(format!("peer abort publication: {error:#}")); false }
+        use crate::shared::experts::rtx::pair::{teardown, Teardown};
+        teardown(&mut Teardown {
+            abort: || {
+                let mut failures = Vec::new();
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    if exchange.terminal_state() == TerminalState::Aborting { continue; }
+                    if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
             },
-            None=>true,
-        };
-        if let Some(tp2) = &self.tp2 {
-            if let Err(error) = tp2.routes.publish_abort() {
-                failures.push(format!("route abort publication: {error:#}"));
-                published = false;
-            }
-        }
-        if let Err(error)=self.terminal_links(|link|link.terminal_quiesce()) {
-            failures.push(format!("Spark QP quiescence: {error:#}"));
-        }
-        let mut compute_drained = false;
-        if published {
-            let result=match &self.exchange {
-                Some(exchange)=>exchange.drain_compute(),
-                None=>self.on(0, || {
-                    // SAFETY: the engine retains its stream and every queued
-                    // buffer; one-GPU work has no unmatched peer-wait kernel.
-                    unsafe { self.library.cuda_stream_synchronize(self.stream) }
-                }),
-            };
-            match result {
-                Ok(()) => compute_drained = true,
-                Err(error) => failures.push(format!("compute drainage: {error:#}")),
-            }
-        }
-        if compute_drained {
-            if let Err(error)=self.terminal_links(|link|link.terminal_drain_copies()) {
-                failures.push(format!("Spark upload drainage: {error:#}"));
-            }
-        } else {
-            // A copy stream may wait on a compute event that can no longer
-            // become visible. Do not replace a failed abort/drain with another
-            // blocking synchronization; retain every upload/landing owner.
-            failures.push("Spark upload drainage skipped because compute completion was not proven".into());
-        }
-        if failures.is_empty() {
-            if let Err(error)=self.terminal_links(|link|link.terminal_release()) {
-                failures.push(format!("Spark owner release: {error:#}"));
-            }
-        }
-        let drained=failures.is_empty();
-        self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-        if let Some(exchange)=&self.exchange { exchange.finish_terminal(drained); }
-        if let Some(tp2)=&self.tp2 { tp2.routes.finish_terminal(drained); }
-        if drained { Ok(()) } else { Err(TerminalPeerError::Retain(failures.join("; ")).into()) }
+            ranks: || {
+                let mut failures = Vec::new();
+                for rank in 0..self.ranks() {
+                    // SAFETY: the engine retains every queued operand until teardown proves drainage.
+                    if let Err(error) = self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }) {
+                        failures.push(format!("rank {rank}: {error:#}"));
+                    }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            links: || self.terminal_links(|link| link.terminal_quiesce()),
+            copies: || self.terminal_links(|link| link.terminal_drain_copies()),
+            graphs: || {
+                self.terminal_links(|link| link.terminal_release())?;
+                for rank in 0..self.ranks() {
+                    self.on(rank, || {
+                        if rank == 0 { self.graphs.borrow_mut().clear(); }
+                        else { self.peer.as_ref().context("peer graphs")?.graphs.borrow_mut().clear(); }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+            },
+        }).map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
     }
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
@@ -1927,6 +1897,7 @@ impl<'a> MimoEngine<'a> {
     /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`,
     /// capturing it first when `key` is new; `launch` false only captures.
     fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,

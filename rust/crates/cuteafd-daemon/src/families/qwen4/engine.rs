@@ -884,15 +884,12 @@ impl<'a> QwenTp2<'a> {
         // SAFETY: forwards the retained input/output and ordering contract.
         let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, shared, output) };
         if result.is_err() {
-            // A failed rank launch already published abort through its callback.
+            // Publish independently, but the whole-engine boundary owns drainage.
             let aborted = match self.exchange.terminal_state() {
                 crate::shared::peer_split::TerminalState::Aborting => Ok(()),
                 _ => self.exchange.publish_abort(),
             };
-            let drained = self.exchange.drain_compute();
-            let complete = aborted.is_ok() && drained.is_ok();
-            self.exchange.finish_terminal(complete);
-            if !complete { self.library.quarantine_module_after_failed_drain(); }
+            crate::shared::decode_graph::fatal_drain(aborted, "Qwen RTX enqueue abort");
         }
         result
     }
@@ -981,6 +978,7 @@ impl Drop for QwenTp2<'_> {
 }
 
 pub(crate) struct Qwen4Engine<'a> {
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
     pub(crate) spark_bf16: bool,
     quantize_grids: Vec<Fp8QuantizeGrid>,
     active_owner: Cell<usize>,
@@ -1219,7 +1217,7 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
@@ -1267,7 +1265,9 @@ impl<'a> Qwen4Engine<'a> {
         }
         let routed = QwenTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
             self.prefill_rows.max(DECODE_ROWS), wire)?;
-        let link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec)?;
+        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec)?;
+        link.attach_abort([routed.exchange.abort_word(0)?.context("Qwen rank zero abort word")?,
+            routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
         self.hops = Some(link);
         self.experts = Some(Experts::Tp2 { routed: RefCell::new(routed), mtp });
         Ok(())
@@ -1654,12 +1654,60 @@ impl<'a> Qwen4Engine<'a> {
             .map(|bank| bank.stream).context("Qwen snapshot device without an execution stream")
     }
 
+    pub(crate) fn require_live(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        if self.terminal.get() != TerminalState::Active {
+            return Err(TerminalPeerError::Closed(self.terminal.get()).into());
+        }
+        if let Some(Experts::Tp2 { routed, .. }) = &self.experts { routed.borrow().exchange.require_live()?; }
+        Ok(())
+    }
+
+    fn shutdown_submission(&self) -> Result<()> {
+        use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
+        self.terminal.set(TerminalState::Aborting);
+        let result = teardown(&mut Teardown {
+            abort: || {
+                if let Some(Experts::Tp2 { routed, .. }) = &self.experts {
+                    let routed = routed.try_borrow()?;
+                    if routed.exchange.terminal_state() != TerminalState::Aborting {
+                        let _scope = self.gdn_banks[0].device.enter()?;
+                        routed.exchange.publish_abort()?;
+                    }
+                }
+                Ok(())
+            },
+            ranks: || self.drain_state(),
+            links: || {
+                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_quiesce()?; }
+                Ok(())
+            },
+            copies: || {
+                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow()?.terminal_drain_copies()?; }
+                Ok(())
+            },
+            graphs: || {
+                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_release()?; }
+                self.graphs.borrow_mut().clear(); Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                if let Some(Experts::Tp2 { routed, .. }) = &self.experts { routed.borrow().exchange.finish_terminal(drained); }
+            },
+        });
+        crate::shared::decode_graph::fatal_drain(result, "Qwen submission shutdown"); Ok(())
+    }
+
     pub(crate) fn drain_state(&self) -> Result<()> {
+        let mut failures = Vec::new();
         for bank in &self.gdn_banks {
             // SAFETY: each bank owns its execution stream and live state allocations.
-            bank.device.run(|| unsafe { self.library.cuda_stream_synchronize(bank.stream) })?;
+            if let Err(error) = bank.device.run(|| unsafe { self.library.cuda_stream_synchronize(bank.stream) }) {
+                failures.push(format!("owner {}: {error:#}", bank.device.id));
+            }
         }
-        Ok(())
+        ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
 
     fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
@@ -2389,7 +2437,13 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
+        forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
+            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs))
+    }
+
+    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         ensure!(self.gdn_banks.len() == 1 || self.hops.is_some(),
             "Qwen dual owner execution needs TP2 exchange and owner graph admission");
@@ -2907,6 +2961,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         if let Some(graph) = self.graphs.borrow().get(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers.
             return unsafe { self.library.cuda_graph_launch(graph.0, self.execution_stream()) };
@@ -3340,11 +3395,7 @@ impl<'a> Qwen4Engine<'a> {
 
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.drain_state() {
-            self.library.quarantine_module_after_failed_drain();
-            tracing::error!(%error, "Qwen owner streams failed to drain; retaining device storage");
-            return;
-        }
+        crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen engine retirement");
         if let Some(bank) = self.gdn_banks.first() {
             // SAFETY: the root owner owns this ordering event; all streams have drained.
             let _ = bank.device.run(|| unsafe { self.library.cuda_event_destroy(self.routes_ready) });
@@ -3401,8 +3452,13 @@ mod owner_state_tests {
                     }
                     schedule.push(1, "hop", 1, "exit send");
                     schedule.wait(0, "hop", 1, "head exit land");
+                    schedule.end_request();
                 }
                 check(&schedule).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                if matches!(layers, 2 | 4 | 8) {
+                    crate::shared::peer_split::order::check_submission_faults(&schedule)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
             }
         }
         Ok(())
