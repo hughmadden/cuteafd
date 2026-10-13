@@ -428,8 +428,9 @@ mod tests {
             }
         }
         if mtp {
+            let draft_package = packages[0].parent().unwrap().join("rtx-tp1");
             for capacity in [1, 16] {
-                let path = lib.parent().unwrap().join(format!("exl3/exl3-qwen4-k4/rtx-tp1/m{capacity}"));
+                let path = draft_package.join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": 640, "experts": 512,
                     "top_k": 10, "capacity": capacity, "trellis_lut": {"bytes": 32},

@@ -173,7 +173,6 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
     use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
     let shape = catalog.routed_experts();
     anyhow::ensure!(rows > 0, "Qwen MTP workspace needs positive rows");
-    anyhow::ensure!(shape.draft_stages > 0, "Qwen MTP expert headers are missing");
     let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
     let (resident, scratch) = if let Some(exl3) = catalog.exl3() {
         let resident = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1 as u64;
@@ -182,7 +181,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
         anyhow::ensure!(rows > 0 && rows <= 4096, "Qwen MTP EXL3 capacity exceeds 4096 rows");
         let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
             let path = root.join(format!("m{capacity}/v41_exl3.json"));
-            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| anyhow::anyhow!("Qwen expert package {}: {error}", path.display()))?)?;
             anyhow::ensure!(m["hidden"].as_u64() == Some(shape.hidden as u64)
                 && m["intermediate"].as_u64() == Some(shape.intermediate as u64)
                 && m["experts"].as_u64() == Some(shape.experts as u64)
@@ -244,7 +243,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
             anyhow::ensure!(rows <= 4096, "Qwen EXL3 TP2 capacity exceeds 4096 rows");
             let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
                 let path = package.join(format!("m{capacity}/v41_exl3.json"));
-                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| anyhow::anyhow!("Qwen expert package {}: {error}", path.display()))?)?;
                 anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
                     && value["intermediate"].as_u64() == Some(width)
                     && value["experts"].as_u64() == Some(shape.experts as u64)
