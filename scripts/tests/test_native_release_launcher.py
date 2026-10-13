@@ -241,6 +241,17 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                 expected = b'before\0after\0' if not seed else b'before\0-e\0CUTEAFD_BENCH_NONCE_SEED=pair-123\0after\0'
                 self.assertEqual(result.stdout, expected)
 
+    def test_private_diag_env_reaches_coordinator_only_when_set(self) -> None:
+        source = FAMILY.read_text()
+        block = 'shared_bench_nonce_args() {\n' + source.split('shared_bench_nonce_args() {\n', 1)[1].split('\n}\n', 1)[0] \
+            + '\n}\nshared_bench_nonce_args\nprintf "%s\\0" before "${bench_nonce_env_args[@]}" after'
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout, b'before\0after\0')
+        environment.update(CUTEAFD_DIAG_V4_VERIFY='/tmp/x', CUTEAFD_DIAG_A='1', CUTEAFD_OTHER='no')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout, b'before\0-e\0CUTEAFD_DIAG_A=1\0-e\0CUTEAFD_DIAG_V4_VERIFY=/tmp/x\0after\0')
+
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
         source = FAMILY.read_text()
         # The shared helper body, run with V4.1's family name.

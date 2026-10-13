@@ -178,6 +178,12 @@ shared_worker_env_args=(-e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD
 shared_bench_nonce_args() {
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
+# Private diagnostics: every CUTEAFD_DIAG_* variable in the launching
+# environment reaches the coordinator unchanged (an env-gated hook reads its
+# own name). Nothing else passes this way; unset, the argv is unchanged.
+while IFS= read -r name; do
+  bench_nonce_env_args+=(-e "$name=${!name}")
+done < <(compgen -e CUTEAFD_DIAG_ | sort)
 }
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, through release-common.sh:
