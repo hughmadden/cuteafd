@@ -11,8 +11,10 @@ Run with Python containing CUDA PyTorch, on one GPU.
    tensor cores with FP32 accumulation against an FP64 reference and against the pedantic FP32
    path (`cuteafd_vocabulary_head_launch_width`) and the few-row kernel (`cuteafd_vocab_head_rows`).
    Reports the drafter's top-16 agreement (BF16-rounded logits, larger first, lower index on
-   ties, as `glm_dflash_topk` ranks them) and times each path by row count. `--head` reads
-   `lm_head.weight` from a checkpoint shard; otherwise the weight is synthetic.
+   ties, as `glm_dflash_topk` ranks them) and times each path by row count. Rank changes qualify
+   only within adjacent FP64 near-ties (1e-5 relative per row).
+   `--head-input` qualifies each file at its serving row count, not as one concatenated GEMM.
+   `--head` reads `lm_head.weight` from a checkpoint shard; otherwise the weight is synthetic.
 2. FP8 GEMMs (`cuteafd_fp8_linear`, `--draft-linear`): mode 1 (passes of 128 rows) must equal
    mode 0 (passes of 64) bit for bit at every row count; mode 2 (W8A8 past 8 rows) must equal
    mode 0 bit for bit up to 8 rows; past them it must match mode 0 to accumulation rounding on
@@ -104,23 +106,71 @@ def top16(logits):
     return torch.topk(key, 16, dim=1).indices
 
 
+def head_rank_mismatches(expected, candidate, oracle, epsilon):
+    """Allow only changes inside groups of adjacent FP64 near-ties."""
+    union = sorted(set(expected) | set(candidate), key=lambda i: (-oracle[i], i))
+    groups = {}
+    group = 0
+    previous = None
+    for token in union:
+        if previous is not None and abs(oracle[token] - oracle[previous]) > epsilon:
+            group += 1
+        groups[token] = group
+        previous = token
+    bad_order = any(groups[a] != groups[b] for a, b in zip(expected, candidate))
+    bad_set = sorted(groups[i] for i in expected) != sorted(groups[i] for i in candidate)
+    first_differs = expected[0] != candidate[0]
+    top_gap = abs(oracle[expected[0]] - oracle[expected[1]])
+    bad_first = first_differs and (groups[expected[0]] != groups[candidate[0]] or top_gap > epsilon)
+    return {
+        "top1": int(first_differs),
+        "set": int(set(expected) != set(candidate)),
+        "order": int(expected != candidate),
+        "bad_top1": int(bad_first),
+        "bad_set": int(bad_set),
+        "bad_order": int(bad_order),
+    }
+
+
+def head_rank_selftest():
+    def check(expected, candidate, scores):
+        return head_rank_mismatches(expected, candidate, dict(enumerate(scores)), 1e-5)
+
+    assert not any(check([0, 1, 2], [0, 1, 2], [3., 2., 1.]).values())
+    assert check([0, 1, 2], [1, 0, 2], [3., 3. - 1e-6, 1.])["bad_order"] == 0
+    assert check([0, 1, 2], [1, 0, 2], [3., 2., 1.])["bad_top1"] == 1
+    assert check([0, 1, 2], [1, 0, 2], [3., 2.999, 1.])["bad_top1"] == 1
+    assert check([0, 1, 2], [0, 1, 3], [3., 2., 1., 1. - 1e-6])["bad_set"] == 0
+    assert check([0, 1, 2], [0, 1, 3], [3., 2., 1., .5])["bad_set"] == 1
+    assert check([0, 1, 2], [0, 2, 1], [3., 2., 1.])["bad_order"] == 1
+
+
 def head_check(lib, args):
     stream = torch.cuda.current_stream().cuda_stream
     torch.manual_seed(53)
     vocab, width = args.head_shape
     rows_all = max(24, max(args.head_rows))
+    head_rank_selftest()
+    batches = []
     if args.head_input:
         inputs = []
+        offset = 0
         for path in args.head_input:
-            data = bytearray(open(path, "rb").read())
+            data = bytearray(Path(path).read_bytes())
             assert len(data) > 0 and len(data) % (width * 2) == 0, (path, len(data), width)
-            inputs.append(torch.frombuffer(data, dtype=torch.bfloat16).view(-1, width))
+            tensor = torch.frombuffer(data, dtype=torch.bfloat16).view(-1, width)
+            rows = tensor.shape[0]
+            assert rows in args.head_rows and rows % 8 == 0, (path, rows, args.head_rows)
+            inputs.append(tensor)
+            batches.append((Path(path).name, offset, rows))
+            offset += rows
         x = torch.cat(inputs).cuda()
         rows_all = x.shape[0]
         assert 8 <= rows_all <= 1024 and rows_all >= max(args.head_rows), rows_all
     else:
         x = (torch.randn(rows_all, width, device="cuda") * torch.linspace(
             0.5, 2.0, rows_all, device="cuda")[:, None]).bfloat16()
+        batches.append(("synthetic", 0, rows_all))
     weight = read_head(args.head, vocab, width) if args.head else (
         torch.randn(vocab, width, device="cuda") * 0.02).bfloat16()
     weight_bytes = weight.numel() * weight.element_size()
@@ -130,21 +180,24 @@ def head_check(lib, args):
                                                     C.byref(handle)) == 0
     out = {name: torch.empty(rows_all, vocab, device="cuda") for name in ("pedantic", "tensor", "few")}
 
-    def launch(name, rows):
+    def launch(name, rows, offset=0):
+        input_ptr = x[offset:].data_ptr()
+        output_ptr = out[name][offset:].data_ptr()
         if name == "pedantic":
-            status = lib.cuteafd_vocabulary_head_launch_width(handle, x.data_ptr(), weight.data_ptr(),
-                                                              out[name].data_ptr(), rows, stream)
+            status = lib.cuteafd_vocabulary_head_launch_width(handle, input_ptr, weight.data_ptr(),
+                                                              output_ptr, rows, stream)
         elif name == "tensor":
-            status = lib.cuteafd_vocabulary_head_launch_tensor_op(handle, x.data_ptr(), weight.data_ptr(),
-                                                                  out[name].data_ptr(), rows, stream)
+            status = lib.cuteafd_vocabulary_head_launch_tensor_op(handle, input_ptr, weight.data_ptr(),
+                                                                  output_ptr, rows, stream)
         else:
-            status = lib.cuteafd_vocab_head_rows(x.data_ptr(), weight.data_ptr(), out[name].data_ptr(), rows, width,
+            status = lib.cuteafd_vocab_head_rows(input_ptr, weight.data_ptr(), output_ptr, rows, width,
                                                  vocab, stream)
         assert status == 0, (name, rows, status)
 
     try:
-        for name in out:
-            launch(name, rows_all)
+        for _, offset, rows in batches:
+            for name in out:
+                launch(name, rows, offset)
         torch.cuda.synchronize()
         # Real inputs qualify every row; synthetic smoke retains its eight-row FP64 gate.
         reference_rows = rows_all if args.head_input else 8
@@ -152,16 +205,42 @@ def head_check(lib, args):
                          for v in range(0, vocab, 16384)], dim=1)
         scale = ref.abs().amax().item()
         reference_top = top16(ref)
+        expected_rows = reference_top.cpu().tolist()
+        epsilons = (ref.abs().amax(dim=1) * 1e-5).cpu().tolist()
+        failures = []
+        rank_counts = {}
         for name in out:
             err = (out[name][:reference_rows].double() - ref).abs().amax().item() / scale
             print(f"head: {name} max |error| / max |logit| over {reference_rows} rows: {err:.2e}")
-            assert err < (1e-3 if name == "tensor" else 1e-5), (name, err)
+            if err >= (1e-3 if name == "tensor" else 1e-5):
+                failures.append((name, "logit error", err))
             candidate = top16(out[name][:reference_rows])
-            print(f"head: {name} against FP64: top-1 "
-                  f"{100 * (candidate[:, 0] == reference_top[:, 0]).float().mean().item():.2f}%, "
-                  f"top-16 in order {100 * (candidate == reference_top).all(dim=1).float().mean().item():.2f}%")
-            if args.head_input:
-                assert torch.equal(candidate, reference_top), ("actual-input top16 versus FP64", name)
+            candidate_rows = candidate.cpu().tolist()
+            indices = torch.cat((reference_top, candidate), dim=1)
+            oracle_rows = ref.gather(1, indices).cpu().tolist()
+            counts = {key: 0 for key in ("top1", "set", "order", "bad_top1", "bad_set", "bad_order")}
+            details = []
+            for row, (expected, actual, scores) in enumerate(zip(
+                    expected_rows, candidate_rows, oracle_rows)):
+                ids = expected + actual
+                oracle = dict(zip(ids, scores))
+                result = head_rank_mismatches(expected, actual, oracle, epsilons[row])
+                for key, value in result.items():
+                    counts[key] += value
+                if result["order"] and len(details) < 8:
+                    source, offset, _ = next(batch for batch in batches if batch[1] <= row < batch[1] + batch[2])
+                    changed = [(a, b, abs(oracle[a] - oracle[b]) / epsilons[row])
+                               for a, b in zip(expected, actual) if a != b]
+                    details.append((source, row - offset, changed, result))
+            rank_counts[name] = counts
+            print(f"head: {name} FP64 rank mismatches over {reference_rows} rows: {counts}; "
+                  "epsilon=1e-5 * row max |FP64 logit|")
+            for detail in details:
+                print(f"head: {name} mismatch source,row,(expected,actual,gap/epsilon),counts: {detail}")
+        for name, counts in rank_counts.items():
+            for key in ("bad_top1", "bad_set", "bad_order"):
+                if counts[key] > rank_counts["pedantic"][key] or rank_counts["pedantic"][key]:
+                    failures.append((name, key, counts[key], "pedantic", rank_counts["pedantic"][key]))
         baseline = top16(out["pedantic"])
         for name in ("tensor", "few"):
             candidate = top16(out[name])
@@ -171,9 +250,7 @@ def head_check(lib, args):
                            for r in range(rows_all)) / rows_all
             print(f"head: {name} against pedantic over {rows_all} rows: top-1 {100 * same_first:.2f}%, "
                   f"top-16 set {100 * same_set:.2f}%, top-16 in order {100 * same_top:.2f}%")
-            if args.head_input:
-                assert torch.equal(baseline, candidate), ("actual-input top16 versus pedantic", name)
-            elif name == "tensor":
+            if not args.head_input and name == "tensor":
                 assert same_first >= 0.95
 
         # Exercise the serving selector on 8-row blocks, excluding each anchor.
@@ -218,6 +295,7 @@ def head_check(lib, args):
                 torch.cuda.synchronize()
             finally:
                 torch.cuda.profiler.stop()
+        assert not failures, ("head qualification", failures)
     finally:
         torch.cuda.synchronize()
         assert lib.cuteafd_v41_markov_destroy(handle) == 0
