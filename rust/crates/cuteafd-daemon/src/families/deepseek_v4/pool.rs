@@ -191,6 +191,16 @@ mod tests {
         // 262,144 tokens over three sequences is 1,027 units: context needs two equal halves.
         assert_eq!(PoolShape::context_units(PoolShape::units_for(262_144, 3), true), 1028);
         assert_eq!(PoolShape::context_units(1027, false), 1027);
+        // Every requested pool and sequence count: an even pool under context, at most one unit added,
+        // and a parity allocator accepts it.
+        for tokens in [1usize, 255, 256, 257, 262_144, 262_145, 1 << 20] {
+            for sequences in 1..=9 {
+                let units = PoolShape::units_for(tokens, sequences);
+                let context = PoolShape::context_units(units, true);
+                assert!(context % 2 == 0 && context - units <= 1, "{tokens} tokens, {sequences} sequences");
+                assert!(PoolAllocator::context(PoolShape::new(sequences, 4096, context)).is_ok());
+            }
+        }
         Ok(())
     }
 }

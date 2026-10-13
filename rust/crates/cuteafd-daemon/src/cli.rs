@@ -617,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn dsv4_golden_accepts_nll_and_requires_it_for_saved_logits() {
+    fn dsv4_golden_saves_prefill_or_decode_logits() {
         use clap::Parser;
         let base = ["cuteafd", "dsv4-golden", "--snapshot", "/model", "--native-lib", "/native.so",
             "--golden", "/golden"];
@@ -627,7 +627,12 @@ mod tests {
         };
         assert!(args.nll);
         assert_eq!(args.save_logits.as_deref(), Some(std::path::Path::new("/rows")));
-        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--save-logits", "/rows"])).is_err());
+        // Without --nll the decode/verify rows past --prefill are saved.
+        let super::Commands::Dsv4Golden(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--prefill", "512", "--verify-rows", "8", "--save-logits", "/rows"])).unwrap().command else {
+            panic!("expected DeepSeek V4 golden");
+        };
+        assert!(!args.nll && args.save_logits.is_some() && args.prefill == Some(512));
     }
 
     #[test]

@@ -101,8 +101,10 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
-    /// With --nll, also save tokens.bin and F32 logits.bin for a reference run.
-    #[arg(long, requires = "nll")]
+    /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
+    /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
+    /// runs compare exactly the rows the decode path produced.
+    #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// Compare only the first N layers' streams (all logits still compared).
     #[arg(long)]
@@ -759,6 +761,14 @@ fn golden_run(
         });
         println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
             100.0 * decode_agree as f64 / decode_steps as f64);
+    }
+    if let Some(dir) = &args.save_logits {
+        ensure!(decode_steps > 0, "--save-logits without --nll saves the decode rows: pass --prefill N");
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), tokens[prefill..].iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
+        std::fs::write(dir.join("logits.bin"), logits[prefill * vocab..].iter().flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>())?;
+        println!("saved {decode_steps} decode rows (positions {prefill}..{t}) to {}", dir.display());
     }
     Ok(())
 }
