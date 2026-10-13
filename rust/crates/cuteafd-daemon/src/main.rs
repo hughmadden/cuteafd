@@ -167,10 +167,15 @@ async fn main() -> Result<()> {
     commands::bench::capture(&matches, coordinator_budget_gib)?;
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
-        Commands::Expertd(_) => shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10)),
+        Commands::Expertd(_) => {
+            shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10));
+            shared::thermal::monitor("expertd");
+        }
         Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeGlmf(_)
-        | Commands::ServeGlm(_) | Commands::ServeDsv4(_) =>
-            shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10)),
+        | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
+            shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
+            shared::thermal::monitor("coordinator");
+        }
         _ => {}
     }
     match command {

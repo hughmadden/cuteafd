@@ -407,6 +407,9 @@ pub struct Baseline {
     /// Wall seconds the baseline took.
     #[serde(default)]
     pub seconds: f64,
+    /// GPU throttle report over the whole baseline run (`/v1/thermal`; absent without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -123,6 +123,8 @@ impl Worker {
         object.insert("totals".into(), totals::snapshot());
         let tables = cuteafd_loader::mapped_table_stats();
         if !tables.is_empty() { object.insert("mapped_tables".into(), json!(tables)); }
+        let thermal = cuteafd_core::thermal::current();
+        if !thermal.is_null() { object.insert("thermal".into(), thermal); }
         object.insert("active".into(), json!(self.requests.len()));
         object.insert("ids".into(), json!(self.requests.keys().collect::<Vec<_>>()));
         // The oldest admitted request still prefilling, and how many are.

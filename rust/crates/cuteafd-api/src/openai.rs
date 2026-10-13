@@ -298,6 +298,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     let mut routes = Router::new()
         .route("/health", get(health))
         .route("/v1/stats", get(stats_route))
+        .route("/v1/thermal", get(thermal_route))
         .route("/v1/chat/completions", post(chat));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the
@@ -334,6 +335,22 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let object = value.as_object_mut().unwrap();
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
+    let thermal = cuteafd_core::thermal::current();
+    if !thermal.is_null() { object.insert("thermal".into(), thermal); }
+    Json(value)
+}
+/// GPU throttle report over `[from, to]` seconds on the report clock (`now_s` in the reply).
+/// Without `from`, the reply carries only the current readings and the clock, so a client can
+/// mark a phase's start and later ask for exactly that interval.
+#[derive(serde::Deserialize)]
+struct ThermalWindow { from: Option<f64>, to: Option<f64> }
+async fn thermal_route(axum::extract::Query(q): axum::extract::Query<ThermalWindow>) -> Json<Value> {
+    let now = cuteafd_core::thermal::now_s();
+    let mut value = json!({"now_s": now, "available": cuteafd_core::thermal::active(),
+        "current": cuteafd_core::thermal::current()});
+    if let Some(from) = q.from {
+        value["window"] = cuteafd_core::thermal::window(from, q.to.unwrap_or(now).min(now));
+    }
     Json(value)
 }
 // Preserve scheduler-published interval/device diagnostics; refresh only the

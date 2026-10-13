@@ -693,6 +693,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "cuteafd-api",
+ "cuteafd-core",
  "cuteafd-loader",
  "cuteafd-transport",
  "futures",

@@ -43,6 +43,10 @@
       <div class="track"><span id="h-bar" style="background:var(--prefill);width:0"></span></div>
       <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num"><span id="h-p50-label">restore p50</span> <b id="h-p50">–</b></span></div>
     </div>
+    <div class="meter" id="gpu-meter" hidden>
+      <div class="row"><span class="label">GPUs · temperature, power, clock</span><span class="num" id="gpu-gov"></span></div>
+      <div id="gpu-rows"></div>
+    </div>
   </section>
 
   <section class="panel">
@@ -482,6 +486,15 @@ function renderMeters() {
     $('#kv-active').textContent = n0(active); $('#kv-ret').textContent = n0(ret);
     $('#kv-a').style.width = (100 * active / kv.pages) + '%'; $('#kv-r').style.width = (100 * ret / kv.pages) + '%';
     $('#kv-tok').textContent = compact(used * kv.tokens_per_page); $('#kv-cap').textContent = compact(kv.pages * kv.tokens_per_page);
+  }
+  const th = g.thermal;
+  $('#gpu-meter').hidden = !th?.gpus?.length;
+  if (th?.gpus?.length) {
+    const f = (v, unit) => v == null ? '–' : `${Math.round(v)}${unit}`;
+    $('#gpu-rows').innerHTML = th.gpus.map((x) => `<div class="row"><span class="num">gpu${x.index} <b>${f(x.temperature_c, ' °C')}</b>`
+      + ` · headroom ${f(x.tlimit_margin_c, ' °C')} · ${f(x.power_w, '')}/${f(x.power_limit_w, ' W')} · ${f(x.sm_clock_mhz, ' MHz')}</span>`
+      + `<span class="num">${esc((x.throttling || []).join(' ') || 'no throttle')}</span></div>`).join('');
+    $('#gpu-gov').textContent = th.governor ? `governor ${esc(String(th.governor.reason ?? ''))}` : '';
   }
   const h = g.host;
   if (h) {

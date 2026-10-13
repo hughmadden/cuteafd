@@ -120,6 +120,20 @@ impl Client {
         self.get("/v1/stats")
     }
 
+    /// The server's report clock (`/v1/thermal` `now_s`), or `None` when the server has no
+    /// throttle report (older build, or no NVML).
+    pub fn thermal_mark(&self) -> Option<f64> {
+        let value = self.get("/v1/thermal").ok()?;
+        value["available"].as_bool().filter(|a| *a)?;
+        value["now_s"].as_f64()
+    }
+
+    /// The GPU throttle summary since `from` (a [`Self::thermal_mark`]) until now.
+    pub fn thermal_since(&self, from: Option<f64>) -> Option<Value> {
+        let value = self.get(&format!("/v1/thermal?from={}", from?)).ok()?;
+        value.get("window").cloned().filter(|w| !w.is_null())
+    }
+
     /// A streamed chat completion. `body` needs no `model` or `stream`;
     /// `probe` registers benchmark diagnostics for this request.
     pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {

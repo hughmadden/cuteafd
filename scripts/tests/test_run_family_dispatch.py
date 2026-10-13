@@ -107,6 +107,24 @@ def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: s
     assert f"{key} was removed for GLM 5.3" in result.stderr
 
 
+@pytest.mark.parametrize("value", [None, "on", "off"])
+def test_thermal_report_key_defaults_on_and_reaches_the_coordinator(tmp_path: Path, value) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
+                                  f"THERMAL={value}\n" if value else "")
+    assert result.returncode == 0, result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert any("cuteafd-spark-expert" in line for line in launches)
+    assert all(f"CUTEAFD_THERMAL={value or 'on'}" in line for line in launches), launches
+
+
+def test_thermal_report_key_rejects_unknown_value(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash", "THERMAL=maybe\n")
+    assert result.returncode != 0
+    assert "THERMAL must be on or off" in result.stderr
+
+
 def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
