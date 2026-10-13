@@ -114,7 +114,7 @@ def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, mo
 
 def test_benches_flag_runs_only_the_bench_suite(tmp_path, monkeypatch):
     seen = []
-    monkeypatch.setattr(gate, 'prepare', lambda source, root: None)
+    monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
     for name in ('cargo', 'scripts', 'benches'):
         monkeypatch.setattr(gate, name, lambda s, r, a, e, n=name: seen.append(n) or {'suite': n, 'status': 'pass'})
