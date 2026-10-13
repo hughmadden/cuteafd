@@ -152,6 +152,8 @@ impl<'a> Fp8MoeTp2<'a> {
         self.experts.resident_bytes()
     }
 
+    pub(crate) fn weight_read_bytes(&self) -> usize { self.experts.weight_read_bytes() }
+
     pub(crate) fn weight_read_group(&self, rows: usize)
         -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
         self.experts.weight_read_group(rows, true)
