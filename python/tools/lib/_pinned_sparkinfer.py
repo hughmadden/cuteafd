@@ -98,7 +98,10 @@ def _pin_cute_host_target() -> None:
     target = host_target()
     if not target:
         return
-    from cutlass.base_dsl import compiler
+    try:
+        from cutlass.base_dsl import compiler
+    except ModuleNotFoundError:
+        return  # no CuTe DSL here (host tools, verifiers): nothing can compile
 
     cls = compiler.HostTarget
     if getattr(cls, "_cuteafd_host_target", None) == target:

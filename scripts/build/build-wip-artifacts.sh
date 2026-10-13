@@ -401,10 +401,10 @@ else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
 fi
-if [[ "$phase" != export ]]; then
+if [[ "${phase:-all}" != export ]]; then
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
 fi
-if [[ "$phase" == export ]]; then
+if [[ "${phase:-all}" == export ]]; then
   :
 elif [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
@@ -444,7 +444,7 @@ fi
 [[ -z "${native_started:-}" ]] ||
   wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)"
 
-[[ "$phase" != export ]] || exit 0
+[[ "${phase:-all}" != export ]] || exit 0
 (
   cd "$output_dir"
   sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS
