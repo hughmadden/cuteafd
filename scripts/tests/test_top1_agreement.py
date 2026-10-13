@@ -72,13 +72,19 @@ def test_draft_head_fp64_rank_gate_allows_only_adjacent_near_ties():
     assert all(better[key] <= same_baseline[key] for key in ('bad_top1', 'bad_set', 'bad_order'))
 
 
-def test_mimo_serving_draft_head_is_tensor_without_changing_target_or_replay():
+def test_mimo_serving_draft_head_is_separate_from_fixed_target_and_replay():
     source = ROOT / 'rust/crates/cuteafd-daemon/src'
     shared = (source / 'shared/draft.rs').read_text().split('pub(crate) unsafe fn launch_bf16_head', 1)[1]
     assert 'head.launch_tensor_op(' in shared and 'head.launch(' not in shared
     head = (source / 'families/mimo_v2/head.rs').read_text()
-    assert 'crate::shared::draft::launch_bf16_head(' in head
-    assert 'head.launch(x.ptr.cast(), w.buffer.ptr.cast(), logits.ptr.cast(), rows as u32, stream)' in head
+    routes = head.split('if draft {', 1)[1].split('MimoHead::Fp8', 1)[0]
+    draft_route, target_route = routes.split('} else {', 1)
+    assert 'crate::shared::draft::launch_bf16_head(' in draft_route
+    assert 'crate::shared::target_head::launch(' not in draft_route
+    assert 'crate::shared::target_head::launch(' in target_route
+    assert 'crate::shared::draft::launch_bf16_head(' not in target_route
+    target = (source / 'shared/target_head.rs').read_text()
+    assert 'head.launch_tensor_invariant(' in target and 'head.launch_tensor_op(' not in target
     draft = (source / 'families/mimo_v2/dflash.rs').read_text()
     serving = draft.split('pub fn draft(', 1)[1].split('pub fn draft_rows(', 1)[0]
     replay = draft.split('pub fn draft_rows(', 1)[1].split('fn draft_from(', 1)[0]
