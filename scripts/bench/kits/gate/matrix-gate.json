@@ -76,7 +76,6 @@
     "ADDR": "0.0.0.0:8733",
     "EXPERT_PORT": "19833",
     "COORDINATOR_GPU_BUDGET_GIB": "31.8",
-    "COORDINATOR_WEIGHT_BUDGET_GIB": "31.8",
     "SPARK_COUNT": "2",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
