@@ -482,7 +482,7 @@ mod tests {
                 layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes })?;
-            assert_eq!(runtime.pool_tokens, 2 << 20);
+            assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);
             assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));
