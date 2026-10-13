@@ -1,4 +1,5 @@
 """Protocol checks for the one-time v5 teacher-forced top-1 study."""
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -53,3 +54,31 @@ def test_reference_requires_same_frozen_corpus(tmp_path):
         protocol={'target_only':True}, samples=[{'id':key,'token_id':1} for key in ids])))
     with pytest.raises(AssertionError):
         COLLECT['load_reference'](reference, 'expected', ids)
+
+
+def test_draft_head_fp64_rank_gate_allows_only_adjacent_near_ties():
+    path = ROOT / 'native/tests/glm_draft_kernels_selftest.py'
+    tree = ast.parse(path.read_text())
+    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+               and node.name in ('head_rank_mismatches', 'head_rank_selftest')]
+    namespace = {}
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), str(path), 'exec'), namespace)
+    namespace['head_rank_selftest']()
+    mismatch = namespace['head_rank_mismatches']
+    same_baseline = mismatch([0, 1, 2], [0, 2, 1], {0: 3., 1: 2., 2: 1.}, 1e-5)
+    assert same_baseline['bad_order'] == 1
+    better = mismatch([0, 1, 2], [0, 1, 2], {0: 3., 1: 2., 2: 1.}, 1e-5)
+    assert all(better[key] <= same_baseline[key] for key in ('bad_top1', 'bad_set', 'bad_order'))
+
+
+def test_mimo_serving_draft_head_is_tensor_without_changing_target_or_replay():
+    source = ROOT / 'rust/crates/cuteafd-daemon/src'
+    shared = (source / 'shared/draft.rs').read_text().split('pub(crate) unsafe fn launch_bf16_head', 1)[1]
+    assert 'head.launch_tensor_op(' in shared and 'head.launch(' not in shared
+    head = (source / 'families/mimo_v2/head.rs').read_text()
+    assert 'crate::shared::draft::launch_bf16_head(' in head
+    assert 'head.launch(x.ptr.cast(), w.buffer.ptr.cast(), logits.ptr.cast(), rows as u32, stream)' in head
+    draft = (source / 'families/mimo_v2/dflash.rs').read_text()
+    serving = draft.split('pub fn draft(', 1)[1].split('pub fn draft_rows(', 1)[0]
+    replay = draft.split('pub fn draft_rows(', 1)[1].split('fn draft_from(', 1)[0]
+    assert 'head.launch_draft(' in serving and 'plan.launch(' in replay

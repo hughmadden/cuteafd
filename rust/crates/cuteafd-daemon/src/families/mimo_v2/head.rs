@@ -45,15 +45,34 @@ pub(crate) struct BorrowedHead<'h, 'a> {
 impl BorrowedHead<'_, '_> {
     pub fn launch(self, bf16: Option<&VocabularyHead<'_>>, x: CuteafdDeviceBuffer,
         logits: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void) -> Result<()> {
+        self.launch_with(bf16, x, logits, rows, stream, false)
+    }
+
+    /// Verified draft proposals use the shared tensor route; target/MTP and
+    /// replay diagnostics retain `launch` and the original target arithmetic.
+    pub fn launch_draft(self, bf16: Option<&VocabularyHead<'_>>, x: CuteafdDeviceBuffer,
+        logits: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void) -> Result<()> {
+        self.launch_with(bf16, x, logits, rows, stream, true)
+    }
+
+    fn launch_with(self, bf16: Option<&VocabularyHead<'_>>, x: CuteafdDeviceBuffer,
+        logits: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void, draft: bool) -> Result<()> {
         ensure!(rows > 0 && rows.checked_mul(self.hidden).and_then(|n| n.checked_mul(2)).is_some_and(|n| n <= x.bytes)
             && rows.checked_mul(self.vocab).and_then(|n| n.checked_mul(4)).is_some_and(|n| n <= logits.bytes),
             "MiMo borrowed head input/output exceeds its admitted rows");
         match self.weight {
             MimoHead::Bf16(w) => {
+                let head = bf16.context("BF16 LM head workspace")?;
                 // SAFETY: checked input/output extents and the model-owned BF16
                 // matrix remain live until the owner's stream drain.
-                unsafe { bf16.context("BF16 LM head workspace")?.launch(x.ptr.cast(), w.buffer.ptr.cast(),
-                    logits.ptr.cast(), rows as u32, stream) }
+                unsafe {
+                    if draft {
+                        crate::shared::draft::launch_bf16_head(head, x.ptr.cast(), w.buffer.ptr.cast(),
+                            logits.ptr.cast(), rows, stream)
+                    } else {
+                        head.launch(x.ptr.cast(), w.buffer.ptr.cast(), logits.ptr.cast(), rows as u32, stream)
+                    }
+                }
             }
             MimoHead::Fp8 { values, scales } => {
                 let program = self.programs.program(&format!("{}_head_fp8", self.family),

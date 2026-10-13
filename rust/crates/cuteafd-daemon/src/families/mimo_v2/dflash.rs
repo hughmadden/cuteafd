@@ -663,7 +663,7 @@ impl<'a> MimoDrafter<'a> {
         ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
             "DFlash borrowed target head geometry differs from its checkpoint");
         self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
-            head.launch(Some(plan), x, out, rows, self.stream))
+            head.launch_draft(Some(plan), x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).

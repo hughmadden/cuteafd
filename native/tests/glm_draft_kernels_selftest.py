@@ -209,6 +209,7 @@ def head_check(lib, args):
         epsilons = (ref.abs().amax(dim=1) * 1e-5).cpu().tolist()
         failures = []
         rank_counts = {}
+        rank_results = {}
         for name in out:
             err = (out[name][:reference_rows].double() - ref).abs().amax().item() / scale
             print(f"head: {name} max |error| / max |logit| over {reference_rows} rows: {err:.2e}")
@@ -220,27 +221,33 @@ def head_check(lib, args):
             oracle_rows = ref.gather(1, indices).cpu().tolist()
             counts = {key: 0 for key in ("top1", "set", "order", "bad_top1", "bad_set", "bad_order")}
             details = []
+            results = []
             for row, (expected, actual, scores) in enumerate(zip(
                     expected_rows, candidate_rows, oracle_rows)):
                 ids = expected + actual
                 oracle = dict(zip(ids, scores))
                 result = head_rank_mismatches(expected, actual, oracle, epsilons[row])
+                results.append(result)
                 for key, value in result.items():
                     counts[key] += value
                 if result["order"] and len(details) < 8:
                     source, offset, _ = next(batch for batch in batches if batch[1] <= row < batch[1] + batch[2])
-                    changed = [(a, b, abs(oracle[a] - oracle[b]) / epsilons[row])
+                    changed = [(a, b, oracle[a], oracle[b], abs(oracle[a] - oracle[b]) / epsilons[row],
+                                out[name][row, a].item(), out[name][row, b].item())
                                for a, b in zip(expected, actual) if a != b]
                     details.append((source, row - offset, changed, result))
             rank_counts[name] = counts
+            rank_results[name] = results
             print(f"head: {name} FP64 rank mismatches over {reference_rows} rows: {counts}; "
                   "epsilon=1e-5 * row max |FP64 logit|")
             for detail in details:
                 print(f"head: {name} mismatch source,row,(expected,actual,gap/epsilon),counts: {detail}")
-        for name, counts in rank_counts.items():
-            for key in ("bad_top1", "bad_set", "bad_order"):
-                if counts[key] > rank_counts["pedantic"][key] or rank_counts["pedantic"][key]:
-                    failures.append((name, key, counts[key], "pedantic", rank_counts["pedantic"][key]))
+        for name, results in rank_results.items():
+            worse = [row for row, (actual, baseline) in enumerate(zip(results, rank_results["pedantic"]))
+                     if any(actual[key] > baseline[key] for key in ("bad_top1", "bad_set", "bad_order"))]
+            print(f"head: {name} rows worse than pedantic under FP64 tie rule: {len(worse)}")
+            if worse:
+                failures.append((name, "rows worse than pedantic", worse[:16]))
         baseline = top16(out["pedantic"])
         for name in ("tensor", "few"):
             candidate = top16(out[name])
