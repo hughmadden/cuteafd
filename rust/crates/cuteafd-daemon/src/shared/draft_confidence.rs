@@ -2,7 +2,6 @@
 use super::draft_policy::{Calibration, DraftHistory};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::Path;
 
 pub(crate) const FEATURE_ORDER: [&str; 6] = ["history_logit", "log1p_margin", "candidate_probability_logit",
@@ -110,7 +109,7 @@ pub(crate) struct ConfidencePolicy {
     selector: Option<SelectorFit>,
     online: Calibration,
     enabled: bool,
-    trace: Option<std::io::BufWriter<std::fs::File>>,
+    trace: Option<super::speculation_trace::Trace>,
 }
 
 impl ConfidencePolicy {
@@ -133,9 +132,7 @@ impl ConfidencePolicy {
     }
 
     fn new(key: String, selector: Option<SelectorFit>) -> Result<Self> {
-        let trace = super::draft_policy::speculation_trace_path("CUTEAFD_DRAFT_CONFIDENCE_TRACE")
-            .map(|(_, path)| std::fs::OpenOptions::new().create(true).append(true).open(path)
-                .map(std::io::BufWriter::new)).transpose()?;
+        let trace = super::speculation_trace::Trace::open("CUTEAFD_DRAFT_CONFIDENCE_TRACE")?;
         let enabled = super::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
         // Enabled selector loading already logs the selected key or fallback once.
         if !enabled || selector.is_none() {
@@ -167,7 +164,7 @@ impl ConfidencePolicy {
                 "history": history.conditional(selector.len()), "features": selector, "prior": prior,
                 "proposed": proposed, "accepted": accepted, "observed": observed,
                 "online": self.online.fitted()});
-            if let Err(error) = writeln!(trace, "{record}").and_then(|_| trace.flush()) {
+            if let Err(error) = trace.write(&record) {
                 tracing::warn!(%error, "draft confidence trace failed");
             }
         }

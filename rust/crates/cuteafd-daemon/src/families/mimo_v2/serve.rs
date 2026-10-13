@@ -511,9 +511,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         Some(policy)
     } else { None };
 
-    let mut trace = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_MIMO_TRACE")
-        .map(|(var, path)| std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .with_context(|| format!("{var} {path}"))).transpose()?.map(std::io::BufWriter::new);
+    let mut trace = crate::shared::speculation_trace::Trace::open("CUTEAFD_MIMO_TRACE")?;
     let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
@@ -1186,7 +1184,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             resource::publish(shared, shared.stats().rounds, 0, None);
         }
         if let Some(trace) = trace.as_mut() {
-            use std::io::Write;
             let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
                 "draft_width": drafted_width, "drafted_requests": drafted_requests,
                 "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
@@ -1201,7 +1198,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
                 "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
                 "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
-            if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
+            if let Err(error) = trace.write(&line) {
                 tracing::warn!(%error, "MiMo speculation trace write failed");
             }
         }

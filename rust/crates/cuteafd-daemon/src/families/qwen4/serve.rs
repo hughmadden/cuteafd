@@ -392,19 +392,15 @@ struct Prefill<'a> {
 }
 
 /// Per-cycle step costs for policy work (`CUTEAFD_SPECULATION_TRACE=path`, JSON lines).
-struct Trace(std::io::BufWriter<std::fs::File>);
+struct Trace(crate::shared::speculation_trace::Trace);
 
 impl Trace {
     fn open() -> Result<Option<Self>> {
-        let Some((var, path)) = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_QWEN4_TRACE") else { return Ok(None) };
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .with_context(|| format!("{var} {path}"))?;
-        Ok(Some(Self(std::io::BufWriter::new(file))))
+        Ok(crate::shared::speculation_trace::Trace::open("CUTEAFD_QWEN4_TRACE")?.map(Self))
     }
 
     fn cycle(&mut self, line: serde_json::Value) {
-        use std::io::Write;
-        if let Err(error) = writeln!(self.0, "{line}").and_then(|_| self.0.flush()) {
+        if let Err(error) = self.0.write(&line) {
             tracing::warn!("trace: {error:#}");
         }
     }

@@ -143,12 +143,11 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
 /// Opt-in complete observation capture, including dSpark head evidence. The
 /// selector-only ConfidencePolicy trace does not cover that serving path.
 fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
-    use std::sync::{Mutex, OnceLock};
-    static TRACE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+    use std::sync::OnceLock;
+    static TRACE: OnceLock<Option<crate::shared::speculation_trace::Trace>> = OnceLock::new();
     let Some(trace) = TRACE.get_or_init(|| {
-        let (_, path) = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_DRAFT_CONFIDENCE_TRACE")?;
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => Some(Mutex::new(std::io::BufWriter::new(file))),
+        match crate::shared::speculation_trace::Trace::open("CUTEAFD_DRAFT_CONFIDENCE_TRACE") {
+            Ok(trace) => trace,
             Err(error) => { tracing::warn!(%error, "draft round trace open failed"); None }
         }
     }) else { return };
@@ -158,17 +157,9 @@ fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
         return;
     }
     let value = round_trace_value(policy, record);
-    if let Ok(mut trace) = trace.lock() {
-        if let Err(error) = write_round_trace(&mut *trace, &value) {
-            tracing::warn!(%error, "draft round trace failed");
-        }
+    if let Err(error) = trace.write(&value) {
+        tracing::warn!(%error, "draft round trace failed");
     }
-}
-
-fn write_round_trace(writer: &mut impl std::io::Write, value: &serde_json::Value) -> std::io::Result<()> {
-    writeln!(writer, "{value}")?;
-    // Static writers are not dropped at process exit; retain every completed round.
-    writer.flush()
 }
 
 fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_json::Value {
@@ -471,31 +462,6 @@ mod tests {
         assert_eq!(value["bucket"], 0);
         assert_eq!(value["selected"], serde_json::json!({"bucket": 0, "shared": false}));
         assert_eq!(value["length_rule"], "priced");
-    }
-
-    #[test]
-    fn round_trace_flushes_each_completed_record() {
-        struct Writer { bytes: Vec<u8>, flushed: bool }
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.bytes.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { self.flushed = true; Ok(()) }
-        }
-        let mut writer = Writer { bytes: Vec::new(), flushed: false };
-        let value = serde_json::json!({"type": "draft_round"});
-        write_round_trace(&mut writer, &value).unwrap();
-        assert!(writer.flushed);
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(), value);
-        struct BrokenFlush;
-        impl std::io::Write for BrokenFlush {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { Ok(bytes.len()) }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "trace sink closed"))
-            }
-        }
-        assert_eq!(write_round_trace(&mut BrokenFlush, &value).unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
