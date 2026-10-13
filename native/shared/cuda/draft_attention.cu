@@ -1,5 +1,6 @@
 #include "draft_attention.cuh"
 #include <cuda_bf16.h>
+#include <math_constants.h>
 #include <mma.h>
 #include <algorithm>
 #include <limits.h>
