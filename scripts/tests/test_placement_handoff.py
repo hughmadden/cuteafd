@@ -96,6 +96,7 @@ wip_layout=
 wip_slot=
 # Shared launch features (run-family.sh helpers) at their defaults.
 bench_dir="$HOME/.cache/cuteafd/bench"
+fidelity_cache="$HOME/.cache/cuteafd/fidelity"
 api_args=() api_mount_args=() probe_args=() trace_args=() bench_nonce_env_args=() graph_census_args=()
 profile_args=() profile_wrapper=() profile_wrapper_args=()
 shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CUTEAFD_ATTENTION_PLACEMENT=auto -e CUTEAFD_FP8_EXPERT_PREFILL=auto)

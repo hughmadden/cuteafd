@@ -87,7 +87,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # shared_thermal_args also mounts the host power governor's state read-only
         # when gpu-powerd runs on this host (#114).
         governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []
-        assert after["mounts"] == sorted(before["mounts"] + governor), where
+        # The coordinator also shares the host fidelity reference cache with the dashboard.
+        fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/tmp/cuteafd-home/.cache/cuteafd/fidelity"] \
+            if role == "coordinator" else []
+        assert after["mounts"] == sorted(before["mounts"] + governor + fidelity), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}
         assert added == INTENDED[role], where
