@@ -60,21 +60,11 @@ fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, devices
     let selected = options.qwen_representation;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64,
         mtp.then_some(options.native_mtp_layers), options.qwen_attention_plan_rows)?;
-    let mut selected_manifest = manifest.cloned();
-    if let Some(manifest) = &mut selected_manifest {
-        let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-            "sm_120", options.rtx_bytes[0]).sms);
-        cuteafd_core::coordinator_programs::select_card_plans(manifest, sms)?;
-        let programs = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
-        for entry in manifest["programs"].as_array_mut().into_iter().flatten() {
-            if entry["name"].as_str().is_some_and(|name| programs.contains(name)) {
-                if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(&entry["geometry"], plan)? {
-                    entry["scratch_bytes_at_capacity"]["scratch"] = bytes.into();
-                }
-            }
-        }
-    }
-    let manifest = selected_manifest.as_ref();
+    let sms = [0, 1].map(|rank| options.physical_sms.unwrap_or_else(||
+        crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[rank]).sms));
+    let selected_manifests = manifest.map(|m| qwen4::dual_program_manifests(m, sms, plan)).transpose()?;
+    let owner_manifests = [0, 1].map(|rank| selected_manifests.as_ref().map(|m| &m[rank]));
+    let manifest = owner_manifests[0];
     let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, selected)?;
     let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
     let costs = qwen4::dual_expert_costs(&catalog, cfg.layers)?;
@@ -86,6 +76,8 @@ fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, devices
     fixed.extend(qwen4::dual_projection_load_staging(&cfg, cfg.layers, mtp, selected));
     fixed.extend(qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
         catalog.exl3().is_some())?.demands()?);
+    fixed.extend(qwen4::dual_peer_diagnostics(
+        std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));
     if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, rows)?); }
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
@@ -95,6 +87,7 @@ fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, devices
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
     let inputs = qwen4::QwenDualInputs {
+        owner_manifests,
         admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,

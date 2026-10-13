@@ -379,8 +379,35 @@ pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
 /// stays single-owner until safety and numerical gates enable this caller.
+/// Match each owner's loaded program recipe, including its attention reduction plan.
+pub fn dual_program_manifests(manifest: &serde_json::Value, sms: [u32; 2],
+    plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<[serde_json::Value; 2]> {
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
+    let mut manifests = [manifest.clone(), manifest.clone()];
+    for (owner, manifest) in manifests.iter_mut().enumerate() {
+        cuteafd_core::coordinator_programs::select_card_plans(manifest, sms[owner])?;
+        for entry in manifest["programs"].as_array_mut().into_iter().flatten() {
+            if entry["name"].as_str().is_some_and(|name| selected.contains(name)) {
+                if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(&entry["geometry"], plan)? {
+                    entry["scratch_bytes_at_capacity"]["scratch"] = bytes.into();
+                }
+            }
+        }
+    }
+    Ok(manifests)
+}
+
+/// PeerExchange has two receive slots plus its control slot; progress is 48
+/// bytes per slot, with the allocator's 256-byte minimum on each owner.
+pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
+    if !enabled { return Vec::new(); }
+    [0, 1].map(|gpu| Demand::new(gpu, Category::Workspace,
+        "expert peer diagnostics", 256, Basis::Exact)).to_vec()
+}
+
 pub struct QwenDualInputs<'a> {
     pub admission: QwenAdmissionInputs<'a>,
+    pub owner_manifests: [Option<&'a serde_json::Value>; 2],
     pub gpus: [GpuBudget; 2],
     pub layer_weights: &'a [u64],
     pub layer_experts: &'a [Option<ExpertCost>],
@@ -440,8 +467,12 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     // Preserve single-owner per-token rounding; do not hide rounded table bytes.
     for bytes in &mut overhead { *bytes = bytes.div_ceil(QWEN_UNIT_ROWS as u64) * QWEN_UNIT_ROWS as u64; }
     let mut fixed = inputs.fixed.clone();
-    let admitted = qwen_admission(a)?;
     for gpu in 0..2 {
+        let owner = QwenAdmissionInputs { cfg: a.cfg, layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
+            manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
+            slots: a.slots, mark_bytes: a.mark_bytes, full_prefill_logits: a.full_prefill_logits,
+            ple: a.ple, future_expert_bytes: a.future_expert_bytes, headroom: a.headroom };
+        let admitted = qwen_admission(&owner)?;
         fixed.extend(admitted.items.iter().filter(|(_, group, _)| matches!(*group, "decode step" | "prefill step"))
             .map(|&(category, group, bytes)| Demand::new(gpu as u8, category, group, bytes, Basis::Formula)));
         fixed.push(Demand::new(gpu as u8, Category::Kv, "owner commit tables", 3 * 64 * 4, Basis::Formula));
@@ -759,6 +790,31 @@ mod tests {
     }
 
     #[test]
+    fn dual_card_scratch_selects_each_owner_and_diagnostics_are_opt_in() {
+        let manifest = serde_json::json!({"programs": [{"name": "qwen4_sparse_gqa_kv_fp8_m64",
+            "card_plans": [
+                {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 8192}, "geometry": {}},
+                {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 1024}, "geometry": {}}
+            ]}]});
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
+        for sms in [[170, 188], [188, 170]] {
+            let owners = dual_program_manifests(&manifest, sms, plan).unwrap();
+            for rank in 0..2 {
+                assert_eq!(crate::serving_capacity::qwen_graphs::qwen_step_scratch(
+                    &owners[rank], true, false, Qwen4KvCache::Fp8).0,
+                    if sms[rank] == 170 { 8192 } else { 1024 });
+            }
+        }
+        assert!(dual_peer_diagnostics(false).is_empty());
+        let demands = dual_peer_diagnostics(true);
+        assert_eq!(demands.len(), 2);
+        for (rank, demand) in demands.iter().enumerate() {
+            assert_eq!(demand.gpu as usize, rank);
+            assert_eq!(demand.bytes, 256);
+        }
+    }
+
+    #[test]
     fn planner_equals_runtime_qwen4_dual_contract() {
         use crate::serving_capacity::qwen_graphs::qwen_cache_geometry_placed;
         let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
@@ -780,7 +836,15 @@ mod tests {
                 crate::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head: false });
             let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
             fixed.extend(transport.iter().chain(&staging).cloned());
+            let manifest = serde_json::json!({"programs": [{"name": "qwen4_sparse_gqa_kv_fp8_m64",
+                "card_plans": [
+                    {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 8192}, "geometry": {}},
+                    {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 1024}, "geometry": {}}
+                ]}]});
+            let manifests = dual_program_manifests(&manifest, [170, 188],
+                cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap()).unwrap();
             let inputs = |measured| QwenDualInputs {
+                owner_manifests: manifests.each_ref().map(Some),
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
@@ -797,6 +861,15 @@ mod tests {
             let measured = dual_placement(&inputs(true)).unwrap();
             assert_eq!(planned, measured);
             assert_eq!(planned.pool_tokens, 2 << 20);
+            let decode = |rank: usize| planned.items[rank].iter().find(|item| item.group == "decode step").unwrap().bytes;
+            assert_eq!(decode(0) - decode(1), if kv_format == Qwen4KvCache::Fp8 { 8192 - 1024 } else { 0 });
+            for enabled in [false, true] {
+                let mut diagnostic = inputs(false);
+                diagnostic.fixed.extend(dual_peer_diagnostics(enabled));
+                let request = dual_request(&diagnostic, [0; 2]).unwrap();
+                assert_eq!(request.fixed.iter().filter(|d| d.group == "expert peer diagnostics").count(),
+                    if enabled { 2 } else { 0 });
+            }
             for demand in transport.iter().chain(&staging) {
                 assert!(planned.items[usize::from(demand.gpu)].iter().any(|item|
                     item.group == demand.group && item.category == demand.category && item.bytes == demand.bytes));

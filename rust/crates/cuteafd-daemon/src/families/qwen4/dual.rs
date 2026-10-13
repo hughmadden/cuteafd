@@ -39,28 +39,24 @@ impl Opened {
                 }
                 Ok(())
             })?;
-        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-        let sms = devices[0].run(|| self.library.sm_count())?;
-        cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, u32::try_from(sms)?)?;
-        for entry in manifest["programs"].as_array_mut().into_iter().flatten() {
-            if entry["name"].as_str().is_some_and(|name| selected.contains(name)) {
-                if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(&entry["geometry"], plan)? {
-                    entry["scratch_bytes_at_capacity"]["scratch"] = bytes.into();
-                }
-            }
-        }
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+        let sms = [devices[0].run(|| self.library.sm_count())?, devices[1].run(|| self.library.sm_count())?];
+        let manifests = qwen4::dual_program_manifests(&manifest,
+            [u32::try_from(sms[0])?, u32::try_from(sms[1])?], plan)?;
         let catalog = self.experts.as_ref().context("Qwen TP2 needs the selected expert catalog")?;
         let experts = admission::dual_experts(args, catalog, layers)?;
         let weights = admission::dual_weights(args, &self.checkpoint, &self.cfg, layers, mtp)?;
         let mut fixed = weights.fixed;
         fixed.extend(experts.transport);
+        fixed.extend(qwen4::dual_peer_diagnostics(
+            std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));
         let draft = if mtp { qwen4::dual_draft_demands(catalog, &args.native_lib, args.prefill_rows as u64)? }
             else { Vec::new() };
         let draft_budget = usize::try_from(draft.iter().map(|d| d.bytes).sum::<u64>())?;
         fixed.extend(draft);
         let ple_info = self.checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
             .map(|t| (weights.resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
-        let inputs = admission::inputs(args, &self.cfg, layers, mtp, Some(&manifest), ple_info, 0)?;
+        let inputs = admission::inputs(args, &self.cfg, layers, mtp, Some(&manifests[0]), ple_info, 0)?;
         let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&self.cfg, layers, mtp, args.kv_format)?;
         let mark_bytes = geometry.ranks[0].retained_mark_bytes;
         ensure!(mark_bytes > 0 && inputs.mark_bytes % mark_bytes == 0, "Qwen prefix reservation must name complete marks");
@@ -78,6 +74,7 @@ impl Opened {
         let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
         let placement = qwen4::dual_placement(&qwen4::QwenDualInputs {
+            owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,
                 baseline: baselines[rank].1, headroom_bytes: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) }),

@@ -237,6 +237,7 @@ mod tests {
         for capacity in [96u64 << 30, 192u64 << 30] {
             for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
                 let mut inputs = qwen4::QwenDualInputs {
+                    owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
                         slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -402,6 +403,15 @@ mod tests {
                 "attention_plan_capacity_rows": 64, "attention_plan_scratch": [
                     {"rows_cap": 1, "scratch": 4096}, {"rows_cap": 8, "scratch": 2048},
                     {"rows_cap": 64, "scratch": 1024}]}}]});
+        let mut manifest = manifest;
+        let recipe = manifest["programs"][0].clone();
+        manifest["programs"][0]["card_plans"] = serde_json::json!([
+            {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 16384},
+                "geometry": {"attention_plan_capacity_rows": 64, "attention_plan_scratch": [
+                    {"rows_cap": 1, "scratch": 8192}, {"rows_cap": 8, "scratch": 4096},
+                    {"rows_cap": 64, "scratch": 2048}]}},
+            {"sm_count": 188, "scratch_bytes_at_capacity": recipe["scratch_bytes_at_capacity"],
+                "geometry": recipe["geometry"]}]);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         let lib = dir.path().join("lib/libcuteafd_native.so");
         let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
@@ -439,18 +449,17 @@ mod tests {
         for (host, fp8_projections, fp8_head, attention_rows) in [(false, false, true, None),
             (true, false, true, None), (false, true, true, None), (false, false, false, None),
             (false, false, true, Some(64))] {
+            for capacities in [[101_973_491_712; 2], [32 << 30, 101_973_491_712], [101_973_491_712, 32 << 30]] {
             args.attention_plan_rows = attention_rows;
-            let mut runtime_manifest = manifest.clone();
             let reduction = super::super::attention_plan(&args, mtp)?;
-            let scratch = cuteafd_core::coordinator_programs::attention_plan_scratch(
-                &runtime_manifest["programs"][0]["geometry"], reduction)?.unwrap();
-            runtime_manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"] = scratch.into();
+            let manifests = qwen4::dual_program_manifests(&manifest,
+                capacities.map(|bytes| cuteafd_loader::placement::ArchContext::for_device("sm_120", bytes).sms), reduction)?;
             args.fp8_decode = fp8_projections;
             args.mtp_fp8_head = fp8_head;
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
-                layout: Some(LayoutOptions { rtx_bytes: vec![101_973_491_712; 2], head_split: true, onboard: Some(Onboard::Fraction(1.0)),
+                layout: Some(LayoutOptions { rtx_bytes: capacities.to_vec(), head_split: true, onboard: Some(Onboard::Fraction(1.0)),
                     context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
@@ -463,10 +472,10 @@ mod tests {
             let mut fixed = weights.fixed;
             fixed.extend(experts.transport);
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, 16)?); }
-            let admission = super::inputs(&args, &cfg, 4, mtp, Some(&runtime_manifest), None, 0)?;
-            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { admission,
-                gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: 101_973_491_712,
-                    headroom_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: 101_973_491_712
+            let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
+            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { owner_manifests: manifests.each_ref().map(Some), admission,
+                gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
+                    headroom_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
                 layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
@@ -482,6 +491,7 @@ mod tests {
                     .cloned().collect::<Vec<_>>();
                 assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
             }
+        }
         }
         std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
         assert!(super::dual_experts(&args, &catalog, 4).is_err());
