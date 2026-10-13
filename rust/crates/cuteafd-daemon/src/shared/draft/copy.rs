@@ -18,6 +18,13 @@ pub(crate) struct Continuation {
     pub neural: usize,
 }
 
+impl Continuation {
+    /// Whether the verified proposal reaches the history-backed tail.
+    pub(crate) fn uses_copy(&self, verified_drafts: usize) -> bool {
+        verified_drafts.min(self.tokens.len()) > self.neural
+    }
+}
+
 pub(crate) fn continuation(history: &[u32], drafted: &[u32], calibrated: &[f64], room: usize,
     greedy: bool) -> Option<Continuation> {
     if !greedy || drafted.len() < MIN_DRAFT_AGREEMENT || calibrated.len() != drafted.len() { return None; }
@@ -57,6 +64,19 @@ fn window(history: &[u32], limit: usize) -> (Option<usize>, usize, &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_neural_prefix_does_not_count_as_a_copy_round() {
+        let copy = Continuation { tokens: vec![20, 21, 22, 50, 51], neural: 3 };
+        for verified in 0..=3 {
+            assert!(!copy.uses_copy(verified));
+        }
+        for verified in [4, 5, 64] {
+            assert!(copy.uses_copy(verified));
+        }
+        let neural_only = Continuation { tokens: vec![20, 21, 22], neural: 3 };
+        assert!(!neural_only.uses_copy(64));
+    }
 
     fn history(copy: &[u32], suffix: usize) -> Vec<u32> {
         let tail: Vec<_> = (1..=suffix as u32).collect();
