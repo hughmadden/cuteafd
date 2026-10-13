@@ -544,8 +544,10 @@ fi
 # the family variables, which are set too for one release.
 trace_args=()
 # Experimental shared policy changes stay off until emitted-throughput gates pass.
-for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE; do
-  if [[ $family == glm5 && -n "$(get "$policy_key")" ]]; then
+for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE DRAFT_SURVIVAL_LENGTHS; do
+  # DRAFT_SURVIVAL_LENGTHS (every shared-policy family, GLM 5.3 included):
+  # verify drafts while calibrated survival >= 0.5 instead of pricing rows.
+  if [[ $family == glm5 && $policy_key != DRAFT_SURVIVAL_LENGTHS && -n "$(get "$policy_key")" ]]; then
     echo "$policy_key was removed for GLM 5.3: it always runs the shared draft policy; delete the key" >&2
     exit 2
   fi

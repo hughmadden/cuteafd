@@ -388,7 +388,8 @@ impl SharedPolicy {
             local = classes.iter().filter(|c| **c == "local").count(), remote = classes.iter().filter(|c| **c == "remote").count(),
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
             "GLM Flash shared draft policy geometry");
-        let policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
+        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
+        crate::shared::draft::apply_length_rule(&mut policy);
         engine.arm_draft_probe(engine.decode_rows)?;
         let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
         let trace = crate::shared::draft_policy::enabled("CUTEAFD_GLMF_DRAFT_TRACE");

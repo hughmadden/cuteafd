@@ -167,7 +167,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
         geometry.max_positions = self.draft_width + crate::shared::draft::copy::COPY_EXTENSION;
         let seed = cuteafd_core::PolicySeed::weak(self.draft_width);
-        let policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
+        let mut policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
+        crate::shared::draft::apply_length_rule(&mut policy);
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
         Ok(())
