@@ -557,8 +557,10 @@ release_profile_docker_args() {
 # worker asked to wrap fails closed (Spark workers still get the environment
 # switches from release_profile_docker_args). Call after that helper, which has
 # validated PROFILE and PROFILE_DIR.
-# PROFILE_NSYS_GPU_METRICS (a GPU index list such as 0 or 0,1) adds nsys GPU
-# metrics sampling (clocks, power, DRAM and SM activity) for those devices.
+# PROFILE_NSYS_GPU_METRICS adds nsys GPU metrics sampling (clocks, power, DRAM
+# and SM activity): `all` samples every GPU the container sees (use this), or an
+# index list in nsys's own device order, which is not CUDA's or nvidia-smi's
+# (`nsys profile --gpu-metrics-devices=help` lists it).
 # Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS.
 release_profile_wrapper() {
   local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}"
@@ -584,7 +586,8 @@ release_profile_wrapper() {
       --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
       "--output=$dir/nsys-$host" --force-overwrite=true)
     if [[ -n "$metrics" ]]; then
-      [[ "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] || release_die "PROFILE_NSYS_GPU_METRICS must be a GPU index list (e.g. 0 or 0,1)"
+      [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+        release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
       RELEASE_PROFILE_WRAPPER+=("--gpu-metrics-devices=$metrics")
     fi
     return 0

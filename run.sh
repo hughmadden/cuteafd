@@ -358,7 +358,8 @@ fi
 # Select and admit the count before touching any serving container or Spark.
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
-count_mounts=(-v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
+# HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
+count_mounts=(-e HF_HOME=/hf -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)

@@ -1070,7 +1070,8 @@ audio_encoder_hash=""
       plan_draft_args+=("$flag" "$value")
     fi
   done
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
+  # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
     "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -1407,8 +1408,9 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 #                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
-#                     PROFILE_NSYS_GPU_METRICS=0 (or 0,1) also samples those GPUs'
-#                     clocks, power and DRAM/SM activity into the same report.
+#                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
+#                     power and DRAM/SM activity into the same report (an index
+#                     list uses nsys's device order, not CUDA's).
 #   ncu               the coordinator runs under `ncu`, replaying the first
 #                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
 #                     required regex PROFILE_NCU_KERNEL, collecting section set
