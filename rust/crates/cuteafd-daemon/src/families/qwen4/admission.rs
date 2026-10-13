@@ -421,7 +421,8 @@ mod tests {
                 let path = packages[rank].join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false}}});
                 std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&m)?)?;
@@ -429,11 +430,12 @@ mod tests {
         }
         if mtp {
             let draft_package = packages[0].parent().unwrap().join("rtx-tp1");
-            for capacity in [1, 16] {
+            for capacity in [1, 16, 80] {
                 let path = draft_package.join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": 640, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "trellis_lut": {"bytes": 32},
+                    "top_k": 10, "capacity": capacity, "tile": [64, 128, 64, 128],
+                    "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * 640,
                         "dtype": "f16", "zero_on_create": false}}});
                 std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&m)?)?;
