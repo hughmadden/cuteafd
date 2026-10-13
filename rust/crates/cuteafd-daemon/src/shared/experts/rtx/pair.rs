@@ -100,14 +100,33 @@ impl<S: FnOnce() -> Result<()>> Drop for SubmissionGuard<S> {
     }
 }
 
+/// Unforgeable, borrowed proof that a whole-submission teardown guard is live.
+/// Executors cannot construct or retain it beyond the guarded body.
+pub(crate) struct SubmissionScope<'a> {
+    _guard: std::marker::PhantomData<&'a ()>,
+}
+impl<S: FnOnce() -> Result<()>> SubmissionGuard<S> {
+    fn scope(&self) -> SubmissionScope<'_> {
+        SubmissionScope { _guard: std::marker::PhantomData }
+    }
+}
+
 pub(crate) fn submit<T>(
     require_live: impl FnOnce() -> Result<()>,
     shutdown: impl FnOnce() -> Result<()>,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    submit_scoped(require_live, shutdown, |_| body())
+}
+
+pub(crate) fn submit_scoped<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
+) -> Result<T> {
     require_live()?;
     let mut guard = SubmissionGuard(Some(shutdown));
-    match body() {
+    match body(&guard.scope()) {
         Ok(value) => { guard.0.take(); Ok(value) }
         Err(cause) => {
             let drain = match guard.shutdown() {
