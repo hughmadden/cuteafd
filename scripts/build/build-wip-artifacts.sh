@@ -122,6 +122,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_dir"
 # kache restores hardlinks; plain and cached Cargo must not share outputs.
 export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
+# Host CPU targets (scripts/build/host-isa.sh): a WIP slot builds only the ISA
+# its host runs (GB10 on a Spark, x86-64-v4 on an AVX-512 coordinator);
+# CUTEAFD_WIP_HOST_ISA overrides (e.g. "x86-64-v2 x86-64-v4" for both). Each ISA
+# builds into $CARGO_TARGET_DIR-<isa>.
+source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+host_isa_text="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")"
+mapfile -t host_isas <<<"$host_isa_text"
+host_isa_cmake="${host_isa_text//$'\n'/;}"
+export CUTEAFD_WIP_HOST_ISA_RESOLVED="${host_isas[*]}"
 [[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
 if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
@@ -164,7 +173,7 @@ else
 fi
 [[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
 [[ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]] || unset CMAKE_BUILD_PARALLEL_LEVEL
-rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"
+rust_phase_marker="$CARGO_TARGET_DIR-${host_isas[0]}/.wip-rust-phase-fingerprint"
 wip_phase_log="$output_dir/BUILD_PHASES.tsv"
 wip_phase_mark() {
   # PHASE SECONDS [DETAIL]: one row per completed phase, read by finalize-wip-slot.sh.
@@ -184,7 +193,7 @@ wip_phase_mark() {
 # ~/.cache/cuteafd/native-store/<arch>, by hardlink, so instances share them.
 native_store_root="${CUTEAFD_WIP_NATIVE_STORE:-$(dirname "$build_dir")/../cache/native-store}"
 native_store_root="$(realpath -m "$native_store_root")"
-native_items=(libcuteafd_native.so PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)
+native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)
 wip_native_key() {
   {
     printf 'schema 1\nrole %s\narch %s %s\n' "$role" "$cuda_arch" "$(uname -m)"
@@ -209,16 +218,13 @@ if [[ "$phase" == export ]]; then
   :
 elif [[ "$phase" != native ]]; then
   rust_started=$SECONDS
-  cargo build \
-    --locked \
-    --quiet \
-    --manifest-path "$source_dir/rust/Cargo.toml" \
-    -p cuteafd-daemon \
-    --release
-  printf '%s' "$wip_rust_fingerprint" >"$rust_phase_marker"
+  for host_isa in "${host_isas[@]}"; do
+    cuteafd_host_isa_cargo_build "$CARGO_TARGET_DIR" "$host_isa" "$source_dir/rust/Cargo.toml" --quiet
+  done
+  printf '%s %s' "$wip_rust_fingerprint" "${host_isas[*]}" >"$rust_phase_marker"
   wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]] && echo ' fallback')"
 else
-  [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd" ]] ||
+  [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint ${host_isas[*]}" && -x "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")" ]] ||
     { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }
 fi
 
@@ -304,6 +310,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
+  -DCUTEAFD_HOST_ISA="${host_isa_cmake:-}" \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
   -DCUTEAFD_SPARKINFER_LOCK_FILE="$source_dir/third_party/sparkinfer.lock.json" \
   -DCUTEAFD_ENABLE_NCCL=OFF \
@@ -320,6 +327,10 @@ done
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
+mkdir -p "$output_dir/lib-variants"
+for host_isa in "${host_isas[@]:1}"; do
+  install -D -m 0755 "$build_dir/native/$host_isa/libcuteafd_native.so" "$output_dir/lib-variants/$host_isa/libcuteafd_native.so"
+done
 # The coordinator program manifest (DeepSeek V4, GLM, GLM Flash, MiMo, Qwen; an empty table
 # when none was built), as the release images carry it at /opt/cuteafd/share/PROGRAMS.json:
 # run-family.sh --wip serves those families from it.
@@ -402,7 +413,12 @@ else
 fi
 fi
 if [[ "${phase:-all}" != export ]]; then
-install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
+install -m 0755 "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")" "$output_dir/cuteafd"
+rm -rf "$output_dir/bin-variants"
+mkdir -p "$output_dir/bin-variants"
+for host_isa in "${host_isas[@]:1}"; do
+  install -D -m 0755 "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "$host_isa")" "$output_dir/bin-variants/$host_isa/cuteafd"
+done
 fi
 if [[ "${phase:-all}" == export ]]; then
   :
@@ -447,6 +463,7 @@ fi
 [[ "${phase:-all}" != export ]] || exit 0
 (
   cd "$output_dir"
-  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS
+  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json \
+    $(find bin-variants lib-variants -type f | LC_ALL=C sort) >ARTIFACT_SHA256SUMS
   sha256sum -c ARTIFACT_SHA256SUMS
 )

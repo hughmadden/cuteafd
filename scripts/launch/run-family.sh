@@ -95,6 +95,14 @@ bond_balance="$(get RDMA_BOND_BALANCE off)"
 case "$bond_balance" in off|labels|probe) ;; *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;; esac
 bond_args=()
 [[ "$bond_balance" == off ]] || bond_args=(-e "CUTEAFD_RDMA_BOND_BALANCE=$bond_balance")
+# HOST_ISA (auto, x86-64-v2 or x86-64-v4): the coordinator daemon's host CPU build;
+# auto picks x86-64-v4 on AVX-512 hosts (rust/crates/cuteafd-ffi/src/host_isa.rs).
+host_isa="$(get HOST_ISA auto)"
+case "$host_isa" in
+  auto) ;;
+  x86-64-v2|x86-64-v4) bond_args+=(-e "CUTEAFD_HOST_ISA=$host_isa") ;;
+  *) release_die "HOST_ISA must be auto, x86-64-v2 or x86-64-v4" ;;
+esac
 # ---------------------------------------------------------------------------
 # Launch features every family shares. Each sets arrays the coordinator (and
 # workers) `docker run` expand; DeepSeek V4.1's section calls the same ones.
@@ -622,6 +630,8 @@ if [[ "$wip_slot" != __none__ ]]; then
   mkdir -p "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
   mv "$layout.tmp/raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
+  if [[ -d "$layout.tmp/raw/bin-variants" ]]; then cp -a "$layout.tmp/raw/bin-variants/." "$layout.tmp/bin/"; rm -rf "$layout.tmp/raw/bin-variants"; fi
+  if [[ -d "$layout.tmp/raw/lib-variants" ]]; then cp -a "$layout.tmp/raw/lib-variants/." "$layout.tmp/lib/"; rm -rf "$layout.tmp/raw/lib-variants"; fi
   [[ ! -d "$layout.tmp/raw/exl3" ]] || mv "$layout.tmp/raw/exl3" "$layout.tmp/lib/exl3"
   mv "$layout.tmp/raw/"* "$layout.tmp/share/"
   mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
@@ -813,7 +823,7 @@ fi
 # Optional RDMA tuning values travel to both roles only when the operator sets
 # them, so a multi-homed six-rank launch can pin the rail without changing any
 # default. Values were format-checked above by release_validate_verbs_device_map.
-rdma_env_args=()
+rdma_env_args=("${bond_args[@]}")
 # Optional V4.1 coordinator switches from the operator's environment, forwarded only when set.
 # (CONSOLE_TEXT and THERMAL are configuration keys, as for every family.)
 for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_TP2_TOKEN_SUMS CUTEAFD_V41_DEVICE CUTEAFD_V41_DEVICE_LANES CUTEAFD_SPARK_WRITE CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_STAGING_FENCE; do

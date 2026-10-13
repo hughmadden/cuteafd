@@ -126,6 +126,10 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharin
 
 COPY .cuteafd-release-image/cuteafd /opt/cuteafd/bin/cuteafd
 COPY .cuteafd-release-image/libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so
+# Host-ISA variants (x86-64-v4 on the coordinator; empty on Sparks): the daemon
+# execs bin/<isa>/cuteafd and loads lib/<isa>/libcuteafd_native.so when the CPU has it.
+COPY .cuteafd-release-image/bin-variants/ /opt/cuteafd/bin/
+COPY .cuteafd-release-image/lib-variants/ /opt/cuteafd/lib/
 COPY .cuteafd-release-image/exl3 /opt/cuteafd/lib/exl3
 COPY .cuteafd-release-image/fp8 /opt/cuteafd/lib/fp8
 COPY .cuteafd-release-image/V41_EXPERT_AOT.json /opt/cuteafd/share/V41_EXPERT_AOT.json

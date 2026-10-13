@@ -96,7 +96,10 @@ def test_cargo_build_and_daemon_install_share_one_target_dir():
     assert 'export CARGO_TARGET_DIR="$cargo_target_dir"' in text, (
         "cargo must build into the selected target directory"
     )
-    assert 'install -m 0755 "$cargo_target_dir/release/cuteafd"' in text, (
+    assert 'cuteafd_host_isa_cargo_build "$cargo_target_dir"' in text, (
+        "every host-ISA daemon must build beneath the selected target directory"
+    )
+    assert 'cuteafd_host_isa_install "$output_dir" "$build_root/native" "$cargo_target_dir"' in text, (
         "the daemon install must read from the same selected target directory"
     )
     assert "$build_root/source/rust/target/release/cuteafd" not in text, (
@@ -201,9 +204,11 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         """
         #!/usr/bin/env bash
         set -euo pipefail
-        mkdir -p "$CARGO_TARGET_DIR/release"
-        printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/cuteafd"
-        chmod +x "$CARGO_TARGET_DIR/release/cuteafd"
+        triple=""
+        while [[ $# -gt 0 ]]; do [[ "$1" == --target ]] && triple="$2/"; shift; done
+        mkdir -p "$CARGO_TARGET_DIR/${triple}release"
+        printf 'daemon\\n' >"$CARGO_TARGET_DIR/${triple}release/cuteafd"
+        chmod +x "$CARGO_TARGET_DIR/${triple}release/cuteafd"
         """,
     )
     _write_stub(
@@ -219,8 +224,9 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
           esac
         done
         [[ -n "$build_dir" ]] || exit 0
-        mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8"
+        mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8" "$build_dir/x86-64-v4"
         printf 'native\\n' >"$build_dir/libcuteafd_native.so"
+        printf 'native v4\\n' >"$build_dir/x86-64-v4/libcuteafd_native.so"
         printf '{}\\n' >"$build_dir/v41_experts/v41_experts.json"
         printf '{}\\n' >"$build_dir/v41_fp8/v41_fp8.json"
         exit 0
@@ -277,11 +283,15 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    # The stub only ever wrote into the relocated target...
-    assert (relocated / "release" / "cuteafd").exists()
-    # ...and the daemon still reached the output, because build and install
+    # The stub only ever wrote into the relocated target, one directory per host ISA...
+    triple = "x86_64-unknown-linux-gnu"
+    assert (relocated.parent / f"{relocated.name}-x86-64-v2" / triple / "release" / "cuteafd").exists()
+    assert (relocated.parent / f"{relocated.name}-x86-64-v4" / triple / "release" / "cuteafd").exists()
+    # ...and the daemons still reached the output, because build and install
     # read the same selected target rather than a hardcoded default.
     assert (output / "cuteafd").read_text() == "daemon\n"
+    assert (output / "bin-variants" / "x86-64-v4" / "cuteafd").read_text() == "daemon\n"
+    assert (output / "lib-variants" / "x86-64-v4" / "libcuteafd_native.so").read_text() == "native v4\n"
     assert not (output / "cargo-target").exists()
 
 

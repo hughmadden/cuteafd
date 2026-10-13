@@ -581,8 +581,8 @@ def test_split_native_phase_requires_matching_rust_source_and_cache_mode():
     text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     assert 'phase="${6:-all}"' in text
     assert '[[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline' in text
-    assert 'rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"' in text
-    assert '"$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd"' in text
+    assert 'rust_phase_marker="$CARGO_TARGET_DIR-${host_isas[0]}/.wip-rust-phase-fingerprint"' in text
+    assert '"$wip_rust_fingerprint ${host_isas[*]}" && -x "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")"' in text
     assert '[[ "$phase" != rust ]] || exit 0' in text
 
 
@@ -606,7 +606,7 @@ def test_native_export_lock_only_after_cargo(tmp_path):
     trace.unlink()
     subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'off'}, check=True)
     assert trace.read_text() == 'export\n'
-    assert text.index('cargo build') < start
+    assert text.index('cuteafd_host_isa_cargo_build ') < start
 
 
 @pytest.mark.parametrize('matched', [False, True])

@@ -314,7 +314,7 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
 
 def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp_path):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    assert script.index('verify-transformers-source.py') < script.index('cargo build')
+    assert script.index('verify-transformers-source.py') < script.index('cuteafd_host_isa_cargo_build ')
     assert script.index('verify-transformers-source.py') > script.index('case "$role" in')
     assert '--print-source-digest' in script
     freeze = (ROOT / 'wip.sh').read_text()

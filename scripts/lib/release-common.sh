@@ -643,7 +643,7 @@ release_known_key() {
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
-    RDMA_BOND_BALANCE) return 0 ;;
+    RDMA_BOND_BALANCE|HOST_ISA) return 0 ;;
     GLM5_FLASH_KDA_STATE) return 0 ;;
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
@@ -1886,6 +1886,9 @@ release_stage_wip_layout() {
     release_die "WIP slot $slot lacks docker/release-entrypoint.sh"
   mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
+  # Host-ISA variants (scripts/build/host-isa.sh): bin/<isa>/cuteafd, lib/<isa>/libcuteafd_native.so.
+  if [[ -d "$raw/bin-variants" ]]; then cp -a "$raw/bin-variants/." "$layout.tmp/bin/"; rm -rf "$raw/bin-variants"; fi
+  if [[ -d "$raw/lib-variants" ]]; then cp -a "$raw/lib-variants/." "$layout.tmp/lib/"; rm -rf "$raw/lib-variants"; fi
   [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
   [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
   mv "$raw/"* "$layout.tmp/share/"

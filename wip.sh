@@ -677,6 +677,13 @@ REMOTE
 # checkout whose key matches a sealed slot elsewhere on these hosts adopts that
 # slot (hardlinks, seal verified, identity resealed) instead of rebuilding.
 # Dirty trees, --from-slot clones and CUTEAFD_WIP_REUSE=off always build.
+# Host CPU targets of the coordinator slot (scripts/build/host-isa.sh): this
+# host's own ISA unless CUTEAFD_WIP_HOST_ISA names a list (base first). The
+# Spark leg always builds its one GB10 target.
+source "$repo_root/scripts/build/host-isa.sh"
+wip_coordinator_host_isa="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")" ||
+  release_die "CUTEAFD_WIP_HOST_ISA: ${CUTEAFD_WIP_HOST_ISA:-}"
+wip_coordinator_host_isa="${wip_coordinator_host_isa//$'\n'/ }"
 wip_build_key=""
 wip_coordinator_key=""
 wip_expert_key=""
@@ -691,6 +698,9 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       git -C "$repo_root" ls-tree -r HEAD | awk '$2 == "commit" {print $3, $4}'
       printf 'config %s\n' "$(sha256sum "$staging_dir/cuteafd.config" | awk '{print $1}')"
       printf 'toolchain %s caches %s\n' "$wip_toolchain_hash" "${CUTEAFD_BUILD_CACHES:-on}"
+      # Host CPU targets: the coordinator slot builds the ISA this host runs, so a
+      # slot built on an AVX-512 host is never adopted by an AVX2-only one.
+      printf 'host-isa coordinator %s spark grace\n' "$wip_coordinator_host_isa"
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
         GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
@@ -1131,6 +1141,7 @@ build_coordinator() {
   local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
     -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" \
+    -e "CUTEAFD_WIP_HOST_ISA=${wip_coordinator_host_isa:-${CUTEAFD_WIP_HOST_ISA:-}}" \
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \

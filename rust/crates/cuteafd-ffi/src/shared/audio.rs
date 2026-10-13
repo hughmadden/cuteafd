@@ -200,7 +200,7 @@ impl NativeAudio {
     pub fn required(path: &Path, spec: &AudioSpec) -> Result<AudioLedger, AudioError> {
         // SAFETY: trusted versioned native ABI, no CUDA context or payload read.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Library::new(crate::host_isa::native_library(path))?;
             let required = library.get::<Required>(b"cuteafd_audio_required")?;
             let mut ledger = AudioLedger::default();
             check(required(spec, &mut ledger))?;
@@ -212,7 +212,7 @@ impl NativeAudio {
         let mut buffer = [0u8; 256];
         // SAFETY: exact backend symbol ABI and bounded caller-owned output.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Library::new(crate::host_isa::native_library(path))?;
             let backend = library.get::<Backend>(b"cuteafd_audio_backend")?;
             check(backend(buffer.as_mut_ptr(), buffer.len() as u64))?;
         }
@@ -267,7 +267,7 @@ impl NativeAudio {
         // SAFETY: checked immutable host extents, exact ABI symbols and library
         // retained until native owner destruction. Native create/upload drain errors.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Library::new(crate::host_isa::native_library(path))?;
             let required = *library.get::<Required>(b"cuteafd_audio_required")?;
             let create = *library.get::<Create>(b"cuteafd_audio_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_audio_upload")?;

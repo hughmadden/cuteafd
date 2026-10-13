@@ -60,9 +60,11 @@ def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:
             #!/usr/bin/env bash
             set -euo pipefail
             printf '%s\\n' "$CARGO_TARGET_DIR" >>{log}
-            mkdir -p "$CARGO_TARGET_DIR/release"
-            printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/cuteafd"
-            chmod +x "$CARGO_TARGET_DIR/release/cuteafd"
+            triple=""
+            while [[ $# -gt 0 ]]; do [[ "$1" == --target ]] && triple="$2/"; shift; done
+            mkdir -p "$CARGO_TARGET_DIR/${{triple}}release"
+            printf 'daemon\\n' >"$CARGO_TARGET_DIR/${{triple}}release/cuteafd"
+            chmod +x "$CARGO_TARGET_DIR/${{triple}}release/cuteafd"
             """,
         "cmake": f"""
             #!/usr/bin/env bash
@@ -76,8 +78,9 @@ def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:
             done
             [[ -n "$build_dir" ]] || exit 0
             printf '%s\\n' "$build_dir" >>{log}
-            mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8"
+            mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8" "$build_dir/x86-64-v4"
             printf 'native\\n' >"$build_dir/libcuteafd_native.so"
+            printf 'native\\n' >"$build_dir/x86-64-v4/libcuteafd_native.so"
             printf '{{}}\\n' >"$build_dir/v41_experts/v41_experts.json"
             printf '{{}}\\n' >"$build_dir/v41_fp8/v41_fp8.json"
             """,

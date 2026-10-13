@@ -92,11 +92,18 @@ mod media_defaults_tests {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Before any thread, tracing or CUDA: exec the AVX-512 build when this host
+    // has AVX-512 and the image carries it (cuteafd_ffi::host_isa).
+    let host_isa = cuteafd_ffi::host_isa::startup()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    tracing::info!("{host_isa}");
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
 
     let parse = |matches: clap::ArgMatches| {
         match Cli::from_arg_matches(&matches) {

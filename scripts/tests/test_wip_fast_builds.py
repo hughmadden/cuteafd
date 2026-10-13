@@ -218,8 +218,8 @@ def test_native_key_covers_every_native_input():
                  'find native python scripts/build', '"$role" "$cuda_arch"'):
         assert part in block, part
     # A hit restores every native output and nothing else; the daemon always comes from Cargo.
-    assert 'native_items=(libcuteafd_native.so PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)' in script
-    assert script.index('cp -a "$native_entry/output/." "$output_dir/"') < script.index('install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd"')
+    assert 'native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)' in script
+    assert script.index('cp -a "$native_entry/output/." "$output_dir/"') < script.index('install -m 0755 "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")"')
 
 
 def test_source_checkout_initializes_only_build_submodules_from_local_stores():
