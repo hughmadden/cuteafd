@@ -1415,11 +1415,11 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     // The GLM programs' scratch of an export (the engine reads the same manifest).
     let programs: Vec<Value> = [("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
-        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720), ("glmf_kda_w8_m64", 10_526_720),
         ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
         ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
         ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
-        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_kda_w8_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
         ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
         ("glmf_ffn_i12288_m4096", 353_894_400)].into_iter()
         .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
@@ -1447,6 +1447,38 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         assert_eq!((steps.bytes, steps.basis), (engine, Basis::Formula),
             "the step workspaces and every lane's intake planes");
     }
+    // A 32 GiB plan must use the selected precision, including state and marks.
+    let planned = |state, fp8, manifest_path: &std::path::Path| {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![32 << 30], drafter_bytes: 256 << 20, context_tokens: 131_072,
+            workspace_manifest: Some(manifest_path.to_path_buf()),
+            glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+                kda_fp8: fp8, ..Default::default() }, glmf_kda_state: state,
+            ..Default::default() }), ..sparks(4) };
+        plan(dir.path(), &options).unwrap().memory_layout.unwrap()
+    };
+    let mut s16 = manifest.clone();
+    for (name, bytes) in [("glmf_kda_s16_m64", 10_526_720), ("glmf_kda_s16_m4096", 782_236_672),
+        ("glmf_kda_s16t_m4096", 782_236_672)] {
+        s16["programs"].as_array_mut().unwrap().push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+    }
+    let s16_path = dir.path().join("S16.json");
+    std::fs::write(&s16_path, s16.to_string()).unwrap();
+    use crate::serving_capacity::GlmfKdaState;
+    let f32 = planned(GlmfKdaState::F32, false, &s16_path);
+    let bf16 = planned(GlmfKdaState::Bf16, false, &s16_path);
+    let tile = planned(GlmfKdaState::Bf16Tile, false, &s16_path);
+    let state_bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
+        .filter(|i| i.category == Category::Kv && i.group != "MLA pools").map(|i| i.bytes).sum::<u64>();
+    assert!(state_bytes(&f32) > state_bytes(&bf16));
+    assert_eq!(state_bytes(&bf16), state_bytes(&tile));
+    assert!(planned(GlmfKdaState::Bf16, true, &s16_path).notes.iter().any(|n| n.contains("W8+S16")));
+    let mut missing = s16.clone();
+    missing["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glmf_kda_w8_m4096");
+    let missing_path = dir.path().join("MISSING-W8.json");
+    std::fs::write(&missing_path, missing.to_string()).unwrap();
+    assert!(planned(GlmfKdaState::F32, true, &missing_path).notes.iter()
+        .any(|n| n.contains("lacks the requested step scratch")));
     // Without a manifest: the one-GPU allowance, never below the default lanes' rows in flight.
     let options = |lanes: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30],
         prefill_lanes: lanes, prefill_rows: rows, workspace_manifest: Some(dir.path().join("absent.json")),
@@ -1641,16 +1673,16 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     config["text_config"]["vocab_size"] = 154_880.into();
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     let base: Vec<(&str, u64)> = vec![("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
-        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720), ("glmf_kda_w8_m64", 10_526_720),
         ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
         ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
         ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
-        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_kda_w8_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
         ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
         ("glmf_ffn_i12288_m4096", 353_894_400)];
     // The offline SM 12.0 export of the 16 wide programs (170 SMs, the sparse MLA at one split).
     let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_304_576),
-        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
+        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_kda_w8_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
         ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
         ("glmf_ffn_i12288_m128", 9_437_184)];
     let write = |name: &str, programs: &[(&str, u64)]| {
@@ -1833,11 +1865,11 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
     let manifest = |small: bool| {
         let prefill = |bytes: u64| if small { 1 << 20 } else { bytes };
         let programs: Vec<Value> = [("glmf_mhc_pre", prefill(26_214_400)), ("glmf_index_producer_m64", 561_152),
-            ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+            ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720), ("glmf_kda_w8_m64", 10_526_720),
             ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
             ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592),
             ("glmf_index_producer_m4096", prefill(35_913_728)), ("glmf_index_topk_prefill_m4096", 558_007_296),
-            ("glmf_mhc_post_pre_m4096", prefill(26_214_400)), ("glmf_kda_m4096", prefill(782_236_672)),
+            ("glmf_mhc_post_pre_m4096", prefill(26_214_400)), ("glmf_kda_m4096", prefill(782_236_672)), ("glmf_kda_w8_m4096", prefill(782_236_672)),
             ("glmf_mla_producer_m4096", prefill(168_296_448)), ("glmf_o_m4096", prefill(203_423_744)),
             ("glmf_sparse_mla_prefill_m4096", prefill(1_048_576)), ("glmf_ffn_i2048_m4096", prefill(67_633_152)),
             ("glmf_ffn_i12288_m4096", prefill(353_894_400))].into_iter()

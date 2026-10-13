@@ -311,6 +311,21 @@ pub(crate) struct PlanArgs {
     /// Qwen head residency for --layout.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub(crate) mtp_fp8_head: bool,
+    /// GLM Flash KDA projection residency (default: launcher's row128).
+    #[arg(long, value_enum, default_value = "row128")]
+    pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
+    /// GLM Flash recurrent state storage for --layout.
+    #[arg(long, value_enum, default_value = "f32")]
+    pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
+    /// GLM Flash shared target/draft head residency (default: launcher's FP8).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) fp8_head: bool,
+    /// GLM Flash BF16 target head arithmetic; FP8 heads use their own program.
+    #[arg(long, value_enum)]
+    pub(crate) target_head: Option<crate::shared::target_head::TargetHead>,
+    /// GLM Flash draft head arithmetic; it borrows the target's resident copy.
+    #[arg(long, value_enum, default_value = "exact")]
+    pub(crate) draft_head: crate::families::glm5::DraftHead,
     /// Qwen immutable attention scratch override.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub(crate) attention_plan_rows: Option<usize>,
