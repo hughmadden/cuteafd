@@ -147,6 +147,82 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
     }).collect()
 }
 
+/// Package selection is checkpoint-native and shared by plan and runtime.
+pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path)
+    -> anyhow::Result<[std::path::PathBuf; 2]> {
+    let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
+    if let Some(exl3) = catalog.exl3() {
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
+        Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
+    } else {
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?;
+        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let rank = |rank| -> anyhow::Result<_> {
+            Ok(root.join(format!("tp2-w{}", tensors.rank_width(2, rank,
+                crate::formats::fp8_experts::Slicing::Blocks(128))?)))
+        };
+        Ok([rank(0)?, rank(1)?])
+    }
+}
+
+/// The separate, full-width MTP expert arena stays on the head owner. Include
+/// every retained TP1 capacity, not the target's half-width workspace.
+pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path,
+    rows: u64) -> anyhow::Result<Vec<Demand>> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(rows > 0, "Qwen MTP workspace needs positive rows");
+    anyhow::ensure!(shape.draft_stages > 0, "Qwen MTP expert headers are missing");
+    let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
+    let (resident, scratch) = if let Some(exl3) = catalog.exl3() {
+        let resident = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1 as u64;
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}/rtx-tp1"));
+        anyhow::ensure!(rows > 0 && rows <= 4096, "Qwen MTP EXL3 capacity exceeds 4096 rows");
+        let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
+            let path = root.join(format!("m{capacity}/v41_exl3.json"));
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            anyhow::ensure!(m["hidden"].as_u64() == Some(shape.hidden as u64)
+                && m["intermediate"].as_u64() == Some(shape.intermediate as u64)
+                && m["experts"].as_u64() == Some(shape.experts as u64)
+                && m["top_k"].as_u64() == Some(shape.topk as u64)
+                && m["capacity"].as_u64() == Some(capacity), "Qwen MTP package geometry: {}", path.display());
+            Ok(m)
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+    } else {
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen MTP format unsupported"))?.for_layer(shape.layers)?;
+        tensors.validate_layer(shape.layers)?;
+        let resident = Fp8Projection::ALL.iter().try_fold(0u64, |total, &projection| {
+            let (weights, _) = tensors.slice_bytes_with(projection, 1, 0, Slicing::Padded)?;
+            let scales = tensors.scale_region_bytes_with(projection, 1, 0, Slicing::Padded)?;
+            Ok::<_, anyhow::Error>(total + weights as u64 * shape.experts as u64 + scales as u64)
+        })?;
+        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let info = &manifest["layouts"]["tp1"];
+        let weights = match tensors.format() {
+            ExpertFormat::Fp8Block128 => info["weights"].as_str() == Some("fp8"),
+            ExpertFormat::Mxfp4 => info["weights"].as_str() == Some("mxfp4"),
+            ExpertFormat::Nvfp4 => matches!(info["weights"].as_str(), Some("nvfp4" | "nvfp4a4")),
+        };
+        anyhow::ensure!(info["tp"].as_u64() == Some(1)
+            && info["hidden"].as_u64() == Some(shape.hidden as u64)
+            && info["intermediate"].as_u64() == Some(shape.intermediate as u64)
+            && info["slice"].as_u64() == Some(shape.intermediate as u64)
+            && info["experts"].as_u64() == Some(shape.experts as u64)
+            && info["top_k"].as_u64() == Some(shape.topk as u64)
+            && info["input"].as_str() == Some("bf16") && weights,
+            "Qwen MTP package must be native full-width BF16-input TP1: {}", root.display());
+        let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", rows)
+            .ok_or_else(|| anyhow::anyhow!("Qwen MTP package has no capacity for {rows} rows"))?.max(256);
+        (resident, scratch)
+    };
+    Ok(vec![Demand::new(0, Category::Experts, "MTP expert weights", resident, Basis::Exact),
+        Demand::new(0, Category::Experts, "MTP expert workspace", scratch, Basis::Formula)])
+}
+
 /// Exact rank-package workspace before CUDA initialization. Packages are
 /// explicitly selected by the caller; unequal ranks may never fall back to a
 /// padded sibling. The runtime also checks its DSO ABI against these totals.
@@ -243,8 +319,8 @@ impl QwenTp2Rows {
             exchange_slot_bytes: align(bytes.max(partial_bytes))? })
     }
 
-    /// Data buffers and existing peer control only. Abort words and independent
-    /// publisher resources are admitted separately by the sealed transport API.
+    /// Persistent buffers of the abortable two-slot expert exchange. Native
+    /// publisher modules and streams belong to the context/module baseline.
     pub fn demands(self) -> anyhow::Result<Vec<Demand>> {
         let receive = self.exchange_slot_bytes.max(256).checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("Qwen TP2 receive extent overflow"))?;
@@ -253,6 +329,7 @@ impl QwenTp2Rows {
             Demand::new(gpu, Category::Transport, "expert receive", receive, Basis::Formula),
             Demand::new(gpu, Category::Transport, "expert reduction", self.reduction_bytes, Basis::Formula),
             Demand::new(gpu, Category::Transport, "expert peer control", 256, Basis::Formula),
+            Demand::new(gpu, Category::Transport, "expert abort word", 256, Basis::Formula),
         ]).collect())
     }
 }
@@ -554,10 +631,10 @@ mod tests {
                 assert_eq!(p.reduction_bytes, rows * 5120);
                 assert_eq!(p.exchange_slot_bytes, align(payload.max(p.partial_bytes)));
                 let demands = p.demands()?;
-                assert_eq!(demands.len(), 8);
+                assert_eq!(demands.len(), 10);
                 for rank in 0..2 {
                     let rank_bytes = demands.iter().filter(|d| d.gpu == rank).map(|d| d.bytes).sum::<u64>();
-                    assert_eq!(rank_bytes, payload + 2 * p.exchange_slot_bytes.max(256) + rows * 5120 + 256);
+                    assert_eq!(rank_bytes, payload + 2 * p.exchange_slot_bytes.max(256) + rows * 5120 + 512);
                 }
             }
         }
@@ -649,6 +726,36 @@ mod tests {
         manifest["layouts"]["tp2-w256"]["input"] = serde_json::json!("wire");
         save(&manifest);
         assert!(dual_expert_workspace(&catalog, paths, 9).is_err());
+
+        config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+        for expert in 0..512 {
+            for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+                tensors.extend(nvfp4(&format!("mtp.layers.0.mlp.experts.{expert}.{projection}"), n, k));
+            }
+        }
+        let draft_dir = tempfile::tempdir().unwrap();
+        write_snapshot(draft_dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(draft_dir.path()).unwrap();
+        let lib = draft_dir.path().join("lib/libcuteafd_native.so");
+        let root = lib.parent().unwrap().join("fp8/fp8-qwen4-nvfp4a4");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("manifest.json");
+        let mut draft_manifest = serde_json::json!({"layouts": {"tp1": package(640, 1000)}});
+        draft_manifest["layouts"]["tp1"]["tp"] = 1.into();
+        let save_draft = |value: &serde_json::Value| std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        save_draft(&draft_manifest);
+        let demand = dual_draft_demands(&catalog, &lib, 9).unwrap();
+        assert_eq!(demand[0].bytes, cost.whole.resident);
+        assert_eq!(demand[1].bytes, 1000);
+        assert!(dual_draft_demands(&catalog, &lib, 0).is_err());
+        assert!(dual_draft_demands(&catalog, &lib, 17).is_err());
+        for (key, invalid) in [("tp", serde_json::json!(2)), ("slice", serde_json::json!(384)),
+            ("input", serde_json::json!("wire")), ("weights", serde_json::json!("fp8"))] {
+            let mut wrong = draft_manifest.clone();
+            wrong["layouts"]["tp1"][key] = invalid;
+            save_draft(&wrong);
+            assert!(dual_draft_demands(&catalog, &lib, 9).is_err(), "invalid {key}");
+        }
     }
 
     #[test]

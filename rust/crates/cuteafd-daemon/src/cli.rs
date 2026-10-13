@@ -305,6 +305,15 @@ pub(crate) struct PlanArgs {
     /// Qwen full-attention KV format for --layout.
     #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
     pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    /// Qwen projection residency for --layout.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) fp8_decode: bool,
+    /// Qwen head residency for --layout.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) mtp_fp8_head: bool,
+    /// Qwen immutable attention scratch override.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
+    pub(crate) attention_plan_rows: Option<usize>,
     /// External drafter GiB on the last GPU for --layout (DFlash).
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,

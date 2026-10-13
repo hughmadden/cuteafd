@@ -849,13 +849,14 @@ impl<'a> QwenTp2<'a> {
                 let partial = cuteafd_ffi::CuteafdDeviceBuffer { ptr: tp2.experts[rank].output(),
                     bytes: layout.partial_bytes, device_id: devices[rank].id, ..Default::default() };
                 library.cuda_zero_bytes(partial, partial.bytes)?;
-                let shared = zero(rank, layout.reduction_bytes)?;
+                // Before waits exist, an admitted receive slot is idle scratch.
+                let shared = tp2.exchange.recv(rank, 0)?;
                 // SAFETY: initialize geometry-generic sum/add on disjoint retained buffers.
                 unsafe {
                     tp2.combine[rank].sum(partial.ptr, partial.ptr, tp2.reduced[rank].buffer.ptr.cast(),
                         max_rows * hidden, dtype, stream)?;
                     library.peer_add_bf16(tp2.reduced[rank].buffer.ptr, tp2.reduced[rank].buffer.ptr,
-                        shared.buffer.ptr, max_rows * hidden, stream)?;
+                        shared, max_rows * hidden, stream)?;
                     library.cuda_stream_synchronize(stream)?;
                 }
                 Ok(())

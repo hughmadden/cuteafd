@@ -344,6 +344,151 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn public_dual_planner_equals_runtime_before_allocation() -> anyhow::Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
+        use cuteafd_loader::plan::layout::LayoutOptions;
+        use cuteafd_loader::placement::{families::qwen4, Baseline, GpuBudget, Onboard};
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] engine: super::super::EngineArgs }
+        for mtp in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (mut tensors, mut metadata) = testing::qwen4_exl3(4, 4);
+        for layer in 0..4 {
+            let prefix = format!("model.language_model.layers.{layer}");
+            let projections = if layer == 3 {
+                vec![("self_attn.q_proj", 12288, 2560), ("self_attn.k_proj", 512, 2560),
+                    ("self_attn.v_proj", 512, 2560), ("self_attn.indexer.index_qk_proj", 640, 2560),
+                    ("self_attn.o_proj", 2560, 6144)]
+            } else {
+                vec![("linear_attn.in_proj_qkv", 10240, 2560), ("linear_attn.in_proj_z", 6144, 2560),
+                    ("linear_attn.in_proj_b", 48, 2560), ("linear_attn.in_proj_a", 48, 2560),
+                    ("linear_attn.out_proj", 2560, 6144)]
+            };
+            for (name, rows, cols) in projections {
+                tensors.push(testing::t(format!("{prefix}.{name}.weight"), "BF16", &[rows, cols]));
+            }
+        }
+        tensors.extend([testing::t("model.language_model.embed_tokens.weight", "BF16", &[64, 2560]),
+            testing::t("lm_head.weight", "BF16", &[64, 2560])]);
+        let mut config = testing::qwen4_config(4);
+        if mtp {
+            config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+            let (draft_tensors, draft_metadata) = testing::qwen4_exl3(1, 4);
+            for (name, dtype, shape) in draft_tensors {
+                tensors.push((name.replace("model.language_model.layers.0", "mtp.layers.0"), dtype, shape));
+            }
+            for (name, storage) in draft_metadata["tensor_storage"].as_object().unwrap() {
+                let name = name.replace("model.language_model.layers.0", "mtp.layers.0");
+                let mut storage = storage.clone();
+                let stored = storage["stored_tensors"].as_object().unwrap().iter().map(|(key, value)|
+                    (key.replace("model.language_model.layers.0", "mtp.layers.0"), value.clone())).collect();
+                storage["stored_tensors"] = serde_json::Value::Object(stored);
+                metadata["tensor_storage"][name] = storage;
+            }
+            for (name, rows, cols) in [("q_proj", 12288, 2560), ("k_proj", 512, 2560),
+                ("v_proj", 512, 2560), ("indexer.index_qk_proj", 640, 2560), ("o_proj", 2560, 6144)] {
+                tensors.push(testing::t(format!("mtp.layers.0.self_attn.{name}.weight"), "BF16", &[rows, cols]));
+            }
+        }
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
+        testing::write_quantize_config(dir.path(), &metadata);
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share)?;
+        let manifest_path = share.join("PROGRAMS.json");
+        let manifest = serde_json::json!({"programs": [{"name": "qwen4_sparse_gqa_kv_fp8_m64",
+            "scratch_bytes_at_capacity": {"scratch": 8192}, "geometry": {
+                "attention_plan_capacity_rows": 64, "attention_plan_scratch": [
+                    {"rows_cap": 1, "scratch": 4096}, {"rows_cap": 8, "scratch": 2048},
+                    {"rows_cap": 64, "scratch": 1024}]}}]});
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let lib = dir.path().join("lib/libcuteafd_native.so");
+        let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
+        let packages = qwen4::dual_packages(&catalog, &lib)?;
+        for (rank, width) in [384, 256].into_iter().enumerate() {
+            for capacity in [1, 16, 80] {
+                let path = packages[rank].join(format!("m{capacity}"));
+                std::fs::create_dir_all(&path)?;
+                let m = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
+                        "dtype": "f16", "zero_on_create": false}}});
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&m)?)?;
+            }
+        }
+        if mtp {
+            for capacity in [1, 16] {
+                let path = lib.parent().unwrap().join(format!("exl3/exl3-qwen4-k4/rtx-tp1/m{capacity}"));
+                std::fs::create_dir_all(&path)?;
+                let m = serde_json::json!({"hidden": 2560, "intermediate": 640, "experts": 512,
+                    "top_k": 10, "capacity": capacity, "trellis_lut": {"bytes": 32},
+                    "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * 640,
+                        "dtype": "f16", "zero_on_create": false}}});
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&m)?)?;
+            }
+        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(dir.path())?;
+        let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
+            "--native-lib", lib.to_str().unwrap(), "--local-experts", "--split-device", "1",
+            "--prefill-rows", "16", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
+        args.mtp = if mtp { 3 } else { 0 };
+        args.planner_prefix_bytes = Some(0);
+        args.planner_graph_modes = Some((8, true));
+        for (host, fp8_projections, fp8_head, attention_rows) in [(false, false, true, None),
+            (true, false, true, None), (false, true, true, None), (false, false, false, None),
+            (false, false, true, Some(64))] {
+            args.attention_plan_rows = attention_rows;
+            let mut runtime_manifest = manifest.clone();
+            let reduction = super::super::attention_plan(&args, mtp)?;
+            let scratch = cuteafd_core::coordinator_programs::attention_plan_scratch(
+                &runtime_manifest["programs"][0]["geometry"], reduction)?.unwrap();
+            runtime_manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"] = scratch.into();
+            args.fp8_decode = fp8_projections;
+            args.mtp_fp8_head = fp8_head;
+            args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
+                else { crate::shared::token_io::EmbedPlacement::Gpu };
+            let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
+                layout: Some(LayoutOptions { rtx_bytes: vec![101_973_491_712; 2], head_split: true, onboard: Some(Onboard::Fraction(1.0)),
+                    context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
+                    prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
+                    qwen_attention_plan_rows: attention_rows,
+                    qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head },
+                    workspace_manifest: Some(manifest_path.clone()), ..Default::default() }), ..Default::default() })?;
+            assert!(report.placement_supported, "{:?}", report.hints);
+            let layout = report.memory_layout.unwrap();
+            let weights = super::dual_weights(&args, &checkpoint, &cfg, 4, mtp)?;
+            let experts = super::dual_experts(&args, &catalog, 4)?;
+            let mut fixed = weights.fixed;
+            fixed.extend(experts.transport);
+            if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, 16)?); }
+            let admission = super::inputs(&args, &cfg, 4, mtp, Some(&runtime_manifest), None, 0)?;
+            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { admission,
+                gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: 101_973_491_712,
+                    headroom_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: 101_973_491_712
+                        - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
+                            .map(|item| item.bytes).sum::<u64>() } }),
+                layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
+                layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
+                pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
+                spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes })?;
+            assert_eq!(runtime.pool_tokens, 2 << 20);
+            assert_eq!(runtime.pool_tokens, layout.pool_tokens);
+            assert_eq!(runtime.tp2.unwrap().layers, 4);
+            assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));
+            for rank in 0..2 {
+                let planned = layout.devices[rank].items.iter().filter(|item| item.group != "context+modules")
+                    .cloned().collect::<Vec<_>>();
+                assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
+            }
+        }
+        std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
+        assert!(super::dual_experts(&args, &catalog, 4).is_err());
+        }
+        Ok(())
+    }
+
     fn set(count: u64) -> Option<cuteafd_loader::placement::GraphSet> {
         Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT,
             QWEN_GRAPH_MARGIN_BYTES, 0, cuteafd_loader::placement::Lifetime::Startup))

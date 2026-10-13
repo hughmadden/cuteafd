@@ -4,6 +4,7 @@
 mod media;
 pub(crate) mod engine;
 mod admission;
+mod dual;
 mod mtp_golden;
 pub(crate) mod mtp_policy;
 pub(crate) mod ple;
@@ -33,6 +34,15 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Spark-free local TP2 with solver-owned whole-layer attention ranges.
+    #[arg(long, env = "CUTEAFD_QWEN_SPLIT_DEVICE", requires = "local_experts", conflicts_with_all = ["peers", "shared_only", "expert_window"])]
+    pub split_device: Option<i32>,
+    /// Expert onboarding policy for an explicit local coordinator pair.
+    #[arg(long = "rtx-expert-layers", requires = "split_device", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
+    pub onboard: Option<cuteafd_loader::placement::Onboard>,
+    /// Attention ownership; dual Qwen supports whole layers, not head shards.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto", value_parser = ["auto", "heads", "layers", "context"])]
+    pub attention_placement: String,
     /// Run only the first N layers.
     #[arg(long)]
     pub layers: Option<usize>,
@@ -259,6 +269,27 @@ mod weight_representation_tests {
     }
 
     #[test]
+    fn dual_selector_requires_resident_local_experts() {
+        assert!(args(&["--split-device", "1"]).is_err());
+        assert!(args(&["--local-experts", "--split-device", "1"]).is_ok());
+        assert!(args(&["--local-experts", "--split-device", "1", "--expert-window", "1"]).is_err());
+        assert!(args(&["--local-experts", "--split-device", "1", "--peers", "localhost:1"]).is_err());
+        assert!(args(&[]).unwrap().split_device.is_none());
+    }
+
+    #[test]
+    fn dual_selector_uses_shared_onboarding_and_environment_key() {
+        use clap::CommandFactory;
+        let command = Command::command();
+        let selector = command.get_arguments().find(|arg| arg.get_id() == "split_device").unwrap();
+        assert_eq!(selector.get_env(), Some(std::ffi::OsStr::new("CUTEAFD_QWEN_SPLIT_DEVICE")));
+        assert!(args(&["--rtx-expert-layers", "all"]).is_err());
+        for policy in ["auto", "all", "max", "100%"] {
+            assert!(args(&["--local-experts", "--split-device", "1", "--rtx-expert-layers", policy]).is_ok());
+        }
+    }
+
+    #[test]
     fn measured_defaults_fp8_head_bf16_projections_and_options() {
         for extra in [&[][..], &["--mtp", "1"][..]] {
             let parsed = args(extra).unwrap();
@@ -366,11 +397,22 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>)
         -> Result<T> {
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
+        let selected = if args.split_device.is_some() {
+            ensure!(requested.is_none() || requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers),
+                "Qwen dual supports whole-layer attention only");
+            Some(cuteafd_loader::placement::AttentionPlacement::Layers)
+        } else { requested };
+        cuteafd_loader::placement::families::QWEN4.check_attention(selected,
+            1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
         let args = &context_args;
+        if let Some(peer) = args.split_device {
+            return self.with_dual_engine(args, peer, automatic_context, body);
+        }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
         let required = required_fp8_programs(args);
@@ -563,16 +605,21 @@ impl Opened {
 
     fn spark_mtp_experts<'s>(&'s self, args: &EngineArgs, layer: usize, stream: *mut std::ffi::c_void)
         -> Result<engine::MtpExperts<'s>> {
-        let catalog = self.experts.as_ref().context("--mtp with Spark peers needs the local draft expert catalog")?;
         let (free, _) = self.library.cuda_memory_info()?;
         let budget = free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30));
+        self.local_mtp_experts(args, layer, stream, budget)
+    }
+
+    fn local_mtp_experts<'s>(&'s self, args: &EngineArgs, layer: usize,
+        stream: *mut std::ffi::c_void, budget: usize) -> Result<engine::MtpExperts<'s>> {
+        let catalog = self.experts.as_ref().context("--mtp needs the local draft expert catalog")?;
         let started = Instant::now();
         let mtp = if catalog.exl3().is_some() {
             let experts = crate::families::deepseek_v4::local::LocalExperts::load_range(&self.library,
                 &args.native_lib, catalog, 1, 0..0, args.prefill_rows, budget, stream)?
                 .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
             ensure!(experts.layers() == 0 && experts.stages() == 1,
-                "Spark layout must keep exactly the MTP expert layer locally, no backbone layers");
+                "local draft executor must keep exactly the MTP expert layer, no backbone layers");
             engine::MtpExperts::Exl3(std::cell::RefCell::new(experts))
         } else {
             let tensors = catalog.fp8().context("coordinator-local MTP needs FP8, NVFP4 or EXL3 experts")?;
@@ -584,7 +631,7 @@ impl Opened {
             engine::MtpExperts::Fp8(experts)
         };
         tracing::info!(layer, elapsed_ms = started.elapsed().as_millis() as u64,
-            "Qwen MTP experts resident on coordinator; backbone experts served by Sparks");
+            "Qwen full-width MTP experts resident on head owner");
         Ok(mtp)
     }
 }
