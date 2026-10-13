@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn persistent_bootstrap_rejects_legacy_and_unknown_versions_before_payload() {
-        for version in [None, Some(1), Some(3)] {
+        for version in [None, Some(1), Some(2), Some(PERSISTENT_CONTROL_VERSION + 1)] {
             // Deliberately omit all endpoint fields: version failure must be first.
             let mut value = serde_json::json!({"message":"protocol_v2_persistent_ready"});
             if let Some(version) = version { value["wire_version"] = version.into(); }
@@ -666,6 +666,17 @@ mod tests {
         }
         let start = serde_json::to_value(session_start(0)).unwrap();
         assert!(decode_persistent_control::<VerbsHostProtocolV2PersistentStart>(start).is_ok());
+    }
+
+    #[test]
+    fn persistent_bootstrap_rejects_oversized_grouping_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        std::io::Write::write_all(&mut client, &vec![b' '; PERSISTENT_CONTROL_LIMIT + 1]).unwrap();
+        let error = read_control_value(&mut BufReader::new(server)).unwrap_err();
+        assert!(error.to_string().contains("oversized"));
     }
 
     #[test]

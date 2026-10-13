@@ -16,6 +16,27 @@ use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Pr
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
+fn traffic_contract(contract: cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract)
+    -> cuteafd_transport::worker_selection::ExpertTrafficContract {
+    use cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract as Ffi;
+    use cuteafd_transport::worker_selection::ExpertTrafficContract as Wire;
+    match contract { Ffi::ExactGrouping => Wire::ExactGrouping,
+        Ffi::ConservativeRouteUpperBound => Wire::ConservativeRouteUpperBound }
+}
+
+fn installed_variants(module: &Fp8MoeModule)
+    -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertVariant>> {
+    module.info().capacities.iter().map(|&capacity| {
+        let (_, contract) = module.weight_read_group_for_capacity(capacity, 0)?;
+        cuteafd_transport::worker_selection::InstalledExpertVariant::from_piecewise_queries(
+            capacity, traffic_contract(contract), |rows| {
+                let (group, current) = module.weight_read_group_for_capacity(capacity, rows)?;
+                ensure!(current == contract, "FP8 expert traffic contract changes within a capacity");
+                Ok(group)
+            })
+    }).collect()
+}
+
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
@@ -492,6 +513,26 @@ impl<'a> Fp8Experts<'a> {
     /// Whether the package takes FP8 K32 wire rows (else BF16 rows).
     pub fn wire_input(&self) -> bool {
         self.module.info().wire_input
+    }
+
+    pub fn weight_read_group(&self, rows: usize, bf16: bool)
+        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
+        let module = if bf16 && self.wire_input() {
+            self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
+        } else { &self.module };
+        let (group, contract) = module.weight_read_group(rows)?;
+        Ok((group, traffic_contract(contract)))
+    }
+
+    pub fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize, capacity: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping};
+        let report = InstalledExpertGrouping::new(loaded, rank, capacity, ExpertGroupingSelector::Fp8Nearest,
+            installed_variants(&self.module)?)?;
+        match &self.bf16_module {
+            Some(module) => report.with_bf16_variants(installed_variants(module)?),
+            None => Ok(report),
+        }
     }
 
     /// Routed experts of resident layer `index` for `rows` input rows (wire

@@ -17,6 +17,11 @@ extern "C" {
 // [10 .. 10+n) capacities.
 int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
 int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
+// Static installed traffic contract for capacity/form (same fallback as launch).
+// rows=0 queries the final segment. contract=1: exact_grouping; contract=2:
+// conservative_route_upper_bound (group_rows=1, one slice per routed occurrence).
+int32_t cuteafd_fp8moe_weight_read_group(uint32_t capacity, uint32_t form, uint32_t rows,
+                                       uint32_t* group_rows, uint32_t* contract);
 // Loads every program on the current device.
 int32_t cuteafd_fp8moe_create(void** context);
 // pointers (11): x (wire rows [rows, H + H/32] or BF16 [rows, H]), ids i32 [rows, k], weights f32

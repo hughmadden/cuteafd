@@ -152,6 +152,11 @@ impl<'a> Fp8MoeTp2<'a> {
         self.experts.resident_bytes()
     }
 
+    pub(crate) fn weight_read_group(&self, rows: usize)
+        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
+        self.experts.weight_read_group(rows, true)
+    }
+
     /// Force first-use CUDA loading of each serving capacity before any device
     /// peer-wait is queued. Uses the caller's already admitted startup buffers.
     ///
@@ -183,6 +188,7 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
+    fn group_rows(&self, rows: usize) -> Result<usize> { Ok(self.weight_read_group(rows)?.0) }
 
     unsafe fn prime(&mut self, input: ExpertInput, routes: Routes, stream: *mut c_void) -> Result<()> {
         // SAFETY: the trait's startup buffer/stream contract is the inherent method's.
