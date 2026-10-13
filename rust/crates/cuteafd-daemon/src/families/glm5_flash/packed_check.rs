@@ -41,7 +41,7 @@ pub(crate) fn packed_check(engine: &GlmfEngine<'_>, tokens: &[u32], sequences: u
     let n = lengths.len();
     let prompts: Vec<Vec<u32>> = lengths.iter().enumerate().map(|(i, &len)| sequence(tokens, i, prefix(i) + len))
         .collect();
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     let admit = |allocator: &mut Allocator, prompt: &[u32]| allocator.admit(prompt.len() + 1);
     let mut packed: Vec<GlmfPlacement> = prompts.iter().map(|p| admit(&mut allocator, p)).collect::<Result<_>>()?;
     let mut alone: Vec<GlmfPlacement> = prompts.iter().map(|p| admit(&mut allocator, p)).collect::<Result<_>>()?;

@@ -1784,7 +1784,9 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
                         }), ..sparks(2) };
                         let report = plan(dir.path(), &options).unwrap();
-                        if gpus == 2 && (index == GlmfIndexCache::Compact || shared) { assert!(!report.placement_supported); continue; }
+                        // Two GPUs without context programs serve heads, which keeps the token keys
+                        // (as the runtime's served index cache); shared replay is single-GPU.
+                        if gpus == 2 && shared { assert!(!report.placement_supported); continue; }
                         let memory = report.memory_layout.unwrap();
                         let served_index = if gpus == 2 { GlmfIndexCache::Keys } else { index };
                         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,

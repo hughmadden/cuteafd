@@ -109,10 +109,24 @@ impl ArenaMarks {
     /// the engine's slot regions, and this count is the arena `prefix_cache` allocates.
     pub fn slots_on(self, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig, layers: usize,
         index_cache: IndexCache, kda_state: KdaState) -> Result<usize> {
+        self.slots_placed(cfg, layers, index_cache, kda_state, false)
+    }
+
+    /// [`Self::slots_on`] for an engine whose head split runs context attention (`context`): each
+    /// GPU's part of a mark is its KDA heads' state and every (replicated) index tail.
+    pub fn slots_placed(self, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig, layers: usize,
+        index_cache: IndexCache, kda_state: KdaState, context: bool) -> Result<usize> {
         let Self::Rule(_) = self else { return Ok(self.slots(0)) };
-        let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(cfg, layers, 1,
-            index_cache.into(), kda_state.bytes() as u64)?;
-        let mark = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?.retained_mark_bytes;
+        let geometry = if context {
+            cuteafd_loader::serving_capacity::glm_flash_placed_cache_geometry_rows(cfg, layers, 2, index_cache.into(),
+                kda_state.bytes() as u64, super::engine::DECODE_ROWS as u64,
+                cuteafd_loader::placement::AttentionPlacement::Context, 0)?
+        } else {
+            cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(cfg, layers, 1, index_cache.into(),
+                kda_state.bytes() as u64)?
+        };
+        let mark: u64 = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum();
+        ensure!(mark > 0, "GLM 5.3 Flash cache geometry without a rank");
         Ok(self.slots(usize::try_from(mark)?))
     }
 }
@@ -139,10 +153,11 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged: Vec<_> = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |buffers| (rank, buffers))).collect();
+        let units = engine.local_units();
         for (_, layer) in &paged {
-            ensure!(layer.records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES
-                && layer.keys.is_none_or(|keys| keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES)
-                && layer.pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "MLA cache buffers smaller than the units");
+            ensure!(layer.records.bytes >= units * UNIT_ROWS * RECORD_BYTES
+                && layer.keys.is_none_or(|keys| keys.bytes >= units * UNIT_ROWS * KEY_BYTES)
+                && layer.pools.bytes >= units * POOL_PAGE_BYTES, "MLA cache buffers smaller than the units");
         }
         let parts: Vec<usize> = (0..engine.ranks())
             .map(|rank| engine.slot_regions_on(rank, 0).iter().map(|r| r.bytes).sum()).collect();
@@ -156,6 +171,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
                 Ok(part.div_ceil(unit))
             }).try_fold(0, |units, rank| rank.map(|rank| units.max(rank)))?),
         };
+        ensure!(mark_units == 0 || !engine.context_kv(), "context attention keeps prefix marks in the arena");
         let reserved = if mark_units > 0 { RESERVED_UNITS } else { 0 };
         ensure!(mark_units + reserved < engine.pool_pages.max(1), "a pool mark of {mark_units} units and {reserved} \
             reserved do not fit a pool of {} units", engine.pool_pages);
@@ -178,8 +194,26 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.paged.iter().map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES))
-            + POOL_PAGE_BYTES).sum()
+        // Under context a unit lives on one GPU: one rank's layers.
+        self.paged.iter().filter(|(rank, _)| !self.parity() || *rank == 0)
+            .map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES)) + POOL_PAGE_BYTES).sum()
+    }
+
+    /// Whether units are partitioned by parity (context attention).
+    fn parity(&self) -> bool {
+        self.engine.context_kv()
+    }
+
+    /// The GPU holding unit `unit`'s rows and its local unit there.
+    fn locate(&self, unit: u32) -> (usize, u32) {
+        if self.parity() { ((unit & 1) as usize, unit >> 1) } else { (0, unit) }
+    }
+
+    /// Every allocation the host tier copies (both GPUs' pools under context), for the copy
+    /// engine's routing by owning device.
+    pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
+        self.paged.iter().flat_map(|(_, layer)| std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]))
+            .collect()
     }
 
     /// Arena marks (none when marks live in pool units).
@@ -347,7 +381,8 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
             rule: ReuseRule::EXACT,
             mark_store: if self.mark_units > 0 { MarkStore::Pool { pages: self.mark_units, reserved: RESERVED_UNITS } }
                 else { MarkStore::Arena },
-            page_owners: Default::default(),
+            page_owners: if self.parity() { cuteafd_engine::prefix::PageOwners::Parity }
+                else { cuteafd_engine::prefix::PageOwners::Uniform },
         }
     }
 
@@ -393,7 +428,14 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let rows = UNIT_PAGES * PAGE_ROWS;
         let pools = copy.rows / KPOOL;
-        for &(rank, layer) in &self.paged {
+        // Under heads every GPU holds the unit; under context only its owner, at its local unit.
+        let ((from_rank, from), (to_rank, to)) = (self.locate(copy.from), self.locate(copy.to));
+        if from_rank != to_rank || copy.owner.map(usize::from).is_some_and(|o| o != from_rank)
+            || copy.owner.is_some() != self.parity() {
+            return Err(format!("tail copy {copy:?} crosses GPUs").into());
+        }
+        let copy = TailCopy { from, to, ..copy };
+        for &(rank, layer) in self.paged.iter().filter(|(rank, _)| !self.parity() || *rank == from_rank) {
             let pool_keys = layer.pools;
             for (buffer, row) in std::iter::once((layer.records, RECORD_BYTES)).chain(layer.keys.map(|k| (k, KEY_BYTES))) {
                 self.copy(rank, view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
@@ -415,9 +457,15 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
         Ok(self.engine.synchronize()?)
     }
 
-    /// The host tier's ranges (rank 0's: a head split runs without the host tier).
+    fn page_device(&self, page: u32) -> Option<u8> {
+        self.parity().then_some((page & 1) as u8)
+    }
+
+    /// The host tier's ranges: rank 0's (a heads split runs without the host tier), or under
+    /// context the owner's at its local unit.
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        self.unit_ranges_on(0, page).unwrap_or_default().into_iter()
+        let (owner, unit) = self.locate(page);
+        self.unit_ranges_on(owner, unit).unwrap_or_default().into_iter()
             .map(|b| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
     }
 
@@ -597,7 +645,9 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
     for (u, &unit) in placement.units.iter().enumerate().take(len.div_ceil(UNIT_ROWS)) {
         let rows = (len - u * UNIT_ROWS).min(UNIT_ROWS);
         let unit_pools = (pools.saturating_sub(u * PAGE_ROWS)).min(PAGE_ROWS);
-        for rank in 0..family.engine.ranks() {
+        let (owner, local) = family.locate(unit);
+        for rank in (0..family.engine.ranks()).filter(|&rank| !family.parity() || rank == owner) {
+            let unit = if family.parity() { local } else { unit };
             for layer in family.unit_layers_on(rank, unit)? {
                 out.extend_from_slice(&download(family.engine, rank, layer.records)?[..rows * RECORD_BYTES]);
                 if let Some(keys) = layer.keys {
@@ -682,7 +732,8 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     let embed = &tokens[..n];
     let family = GlmfPrefix::new(engine, marks, |_| 2)?;
     let reserved = family.layout().mark_store.reserved();
-    let mut allocator = Allocator::with_reserved(engine.pages, engine.slots, reserved);
+    let mut allocator = if reserved == 0 { Allocator::for_engine(engine) }
+        else { Allocator::with_reserved(engine.pages, engine.slots, reserved) };
     let err = |e: BoxError| anyhow::anyhow!("{e}");
     // Marks 0 and 1: arena slots, or two marks of pool units.
     let pool_marks = match marks {

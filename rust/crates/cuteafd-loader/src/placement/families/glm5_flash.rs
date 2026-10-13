@@ -4,9 +4,13 @@ use crate::serving_capacity::{self as cache, glmf_graphs};
 use crate::placement::*;
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Candidate layout inventory. Executors stay fail-closed until the family
-/// binds all cache, prefill, verify and prefix paths.
-#[derive(Debug, Clone, Copy, Default)]
+/// Two-GPU attention placement of GLM Flash's MLA layers and the `context` programs' scratch.
+/// `context` (PLAN.md "v3 attention placement without latent replication", GLM Flash DSA):
+/// projections head-split, every 256-token allocation unit of the MLA records and pool keys on
+/// one GPU (logical unit `u` on GPU `u % 2`), decode/verify exchanging q / candidates / partials
+/// and merging by LSE, prefill gathering the history into a staging view. `layers` remains
+/// inventory only (no executor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlmfAttention {
     pub mode: AttentionPlacement,
     pub first_owner: u8,
@@ -14,17 +18,78 @@ pub struct GlmfAttention {
     pub partial_scratch: u64,
 }
 
-/// Additional per-rank context allocations, in serving allocation order.
+/// Programs `context` needs beside the split partials (any `_s<N>` variant of both head halves).
+pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "glmf_dsa_candidate_merge",
+    "glmf_lse_combine2", "glmf_paged_staging_gather_kv", "glmf_paged_staging_gather_index",
+    "glmf_index_expand_owned"];
+
+/// The `context` programs of a build and their scratch (`lookup`: name -> scratch bytes), or None
+/// when it lacks any of them (auto then stays `heads`). Needs the head split's compact commit too.
+pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
+    lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmfAttention> {
+    let partial = |begin: u64| names.clone().into_iter()
+        .filter(|n| n.starts_with(&format!("glmf_sparse_mla_partial_h{begin}_s")) && n.ends_with("_m64"))
+        .filter_map(&lookup).max();
+    CONTEXT_PROGRAMS.iter().chain(&["glmf2_kda_commit_c", "glmf_index_producer_c_m64", "glmf_index_producer_c_m4096"])
+        .all(|n| lookup(n).is_some()).then_some(())?;
+    Some(GlmfAttention { mode: AttentionPlacement::Context, first_owner: 0, topk_scratch: lookup(CONTEXT_PROGRAMS[0])?,
+        partial_scratch: partial(0)?.max(partial(32)?) })
+}
+
+/// The `context` programs a manifest carries (PROGRAMS.json), as [`context_programs`].
+pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
+    let programs = manifest["programs"].as_array()?;
+    let names = programs.iter().filter_map(|p| p["name"].as_str());
+    context_programs(names, |name| programs.iter().find(|p| p["name"].as_str() == Some(name))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
+}
+
+/// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
+/// against the build's `context` programs. Auto is `context` on two GPUs where the build carries
+/// them, else `heads`; an explicit `context` without them, or `layers` (no executor), is refused.
+pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, programs: Option<GlmfAttention>)
+    -> Result<GlmfAttention, PlacementError> {
+    let heads = GlmfAttention { mode: AttentionPlacement::Heads, ..programs.unwrap_or_default() };
+    let refuse = |mode, reason| Err(PlacementError::AttentionPlacement { family: "glm5_flash", mode, reason });
+    match requested {
+        Some(AttentionPlacement::Heads) => Ok(heads),
+        Some(mode) if gpus != 2 => refuse(mode, "requires two coordinator GPUs with peer access"),
+        Some(AttentionPlacement::Layers) => refuse(AttentionPlacement::Layers,
+            "executor not implemented; heads and context are qualified"),
+        Some(AttentionPlacement::Context) => programs.map(|p| GlmfAttention { mode: AttentionPlacement::Context, ..p })
+            .map_or_else(|| refuse(AttentionPlacement::Context,
+                "this build lacks the context programs (CUTEAFD_CONTEXT_SPLIT_AOT)"), Ok),
+        None if gpus == 2 => Ok(programs.map_or(heads, |p| GlmfAttention { mode: AttentionPlacement::Context, ..p })),
+        None => Ok(heads),
+    }
+}
+
+/// Units one GPU commits per prefill lane of `rows` rows: a range spans one more unit than it
+/// fills, and every second unit is this GPU's.
+pub fn context_commit_units(rows: u64) -> u64 {
+    (rows.div_ceil(256) + 1).div_ceil(2)
+}
+
+/// Every allocation the `context` executor adds on one GPU beside the exchange and the staging,
+/// in order; `glm5_flash::engine::context` allocates exactly this list (each with its 256-byte
+/// floor) and the solver charges its sum. Decode reuses the step's own tables: its page table
+/// holds the compact unit table, its pool table the compact pool table, its cache lengths the
+/// shard's pools; `local` holds the candidate merge's local pool slots and counts.
 pub fn context_workspace(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
     context: GlmfAttention) -> Vec<(&'static str, u64)> {
-    let partial = cache::GLMF_DECODE_ROWS * cfg.heads as u64 / 2 * (512 * 2 + 4);
-    let units = extent.div_ceil(256).div_ceil(2);
-    let commits = (rows.div_ceil(256) + 1).div_ceil(2);
-    let mut out = vec![("candidates", cache::GLMF_DECODE_ROWS * (cfg.index_topk / cfg.index_kpool) as u64 * 8),
+    let decode = cache::GLMF_DECODE_ROWS;
+    let k = (cfg.index_topk / cfg.index_kpool) as u64;
+    let partial = decode * cfg.heads as u64 / 2 * (512 * 2 + 4);
+    let units = extent.div_ceil(256);
+    // Per owner: a record-page table over every logical page, then its local units.
+    let gather = (2 * units * 4 + 2 * units.div_ceil(2)) * 4;
+    let mut out = vec![("candidates", decode * k * 8), ("local pools", decode * (k + 1) * 4),
         ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
-        ("gather tables", 2 * units * 4)];
-    out.extend((0..lanes).map(|_| ("commit blocks", 3 * 3 * commits * 8)));
+        ("gather tables", gather)];
+    out.extend((0..lanes).map(|_| ("commit blocks", 3 * 3 * context_commit_units(rows) * 8)));
+    // The staging view's identity pool-page map (the prefill index expansion reads it).
+    out.push(("staging pool map", extent.div_ceil(256) * 4));
     out
 }
 
@@ -338,7 +403,9 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     fixed.extend(workspace.iter().cloned());
     let fixed = working.demands(&fixed).cloned().collect();
     Ok(PlacementRequest {
-        attention_placement: (i.attention.mode != AttentionPlacement::Heads).then_some(i.attention.mode),
+        // The family resolves the mode before admission (its index cache depends on it: compact
+        // under context, keys under heads), so two GPUs pin it.
+        attention_placement: (ranks == 2).then_some(i.attention.mode),
         context_buffers: context_buffers(i.cfg, i.max_context, i.prefill_rows, working.prefill_lanes, i.attention),
         layers_first_gpu: i.attention.first_owner,
         inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
@@ -1302,7 +1369,11 @@ mod tests {
                 input.index = cache::GlmfIndexCache::Compact;
                 input.attention.mode = mode;
                 let mut req = request(&input).unwrap();
-                assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })), "production remains fail-closed");
+                if mode == AttentionPlacement::Layers {
+                    assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })), "owned layers remain fail-closed");
+                } else {
+                    assert_eq!(solve(&req).unwrap().attention_placement, AttentionPlacement::Context);
+                }
                 // A test-only executor proves planner accounting without claiming
                 // these modes are qualified or available to serving.
                 req.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
@@ -1346,8 +1417,9 @@ mod tests {
             (32768, 32896, 4096));
         assert_eq!(buffers.lanes, 1);
         let workspace = context_workspace(&cfg, 1 << 20, 4096, 3, context);
-        assert_eq!(workspace.len(), 9);
-        assert_eq!(workspace.last().unwrap().1, 3 * 3 * 9 * 8);
+        assert_eq!(workspace.len(), 11);
+        assert_eq!(workspace[workspace.len() - 2].1, 3 * 3 * 9 * 8);
+        assert_eq!(workspace.last().unwrap().1, (1 << 20) / 256 * 4);
         assert_eq!(buffers.workspace_bytes, workspace.iter().map(|&(_, bytes)| bytes.max(256)).sum::<u64>());
         let demands = buffers.demands().unwrap();
         for gpu in 0..2 {
@@ -1359,16 +1431,26 @@ mod tests {
     }
 
     #[test]
-    fn glm5_flash_k0_selectors_fail_closed_until_executors_exist() {
+    fn glm5_flash_resolves_context_where_the_build_carries_it_and_refuses_owned_layers() {
+        let programs = Some(GlmfAttention { mode: AttentionPlacement::Context, topk_scratch: 7, partial_scratch: 9,
+            ..Default::default() });
+        use AttentionPlacement::{Context, Heads, Layers};
+        assert_eq!(resolve_attention(None, 2, programs).unwrap().mode, Context);
+        assert_eq!(resolve_attention(None, 2, None).unwrap().mode, Heads);
+        assert_eq!(resolve_attention(None, 1, programs).unwrap().mode, Heads);
+        assert_eq!(resolve_attention(Some(Heads), 2, programs).unwrap().mode, Heads);
+        assert_eq!(resolve_attention(Some(Context), 2, programs).unwrap().topk_scratch, 7);
+        for (mode, gpus, programs) in [(Context, 2, None), (Context, 1, programs), (Layers, 2, programs)] {
+            assert!(matches!(resolve_attention(Some(mode), gpus, programs), Err(PlacementError::AttentionPlacement { .. })));
+        }
+        // The executor runs context, not owned layers; heads stays explicit.
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
         assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Kda).all(|l| l.kv_unit.unit_bytes_context.is_none()));
         assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).all(|l| l.kv_unit.unit_bytes_context.is_some()));
-        assert_eq!(solve(&req).unwrap().attention_placement, AttentionPlacement::Heads);
-        for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
-            req.attention_placement = Some(mode);
-            assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
-        }
+        assert_eq!(solve(&req).unwrap().attention_placement, Heads);
+        req.attention_placement = Some(Layers);
+        assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
     }
 
     #[test]

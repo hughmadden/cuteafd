@@ -19,6 +19,16 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
         let decode_rows = options.glmf_decode_rows;
         anyhow::ensure!(ranks == 1 || decode_rows == 64, "a head split takes --decode-rows 64");
+        // The MLA placement (auto: context where the build carries its programs on two GPUs); context
+        // keeps the compact index cache, heads on two GPUs the token keys.
+        let attention = glmf::resolve_attention(report.requested_attention, ranks,
+            manifest.and_then(glmf::manifest_context))?;
+        report.attention_placement = attention.mode;
+        let index = match attention.mode {
+            placement::AttentionPlacement::Context => crate::serving_capacity::GlmfIndexCache::Compact,
+            _ if ranks == 2 => crate::serving_capacity::GlmfIndexCache::Keys,
+            _ => options.glmf_index,
+        };
         if decode_rows > 64 && manifest.is_some_and(|m| crate::serving_capacity::glmf_manifest_scratch(m)("glmf_mhc_post_pre_m128").is_none()) {
             anyhow::bail!("wide decode needs CUTEAFD_GLMF_WIDE_DECODE_ROWS=128");
         }
@@ -43,15 +53,15 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let available = match scratch { Ok(bytes) => Some(bytes), Err(error) if needed => return Err(error), Err(error) => {
             notes.push(format!("RTX expert onboarding unavailable: {error}")); None } };
         let experts = glmf::expert_costs(&catalog, ranks == 2 && available.is_some())?;
-        let geometry = crate::serving_capacity::glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, ranks,
-            options.glmf_index, 4, decode_rows)?;
+        let geometry = crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
+            index, 4, decode_rows, attention.mode, 0)?;
         let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
             options.glmf_mark_lanes.unwrap_or(sequences), options.mimo_prefix_entries,
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes));
         let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
-                options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact,
+                index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
@@ -121,11 +131,11 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
-        let inputs = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs { attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
-            index: options.glmf_index, kda_state_bytes: 4, shared_replay: options.glmf_shared_replay, representation,
+            index, kda_state_bytes: 4, shared_replay: options.glmf_shared_replay, representation,
             resident, router_replica_bytes: router, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },

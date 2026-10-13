@@ -35,9 +35,14 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// `heads` (`glm5::request`); heads stays an explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
-/// GLM Flash and MiMo: `attach_peer` requires every layer split.
-pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash", modes: &[LayerMode::HeadSplit, WHOLE0],
-    hops: false, attention: AttentionPlacement::Heads };
+/// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
+/// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
+/// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
+/// first) where the build carries its programs (`glm5_flash::resolve_attention`); `heads` stays
+/// an explicit option. Owned MLA layers (`layers`) have no executor yet.
+pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
+/// MiMo: `attach_peer` requires every layer split.
 pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[LayerMode::HeadSplit, WHOLE0],
     hops: false, attention: AttentionPlacement::Heads };
 /// Qwen: one GPU.

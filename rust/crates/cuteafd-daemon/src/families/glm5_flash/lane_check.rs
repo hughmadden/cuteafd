@@ -41,7 +41,7 @@ pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     let cuts = engine.prefill_cuts(n)?;
     ensure!(engine.prefill_capacity() > engine.prefill_rows || engine.prefill_lane_count == 1,
         "--lane-check needs pipelined Spark prefill lanes (--peers, every layer)");
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     let (mut lanes, mut serial) = (allocator.admit(n)?, allocator.admit(n)?);
     let started = std::time::Instant::now();
     let lane_logits = engine.prefill_forced(&mut lanes, &tokens[..n], None, None, true)?

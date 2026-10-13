@@ -1317,7 +1317,7 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
     // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them.
-    let options = GlmfScratchOptions { index_compact: index_compact && !split, split, kda_fp32_partials: fp32_partials, kda_output_shard: split && repr.output_shard, kda_prefill_expanded: split && expanded,
+    let options = GlmfScratchOptions { index_compact, split, kda_fp32_partials: fp32_partials, kda_output_shard: split && repr.output_shard, kda_prefill_expanded: split && expanded,
         kda_w8: repr.kda_fp8 && lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
         ..Default::default() };
     let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
