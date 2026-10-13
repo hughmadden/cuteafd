@@ -1782,6 +1782,8 @@ impl<'a> Engine<'a> {
         self.tp2.as_ref().map_or_else(|| self.local.borrow().as_ref().map_or(0, |l| l.layers()), |t| t.layers.end)
     }
 
+    pub(crate) fn local_expert_tp(&self) -> usize { if self.tp2.is_some() { 2 } else { 1 } }
+
     pub fn install_local(&mut self, local: Option<super::local::LocalExperts<'a>>) {
         *self.local.borrow_mut() = local;
     }

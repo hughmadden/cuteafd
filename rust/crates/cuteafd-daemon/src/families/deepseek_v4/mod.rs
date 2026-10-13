@@ -1,6 +1,7 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
 pub(crate) mod engine;
 pub(crate) mod admission;
+mod draft_binding;
 #[cfg(test)]
 mod placement_tests;
 pub(crate) mod local;

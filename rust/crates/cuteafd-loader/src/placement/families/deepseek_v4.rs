@@ -166,6 +166,13 @@ pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_
     Ok(cuteafd_core::prefix::mark_slots_for(sequences, entries, mark, budget_bytes))
 }
 
+/// Owner-local route ring of the shared draft probe; pinned host bytes have the same extent.
+pub fn draft_probe_bytes(cfg: &DeepseekV4Config, decode_rows: u64) -> Result<u64, PlacementError> {
+    [cfg.n_layers as u64, decode_rows, cfg.n_activated_experts as u64, 4].into_iter()
+        .try_fold(1u64, |bytes, extent| bytes.checked_mul(extent)
+            .ok_or(PlacementError::Overflow("V4 draft route ring"))).map(|bytes| bytes.max(256))
+}
+
 /// Fixed V4 demands and pool overhead per GPU plus each GPU's reserve, the
 /// ones both sides previously computed apart.
 pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Vec<u64>), PlacementError> {
@@ -193,8 +200,9 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
+        let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(inputs.cfg, inputs.decode_rows)? } else { 0 };
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
-            .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake;
+            .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
         let headroom = if inputs.workspace.is_some() {
             deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes,
                 workspace + exchange + inputs.code_bytes.get(rank).copied().unwrap_or(0), GRAPH_BYTES[role])
@@ -341,6 +349,15 @@ mod default_tests {
             "compress_rope_theta":160000,"compress_ratios":(0..43).map(|i|
                 if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 }).collect::<Vec<_>>()
         }), 0).unwrap()
+    }
+
+    #[test]
+    fn draft_probe_extent_matches_the_owner_local_ring() {
+        let cfg = context_cfg();
+        assert_eq!(draft_probe_bytes(&cfg, 64).unwrap(), 43 * 64 * 6 * 4);
+        assert_eq!(draft_probe_bytes(&cfg, 1).unwrap(), 43 * 6 * 4);
+        assert_eq!(draft_probe_bytes(&cfg, 0).unwrap(), 256);
+        assert!(draft_probe_bytes(&cfg, u64::MAX).is_err());
     }
 
     #[test]

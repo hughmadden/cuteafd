@@ -234,3 +234,21 @@ impl<'a> Engine<'a> {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_draft_extent_accepts_only_installed_widths_and_live_rows() {
+        assert_eq!(draft_rows(1, 3, 5, 64, 3).unwrap(), 3);
+        assert_eq!(draft_rows(12, 5, 5, 64, 60).unwrap(), 60);
+        for (requests, width, native, capacity, inputs) in [
+            (0, 5, 5, 64, 0), (1, 0, 5, 64, 0), (1, 6, 5, 64, 6),
+            (13, 5, 5, 64, 65), (2, 5, 5, 64, 9), (2, 5, 5, 64, 11),
+            (1, WINDOW, WINDOW, WINDOW, WINDOW), (usize::MAX, 2, 5, 64, 0),
+        ] {
+            assert!(draft_rows(requests, width, native, capacity, inputs).is_err());
+        }
+    }
+}
