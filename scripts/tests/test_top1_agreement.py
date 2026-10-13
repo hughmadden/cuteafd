@@ -97,10 +97,17 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
         assert 'self.head_mode.get()' in text
     wrapper = (source / 'glm5_flash/dspark.rs').read_text().split("impl<'a> Drafter<'a>", 1)[1]
     diagnostic = wrapper.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
-    assert 'Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head)' in diagnostic
+    assert 'Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head)' in diagnostic
     remote = (source / 'glm5_flash/remote_dflash.rs').read_text()
     remote_head = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
-    assert 'self.draft.draft_head_mode()' in remote_head and 'launch_bf16_head' not in remote_head
+    assert 'TargetHead::Bf16(weight) if serving =>' in remote_head
+    assert 'crate::shared::draft::launch_bf16_head(' in remote_head
+    assert 'self.draft.draft_head_mode()' in remote_head
+    serving = remote.split('pub fn draft_device(', 1)[1].split('pub fn draft_device_diagnostic(', 1)[0]
+    diagnostic = remote.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
+    assert 'head, true)' in serving and 'head, false)' in diagnostic
+    bridge = remote.split('fn draft_device_from(', 1)[1].split('\n    }', 1)[0]
+    assert 'self.launch_head(&head, rows, serving)?' in bridge
     for path in ['glm5/mod.rs', 'glm5_flash/speculate.rs']:
         text = (source / path).read_text()
         assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text

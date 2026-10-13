@@ -954,8 +954,7 @@ impl<'a> Drafter<'a> {
         head: TargetHead<'_>) -> Result<Vec<Draft>> {
         match self {
             Self::Dflash2(d) => d.draft_device_diagnostic(sequences, embedding, head),
-            // The bridge's target-owned head already uses the explicit diagnostic mode.
-            Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head),
+            Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head),
             Self::Dspark(d) => d.draft_device_diagnostic(sequences, embedding, head),
         }
     }
