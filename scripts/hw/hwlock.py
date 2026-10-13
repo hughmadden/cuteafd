@@ -9,7 +9,7 @@ dead process and is removed. A request takes its locks only when no older live
 ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
-order (sparks, gpu0, gpu1, rhea, moa), so callers that still use plain flock
+order (sparks, gpu0, gpu1, rhea, moa, kakapo), so callers that still use plain flock
 stay excluded (they are just not queued fairly). Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
@@ -36,7 +36,9 @@ import sys
 import time
 from pathlib import Path
 
-ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa')
+# kakapo is the out-of-pool build seed (10 GbE, never serves): last, so a
+# serving job's locks are always taken before a seed lease's.
+ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo')
 LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 POLL_S = 2.0
 GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)

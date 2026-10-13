@@ -129,6 +129,14 @@ def test_canonical_order_and_unknown_locks():
         hwlock.canonical(['gpu2'])
 
 
+def test_kakapo_seed_lock_is_known_and_ordered_last():
+    # The out-of-pool build seed's lock sorts after every serving lock, so a
+    # serving job and a seed lease always take shared locks in one order.
+    assert hwlock.ORDER[-1] == 'kakapo'
+    assert hwlock.canonical(['kakapo', 'moa', 'sparks', 'gpu1', 'rhea', 'gpu0']) == \
+        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo']
+
+
 def test_older_dual_gpu_waiter_is_not_overtaken_by_later_single_gpu_job(lockdir):
     # gpu1 is busy; a dual-GPU job queues; a later gpu1-only job must wait behind it.
     busy = spawn(lockdir, 'gpu1', 1.0, lockdir / 'busy')

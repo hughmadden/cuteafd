@@ -29,6 +29,12 @@ REPO = Path(__file__).resolve().parents[2]
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
+# Out-of-pool build seeds: compile, export and seal Spark slots, never serve.
+# kakapo has no RoCE (10 GbE only): its staging lanes are its LAN address and
+# wip.sh moves its sealed slots through sparknest.
+SEED_HOSTS = ('kakapo',)
+SEEDS = ('rhea', 'moa', *SEED_HOSTS)
+DEFAULT_SEED = 'moa'
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -1066,11 +1072,21 @@ def cleanup(arms, task, dry):
         if 'wip_instance' in arm or 'release' in arm:
             continue  # External sealed builds and release images are never owned by this task.
         script = cleanup_script(arm, task)
-        for host in ('raptor', *HOSTS):
+        for host in ('raptor', *HOSTS, *SEED_HOSTS):
             cmd = ['python3', '-c', script] if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(['python3', '-c', script])]
             print(shlex.join(cmd))
             if not dry:
                 print(run(cmd).stdout.strip())
+        # The instance's sparknest build area (sealed slot archives a non-RoCE seed
+        # staged, wip.sh wip_nest_slot_dir) goes with it; it only ever holds ours.
+        area = NEST_BUILD_AREA / arm['instance']
+        cmd = ['bash', '-c', 'if [ -e "$1" ]; then nest rm -r "$1"; else echo "verified absent $1"; fi', 'nest-area', str(area)]
+        print(shlex.join(cmd))
+        if not dry and NEST_BUILD_AREA.parent.is_dir():
+            print(run(cmd).stdout.strip())
+
+
+NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 
 def build_scopes(cards):
@@ -1184,7 +1200,20 @@ def build_slot_capable(revision):
     return shown.returncode == 0 and 'CUTEAFD_WIP_BUILD_SLOT' in shown.stdout
 
 
-def build_arms(items, arms, cards, state, task, dry, seed='moa'):
+def seed_lanes(seed, dry):
+    """LANE_A/LANE_B for a staging config's seed rank. A pool Spark has its RoCE
+    rails; an out-of-pool seed without RoCE uses its directly attached LAN address
+    (scripts/build/seed-transfer.py), which wip.sh uses for every bulk transfer."""
+    if seed in HOSTS:
+        idx = HOSTS.index(seed) + 1
+        return f'10.55.0.{idx}', f'10.55.1.{idx}'
+    if dry:
+        return '0.0.0.0', '0.0.0.0'
+    addr = run([sys.executable, str(REPO / 'scripts/build/seed-transfer.py'), 'lan-addr', seed]).stdout.strip()
+    return addr, addr
+
+
+def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
     scopes = build_scopes(cards)
     for item in items:
         name, revision = item.split('=', 1)
@@ -1235,8 +1264,8 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         values.update(COORDINATOR_DOCKER_DEV='cuteafd-coordinator-dev:' + tag, SPARK_EXPERT_DOCKER_DEV='cuteafd-spark-expert-dev:' + tag)
         arm['dev_image_tag'] = tag
         for i, host in enumerate(hosts):
-            idx = HOSTS.index(host) + 1
-            values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{idx}', f'SPARK_{i}_LANE_B': f'10.55.1.{idx}'})
+            lane_a, lane_b = seed_lanes(host, dry)
+            values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': lane_a, f'SPARK_{i}_LANE_B': lane_b})
         build_config.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
         # Only the submodules a WIP build reads, from the local module stores
         # (scripts/build/wip-source-checkout.sh, verified against the tree locks).
@@ -1272,7 +1301,7 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    for host in (('raptor', *HOSTS) if build_role == 'both' else ('raptor',)):
+                    for host in (('raptor', *HOSTS, *([seed] if seed not in HOSTS else [])) if build_role == 'both' else ('raptor',)):
                         marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
                         mark = ['python3', '-c', marker]
                         run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
@@ -1331,7 +1360,9 @@ def main():
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
-    parser.add_argument('--seed-host', default='moa', choices=('rhea', 'moa'), help='out-of-pool Spark that compiles and seals --build arms (default moa)')
+    parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
+                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}); '
+                        'kakapo is a 10 GbE build-only seed whose slots reach the serving Sparks through sparknest')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)

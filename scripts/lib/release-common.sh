@@ -228,6 +228,25 @@ release_ssh() {
   ssh ${release_ssh_opts[@]+"${release_ssh_opts[@]}"} "$@"
 }
 
+# Bulk transfers that touch a host without RoCE (a build seed on 10 GbE only)
+# use AES-GCM (hardware-accelerated on x86-64 and GB10), no ssh compression
+# (zstd compresses the payload where it pays) and, when ADDR is given, the
+# host's directly attached LAN address instead of a slower name route; the
+# host key is still checked under HOST's own name.
+release_bulk_ssh_opts=(-c aes128-gcm@openssh.com -o Compression=no)
+# release_host_has_rdma HOST: HOST has at least one RDMA device (RoCE fabric).
+release_host_has_rdma() {
+  release_ssh "$1" 'ls /sys/class/infiniband 2>/dev/null | grep -q .'
+}
+# release_bulk_ssh HOST ADDR ARGS...: one bulk ssh leg (ADDR may be empty).
+release_bulk_ssh() {
+  local host="$1" addr="$2"
+  shift 2
+  local -a route=()
+  [[ -z "$addr" || "$addr" == "$host" ]] || route=(-o "HostName=$addr" -o "HostKeyAlias=$host")
+  release_ssh "${release_bulk_ssh_opts[@]}" ${route[@]+"${route[@]}"} "$host" "$@"
+}
+
 # Inference images verify package payload hashes when built. Compare their
 # immutable manifests before changing services so all peers select one layout.
 release_exl3_package_identity() {

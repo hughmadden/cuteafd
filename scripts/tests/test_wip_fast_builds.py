@@ -277,7 +277,7 @@ def test_seed_lease_holds_the_real_flock_until_released(tmp_path):
     leg runs and free again after release."""
     text = (ROOT / 'wip.sh').read_text()
     helpers = text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3]
-    helpers += text[text.index("# The seed Spark's lock: rhea and moa have their own"):text.index('build_coordinator() {')]
+    helpers += text[text.index("# The seed Spark's lock: rhea, moa and the out-of-pool build seed kakapo"):text.index('build_coordinator() {')]
     locks = tmp_path / 'locks'
     locks.mkdir()
     probe = 'import fcntl,sys; f=open(sys.argv[1],"a"); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)'
@@ -288,7 +288,7 @@ wip_seed_lease_acquire moa
 if python3 -c {probe!r} {str(locks / 'moa.lock')!r} 2>/dev/null; then echo free-while-held; fi
 wip_seed_lease_release
 python3 -c {probe!r} {str(locks / 'moa.lock')!r} && echo free-after
-[[ "$(wip_seed_lock rhea) $(wip_seed_lock ostrich)" == "rhea sparks" ]]
+[[ "$(wip_seed_lock rhea) $(wip_seed_lock ostrich) $(wip_seed_lock kakapo)" == "rhea sparks kakapo" ]]
 '''
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + command], capture_output=True, text=True, timeout=60,
                             env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'TMPDIR': str(tmp_path)})
