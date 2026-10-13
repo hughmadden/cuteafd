@@ -135,6 +135,9 @@ before → after tables with conditions.
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   no failing ids since the codex/v1 merge (808 pass); add none.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
+  From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
+  (`cd /home/tj/Developer/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
+  relative submodule gitfiles resolve only from the real path.
 - Release and WIP builds persist Cargo registry/git under
   `~/.cache/cuteafd/cargo-home/<arch>`, toolchain-keyed JIT caches under
   `~/.cache/cuteafd/jit/<dev-toolchain-hash>/<arch>`, and local compiler caches

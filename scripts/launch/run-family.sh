@@ -1374,11 +1374,11 @@ case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2;
 # (temperature, T.Limit headroom, power and limit, SM clock, clock-event reasons and their
 # cumulative throttle seconds) for /v1/stats, /v1/thermal, the console and every bench
 # report's per-phase throttle summary; off disables it. A host power governor's state file
-# (/run/gpu-power-governor, when present) is mounted read-only so the report carries it.
+# (gpu-powerd's /run/gpu-powerd, when present) is mounted read-only so the report carries it.
 thermal="$(get THERMAL on)"
 case "$thermal" in on|off) ;; *) echo "THERMAL must be on or off" >&2; exit 2 ;; esac
 thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
-[[ ! -d /run/gpu-power-governor ]] || thermal_args+=(-v /run/gpu-power-governor:/run/gpu-power-governor:ro)
+[[ ! -d /run/gpu-powerd ]] || thermal_args+=(-v /run/gpu-powerd:/run/gpu-powerd:ro)
 api_mount_args=()
 agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
 mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"

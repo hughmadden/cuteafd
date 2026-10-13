@@ -72,38 +72,14 @@ pub(super) struct GlmContextSplit<'a> {
 }
 
 /// The `glm_sparse_mla_partial_h{begin}_s{N}_m64` variants this GPU runs, as (row cap, program)
-/// ascending: the exporter's split plan per (SM count, row cap) (`row_caps`; a variant without
-/// it serves the full decode rows of its `device_sm_counts`), else the one variant. A step of
-/// `t` rows runs the smallest cap >= `t` ([`pick`]): a few verify rows plan more splits.
+/// ascending ([`crate::shared::peer_split::context::partial_programs`]).
 fn partial_programs(manifest: &serde_json::Value, begin: usize, sms: usize) -> Result<Vec<(usize, String)>> {
-    let programs = manifest["programs"].as_array().context("program manifest")?;
-    let prefix = format!("glm_sparse_mla_partial_h{begin}_s");
-    let variants: Vec<&serde_json::Value> = programs.iter()
-        .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with("_m64"))).collect();
-    let full = DECODE_ROWS;
-    let mut out: Vec<(usize, String)> = Vec::new();
-    for p in &variants {
-        let name = p["name"].as_str().context("program name")?.to_string();
-        let caps: Vec<usize> = match p["params"]["row_caps"].get(sms.to_string()) {
-            Some(caps) => caps.as_array().context("row caps")?.iter().filter_map(|c| c.as_u64().map(|c| c as usize)).collect(),
-            None if p["params"]["device_sm_counts"].as_array()
-                .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))) => vec![full],
-            None => Vec::new(),
-        };
-        out.extend(caps.into_iter().map(|cap| (cap, name.clone())));
-    }
-    if out.is_empty() && variants.len() == 1 {
-        out.push((full, variants[0]["name"].as_str().context("program name")?.to_string()));
-    }
-    out.sort();
-    out.dedup_by_key(|(cap, _)| *cap);
-    ensure!(out.last().is_some_and(|(cap, _)| *cap >= full), "no {prefix}*_m64 variant planned for {sms} SMs at {full} rows");
-    Ok(out)
+    crate::shared::peer_split::context::partial_programs(manifest, "glm", begin, DECODE_ROWS, sms)
 }
 
 /// The variant of `partials` (ascending caps) a step of `rows` rows runs.
 fn pick(partials: &[(usize, String)], rows: usize) -> &str {
-    partials.iter().find(|(cap, _)| *cap >= rows).or(partials.last()).map_or("", |(_, name)| name.as_str())
+    crate::shared::peer_split::context::pick_partial(partials, rows)
 }
 
 /// A view of `bytes` at `offset` inside `dev`.
