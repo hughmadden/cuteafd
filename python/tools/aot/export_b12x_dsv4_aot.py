@@ -335,7 +335,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     # BF16 KDA recurrent state (serve --kda-state bf16): the BF16-projection KDA programs and the
     # replay commit over a BF16 state, computed in FP32 and rounded after every decode, verify and
     # commit row and where each chunked-prefill window stores it (``s16t``: after every 16-row
-    # tile). New stems: the FP32 programs above, and their objects, are unchanged.
+    # tile). Decode shares the FP32-state programs' scheduling; prefill keeps its original route.
     for rows, f8, tag, rounding in ((decode_rows, True, "s16", "window"), (prefill_rows, "prefill", "s16", "window"),
                                     (prefill_rows, "prefill", "s16t", "tile")):
         kda_decode = {"seq_ctas": 8, "decode_tiles": True} if f8 is True else {}
