@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -192,6 +193,39 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             assert args[args.index("--geometry") + 1] == family
             assert args[args.index("--role") + 1] == role
             assert args[args.index("--atomic-min-capacity") + 1] == "256"
+
+
+def test_hybrid_group_covers_compact_and_grouped_live_rows():
+    _, exporter, args = next(job for job in compare_sm.jobs("all")
+                             if job[0] == "v41-slices-rtx_tp2-hybrid")
+    assert exporter == "export_b12x_slices_aot.py"
+    assert args[args.index("--role") + 1] == "rtx_tp2"
+    assert args[args.index("--compact-max-capacity") + 1] == "80"
+    assert args[args.index("--compact-live-rows") + 1] == "8"
+    assert args[args.index("--rows") + 1] == "1,2,16,80"
+
+
+def test_hybrid_objects_are_identical_at_188_and_170_sms(tmp_path, monkeypatch):
+    # The normal host script gate has no DSL compiler. In the coordinator
+    # compiler image this executes the real offline exporter, without a GPU.
+    pytest.importorskip("cutlass")
+    monkeypatch.setattr(compare_sm, "ROOT", ROOT)
+    monkeypatch.setenv("CUTEAFD_SOURCE_ROOT", str(ROOT))
+    for sms in (188, 170):
+        output = tmp_path / str(sms)
+        output.mkdir()
+        payload = dict(output=str(output), sms=sms,
+                       exporter="export_b12x_slices_aot.py",
+                       args=["--role", "rtx_tp2", "--rows", "1,16", "--width", "192",
+                             "--compact-max-capacity", "16", "--compact-live-rows", "8",
+                             "--standard-names"])
+        subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
+                        "--_worker", json.dumps(payload)], check=True, timeout=300)
+    report = compare_sm.compare(tmp_path / "188", tmp_path / "170")
+    assert report["programs"]
+    assert all(program["object_identical"] and program["header_identical"]
+               and program["cubins_identical"] for program in report["programs"])
+    assert not report["manifest_changed_fields"]
 
 
 def test_offline_exporters_do_not_initialize_or_allocate_cuda():

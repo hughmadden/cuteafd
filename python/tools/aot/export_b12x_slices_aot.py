@@ -201,13 +201,13 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         ]
         label = (f"{family}_{role}_m{capacity}" if standard_names
                  else f"v41_slices_m{capacity}_w{selected_width}")
-        pipeline = (V41DraftSlicePipeline(capacity, selected_width, props.multi_processor_count)
+        pipeline = (V41DraftSlicePipeline(capacity, selected_width)
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
                                                hidden=hidden))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
-            pipeline = V41HybridPipeline(capacity, selected_width, props.multi_processor_count,
+            pipeline = V41HybridPipeline(capacity, selected_width,
                 intermediate=intermediate, cutoff=min(capacity, compact_live_rows))
         if coordinator:
             args.insert(0, make_fake_tensor(cutlass.BFloat16, (capacity, 5120), (5120, 1), assumed_align=16))
