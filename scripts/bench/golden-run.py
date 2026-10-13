@@ -340,6 +340,12 @@ def docker_command(state, name, arm, slot, out_dir, golden):
     gpus = state['gpus']
     mounts = [(str(art / 'cuteafd'), f'{SLOT_BIN}/cuteafd'),
               (str(art / 'libcuteafd_native.so'), f'{SLOT_LIB}/libcuteafd_native.so')]
+    for source, target in (('bin-variants', SLOT_BIN), ('lib-variants', SLOT_LIB)):
+        variants = art / source
+        if variants.is_dir():
+            for variant in sorted(variants.iterdir()):
+                if variant.is_dir():
+                    mounts.append((str(variant), f'{target}/{variant.name}'))
     for package in ('exl3', 'fp8'):
         if (art / package).is_dir():
             mounts.append((str(art / package), f'{SLOT_LIB}/{package}'))
