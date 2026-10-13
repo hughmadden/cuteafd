@@ -1202,10 +1202,42 @@ def build_slot_capable(revision):
     return shown.returncode == 0 and 'CUTEAFD_WIP_BUILD_SLOT' in shown.stdout
 
 
+def seed_option_capable(revision):
+    """Whether `revision`'s wip.sh takes its build seed from WIP_SEED_HOST. An older
+    one builds on SPARK_0_HOST, so its staging config must lead with the seed."""
+    shown = subprocess.run(['git', '-C', str(REPO), 'show', revision + ':wip.sh'], capture_output=True, text=True, timeout=120)
+    return shown.returncode == 0 and 'WIP_SEED_HOST' in shown.stdout
+
+
+def staging_hosts(union, seed, separate):
+    """The Spark hosts a staging config lists. With a separate seed (WIP_SEED_HOST)
+    they are only the serving union, filled to six when its size is not a rank count
+    config validation admits (2/3/4/6), preferring a pool-Spark seed as filler; a seed
+    outside the pool (kakapo) is never named. A legacy wip.sh builds on SPARK_0_HOST,
+    so there the seed leads."""
+    if separate:
+        hosts = [h for h in HOSTS if h in union]
+        spare = [*([seed] if seed in HOSTS and seed not in hosts else []), *(h for h in HOSTS if h not in hosts and h != seed)]
+    else:
+        hosts = [seed, *[h for h in HOSTS if h in union and h != seed]]
+        spare = [h for h in HOSTS if h not in hosts]
+    # Config validation admits 2/3/4/6 ranks, not arbitrary staging unions.
+    return hosts if len(hosts) in (2, 3, 4, 6) else hosts + spare[:6 - len(hosts)]
+
+
+def seed_env(arm, seed, dry):
+    """wip.sh's seed parameters for a Spark build: WIP_SEED_HOST, plus the bulk
+    transfer address of a seed off the RoCE fabric. Legacy wip.sh reads neither."""
+    if not arm.get('seed_separate') or arm.get('build_role') != 'both':
+        return {}
+    return dict(WIP_SEED_HOST=seed, **({} if seed in HOSTS else {'WIP_SEED_ADDR': seed_lanes(seed, dry)[0]}))
+
+
 def seed_lanes(seed, dry):
-    """LANE_A/LANE_B for a staging config's seed rank. A pool Spark has its RoCE
-    rails; an out-of-pool seed without RoCE uses its directly attached LAN address
-    (scripts/build/seed-transfer.py), which wip.sh uses for every bulk transfer."""
+    """LANE_A/LANE_B of a build seed. A pool Spark has its RoCE rails; an
+    out-of-pool seed without RoCE uses its directly attached LAN address
+    (scripts/build/seed-transfer.py), which wip.sh uses for every bulk transfer
+    (WIP_SEED_ADDR; never a SPARK_* key)."""
     if seed in HOSTS:
         idx = HOSTS.index(seed) + 1
         return f'10.55.0.{idx}', f'10.55.1.{idx}'
@@ -1243,12 +1275,15 @@ def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             print('# legacy arm: GPU lock held for the full build')
             build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
         print('# build locking ' + name + ': ' + arm['build_lock_mode'])
-        # Seed on an out-of-pool Spark; stage the sealed slot to the whole union.
+        # Seed on an out-of-pool host; stage the sealed slot to the whole serving union.
+        # The seed is wip.sh's own parameter (WIP_SEED_HOST), never a SPARK_* rank,
+        # unless this revision's wip.sh predates it.
         union = {h for card in cards for h in card.get('sparks', [])}
-        hosts = [seed, *[h for h in HOSTS if h in union and h != seed]]
-        # Config validation admits 2/3/4/6 ranks, not arbitrary staging unions.
-        if len(hosts) not in (2, 3, 4, 6):
-            hosts += [h for h in HOSTS if h not in hosts][:6 - len(hosts)]
+        arm['seed_separate'] = seed_option_capable(revision)
+        hosts = staging_hosts(union, seed, arm['seed_separate'])
+        if build_role == 'both':
+            print(f"# build seed {name}: {seed} ({'WIP_SEED_HOST' if arm['seed_separate'] else 'legacy SPARK_0_HOST'}); "
+                  f"Spark targets ({len(hosts)}): {','.join(hosts)}")
         build_config = state / ('build-' + name + '.config')
         # A staging config: the first card's model and its --set/--arm-set
         # overrides, the union of Spark hosts, and no serving topology. Export
@@ -1308,6 +1343,9 @@ def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         mark = ['python3', '-c', marker]
                         run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
+                    env.pop('WIP_SEED_HOST', None)
+                    env.pop('WIP_SEED_ADDR', None)
+                    env.update(seed_env(arm, seed, dry))
                     if arm['build_slot']:
                         env['CUTEAFD_WIP_BUILD_SLOT'] = 'on'
                     if arm['build_lock_mode'] == 'legacy-full-build':

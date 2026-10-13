@@ -268,14 +268,15 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     # A revision whose wip.sh predates build slots keeps the outer build.lock.
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
+    monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: True)
     cards.build_arms(['base=HEAD', 'candidate=HEAD'], arms, [entry, other], tmp_path, 'task', True)
     for arm in ('base', 'candidate'):
         cfg = cards.config(tmp_path / ('build-' + arm + '.config'))
-        hosts = {cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))}
-        # The default seed (build-only kakapo) leads; the union's serving hosts follow
-        # (six ranks already, so no padding host).
-        assert hosts == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', cards.DEFAULT_SEED}
-        assert cfg['SPARK_0_HOST'] == cards.DEFAULT_SEED
+        hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+        # The union's five serving hosts, padded to six ranks with a pool Spark; the
+        # default seed (build-only kakapo) is wip.sh's WIP_SEED_HOST, never a rank (#117).
+        assert set(hosts) == {'moa', 'rhea', 'ostrich', 'dodo', 'emu', 'kiwi'} and len(hosts) == 6
+        assert cards.DEFAULT_SEED not in hosts
     output = capsys.readouterr().out
     assert output.count('identical build scopes') == 2
     assert 'build.lock' in output and 'gpu1.lock' not in output
@@ -318,11 +319,14 @@ def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, g
 def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
     arms = cards.arms_from(['base=b:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
-    cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
-    cfg = cards.config(tmp_path / 'build-base.config')
-    assert cfg['SPARK_0_HOST'] == 'rhea'
-    hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
-    assert hosts.count('rhea') == 1 and set(entry['sparks']) <= set(hosts)
+    for separate in (False, True):
+        monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: separate)
+        cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
+        cfg = cards.config(tmp_path / 'build-base.config')
+        hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+        # Legacy wip.sh builds on SPARK_0_HOST; a separate seed is passed as WIP_SEED_HOST.
+        assert (hosts[0] == 'rhea') == (not separate)
+        assert set(entry['sparks']) <= set(hosts) and hosts.count('rhea') == (0 if separate else 1)
 
 
 def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, capsys):

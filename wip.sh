@@ -17,13 +17,18 @@ bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|g
 usage() {
   cat <<'EOF'
 Usage: ./wip.sh [--slot NAME] [--role coordinator|expert|both]
-                [--from-slot NAME] [--config FILE] [--recreate] [--dry-run]
+                [--from-slot NAME] [--config FILE] [--seed HOST] [--recreate] [--dry-run]
 
 Synchronizes the current checkout into persistent development containers and
 incrementally builds a named WIP slot. The coordinator container builds and
-runs coordinator slots. The first configured Spark builds Spark slots, which
-are copied directly and concurrently to the other persistent Spark WIP
-containers.
+runs coordinator slots. A seed host builds Spark slots, which are copied to
+every configured Spark's persistent WIP container. --seed HOST (or
+WIP_SEED_HOST) names the seed; it need not be a configured Spark (a build-only
+seed such as kakapo is never one), and the config's SPARK_*_HOST list stays the
+serving Sparks that receive the slot. Unset, the seed is SPARK_0_HOST.
+WIP_SEED_ADDR optionally gives a seed without RDMA its bulk-transfer address
+(default: its LANE_A when it is a configured Spark, else its directly attached
+LAN address).
 The default builds the shared release Spark role set alongside historical TP4,
 independent of the serving topology. CUTEAFD_WIP_SPARK_TP_ROLES selects an
 explicit subset (empty keeps only TP4).
@@ -50,6 +55,7 @@ config="$repo_root/cuteafd.config"
 slot=current
 role=both
 from_slot=
+seed_option="${WIP_SEED_HOST:-}"
 recreate=0
 dry_run=0
 while [[ $# -gt 0 ]]; do
@@ -68,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --config)
       config="${2:?$1 requires a configuration file}"
+      shift 2
+      ;;
+    --seed)
+      seed_option="${2:?--seed requires a host}"
       shift 2
       ;;
     --recreate)
@@ -93,6 +103,8 @@ done
 [[ -z "$from_slot" || "$from_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
   release_die "invalid source WIP slot name: $from_slot"
 [[ "$slot" != "$from_slot" ]] || release_die "--from-slot must differ from --slot"
+[[ -z "$seed_option" || "$seed_option" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+  release_die "invalid WIP seed host: $seed_option"
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
 # A fresh coordinator-only slot (0-Spark cards) touches no Spark: no Spark dev
 # image, container, process check, build or distribution.
@@ -128,8 +140,18 @@ mapfile -t wip_hosts < <(release_spark_values HOST)
 ((${#wip_hosts[@]})) || release_die "configuration has no active Spark hosts"
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
   release_die "SPARK_COUNT=$SPARK_COUNT does not match ${#wip_hosts[@]} configured Spark hosts"
-seed_host="${wip_hosts[0]}"
-wip_target_hosts=("${wip_hosts[@]:1}")
+# The seed builds the Spark slot; the configured Sparks (wip_hosts) serve it.
+# A seed outside them (kakapo) is a build host only: it gets the build
+# container, never a serving one, and is never a distribution target. Every
+# host that holds this instance's Spark WIP container is wip_container_hosts.
+seed_host="${seed_option:-${wip_hosts[0]}}"
+wip_target_hosts=()
+wip_seed_serves=0
+for host in "${wip_hosts[@]}"; do
+  if [[ "$host" == "$seed_host" ]]; then wip_seed_serves=1; else wip_target_hosts+=("$host"); fi
+done
+wip_container_hosts=("${wip_hosts[@]}")
+((wip_seed_serves)) || wip_container_hosts=("$seed_host" "${wip_hosts[@]}")
 
 # Opt-in replicated-group Spark expert roles for the WIP slot. Shared slots
 # derive coverage from the release role configuration; an explicit empty
@@ -145,7 +167,8 @@ if ((dry_run)); then
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
   echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
-  echo "  seed host: $seed_host (transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto})"
+  echo "  seed host: $seed_host ($( ((wip_seed_serves)) && echo serving || echo build-only), transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto}${WIP_SEED_ADDR:+ via $WIP_SEED_ADDR})"
+  echo "  Spark targets (${#wip_target_hosts[@]}): $(IFS=,; echo "${wip_target_hosts[*]}")"
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
@@ -161,7 +184,6 @@ release_resolve_coordinator_gpu_identity
 
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
-seed_host="$SPARK_0_HOST"
 state_dir="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
 wip_mount_root="$state_dir"
 python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$state_dir"
@@ -301,8 +323,9 @@ CANCEL
 release_configure_ssh_transport
 # The seed's transport. A seed on the RoCE fabric streams directly (rdmasync,
 # rdmapipe). A seed without RDMA (a 10 GbE build seed such as kakapo) moves bulk
-# data over its configured SPARK_0_LANE_A address (its directly attached LAN
-# address, not a slower name route) with release_bulk_ssh, compresses what
+# data over WIP_SEED_ADDR (default: its LANE_A when it is a configured Spark,
+# else its directly attached LAN address from scripts/build/seed-transfer.py;
+# not a slower name route) with release_bulk_ssh, compresses what
 # crosses that link, and hands sealed slots to the serving Sparks through
 # sparknest (CUTEAFD_WIP_SEED_TRANSFER: auto, nest or stream; see
 # wip_slot_transfer_mode).
@@ -312,7 +335,16 @@ wip_seed_transfer="${CUTEAFD_WIP_SEED_TRANSFER:-auto}"
 case "$wip_seed_transfer" in auto|nest|stream) ;; *) release_die "CUTEAFD_WIP_SEED_TRANSFER must be auto, nest or stream" ;; esac
 if ((wip_spark_leg)) && ! release_host_has_rdma "$seed_host"; then
   wip_seed_rdma=0
-  wip_seed_addr="$SPARK_0_LANE_A"
+  wip_seed_addr="${WIP_SEED_ADDR:-}"
+  if [[ -z "$wip_seed_addr" ]]; then
+    for ((wip_rank = 0; wip_rank < SPARK_COUNT; wip_rank++)); do
+      wip_key="SPARK_${wip_rank}_HOST"
+      [[ "${!wip_key}" != "$seed_host" ]] || { wip_key="SPARK_${wip_rank}_LANE_A"; wip_seed_addr="${!wip_key}"; }
+    done
+  fi
+  [[ -n "$wip_seed_addr" ]] ||
+    wip_seed_addr="$(python3 "$repo_root/scripts/build/seed-transfer.py" lan-addr "$seed_host")" ||
+    release_die "WIP seed $seed_host has no RDMA and no reachable LAN address; set WIP_SEED_ADDR"
   echo "WIP seed $seed_host has no RDMA: bulk transfers over $wip_seed_addr"
 fi
 if ((wip_spark_leg)); then
@@ -380,7 +412,7 @@ distribute_spark_dev_image() {
 remove_wip_containers() {
   docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
   local host
-  for host in "${wip_hosts[@]}"; do
+  for host in "${wip_container_hosts[@]}"; do
     ssh -o BatchMode=yes "$host" "docker rm -f '$spark_container' >/dev/null 2>&1 || true" &
   done
   wait
@@ -395,7 +427,7 @@ fi
 if ((recreate)); then
   # Refuse before removing any container or payload, including remote uid-1001
   # trees. Legacy root slots stay available until an operator chooses a new root.
-  for host in "${wip_hosts[@]}"; do
+  for host in "${wip_container_hosts[@]}"; do
     ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'CHECK_ROOT'
 set -euo pipefail
 root="$1"
@@ -416,7 +448,7 @@ CHECK_ROOT
   # instance's build payloads even when its host-backed root was implicit.
   for part in build output slots incoming run cache; do
     rm -rf "$state_dir/$part"
-    for host in "${wip_hosts[@]}"; do
+    for host in "${wip_container_hosts[@]}"; do
       ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$part" <<'CLEAR_ROOT'
 set -euo pipefail
 root="$1"
@@ -446,7 +478,7 @@ preflight_existing_container_images() {
   fi
   ((wip_spark_leg)) || return 0
   expected="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
-  for host in "${wip_hosts[@]}"; do
+  for host in "${wip_container_hosts[@]}"; do
     actual="$(ssh -o BatchMode=yes "$host" "docker inspect -f '{{.Image}}' '$spark_container' 2>/dev/null || true")"
     [[ -z "$actual" || "$actual" == "$expected" ]] ||
       release_die "$host $spark_container uses an old development image; rerun ./wip.sh --recreate"
@@ -650,7 +682,8 @@ wip_reuse_role() {
 }
 
 echo "== ensuring persistent WIP development containers =="
-wip_hosts_for_containers=("${wip_hosts[@]}")
+# The serving Sparks' containers, plus the build-only seed's own build container.
+wip_hosts_for_containers=("${wip_container_hosts[@]}")
 ensure_local_container
 remote_pids=()
 ((wip_spark_leg)) || wip_hosts_for_containers=()
@@ -676,7 +709,7 @@ exit 1
 wip_expert_processes_active() {
   local host
   ((wip_spark_leg)) || return 1
-  for host in "${wip_hosts[@]}"; do
+  for host in "${wip_container_hosts[@]}"; do
     if ssh -o BatchMode=yes "$host" docker exec -i "$spark_container" bash -s <<'CONTAINER'
 for pid_file in /wip/run/*.pid; do
   [ -f "$pid_file" ] || continue
