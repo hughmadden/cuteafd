@@ -32,7 +32,8 @@
 //! words); graphs capture only its persistent buffers.
 use super::*;
 use crate::shared::peer_split::attention::{context_decode, Candidates, ContextKernels, Partial, Query};
-use crate::shared::peer_split::context::{local_pages, partial_programs, pick_partial, ContextExchange};
+use crate::shared::peer_split::context::{local_pages, partial_program, ContextExchange};
+use cuteafd_core::coordinator_programs::AttentionReductionPlan;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::deepseek_v4::{context_buffers, context_commit_units, context_workspace,
     V4Context};
@@ -70,8 +71,10 @@ pub(super) struct V4ContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical units one staging view holds: the compiled extent's.
     staging_units: usize,
-    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)` by row cap.
-    partial: [[Vec<(usize, String)>; 2]; 2],
+    /// Per GPU, the partial program of heads `[0, H/2)` and `[H/2, H)`: one split plan chosen
+    /// at load from the attention reduction plan, the same for every step's row count, so k
+    /// one-row steps and one k-row verify reduce identically (lossless speculation).
+    partial: [[String; 2]; 2],
     /// Physical layer -> C4 ordinal (`None`: not a C4 layer).
     ordinal: Vec<Option<usize>>,
     commit_limit: usize,
@@ -91,7 +94,7 @@ impl<'a> V4ContextSplit<'a> {
     /// Allocates both GPUs' context buffers and the exchange for `engine` (whose peer is attached)
     /// over `extent` tokens; `abort`: the head split's terminal abort words.
     pub fn new(engine: &Engine<'a>, context: V4Context, extent: usize, manifest: &serde_json::Value,
-        abort: Option<[*const u32; 2]>) -> Result<Self> {
+        abort: Option<[*const u32; 2]>, plan: &AttentionReductionPlan) -> Result<Self> {
         let cfg = &engine.cfg;
         let (prefill, decode, lanes) = (engine.prefill_rows as u64, engine.decode_rows as u64, PREFILL_LANES as u64);
         let buffers = context_buffers(cfg, extent as u64, prefill, decode, lanes, context);
@@ -106,12 +109,14 @@ impl<'a> V4ContextSplit<'a> {
             .filter(|(name, _)| !name.starts_with("C4 scratch")).collect();
         ensure!(metadata::C4_SCRATCH_UNITS as u64 >= cuteafd_loader::placement::families::deepseek_v4::context_scratch_units(decode),
             "{decode} decode rows need more than {} C4 scratch pages", metadata::C4_SCRATCH_UNITS);
-        let mut partial: [[Vec<(usize, String)>; 2]; 2] = Default::default();
+        let mut partial: [[String; 2]; 2] = Default::default();
         let mut build = |rank: usize| -> Result<ContextRank<'a>> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
                 for (slot, begin) in partial[rank].iter_mut().zip([0, cfg.n_heads / 2]) {
-                    *slot = partial_programs(manifest, engine.family, begin, engine.decode_rows, sms)?;
+                    let program = partial_program(manifest, engine.family, begin, engine.decode_rows, sms, plan)?;
+                    *slot = program.strip_prefix(engine.family).and_then(|p| p.strip_prefix('_'))
+                        .context("partial program of another family")?.to_string();
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
                 let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
@@ -183,8 +188,14 @@ impl<'a> Engine<'a> {
             (Some(a), Some(b)) => Some([a, b]),
             _ => None,
         };
-        let split = V4ContextSplit::new(self, context, extent, manifest, abort)?;
-        tracing::info!(bytes = ?split.bytes(), exchange = split.exchange.bytes(), "V4 C4 context attention buffers");
+        // One reduction plan for every step, after the drafter loaded: each sequence verifies
+        // draft_block() + 1 rows (C1), plain decode one.
+        let block = self.draft_block();
+        let plan = AttentionReductionPlan::new(self.decode_rows, (block > 0).then_some(block), None)
+            .map_err(|error| anyhow::anyhow!("V4 attention reduction plan: {error:?}"))?;
+        let split = V4ContextSplit::new(self, context, extent, manifest, abort, &plan)?;
+        tracing::info!(bytes = ?split.bytes(), exchange = split.exchange.bytes(), plan_rows = plan.rows(),
+            partial = ?split.partial, "V4 C4 context attention buffers");
         self.context = Some(split);
         Ok(())
     }
@@ -312,10 +323,7 @@ impl<'a> Engine<'a> {
                 let window = if self.ordinal % 2 == rank { m.swa_lengths.buffer.ptr } else { own.empty_window.buffer.ptr };
                 // Before the first completed group nothing is selected: an empty C4 list.
                 let selected = if self.tables.c4_groups == 0 { own.empty_window.buffer.ptr } else { own.local_lengths.buffer.ptr };
-                let program = pick_partial(&split.partial[rank][heads_rank], self.t);
-                let program = program.strip_prefix(e.family).and_then(|p| p.strip_prefix('_'))
-                    .context("partial program of another family")?;
-                e.run_on(rank, false, program, &[
+                e.run_on(rank, false, &split.partial[rank][heads_rank], &[
                     ("q", query), ("cache", e.caches_on(rank)[self.layer].main.buffer.ptr),
                     ("indices", m.swa_indices.buffer.ptr), ("lengths", window), ("extra_cache", records),
                     ("extra_indices", w.selected.buffer.ptr), ("extra_lengths", selected), ("out", out.buffer.ptr),
@@ -438,6 +446,36 @@ mod tests {
         // One scratch page covers every decode row (a step's discarded groups write distinct rows).
         assert!(metadata::C4_SCRATCH_UNITS as u64
             >= cuteafd_loader::placement::families::deepseek_v4::context_scratch_units(64));
+    }
+
+    /// V4's reduction plan is chosen once from dSpark's verify width (block 5 + 1 = 6 rows) and
+    /// selects the same partial for every step row count; without a drafter, the one-row plan.
+    #[test]
+    fn one_partial_plan_per_card_from_the_draft_width() {
+        // As the exporter records them: each variant lists only the SM counts it serves.
+        let caps = |s: &str, c: serde_json::Value| {
+            let sms: Vec<u64> = c.as_object().unwrap().keys().map(|k| k.parse().unwrap()).collect();
+            serde_json::json!({"name": s, "params": {"row_caps": c, "device_sm_counts": sms}})
+        };
+        let mut programs = Vec::new();
+        for begin in [0, 32] {
+            programs.push(caps(&format!("dsv4f_sparse_mla_partial_h{begin}_s10_m64"), serde_json::json!({"170": [1, 8], "188": [1, 8]})));
+            programs.push(caps(&format!("dsv4f_sparse_mla_partial_h{begin}_s4_m64"), serde_json::json!({"188": [64]})));
+            programs.push(caps(&format!("dsv4f_sparse_mla_partial_h{begin}_s1_m64"), serde_json::json!({"170": [64]})));
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        let dspark = AttentionReductionPlan::new(64, Some(5), None).unwrap();
+        assert_eq!(dspark.rows(), 6);
+        for sms in [170, 188] {
+            for begin in [0, 32] {
+                assert_eq!(partial_program(&manifest, "dsv4f", begin, 64, sms, &dspark).unwrap(),
+                    format!("dsv4f_sparse_mla_partial_h{begin}_s10_m64"));
+            }
+        }
+        let plain = AttentionReductionPlan::new(64, None, None).unwrap();
+        assert_eq!(partial_program(&manifest, "dsv4f", 0, 64, 188, &plain).unwrap(), "dsv4f_sparse_mla_partial_h0_s10_m64");
+        let wide = AttentionReductionPlan::new(64, Some(5), Some(48)).unwrap();
+        assert_eq!(partial_program(&manifest, "dsv4f", 0, 64, 188, &wide).unwrap(), "dsv4f_sparse_mla_partial_h0_s4_m64");
     }
 
     /// Every decode/verify C4 write lands inside a GPU's local pool or its scratch page: the
