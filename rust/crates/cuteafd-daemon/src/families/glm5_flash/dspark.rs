@@ -802,6 +802,10 @@ impl<'a> Drafter<'a> {
         match self { Self::RemoteDflash(d) => d.synchronize(), _ => Ok(()) }
     }
 
+    pub fn finish_request(&self) -> Result<()> {
+        match self { Self::RemoteDflash(d) => d.finish_request(), _ => Ok(()) }
+    }
+
     pub fn finish_terminal(&self, drained: bool) {
         if let Self::RemoteDflash(d) = self { d.finish_terminal(drained); }
     }

@@ -266,7 +266,12 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     for metadata in ("positions", "tables", "anchors"):
         assert draft.index(f"self.put(&w.{metadata}") < draft.index("input(&ids, w.h.buffer")
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
-    assert transport.index("self.synchronize()?") < transport.index("self.draft.update_with(")
+    assert "self.synchronize()?" not in transport
+    assert "cuda_stream_synchronize" not in transport
+    final_ack = remote.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
+    assert final_ack.index("self.exchange.wait(0, TAPS)") < final_ack.index("cuda_stream_synchronize")
+    release = (family / "serve.rs").read_text().split("fn release(", 1)[1].split("#[derive", 1)[0]
+    assert release.index("family.finish_request()") < release.index("cache.release(")
     assert transport.index("self.exchange.wait(0, TAPS)") < transport.index("self.exchange.push_planes(0, TAPS")
     assert transport.index("self.exchange.wait(1, TAPS)") < transport.index("self.exchange.signal(1, TAPS)")
     taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
@@ -274,7 +279,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     owner = remote.split("pub(crate) struct RemoteDflash", 1)[1].split("impl<'a>", 1)[0]
     assert owner.index("pub draft:") < owner.index("exchange:") < owner.index("stream:")
     drain = (family / "engine.rs").read_text().split("    pub(crate) fn synchronize(", 1)[1].split("    fn start(", 1)[0]
-    assert drain.index("drain_ranks(") < drain.index("drafter.finish_terminal(result.is_ok())")
+    assert "drain_ranks(" in drain
+    shutdown = (family / "engine.rs").read_text().split("    fn shutdown_submission(", 1)[1].split("    fn publish_tp2_abort(", 1)[0]
+    assert shutdown.index("ranks:") < shutdown.index("links:") < shutdown.index("copies:") < shutdown.index("graphs:")
+    assert "drafter.finish_terminal(drained)" in shutdown
     assert "synchronize_remote()" in drain
     serving = (family / "serve.rs").read_text()
     assert "drafter.require_live()?;" in serving
