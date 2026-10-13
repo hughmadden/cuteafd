@@ -14,8 +14,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 /// Fast samples per second the sampler takes (temperature, clock, power, reasons).
-pub const SAMPLE_HZ: u32 = 10;
-/// Every this many fast samples also reads the slow tier (throttle counters, T.Limit margin).
+pub const SAMPLE_HZ: u32 = 1;
+/// Every this many fast samples also reads the slow tier (throttle counters, T.Limit margin):
+/// those are GSP RPCs of about 2 ms per GPU, so every 10 s.
 pub const SLOW_EVERY: u32 = 10;
 /// Samples kept per GPU (two hours at [`SAMPLE_HZ`]); a longer window is summarized over what remains.
 const KEEP: usize = 2 * 3600 * SAMPLE_HZ as usize;

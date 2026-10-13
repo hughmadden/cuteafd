@@ -3,7 +3,8 @@
 //! One thread, off every request path: the fast tier (temperature, SM clock,
 //! power, limit, clock-event reasons, utilization; about 0.1 ms per GPU) at
 //! [`thermal::SAMPLE_HZ`], the slow tier (cumulative throttle counters, T.Limit
-//! headroom, memory temperature; about 2 ms per GPU) once a second. Samples go
+//! headroom, memory temperature; about 2 ms per GPU) every
+//! [`thermal::SLOW_EVERY`] fast samples. Samples go
 //! to `cuteafd_core::thermal`, which `/v1/stats` (current values) and
 //! `/v1/thermal` (interval summaries for the bench) read. A periodic log line
 //! puts current values on the console. `CUTEAFD_THERMAL=off` disables it.
