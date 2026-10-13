@@ -843,21 +843,49 @@ GLMF_TWO_LAYER = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_
                   "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-@pytest.mark.parametrize("keys,tensor", [("", False), ("GLM5_FLASH_DRAFT_HEAD=exact\n", False),
-                                        ("GLM5_FLASH_DRAFT_HEAD=tensor\n", True)])
-def test_glmf_draft_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+@pytest.mark.parametrize("keys,forwarded", [
+    # auto (unset) forwards nothing: the engine resolves tensor over the BF16 head and leaves the FP8 head's
+    # own program alone, so both default launch lines are unchanged.
+    ("", None), ("GLM5_FLASH_TARGET_HEAD=auto\n", None), ("GLM5_FLASH_FP8_HEAD=off\n", None),
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=auto\n", None),
+    # Explicit settings are forwarded; exact stays an explicit diagnostic.
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=tensor\n", "tensor"),
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=exact\n", "exact"),
+    ("GLM5_FLASH_TARGET_HEAD=exact\n", "exact")])
+def test_glmf_target_head_defaults_to_tensor_with_the_bf16_head(tmp_path, keys, forwarded):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert ("--draft-head tensor" in launch) == tensor, launch
-    assert ("--draft-head" in launch) == tensor, launch
+    assert ("--target-head" in launch) == (forwarded is not None), launch
+    if forwarded:
+        assert f"--target-head {forwarded}" in launch, launch
 
 
-def test_glmf_draft_head_rejects_unknown_values_before_launch(tmp_path):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_HEAD=fp8\n")
-    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" in result.stderr, result.stderr
+def test_glmf_fp8_head_launch_is_identical_with_and_without_the_target_head_key(tmp_path):
+    """The FP8-head default config is byte-for-byte unaffected by the target-head default."""
+    lines = []
+    for index, keys in enumerate(["", "GLM5_FLASH_TARGET_HEAD=auto\n"]):
+        root = tmp_path / str(index)
+        root.mkdir()
+        result = _family_launch_result(root, GLMF_TWO_LAYER, "test/glmf",
+                                      "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+        assert "--fp8-head true" in launch and "--target-head" not in launch, launch
+        lines.append(launch.replace(str(root), "ROOT"))
+    assert lines[0] == lines[1], lines
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=fp8\n", "GLM5_FLASH_TARGET_HEAD must be auto, exact or tensor"),
+    # The launcher's FP8 head default (auto) is on: an explicit tensor target head needs the BF16 head.
+    ("GLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+    ("GLM5_FLASH_FP8_HEAD=on\nGLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
+])
+def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_head(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
