@@ -51,10 +51,6 @@ use std::sync::Mutex;
 /// Resource classes: coordinator RTX and Spark expert ranks.
 const LOCAL: u8 = 0;
 const REMOTE: u8 = 1;
-/// Rows per weight-read group of the installed expert kernels. The CuTe
-/// grouped slice kernels use 16; the fp8moe/EXL3 manifests do not record a
-/// tile yet, and a wrong constant biases the fitted bandwidth, not the order.
-const GROUP_ROWS: u8 = 16;
 /// Most drafter positions the binding prices (GLM drafters propose 7 or 8).
 const MAX_POSITIONS: usize = 16;
 /// Most copy positions appended past the drafter's window.
@@ -113,10 +109,26 @@ pub(crate) enum LayerHome {
 /// GLM Flash's policy geometry from each layer's home, the router's expert
 /// count and top-k, the step's row budget, the drafter's block and the copy
 /// positions that may extend it.
+// Synthetic grouping for legacy constructor replay and CPU fixtures only.
+// Production callers migrate to geometry_with_grouping before this is cfg(test).
 pub(crate) fn geometry(homes: &[LayerHome], experts: usize, topk: usize, rows: usize, drafts: usize,
     extension: usize) -> Result<PolicyGeometry> {
+    let mut geometry = geometry_with_grouping(homes, experts, topk, rows, drafts, extension, |_, _| Ok(16))?;
+    geometry.group_rows_by_rows.clear();
+    Ok(geometry)
+}
+
+/// Price the exact installed package selected at each live verifier row count.
+pub(crate) fn geometry_with_grouping(homes: &[LayerHome], experts: usize, topk: usize, rows: usize,
+    drafts: usize, extension: usize, group: impl Fn(usize, usize) -> Result<usize>) -> Result<PolicyGeometry> {
     ensure!(drafts > 0, "a speculating drafter proposes at least one token");
     let width = drafts.min(MAX_POSITIONS);
+    let groups = (0..=rows).map(|rows| homes.iter().enumerate().map(|(layer, home)| {
+        if *home == LayerHome::Dense { return Ok(1); }
+        let group = u8::try_from(group(layer, rows)?).context("installed expert group exceeds 255")?;
+        ensure!(group > 0, "installed expert grouping is zero for layer {layer}, rows {rows}");
+        Ok(group)
+    }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     Ok(PolicyGeometry {
         layers: homes.iter().enumerate().map(|(layer, home)| {
             let (class, slice_bytes) = match *home {
@@ -124,7 +136,7 @@ pub(crate) fn geometry(homes: &[LayerHome], experts: usize, topk: usize, rows: u
                 LayerHome::Local { slice_bytes } => (Some(LOCAL), slice_bytes),
                 LayerHome::Remote { slice_bytes } => (Some(REMOTE), slice_bytes),
             };
-            LayerResource { class, slice_bytes, group_rows: GROUP_ROWS, timed: layer > 0 }
+            LayerResource { class, slice_bytes, group_rows: groups[0][layer], timed: layer > 0 }
         }).collect(),
         experts: u16::try_from(experts).context("GLM Flash routes more than 65535 experts")?,
         topk: u8::try_from(topk).context("GLM Flash top-k exceeds 255")?,
@@ -132,8 +144,21 @@ pub(crate) fn geometry(homes: &[LayerHome], experts: usize, topk: usize, rows: u
         max_positions: width + extension,
         widths: vec![width],
         classes: vec![ResourceClass::rtx(), spark_class()],
-        group_rows_by_rows: Vec::new(), regimes: 1,
+        group_rows_by_rows: groups, regimes: 1,
     })
+}
+
+/// All installed ranks serving a layer must attest the same execution grouping.
+pub(crate) fn worker_group_rows(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
+    layer: usize, rows: usize) -> Result<usize> {
+    let mut groups = reports.iter().filter(|report| report.layers().iter()
+        .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
+        .map(|report| report.group_rows(rows));
+    let group = groups.next().with_context(|| format!("installed worker report missing layer {layer}"))??;
+    for other in groups {
+        ensure!(other? == group, "installed workers disagree on layer {layer} grouping");
+    }
+    Ok(group)
 }
 
 /// Per-device bytes of one expert of an FP8/NVFP4 checkpoint at `tp` ranks:
@@ -320,6 +345,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         }
     }
     if fit_budget(&mut lengths, max_rows) { predicted = None; }
+    binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
 }
 
@@ -573,6 +599,36 @@ mod tests {
         // dSpark's eight-token block keeps all eight positions.
         assert_eq!((local.widths.clone(), local.max_positions, local.max_requests), (vec![8], 8, 128));
         assert!(geometry(&homes(true), 288, 8, 64, 0, 0).is_err());
+    }
+
+    #[test]
+    fn installed_exl3_geometry_prices_route_blocks_not_program_capacity() {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping,
+            InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+        let loaded = WorkerSelection::new(WorkerIdentity { checkpoint: "0".repeat(64),
+            geometry: [4096, 288, 8, 2048, 45], world: 2, topology: None }, &[3, 4]).unwrap();
+        let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
+            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 16, 80, 256].into_iter().map(|capacity|
+                InstalledExpertVariant::from_queries(capacity, |_| Ok(8)).unwrap()).collect()).unwrap()).collect();
+        let homes = [LayerHome::Dense, LayerHome::Dense, LayerHome::Dense,
+            LayerHome::Remote { slice_bytes: 1e6 }, LayerHome::Remote { slice_bytes: 1e6 }];
+        let geometry = geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION,
+            |layer, rows| worker_group_rows(&reports, layer, rows)).unwrap();
+        assert_eq!(geometry.layers[3].group_rows, 8);
+        for rows in 0..=128 {
+            assert_eq!(geometry.group_rows(3, rows), 8);
+            assert_eq!(geometry.group_rows(4, rows), 8);
+        }
+        assert!(geometry.layers[..3].iter().all(|layer| layer.class.is_none() && layer.group_rows == 1));
+        assert!(worker_group_rows(&reports, 2, 16).is_err());
+        let mut mixed = reports.clone();
+        mixed[1] = InstalledExpertGrouping::new(loaded, 1, 256,
+            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 16, 80, 256].into_iter().map(|capacity|
+                InstalledExpertVariant::from_queries(capacity, |_| Ok(16)).unwrap()).collect()).unwrap();
+        assert!(worker_group_rows(&mixed, 3, 16).is_err());
+        assert!(geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION, |_, _| Ok(0)).is_err());
+        assert!(geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION, |_, _| Ok(256)).is_err());
+        DraftPolicy::seeded(geometry, seed()).unwrap();
     }
 
     #[test]
