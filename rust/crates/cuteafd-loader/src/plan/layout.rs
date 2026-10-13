@@ -976,7 +976,8 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     if family == "deepseek_v4" {
         let solved = deepseek_v4_placement(report, checkpoint, options, &devices[..active_gpus],
             V4PlanShape { prefill_rows, decode_rows, concurrency, context_tokens, native_layers,
-                cache_native_layers, exl3_workspace, workspace: v4_workspace.clone() });
+                cache_native_layers, exl3_workspace, workspace: v4_workspace.clone(),
+                manifest: workspace_manifest.clone() });
         match solved {
             Ok((placement, reserves)) => {
                 for (device, reserve) in devices.iter_mut().zip(&reserves) {
@@ -1001,6 +1002,11 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                         range.first, range.first + range.layers));
                 }
                 notes.push(format!("placement: {}", placement.summary()));
+                // The solver resolved auto against this build's programs.
+                report.attention_placement = placement.attention_placement;
+                if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
+                    *note = format!("attention placement {}", placement.attention_placement);
+                }
                 local_layers = placement.onboard_layers;
                 if let Some(t) = placement.tp2 {
                     notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers));
@@ -1454,6 +1460,8 @@ struct V4PlanShape {
     cache_native_layers: usize,
     exl3_workspace: Option<u64>,
     workspace: Option<Vec<crate::serving_capacity::V4WorkspaceRank>>,
+    /// The program manifest (its C4 context programs), when given.
+    manifest: Option<serde_json::Value>,
 }
 
 /// V4's planned admission: the same `placement::families::deepseek_v4`
@@ -1497,7 +1505,10 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(&catalog), devices.len()) };
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(&catalog), devices.len()),
+        context: shape.manifest.as_ref().and_then(|m| v4::manifest_context(m, if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" },
+            cfg.n_heads, shape.decode_rows)),
+        attention: report.requested_attention };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
     Ok((crate::placement::solve(&request)?, reserves))

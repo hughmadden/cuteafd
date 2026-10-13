@@ -167,3 +167,16 @@ def test_prepare_refuses_a_moved_pin_only_in_the_gated_source(tmp_path, monkeypa
         gate.prepare(tmp_path, tmp_path / 'head')
     gate.prepare(tmp_path, tmp_path / 'base', owned=True)
     assert any('submodule' in cmd for cmd in calls)
+
+
+def test_gate_records_the_starting_head_and_fails_when_it_moves(tmp_path, monkeypatch):
+    """A checkout that changes while the gate runs must not be credited with its tests."""
+    monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
+    heads = iter(['aaaa', 'bbbb'])
+    def checked(cmd, **k):
+        return next(heads) + '\n' if 'rev-parse' in cmd else ''
+    monkeypatch.setattr(gate, 'checked', checked)
+    monkeypatch.setattr(gate, 'scripts', lambda *a: {'suite': 'scripts', 'status': 'pass'})
+    args = SimpleNamespace(cargo=False, scripts=True, benches=False)
+    record = gate.gate(ROOT, tmp_path, args)
+    assert record['head'] == 'aaaa' and record['moved'] and record['status'] == 'failed'

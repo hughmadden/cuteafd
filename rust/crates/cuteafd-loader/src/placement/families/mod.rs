@@ -18,12 +18,14 @@ use super::{AttentionPlacement, ExecutorModes, FfnMode, LayerMode};
 const WHOLE0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 
-/// V4 Flash/Pro: every layer head-split on two GPUs, or whole on GPU0. Its
-/// only hop is the entry broadcast of the embedding rows into GPU1.
-/// Per-layer ownership (`Whole{gpu}` mixes, ranges) waits for its per-layer
-/// executor (P7).
-pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4", modes: &[LayerMode::HeadSplit, WHOLE0],
-    hops: false, attention: AttentionPlacement::Heads };
+/// V4 Flash/Pro: every layer head-split on two GPUs, or whole on GPU0; under
+/// `context` the C4 layers token-split their compressed records (#58; C128,
+/// window rings and carry stay replicated). Its only hop is the entry
+/// broadcast of the embedding rows into GPU1. Per-layer ownership (`Whole{gpu}`
+/// mixes, ranges) waits for its per-layer executor (P7). `heads` stays the
+/// recorded default until `context` passes its gates.
+pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4",
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Heads };
 /// V4.1: layer ranges, layers 0-19 / 20-39 whole on each GPU with one boundary
 /// hop (`BlockTransfer`) and the owner-reduce FFN.
 pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true, attention: AttentionPlacement::Heads };

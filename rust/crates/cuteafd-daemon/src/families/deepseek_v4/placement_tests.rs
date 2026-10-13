@@ -32,6 +32,8 @@ struct Case<'a> {
     dspark: bool,
     exchange_f32: bool,
     peer_budget: Option<u64>,
+    /// `--attention-placement` on both sides (`None`: auto).
+    attention: Option<cuteafd_loader::placement::AttentionPlacement>,
 }
 
 fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
@@ -39,7 +41,7 @@ fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
         layout: Some(LayoutOptions { rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
-        ..Default::default() }).unwrap();
+        attention_placement: case.attention, ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
     (report.memory_layout.unwrap(), report.placement_supported, hints)
 }
@@ -62,6 +64,7 @@ fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool)
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
+    if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
     let cli = Cli::try_parse_from(argv)?;
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
@@ -135,8 +138,9 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     assert_eq!(runtime.residual.len(), runtime.layers.len() + 1, "{label}: residual homes");
     assert!(runtime.hops.iter().all(|h| !h.charged()), "{label}: V4 hops");
     assert!(runtime.items.iter().flatten().all(|i| i.group != "residual hops"), "{label}: hop buffers");
-    super::check_modes(&runtime, case.rtx == 2).unwrap_or_else(|e| panic!("{label}: {e:#}"));
-    assert!(super::check_modes(&runtime, case.rtx != 2).is_err(), "{label}: the other engine shape is refused");
+    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1).unwrap();
+    super::check_modes(&runtime, case.rtx == 2, &cfg).unwrap_or_else(|e| panic!("{label}: {e:#}"));
+    assert!(super::check_modes(&runtime, case.rtx != 2, &cfg).is_err(), "{label}: the other engine shape is refused");
     if let Some(t) = runtime.tp2 {
         assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
         assert!(layout.notes.contains(&format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers)));
@@ -159,6 +163,65 @@ fn synthetic(dir: &Path) -> PathBuf {
     path
 }
 
+/// [`synthetic`] with the C4 token-split programs a context build exports.
+fn synthetic_context(dir: &Path) -> PathBuf {
+    let path = synthetic(dir);
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let programs = manifest["programs"].as_array_mut().unwrap();
+    for (name, scratch) in [("dsv4f_scored_index_topk_decode_m64", 9_178_112), ("dsv4f_dsa_candidate_merge", 0),
+        ("dsv4f_lse_combine2", 0), ("dsv4f_paged_staging_gather_c4", 0), ("dsv4f_paged_staging_gather_index", 0),
+        ("dsv4f_sparse_mla_partial_h0_s4_m64", 4_000_000), ("dsv4f_sparse_mla_partial_h32_s4_m64", 4_000_000)] {
+        programs.push(serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": scratch}}));
+    }
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    path
+}
+
+/// C4 token-split admission (#58): the planner and serve-dsv4 agree under `context`, auto stays
+/// `heads` even where the build carries the programs, only C4 layers split, and the context
+/// buffers are charged on both GPUs while the C4 records halve.
+#[test]
+fn planner_equals_runtime_deepseek_v4_fixture_context() {
+    use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    let case = |attention| Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2, context: 1_048_576,
+        budget: 24 << 30, onboard: None, dspark: false, exchange_f32: false, peer_budget: None, attention };
+    let heads = assert_equal(&case(Some(AttentionPlacement::Heads)), "context fixture heads");
+    let auto = assert_equal(&case(None), "context fixture auto");
+    assert_eq!(auto, heads, "auto keeps heads until context passes its gates");
+    let context = assert_equal(&case(Some(AttentionPlacement::Context)), "context fixture context");
+    assert_eq!(context.attention_placement, AttentionPlacement::Context);
+    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 1).unwrap();
+    for (layer, (a, &ratio)) in context.layers.iter().zip(&cfg.compress_ratios).enumerate() {
+        assert_eq!(a.mode, if ratio == 4 { LayerMode::ContextSplit } else { LayerMode::HeadSplit }, "layer {layer}");
+    }
+    assert!(super::check_modes(&context, true, &cfg).unwrap());
+    assert!(!super::check_modes(&heads, true, &cfg).unwrap());
+    let bytes = |p: &Placement, gpu: usize, group: &str| p.items[gpu].iter().filter(|i| i.group == group)
+        .map(|i| i.bytes).sum::<u64>();
+    for gpu in 0..2 {
+        for group in ["context staging", "context exchange", "context workspace"] {
+            assert!(bytes(&context, gpu, group) > 0 && bytes(&heads, gpu, group) == 0, "rtx{gpu} {group}");
+        }
+        // Per 256-token unit: the two C4 layers' 45,888 B halve on each GPU, the C128 layer's 1,728 B
+        // stays whole (the window-only layer has none).
+        let per_unit = |p: &Placement| bytes(p, gpu, "records") / (p.pool_tokens / 256);
+        assert_eq!(per_unit(&heads) - per_unit(&context), 45_888, "rtx{gpu} C4 records halve");
+    }
+    // A build without the programs refuses an explicit context and runs heads on auto.
+    let plain = synthetic(&dir.path().join("plain").tap_dir());
+    let mut refused = case(Some(AttentionPlacement::Context));
+    refused.manifest = &plain;
+    let (layout, _, _) = planned(&refused);
+    assert!(runtime(&refused, &layout).is_err(), "explicit context without its programs");
+}
+
+trait TapDir { fn tap_dir(self) -> Self; }
+impl TapDir for PathBuf {
+    fn tap_dir(self) -> Self { std::fs::create_dir_all(&self).unwrap(); self }
+}
+
 /// Always runs: the fixture's four layers at Flash geometry, one and two
 /// GPUs, both extents, automatic and fixed onboard.
 #[test]
@@ -170,7 +233,7 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
             for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Layers(0)), Some(Onboard::Fraction(0.5)),
                 Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
-                    onboard, dspark: false, exchange_f32: false, peer_budget: None };
+                    onboard, dspark: false, exchange_f32: false, peer_budget: None, attention: None };
                 let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
                 // The default: pool first for Flash on one or two RTX (`default_onboard`).
                 let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard());
@@ -198,7 +261,7 @@ fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
         for exchange_f32 in [false, true] {
             let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
                 context: 1_048_576, budget: 32 << 30, peer_budget: Some(30 << 30),
-                onboard, dspark: true, exchange_f32 };
+                onboard, dspark: true, exchange_f32, attention: None };
             let p = assert_equal(&case, &format!("fixture TP2 dSpark {onboard:?} f32={exchange_f32}"));
             assert!(p.expert_ranges.iter().all(|r| r.layers == 0));
             assert!(p.expert_ranges[0].peak_bytes > 0);
@@ -216,7 +279,7 @@ fn planner_equals_runtime_v4_bundled_draft_off() {
     for rtx in [1, 2] {
         let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
             context: 1_048_576, budget: 32 << 30, peer_budget: None,
-            onboard: Some(Onboard::Layers(0)), dspark: false, exchange_f32: false };
+            onboard: Some(Onboard::Layers(0)), dspark: false, exchange_f32: false, attention: None };
         let p = assert_equal(&case, &format!("bundled draft off rtx{rtx}"));
         assert!(p.expert_ranges.iter().all(|range| range.peak_bytes == 0));
         let (layout, _, _) = planned(&case);
@@ -232,7 +295,8 @@ fn tp2_backbone_admission_does_not_require_tp1_kernels() {
     for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0)), Some(Onboard::Layers(2)),
         Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
         let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
-            context: 1_048_576, budget: 24 << 30, peer_budget: None, onboard, dspark: false, exchange_f32: false };
+            context: 1_048_576, budget: 24 << 30, peer_budget: None, onboard, dspark: false, exchange_f32: false,
+            attention: None };
         let (layout, supported, _) = planned(&case);
         assert!(supported);
         assert_eq!(runtime_with_tp1(&case, &layout, false).unwrap(), runtime(&case, &layout).unwrap());
@@ -282,7 +346,7 @@ fn planner_equals_runtime_deepseek_v4() {
                 for asymmetric in [false, true] {
                     let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
                         onboard, dspark: true, exchange_f32: asymmetric,
-                        peer_budget: asymmetric.then_some(budget - (2 << 30)) };
+                        peer_budget: asymmetric.then_some(budget - (2 << 30)), attention: None };
                     let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}"));
                     if rtx == 2 {
                         assert!(placement.expert_ranges.iter().all(|r| r.layers == 0));
@@ -313,7 +377,7 @@ fn planner_equals_runtime_deepseek_v4_missing_tp2_package() {
     for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0))] {
         let case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6,
             context: 1_048_576, budget: (95.5 * (1u64 << 30) as f64) as u64,
-            peer_budget: None, onboard, dspark: false, exchange_f32: false };
+            peer_budget: None, onboard, dspark: false, exchange_f32: false, attention: None };
         let p = assert_equal(&case, &format!("missing TP2 package {onboard:?}"));
         assert_eq!(p.onboard_layers, 0);
         assert!(p.tp2.is_none());
@@ -412,7 +476,7 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let onboard = fixture.onboard.as_deref().map(|o| o.parse::<Onboard>().unwrap());
         let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
             context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
-            peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes) };
+            peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes), attention: None };
         let (layout, supported, hints) = planned(&case);
         assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
         let catalog = cuteafd_loader::read_expert_catalog(&snapshot).unwrap();

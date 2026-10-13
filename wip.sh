@@ -156,6 +156,9 @@ wip_hwlock() {
   python3 "$repo_root/scripts/hw/hwlock.py" --locks "$1" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-1800}" -- "${@:2}"
 }
 mapfile -t wip_hosts < <(release_spark_values HOST)
+# A coordinator-only clone of a config with no active Sparks (0-Spark cards)
+# also skips the Spark leg: nothing to clone, rebuild or reach.
+((${#wip_hosts[@]})) || [[ "$role" != coordinator ]] || wip_spark_leg=0
 ((${#wip_hosts[@]} || !wip_spark_leg)) || release_die "configuration has no active Spark hosts"
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
   release_die "SPARK_COUNT=$SPARK_COUNT does not match ${#wip_hosts[@]} configured Spark hosts"
@@ -185,6 +188,7 @@ if ((dry_run)); then
   echo "  slot: $slot (role $role)"
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
   echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+  echo "  Spark leg: $( ((wip_spark_leg)) && echo on || echo off)"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host ($( ((wip_seed_serves)) && echo serving || echo build-only), transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto}${WIP_SEED_ADDR:+ via $WIP_SEED_ADDR})"
   echo "  Spark targets (${#wip_target_hosts[@]}): $(IFS=,; echo "${wip_target_hosts[*]}")"
@@ -800,6 +804,7 @@ to="$2"
 test -d "/wip/slots/$from/coordinator"
 test ! -e "/wip/slots/$to"
 CONTAINER
+  if ((wip_spark_leg)); then
   ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
 set -euo pipefail
 from="$1"
@@ -807,6 +812,7 @@ to="$2"
 test -d "/wip/slots/$from/spark-expert"
 test ! -e "/wip/slots/$to"
 CONTAINER
+  fi
   docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
 set -euo pipefail
 from="$1"
@@ -814,6 +820,7 @@ to="$2"
 mkdir -p "/wip/slots/$to"
 cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
 CONTAINER
+  if ((wip_spark_leg)); then
   ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
 set -euo pipefail
 from="$1"
@@ -822,6 +829,7 @@ test -d "/wip/slots/$from/spark-expert"
 mkdir -p "/wip/slots/$to"
 cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
 CONTAINER
+  fi
 fi
 
 # Reuse needs each role's slot on the host that builds it: raptor and the seed.
@@ -1329,7 +1337,7 @@ if [ ! -d "/wip/slots/$to/coordinator" ]; then
   cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
 fi
 CONTAINER
-elif [[ -n "$from_slot" && "$role" == coordinator ]]; then
+elif [[ -n "$from_slot" && "$role" == coordinator ]] && ((wip_spark_leg)); then
   ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
 set -euo pipefail
 from="$1"
@@ -1353,7 +1361,7 @@ test -s "/wip/slots/$slot/coordinator/FINGERPRINT"
 test -s "/wip/slots/$slot/coordinator/workspace/cuteafd.config"
 CONTAINER
 fi
-if [[ "$role" != coordinator || -n "$from_slot" ]]; then
+if ((wip_spark_leg)) && [[ "$role" != coordinator || -n "$from_slot" ]]; then
 ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$slot" <<'CONTAINER'
 set -euo pipefail
 slot="$1"

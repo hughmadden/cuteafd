@@ -30,9 +30,13 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec::default(),
-        executor: families::DEEPSEEK_V4,
+        executor: V4_HEADS,
     }
 }
+
+/// V4 as `deepseek_v4::request` builds it without the C4 context programs: heads or GPU0 only.
+const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
+    ..families::DEEPSEEK_V4 };
 
 #[test]
 fn v4_defaults_to_pool_first_and_retains_explicit_max() {
@@ -752,9 +756,15 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
             layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
         }
         req.pool_overhead = vec![0; 2];
+        // A family whose context mode is not yet its recorded default pins auto to heads in its
+        // request (V4 until #58's gates pass: `deepseek_v4::request`).
+        if executor.family == "deepseek_v4" {
+            req.policy.attention = vec![(AttentionClass::Csa, AttentionPlacement::Heads)];
+        }
         let auto = solve(&req).unwrap();
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
+        req.policy.attention.clear();
         if executor.attention_default() != AttentionPlacement::Heads {
             // A recorded non-heads default is not a flip: auto runs it outright.
             req.attention_placement = Some(executor.attention_default());

@@ -231,6 +231,9 @@ def scripts(source, root, args, env):
 
 def gate(source, root, args, owned=False):
     prepare(source, root, owned)
+    # Record the gated commit before running: a checkout that moves during the
+    # gate would otherwise be credited with tests that ran against older source.
+    head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
     env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
     suites = []
     if args.cargo:
@@ -239,15 +242,17 @@ def gate(source, root, args, owned=False):
         suites.append(scripts(source, root, args, env))
     if args.benches:
         suites.append(benches(source, root, args, env))
-    head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
+    moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
-    return dict(source=str(source), head=head, dirty=dirty, suites=suites,
-                status='pass' if suites and all(s['status'] == 'pass' for s in suites) else 'failed')
+    passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
+    return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites,
+                status='pass' if passed else 'failed')
 
 
 def render(record):
     lines = [f"# CPU gate {record['task']}: {record['verdict']}", '',
              f"HEAD {record['head'][:12]}{' (dirty)' if record['dirty'] else ''}" +
+             (' (moved during the gate: rerun)' if record.get('moved') else '') +
              (f", base {record['base']['head'][:12]}" if record.get('base') else ''), '',
              '| Suite | Status | Passed | Failed | Seconds | Note |', '| --- | --- | ---: | ---: | ---: | --- |']
     for suite in record['suites']:

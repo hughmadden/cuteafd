@@ -47,7 +47,6 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use std::path::PathBuf;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -937,12 +936,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
-    let mut trace = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_GLMF_TRACE")
-        .map(|(var, path)| {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)
-                .with_context(|| format!("{var}: opening speculation trace {path}"))
-        }).transpose()?;
+    let mut trace = crate::shared::speculation_trace::Trace::open("CUTEAFD_GLMF_TRACE")?;
     let mut trace_round = 0u64;
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
@@ -1534,7 +1528,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
                 "finished": finished,
             });
-            if let Err(error) = writeln!(trace, "{line}").and_then(|_| trace.flush()) {
+            if let Err(error) = trace.write(&line) {
                 tracing::warn!(%error, "GLM Flash speculation trace write failed");
             }
         }
