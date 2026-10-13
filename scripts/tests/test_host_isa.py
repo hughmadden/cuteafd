@@ -127,7 +127,7 @@ def test_wip_build_key_and_staging_carry_the_variants():
     wip = (ROOT / 'wip.sh').read_text()
     key = wip[wip.index('wip_build_key="$('):wip.index('} | sha256sum', wip.index('wip_build_key="$('))]
     assert 'host-isa coordinator' in key
-    for path in ('scripts/lib/release-common.sh', 'run.sh'):
+    for path in ('scripts/lib/release-common.sh', 'scripts/launch/run-family.sh'):
         text = (ROOT / path).read_text()
         assert '/bin-variants/." ' in text and '/lib-variants/." ' in text, path
     finalize = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
