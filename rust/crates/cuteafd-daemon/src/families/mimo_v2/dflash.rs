@@ -356,14 +356,16 @@ mod mask_tests {
 }
 
 impl<'a> MimoDrafter<'a> {
-    pub fn confidence_policy(&self, head: &str) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
+    pub fn confidence_prior(&self, head: &str) -> Result<crate::shared::draft_confidence::SelectorFit> {
         let (storage, rows) = match self.representation {
             MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
             MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
         };
         let numerics = format!("{storage}-{rows}-{head}-{:?}-r1", self.confidence_scales).to_ascii_lowercase();
-        crate::shared::draft_confidence::ConfidencePolicy::load_prior(&self.confidence_directory,
-            format!("mimo_v2/dflash/{numerics}"))
+        let key = format!("mimo_v2/dflash/{numerics}");
+        let mut fit = crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory, &key)?;
+        fit.key = key;
+        Ok(fit)
     }
 
     /// Loads the drafter's weights from `file` (its safetensors bytes, see

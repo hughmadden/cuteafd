@@ -634,22 +634,80 @@ impl<'a> MimoEngine<'a> {
         Some(observe(routes, &times))
     }
 
-    pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
+    pub(crate) fn draft_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
-        let tensors = catalog.fp8().context("MiMo routed expert format")?;
-        let ranks = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().world_size(),
-            _ => 1,
+        let reports = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            _ => Vec::new(),
         };
-        self.weights.layers.iter().enumerate().map(|(index, layer)| {
+        let homes = self.weights.layers.iter().enumerate().map(|(index, layer)| {
             if layer.dense { return Ok(LayerHome::Dense); }
-            let local = self.tp2_layer(index) || self.rtx_local_layer(index)
-                || !matches!(self.experts, Some(Experts::Spark { .. }));
-            let tp = if self.tp2_layer(index) { 2 } else if local { 1 } else { ranks };
-            let bytes = resource::fp8_slice_bytes(tensors, tp)?;
-            Ok(if local { LayerHome::Local { slice_bytes: bytes } } else { LayerHome::Remote { slice_bytes: bytes } })
-        }).collect()
+            let bytes = if self.tp2_layer(index) {
+                self.tp2.as_ref().context("MiMo TP2")?.ranks.iter()
+                    .map(|rank| rank.borrow().weight_read_bytes()).max().context("MiMo TP2 ranks")?
+            } else if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(index).is_ok()) {
+                local.weight_read_bytes()
+            } else { match &self.experts {
+                Some(Experts::Local(local)) => {
+                    local.index_of(index)?;
+                    local.weight_read_bytes()
+                }
+                Some(Experts::Streamed { experts, .. }) => experts.borrow().weight_read_bytes(),
+                Some(Experts::Spark { .. }) => {
+                    let bytes = reports.iter().filter(|report| report.layers().iter()
+                        .any(|range| (range.first as usize..range.end as usize).contains(&index)))
+                        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
+                    return Ok(LayerHome::Remote { slice_bytes: *bytes.iter().max()
+                        .with_context(|| format!("installed MiMo worker missing layer {index}"))? as f64 });
+                }
+                Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {index} has no installed expert owner"),
+            }};
+            Ok(LayerHome::Local { slice_bytes: bytes as f64 })
+        }).collect::<Result<Vec<_>>>()?;
+        let geometry = resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk,
+            DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION,
+            |layer, rows| Ok(self.draft_group(layer, rows, &reports)?.0))?;
+        let mut geometry = geometry;
+        geometry.classes = vec![cuteafd_core::ResourceClass::rtx(), cuteafd_core::ResourceClass::spark()];
+        for (layer, home) in homes.iter().enumerate().filter(|(_, home)| **home != LayerHome::Dense) {
+            let (group_rows, contract) = self.draft_group(layer, 0, &reports)?;
+            tracing::info!(layer, ?home, group_rows, traffic_contract = contract.label(),
+                "MiMo installed draft-policy expert traffic");
+        }
+        Ok(geometry)
+    }
+
+    fn draft_group(&self, layer: usize, rows: usize,
+        reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping])
+        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
+        if self.tp2_layer(layer) {
+            let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
+            let group = tp2.ranks[0].borrow().weight_read_group(rows)?;
+            ensure!(tp2.ranks[1].borrow().weight_read_group(rows)? == group,
+                "MiMo TP2 ranks disagree on installed expert grouping");
+            return Ok(group);
+        }
+        if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(layer).is_ok()) {
+            return local.weight_read_group(rows, true);
+        }
+        match &self.experts {
+            Some(Experts::Local(local)) => local.weight_read_group(rows, !local.wire_input()),
+            Some(Experts::Streamed { experts, .. }) => {
+                let local = experts.borrow();
+                local.weight_read_group(rows, !local.wire_input())
+            }
+            Some(Experts::Spark { .. }) => {
+                let group = crate::shared::draft::resource::worker_group_rows_for_input(
+                    reports, layer, rows, self.expert_bf16_input(true))?;
+                let mut contracts = reports.iter().filter(|report| report.layers().iter()
+                    .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
+                    .map(|report| report.traffic_contract());
+                let contract = contracts.next().with_context(|| format!("installed MiMo worker missing layer {layer}"))?;
+                ensure!(contracts.all(|other| other == contract), "MiMo workers disagree on installed traffic contract");
+                Ok((group, contract))
+            }
+            Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {layer} has no installed expert owner"),
+        }
     }
 
     fn probe_mark(&self, index: usize) -> Result<()> {
