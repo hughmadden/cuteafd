@@ -410,10 +410,16 @@ distribute_spark_dev_image() {
   ((failed == 0)) || release_die "Spark development image distribution failed"
 }
 
+# --recreate follows --role: coordinator touches only raptor's container and
+# state, expert only the Spark legs, both everything. A leg the role does not
+# name keeps its containers and sealed slot outputs.
+recreate_local=1 recreate_remote=1
+[[ "$role" != expert ]] || recreate_local=0
+[[ "$role" != coordinator ]] || recreate_remote=0
 remove_wip_containers() {
-  docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
+  ((recreate_local == 0)) || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
   local host
-  for host in "${wip_container_hosts[@]}"; do
+  ((recreate_remote == 0)) || for host in "${wip_container_hosts[@]}"; do
     ssh -o BatchMode=yes "$host" "docker rm -f '$spark_container' >/dev/null 2>&1 || true" &
   done
   wait
@@ -428,7 +434,7 @@ fi
 if ((recreate)); then
   # Refuse before removing any container or payload, including remote uid-1001
   # trees. Legacy root slots stay available until an operator chooses a new root.
-  for host in "${wip_container_hosts[@]}"; do
+  ((recreate_remote == 0)) || for host in "${wip_container_hosts[@]}"; do
     ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'CHECK_ROOT'
 set -euo pipefail
 root="$1"
@@ -448,8 +454,8 @@ CHECK_ROOT
   # The frozen source and global stores survive. --recreate clears this
   # instance's build payloads even when its host-backed root was implicit.
   for part in build output slots incoming run cache; do
-    rm -rf "$state_dir/$part"
-    for host in "${wip_container_hosts[@]}"; do
+    ((recreate_local == 0)) || rm -rf "$state_dir/$part"
+    ((recreate_remote == 0)) || for host in "${wip_container_hosts[@]}"; do
       ssh -o BatchMode=yes "$host" bash -s -- "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$part" <<'CLEAR_ROOT'
 set -euo pipefail
 root="$1"

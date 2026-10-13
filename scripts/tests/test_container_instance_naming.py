@@ -253,33 +253,47 @@ def test_wip_launchers_use_recorded_container_and_layout():
     assert '"wip_instance": ${wip_instance@Q}' in (ROOT / "scripts/build/finalize-wip-slot.sh").read_text()
 
 
-def test_wip_recreate_targets_only_resolved_instance(tmp_path):
+@pytest.mark.parametrize("role,local,remote", [("coordinator", True, False), ("expert", False, True), ("both", True, True)])
+def test_wip_recreate_targets_only_resolved_instance_and_role(tmp_path, role, local, remote):
     text = (ROOT / "wip.sh").read_text()
+    gate = "recreate_local=1 recreate_remote=1" + text.split("recreate_local=1 recreate_remote=1", 1)[1].split("remove_wip_containers() {", 1)[0]
     body = text.split("remove_wip_containers() {", 1)[1].split("\n}", 1)[0]
+    # The clearing loop: state on raptor and on every Spark, one part at a time.
+    clear = "for part in build output" + text.split("for part in build output", 1)[1].split("\n  done\nfi\n", 1)[0] + "\n  done\n"
     binary = tmp_path / "bin"
     binary.mkdir()
     log = tmp_path / "calls"
+    state = tmp_path / "state"
+    for part in ["build", "output", "slots", "incoming", "run", "cache"]:
+        (state / part).mkdir(parents=True)
     for name in ["docker", "ssh"]:
         stub = binary / name
-        stub.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$LOG"\n')
+        stub.write_text('#!/usr/bin/env bash\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$LOG"\ncat >/dev/null 2>&1 || true\n')
         stub.chmod(0o755)
     script = f'''set -euo pipefail
 source "{COMMON}"
 WIP_INSTANCE=own
+role={role}
+state_dir="{state}"
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
-wip_hosts=(rhea moa)
+wip_container_hosts=(rhea moa)
+{gate}
 remove_wip_containers() {{{body}
 }}
 remove_wip_containers
+{clear}
 '''
     result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}", LOG=str(log)),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    calls = log.read_text().splitlines()
-    assert "rm -f cuteafd-coordinator-wip-own" in calls
-    assert all("cuteafd-spark-expert-wip-own" in call for call in calls if "rhea" in call or "moa" in call)
-    assert "rm -f cuteafd-coordinator-wip" not in calls
+    calls = log.read_text().splitlines() if log.exists() else []
+    assert ("docker rm -f cuteafd-coordinator-wip-own" in calls) == local
+    assert "docker rm -f cuteafd-coordinator-wip" not in calls
+    spark_calls = [c for c in calls if c.startswith("ssh ")]
+    assert any("cuteafd-spark-expert-wip-own" in c for c in spark_calls) == remote
+    assert any("CLEAR_ROOT" in c or " build" in c or "slots" in c for c in spark_calls) == remote
+    assert [(state / part).exists() for part in ["build", "output", "slots"]] == [not local] * 3
 
 
 @pytest.mark.parametrize("root", ["/tmp/build", "/mnt/scratch/wip", "/home/tj/.cache/cuteafd/builds/../wrong", "/home/tj/.cache/cuteafd/builds"])
