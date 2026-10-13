@@ -54,9 +54,11 @@ but bounded engineering still goes to Sol.
 | Critical kernel design only, after Sol `xhigh` and Opus have stalled | Astra 6 | `medium`; a short, design-only task that ends with a written design, then Sol builds it |
 | Structural or simple work, fast turnaround | DeepSeek Flash | `high`, `max` for larger sweeps |
 | Design changes, hard merges, independent review, decisions | Claude Opus | default |
+| Shared build/run tooling answering an agent's tooling request (wip.sh, wip-cards, hwlock, smoke, launchers, cpu-gate) | Claude Opus, or Sonnet for a narrow, well-specified fix | default |
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
 | Everything else exhausted | MiMo | default |
 
+- **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol `-backup` stays the default for everything else.
 - **Astra and Fable are rare.** Both cost far more per task; use them at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems. Astra burned a backup week mostly on probe plumbing in one investigation.
 - **Codex subscriptions:** start new agents on the `-backup` models (TJ's
   second subscription); when backup hits its weekly limit, start new agents
