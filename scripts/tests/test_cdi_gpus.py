@@ -52,6 +52,16 @@ def test_shell_args_and_failure(spec):
     assert bad.returncode != 0 and 'nvidia-ctk cdi generate' in bad.stderr
 
 
+def test_v41_launch_uses_cdi_for_coordinator_and_exports_helpers_to_workers():
+    text = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    v41 = text.split('launch_deepseek_v41() {', 1)[1].split('# The family:', 1)[0]
+    assert 'cuteafd_cdi_gpu_args "$gpu_uuid_csv" || exit 2' in v41
+    assert 'cuteafd_cdi_gpu_args all || exit 2' in v41
+    assert '--name "$coordinator" --restart no "${CUTEAFD_CDI_ARGS[@]}"' in v41
+    assert '--name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}"' in v41
+    assert 'export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args;' in v41
+
+
 def test_no_legacy_gpus_flag_in_launchers():
     for name in ('build.sh', 'run.sh', 'wip.sh', 'scripts/launch/run-family.sh', 'scripts/build/cuteafd-dev.sh',
                  'scripts/bench/wip-cards.py', 'scripts/bench/golden-run.py', 'scripts/bench/ab-spark-intake.sh',
