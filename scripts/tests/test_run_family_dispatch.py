@@ -369,6 +369,8 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
         for part in ("bin", "lib", "share"):
             assert f"wip-run/plan-test/slot-test/serve-default/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
+        # Draft snapshots resolve under HF_HOME; the hub is mounted at /hf/hub.
+        assert "HF_HOME=/hf" in preflight and ":/hf/hub:ro" in preflight
 
 
 @pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
