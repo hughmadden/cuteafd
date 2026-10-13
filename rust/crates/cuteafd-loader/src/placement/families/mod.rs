@@ -47,8 +47,9 @@ pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
 /// MiMo: `attach_peer` requires every layer split.
 pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[LayerMode::HeadSplit, WHOLE0],
     hops: false, attention: AttentionPlacement::Heads };
-/// Qwen: one GPU.
-pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0], hops: false, attention: AttentionPlacement::Heads };
+/// Qwen: qualified whole-width contiguous layer ranges on a Spark-free pair.
+pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0, WHOLE1],
+    hops: true, attention: AttentionPlacement::Layers };
 
 /// Every family's executor set, for lookups by family name.
 pub const EXECUTORS: [ExecutorModes; 6] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4];

@@ -2234,12 +2234,32 @@ fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
 }
 
 #[test]
-fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
+fn qwen_default_attention_follows_spark_free_coordinator_layout() {
+    use crate::placement::AttentionPlacement;
+    let dir = snapshot(qwen4_config(48), &[]);
+    for (gpus, peer, ranks, expected) in [
+        (2, true, 0, AttentionPlacement::Layers),
+        (1, true, 0, AttentionPlacement::Heads),
+        (2, false, 0, AttentionPlacement::Heads),
+        (2, true, 1, AttentionPlacement::Heads),
+        (2, true, 4, AttentionPlacement::Heads),
+    ] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
+        }), ..sparks(ranks) };
+        let report = plan(dir.path(), &options).unwrap();
+        assert_eq!(report.attention_placement, expected, "GPUs={gpus}, peer={peer}, Sparks={ranks}");
+        assert!(report.config_error.is_none(), "{:?}", report.config_error);
+    }
+}
+
+#[test]
+fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(qwen4_config(48), &[]);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![12 << 30, 96 << 30], pool_tokens: Some(0), ..Default::default()
+            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0), ..Default::default()
         }), ..sparks(0)
     };
     let report = plan(dir.path(), &options).unwrap();
@@ -2544,12 +2564,12 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
 }
 
 #[test]
-fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
+fn split_off_local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions {
         layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![96 << 30, 96 << 30], pool_tokens: Some(32768), ..Default::default()
+            rtx_bytes: vec![96 << 30, 96 << 30], head_split: false, pool_tokens: Some(32768), ..Default::default()
         }),
         ..sparks(0)
     }).unwrap();
@@ -2891,11 +2911,21 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
-            // This fixture has no context programs; GLM's and GLM Flash's build-specific default is heads.
-            let default = if gpus == 1 || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
+            // No context programs here; Qwen with Spark experts also keeps its single-owner default.
+            let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
+            let default = if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
+            if auto.family.as_deref() == Some("qwen4") {
+                assert_eq!(auto.spark_ranks, 4);
+                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
+                if gpus == 2 {
+                    let layout = auto.memory_layout.as_ref().unwrap();
+                    assert!(layout.devices[1].items.is_empty(), "{}", layout.render());
+                    assert_eq!(layout.devices[1].kv_tokens, 0);
+                }
+            }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
                 assert!(auto.placement_supported, "{}", render(&auto));
@@ -2914,7 +2944,7 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
                     assert!(unsupported.config_error.is_none() && !unsupported.placement_supported, "{}", render(&unsupported));
                     continue;
                 }
-                if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
+                if executor.check_attention(Some(mode), gpus, peer).is_ok() {
                     assert!(unsupported.config_error.is_none());
                 } else {
                     assert!(!unsupported.executable());

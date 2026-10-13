@@ -69,6 +69,16 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || cfg[SPARK_COUNT]="$SPARK_COUNT"
 [[ -z "${SPARK_HOSTS:-}" ]] || cfg[SPARK_HOSTS]="$SPARK_HOSTS"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Owner-indexed plans name entry/head first; CDI exposes physical device order.
+dual_owner_media_device() {
+  local mode="$1" entry_device="$2" peer_device="$3"
+  case "$mode" in
+    rtx:0) printf 'rtx:%s' "$entry_device" ;;
+    rtx:1) printf 'rtx:%s' "$peer_device" ;;
+    rtx:*) release_die "dual encoder owner must be 0 or 1" ;;
+    *) printf '%s' "$mode" ;;
+  esac
+}
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
 # release with a warning.
 key() {
@@ -1109,7 +1119,7 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # carries its programs); the planner and the server resolve it. Explicit modes run only where an
 # executor exists.
 case "$attention_placement:$family" in
-  auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4) ;;
+  auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac
@@ -1615,7 +1625,12 @@ split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
-  qwen4:*) split_hint="add Qwen head-split GDN/GQA/shared-expert kernels and sharded recurrent/KV state" ;;
+  qwen4:*)
+    if [[ "$ranks" == 0 ]]; then
+      : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
+    else
+      split_hint="Qwen dual requires a Spark-free local TP2 layout"
+    fi ;;
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
 esac
@@ -1635,6 +1650,11 @@ if [[ -n "$second" && "$split" != off ]]; then
   [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
   [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
   if [[ -z "$split_hint" ]]; then
+    if [[ "$family" == qwen4 ]]; then
+      family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS all)")
+      [[ "$attention_placement" != heads ]] || release_die "Qwen dual owns whole layers; head-split attention is not implemented"
+      attention_placement=layers
+    fi
     for selected in "$gpu" "$second"; do
       grep -qx "$selected" <<<"$physical_gpus" ||
         { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
@@ -1646,6 +1666,9 @@ if [[ -n "$second" && "$split" != off ]]; then
   elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
+fi
+if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
+  release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
@@ -2064,7 +2087,16 @@ audio_encoder_hash=""
   if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
     plan_draft_args+=(--decode-rows 128)
   fi
-  [[ "$family" != qwen4 ]] || plan_draft_args+=(--kv-cache "$kv_format")
+  if [[ "$family" == qwen4 ]]; then
+    plan_draft_args+=(--kv-cache "$kv_format")
+    for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
+      case "$(get "QWEN_${key%%:*}")" in
+        on) plan_draft_args+=("${key#*:}" true) ;;
+        off) plan_draft_args+=("${key#*:}" false) ;;
+      esac
+    done
+    [[ "$head_split" != 1 ]] || plan_draft_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS all)")
+  fi
   count_args=(--available-sparks "$available_sparks")
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
@@ -2134,6 +2166,9 @@ elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
 ' "$family" <<<"$plan_json")"
   read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
+  if [[ "$family" == qwen4 && "$head_split" == 1 ]]; then
+    vision="$(dual_owner_media_device "$vision" "$((gpu == lower ? 0 : 1))" "$((gpu == lower ? 1 : 0))")"
+  fi
   if [[ "$vision" == spark:* ]]; then
     IFS=, read -r -a encoder_ranks <<<"$rank_csv"
     for encoder_rank in "${encoder_ranks[@]}"; do

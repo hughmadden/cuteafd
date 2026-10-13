@@ -40,6 +40,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
                 qwen_kv: args.kv_format,
+                qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
+                    fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
+                qwen_attention_plan_rows: args.attention_plan_rows,
                 vision_replicas: args.vision_replicas as usize,
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
@@ -635,6 +638,7 @@ mod tests {
             coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             kv_format: Default::default(),
+            fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             drafter_gib: 0.0,
             local_expert_layers: None,
             rtx_expert_layers: None,
