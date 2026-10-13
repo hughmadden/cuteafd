@@ -412,3 +412,43 @@ def test_preflight_requires_requested_layout_workspace_and_image_identity(tmp_pa
     write_package(tmp_path / "fp8-mimo-bf16", input_kind="bf16")
     with pytest.raises(ValueError, match=error):
         preflight.verify_sibling(tmp_path, "mimo", layout, capacity, revision, package_tool.verify)
+
+
+@pytest.mark.parametrize("counts,geometry,expected", [
+    ("glm=6;qwen4=4", "qwen4", "LAYOUTS=tp4-rank0;tp4-rank1;tp4-rank2;tp4-rank3"),
+    ("glm=6", "qwen4", "LAYOUTS=tp1-rank0"),  # no count for qwen4: packaged defaults
+])
+def test_cmake_exl3_family_counts_only_apply_to_their_family(tmp_path, counts, geometry, expected):
+    source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
+    body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
+    script = tmp_path / "select.cmake"
+    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+                      f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\nset(CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp1-rank0)\n'
+                      f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body
+                      + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stderr
+
+
+def test_cmake_exl3_own_family_invalid_count_still_fails(tmp_path):
+    source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
+    body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
+    script = tmp_path / "select.cmake"
+    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY qwen4)\n'
+                      'set(CUTEAFD_GENERIC_SPARK_COUNTS "qwen4=6")\n' + body)
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and "requires a nonempty H128 slice" in result.stderr
+
+
+def test_cmake_fp8_family_counts_only_apply_to_their_family(tmp_path):
+    source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
+    for family, expected in (("glm", "LAYOUTS=--layouts;tp6"), ("qwen4", "LAYOUTS=--layouts;tp4"), ("mimof", "LAYOUTS=")):
+        script = tmp_path / "select.cmake"
+        script.write_text('set(CUTEAFD_FP8_MOE_ROLE spark)\n'
+                          f'set(count_family {family})\nset(CUTEAFD_GENERIC_SPARK_COUNTS "glm=6;qwen4=4")\n'
+                          'set(requested_layouts)\n' + body + '\nmessage("LAYOUTS=${requested_layouts}")\n')
+        result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert expected in result.stderr and (family != "mimof" or "tp" not in result.stderr)
