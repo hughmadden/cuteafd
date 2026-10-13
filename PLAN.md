@@ -957,7 +957,9 @@ Work, in priority order:
    plus fixed-capacity scratch (791,907,584 B): 1,919,933,760 B admitted, Spark-first
    when capacity permits. Unsupported towers remain unsupported, not admitted;
    checkpoints without a tower stay text-only. Quantized checkpoints lacking a
-   compatible bundled template still require explicit `CHAT_TEMPLATE_FROM`.
+   compatible bundled template still require explicit `CHAT_TEMPLATE_FROM` for
+   vision; without it `VISION=auto` serves them text only, with one note, and an
+   explicit placement is refused.
    The original failed v1 loss evidence stays intact; v3 closes the remaining
    gates. Shared code gets the quick A/B pair on an affected model (AGENTS.md).
    **Qwen image capacity:** 1024 merged tokens per image, `detail=low` 256,

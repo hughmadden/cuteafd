@@ -269,6 +269,33 @@ mod vision_template {
     }
 
     #[test]
+    fn template_gap_is_a_text_only_template_without_a_declared_base() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), TEXT_ONLY, None);
+        let gap = GlmEncoding::vision_template_gap(temp.path()).unwrap().unwrap();
+        // The refusal names the same gap.
+        let refusal = GlmEncoding::from_snapshot_for_vision(temp.path(), None, None).unwrap_err().to_string();
+        assert_eq!(refusal, format!("VISION enabled but {gap}; set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template, or VISION=off"));
+        assert!(gap.contains("does not render image markers") && gap.contains("no base_model")
+            && gap.contains(&temp.path().display().to_string()), "{gap}");
+        // An unused image macro or a refusing template is a gap; a declared base (even one that is
+        // not downloaded) or a template that marks images is not.
+        snapshot(temp.path(), "{% macro image() %}<boi><img><eoi>{% endmacro %}no images<think>", None);
+        assert!(GlmEncoding::vision_template_gap(temp.path()).unwrap().is_some());
+        snapshot(temp.path(), "{{ raise_exception('text only') }}", None);
+        assert!(GlmEncoding::vision_template_gap(temp.path()).unwrap().is_some());
+        // The EXL3 quant's own template answers an image with its text-only reminder.
+        snapshot(temp.path(), EXL3_K4, None);
+        assert!(GlmEncoding::vision_template_gap(temp.path()).unwrap().is_some());
+        snapshot(temp.path(), TEXT_ONLY, Some("missing/base"));
+        assert_eq!(GlmEncoding::vision_template_gap(temp.path()).unwrap(), None);
+        snapshot(temp.path(), VISION, None);
+        assert_eq!(GlmEncoding::vision_template_gap(temp.path()).unwrap(), None);
+        std::fs::remove_file(temp.path().join("tokenizer.json")).unwrap();
+        assert!(GlmEncoding::vision_template_gap(temp.path()).is_err());
+    }
+
+    #[test]
     fn invalid_missing_or_text_only_override_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let served = temp.path().join("served");
@@ -368,6 +395,8 @@ mod vision_template {
             .template_provenance().unwrap().selection, "checkpoint");
         let error = GlmEncoding::from_snapshot_for_vision(&tr3, None, None).unwrap_err().to_string();
         assert!(error.contains("CHAT_TEMPLATE_FROM"), "{error}");
+        assert!(GlmEncoding::vision_template_gap(&tr3).unwrap().is_some());
+        assert_eq!(GlmEncoding::vision_template_gap(&official).unwrap(), None);
         let old = GlmEncoding::from_snapshot(&tr3).unwrap();
         let fallback = GlmEncoding::from_snapshot_for_vision(&tr3, Some(official.to_str().unwrap()), None).unwrap();
         assert_eq!(old.tokens(), fallback.tokens());

@@ -128,9 +128,8 @@ impl GlmEncoding {
             Some(source) => Some(("explicit", source.to_owned())),
             None if served_supports_images => None,
             None => Some(("config_base_model", declared_base_model(&config)?.with_context(|| format!(
-                "VISION enabled but {} chat template does not render image markers and config has no base_model; \
-                 set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template, or VISION=off",
-                snapshot.display()))?)),
+                "VISION enabled but {}; set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template, or VISION=off",
+                template_gap(snapshot)))?)),
         };
         let (selected_snapshot, selected_file, selected_source, selection, requested_source) = if let Some((selection, source)) = requested {
             let base = resolve_template_snapshot(&source, hf_home)?;
@@ -157,6 +156,18 @@ impl GlmEncoding {
             selection: selection.into(), requested_source,
         });
         Ok(encoding)
+    }
+
+    /// Why a checkpoint cannot mark images from its own files: its chat template renders no image
+    /// marker span and its config names no base model to take a template from. `None` when either
+    /// can serve vision. Automatic vision serves text on a gap; `from_snapshot_for_vision` refuses it.
+    pub fn vision_template_gap(snapshot: &Path) -> Result<Option<String>> {
+        let (served_source, _) = read_chat_template(snapshot)?;
+        let config = read_json(&snapshot.join("config.json"))?;
+        let markers = vision_markers(&config, &read_json(&snapshot.join("tokenizer.json"))?)?;
+        let encoding = Self::from_snapshot_template(snapshot, served_source)?;
+        Ok((!supports_images(&encoding, snapshot, &markers)? && declared_base_model(&config)?.is_none())
+            .then(|| template_gap(snapshot)))
     }
 
     pub fn template_provenance(&self) -> Option<&GlmTemplateProvenance> { self.template_provenance.as_ref() }
@@ -247,6 +258,10 @@ fn supports_images(encoding: &GlmEncoding, snapshot: &Path, markers: &[String; 3
         }
     }
     Ok(true)
+}
+
+fn template_gap(snapshot: &Path) -> String {
+    format!("{} chat template does not render image markers and config has no base_model", snapshot.display())
 }
 
 fn declared_base_model(config: &Value) -> Result<Option<String>> {

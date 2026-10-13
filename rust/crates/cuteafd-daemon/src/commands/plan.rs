@@ -236,6 +236,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
         return Ok(());
     }
+    options.vision = glm_flash_vision(&args, family, &snapshot);
     let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
     if args.json {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
@@ -254,6 +255,21 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; "));
     }
     Ok(())
+}
+
+/// The vision policy to plan: GLM 5.3 Flash's automatic vision is off when serve-glmf would serve
+/// text (`serve::auto_vision`), so no encoder is placed for a checkpoint whose own chat template
+/// cannot mark images; the note goes to stderr once. Chat files a plan cannot read leave the policy
+/// as given: a plan needs only the checkpoint's config and tensor headers.
+fn glm_flash_vision(args: &PlanArgs, family: &str, snapshot: &std::path::Path) -> cuteafd_loader::plan::MediaMode {
+    if family != "glm5_flash" { return args.vision; }
+    match crate::families::glm5_flash::serve::auto_vision(args.vision, snapshot, args.chat_template_from.as_deref()) {
+        Ok((vision, note)) => {
+            if let Some(note) = note { eprintln!("note: {note}"); }
+            vision
+        }
+        Err(_) => args.vision,
+    }
 }
 
 fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTreeMap<String, String>> {
@@ -599,6 +615,7 @@ mod tests {
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,
+            chat_template_from: None,
             model: model.display().to_string(),
             embedding_placement: Some(crate::shared::token_io::EmbedPlacement::Gpu),
             revision: None,
@@ -1207,6 +1224,43 @@ mod tests {
             && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
+    }
+
+    /// `cuteafd plan` plans the vision policy serve-glmf serves: automatic vision on a GLM 5.3 Flash
+    /// checkpoint whose own chat template cannot mark images is off unless the launcher passes the
+    /// template source; explicit placements, other families and unreadable chat files plan as given.
+    #[test]
+    fn glm_flash_auto_vision_plans_text_when_the_template_cannot_mark_images() {
+        use clap::Parser;
+        use crate::families::glm5_flash::serve::auto_vision_tests::{chat_files, MARKS_IMAGES, TEXT_ONLY};
+        use cuteafd_loader::plan::MediaMode;
+        let snapshot = tempfile::tempdir().unwrap();
+        let model = snapshot.path().display().to_string();
+        let planned = |family: &str, extra: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", model.as_str()].into_iter()
+                .chain(extra.iter().copied())).unwrap();
+            let vision = crate::resolve_vision(cli.vision, None);
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.vision = vision;
+            glm_flash_vision(&args, family, snapshot.path())
+        };
+        chat_files(snapshot.path(), TEXT_ONLY, true, None);
+        assert_eq!(planned("glm5_flash", &[]), MediaMode::Off);
+        assert_eq!(planned("glm5_flash", &["--vision", "auto"]), MediaMode::Off);
+        assert_eq!(planned("glm5_flash", &["--chat-template-from", "zai-org/GLM-5.3-Flash"]), MediaMode::Auto);
+        for mode in ["spark", "spark:1", "rtx", "rtx:0", "off"] {
+            assert_eq!(planned("glm5_flash", &["--vision", mode]), mode.parse().unwrap(), "{mode}");
+        }
+        assert_eq!(planned("mimo_v2", &[]), MediaMode::Auto);
+        // A plan reads headers: without the chat files it keeps the policy it was given.
+        std::fs::remove_file(snapshot.path().join("tokenizer.json")).unwrap();
+        assert_eq!(planned("glm5_flash", &[]), MediaMode::Auto);
+        chat_files(snapshot.path(), MARKS_IMAGES, true, None);
+        assert_eq!(planned("glm5_flash", &[]), MediaMode::Auto);
+        chat_files(snapshot.path(), TEXT_ONLY, true, Some("zai-org/GLM-5.3-Flash"));
+        assert_eq!(planned("glm5_flash", &[]), MediaMode::Auto);
+        chat_files(snapshot.path(), TEXT_ONLY, false, None);
+        assert_eq!(planned("glm5_flash", &[]), MediaMode::Auto);
     }
 
     #[test]
