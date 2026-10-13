@@ -1,0 +1,12 @@
+{
+  "hosts": ["raptor"],
+  "gpu_uuids": [
+    "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+    "GPU-95f8f212-9131-df99-fd53-7535965197d7"
+  ],
+  "floor_w": 150,
+  "ceiling_w": 325,
+  "safe_w": 325,
+  "target_headroom_c": 15,
+  "hard_headroom_c": 8
+}
