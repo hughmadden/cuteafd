@@ -10,7 +10,7 @@
 mod shared_tp2_tests;
 use crate::shared::experts::exl3::{
     aot_layout_directory,
-    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -25,9 +25,11 @@ use std::{ffi::c_void, path::Path, rc::Rc};
 
 /// The exported capacities (rows per launch) a layer runs for at most
 /// `max_rows` live rows: each once, up to the first at or above `max_rows`
-/// (`placement::inventory::exl3_capacities`, shared with the planner).
+/// for native, non-EXL3 kernels. EXL3 also admits canonical decode scratch.
 fn capacities(max_rows: usize) -> Vec<u32> {
-    cuteafd_loader::placement::inventory::exl3_capacities(max_rows as u64).into_iter().map(|c| c as u32).collect()
+    const EXPORTED: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+    let top = EXPORTED.into_iter().find(|&c| c as usize >= max_rows).unwrap_or(4096);
+    EXPORTED.into_iter().filter(|&c| c <= top).collect()
 }
 
 struct State<'a> {
@@ -57,6 +59,7 @@ enum Backend<'a> {
     Exl3 {
         executions: Vec<Exl3Execution<'a>>,
         row_policy: Exl3RowPolicy,
+        reduction_plan: Exl3ReductionPlan,
         stages: usize,
         first: usize,
         layers: usize,
@@ -92,7 +95,9 @@ pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalo
     let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = Exl3RowPolicy::active().capacities(max_rows)?.iter()
+            .map(|c| directory.join(format!("m{c}"))).collect();
+        Exl3ReductionPlan::new(&directories)?;
         for directory in &directories { require_exl3_manifest(directory)?; }
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
@@ -120,7 +125,9 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
     let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = Exl3RowPolicy::active().capacities(max_rows)?.iter()
+            .map(|c| directory.join(format!("m{c}"))).collect();
+        Exl3ReductionPlan::new(&directories)?;
         for directory in &directories { require_exl3_manifest(directory)?; }
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
@@ -199,9 +206,7 @@ impl<'a> LocalExperts<'a> {
         if let Some(manifest) = catalog.exl3() {
             let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
             let row_policy = Exl3RowPolicy::active();
-            let capacities = if row_policy == Exl3RowPolicy::GlmFlashK64 {
-                row_policy.capacities(max_rows)?
-            } else { capacities };
+            let capacities = row_policy.capacities(max_rows)?;
             return Self::load_exl3(library, catalog, &directory, &capacities, row_policy, draft_stages, backbone, max_rows, budget);
         }
         let mut states = Vec::new();
@@ -286,6 +291,7 @@ impl<'a> LocalExperts<'a> {
             return Ok(None);
         }
         let output_bytes = max_rows * shape.hidden * 2;
+        let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let workspace = Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(output_bytes).context("local EXL3 workspace overflow")?;
         ensure!(budget > workspace, "local EXL3 experts need {workspace} workspace bytes, budget is {budget}");
@@ -330,7 +336,7 @@ impl<'a> LocalExperts<'a> {
             executions.push(execution);
         }
         Ok(Some(Self {
-            backend: Backend::Exl3 { executions, row_policy, stages: draft_stages, first: backbone.start, layers },
+            backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages: draft_stages, first: backbone.start, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,
             topk: shape.topk,
@@ -372,14 +378,15 @@ impl<'a> LocalExperts<'a> {
     ) -> Result<()> {
         let (first, layers, stages, states) = match &mut self.backend {
             Backend::Native { first, layers, stages, states, .. } => (*first, layers, stages, states),
-            Backend::Exl3 { executions, row_policy, stages, first, layers } => {
+            Backend::Exl3 { executions, row_policy, reduction_plan, stages, first, layers } => {
                 let index = match layer {
                     LocalLayer::Stage(n) if n < *stages => n,
                     LocalLayer::Backbone(n) if (*first..*first + *layers).contains(&n) => *stages + n - *first,
                     _ => anyhow::bail!("local expert layer {layer:?} is not resident"),
                 };
-                let execution = executions.iter_mut().find(|e| e.capacity() >= row_policy.required_capacity(rows))
-                    .context("no local EXL3 capacity for this many rows")?;
+                let selected = reduction_plan.execution_index(rows, row_policy.required_capacity(rows),
+                    executions.iter().map(|e| e.capacity()))?;
+                let execution = &mut executions[selected];
                 let buffer = |ptr: *mut c_void, bytes: usize| CuteafdDeviceBuffer {
                     ptr, bytes, device_id: self.device, ..Default::default()
                 };
