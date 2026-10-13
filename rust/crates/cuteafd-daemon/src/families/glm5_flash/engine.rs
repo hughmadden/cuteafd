@@ -3155,6 +3155,13 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
+    /// Eager speculative verification for timing: complete device work without downloading logits.
+    pub(super) fn bench_verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32])
+        -> Result<()> {
+        self.decode_step(sequences, tokens, None, true, None, None, true)?;
+        self.synchronize()
+    }
+
     pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
 
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
