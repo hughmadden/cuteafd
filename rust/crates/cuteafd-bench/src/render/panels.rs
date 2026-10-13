@@ -28,6 +28,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "prefill" => prefill(doc, t, latest, w),
         "retained" => retained(doc, t, latest, w),
         "prefix_cache" => prefix_cache(doc, t, latest, w),
+        "context_load" => context_load(doc, t, latest, w),
         "fidelity" | "fidelity_full" => fidelity(doc, t, latest, w),
         "structured" => structured(doc, t, latest, w),
         "needle" => needle(doc, t, latest, w),
@@ -40,6 +41,51 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "startup" => startup(doc, t, latest, w),
         _ => return None,
     })
+}
+
+// Multiple incomparable units belong in a table, not on competing axes.
+fn context_load(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    let points = v["points"].as_array().cloned().unwrap_or_default();
+    if points.is_empty() { return empty(doc, t, "no measurements yet"); }
+    let columns = ["context", "C", "agg tok/s", "med tok/s", "TTFT ms", "cached", "cold ms"];
+    let widths = [0.16, 0.06, 0.16, 0.15, 0.15, 0.16, 0.16];
+    let mut y = 16.0;
+    let mut x = 0.0;
+    for (name, fraction) in columns.iter().zip(widths) {
+        doc.text(x, y, Font::new(10.0, t.ink2).weight(600), name);
+        x += w * fraction;
+    }
+    y += 10.0;
+    doc.line(0.0, y, w, y, t.line, 1.0);
+    y += 22.0;
+    for point in points {
+        let values = [
+            point["context"].as_u64().map(crate::report::short_tokens).unwrap_or_else(|| "-".into()),
+            point["c"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            num(&point, "aggregate_tok_s").map(rate).unwrap_or_else(|| "-".into()),
+            num(&point, "per_request_tok_s").map(rate).unwrap_or_else(|| "-".into()),
+            num(&point, "ttft_s").map(|n| format!("{:.1}", n * 1e3)).unwrap_or_else(|| "-".into()),
+            num(&point, "cached_tokens").map(|n| format!("{n:.0}")).unwrap_or_else(|| "-".into()),
+            num(&point, "cold_ttft_s").map(|n| format!("{:.1}", n * 1e3)).unwrap_or_else(|| "-".into()),
+        ];
+        x = 0.0;
+        for (value, fraction) in values.iter().zip(widths) {
+            doc.text(x, y, Font::new(11.0, t.ink), &super::svg::fit(value, 11.0, w * fraction - 6.0));
+            x += w * fraction;
+        }
+        y += 20.0;
+        let status = point["status"].as_str().unwrap_or("unknown");
+        let detail = if status == "ok" {
+            format!("{status}: {}", point["restore_pages"].as_str().unwrap_or("unknown page sharing"))
+        } else {
+            format!("{status}: {}", point["reason"].as_str().unwrap_or("cache reuse or request failure; see JSON"))
+        };
+        doc.titled(&detail);
+        doc.text(0.0, y, Font::new(10.0, t.ink2), &super::svg::fit(&detail, 10.0, w));
+        doc.end();
+        y += 24.0;
+    }
+    y
 }
 
 fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -559,4 +605,21 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.text(x0, y + 14.0, Font::new(10.0, t.muted), "process start");
     doc.text(x0 + bar_w, y + 14.0, Font::new(10.0, t.muted).anchor(Anchor::End), &format!("{} after start", seconds(end)));
     y + 20.0
+}
+
+#[cfg(test)]
+mod context_load_tests {
+    #[test]
+    fn context_table_renders_results_and_skips() {
+        let v = serde_json::json!({"points": [
+            {"context":32768,"c":8,"status":"ok","aggregate_tok_s":123.4,"per_request_tok_s":20.0,
+             "ttft_s":0.01,"cached_tokens":32760,"cold_ttft_s":3.0,"restore_pages":"shared_device_pages"},
+            {"context":131072,"c":16,"status":"skipped","reason":"shared estimate exceeds KV pool"}]});
+        let mut doc = super::Doc::new(900.0, 300.0);
+        assert!(super::context_load(&mut doc, &super::super::theme::NORMAL, &v, 900.0) > 0.0);
+        let svg = doc.finish();
+        for label in ["32K", "128K", "32760", "agg tok/s", "shared_device_pages", "shared estimate exceeds KV pool"] {
+            assert!(svg.contains(label), "{label}");
+        }
+    }
 }

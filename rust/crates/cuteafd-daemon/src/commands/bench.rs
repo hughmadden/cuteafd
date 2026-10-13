@@ -66,6 +66,12 @@ pub(crate) struct RunArgs {
     /// scripts/bench/fixtures/spec-lossless-set-v1.json.
     #[arg(long, value_name = "FILE")]
     pub(crate) lossless_set: Option<PathBuf>,
+    /// Shared base context lengths for context_load (256..1048576 tokens).
+    #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_lengths_arg)]
+    pub(crate) context_lengths: Option<String>,
+    /// Decode concurrency levels for context_load (distinct values in 1..256).
+    #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_levels_arg)]
+    pub(crate) context_levels: Option<String>,
     /// Exports to write: svg (report, card, panels), png (report, card), json.
     #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
     pub(crate) export: Vec<String>,
@@ -121,7 +127,8 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
-                lossless_set };
+                lossless_set, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
+                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {
@@ -212,6 +219,19 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn context_load_arguments_parse_and_validate() {
+        let args = |lengths: &str, levels: &str| crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "bench", "--panels", "context_load", "--context-lengths", lengths, "--context-levels", levels]);
+        let parsed = args("32768,131072", "1,8,16").unwrap();
+        let bench = BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap();
+        assert_eq!(bench.run.context_lengths.as_deref(), Some("32768,131072"));
+        assert_eq!(bench.run.context_levels.as_deref(), Some("1,8,16"));
+        for (l, c) in [("255", "1"), ("1048577", "1"), ("abc", "1"), ("32768", "0"), ("32768", "8,8")] {
+            assert!(args(l, c).is_err());
+        }
+    }
 
     #[test]
     fn a_split_device_admits_two_gpu_attention_placements() {

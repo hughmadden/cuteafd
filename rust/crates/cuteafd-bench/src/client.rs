@@ -116,6 +116,18 @@ impl Client {
         }
     }
 
+    /// Short, bounded reads for the in-wave pool observer.
+    pub fn pool_observation(&self) -> Value {
+        let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(2))
+            .timeout_read(Duration::from_secs(2)).build();
+        let get = |path: &str| self.authorize(agent.get(&format!("{}{path}", self.base)))
+            .call().ok().and_then(|r| r.into_json::<Value>().ok()).unwrap_or(Value::Null);
+        let stats = get("/v1/stats");
+        let console = get("/v1/console/snapshot");
+        json!({"active": stats["active"], "prefilling": stats["prefilling"], "queued": stats["queued"],
+            "prefix_cache": stats["prefix_cache"], "console": console["g"]})
+    }
+
     pub fn stats(&self) -> Result<Value> {
         self.get("/v1/stats")
     }

@@ -1402,3 +1402,34 @@ def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path
     panel.update(status='unsupported', error='no speculator: nothing to check')
     (report_dir / 'report.json').write_text(json.dumps(report))
     assert cards.summarize_job(job, 0)['lossless_set']['status'] == 'skipped'
+
+
+def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'context-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['profile'] == 'panels:context_load' and e['baseline'] is False
+    assert e['context_lengths'] == [32768, 131072] and e['context_levels'] == [1, 8, 16]
+
+
+@pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
+    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8')])
+def test_context_load_invalid_options_fail_before_hardware(entry, tmp_path, monkeypatch, option, value):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 'bad-context'), '--panels', 'context_load', option, value, '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
+def test_context_load_reuse_failure_fails_card(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:context_load'}, tmp_path)
+    reports = Path(job['state']) / 'reports' / 'context'
+    reports.mkdir(parents=True)
+    (reports / 'report.json').write_text(json.dumps({'status': 'done', 'panels': [
+        {'id': 'context_load', 'passes': [{'points': [{'context': 32768, 'c': 1, 'status': 'failed'}]}]}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and 'prefix-reuse failure' in row['error']
