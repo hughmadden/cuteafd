@@ -297,11 +297,37 @@ mod tests {
         let requests = [request(1, 5, 3, DraftSource::Neural, Some(Evidence::Head(&p)), Some(Censor::Eos)),
             request(2, 5, 1, DraftSource::Neural, Some(Evidence::Head(&p)), Some(Censor::OutputLimit)),
             request(3, 5, 3, DraftSource::Neural, Some(Evidence::Head(&p)), None),
-            request(4, 2, 1, DraftSource::Neural, Some(Evidence::History), None)];
+            request(4, 2, 1, DraftSource::Neural, Some(Evidence::History(&p[..1])), None)];
         let routes = routes(17);
         let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: None })), 5).unwrap();
         let confidence: Vec<_> = built.view().requests.iter().map(|r| r.confidence.map(<[f64]>::len)).collect();
-        assert_eq!(confidence, [Some(2), Some(0), Some(4), None]);
+        assert_eq!(confidence, [Some(2), Some(0), Some(4), Some(1)]);
+    }
+
+    #[test]
+    fn pooled_history_trains_platt_only_on_reached_uncensored_positions() {
+        use cuteafd_core::{LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()], regimes: 1 };
+        let mut policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
+        let prior = [0.75; 4];
+        let requests = [
+            request(1, 5, 3, DraftSource::Neural, Some(Evidence::History(&prior)), Some(Censor::Eos)),
+            request(2, 5, 1, DraftSource::Neural, Some(Evidence::History(&prior)), Some(Censor::Cancelled)),
+            request(3, 5, 3, DraftSource::Neural, Some(Evidence::History(&prior)), None),
+            request(4, 3, 3, DraftSource::Copy, Some(Evidence::History(&prior)), None),
+        ];
+        let routes = routes(18);
+        let before = policy.calibration();
+        let mut round = record(&requests, &routes, Some(DraftPass { width: 5, requests: Some(3) }));
+        round.predicted = None;
+        observe(&mut policy, &round).unwrap();
+        assert_eq!(policy.stats().position_reached[..4], [2, 2, 1, 0]);
+        assert_eq!(policy.stats().position_accepted[..4], [2, 2, 0, 0]);
+        assert_ne!(policy.calibration()[0], before[0]);
+        assert_eq!(policy.calibration()[3], before[3]);
     }
 
     #[test]
