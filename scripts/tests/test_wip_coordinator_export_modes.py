@@ -83,7 +83,7 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
     assert 'smi=/usr/lib/wsl/lib/nvidia-smi' in remote
     admit = remote.index('"$placement" admit --smi "$smi"')
-    container = remote.index('docker run --rm --gpus all --user')
+    container = remote.index('docker run --rm --device nvidia.com/gpu=all --user')
     assert admit < container  # admission precedes the export container
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.
