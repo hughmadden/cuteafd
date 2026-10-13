@@ -16,6 +16,7 @@ pub fn report(failed: bool) -> Report {
             pcie: Some("32 GT/s x16".into()), netdev: Some("enp1s0f0np0".into()),
             subnets: vec!["10.55.0.0/24".into(), "10.55.1.0/24".into()] }],
         rails: Some("2 rails on one 400 Gb/s port; using 1 (link rate < PCIe ingress)".into()),
+        power: None,
     };
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
