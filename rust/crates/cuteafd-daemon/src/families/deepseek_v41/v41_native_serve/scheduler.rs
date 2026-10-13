@@ -1425,7 +1425,7 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
         if compact {
             return ScoreRows::from_greedy(VOCAB, unsafe { pass.execute_greedy(requests, batch, transport, 0, &selected).await? });
         }
-        let logits = unsafe { pass.execute(requests, batch, transport, 0, &selected).await? };
+        let logits = unsafe { pass.execute_decode(requests, batch, transport, 0, &selected).await? };
         let mut bytes = vec![0; logits.logits.bytes];
         lib.copy_d2h(&mut bytes, logits.logits)?;
         ScoreRows::new(VOCAB, bytes)

@@ -207,6 +207,16 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
         self.head.output()
     }
+    /// Full-logit decode uses the same fixed attention as device-scored verification.
+    /// # Safety
+    /// Same ownership and lifetime contract as `execute`.
+    pub async unsafe fn execute_decode(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize]) -> Result<TargetLogits<'_>> {
+        self.set_attention_decode(true);
+        ensure!(batch.cache()?.stage() == CacheStage::Full, "decode target execute requires full phase");
+        unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
+        self.head.output()
+    }
     /// Execute one full verification while allowing unrelated request commits
     /// during remote waits. The caller owns disjoint leases and drains queued
     /// lane work before releasing any request or device storage.
