@@ -357,7 +357,7 @@ mod tests {
         let requests = [request(1, 6, 4, DraftSource::Neural, Some(Evidence::Head(&p)), None)];
         let routes = routes(6);
         for round in 0..160 {
-            let layer_us = if super::super::probe::timing_round(round) {
+            let layer_us = if round % 8 == 7 {
                 [Some(100.), Some(100.)]
             } else { [None, None] };
             let record = RoundRecord { shared: false, requests: &requests, routes: &routes,
@@ -405,7 +405,7 @@ mod tests {
                 let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 5, draft_us: 3000. }];
                 let width = policy.choose_action(false, &action_requests, &actions, 96).unwrap();
                 decisions[arm].push((width, lengths));
-                let layer_us = if arm == 0 || super::super::probe::timing_round(round as u64) {
+                let layer_us = if arm == 0 || round % 8 == 7 {
                     class_us.map(Some)
                 } else { [None, None] };
                 observe(policy, &RoundRecord { shared: false, requests: &requests, routes: &routes,

@@ -2,7 +2,7 @@
 //! verify step's per-layer device time and routed expert ids, collected where
 //! the engine already has them and read once after the step's own sync.
 //!
-//! - Layer time: owner-local [`LayerClock`] events every eighth observed round,
+//! - Layer time: owner-local [`LayerClock`] events every observed round,
 //!   between the per-layer graph segments (or eager layers).
 //! - Spark layers: the ids the step already stages to pinned host memory for
 //!   the expert request, copied before the staging is reused.
@@ -26,12 +26,6 @@ use std::ffi::c_void;
 /// GLM Flash router ids are plain expert indices (no flag bits).
 const ROUTE_MASK: u32 = u32::MAX;
 
-pub(crate) const LAYER_TIMING_CADENCE: u64 = 8;
-
-pub(crate) fn timing_round(observed: u64) -> bool {
-    observed % LAYER_TIMING_CADENCE == LAYER_TIMING_CADENCE - 1
-}
-
 /// Ring and staged-id agreement under `CUTEAFD_GLMF_ROUTE_RING_CHECK`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RingCheck {
@@ -47,8 +41,6 @@ pub(crate) struct RoundProbe<'a> {
     device_ring: DeviceAllocation<'a>,
     last_owned: Option<usize>,
     downloaded: bool,
-    observed: u64,
-    timing: bool,
     capacity: usize,
     topk: usize,
     dense: Vec<bool>,
@@ -78,7 +70,7 @@ impl<'a> RoundProbe<'a> {
         library.copy_h2d(device_ring.buffer, ring.bytes())?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
         Ok(Self { clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
-            device_ring, last_owned, downloaded: false, observed: 0, timing: false, capacity,
+            device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
             check: std::env::var("CUTEAFD_GLMF_ROUTE_RING_CHECK").is_ok_and(|v| v == "1"),
             ring_check: RingCheck::default(), active: false, pending: false, error: None })
@@ -91,7 +83,6 @@ impl<'a> RoundProbe<'a> {
             if dense { let _ = self.routes.dense(layer); }
         }
         self.clock.reset();
-        self.timing = timing_round(self.observed);
         self.downloaded = false;
         self.ringed.fill(false);
         self.staged.fill(false);
@@ -116,10 +107,8 @@ impl<'a> RoundProbe<'a> {
     /// `stream` is the engine's live stream on this probe's device.
     pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.active {
-            if self.timing {
-                // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
-                unsafe { self.clock.mark(layer, stream, false) };
-            }
+            // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
+            unsafe { self.clock.mark(layer, stream, false) };
             if Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
                 // SAFETY: all owner-local D2D writes precede this download on the same stream;
                 // the pinned ring remains owned until the existing verifier sync and finish.
@@ -137,7 +126,7 @@ impl<'a> RoundProbe<'a> {
     /// # Safety
     /// `stream` is live on this probe's device and ordered after the input transfer.
     pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
-        if self.active && self.timing {
+        if self.active {
             // SAFETY: the caller guarantees the event and stream ownership/order.
             unsafe { self.clock.mark_entry(layer, stream, false); }
         }
@@ -199,7 +188,6 @@ impl<'a> RoundProbe<'a> {
             return None;
         }
         self.routes.complete().ok()?;
-        self.observed = self.observed.wrapping_add(1);
         Some((&self.routes, self.clock.read()))
     }
 }
@@ -231,11 +219,6 @@ fn settle(routes: &mut RoundRoutes, ring: &[u8], capacity: usize, topk: usize, r
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn layer_timing_samples_only_every_eighth_observed_round() {
-        assert_eq!((0..24).filter(|&round| timing_round(round)).collect::<Vec<_>>(), [7, 15, 23]);
-    }
 
     fn ring(layers: usize, capacity: usize, topk: usize, fill: &[(usize, Vec<u32>)]) -> Vec<u8> {
         let mut ring = vec![0u8; layers * capacity * topk * 4];
