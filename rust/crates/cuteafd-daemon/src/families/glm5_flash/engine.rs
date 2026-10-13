@@ -69,6 +69,10 @@ use std::rc::Rc;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
+#[path = "engine/context.rs"]
+mod context;
+pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
+
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
@@ -507,8 +511,15 @@ fn tp2_prepared_peer<T>(prepared: Option<&T>) -> Result<&T> {
 }
 
 /// Host tables of one step.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct StepTables {
+    /// The prefill lane these tables belong to (its context gather and commit lists; 0 otherwise).
+    lane: usize,
+    /// Context decode: each row's compact unit-table stride and the columns its top-k reads (the
+    /// pool table holds this GPU's units). The logical `pool_stride` / `pool_width` stay the
+    /// step's, so both GPUs key their graphs alike.
+    context_stride: usize,
+    context_width: usize,
     decode: bool,
     eager: bool,
     /// Ordinary rows before startup graph padding; zero for all-masked warm-up.
@@ -539,6 +550,11 @@ struct StepTables {
     /// runs once per segment over its rows, with its own tables. Empty: one sequence (or a decode
     /// step, whose programs take every row's sequence from the tables).
     segments: Vec<packing::Segment>,
+}
+
+/// A prefill step's sequence units (its pool table: one unit per pool page); empty for decode.
+fn placement_units(tables: &StepTables) -> Vec<u32> {
+    if tables.decode { Vec::new() } else { tables.pool_table.iter().map(|&p| p as u32).collect() }
 }
 
 /// Rows a per-sequence program runs over: one packed sequence's, or the whole step's.
@@ -647,6 +663,15 @@ impl Allocator {
     /// Over an engine of `pages` MLA pages (a whole number of units) and `slots` KDA slots.
     pub fn new(pages: usize, slots: usize) -> Self {
         Self::with_reserved(pages, slots, 0)
+    }
+
+    /// `engine`'s units and KDA slots: parity half pools under context (unit `j` of every
+    /// sequence on GPU `j % 2`), else one pool.
+    pub fn for_engine(engine: &GlmfEngine<'_>) -> Self {
+        if engine.context_kv() {
+            Self { units: cuteafd_engine::prefix::RefPagePool::parity(engine.pool_pages, UNIT_ROWS, 0),
+                slots: (0..engine.slots as i32).rev().collect() }
+        } else { Self::new(engine.pages, engine.slots) }
     }
 
     /// [`Self::new`] that never hands out the first `reserved` units (pool-page prefix marks keep
@@ -1273,6 +1298,13 @@ pub(crate) struct GlmfEngine<'a> {
     caches: Caches<'a>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
+    /// Token-split MLA attention (#57): the build's programs, set at construction (each GPU's MLA
+    /// caches then hold half the units), and once the peer is attached its buffers and exchange
+    /// (dropped before the head split's exchange, whose abort words it borrows).
+    context_mode: Option<GlmfAttention>,
+    context: Option<context::GlmfContextSplit<'a>>,
+    /// Per prefill lane and rank: this step's context gather and commit counts.
+    context_units: RefCell<context::ContextUnits>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
@@ -1577,7 +1609,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
-        records: Option<PrefillScratch<'a>>) -> Result<Self> {
+        records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -1605,15 +1637,22 @@ impl<'a> GlmfEngine<'a> {
         let index_cache = if mla_ordinal.iter().flatten().next().is_some() { index_cache } else { IndexCache::Keys };
         // A head split's shares hold half the KDA heads (and their state).
         let split = weights.layers.first().is_some_and(|l| l.split);
-        ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
+        ensure!(context_mode.is_none() || (split && index_cache == IndexCache::Compact),
+            "context attention runs on a head split with the compact index cache");
+        ensure!(!split || index_cache == IndexCache::Keys || context_mode.is_some(),
+            "a head split keeps the per-token index keys (context attention: compact)");
+        // Under context each GPU's MLA caches hold half the units (an even pool).
+        ensure!(context_mode.is_none() || (pages / UNIT_PAGES) % 2 == 0,
+            "a context pool has two equal halves, not {} units", pages / UNIT_PAGES);
         // The head split's share programs (`glmf2_*`) exist at 64 decode rows only.
         ensure!(!split || decode_rows == DECODE_ROWS,
             "a head split takes decode steps of up to {DECODE_ROWS} rows (--decode-rows {DECODE_ROWS})");
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
         ensure!(records.is_none() || !split, "a head split keeps the replay records of its own (--replay-records own)");
         let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
-        let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache,
-            kda_state, decode_rows, records)?;
+        let local = if context_mode.is_some() { 2 } else { 1 };
+        let caches = Caches::new(library, &cfg, &weights.layers, pages / local, pool_pages / local, slots, kda_heads,
+            index_cache, kda_state, decode_rows, records)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
@@ -1621,7 +1660,8 @@ impl<'a> GlmfEngine<'a> {
             pages, slots, decode_rows, verify_rows, buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
-            device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
+            device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
+            peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, tp2: None, local: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
@@ -2178,14 +2218,17 @@ impl<'a> GlmfEngine<'a> {
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
         exchange.trace_identity("glmf-target-main");
-        // Both GPUs run the indexer; per-rank index tails are not built yet.
-        ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
+        // Both GPUs run the indexer: heads keeps the token keys; context the compact cache (each
+        // GPU its replicated index tails, its units' pool keys).
+        ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some(),
+            "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-            let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
+            let local = if self.context_mode.is_some() { 2 } else { 1 };
+            let caches = Caches::new(self.library, &self.cfg, &layers, self.pages / local, self.pool_pages / local,
+                self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
@@ -2344,7 +2387,9 @@ impl<'a> GlmfEngine<'a> {
             ensure!(page < self.pool_pages, "pool page {page} out of range");
             changed |= std::mem::replace(&mut host[page], logical as i32) != logical as i32;
         }
-        if changed {
+        // Under context no program reads the map (prefill expands over the staging's identity
+        // tables, decode through the owned expansion's unit tables).
+        if changed && self.context_mode.is_none() {
             // Entries other sequences' queued steps read keep their values.
             for rank in 0..self.ranks() {
                 let map = self.caches_of(rank).pool_logical.buffer;
@@ -3147,6 +3192,42 @@ impl<'a> GlmfEngine<'a> {
         self.on(1, || self.put_tables(w1, tables))
     }
 
+    /// Uploads a step's tables (one per prefill lane, or the decode step) to rank 0's and rank 1's
+    /// workspaces with stream-ordered copies, and returns each lane's per-rank tables: identical
+    /// under heads, each GPU's own under context ([`Self::rank_tables`]), with each prefill lane's
+    /// gather and commit lists (the first lane gathers the history for every lane: later lanes'
+    /// history is earlier lanes' rows, already in the same staging view). `units`: each lane's
+    /// sequence units (empty for a decode step).
+    fn step_tables(&self, lanes: &[(&Workspace<'_>, Option<&Workspace<'_>>, &StepTables)], units: &[Vec<u32>])
+        -> Result<Vec<[StepTables; 2]>> {
+        let mut out = Vec::new();
+        let mut context_units = Vec::new();
+        for (lane, (&(w, w1, tables), units)) in lanes.iter().zip(units).enumerate() {
+            let mut ranked = if self.context.is_some() && w1.is_some() {
+                if !tables.decode {
+                    let start = tables.positions.first().map_or(0, |&p| p as usize);
+                    let history = if lane == 0 { start } else { 0 };
+                    let rows = tables.positions.len();
+                    let unit = |rank| self.context_prefill_tables(rank, lane, history, start, rows, units);
+                    context_units.push([unit(0)?, unit(1)?]);
+                }
+                [self.rank_tables(tables, 0)?, self.rank_tables(tables, 1)?]
+            } else {
+                [tables.clone(), tables.clone()]
+            };
+            for rank_tables in &mut ranked { rank_tables.lane = lane; }
+            self.put_tables(w, &ranked[0])?;
+            if let Some(w1) = w1 {
+                self.peer_tables(w1, &ranked[1])?;
+            }
+            out.push(ranked);
+        }
+        if self.context.is_some() {
+            *self.context_units.borrow_mut() = context_units;
+        }
+        Ok(out)
+    }
+
     /// Rank 1's workspaces (the decode one, or `lanes` prefill lanes: a serial prefill runs in the
     /// first), created on first use; None without a head split.
     fn peer_workspaces(&self, decode: bool, lanes: Option<usize>) -> Result<Option<PeerWorkspaces<'_, 'a>>> {
@@ -3352,14 +3433,13 @@ impl<'a> GlmfEngine<'a> {
         self.prepare_route_checks(&[t])?;
         ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        self.put_tables(w, tables)?;
-        // The head split's second GPU: its workspace of the same shape and the same tables.
+        // The head split's second GPU: its workspace of the same shape, and the same tables (under
+        // context each rank's own: its slots, unit tables and shard lengths).
         let peer_workspaces = self.peer_workspaces(tables.decode, None)?;
         let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;
-        if let Some(w1) = w1 {
-            ensure!(forced.is_none(), "teacher-forced prefill runs without a head split");
-            self.peer_tables(w1, tables)?;
-        }
+        ensure!(w1.is_none() || forced.is_none(), "teacher-forced prefill runs without a head split");
+        let ranked = self.step_tables(&[(w, w1, tables)], &[placement_units(tables)])?;
+        let [tables, tables1] = &ranked[0];
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
         let graphed = !self.tp2.as_ref().is_some_and(|t| t.checking.get()) && self.use_graphs && tables.decode && !tables.eager && on_layer.is_none() && forced.is_none()
@@ -3369,7 +3449,7 @@ impl<'a> GlmfEngine<'a> {
         if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
         let rows = Scalar::I32(t as i32);
         if graphed {
-            let result = self.decode_graphed(w, w1, tables, t, rows, logit_rows);
+            let result = self.decode_graphed(w, w1, tables, tables1, t, rows, logit_rows);
             self.finish_route_checks()?;
             return result;
         }
@@ -3383,7 +3463,7 @@ impl<'a> GlmfEngine<'a> {
             // The streams to the second GPU, which runs a unit ahead of the host's rank-0
             // work (all its inputs are pushes from rank 0).
             self.exchange_direct(w.streams[0].buffer.ptr, w1.streams[0].buffer.ptr, t * HC * row)?;
-            self.peer_attention(0, 0, w1, t, cap, tables)?;
+            self.peer_attention(0, 0, w1, t, cap, tables1)?;
         }
         let mut cur = 0usize;
         for span in &spans {
@@ -3433,7 +3513,7 @@ impl<'a> GlmfEngine<'a> {
                 // Rank 1: this layer's FFN exchange, then the next layer's attention.
                 self.peer_post(index, 0, w1, t, cap)?;
                 if index + 1 < layers.len() {
-                    self.peer_attention(index + 1, 0, w1, t, cap, tables)?;
+                    self.peer_attention(index + 1, 0, w1, t, cap, tables1)?;
                 }
             }
             if let Some(dir) = trace {
@@ -3448,7 +3528,7 @@ impl<'a> GlmfEngine<'a> {
                 self.tp2_publish(index, 0, t, w1)?;
                 if let Some(w1) = w1 {
                     self.peer_post(index, 0, w1, t, cap)?;
-                    if index + 1 < layers.len() { self.peer_attention(index + 1, 0, w1, t, cap, tables)?; }
+                    if index + 1 < layers.len() { self.peer_attention(index + 1, 0, w1, t, cap, tables1)?; }
                 }
             }
             let out = self.meet_ffn(w, index, 0, layers.len(), t)?;
@@ -3530,8 +3610,9 @@ impl<'a> GlmfEngine<'a> {
     /// Under a head split each segment exchanges with rank 1's segment of the same layer
     /// (captured on rank 1's stream); rank 1's next segment is queued before the host waits in
     /// this layer's expert exchange.
-    fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize, rows: Scalar,
-        logit_rows: usize) -> Result<Option<DeviceLogits>> {
+    #[allow(clippy::too_many_arguments)]
+    fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, tables1: &StepTables,
+        t: usize, rows: Scalar, logit_rows: usize) -> Result<Option<DeviceLogits>> {
         self.release_retired_graphs()?;
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
@@ -3595,14 +3676,14 @@ impl<'a> GlmfEngine<'a> {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before the
                 // host waits in this layer's expert exchange.
                 if index == 0 && !layers.is_empty() {
-                    self.peer_segment(0, w1, t, tables)?;
+                    self.peer_segment(0, w1, t, tables1)?;
                 }
                 if index + 1 < layers.len() && !self.tp2_layer(index) {
                     // Rank 1's next weights into L2 while it waits for this layer's exchange.
                     if let (false, Some(l2)) = (layers[index].dense, self.peer()?.l2.as_ref()) {
                         self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
                     }
-                    self.peer_segment(index + 1, w1, t, tables)?;
+                    self.peer_segment(index + 1, w1, t, tables1)?;
                 }
             }
             if layers.get(index).is_some_and(|layer| !layer.dense) {
@@ -3654,7 +3735,7 @@ impl<'a> GlmfEngine<'a> {
             if self.tp2_layer(index) {
                 self.tp2_publish(index, 0, t, w1)?;
                 if index + 1 < layers.len() {
-                    if let Some(w1) = w1 { self.peer_segment(index + 1, w1, t, tables)?; }
+                    if let Some(w1) = w1 { self.peer_segment(index + 1, w1, t, tables1)?; }
                 }
             }
             if index < layers.len() {
@@ -4038,24 +4119,36 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Layer `index`'s MLA on rank `rank` (a head split: the replicated latent record and DSA
-    /// indexer, its heads' queries, sparse MLA, W_UV and a partial o_proj).
+    /// indexer, its heads' queries, sparse MLA, W_UV and a partial o_proj). Under context
+    /// attention, the token-split decode exchange or the gathered prefill (`engine/context.rs`).
     #[allow(clippy::too_many_arguments)]
     fn mla_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables, trace: Option<&std::path::Path>) -> Result<()> {
-        let t = tables.positions.len();
-        let trace = trace.filter(|_| rank == 0);
+        if self.context.is_some() {
+            if tables.decode {
+                return self.context_decode_attention(rank, w, index, layer, rows, cap, tables);
+            }
+            let unit = self.context_units.borrow().get(tables.lane).context("context prefill unit")?[rank];
+            return self.context_prefill_attention(rank, w, index, layer, rows, cap, tables, tables.lane, unit);
+        }
         let caches = self.caches_of(rank);
-        let split = layer.split;
-        let heads = self.cfg.heads / if split { 2 } else { 1 };
-        // These scratch layouts are diagnostic-only and match the pinned AOT
-        // decode programs. Stop at the first MLA layer; later layers' inputs
-        // already differ and cannot identify the original numerical cause.
-        let trace = trace.filter(|_| tables.decode && index == 3);
-        let mode = if tables.decode { "decode" } else { "prefill" };
-        let cache = caches.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
-        let index_cache = caches.index[index].as_ref().context("MLA layer without an index cache")?;
-        let pool_cache = &index_cache.pools;
-        let decode = tables.decode;
+        let cache = caches.kv[index].as_ref().context("MLA layer without a record pool")?.buffer;
+        let pools = caches.index[index].as_ref().context("MLA layer without an index cache")?.pools.buffer;
+        self.mla_over(rank, w, index, layer, rows, cap, tables, cache, pools, caches.pool_logical.buffer.ptr, trace)
+    }
+
+    /// The MLA producer on `rank`: each row's latent record at its slot of layer `index`'s record
+    /// pool (a negative slot skips the row) and this rank's heads' absorbed query into `w.query`.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
+        decode: bool) -> Result<()> {
+        let cache = self.caches_of(rank).kv[index].as_ref().context("MLA layer without a record pool")?.buffer;
+        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache.ptr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mla_producer_into(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
+        decode: bool, cache: *mut c_void) -> Result<()> {
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let fp8 = decode || self.fp8_prefill.mla;
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
@@ -4064,7 +4157,88 @@ impl<'a> GlmfEngine<'a> {
             ("w_q_b_fp8", layer.ptr("w_q_b_fp8")?), ("w_q_b_scale", layer.ptr("w_q_b_scale")?)];
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run_on(rank, split, &format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
+        self.run_on(rank, layer.split, &format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+    }
+
+    /// One sequence part's DSA index producer on `rank` (per-token keys, or the compact cache's
+    /// pooled keys and tails): the index query and head weights, and every completed pool's key at
+    /// its pool slot of `pools` (a negative slot skips it).
+    #[allow(clippy::too_many_arguments)]
+    fn index_producer_part(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables, first: usize, pools: *mut c_void) -> Result<()> {
+        let caches = self.caches_of(rank);
+        let index_cache = caches.index[index].as_ref().context("MLA layer without an index cache")?;
+        let t = tables.positions.len();
+        let (h, q) = (self.cfg.hidden, self.cfg.q_lora_rank);
+        let (x, q_resid) = (row_at(&w.x, first, h * 2), row_at(&w.q_resid, first, q * 2));
+        let (q_fp8, head_weights) = (row_at(&w.q_fp8, first, INDEX_HEADS * 128), row_at(&w.head_weights, first,
+            INDEX_HEADS * 4));
+        let (pool_slots, positions) = (row_at(&w.pool_slots, first, 8), row_at(&w.positions, first, 8));
+        match (&index_cache.keys, &caches.index_tails) {
+            (Some(keys), _) => self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", x),
+                ("q_resid", q_resid), ("slots", row_at(&w.kv_slots, first, 8)), ("pool_slots", pool_slots),
+                ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
+                ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("token_keys", keys.buffer.ptr),
+                ("index_cache", pools), ("q_fp8", q_fp8), ("head_weights", head_weights),
+                ("scratch", w.scratch.buffer.ptr)], &[rows]),
+            (None, Some((tails, records))) => {
+                // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
+                let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+                let recorded = replay_rows_of(cap);
+                ensure!(!tables.spec || t <= recorded, "a speculative step of {t} rows exceeds the replay record");
+                // SAFETY: ordinal < MLA layers and the records hold `decode_rows` >= `recorded` rows per
+                // layer: both regions lie inside their pools.
+                let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
+                    records.buffer.ptr.cast::<u8>().add(ordinal * recorded * KEY_BYTES)) };
+                self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", x), ("q_resid", q_resid),
+                    ("pool_slots", pool_slots), ("positions", positions),
+                    ("kda_slots", row_at(&w.kda_slots, first, 4)), ("seq_first", row_at(&w.seq_first, first, 4)),
+                    ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
+                    ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("tails", tails.cast()),
+                    ("replay", record.cast()), ("index_cache", pools), ("q_fp8", q_fp8),
+                    ("head_weights", head_weights), ("scratch", w.scratch.buffer.ptr)],
+                    &[rows, Scalar::I32(i32::from(tables.spec))])
+            }
+            (None, None) => anyhow::bail!("MLA layer {index} has neither token keys nor index tails"),
+        }
+    }
+
+    /// The whole step's DSA index producer on `rank` into its own pool keys (context decode).
+    fn index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables) -> Result<()> {
+        let pools = self.caches_of(rank).index[index].as_ref().context("MLA layer without an index cache")?.pools.buffer;
+        self.index_producer_part(rank, w, index, layer, rows, cap, tables, 0, pools.ptr)
+    }
+
+    /// W_UV + o_proj of this rank's heads over `w.latent` into `delta` (a partial under a split).
+    fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
+        -> Result<()> {
+        let fp8 = decode || self.fp8_prefill.mla;
+        let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
+            ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
+            ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+        self.run_on(rank, layer.split, &format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+    }
+
+    /// The head split's MLA of layer `index` on `rank` over the record and pool-key buffers given
+    /// (this rank's pools, or a context prefill's staging view through identity tables).
+    #[allow(clippy::too_many_arguments)]
+    fn mla_over(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
+        tables: &StepTables, cache: cuteafd_ffi::CuteafdDeviceBuffer, pool_buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+        pool_logical: *mut c_void, trace: Option<&std::path::Path>) -> Result<()> {
+        let t = tables.positions.len();
+        let trace = trace.filter(|_| rank == 0);
+        let caches = self.caches_of(rank);
+        let heads = self.cfg.heads / if layer.split { 2 } else { 1 };
+        // These scratch layouts are diagnostic-only and match the pinned AOT
+        // decode programs. Stop at the first MLA layer; later layers' inputs
+        // already differ and cannot identify the original numerical cause.
+        let trace = trace.filter(|_| tables.decode && index == 3);
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
+        let decode = tables.decode;
+        let split = layer.split;
+        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)?;
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
             let q_width = self.cfg.heads * self.cfg.qk_nope_dim;
@@ -4080,47 +4254,20 @@ impl<'a> GlmfEngine<'a> {
         }
         // The DSA indexer, its pool top-k and the selection read one sequence's tables: a packed
         // prefill runs them once per sequence, over its rows and its tables (one part: the step).
-        let (h, q, pools) = (self.cfg.hidden, self.cfg.q_lora_rank, self.cfg.index_topk / KPOOL);
+        let pools = self.cfg.index_topk / KPOOL;
         ensure!(rank == 0 || tables.segments.is_empty(), "a packed prefill runs on one GPU");
         for part in self.index_parts(w, tables) {
             let (first, rows) = (part.first, if tables.segments.is_empty() { rows } else { Scalar::I32(part.rows as i32) });
-            let (x, q_resid) = (row_at(&w.x, first, h * 2), row_at(&w.q_resid, first, q * 2));
             let (q_fp8, head_weights) = (row_at(&w.q_fp8, first, INDEX_HEADS * 128), row_at(&w.head_weights, first,
                 INDEX_HEADS * 4));
-            let (pool_slots, positions) = (row_at(&w.pool_slots, first, 8), row_at(&w.positions, first, 8));
-            match (&index_cache.keys, &caches.index_tails) {
-                (Some(keys), _) => self.run_on(rank, false, &format!("index_producer_{cap}"), &[("x", x),
-                    ("q_resid", q_resid), ("slots", row_at(&w.kv_slots, first, 8)), ("pool_slots", pool_slots),
-                    ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
-                    ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("token_keys", keys.buffer.ptr),
-                    ("index_cache", pool_cache.buffer.ptr), ("q_fp8", q_fp8), ("head_weights", head_weights),
-                    ("scratch", w.scratch.buffer.ptr)], &[rows])?,
-                (None, Some((tails, records))) => {
-                    // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
-                    let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
-                    let recorded = replay_rows_of(cap);
-                    ensure!(!tables.spec || t <= recorded, "a speculative step of {t} rows exceeds the replay record");
-                    // SAFETY: ordinal < MLA layers and the records hold `decode_rows` >= `recorded` rows per
-                    // layer: both regions lie inside their pools.
-                    let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
-                        records.buffer.ptr.cast::<u8>().add(ordinal * recorded * KEY_BYTES)) };
-                    self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", x), ("q_resid", q_resid),
-                        ("pool_slots", pool_slots), ("positions", positions),
-                        ("kda_slots", row_at(&w.kda_slots, first, 4)), ("seq_first", row_at(&w.seq_first, first, 4)),
-                        ("w_iq", layer.ptr("w_iq")?), ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
-                        ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("tails", tails.cast()),
-                        ("replay", record.cast()), ("index_cache", pool_cache.buffer.ptr), ("q_fp8", q_fp8),
-                        ("head_weights", head_weights), ("scratch", w.scratch.buffer.ptr)],
-                        &[rows, Scalar::I32(i32::from(tables.spec))])?
-                }
-                (None, None) => anyhow::bail!("MLA layer {index} has neither token keys nor index tails"),
-            }
+            let positions = row_at(&w.positions, first, 8);
+            self.index_producer_part(rank, w, index, layer, rows, cap, tables, first, pool_cache)?;
             let pools_at = row_at(&w.pools, first, pools * 4);
             // A packed step is long when any of its sequences is: its short parts skip the top-k.
             if tables.long {
                 if part.long {
                     self.run_on(rank, false, &format!("index_topk_{mode}_{cap}"), &[("q_fp8", q_fp8),
-                        ("weights", head_weights), ("index_k_cache", pool_cache.buffer.ptr),
+                        ("weights", head_weights), ("index_k_cache", pool_cache),
                         ("page_table", part.pool.map_or(w.pool_table.buffer.ptr, |(table, _)| table)),
                         ("cache_lengths", row_at(&w.cache_lengths, first, 4)), ("output_indices", pools_at),
                         ("scratch", w.topk_scratch.buffer.ptr)],
@@ -4129,7 +4276,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             self.run_on(rank, false, "index_expand", &[("positions", positions), ("pools", pools_at),
-                ("pool_logical", caches.pool_logical.buffer.ptr), ("page_table", part.page_table),
+                ("pool_logical", pool_logical), ("page_table", part.page_table),
                 ("indices", row_at(&w.indices, first, SPARSE_TOPK * 4)), ("lengths", row_at(&w.lengths, first, 4))],
                 &[rows, Scalar::I32(tables.page_stride as i32)])?;
         }
@@ -4174,10 +4321,7 @@ impl<'a> GlmfEngine<'a> {
             std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
                 self.scratch(&format!("sparse_mla_decode_{cap}"))?)?)?;
         }
-        let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
-            ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
-            ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-        self.run_on(rank, split, &format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
+        self.mla_output(rank, w, layer, cap, rows, decode)?;
         if let Some(dir) = trace {
             std::fs::write(dir.join("mla_values.bin"), self.download(&w.scratch,
                 t * self.cfg.heads * self.cfg.v_head_dim * 2)?)?;
@@ -4496,10 +4640,21 @@ impl<'a> GlmfEngine<'a> {
         let total: usize = lanes.iter().map(|(t, _)| t.kv_slots.len()).sum();
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        for ((tables, tokens), w) in lanes.iter().zip(workspaces.iter()) {
+        // Each lane's tables on both GPUs (under context each rank's own), uploaded once both
+        // streams drained.
+        let peer_workspaces = self.peer_workspaces(false, Some(lanes.len()))?;
+        let mut units = Vec::new();
+        for (lane, ((tables, _), w)) in lanes.iter().zip(workspaces.iter()).enumerate() {
             let t = tables.kv_slots.len();
             ensure!(t <= w.rows, "lane of {t} rows exceeds its workspace");
-            self.put_tables(w, tables)?;
+            units.push((w, peer_workspaces.as_ref().map(|p| p.get(lane)).transpose()?, tables));
+        }
+        if peer_workspaces.is_some() {
+            // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
+        }
+        let ranked = self.step_tables(&units, &lanes.iter().map(|(t, _)| placement_units(t)).collect::<Vec<_>>())?;
+        for ((tables, tokens), w) in lanes.iter().zip(workspaces.iter()) {
             self.load_streams(w, tokens, false)?;
             self.inject_media(w, tables, media)?;
             if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
@@ -4509,20 +4664,16 @@ impl<'a> GlmfEngine<'a> {
         let cap = "m4096";
         let rows_of = |lane: usize| Scalar::I32(lanes[lane].0.kv_slots.len() as i32);
         let count_of = |lane: usize| lanes[lane].0.kv_slots.len();
-        // The head split's second GPU: each lane's tables and streams, then every lane's
-        // layer-0 attention (rank 1 runs a unit ahead of the host's rank-0 work).
-        let peer_workspaces = self.peer_workspaces(false, Some(lanes.len()))?;
+        // The head split's second GPU: each lane's streams, then every lane's layer-0 attention
+        // (rank 1 runs a unit ahead of the host's rank-0 work).
         if let Some(peers) = &peer_workspaces {
-            // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
-            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            for (lane, ((tables, _), w)) in lanes.iter().zip(workspaces.iter()).enumerate() {
+            for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
                 let w1 = peers.get(lane)?;
-                self.on(1, || self.put_tables(w1, tables))?;
                 self.exchange_direct(w.streams[0].buffer.ptr, w1.streams[0].buffer.ptr,
                     count_of(lane) * HC * self.cfg.hidden * 2)?;
             }
-            for (lane, (tables, _)) in lanes.iter().enumerate() {
-                self.peer_attention(0, lane, peers.get(lane)?, count_of(lane), cap, tables)?;
+            for lane in 0..lanes.len() {
+                self.peer_attention(0, lane, peers.get(lane)?, count_of(lane), cap, &ranked[lane][1])?;
             }
         }
         // After rank 0 queued unit (layer, lane)'s FFN: rank 1's FFN exchange of that unit and
@@ -4532,7 +4683,7 @@ impl<'a> GlmfEngine<'a> {
             let w1 = peers.get(lane)?;
             self.peer_post(layer, lane, w1, count_of(lane), cap)?;
             if layer + 1 < layers.len() {
-                self.peer_attention(layer + 1, lane, w1, count_of(lane), cap, &lanes[lane].0)?;
+                self.peer_attention(layer + 1, lane, w1, count_of(lane), cap, &ranked[lane][1])?;
             }
             Ok(())
         };
@@ -4551,7 +4702,7 @@ impl<'a> GlmfEngine<'a> {
             if layer == 0 {
                 self.pre(w, &w.streams[0], weights, rows)?;
             }
-            self.attention(0, w, layer, weights, rows, cap, &lanes[lane].0, None)?;
+            self.attention(0, w, layer, weights, rows, cap, &ranked[lane][0], None)?;
             let attended = self.meet_attention(w, slot(layer, false, lane), t, weights, "m4096")?;
             self.post_pre_on(0, w, attended, 0, weights, "ffn", "post_norm", rows, cap)?;
             if weights.dense {

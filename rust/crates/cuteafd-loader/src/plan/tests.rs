@@ -1531,7 +1531,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -1784,7 +1784,9 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
                         }), ..sparks(2) };
                         let report = plan(dir.path(), &options).unwrap();
-                        if gpus == 2 && (index == GlmfIndexCache::Compact || shared) { assert!(!report.placement_supported); continue; }
+                        // Two GPUs without context programs serve heads, which keeps the token keys
+                        // (as the runtime's served index cache); shared replay is single-GPU.
+                        if gpus == 2 && shared { assert!(!report.placement_supported); continue; }
                         let memory = report.memory_layout.unwrap();
                         let served_index = if gpus == 2 { GlmfIndexCache::Keys } else { index };
                         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,
@@ -2889,8 +2891,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
-            // This fixture has no context programs; GLM's build-specific default is heads.
-            let default = if gpus == 1 || auto.family.as_deref() == Some("glm5") {
+            // This fixture has no context programs; GLM's and GLM Flash's build-specific default is heads.
+            let default = if gpus == 1 || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
@@ -2906,6 +2908,12 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             assert_eq!(auto.placement_supported, explicit_default.placement_supported);
             for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
                 let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
+                // GLM Flash's explicit context needs the build's programs, which this fixture lacks:
+                // the placement refuses it (the executor runs it where built).
+                if auto.family.as_deref() == Some("glm5_flash") && mode == AttentionPlacement::Context && gpus == 2 {
+                    assert!(unsupported.config_error.is_none() && !unsupported.placement_supported, "{}", render(&unsupported));
+                    continue;
+                }
                 if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
                     assert!(unsupported.config_error.is_none());
                 } else {

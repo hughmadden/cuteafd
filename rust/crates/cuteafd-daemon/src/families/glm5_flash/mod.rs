@@ -47,7 +47,11 @@ pub(crate) struct EngineArgs {
     /// LM head and drafter stay on --device.
     #[arg(long)]
     pub split_device: Option<i32>,
-    /// Attention executor placement; context/layers are not implemented for GLM Flash.
+    /// MLA attention over the two GPUs of a head split: auto (context where this build carries its
+    /// programs), context (records and pool keys by 256-token unit on one GPU each, a q /
+    /// candidate / partial exchange per MLA layer, the compact index cache), or heads (replicated
+    /// latent and token keys, head-split attention). KDA layers are always head-split; owned MLA
+    /// layers (`layers`) have no executor yet.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
     pub attention_placement: String,
     /// Run only the first N layers (layers 0-2 are the dense ones).
@@ -479,8 +483,14 @@ mod draft_cli_tests {
                 check_options(&args).unwrap();
             }
         }
-        for mode in ["context", "layers", "unknown"] {
-            for peer in [false, true] {
+        // context runs on a head split (#57); one GPU, owned layers and unknown modes are refused.
+        let mut args = parse(&["--attention-placement", "context"]);
+        args.split_device = Some(1);
+        check_options(&args).unwrap();
+        args.prefix_marks = prefix::PrefixMarks::Pool;
+        assert!(check_options(&args).unwrap_err().to_string().contains("prefix marks"));
+        for (mode, peers) in [("context", &[false][..]), ("layers", &[false, true]), ("unknown", &[false, true])] {
+            for &peer in peers {
                 let mut args = parse(&["--attention-placement", mode]);
                 args.split_device = peer.then_some(1);
                 assert!(check_options(&args).unwrap_err().to_string().contains("attention placement"));
@@ -1066,6 +1076,9 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     let executor = cuteafd_loader::placement::families::executor("glm5_flash").context("GLM Flash executor")?;
     executor.check_attention(requested, 1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
+    ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Context)
+        || args.prefix_marks == prefix::PrefixMarks::Arena,
+        "--attention-placement context keeps prefix marks in the arena (--prefix-marks arena)");
     let precise = args.kda_fp32_partials || args.kda_output_shard;
     ensure!(!(precise || args.kda_prefill_expanded) ||
         (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
@@ -1254,10 +1267,28 @@ pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool
     if head_split { engine::IndexCache::Keys } else { requested }
 }
 
+/// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
+/// the build's context programs), with its programs' scratch.
+fn resolve_attention(args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, split: bool)
+    -> Result<engine::GlmfAttention> {
+    let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
+    let names: Vec<&str> = programs.names().collect();
+    let available = cuteafd_loader::placement::families::glm5_flash::context_programs(names.iter().copied(),
+        |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)));
+    let attention = cuteafd_loader::placement::families::glm5_flash::resolve_attention(requested,
+        1 + usize::from(split), available)?;
+    // Auto with pool marks keeps heads (context keeps marks in the arena).
+    if requested.is_none() && args.prefix_marks == prefix::PrefixMarks::Pool {
+        return Ok(engine::GlmfAttention { mode: cuteafd_loader::placement::AttentionPlacement::Heads, ..attention });
+    }
+    Ok(attention)
+}
+
 impl Opened {
+    #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
-        prepared_draft: Option<&remote_dflash::Prepared<'_>>)
+        prepared_draft: Option<&remote_dflash::Prepared<'_>>, attention: engine::GlmfAttention)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -1345,7 +1376,7 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { cfg: &self.cfg, layers, local_tp2_exl3,
+        let inputs = admission::GlmfInputs { attention, cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, remote_dflash::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
@@ -1483,10 +1514,16 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
-        let index_cache = served_index_cache(args.index_cache, split_device.is_some());
-        if let (Some(device), true) = (split_device, index_cache != args.index_cache) {
-            tracing::warn!(device, "--index-cache compact is single-GPU for now; the head split keeps the token keys");
+        // The MLA placement: auto is context on two GPUs where this build carries its programs
+        // (with the compact index cache), else heads (whose split keeps the token keys).
+        let attention = resolve_attention(args, &programs, split_device.is_some())?;
+        let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
+        let index_cache = if context_mode.is_some() { engine::IndexCache::Compact }
+            else { served_index_cache(args.index_cache, split_device.is_some()) };
+        if let (Some(device), true, None) = (split_device, index_cache != args.index_cache, context_mode) {
+            tracing::warn!(device, "--index-cache compact is single-GPU under heads; the head split keeps the token keys");
         }
+        cuteafd_bench::context::set_resolved("attention-placement", &attention.mode.to_string());
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -1502,7 +1539,8 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         // The prefix mark arena on the layout this engine serves, its index cache resolved above:
         // both admissions reserve these marks, and `prefix_cache` allocates as many.
-        let mark_slots = args.mark_arena.slots_on(&self.cfg, layers, index_cache, args.kda_state)?;
+        let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
+            context_mode.is_some())?;
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
@@ -1520,7 +1558,11 @@ impl Opened {
             _ => None,
         };
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
-            split_device, automatic_context, prepared_draft.as_ref())?;
+            split_device, automatic_context, prepared_draft.as_ref(), attention)?;
+        cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
+        ensure!((placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context)
+            == context_mode.is_some(), "GLM Flash admission placed {} attention, the engine serves {}",
+            placement.attention_placement, attention.mode);
         let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
             .map_or(0, |(_, gpu)| *gpu);
         if draft_gpu == 0 { drop(prepared_draft.take()); }
@@ -1608,7 +1650,7 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records)?;
+            args.kda_state, args.decode_rows, records, context_mode)?;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
         if !startup_graphs {
@@ -1624,7 +1666,13 @@ impl Opened {
             tensor_from_rows = head::TARGET_HEAD_TENSOR_ROWS, fp8_head = args.fp8_head, "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
-            tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
+            tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
+                "GLM 5.3 Flash head split over two GPUs");
+        }
+        if context_mode.is_some() {
+            // The solver charged the staging over the compiled extent it was given.
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+            engine.attach_context(args.max_context, &manifest)?;
         }
         probe("peer-exchanges")?;
         engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
@@ -2013,7 +2061,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     ensure!(!args.nll || engine.full_prefill_logits, "--nll needs full prefill logits");
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let mut placement = engine::Allocator::new(engine.pages, engine.slots).admit(tokens.len() + args.bench_decode)?;
+    let mut placement = engine::Allocator::for_engine(engine).admit(tokens.len() + args.bench_decode)?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
@@ -2125,7 +2173,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         engine.op_profile()?;
         let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_capacity()));
         let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
-        let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
+        let mut allocator = engine::Allocator::for_engine(engine);
         let _held = allocator.admit(tokens.len() + args.bench_decode)?;
         let mut times = Vec::new();
         for _ in 0..args.bench_prefill {
@@ -2229,7 +2277,7 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'
     if let Some(p) = args.prefill {
         tokens.truncate(p);
     }
-    let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
+    let mut allocator = engine::Allocator::for_engine(engine);
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let mut last = None;
     for chunk in tokens.chunks(engine.prefill_capacity()) {

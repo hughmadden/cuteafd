@@ -292,7 +292,7 @@ pub(super) fn draft_modes(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequences:
         (the ring holds {RING} positions; tokens.bin has {} tokens)", tokens.len());
     let fp8 = drafter.replay().resident_modes().iter().any(|mode| mode.name == "FP8");
     let settings = draft_mode_settings(fp8, args.engine.draft_linear);
-    let placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
+    let placement = Allocator::for_engine(engine).admit(end + 1)?;
     let mut steps = EngineDraftModes { engine, drafter, placement };
     let tally = draft_mode_schedule(&mut steps, &tokens, prefill, end, sequences, super::engine::DECODE_ROWS,
         &settings);
@@ -331,7 +331,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         _ => sequence.len(),
     };
     let greedy = end > sequence.len();
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     let mut placement = allocator.admit(end + 1)?;
     let started = Instant::now();
     let logits = prefill_with_taps(engine, &mut placement, &sequence[..prefill], 0)?;
@@ -478,7 +478,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     let rows = args.step_rows;
     ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
     let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     let mut serial = allocator.admit(prefill + rows)?;
     let mut wide = allocator.admit(prefill + rows)?;
     engine.prefill(&mut serial, &sequence[..prefill], None)?;
@@ -580,7 +580,7 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
     let capacity = rounds.iter().map(|r| r.starts[0].checked_add(r.verify_tokens[0].len())
         .context("trace position overflow")).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap().max(prefill);
     ensure!(capacity <= engine.max_context, "trace exceeds admitted context");
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     let mut target = allocator.admit(capacity)?;
     let mut serial = allocator.admit(capacity)?;
     let prompt_logits = prefill_with_taps(engine, &mut target, &sequence[..prefill], 0)?;
@@ -737,7 +737,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
     // The recurrent part of a slot's state (FP32 or BF16, `--kda-state`), then its conv windows.
     let element = engine.kda_state.bytes();
     let recurrent_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * element;
-    let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
+    let allocator = std::cell::RefCell::new(Allocator::for_engine(engine));
     let fresh = || -> Result<GlmfPlacement> {
         let mut placement = allocator.borrow_mut().admit(prefill + rows + 1)?;
         engine.prefill(&mut placement, &sequence[..prefill], None)?;
@@ -1033,7 +1033,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
     let sequence = tokens(args)?;
     let count = args.bench_sequences.max(1);
     let prefill = args.prefill.unwrap_or(256).min(sequence.len() - max_rows - count);
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::for_engine(engine);
     // Distinct sequences: sequence i starts i tokens later in the golden prompt.
     let mut placements = (0..count).map(|i| -> Result<GlmfPlacement> {
         let mut placement = allocator.admit(prefill + max_rows + 1)?;

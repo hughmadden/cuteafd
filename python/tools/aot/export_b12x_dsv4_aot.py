@@ -577,6 +577,12 @@ def context_split_programs(g, decode_rows: int, max_context: int):
                     {"row_bytes": row_bytes, "page_rows": page_rows, "page_bytes": page_bytes},
                     lambda rb=row_bytes, pr=page_rows, pb=page_bytes:
                         split.compile_paged_staging_gather_aot(row_bytes=rb, page_rows=pr, page_bytes=pb)))
+    if hasattr(g, "index_kpool") and not v4:
+        # GLM Flash: one GPU's selection over its own allocation units (dense rows, its picks of
+        # the merged top-k pools, the open tail pool on its owner).
+        from b12x.integration.cuteafd import glmf
+        out.append(("index_expand_owned", "index_expand", {"owned": True},
+                    lambda: glmf.compile_glmf_index_expand_owned_aot(g)))
     return out
 
 
@@ -695,6 +701,15 @@ def main() -> None:
         for name in (n for n in geometries if n in bases):
             work += [(families[name], *item) for item in context_split_programs(
                 bases[name], args.decode_rows, geometry_context(name, args.max_context))]
+        if "glmf2" in geometries:
+            # GLM Flash context keeps the compact index cache on two GPUs: each GPU's share commits
+            # its KDA heads and rebuilds the (replicated) index tails in one launch.
+            from b12x.integration.cuteafd import glmf
+            glmf2 = dataclasses.replace(GLM53_FLASH, name="glm53_flash_tp2", heads=GLM53_FLASH.heads // 2,
+                                        kda_heads=GLM53_FLASH.kda_heads // 2, dense_inter=GLM53_FLASH.dense_inter // 2,
+                                        moe_inter=GLM53_FLASH.moe_inter // 2)
+            work.append(("glmf2", "kda_commit_c", "kda_commit", {"index_cache": "compact"},
+                         lambda: glmf.compile_glmf_kda_commit_c_aot(glmf2)))
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

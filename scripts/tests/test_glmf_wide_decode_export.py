@@ -226,6 +226,10 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
         assert layouts["paged_staging_gather_swa"] == 149760
     else:
         assert layouts["paged_staging_gather_kv"] == record_bytes*64
+    # GLM Flash alone: one GPU's selection over its own units (glmf_index_expand_owned).
+    assert ("index_expand_owned" in calls) == (family == "glmf")
+    if family == "glmf":
+        assert calls["index_expand_owned"][1][:2] == ("glmf", "compile_glmf_index_expand_owned_aot")
 
 
 def test_context_split_programs_append_after_every_other_program_when_switched_on():
@@ -241,3 +245,5 @@ def test_context_split_programs_append_after_every_other_program_when_switched_o
     appended = source.index('if args.context_split == "on":')
     assert appended > wide, "context-split programs must come after every existing program"
     assert 'context_split_programs(\n                bases[name], args.decode_rows, geometry_context(name, args.max_context))' in source
+    # glmf2's compact commit (context keeps the compact index cache on two GPUs) comes last too.
+    assert source.index('work.append(("glmf2", "kda_commit_c", "kda_commit"') > appended
