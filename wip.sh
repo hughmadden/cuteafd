@@ -480,6 +480,8 @@ preflight_existing_container_images() {
         '{{range .HostConfig.DeviceRequests}}{{range .DeviceIDs}}{{println .}}{{end}}{{end}}' \
         "$coordinator_container"
     )"
+    # CDI records the request as nvidia.com/gpu=UUID; containers made with --gpus record the bare UUID.
+    coordinator_device="${coordinator_device#nvidia.com/gpu=}"
     [[ "$coordinator_device" == "$RELEASE_COORDINATOR_GPU_UUID" ]] ||
       release_die "$coordinator_container is not bound to the configured physical GPU; rerun ./wip.sh --recreate"
   fi

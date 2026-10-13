@@ -60,3 +60,29 @@ ensure_local_container
     else:
         assert 'lost GPU access' in result.stderr
         assert calls.index('docker rm -f c') < calls.index('docker run -d --name c')
+
+
+@pytest.mark.parametrize('recorded,bound', [('GPU-x', True), ('nvidia.com/gpu=GPU-x', True),
+                                            ('nvidia.com/gpu=GPU-y', False), ('GPU-y', False)])
+def test_gpu_binding_preflight_accepts_cdi_and_legacy_requests(tmp_path, recorded, bound):
+    start = WIP.index('preflight_existing_container_images() {')
+    end = WIP.index('\n}\n', start) + 3
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    (bindir / 'docker').write_text(f'''#!/usr/bin/env bash
+case "$*" in
+  *"image inspect"*) echo img ;;
+  *"container inspect"*) exit 0 ;;
+  *DeviceRequests*) echo "{recorded}" ;;
+  *) echo img ;;
+esac
+''')
+    (bindir / 'docker').chmod(0o755)
+    script = (f'release_die() {{ echo "DIE $*" >&2; exit 9; }}\n'
+              'COORDINATOR_DOCKER_DEV=img coordinator_container=c RELEASE_COORDINATOR_GPU_UUID=GPU-x wip_spark_leg=0\n'
+              + WIP[start:end] + 'preflight_existing_container_images\n')
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                            env={**os.environ, 'PATH': f'{bindir}:{os.environ["PATH"]}'})
+    assert (result.returncode == 0) == bound, result.stderr
+    if not bound:
+        assert 'not bound to the configured physical GPU' in result.stderr
