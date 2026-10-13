@@ -72,12 +72,16 @@ VERSION = str(
 # otherwise, so a Zen 5 build host emitted AVX-512 that a coordinator without
 # it cannot run, and two build hosts never produced identical objects. Every
 # exporter imports this module before compiling, so the default HostTarget is
-# pinned here once: x86-64-v3 (AVX2) for coordinator exports, GB10's smaller
-# core for Spark exports. An explicit per-call --host-target still wins;
-# CUTEAFD_CUTE_HOST_TARGET overrides the default ("native" keeps the build host).
+# pinned here once. Coordinator stubs (launch wrappers, not hot code) use
+# x86-64-v3 (AVX2). Every Spark is a GB10 (Cortex-X925 + Cortex-A725, one
+# feature set), so Spark exports are tuned for its fast core: CuTe DSL 4.6.2's
+# LLVM accepts cortex-x925, and on a GB10 "native" already resolved to it
+# (identical objects), so the pin keeps today's code and makes it reproducible.
+# An explicit per-call --host-target still wins; CUTEAFD_CUTE_HOST_TARGET
+# overrides the default ("native" keeps the build host).
 HOST_TARGETS = {
     "x86_64": "llvm -mtriple=x86_64-unknown-linux-gnu -mcpu=x86-64-v3",
-    "aarch64": "llvm -mtriple=aarch64-unknown-linux-gnu -mcpu=cortex-a725",
+    "aarch64": "llvm -mtriple=aarch64-unknown-linux-gnu -mcpu=cortex-x925",
 }
 
 

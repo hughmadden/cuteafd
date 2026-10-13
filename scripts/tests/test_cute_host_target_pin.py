@@ -59,7 +59,7 @@ def fake_cutlass(monkeypatch):
     return compiler
 
 
-@pytest.mark.parametrize('machine,cpu', [('x86_64', 'x86-64-v3'), ('aarch64', 'cortex-a725')])
+@pytest.mark.parametrize('machine,cpu', [('x86_64', 'x86-64-v3'), ('aarch64', 'cortex-x925')])
 def test_default_is_a_portable_baseline_per_architecture(monkeypatch, machine, cpu):
     monkeypatch.delenv('CUTEAFD_CUTE_HOST_TARGET', raising=False)
     monkeypatch.setattr('platform.machine', lambda: machine)
