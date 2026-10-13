@@ -337,32 +337,26 @@ impl Active<'_> {
 /// its selector features, step ms) and every finished request's generated
 /// tokens. At temperature 0 the output is the target's greedy sequence, so
 /// the trace scores any draft-count policy offline.
-struct Trace(std::io::BufWriter<std::fs::File>);
+struct Trace(crate::shared::speculation_trace::Trace);
 
 impl Trace {
     fn open() -> Result<Option<Self>> {
-        let Some((var, path)) = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_GLM_TRACE") else { return Ok(None) };
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .with_context(|| format!("{var} {path}"))?;
-        Ok(Some(Self(std::io::BufWriter::new(file))))
+        Ok(crate::shared::speculation_trace::Trace::open("CUTEAFD_GLM_TRACE")?.map(Self))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn cycle(&mut self, id: u64, position: usize, rows: usize, committed: usize, planned: usize, copy: bool,
         draft: Option<&super::dflash::Draft>, verify_ms: f64) -> Result<()> {
-        use std::io::Write;
         let line = serde_json::json!({"kind": "cycle", "id": id, "position": position, "rows": rows,
             "committed": committed, "planned": planned, "copy": copy, "verify_ms": verify_ms,
             "draft": draft.map(|d| &d.tokens), "features": draft.map(|d| &d.features)});
-        writeln!(self.0, "{line}")?;
+        self.0.write(&line)?;
         Ok(())
     }
 
     fn done(&mut self, id: u64, prompt_tokens: usize, generated: &[u32]) -> Result<()> {
-        use std::io::Write;
-        writeln!(self.0, "{}", serde_json::json!({"kind": "done", "id": id, "prompt_tokens": prompt_tokens,
+        self.0.write(&serde_json::json!({"kind": "done", "id": id, "prompt_tokens": prompt_tokens,
             "generated": generated}))?;
-        self.0.flush()?;
         Ok(())
     }
 }

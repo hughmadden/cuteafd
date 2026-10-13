@@ -25,6 +25,7 @@ pub(crate) mod probe;
 pub(crate) mod sampler;
 pub(crate) mod serve;
 pub(crate) mod speculation;
+pub(crate) mod speculation_trace;
 pub(crate) mod token_io;
 pub(crate) mod spark_intake;
 pub(crate) mod spark_topology;
