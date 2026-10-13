@@ -97,7 +97,7 @@ sys.exit(subprocess.run(['bash', '-s', '--', 'test'], input=script, text=True).r
     ssh = bins / 'ssh'
     ssh.write_text('#!/usr/bin/env bash\nshift 3\nexec "$@"\n')
     ssh.chmod(0o755)
-    return subprocess.run(['bash', '-c', 'set -euo pipefail\nrole=$1; from_slot=$2; slot=test; '
+    return subprocess.run(['bash', '-c', 'set -euo pipefail\nwip_spark_leg=1; role=$1; from_slot=$2; slot=test; '
                            'coordinator_container=fixture; spark_container=fixture; seed_host=fixture\n' + block,
                            'test', role, from_slot], capture_output=True, text=True, timeout=10,
                           env={**os.environ, 'MOCK_SLOTS': str(slots), 'PATH': str(bins)+':'+os.environ['PATH']})
@@ -332,3 +332,22 @@ def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     transformers_verifier().verify(stage / 'third_party/transformers', stage / 'third_party/transformers.lock.json')
+
+
+def _wip_dry_run(*args):
+    return subprocess.run(['bash', str(ROOT / 'wip.sh'), '--dry-run', '--slot', 'new', *args],
+                          capture_output=True, text=True, timeout=60, cwd=ROOT)
+
+
+def test_zero_spark_coordinator_from_slot_skips_spark_leg():
+    config = ROOT / 'examples/configs/qwen38-exl3-min.config'
+    result = _wip_dry_run('--role', 'coordinator', '--from-slot', 'old', '--config', str(config))
+    assert result.returncode == 0, result.stderr
+    assert 'Spark leg: off' in result.stdout
+
+
+def test_zero_spark_expert_role_still_refused():
+    config = ROOT / 'examples/configs/qwen38-exl3-min.config'
+    result = _wip_dry_run('--role', 'expert', '--config', str(config))
+    assert result.returncode != 0
+    assert 'no active Spark hosts' in result.stderr
