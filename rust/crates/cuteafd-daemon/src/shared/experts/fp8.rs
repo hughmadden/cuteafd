@@ -248,6 +248,7 @@ pub(crate) struct Fp8Experts<'a> {
     pub module: Fp8MoeModule,
     pub tp: usize,
     pub rank: usize,
+    weight_read_bytes: usize,
 }
 
 impl<'a> Fp8Experts<'a> {
@@ -323,14 +324,18 @@ impl<'a> Fp8Experts<'a> {
             let scratch = bf16.scratch_bytes(top)?;
             Ok::<_, anyhow::Error>((bf16, scratch))
         }).transpose()?;
-        let (resident_bytes, scratch_bytes) = resident_admission(Fp8Layer::bytes_for(tensors, tp, rank, slicing)?,
+        let layer_bytes = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?;
+        let weight_read_bytes = tensors.weight_read_bytes_with(tp, rank, slicing)?;
+        ensure!(weight_read_bytes > 0 && weight_read_bytes.checked_mul(shape.experts) == Some(layer_bytes),
+            "FP8 layer read extent does not divide into experts");
+        let (resident_bytes, scratch_bytes) = resident_admission(layer_bytes,
             layers.len(), primary_scratch,
             bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
         tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
             "FP8 expert allocation admitted");
         let scratch = DeviceAllocation::new(library, scratch_bytes)?;
         Ok(Self { layers: Vec::with_capacity(layers.len()), scratch,
-            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank })
+            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank, weight_read_bytes })
     }
 
     /// Bounded P4 double banks: each checkpoint projection is read once, then
@@ -524,11 +529,14 @@ impl<'a> Fp8Experts<'a> {
         Ok((group, traffic_contract(contract)))
     }
 
+    /// Stored checkpoint read extent, excluding scratch and allocator alignment.
+    pub fn weight_read_bytes(&self) -> usize { self.weight_read_bytes }
+
     pub fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize, capacity: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping};
         let report = InstalledExpertGrouping::new(loaded, rank, capacity, ExpertGroupingSelector::Fp8Nearest,
-            installed_variants(&self.module)?)?;
+            installed_variants(&self.module)?)?.with_weight_read_bytes(self.weight_read_bytes)?;
         match &self.bf16_module {
             Some(module) => report.with_bf16_variants(installed_variants(module)?),
             None => Ok(report),

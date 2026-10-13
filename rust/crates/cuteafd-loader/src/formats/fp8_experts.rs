@@ -437,6 +437,19 @@ impl Fp8ExpertTensors {
         Ok(experts * self.slice_bytes_with(projection, tp, rank, slicing)?.1 + alphas)
     }
 
+    /// One expert's stored weight and scale read extent for an installed rank.
+    pub fn weight_read_bytes_with(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<usize> {
+        let experts = self.shape.experts;
+        ensure!(experts > 0, "expert read extent needs a positive expert count");
+        Fp8Projection::ALL.iter().try_fold(0usize, |total, &projection| {
+            let (weights, _) = self.slice_bytes_with(projection, tp, rank, slicing)?;
+            let region = self.scale_region_bytes_with(projection, tp, rank, slicing)?;
+            ensure!(region % experts == 0, "expert scale read extent is not uniform");
+            total.checked_add(weights).and_then(|bytes| bytes.checked_add(region / experts))
+                .context("expert weight/scale read extent overflow")
+        })
+    }
+
     /// Rows of one slice block: the 128x128 scale block (FP8), the 32-wide
     /// UE8M0 block (MXFP4) or the 16-wide E4M3 block (NVFP4).
     pub fn block(&self) -> usize {
@@ -720,6 +733,31 @@ mod tests {
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
         (0..tp).map(|rank| tensors.rank_range(tp, rank).unwrap()).collect()
+    }
+
+    #[test]
+    fn installed_read_bytes_follow_exact_rank_widths_and_checkpoint_scales() {
+        for (format, divisor, group, scalar) in [
+            (ExpertFormat::Fp8Block128, 1, 128, 0),
+            (ExpertFormat::Mxfp4, 2, 32, 0),
+            (ExpertFormat::Nvfp4, 2, 16, 8),
+        ] {
+            let tensors = catalog(format, 2048);
+            let hidden = tensors.shape().hidden;
+            let widths = [384, 384, 384, 384, 256, 256];
+            for (rank, width) in widths.into_iter().enumerate() {
+                let weights = hidden * width / divisor;
+                let scales = if format == ExpertFormat::Fp8Block128 {
+                    hidden.div_ceil(group) * width.div_ceil(group) * 4
+                } else { hidden * width / group };
+                assert_eq!(tensors.weight_read_bytes_with(6, rank, Slicing::Blocks(128)).unwrap(),
+                    3 * (weights + scales + scalar));
+            }
+            let padded = tensors.weight_read_bytes_with(6, 5, Slicing::Padded).unwrap();
+            assert_eq!(padded, tensors.weight_read_bytes_with(6, 0, Slicing::Blocks(128)).unwrap());
+            assert!(padded > tensors.weight_read_bytes_with(6, 5, Slicing::Blocks(128)).unwrap());
+            assert!(tensors.weight_read_bytes_with(6, 6, Slicing::Blocks(128)).is_err());
+        }
     }
 
     #[test]

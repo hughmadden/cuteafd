@@ -221,13 +221,16 @@ pub struct InstalledExpertGrouping {
     selector: ExpertGroupingSelector,
     variants: Vec<InstalledExpertVariant>,
     bf16_variants: Option<Vec<InstalledExpertVariant>>,
+    /// Checkpoint weight and scale read extent per expert for this loaded rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weight_read_bytes: Option<usize>,
 }
 
 impl InstalledExpertGrouping {
     pub fn new(loaded: WorkerSelection, rank: usize, capacity: usize,
         selector: ExpertGroupingSelector, mut variants: Vec<InstalledExpertVariant>) -> Result<Self> {
         variants.sort_by_key(|variant| variant.capacity);
-        let report = Self { loaded, rank, capacity, selector, variants, bf16_variants: None };
+        let report = Self { loaded, rank, capacity, selector, variants, bf16_variants: None, weight_read_bytes: None };
         report.validate()?;
         Ok(report)
     }
@@ -238,6 +241,16 @@ impl InstalledExpertGrouping {
         self.bf16_variants = Some(variants);
         self.validate()?;
         Ok(self)
+    }
+
+    pub fn with_weight_read_bytes(mut self, bytes: usize) -> Result<Self> {
+        self.weight_read_bytes = Some(bytes);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn weight_read_bytes(&self) -> Result<usize> {
+        self.weight_read_bytes.context("installed expert read-byte descriptor missing; rebuild coordinator and workers together")
     }
 
     pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
@@ -251,6 +264,9 @@ impl InstalledExpertGrouping {
 
     fn validate(&self) -> Result<()> {
         self.loaded.validate()?;
+        ensure!(self.weight_read_bytes.is_none_or(|bytes| bytes > 0)
+            && (self.selector == ExpertGroupingSelector::Fp8Nearest || self.weight_read_bytes.is_none()),
+            "invalid installed FP8 expert read-byte descriptor");
         ensure!(self.rank < self.loaded.identity.world as usize && !self.loaded.ranges.is_empty(),
             "invalid installed expert rank/resident layers");
         ensure!((1..=4096).contains(&self.capacity) && (1..=6).contains(&self.variants.len()),
@@ -349,7 +365,8 @@ impl InstalledExpertGrouping {
                     .any(|b| a.first < b.end && b.first < a.end));
                 ensure!(!overlap || (report.capacity == previous.capacity
                     && report.selector == previous.selector && report.variants == previous.variants
-                    && report.bf16_variants == previous.bf16_variants),
+                    && report.bf16_variants == previous.bf16_variants
+                    && report.weight_read_bytes.is_some() == previous.weight_read_bytes.is_some()),
                     "installed expert grouping differs across ranks {} and {rank} for the same layer (mixed packages)",
                     previous.rank);
             }
@@ -500,6 +517,26 @@ mod tests {
             InstalledExpertVariant::from_queries(capacity, |rows|
                 Ok(if rows > 0 && rows <= compact.min(capacity) { 1 } else { 16 })).unwrap()).collect();
         InstalledExpertGrouping::new(loaded, rank, 256, ExpertGroupingSelector::Native, variants).unwrap()
+    }
+
+    #[test]
+    fn installed_fp8_rank_read_bytes_allow_unequal_exact_slices_but_not_mixed_descriptors() {
+        let report = |rank| {
+            let loaded = WorkerSelection::new(identity(), &[13, 14, 15]).unwrap();
+            let variant = InstalledExpertVariant::from_piecewise_queries(80,
+                ExpertTrafficContract::ExactGrouping, |_| Ok(48)).unwrap();
+            InstalledExpertGrouping::new(loaded, rank, 80, ExpertGroupingSelector::Fp8Nearest,
+                vec![variant]).unwrap()
+        };
+        let left = report(0).with_weight_read_bytes(9_216_024).unwrap();
+        let right = report(1).with_weight_read_bytes(6_144_024).unwrap();
+        InstalledExpertGrouping::validate_ranks(&[left.clone(), right]).unwrap();
+        let restored: InstalledExpertGrouping = serde_json::from_slice(&serde_json::to_vec(&left).unwrap()).unwrap();
+        assert_eq!(restored.weight_read_bytes().unwrap(), 9_216_024);
+        assert!(report(0).weight_read_bytes().is_err());
+        assert!(report(0).with_weight_read_bytes(0).is_err());
+        assert!(InstalledExpertGrouping::validate_ranks(&[left, report(1)]).is_err());
+        assert!(grouping(0, 8).with_weight_read_bytes(10).is_err());
     }
 
     #[test]
