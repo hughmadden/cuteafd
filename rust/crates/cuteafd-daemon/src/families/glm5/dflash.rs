@@ -865,6 +865,10 @@ impl<'a> GlmDrafter<'a> {
         let drafted = sequences * c.drafts();
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let attention_workspace = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
+            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+        };
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -889,8 +893,7 @@ impl<'a> GlmDrafter<'a> {
             features: alloc(drafted * 16)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
-            attention_workspace: alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads,
-                RING + c.block)?)?,
+            attention_workspace,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,

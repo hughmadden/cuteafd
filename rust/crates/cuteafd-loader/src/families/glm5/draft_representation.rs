@@ -191,7 +191,8 @@ pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) ->
         + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 }
 }
 
-/// Owned draft arenas at readiness. The target head and its mask row are borrowed.
+/// SM-independent owned arenas and candidate-local linear/attention scratch at readiness.
+/// The target head and its mask row are borrowed.
 pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, block: u64,
     fp8: bool, sms: u64, mode: u8) -> Result<(u64, u64), GlmDraftStorageError> {
     // Validate before arithmetic, including hostile config.json values. Native kernels and
@@ -218,16 +219,16 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
         rows * 2 * g.intermediate * 2, rows * g.intermediate * 2, rows * g.vocab * 4,
         drafted * 16 * 4, drafted * 16 * 4, rows * g.selector_rank * 2, sequences * 4,
         rows * 4, drafted * 4, drafted * 16, rows * 8, 3 * sequences * 4,
-        crate::serving_capacity::draft_attention_workspace_bytes(sequences, g.kv_heads, 2,
-            2048 + block, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?,
         drafted * 64 * 16 * 8].into_iter().map(allocation).sum::<u64>();
     let scratch = if fp8 {
         let layout = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, capacity, 2048)?;
         layout.fp8_scratch.unwrap().shapes.iter().map(|s|
             draft_fp8_scratch_bytes(2048.max(rows), s.k, s.n, sms, mode)).max().unwrap_or(256)
     } else { 0 };
-    // fp8_linear scratch has its own workspace ledger scope, unlike draft activations.
-    Ok((add(owned, workspace)?, scratch))
+    let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(sequences,
+        g.kv_heads, 2, 2048 + block, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
+    // Both SM-sized arenas follow the selected GPU, even for BF16 projections.
+    Ok((add(owned, workspace)?, add(scratch, allocation(attention_scratch))?))
 }
 
 pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u64), GlmDraftStorageError> {
@@ -301,14 +302,14 @@ fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: us
         (sequences as u64,1,4),(rows,1,4),(rows,1,4),(rows,1,4),(rows,1,8),(sequences as u64,3,4)];
     let mut workspace = 4 << 20;
     for (a,b,c) in terms { workspace = add(workspace,mul(mul(a,b)?,c)?.max(256))?; }
-    workspace = add(workspace,crate::serving_capacity::draft_attention_workspace_bytes(
+    let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(
         sequences as u64, kvh, 1, add(2048,block)?, 64, sms)
-        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256))?;
+        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256);
     workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
     let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
         draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
-    Ok((sum([weights,owned,workspace])?,scratch))
+    Ok((sum([weights,owned,workspace])?,add(scratch,attention_scratch)?))
 }
 
 #[cfg(test)]
@@ -334,9 +335,9 @@ mod tests {
         let new_attention = crate::serving_capacity::draft_attention_workspace_bytes(8, 8, 2,
             2056, 128, 188).unwrap();
         assert_eq!(layout.weights.resident_bytes().unwrap() + arenas,
-            1_835_700_096 - old_attention + new_attention);
+            1_835_700_096 - old_attention);
         // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
-        assert_eq!(scratch,30_491_648 + 128 * 80 * 4);
+        assert_eq!(scratch,30_491_648 + 128 * 80 * 4 + new_attention);
         let mut invalid = g; invalid.conv_group = 0;
         assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2).is_err());
     }

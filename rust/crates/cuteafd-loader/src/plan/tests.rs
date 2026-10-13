@@ -1954,7 +1954,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     };
     let bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout, rank, category| memory.devices.iter()
         .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
-        .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash fp8-linear scratch"))
+        .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
         .map(|i| i.bytes).sum::<u64>();
     let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
         &[170,188],GlmDraftRepresentation::Fp8Only,2).unwrap();
