@@ -298,7 +298,7 @@ def test_cmake_cxx_toggle_is_detected_and_build_scripts_check_it(tmp_path):
     assert result.returncode == 1 and "CMake CXX compiler changed" in result.stderr
     for name in ("build-wip-artifacts.sh", "build-release-artifacts.sh"):
         text = (ROOT / "scripts/build" / name).read_text()
-        assert text.index("cuteafd_compiler_cache_check_cmake_compilers") < text.index("cargo build")
+        assert text.index("cuteafd_compiler_cache_check_cmake_compilers") < text.index("cuteafd_host_isa_cargo_build ")
 
 
 def test_docker_missing_remote_emits_no_partial_mounts(tmp_path):
