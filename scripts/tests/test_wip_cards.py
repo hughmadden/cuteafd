@@ -559,8 +559,11 @@ release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
+# The fair turn as the only mode (off-queue modes: test_wip_coordinator_export_modes.py).
+CUTEAFD_WIP_COORDINATOR_EXPORT=turn
 '''
-    subprocess.run(['bash', '-c', setup + function + '\nbuild_coordinator'], check=True,
+    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
+    subprocess.run(['bash', '-c', setup + modes + function + '\nbuild_coordinator'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
@@ -576,7 +579,7 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
 def test_split_native_phase_requires_matching_rust_source_and_cache_mode():
     text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     assert 'phase="${6:-all}"' in text
-    assert '[[ "$phase" == native ]] || cuteafd_build_cache_cargo_offline' in text
+    assert '[[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline' in text
     assert 'rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"' in text
     assert '"$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd"' in text
     assert '[[ "$phase" != rust ]] || exit 0' in text

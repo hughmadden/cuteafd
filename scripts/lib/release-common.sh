@@ -234,6 +234,13 @@ release_ssh() {
 # host's directly attached LAN address instead of a slower name route; the
 # host key is still checked under HOST's own name.
 release_bulk_ssh_opts=(-c aes128-gcm@openssh.com -o Compression=no)
+# release_gpu_device_args UUID: the docker run arguments that expose one GPU.
+# The one place a container's GPU binding is spelled, so a switch to CDI
+# (--device nvidia.com/gpu=UUID) changes only this function.
+release_gpu_device_args() {
+  printf '%s\n' --gpus "device=$1"
+}
+
 # release_host_has_rdma HOST: HOST has at least one RDMA device (RoCE fabric).
 release_host_has_rdma() {
   release_ssh "$1" 'ls /sys/class/infiniband 2>/dev/null | grep -q .'
