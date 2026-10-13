@@ -488,6 +488,11 @@ preflight_existing_container_images() {
 preflight_existing_container_images
 ((wip_spark_leg == 0)) || distribute_spark_dev_image
 
+# wip_container_gpu_ok CONTAINER: its GPU still answers NVML.
+wip_container_gpu_ok() {
+  timeout 60 docker exec "$1" nvidia-smi -L >/dev/null 2>&1
+}
+
 ensure_local_container() {
   local image_id container_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
@@ -506,8 +511,15 @@ ensure_local_container() {
     cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
       docker start "$coordinator_container" >/dev/null
-    docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
-    return
+    # A container can outlive its GPU access (a host daemon-reload drops NVML in
+    # running containers). Its state is all on the /wip bind mount, so recreate it
+    # rather than fail later in the export.
+    if wip_container_gpu_ok "$coordinator_container"; then
+      docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
+      return
+    fi
+    echo "WIP: $coordinator_container lost GPU access (nvidia-smi -L failed); recreating it" >&2
+    docker rm -f "$coordinator_container" >/dev/null
   fi
   local -a args=(
     run -d --name "$coordinator_container" --restart no
