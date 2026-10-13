@@ -210,6 +210,7 @@ def test_hybrid_objects_are_identical_at_188_and_170_sms(tmp_path, monkeypatch):
     # compiler image this executes the real offline exporter, without a GPU.
     pytest.importorskip("cutlass")
     monkeypatch.setattr(compare_sm, "ROOT", ROOT)
+    monkeypatch.setenv("CUTEAFD_SOURCE_ROOT", str(ROOT))
     for sms in (188, 170):
         output = tmp_path / str(sms)
         output.mkdir()
