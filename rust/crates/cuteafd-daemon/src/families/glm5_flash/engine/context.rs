@@ -244,6 +244,23 @@ impl<'a> GlmfEngine<'a> {
             engine: &'e GlmfEngine<'a>, w: &'e Workspace<'w>, layer: &'e GlmfLayer<'l>,
             tables: &'e StepTables, rank: usize, index: usize, rows: Scalar, cap: &'e str, t: usize,
         }
+        impl Bindings<'_, '_, '_, '_> {
+            /// This GPU's selection (`glmf_index_expand_owned`): its own earlier tokens below the
+            /// dense limit, else its merged pool picks (`local_lengths`: their counts) and the open
+            /// tail pool on its owner. A short step passes no picks (no row reads them).
+            fn expand(&self, local_lengths: *mut c_void) -> Result<()> {
+                let (e, w, rank) = (self.engine, self.w, self.rank);
+                let own = &e.context.as_ref().context("context split")?.ranks[rank];
+                let k = e.cfg.index_topk / KPOOL;
+                let local_lengths = if local_lengths.is_null() { view(&own.local, DECODE_ROWS * k * 4, self.t * 4)?.ptr }
+                    else { local_lengths };
+                e.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
+                    ("local_pools", own.local.buffer.ptr), ("local_lengths", local_lengths),
+                    ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
+                    ("lengths", w.lengths.buffer.ptr)],
+                    &[self.rows, Scalar::I32(self.tables.context_stride as i32), Scalar::I32(rank as i32)])
+            }
+        }
         impl ContextKernels for Bindings<'_, '_, '_, '_> {
             fn produce(&mut self) -> Result<Query> {
                 let (e, w) = (self.engine, self.w);
@@ -253,19 +270,26 @@ impl<'a> GlmfEngine<'a> {
             fn score(&mut self) -> Result<Option<Candidates>> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);
                 e.index_producer(rank, w, self.index, self.layer, self.rows, self.cap, self.tables)?;
+                if !self.tables.long {
+                    // Every row within the dense context (both GPUs see the same step): no top-k, no
+                    // candidate exchange, as the head split skips its pool top-k; each GPU selects
+                    // its own earlier tokens. Graphs of short steps key no pool geometry.
+                    self.expand(std::ptr::null_mut())?;
+                    return Ok(None);
+                }
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
                 let k = e.cfg.index_topk / KPOOL;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };
                 let caches = e.caches_of(rank);
                 let pools = &caches.index[self.index].as_ref().context("MLA layer without an index cache")?.pools;
-                let width = Scalar::I32(self.tables.pool_stride as i32);
+                let width = Scalar::I32(self.tables.context_stride as i32);
                 e.run_on(rank, false, "scored_index_topk_decode_m64", &[("q", w.q_fp8.buffer.ptr),
                     ("weights", w.head_weights.buffer.ptr), ("cache", pools.buffer.ptr),
                     ("table", w.pool_table.buffer.ptr), ("lengths", w.cache_lengths.buffer.ptr),
                     ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
                     ("scratch", own.topk_scratch.buffer.ptr)],
-                    &[self.rows, Scalar::I32(self.tables.pool_width.max(1) as i32), width, Scalar::I32(2),
+                    &[self.rows, Scalar::I32(self.tables.context_width as i32), width, Scalar::I32(2),
                         Scalar::I32(rank as i32)])?;
                 Ok(Some(candidates))
             }
@@ -279,12 +303,8 @@ impl<'a> GlmfEngine<'a> {
                     ("out_indices", view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr),
                     ("table", w.pool_table.buffer.ptr), ("local_slots", own.local.buffer.ptr),
                     ("local_lengths", local_lengths)],
-                    &[self.rows, Scalar::I32(self.tables.pool_stride as i32), Scalar::I32(rank as i32)])?;
-                e.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
-                    ("local_pools", own.local.buffer.ptr), ("local_lengths", local_lengths),
-                    ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
-                    ("lengths", w.lengths.buffer.ptr)],
-                    &[self.rows, Scalar::I32(self.tables.pool_stride as i32), Scalar::I32(rank as i32)])
+                    &[self.rows, Scalar::I32(self.tables.context_stride as i32), Scalar::I32(rank as i32)])?;
+                self.expand(local_lengths)
             }
             fn partial(&mut self, query: *mut c_void, heads_rank: usize) -> Result<Partial> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);
@@ -402,7 +422,9 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
     }
     let stride = tables.pool_stride;
     ensure!(stride > 0 && tables.pool_table.len() == stride * tables.positions.len(), "decode pool table geometry");
-    let half = stride.div_ceil(2);
+    // The compact unit table's stride follows the record-page stride, which every decode graph
+    // keys (the pool stride only long steps key): units a row's pages span, this GPU's half.
+    let half = (tables.page_stride / UNIT_PAGES).div_ceil(2);
     for row in 0..tables.positions.len() {
         let position = tables.positions[row];
         let masked = position < 0;
@@ -420,7 +442,8 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
         } else { -1 });
         let pools = if masked { 0 } else { tables.cache_lengths[row].max(0) as usize };
         let local = if masked { Vec::new() } else {
-            let used = pools.div_ceil(PAGE_ROWS).max((position as usize + 1).div_ceil(UNIT_ROWS)).min(stride);
+            let used = (position as usize + 1).div_ceil(UNIT_ROWS);
+            ensure!(used <= stride && used <= 2 * half, "row {row}: {used} units past the decode table strides");
             let ids: Vec<u32> = tables.pool_table[row * stride..][..used].iter().map(|&p| p as u32).collect();
             local_pages(&ids, rank)?
         };
@@ -429,8 +452,11 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
         out.pool_table.extend(std::iter::repeat_n(0, half - local.len()));
         out.cache_lengths.push(shard_pools(pools, rank) as i32);
     }
-    out.pool_stride = half;
-    out.pool_width = tables.pool_width.div_ceil(2).max(1);
+    // Graph keys read the logical geometry; the context kernels the compact one.
+    out.pool_stride = tables.pool_stride;
+    out.pool_width = tables.pool_width;
+    out.context_stride = half;
+    out.context_width = tables.pool_width.div_ceil(2).max(1);
     // The record pages are never read under context decode (the owned expansion reads units).
     out.page_stride = tables.page_stride;
     out.page_table = tables.page_table.clone();
@@ -504,7 +530,7 @@ mod tests {
         }
         for rank in 0..2 {
             let r = rank_tables(&padded, rank, 64).unwrap();
-            assert_eq!(r.pool_stride, 4);
+            assert_eq!((r.pool_stride, r.context_stride), (8, 4));
             // Rows 0, 1 on unit 4 (GPU0), row 2 on unit 3 (GPU1).
             for (row, owner) in [(0, 0), (1, 0), (2, 1)] {
                 let p = padded.positions[row];

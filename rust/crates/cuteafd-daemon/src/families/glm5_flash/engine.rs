@@ -515,6 +515,11 @@ fn tp2_prepared_peer<T>(prepared: Option<&T>) -> Result<&T> {
 struct StepTables {
     /// The prefill lane these tables belong to (its context gather and commit lists; 0 otherwise).
     lane: usize,
+    /// Context decode: each row's compact unit-table stride and the columns its top-k reads (the
+    /// pool table holds this GPU's units). The logical `pool_stride` / `pool_width` stay the
+    /// step's, so both GPUs key their graphs alike.
+    context_stride: usize,
+    context_width: usize,
     decode: bool,
     eager: bool,
     /// Ordinary rows before startup graph padding; zero for all-masked warm-up.
