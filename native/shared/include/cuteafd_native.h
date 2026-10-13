@@ -313,6 +313,8 @@ cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
+// Retains a timestamp-producing event node inside captured profiling graphs.
+cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained

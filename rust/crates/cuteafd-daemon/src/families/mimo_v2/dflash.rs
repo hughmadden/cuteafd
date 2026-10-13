@@ -133,6 +133,7 @@ pub(crate) struct Draft {
 
 pub(crate) struct MimoDrafter<'a> {
     library: &'a NativeLibrary,
+    timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
     /// Ring slots (sequences with a drafter context).
@@ -478,6 +479,7 @@ impl<'a> MimoDrafter<'a> {
             confidence_directory: dir.into(),
             confidence_scales: scales,
             fp8_workspace,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mimo-dflash")?,
             cfg,
         })
     }
@@ -591,6 +593,7 @@ impl<'a> MimoDrafter<'a> {
         let (h, kv, c) = (self.cfg.hidden, self.cfg.kv_width(), &self.cfg);
         let width = c.taps.len() * h;
         let s = self.stream;
+        let context_span = self.timing.begin("context", None, n, s)?;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
             self.linear(at(taps, first * width * 2), &self.fc, 0,
@@ -607,6 +610,7 @@ impl<'a> MimoDrafter<'a> {
                     c.rope_dim, c.theta, c.eps, c.v_scale, s)?;
             }
         }
+        self.timing.end(context_span, s)?;
         Ok(())
     }
 
@@ -659,7 +663,7 @@ impl<'a> MimoDrafter<'a> {
         ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
             "DFlash borrowed target head geometry differs from its checkpoint");
         self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
-            head.launch(Some(plan), x, out, rows, self.stream))
+            head.launch_draft(Some(plan), x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
@@ -696,6 +700,9 @@ impl<'a> MimoDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         match anchors {
             Anchors::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -723,11 +730,13 @@ impl<'a> MimoDrafter<'a> {
         self.put(&w.tables, bytes_of(&tables))?;
         let (s, l, eps, inter) = (self.stream, self.library, c.eps, c.intermediate);
         let attention_width = c.heads * c.head_dim;
+        let forward_span = self.timing.begin("forward", None, rows, s)?;
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
+                let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
                 self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h,
                     c.qkv_width())?;
                 l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
@@ -737,7 +746,7 @@ impl<'a> MimoDrafter<'a> {
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4),
                     at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,
@@ -749,19 +758,26 @@ impl<'a> MimoDrafter<'a> {
                     inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.n.buffer.ptr, rows, h, eps, s)?;
+                self.timing.end(layer_span, s)?;
             }
+            self.timing.end(forward_span, s)?;
+            let head_span = self.timing.begin("head_topk", None, rows, s)?;
             head(&w.head, w.n.buffer, w.logits.buffer, rows)?;
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+            self.timing.end(head_span, s)?;
             l.cuda_stream_synchronize(s)?;
         }
+        self.timing.publish_completed()?;
+        self.timing.dump_head_input(w.n.buffer, rows, h)?;
+        let confidence_span = self.timing.host_span();
         let drafted = s_count * c.drafts();
         let mut unary = vec![0u8; drafted * 64];
         let mut candidates = vec![0u8; drafted * 64];
         l.copy_d2h(&mut unary, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer })?;
         l.copy_d2h(&mut candidates, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer })?;
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-        Ok((0..s_count).map(|i| {
+        let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);
             Draft {
                 tokens: rows.clone().map(|r| word(&candidates, r * 16)).collect(),
@@ -770,7 +786,9 @@ impl<'a> MimoDrafter<'a> {
                     features(&values)
                 }).collect(),
             }
-        }).collect())
+        }).collect();
+        self.timing.publish_host("download_confidence", rows, confidence_span)?;
+        Ok(drafts)
     }
 
     /// The last draft step's final-norm rows [sequences * block, hidden] BF16.

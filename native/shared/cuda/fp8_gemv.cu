@@ -33,8 +33,12 @@ namespace {
 constexpr int kWarps = 4;
 constexpr int kMaxRows = 64;
 
-// Smallest power of two >= x (x > 0).
+// Smallest power of two >= x (x > 0). Keep libdevice's edge behavior for
+// subnormals and the top exponent, without its calls on ordinary norm rows.
 __device__ __forceinline__ float pow2_ceil(float x) {
+  const uint32_t bits = __float_as_uint(x), exponent = bits & 0x7f800000u;
+  if (exponent != 0 && exponent < 0x7f000000u)
+    return __uint_as_float(exponent + ((bits & 0x007fffffu) != 0 ? 0x00800000u : 0));
   int e;
   const float m = frexpf(x, &e);  // x = m * 2^e, m in [0.5, 1)
   return ldexpf(1.0f, m == 0.5f ? e - 1 : e);
@@ -121,35 +125,48 @@ __global__ void pack_kernel(const __nv_bfloat16* __restrict__ w, uint8_t* __rest
   }
 }
 
-// Per activation row: a power of two that brings its absolute maximum to at
-// most 2^14 (f16 holds it exactly), and its inverse for the output.
-__global__ void row_scale_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ sx, int rows, int k) {
-  const int m = blockIdx.x;
+// Split each row's maximum across K; the packing launch completes the max.
+// A row-wide CTA serializes long K loads and leaves most SMs idle at C1.
+constexpr int kScaleCols = 256;
+__global__ void row_max_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ maxima,
+                               int rows, int k, int splits) {
+  const int m = blockIdx.y, split = blockIdx.x;
+  const int col = split * kScaleCols + threadIdx.x * 2;
   float amax = 0.0f;
-  if (m < rows) {
-    for (int i = threadIdx.x; i < k; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(x[size_t(m) * k + i])));
+  if (m < rows && col < k) {
+    const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(x + size_t(m) * k + col);
+    amax = fmaxf(fabsf(__low2float(v)), fabsf(__high2float(v)));
   }
-  __shared__ float warp_max[32];
   for (int offset = 16; offset; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+  __shared__ float warp_max[kScaleCols / 64];
   if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = amax;
   __syncthreads();
   if (threadIdx.x == 0) {
-    for (int i = 1; i < int(blockDim.x / 32); ++i) amax = fmaxf(amax, warp_max[i]);
-    amax = fmaxf(amax, warp_max[0]);
-    // amax * s <= 2^14; a zero (or padding) row keeps 1.
-    const float s = amax > 0.0f ? 16384.0f / pow2_ceil(amax) : 1.0f;
-    sx[m] = s;
-    sx[kMaxRows + m] = 1.0f / s;
+    for (int i = 0; i < kScaleCols / 64; ++i) amax = fmaxf(amax, warp_max[i]);
+    maxima[size_t(m) * splits + split] = amax;
   }
 }
 
+int row_max_splits(int k) { return (k + kScaleCols - 1) / kScaleCols; }
+size_t row_max_bytes(int k, int stride) { return size_t(row_max_splits(k)) * stride * sizeof(float); }
+
 // Activations [rows, k] -> f16 B fragments: per 32-wide k tile and 8-row
 // group, 32 lanes x 16 bytes (two k16 steps of b0b1, b2b3).
-__global__ void pack_x_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ sx,
-                              uint4* __restrict__ xp, int rows, int k, int groups) {
+__global__ void pack_x_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ maxima,
+                              float* __restrict__ sx, uint4* __restrict__ xp, int rows, int k, int groups,
+                              int stride, int splits) {
   const int kt = blockIdx.x, group = blockIdx.y, lane = threadIdx.x;
   const int m = group * 8 + lane / 4, c = (lane % 4) * 2;
-  const float s = sx[m];
+  float amax = 0.0f;
+  for (int i = lane % 4; i < splits; i += 4) amax = fmaxf(amax, maxima[size_t(m) * splits + i]);
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  // Same power-of-two scale as the row-wide reduction; max reordering is exact.
+  const float s = amax > 0.0f ? 16384.0f / pow2_ceil(amax) : 1.0f;
+  if (kt == 0 && lane % 4 == 0) {
+    sx[m] = s;
+    sx[stride + m] = 1.0f / s;
+  }
   auto h = [&](int col) -> __half {
     return m < rows ? __float2half_rn(__bfloat162float(x[size_t(m) * k + col]) * s) : __float2half_rn(0.0f);
   };
@@ -314,30 +331,6 @@ constexpr int kWideRows = 128;
 // Most rows the W8A8 mode keeps on the f16 path (one draft block).
 constexpr int kW8a16Rows = 8;
 
-// row_scale_kernel for a pass of up to kWideRows rows: the scale at sx[m], its
-// inverse at sx[kWideRows + m]. gemv_kernel and reduce_kernel read a row's
-// inverse at sx[kMaxRows + m], so a wide pass hands them sx + kWideRows -
-// kMaxRows.
-__global__ void row_scale_wide_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ sx, int rows, int k) {
-  const int m = blockIdx.x;
-  float amax = 0.0f;
-  if (m < rows) {
-    for (int i = threadIdx.x; i < k; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(x[size_t(m) * k + i])));
-  }
-  __shared__ float warp_max[32];
-  for (int offset = 16; offset; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
-  if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = amax;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    for (int i = 1; i < int(blockDim.x / 32); ++i) amax = fmaxf(amax, warp_max[i]);
-    amax = fmaxf(amax, warp_max[0]);
-    // amax * s <= 2^14; a zero (or padding) row keeps 1.
-    const float s = amax > 0.0f ? 16384.0f / pow2_ceil(amax) : 1.0f;
-    sx[m] = s;
-    sx[kWideRows + m] = 1.0f / s;
-  }
-}
-
 // Four floats to E4M3 (round to nearest, saturating), first in the low byte.
 __device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
   const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
@@ -501,7 +494,8 @@ size_t wide_bytes(int rows, int k, int n, bool w8a8) {
   const int m = rows < kWideRows ? rows : kWideRows;
   int kb_per_split, splits;
   split_plan(n, k, &kb_per_split, &splits);
-  return align256(2 * kWideRows * sizeof(float)) + align256(size_t(k) * kWideRows * 2) +
+  return align256(2 * kWideRows * sizeof(float)) + align256(row_max_bytes(k, kWideRows)) +
+         align256(size_t(k) * kWideRows * 2) +
          (w8a8 ? align256(size_t(k / 128) * kWideRows * sizeof(float)) : 0) +
          (splits > 1 ? align256(size_t(splits) * m * n * sizeof(float)) : 0);
 }
@@ -528,7 +522,8 @@ extern "C" size_t cuteafd_fp8_w8a16_workspace(int32_t rows, int32_t k, int32_t n
   const int chunk = rows < kMaxRows ? rows : kMaxRows;
   int kb_per_split, splits;
   split_plan(n, k, &kb_per_split, &splits);
-  return align256(2 * kMaxRows * sizeof(float)) + align256(size_t(k) * kMaxRows * 2) +
+  return align256(2 * kMaxRows * sizeof(float)) + align256(row_max_bytes(k, kMaxRows)) +
+         align256(size_t(k) * kMaxRows * 2) +
          (splits > 1 ? align256(size_t(splits) * chunk * n * sizeof(float)) : 0);
 }
 
@@ -542,9 +537,12 @@ extern "C" int32_t cuteafd_fp8_w8a16_linear(const void* x, const void* packed, c
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   uint8_t* ws = static_cast<uint8_t*>(workspace);
   float* sx = reinterpret_cast<float*>(ws);
-  uint4* xp = reinterpret_cast<uint4*>(ws + align256(2 * kMaxRows * sizeof(float)));
-  float* partial = reinterpret_cast<float*>(ws + align256(2 * kMaxRows * sizeof(float)) +
+  float* maxima = reinterpret_cast<float*>(ws + align256(2 * kMaxRows * sizeof(float)));
+  uint4* xp = reinterpret_cast<uint4*>(ws + align256(2 * kMaxRows * sizeof(float)) +
+                                     align256(row_max_bytes(k, kMaxRows)));
+  float* partial = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xp) +
                                             align256(size_t(k) * kMaxRows * 2));
+  const int max_splits = row_max_splits(k);
   int kb_per_split, splits;
   split_plan(n, k, &kb_per_split, &splits);
   const size_t out_row = size_t(n) * (out_f32 ? 4 : 2);
@@ -553,8 +551,8 @@ extern "C" int32_t cuteafd_fp8_w8a16_linear(const void* x, const void* packed, c
     const int groups = m <= 8 ? 1 : m <= 16 ? 2 : m <= 32 ? 4 : 8;
     const __nv_bfloat16* xm = static_cast<const __nv_bfloat16*>(x) + size_t(first) * k;
     void* om = static_cast<uint8_t*>(out) + size_t(first) * out_row;
-    row_scale_kernel<<<groups * 8, 256, 0, s>>>(xm, sx, m, k);
-    pack_x_kernel<<<dim3(k / 32, groups), 32, 0, s>>>(xm, sx, xp, m, k, groups);
+    row_max_kernel<<<dim3(max_splits, groups * 8), kScaleCols / 2, 0, s>>>(xm, maxima, m, k, max_splits);
+    pack_x_kernel<<<dim3(k / 32, groups), 32, 0, s>>>(xm, maxima, sx, xp, m, k, groups, kMaxRows, max_splits);
     const int warps = (n / 16) * splits;
     const dim3 grid((warps + kWarps - 1) / kWarps), block(kWarps * 32);
     const uint4* wp = static_cast<const uint4*>(packed);
@@ -589,7 +587,9 @@ int32_t run_wide(const void* x, const void* packed, const void* scale, void* out
   float* sx = reinterpret_cast<float*>(ws);
   // gemv_kernel and reduce_kernel read a row's inverse at [kMaxRows + m].
   const float* inverse = sx + (kWideRows - kMaxRows);
-  uint8_t* fragments = ws + align256(2 * kWideRows * sizeof(float));
+  float* maxima = reinterpret_cast<float*>(ws + align256(2 * kWideRows * sizeof(float)));
+  uint8_t* fragments = ws + align256(2 * kWideRows * sizeof(float)) + align256(row_max_bytes(k, kWideRows));
+  const int max_splits = row_max_splits(k);
   uint4* xp = reinterpret_cast<uint4*>(fragments);
   uint2* xq = reinterpret_cast<uint2*>(fragments);
   float* sxa = reinterpret_cast<float*>(fragments + align256(size_t(k) * kWideRows * 2));
@@ -625,8 +625,8 @@ int32_t run_wide(const void* x, const void* packed, const void* scale, void* out
       }
     } else {
       // kMaxRows < m <= kWideRows: 16 groups of 8 rows.
-      row_scale_wide_kernel<<<kWideRows, 256, 0, s>>>(xm, sx, m, k);
-      pack_x_kernel<<<dim3(k / 32, 16), 32, 0, s>>>(xm, sx, xp, m, k, 16);
+      row_max_kernel<<<dim3(max_splits, kWideRows), kScaleCols / 2, 0, s>>>(xm, maxima, m, k, max_splits);
+      pack_x_kernel<<<dim3(k / 32, 16), 32, 0, s>>>(xm, maxima, sx, xp, m, k, 16, kWideRows, max_splits);
       gemv_kernel<16><<<grid, block, 0, s>>>(wp, sc, xp, inverse, om, partial, out_f32, m, n, k, kb_per_split, splits);
     }
     if (splits > 1) {

@@ -60,9 +60,12 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         device.run(|| unsafe {
             let graph = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)).map(|owner| owner.raw);
+            let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
+                None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
                 graph, || if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
-                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) })
+                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) })?;
+            terminal.timing.end(span, terminal.stream.raw)
         })
     }
     unsafe fn capture_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
@@ -131,6 +134,11 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                             return Ok(false);
                         }
                         let sampling = matches!(phase, Phase::Sample);
+                        device.run(|| {
+                            self.terminal.timing.publish_completed()?;
+                            self.terminal.timing.publish_retained(if sampling { "sample" } else { "normalize" },
+                                requests * self.terminal.width)
+                        })?;
                         unsafe { self.capture_stage(requests, sampling)?; }
                         if sampling {
                             self.pending = None;

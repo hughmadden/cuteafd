@@ -25,6 +25,7 @@ impl DsparkMainContext<'_, '_> {
             let lib = self.stream.library;
             lib.copy_d2d_async(self.input(), input, input.bytes, self.stream.raw)?;
             lib.copy_h2d_async(self.positions.buffer, &self.commit_staging.bytes_mut()[..positions.len()*8], self.stream.raw)?;
+            let span = self.timing.begin("context", None, rows as usize, self.stream.raw)?;
             self.enqueue(rows)?;
             for stage in 0..3 {
                 let start = self.capacity as usize*8 + stage*384;
@@ -33,6 +34,7 @@ impl DsparkMainContext<'_, '_> {
                 windows[stage].enqueue_write(&self.pending_writes.as_ref().unwrap()[stage],
                     self.rotated[stage].buffer, self.commit_descriptors[stage].buffer, self.stream.raw)?;
             }
+            self.timing.end(span, self.stream.raw)?;
         }
         Ok(())
     }
@@ -42,6 +44,7 @@ impl DsparkMainContext<'_, '_> {
     }
     pub fn publish_commit(&mut self, windows: &mut [DsparkWindow<'_>; 3]) -> Result<()> {
         ensure!(self.poll_commit()?, "main-context commit has not completed");
+        self.timing.publish_completed()?;
         let writes = self.pending_writes.as_ref().unwrap();
         // Validate every owner before publishing any stage.
         for stage in 0..3 { windows[stage].validate_async_write(&writes[stage])?; }

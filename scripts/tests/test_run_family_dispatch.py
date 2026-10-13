@@ -249,7 +249,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "drafter.require_live()?;" in serving
     prime = remote.split("    pub fn prime(", 1)[1].split("    fn launch_head(", 1)[0]
     assert "self.draft.prime_remote()" in prime
-    assert "self.launch_head(&head, rows)?" in prime
+    assert "self.launch_head(&head, rows, true)?" in prime
+    assert "self.launch_head(&head, rows, false)?" in prime
+    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.exchange.stream(0))")
     assert "cuda_stream_synchronize(self.exchange.stream(0))" in prime
     assert "self.exchange.wait(" not in prime and "self.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
@@ -929,6 +931,16 @@ def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_he
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("value", [None, "exact", "tensor", "fp8"])
+def test_glmf_serving_head_has_no_arithmetic_selection(tmp_path, value):
+    keys = "" if value is None else f"GLM5_FLASH_DRAFT_HEAD={value}\n"
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--draft-head" not in launch, launch
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_DRAFT_LINEAR=w8a16\n", None),
@@ -2352,7 +2364,7 @@ def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
                                   f"RTX_GPUS=1\nSPECULATOR_FP8={fp8}\n")
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert "--draft-head tensor" in serve
+    assert "--draft-head" not in serve
     assert ("--draft-linear w8a8" in serve) == (fp8 != "off")
 
 

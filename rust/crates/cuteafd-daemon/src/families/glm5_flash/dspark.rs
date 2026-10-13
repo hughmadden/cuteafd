@@ -567,6 +567,10 @@ impl<'a> DsparkDrafter<'a> {
         let rows = sequences * c.block;
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let attention_workspace = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
+            alloc(self.library.glmf_dspark_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+        };
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -586,8 +590,7 @@ impl<'a> DsparkDrafter<'a> {
             confidence: alloc(rows * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
-            attention_workspace: alloc(self.library.glmf_dspark_attention_workspace(sequences, c.kv_heads,
-                RING + c.block)?)?,
+            attention_workspace,
             markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences, c.block)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
@@ -611,10 +614,15 @@ impl<'a> DsparkDrafter<'a> {
     /// from the target's embedding table.
     pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, true)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>)
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, false)
+    }
+
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
         -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadRef::Bf16(p) if p.is_null()), "dSpark has no borrowed target head");
         let c = &self.cfg;
@@ -640,6 +648,9 @@ impl<'a> DsparkDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         match input {
             DraftInput::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -676,7 +687,7 @@ impl<'a> DsparkDrafter<'a> {
                 l.glmf_dspark_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, c.causal, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.causal, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
                 l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
                     w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
@@ -688,6 +699,8 @@ impl<'a> DsparkDrafter<'a> {
                     rows, h, eps, s)?;
             }
             match head {
+                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
                 HeadRef::Bf16(weight) => crate::families::glm5::launch_draft_head(l, &w.head, w.n.buffer.ptr,
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
@@ -755,7 +768,7 @@ impl ReplayDrafter for DsparkDrafter<'_> {
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
         // Replay's caller keeps the target BF16 head live throughout.
-        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadRef::Bf16(head))?.into_iter()
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadRef::Bf16(head), false)?.into_iter()
             .map(|d| d.tokens).collect())
     }
 
@@ -937,6 +950,15 @@ impl<'a> Drafter<'a> {
             Self::Dflash2(d) => d.draft_device(sequences, embedding, head),
             Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head),
             Self::Dspark(d) => d.draft_device(sequences, embedding, head),
+        }
+    }
+
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        match self {
+            Self::Dflash2(d) => d.draft_device_diagnostic(sequences, embedding, head),
+            Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head),
+            Self::Dspark(d) => d.draft_device_diagnostic(sequences, embedding, head),
         }
     }
 

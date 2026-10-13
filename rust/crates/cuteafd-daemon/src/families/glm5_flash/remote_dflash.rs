@@ -109,7 +109,8 @@ impl<'a> RemoteDflash<'a> {
                     let rows = count * self.draft.cfg.block;
                     embedding.embed(&vec![self.draft.cfg.mask_token; rows], self.target.ids.buffer, 1,
                         self.target.input.buffer, self.exchange.stream(0))?;
-                    self.launch_head(&head, rows)?;
+                    self.launch_head(&head, rows, true)?;
+                    self.launch_head(&head, rows, false)?;
                     // SAFETY: retire gathers before synchronous ids reuse on the
                     // next width; this target stream has no peer wait during priming.
                     unsafe { library.cuda_stream_synchronize(self.exchange.stream(0))?; }
@@ -119,8 +120,14 @@ impl<'a> RemoteDflash<'a> {
         })
     }
 
-    fn launch_head(&self, head: &TargetHead<'_>, rows: usize) -> Result<()> {
+    fn launch_head(&self, head: &TargetHead<'_>, rows: usize, serving: bool) -> Result<()> {
         self.target.device.run(|| match head {
+            TargetHead::Bf16(weight) if serving => {
+                // SAFETY: target-owned weight and admitted scratch stay live on this stream.
+                unsafe { crate::shared::draft::launch_bf16_head(&self.target.head,
+                    self.target.hidden.buffer.ptr.cast(), weight.buffer.ptr.cast(),
+                    self.target.logits.buffer.ptr.cast(), rows, self.exchange.stream(0)) }
+            }
             TargetHead::Bf16(weight) => {
                 // SAFETY: target head and admitted operands share the target stream.
                 unsafe { crate::families::glm5::launch_draft_head(self.draft.device.library,
@@ -251,6 +258,16 @@ impl<'a> RemoteDflash<'a> {
 
     pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
         head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_device_from(sequences, embedding, head, true)
+    }
+
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_device_from(sequences, embedding, head, false)
+    }
+
+    fn draft_device_from(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>, serving: bool) -> Result<Vec<Draft>> {
         self.checked(|| {
             let input = |ids: &[u32], out: CuteafdDeviceBuffer, stream: *mut c_void| {
                 ensure!(stream == self.stream.raw && ids.len() <= self.rows, "remote draft input capacity/stream");
@@ -265,7 +282,7 @@ impl<'a> RemoteDflash<'a> {
                 self.exchange.push_to(1, HIDDEN, hidden, self.target.hidden.buffer.ptr,
                     rows * self.draft.cfg.hidden * 2)?;
                 self.exchange.wait(0, HIDDEN)?;
-                self.launch_head(&head, rows)?;
+                self.launch_head(&head, rows, serving)?;
                 self.exchange.push_to(0, LOGITS, self.target.logits.buffer.ptr.cast_const(), logits.cast(),
                     rows * self.draft.cfg.vocab * 4)?;
                 self.exchange.wait(1, LOGITS)

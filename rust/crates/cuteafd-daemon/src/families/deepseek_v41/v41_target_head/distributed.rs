@@ -5,6 +5,7 @@ use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 struct Rank<'w, 'a> {
     stream: LoadStream<'a>,
+    draft_timing: Option<crate::shared::draft::timing::DraftTiming<'a>>,
     projection: V41VocabularyProjection<'a>,
     _workspace: DeviceAllocation<'a>,
     input: DeviceAllocation<'a>,
@@ -30,6 +31,7 @@ impl<'w, 'a> Rank<'w, 'a> {
         ensure!(input.buffer.device_id == weights.device_id(), "vocabulary rank weight device differs");
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            draft_timing: None,
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4)?,
             candidates: DeviceAllocation::new(library, capacity * 8)?,
@@ -67,8 +69,11 @@ impl<'w, 'a> Rank<'w, 'a> {
             } else {
                 lib.copy_peer_async(self.input.buffer, input, rows * 10240, self.stream.raw)?;
             }
+            let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                self.graphs[mode].get(rows), || self.enqueue(rows, greedy))
+                self.graphs[mode].get(rows), || self.enqueue(rows, greedy))?;
+            if let Some(timing) = &self.draft_timing { timing.end(span, self.stream.raw)?; }
+            Ok(())
         }
     }
     unsafe fn capture_ready(&mut self, rows: usize, greedy: bool) -> Result<()> {
@@ -146,6 +151,10 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             let rank = rank.get_mut();
             rank.fp8_scratch = device.run(|| crate::families::deepseek_v41::v41_tensors::fp8_scratch(device.library,
                 rank.weights.fp8(), capacity, site))?;
+            if matches!(site, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft) {
+                rank.draft_timing = Some(device.run(|| crate::shared::draft::timing::DraftTiming::from_env(
+                    device.library, "v41-head"))?);
+            }
         }
         Ok(())
     }
@@ -316,6 +325,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
                     let device = rank.device;
                     complete[index] = device.run(|| unsafe {
                         if !rank.stream.library.cuda_stream_query(rank.stream.raw)? { return Ok(false); }
+                        if let Some(timing) = &rank.draft_timing { timing.publish_completed()?; }
                         rank.get_mut().capture_ready(rows, false)?;
                         Ok(true)
                     })?;

@@ -326,6 +326,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/router.cu
     shared/cuda/linear.cu
     shared/cuda/attention.cu
+    shared/cuda/draft_attention.cu
     shared/cuda/embedding.cu
     shared/cuda/token_io.cu
     shared/cuda/sampling.cu

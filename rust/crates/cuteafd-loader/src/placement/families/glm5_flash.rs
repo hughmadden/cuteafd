@@ -145,7 +145,7 @@ pub struct GlmfInputs<'a> {
     pub tp2_workspace: [u64; 2],
     /// SM-independent draft weights and owned activations; embedding stays host mapped.
     pub drafter_bytes: u64,
-    /// fp8_linear workspace on each candidate GPU, keyed by that GPU's physical SM count.
+    /// Linear and attention scratch on each candidate GPU, sized by physical SM count.
     pub drafter_scratch: Vec<u64>,
     /// Present only when the GPU1 DFlash2 executor is requested. dSpark stays local.
     pub drafter_bridge: Option<MovableDemands>,
@@ -171,7 +171,7 @@ pub fn replicated_mla_bytes(cfg: &GlmNextConfig, index: cache::GlmfIndexCache,
         .ok_or(PlacementError::Overflow("GLM Flash replicated MLA records"))
 }
 
-/// Shared checkpoint-derived inventory; only package scratch depends on the chosen GPU.
+/// Shared checkpoint-derived inventory; linear/attention scratch follows the chosen GPU.
 pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
     mode: u8) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
@@ -304,7 +304,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             let mut demands = if rank == 1 { i.drafter_bridge.as_ref().map(|b| b.demands.clone()).unwrap_or_default() }
                 else { vec![] };
             if bytes > 0 { demands.push(Demand::new(rank as u8, Category::Workspace,
-                "DFlash fp8-linear scratch", bytes, Basis::Formula)); }
+                "DFlash linear/attention scratch", bytes, Basis::Formula)); }
             (!demands.is_empty()).then_some(MovableDemands { placement_gpu: rank as u8, demands })
         }).collect();
         vec![Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }],
@@ -999,13 +999,22 @@ mod tests {
                     assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
                         sms, representation, mode).unwrap());
                 }
-                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, [0, 0]); }
-                else { assert!(scratch[0] > scratch[1]); }
+                let attention: Vec<_> = [188, 170].into_iter().map(|sms|
+                    cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
+                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, attention); }
+                else { assert!(scratch.iter().zip(attention).all(|(&total, arena)| total > arena)); }
+                assert!(scratch[0] > scratch[1]);
             }
         }
         let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
-        assert_eq!(owned, 1_835_700_096);
-        assert_eq!(scratch, [30_491_648, 28_394_496]);
+        let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
+        let attention: Vec<_> = [188, 170].into_iter().map(|sms|
+            cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
+        assert_eq!(owned, 1_835_700_096 - old_attention);
+        // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
+        let row_max_bytes = 128 * 80 * 4;
+        assert_eq!(scratch, [30_491_648 + row_max_bytes + attention[0],
+            28_394_496 + row_max_bytes + attention[1]]);
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_bytes = owned;
@@ -1014,13 +1023,33 @@ mod tests {
         assert_eq!(req.movables[0].allowed, [0]);
         assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
             c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
-            [(0, 0, Category::Workspace, 30_491_648, Basis::Formula),
-             (1, 1, Category::Workspace, 28_394_496, Basis::Formula)]);
+            [(0, 0, Category::Workspace, 30_491_648 + row_max_bytes + attention[0], Basis::Formula),
+             (1, 1, Category::Workspace, 28_394_496 + row_max_bytes + attention[1], Basis::Formula)]);
         let actual = solve(&req).unwrap();
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
         assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
-        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash fp8-linear scratch").unwrap().bytes, 30_491_648);
-        assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash fp8-linear scratch"));
+        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash linear/attention scratch").unwrap().bytes,
+            30_491_648 + row_max_bytes + attention[0]);
+        assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash linear/attention scratch"));
+        let mut previous = req.clone();
+        for candidate in &mut previous.movables[0].conditional {
+            candidate.demands[0].bytes -= row_max_bytes;
+        }
+        let before = solve(&previous).unwrap();
+        assert_eq!(actual.pool_tokens, before.pool_tokens);
+        assert_eq!(actual.layers, before.layers);
+        let charged = |placed: &Placement, rank: usize| placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
+        assert_eq!(charged(&actual, 0) - charged(&before, 0), row_max_bytes);
+        assert_eq!(charged(&actual, 1), charged(&before, 1));
+        // At a full GPU0 budget, only one rounded KV allocation unit is lost.
+        previous.movables[0].allowed = vec![0];
+        previous.inventory.gpus[0].headroom_bytes += previous.inventory.gpus[0].available() - charged(&before, 0);
+        let mut constrained = previous.clone();
+        constrained.movables[0].conditional[0].demands[0].bytes += row_max_bytes;
+        let before = solve(&previous).unwrap();
+        let after = solve(&constrained).unwrap();
+        assert_eq!(before.pool_tokens - after.pool_tokens, req.pool.unit_rows);
+        assert_eq!(before.layers, after.layers);
         // Splitting the ledger categories must not change the old GPU0 total or pool/layer decision.
         input.drafter_bytes += input.drafter_scratch[0];
         input.drafter_scratch.fill(0);
@@ -1082,7 +1111,7 @@ mod tests {
         assert_eq!(req.movables[0].allowed, [0, 1]);
         assert_eq!(req.movables[0].conditional.iter().map(|c| c.placement_gpu).collect::<Vec<_>>(), [0, 1]);
         let candidate = req.movables[0].conditional[1].clone();
-        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash fp8-linear scratch")
+        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash linear/attention scratch")
             .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(1, input.drafter_scratch[1])]);
         assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash bridge logits")
             .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(0, 8 * 8 * 154_880 * 4)]);
@@ -1146,7 +1175,7 @@ mod tests {
                     assert_eq!(bytes(&p, &demand.group), expected);
                     assert_eq!(bytes(&r, &demand.group), expected);
                 }
-                assert_eq!(bytes(&p, "DFlash fp8-linear scratch"),
+                assert_eq!(bytes(&p, "DFlash linear/attention scratch"),
                     if rank == expected_home as usize { planned.drafter_scratch[rank] } else { 0 });
                 let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
                     capacity_bytes: input.gpus[rank].0, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available()

@@ -1,3 +1,4 @@
+#include "../../../shared/cuda/draft_attention.cuh"
 // DFlash block drafter of MiMo V2.6 Pro (the snapshot's dflash/: five
 // Qwen3-style layers, 128 query / 8 KV heads of 128, attention sinks, value
 // scale, NeoX RoPE on the first 64 dims, non-causal block attention over a
@@ -86,156 +87,6 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   }
 }
 
-// Block attention with an optional per-head sink logit: every block row sees
-// the whole block (non-causal) and the sequence's context entries within the
-// window (row r at position end + r sees context positions q with end + r -
-// q < window; window 0 = all `ctx` entries). One CTA per (key chunk, kv head x
-// 64-query slice, sequence); a second pass merges chunks and adds the sink.
-constexpr int kAttnThreads = 256;
-constexpr int kChunk = 128;
-constexpr int kTile = 32;
-constexpr int kQueries = 64;
-
-__global__ void attention_partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block, const bf16* k_ring,
-                                         const bf16* v_ring, const int32_t* seq_slots, const int32_t* ctx_lengths,
-                                         const int32_t* ctx_ends, float* partial_o, float* partial_ml, int ring,
-                                         int heads, int kv_heads, int block_rows, int chunks, int slices, float scale,
-                                         int window) {
-  const int chunk = blockIdx.x, kvh = blockIdx.y / slices, slice = blockIdx.y % slices, s = blockIdx.z;
-  const int group = heads / kv_heads, queries = group * block_rows;
-  const int ctx = ctx_lengths[s], end = ctx_ends[s], total = ctx + block_rows;
-  const int first = chunk * kChunk, last = min(total, first + kChunk);
-  const int t = threadIdx.x, local = t / 4, sub = t % 4, query = slice * kQueries + local;
-  const uint64_t out_base = (((uint64_t(s) * kv_heads + kvh) * slices + slice) * chunks + chunk) * kQueries + local;
-  float* o_out = partial_o + out_base * kHeadDim + sub * 32;
-  if (first >= last) {
-    if (sub == 0) {
-      partial_ml[out_base * 2] = -CUDART_INF_F;
-      partial_ml[out_base * 2 + 1] = 0;
-    }
-    for (int d = 0; d < 32; ++d) o_out[d] = 0;
-    return;
-  }
-  __shared__ bf16 qs[kQueries][kHeadDim];
-  __shared__ bf16 ks[kTile][kHeadDim + 8];
-  __shared__ bf16 vs[kTile][kHeadDim];
-  __shared__ float ps[kQueries][kTile + 1];
-  // Query `query` is block row query / group, head kvh * group + query % group.
-  for (int i = t; i < kQueries * kHeadDim; i += kAttnThreads) {
-    const int qi = slice * kQueries + i / kHeadDim, d = i % kHeadDim;
-    const int row = qi / group, head = kvh * group + qi % group;
-    qs[i / kHeadDim][d] = qi < queries ? q[((uint64_t(s) * block_rows + row) * heads + head) * kHeadDim + d]
-                                       : bf16(0.0f);
-  }
-  const int lowest = window > 0 ? end + min(query / group, block_rows - 1) - window + 1 : INT32_MIN;
-  float m = -CUDART_INF_F, l = 0, acc[32];
-#pragma unroll
-  for (int d = 0; d < 32; ++d) acc[d] = 0;
-  const int slot = seq_slots[s];
-  for (int tile = first; tile < last; tile += kTile) {
-    const int n = min(kTile, last - tile);
-    __syncthreads();
-    for (int i = t; i < kTile * (kHeadDim / 8); i += kAttnThreads) {
-      const int key = i / (kHeadDim / 8), d = (i % (kHeadDim / 8)) * 8;
-      uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
-      if (key < n) {
-        const int j = tile + key;
-        const bf16 *kp, *vp;
-        if (j < ctx) {
-          const int position = end - ctx + j;
-          const uint64_t at = ((uint64_t(slot) * ring + position % ring) * kv_heads + kvh) * kHeadDim + d;
-          kp = k_ring + at;
-          vp = v_ring + at;
-        } else {
-          const uint64_t at = ((uint64_t(s) * block_rows + (j - ctx)) * kv_heads + kvh) * kHeadDim + d;
-          kp = k_block + at;
-          vp = v_block + at;
-        }
-        kv4 = *reinterpret_cast<const uint4*>(kp);
-        vv4 = *reinterpret_cast<const uint4*>(vp);
-      }
-      *reinterpret_cast<uint4*>(&ks[key][d]) = kv4;
-      *reinterpret_cast<uint4*>(&vs[key][d]) = vv4;
-    }
-    __syncthreads();
-    float score[8];
-    float tile_max = -CUDART_INF_F;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const int key = sub * 8 + j;
-      float dot = 0;
-      for (int d = 0; d < kHeadDim; d += 2) {
-        const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&qs[local][d]));
-        const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ks[key][d]));
-        dot = fmaf(a.x, b.x, dot);
-        dot = fmaf(a.y, b.y, dot);
-      }
-      const int j_key = tile + key;
-      const bool visible = key < n && (j_key >= ctx || end - ctx + j_key >= lowest);
-      score[j] = visible ? dot * scale : -CUDART_INF_F;
-      tile_max = fmaxf(tile_max, score[j]);
-    }
-    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 1));
-    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 2));
-    const float m_new = fmaxf(m, tile_max);
-    const float factor = m_new == -CUDART_INF_F ? 1.0f : expf(m - m_new);
-    float tile_sum = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const float p = m_new == -CUDART_INF_F ? 0.0f : expf(score[j] - m_new);
-      tile_sum += p;
-      ps[local][sub * 8 + j] = r(p);
-    }
-    tile_sum += __shfl_xor_sync(0xffffffffu, tile_sum, 1);
-    tile_sum += __shfl_xor_sync(0xffffffffu, tile_sum, 2);
-    l = l * factor + tile_sum;
-    m = m_new;
-    __syncwarp();
-#pragma unroll
-    for (int d = 0; d < 32; ++d) acc[d] *= factor;
-    for (int key = 0; key < n; ++key) {
-      const float p = ps[local][key];
-#pragma unroll
-      for (int d = 0; d < 32; d += 2) {
-        const float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&vs[key][sub * 32 + d]));
-        acc[d] = fmaf(p, v.x, acc[d]);
-        acc[d + 1] = fmaf(p, v.y, acc[d + 1]);
-      }
-    }
-  }
-  if (sub == 0) {
-    partial_ml[out_base * 2] = m;
-    partial_ml[out_base * 2 + 1] = l;
-  }
-#pragma unroll
-  for (int d = 0; d < 32; ++d) o_out[d] = acc[d];
-}
-
-// out [rows, heads * 128] BF16 from the chunk partials; the sink logit (when
-// given) joins the denominator with no value.
-__global__ void attention_merge_kernel(const float* partial_o, const float* partial_ml, const bf16* sinks, bf16* out,
-                                       int heads, int kv_heads, int block_rows, int chunks, int slices) {
-  const int query = blockIdx.x, kvh = blockIdx.y, s = blockIdx.z, d = threadIdx.x;
-  const int group = heads / kv_heads;
-  const int slice = query / kQueries, local = query % kQueries;
-  const int row = query / group, head = kvh * group + query % group;
-  const uint64_t base = ((uint64_t(s) * kv_heads + kvh) * slices + slice) * chunks;
-  float m = -CUDART_INF_F;
-  for (int c = 0; c < chunks; ++c) m = fmaxf(m, partial_ml[((base + c) * kQueries + local) * 2]);
-  const float sink = sinks != nullptr ? f(sinks[head]) : -CUDART_INF_F;
-  m = fmaxf(m, sink);
-  float l = sinks != nullptr ? expf(sink - m) : 0.0f, o = 0;
-  for (int c = 0; c < chunks; ++c) {
-    const uint64_t at = (base + c) * kQueries + local;
-    const float cm = partial_ml[at * 2];
-    if (cm == -CUDART_INF_F) continue;
-    const float w = expf(cm - m);
-    l += partial_ml[at * 2 + 1] * w;
-    o += partial_o[at * kHeadDim + d] * w;
-  }
-  out[((uint64_t(s) * block_rows + row) * heads + head) * kHeadDim + d] = __float2bfloat16(o / l);
-}
-
 // h = bf16(h + delta); n = RMSNorm(h) * w (Qwen3 rounding), one block per row.
 __global__ void add_norm_kernel(bf16* h, const bf16* delta, const bf16* w, bf16* n, int width, float eps) {
   __shared__ float partial[kNormThreads / 32];
@@ -274,9 +125,10 @@ extern "C" int32_t cuteafd_mimo_dflash_qk_rope(const void* qkv, const void* q_no
 // Workspace bytes cuteafd_mimo_dflash_attention needs.
 extern "C" uint64_t cuteafd_mimo_dflash_attention_workspace(int32_t sequences, int32_t heads, int32_t kv_heads,
                                                              int32_t block_rows, int32_t max_keys) {
-  const uint64_t chunks = (uint64_t(max_keys) + kChunk - 1) / kChunk;
-  const uint64_t slices = (uint64_t(heads / kv_heads) * block_rows + kQueries - 1) / kQueries;
-  return uint64_t(sequences) * kv_heads * slices * chunks * kQueries * (kHeadDim + 2) * sizeof(float);
+  if (kv_heads < 1 || heads < 1 || heads % kv_heads || block_rows < 1) return 0;
+  const int slices = (heads / kv_heads * block_rows + cuteafd::draft_attention::queries_per_slice - 1)
+      / cuteafd::draft_attention::queries_per_slice;
+  return cuteafd::draft_attention::workspace(sequences, kv_heads, slices, max_keys, kHeadDim);
 }
 
 // out [sequences * block_rows, heads * 128]: softmax(q k^T * scale [; sink]) v over
@@ -290,21 +142,12 @@ extern "C" int32_t cuteafd_mimo_dflash_attention(const void* q, const void* k_bl
                                                  void* out, void* workspace, int32_t sequences, int32_t block_rows,
                                                  int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
                                                  int32_t window, float scale, void* stream) {
-  if (sequences < 1 || kv_heads < 1 || heads % kv_heads || window < 0 || block_rows < 1) return cudaErrorInvalidValue;
-  const int queries = heads / kv_heads * block_rows;
-  const int slices = (queries + kQueries - 1) / kQueries;
-  const int chunks = (max_keys + kChunk - 1) / kChunk;
-  auto* o = static_cast<float*>(workspace);
-  auto* ml = o + uint64_t(sequences) * kv_heads * slices * chunks * kQueries * kHeadDim;
-  auto s = static_cast<cudaStream_t>(stream);
-  attention_partial_kernel<<<dim3(chunks, kv_heads * slices, sequences), kAttnThreads, 0, s>>>(
-      static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
-      static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(seq_slots),
-      static_cast<const int32_t*>(ctx_lengths), static_cast<const int32_t*>(ctx_ends), o, ml, ring, heads, kv_heads,
-      block_rows, chunks, slices, scale, window);
-  attention_merge_kernel<<<dim3(queries, kv_heads, sequences), kHeadDim, 0, s>>>(
-      o, ml, static_cast<const bf16*>(sinks), static_cast<bf16*>(out), heads, kv_heads, block_rows, chunks, slices);
-  return cudaGetLastError();
+  if (kv_heads < 1 || heads < 1 || heads % kv_heads || block_rows < 1) return cudaErrorInvalidValue;
+  const int slices = (heads / kv_heads * block_rows + cuteafd::draft_attention::queries_per_slice - 1)
+      / cuteafd::draft_attention::queries_per_slice;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, sinks, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, false, kHeadDim, slices, scale, static_cast<cudaStream_t>(stream));
 }
 
 // h = h + delta (BF16), n = RMSNorm(h) * w for `rows` rows of `width` (<= 8192 * 4).

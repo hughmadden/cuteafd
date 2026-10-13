@@ -98,8 +98,10 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             for stage in 0..3 { chain.stages[stage].upload_on(&pending.reads[stage], bindings[stage], chain.stream.raw)?; }
             let graph = chain.graphs.get(&(count, chain.width)).map(|owner| owner.raw);
             let stream = chain.stream.raw;
+            let span = chain.timing.begin("graph_forward", None, count * chain.width, stream)?;
             crate::shared::decode_graph::census::dispatch(lib, stream, c"dspark", count, graph,
                 || chain.enqueue(&pending.reads, count))?;
+            chain.timing.end(span, stream)?;
             let source = chain.stages[2].output_storage();
             let target = self.terminal.inputs();
             chain.ops.terminal_layout(source[0], source[1], target[0], target[1], count as u32, chain.stream.raw)?;
@@ -124,7 +126,9 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
                         self.pending = Some(Phase::Transformer(pending));
                         return Ok(false);
                     }
+                    chain.timing.publish_completed()?;
                     let count = pending.count;
+                    chain.timing.publish_retained("forward", count * chain.width)?;
                     if pending.warming { unsafe { chain.capture_ready(&pending.reads, count)?; } }
                     pending.armed = false;
                     drop(pending);

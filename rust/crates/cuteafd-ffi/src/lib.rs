@@ -1979,6 +1979,21 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_cuda_event_record", status)
     }
 
+    /// Records a retained event node when capturing, for graph-internal timing.
+    /// # Safety
+    /// The event and stream belong to the current device. Retain the event until
+    /// every graph referencing it is drained and destroyed.
+    pub unsafe fn cuda_event_record_external(
+        &self,
+        cuda_event: *mut c_void,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        let record_fn: Symbol<CudaEventRecordFn> =
+            unsafe { self.lib.get(b"cuteafd_cuda_event_record_external")? };
+        let status = unsafe { record_fn(cuda_event, cuda_stream) };
+        self.status_to_result("cuteafd_cuda_event_record_external", status)
+    }
+
     pub unsafe fn cuda_event_synchronize(&self, cuda_event: *mut c_void) -> Result<()> {
         let synchronize_fn: Symbol<CudaEventSynchronizeFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_event_synchronize")? };

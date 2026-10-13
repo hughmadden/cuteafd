@@ -332,6 +332,7 @@ enum DraftInput<'r, 'e> {
 
 pub(crate) struct GlmDrafter<'a> {
     library: &'a NativeLibrary,
+    timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
     /// Ring slots (sequences with a drafter context).
@@ -635,6 +636,7 @@ impl<'a> GlmDrafter<'a> {
             confidence_directory: snapshot.into(),
             confidence_scales: scales,
             fp8_workspace,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
             head_mode: Cell::new(super::DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
@@ -786,6 +788,7 @@ impl<'a> GlmDrafter<'a> {
         let (h, kv) = (self.cfg.hidden, self.cfg.kv_width());
         let width = self.cfg.taps.len() * h;
         let s = self.stream;
+        let context_span = self.timing.begin("context", None, n, s)?;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
             self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
@@ -802,6 +805,7 @@ impl<'a> GlmDrafter<'a> {
                     self.cfg.theta, self.cfg.eps, s)?;
             }
         }
+        self.timing.end(context_span, s)?;
         Ok(())
     }
 
@@ -861,6 +865,10 @@ impl<'a> GlmDrafter<'a> {
         let drafted = sequences * c.drafts();
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let attention_workspace = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
+            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+        };
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -885,8 +893,7 @@ impl<'a> GlmDrafter<'a> {
             features: alloc(drafted * 16)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
-            attention_workspace: alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads,
-                RING + c.block)?)?,
+            attention_workspace,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
@@ -898,7 +905,7 @@ impl<'a> GlmDrafter<'a> {
     /// Drafts `block - 1` tokens after each sequence's anchor. `anchor_rows`
     /// holds the anchors' embedding rows; `head` is the target's vocabulary head.
     pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: TargetHead<'_>) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?, false)
     }
 
     /// [`Self::draft`] with the block's input rows gathered from the target's
@@ -906,7 +913,13 @@ impl<'a> GlmDrafter<'a> {
     /// drafter's mask row is that table row).
     pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, true)
+    }
+
+    /// Diagnostic device-input replay retains the explicit head arithmetic selection.
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, false)
     }
 
     /// Device input bridge for a drafter on another GPU. Existing same-device
@@ -914,7 +927,7 @@ impl<'a> GlmDrafter<'a> {
     /// returning and keep its owners alive through the draft's stream drain.
     pub(crate) fn draft_device_with(&self, sequences: &[DraftSeq], input: &InputLaunch<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Launch(input), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Launch(input), self.head_call(&head)?, true)
     }
 
     fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
@@ -933,7 +946,8 @@ impl<'a> GlmDrafter<'a> {
         Ok(owner.buffer.ptr)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>) -> Result<Vec<Draft>> {
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
+        serving: bool) -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
@@ -958,6 +972,9 @@ impl<'a> GlmDrafter<'a> {
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
+        // Eager per-round launch: keep the arena capacity-sized, not this work bound.
+        // A future graph path must read changing lengths on-device instead.
+        let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
         let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
@@ -985,11 +1002,13 @@ impl<'a> GlmDrafter<'a> {
         let (s, l) = (self.stream, self.library);
         let (eps, group, inter) = (c.eps, c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
+        let forward_span = self.timing.begin("forward", None, rows, s)?;
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
+                let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
                 self.linear(w.n.buffer.ptr, &layer.attn_conv, 0, w.dynamic.buffer.ptr,
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr, w.conv.buffer.ptr,
@@ -1002,7 +1021,7 @@ impl<'a> GlmDrafter<'a> {
                 l.glm_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
@@ -1019,21 +1038,31 @@ impl<'a> GlmDrafter<'a> {
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                self.timing.end(layer_span, s)?;
             }
+            self.timing.end(forward_span, s)?;
+            let head_span = self.timing.begin("head_topk", None, rows, s)?;
             match &head {
+                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
                 HeadCall::Bf16(weight) => super::launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
                     w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+            self.timing.end(head_span, s)?;
+            let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
             self.linear(w.n.buffer.ptr, &self.projection, 0,
                 w.projected.buffer.ptr, rows, h, c.rank)?;
             l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+            self.timing.end(select_span, s)?;
             l.cuda_stream_synchronize(s)?;
         }
+        self.timing.publish_completed()?;
+        self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
         let mut tokens = vec![0u8; drafted * 4];
         let mut features = vec![0u8; drafted * 16];
@@ -1145,7 +1174,7 @@ impl ReplayDrafter for GlmDrafter<'_> {
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
         // Replay's caller keeps the target BF16 head owner live throughout.
-        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head))?.into_iter()
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head), false)?.into_iter()
             .map(|d| d.tokens).collect())
     }
 

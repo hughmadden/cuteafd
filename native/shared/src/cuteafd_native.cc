@@ -1345,6 +1345,32 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cu
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream) {
+  if (cuda_event == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaStreamCaptureStatus capture_status;
+  cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamIsCapturing failed", err);
+  }
+  // External records are graph nodes, not eager records. Drafters warm eagerly
+  // before capturing the same markers, and may reuse them for uncaptured shapes.
+  const unsigned flags = capture_status == cudaStreamCaptureStatusNone
+      ? cudaEventRecordDefault : cudaEventRecordExternal;
+  err = cudaEventRecordWithFlags(reinterpret_cast<cudaEvent_t>(cuda_event), stream, flags);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventRecordWithFlags failed", err);
+  }
+  return ok();
+#else
+  (void)cuda_stream;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA event recording is unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event) {
   if (cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,

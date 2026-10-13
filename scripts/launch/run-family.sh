@@ -1701,18 +1701,6 @@ if [[ $family == glm5_flash ]]; then
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
   esac
-  # GLM5_FLASH_DRAFT_HEAD: tensor by default with a drafter; exact runs as the
-  # target's own head, FP32 products and sums on CUDA cores past 24 rows) or tensor (from two draft
-  # blocks of 8 rows, a BF16 tensor-core GEMM with FP32 accumulation that reads the head once).
-  # Drafts only: the target verifies every proposal through its own head.
-  draft_head_default=exact
-  [[ ${#draft_args[@]} == 0 ]] || draft_head_default=tensor
-  draft_head="$(get GLM5_FLASH_DRAFT_HEAD "$draft_head_default")"
-  case "$draft_head" in
-    ""|exact) ;;
-    tensor) family_args+=(--draft-head tensor) ;;
-    *) echo "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" >&2; exit 2 ;;
-  esac
   # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
   # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.

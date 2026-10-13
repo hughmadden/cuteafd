@@ -245,13 +245,10 @@ pub(crate) struct EngineArgs {
     /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
-    /// The drafter's vocabulary head over the target's BF16 head (DFlash2 and dSpark): `exact`
-    /// (default) as the target's own head: the few-row FP32 kernel up to 24 rows (one read of the
-    /// head per 8 rows), the pedantic FP32 cuBLAS GEMM on CUDA cores past them (128 rows at 16
-    /// sequences: 4.5 ms on an RTX 5090). `tensor`: one draft block (8 rows) as `exact`, two and
-    /// more as a BF16 tensor-core GEMM with FP32 accumulation, one read of the head. Drafts only:
-    /// the target verifies every proposal through its own head, which this leaves as it is. The
-    /// FP8 head (--fp8-head) runs its own program either way.
+    /// Diagnostic drafter head arithmetic for golden/replay and --draft-modes: `exact` uses
+    /// the target's FP32 path; `tensor` uses the legacy tensor route past one draft block.
+    /// Serving always uses the shared BF16 tensor head at every row count. The target's own
+    /// arithmetic and the FP8 head (--fp8-head) remain unchanged.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_HEAD", default_value = "exact")]
     pub draft_head: crate::families::glm5::DraftHead,
     /// The FP8 drafter's GEMMs (DFlash2 and dSpark): `w8a16` (default: BF16 activations, exact

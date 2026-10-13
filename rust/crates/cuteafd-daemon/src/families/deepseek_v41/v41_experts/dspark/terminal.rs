@@ -21,6 +21,7 @@ struct LocalHead<'w, 'a> {
 /// stream. All draft tensors use [position,request,...] order at live row count.
 pub(crate) struct DsparkTerminal<'weights, 'library> {
     stream: LoadStream<'library>,
+    timing: crate::shared::draft::timing::DraftTiming<'library>,
     markov: DsparkMarkov<'weights, 'library>,
     confidence: DsparkConfidence<'weights, 'library>,
     sample: V41DraftStep<'library>,
@@ -72,6 +73,7 @@ impl<'library> DsparkWeights<'library> {
             Ok(LocalHead { kernel, _workspace: workspace, weights, fp8_scratch })
         }).transpose()?;
         Ok(DsparkTerminal {
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-terminal")?,
             local_head,
             normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240)?,
             weights: self,
@@ -240,14 +242,17 @@ impl DsparkTerminal<'_, '_> {
         let head = self.local_head.as_ref().context("terminal requires external vocabulary projection")?;
         unsafe {
             self.enqueue_normalize_on(requests, stream)?;
+            let span = self.timing.begin_retained("head", "head", None, requests * self.width, stream)?;
             crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &head.kernel,
                 head.weights.weight(), head.weights.fp8().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
                 self.shared_logits.buffer, requests * self.width, stream)?;
+            self.timing.end_retained(span, stream)?;
             self.enqueue_sampling_on(requests, stream)
         }
     }
     unsafe fn enqueue_normalize_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
+        let span = self.timing.begin_retained("normalize", "terminal_norm", None, requests * self.width, stream)?;
         let library = self.stream.library;
         unsafe {
             self.hc.pre(
@@ -268,12 +273,14 @@ impl DsparkTerminal<'_, '_> {
                 stream,
             )?;
         }
+        self.timing.end_retained(span, stream)?;
         Ok(())
     }
     unsafe fn enqueue_sampling_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
         let library = self.stream.library;
         let row_bytes = requests * 129280 * 4;
+        let span = self.timing.begin_retained("sample", "selector", None, requests * self.width, stream)?;
         unsafe {
             library.copy_d2d_async(
                 self.markov.tokens(),
@@ -310,7 +317,16 @@ impl DsparkTerminal<'_, '_> {
                     library.copy_d2d_async(self.markov.tokens(), next, requests * 4, stream)?;
                 }
             }
+            self.timing.end_retained(span, stream)?;
+            let confidence = self.timing.begin_retained("sample", "confidence", None, requests * self.width, stream)?;
             self.confidence.enqueue_on(requests * self.width, stream)?;
+            self.timing.end_retained(confidence, stream)?;
+        }
+        Ok(())
+    }
+    pub(super) fn publish_timing(&self, requests: usize) -> Result<()> {
+        for group in ["normalize", "head", "sample"] {
+            self.timing.publish_retained(group, requests * self.width)?;
         }
         Ok(())
     }

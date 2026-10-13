@@ -23,6 +23,7 @@ pub(crate) mod probe;
 pub(crate) mod resource;
 pub(crate) mod routes;
 pub(crate) mod runtime;
+pub(crate) mod timing;
 
 /// Apply the opt-in length rule (`CUTEAFD_DRAFT_SURVIVAL_LENGTHS`, launcher key
 /// `DRAFT_SURVIVAL_LENGTHS`): verify drafts while their calibrated survival is
@@ -31,4 +32,20 @@ pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
     let survival = super::draft_policy::enabled("CUTEAFD_DRAFT_SURVIVAL_LENGTHS");
     if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
     policy.set_survival_lengths(survival);
+}
+
+/// BF16 drafter proposals use tensor cores at every row count, borrowing the
+/// target's only resident head and the drafter's admitted handle/workspace.
+/// Target and diagnostic projections keep their own arithmetic.
+///
+/// # Safety
+/// `input` [rows, hidden] BF16, `weight` [vocab, hidden] BF16 and `logits`
+/// [rows, vocab] FP32 are live on `stream`'s device until it drains. `head`
+/// was created for this geometry and at least `rows` rows.
+pub(crate) unsafe fn launch_bf16_head(head: &cuteafd_ffi::programs::VocabularyHead<'_>,
+    input: *const u16, weight: *const u16, logits: *mut f32, rows: usize,
+    stream: *mut std::ffi::c_void) -> anyhow::Result<()> {
+    let rows = u32::try_from(rows).map_err(|_| anyhow::anyhow!("drafter head row count exceeds u32"))?;
+    // SAFETY: the caller retains the checked geometry, buffers and workspace.
+    unsafe { head.launch_tensor_op(input, weight, logits, rows, stream) }
 }
