@@ -195,6 +195,9 @@ wip_native_key() {
       grep -vE '^CUTEAFD_WIP_(EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
+    # The CuTe DSL host target the exporters pin (#127; python/tools/lib/_pinned_sparkinfer.py):
+    # an override, or "native", changes every exported object's host code.
+    printf 'cute-host-target %s\n' "${CUTEAFD_CUTE_HOST_TARGET-<pinned default>}"
     # Pinned submodule trees by their verified lock digests (sparkinfer, xgrammar,
     # transformers), then every native, exporter and build-helper file.
     cat "$source_dir/third_party/"*.lock.json

@@ -62,14 +62,14 @@ def test_admit_reads_the_host_smi_and_refuses_what_does_not_fit(tmp_path):
 def test_wsl_admission_never_trusts_the_containers_view(tmp_path):
     # On oliver a container's cudaMemGetInfo reported 93.9 of 95.6 GiB free while
     # the host's WSL nvidia-smi showed TJ's job holding 65.5 GB. Admission takes
-    # its reading from the HOST smi binary it is given; wip.sh passes oliver's
-    # /usr/lib/wsl/lib/nvidia-smi and runs admission before any container starts.
+    # its reading from the HOST smi binary it is given; export-remote.sh passes
+    # oliver's /usr/lib/wsl/lib/nvidia-smi and admits before any container starts.
     host, _ = fake_smi(tmp_path, '0, GPU-o, 65485, 97887, 4000\n', name='host-smi')
     container_view, _ = fake_smi(tmp_path, '0, GPU-o, 1700, 97887, 96187\n', name='container-smi')
     assert run('admit', '--smi', str(container_view), '--gpu', '0').returncode == 0
     assert run('admit', '--smi', str(host), '--gpu', '0').returncode == placement.NO_TURN
-    wip = (ROOT / 'wip.sh').read_text()
-    assert '/usr/lib/wsl/lib/nvidia-smi' in wip
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    assert 'smi=/usr/lib/wsl/lib/nvidia-smi' in remote
     assert 'mem_get_info' not in SCRIPT.read_text().split('"""', 2)[2]
 
 
