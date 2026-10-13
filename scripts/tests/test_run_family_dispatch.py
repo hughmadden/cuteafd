@@ -421,7 +421,7 @@ def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
     assert "CUTEAFD_BENCH_DIR=/run/cuteafd/bench" in coordinator
     worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
     assert 'id -u' in worker and 'id -g' in worker
-    assert 'release_serving_docker_args; docker run -d' in worker
+    assert 'release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; docker run -d' in worker or ('release_serving_docker_args; cuteafd_cdi_gpu_args all' in worker and 'docker run -d' in worker)
     assert '"${RELEASE_SERVING_ARGS[@]}"' in worker
     assert '/root/' not in coordinator + worker
 
@@ -1620,7 +1620,7 @@ def test_explicit_split_without_kernels_serves_from_the_first_gpu(
     assert result.returncode == 0, result.stderr
     assert "has no head split yet" in result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "device=0" in launch and "--split-device" not in launch
+    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
@@ -1629,7 +1629,7 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "device=0" in launch and "--split-device" not in launch
+    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
     assert "auto selected GPU 0 alone" in result.stderr
 
 
@@ -1638,7 +1638,7 @@ def test_split_off_explicitly_uses_the_first_gpu(tmp_path: Path) -> None:
                                   "RTX_GPUS=2\nCOORDINATOR_GPUS=1,0\nCOORDINATOR_SPLIT=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "device=1" in launch and "--split-device" not in launch
+    assert "nvidia.com/gpu=1" in launch and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
@@ -1646,7 +1646,7 @@ def test_glm_flash_explicit_split_passes_both_gpus(tmp_path: Path, keys: str) ->
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "zai-org/GLM-5.3-Flash", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "--split-device" in launch and "device=0,1" in launch
+    assert "--split-device" in launch and "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["mimo_flash", "mimo_pro"])
@@ -1655,14 +1655,14 @@ def test_both_mimo_model_types_keep_their_supported_split(tmp_path: Path, checkp
                                   "COORDINATOR_GPUS=1,0\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "--device 1 --split-device 0" in launch and "device=0,1" in launch
+    assert "--device 1 --split-device 0" in launch and "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
 
 
 def test_auto_uses_one_gpu_when_only_one_exists(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["mimo_pro"], "test/model", "", physical_gpus=(0,))
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "device=0" in launch and "--split-device" not in launch
+    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
 
 
 def test_split_off_needs_only_the_first_physical_gpu(tmp_path: Path) -> None:
@@ -1670,7 +1670,7 @@ def test_split_off_needs_only_the_first_physical_gpu(tmp_path: Path) -> None:
                                   "RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", physical_gpus=(0,))
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "device=0" in launch and "--split-device" not in launch
+    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n",
