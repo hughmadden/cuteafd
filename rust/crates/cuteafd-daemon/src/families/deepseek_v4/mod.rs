@@ -467,9 +467,6 @@ pub(crate) fn with_engine<T>(
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
-        if context_mode.is_some() {
-            engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
-        }
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
         let started = Instant::now();
@@ -502,6 +499,11 @@ pub(crate) fn with_engine<T>(
             };
             ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
             engine.install_tp2(ranks)?;
+        }
+        // The auto reduction plan uses draft_block(), which is nonzero only after
+        // the drafter's local stage experts are installed. Freeze it before capture.
+        if context_mode.is_some() {
+            engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
@@ -816,7 +818,27 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
 
 #[cfg(test)]
 mod program_selection_tests {
-    use cuteafd_core::coordinator_programs::CoordinatorPrograms;
+    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, CoordinatorPrograms};
+
+    #[test]
+    fn context_plan_is_frozen_after_draft_experts_and_before_capture() {
+        let source = include_str!("mod.rs");
+        let startup = source.split("let result = (|| -> Result<T> {").nth(1).unwrap()
+            .split("body(&engine, &mut transports, &runtime)").next().unwrap();
+        let install = startup.find("engine.install_local(local)").unwrap();
+        let attach = startup.find("engine.attach_context(").unwrap();
+        let capture = startup.find("engine.warm_local_graphs()").unwrap();
+        assert!(install < attach && attach < capture,
+            "context auto plan must see resident draft experts and precede graph capture");
+        assert_eq!(startup.matches("engine.attach_context(").count(), 1);
+        let context = include_str!("engine/context.rs");
+        assert!(context.contains("let block = self.draft_block();"));
+        assert!(context.contains("(block > 0).then_some(block)"));
+        let ready = include_str!("engine/dspark.rs");
+        assert!(ready.contains("self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)"));
+        assert_eq!(AttentionReductionPlan::new(64, Some(5), None).unwrap().rows(), 6);
+        assert_eq!(AttentionReductionPlan::new(64, None, None).unwrap().rows(), 1);
+    }
 
     #[test]
     fn every_v4_dispatch_template_is_selected_and_required_at_startup() {
