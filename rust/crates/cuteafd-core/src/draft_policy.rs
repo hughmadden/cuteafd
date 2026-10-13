@@ -728,6 +728,8 @@ impl DraftPolicyStats {
 #[derive(Clone, Debug)]
 pub struct DraftPolicy {
     geometry: PolicyGeometry,
+    /// Native neural positions need not equal the narrow execution width.
+    native_confidence_positions: usize,
     priced: Vec<Priced>,
     fixed: bool,
     cost: CostModel,
@@ -837,14 +839,24 @@ impl DraftPolicy {
             unknown_groups: vec![0.; WINDOWS * geometry.layers.len()], dynamic_grouping,
             scratch: vec![0; usize::from(geometry.experts)],
             occupancy: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts).div_ceil(64)],
-            saturated: false, geometry,
+            saturated: false, native_confidence_positions: geometry.widths[0], geometry,
         }
     }
     /// A fresh policy over the same geometry and priors.
     pub fn restarted(&self, fixed: bool) -> Self {
         let mut policy = Self::build(self.geometry.clone(), fixed, self.seed.clone());
         policy.survival_lengths = self.survival_lengths;
+        policy.native_confidence_positions = self.native_confidence_positions;
         policy
+    }
+    /// Configure the checkpoint's neural extent before observations. Legacy
+    /// bindings retain their narrow-width boundary unless explicitly changed.
+    pub fn set_native_confidence_positions(&mut self, positions: usize) -> Result<(), DraftPolicyError> {
+        if positions == 0 || positions > self.geometry.max_positions || self.stats.rounds != 0 {
+            return Err(DraftPolicyError::Geometry("invalid native confidence extent or policy already observed"));
+        }
+        self.native_confidence_positions = positions;
+        Ok(())
     }
     /// Choose lengths by calibrated survival (draft while at least one half)
     /// instead of by priced rows; width, skip and copy actions stay priced.
@@ -922,7 +934,7 @@ impl DraftPolicy {
     /// confidence inside the native block, and past it the request's own
     /// recent outcomes shrunk toward that calibrated rate.
     fn request_probability(&self, id: u64, position: usize, calibrated: f64) -> f64 {
-        if position < self.geometry.widths[0] { return calibrated; }
+        if position < self.native_confidence_positions { return calibrated; }
         let (hits, trials) = self.outcomes.get(&id).map_or((0., 0.), |o| o[position]);
         (hits + OUTCOME_PRIOR * calibrated) / (trials + OUTCOME_PRIOR)
     }
@@ -1151,6 +1163,25 @@ impl DraftPolicy {
     /// start action until the resource fit is usable. Ties retain the first action.
     pub fn choose_action(&mut self, shared: bool, requests: &[(u64, usize)], actions: &[DraftAction],
         max_rows: usize) -> Result<Option<usize>, DraftPolicyError> {
+        self.choose_action_impl(shared, requests, actions, None, max_rows)
+    }
+
+    /// Action-specific proposal room, aligned with all verifier requests. Zero
+    /// excludes a request from that drafter pass, never from the anchor budget.
+    /// The adapter supplies each action's cost for its actual participant count.
+    pub fn choose_action_with_rooms(&mut self, shared: bool, requests: &[(u64, usize)],
+        actions: &[DraftAction], action_rooms: &[&[usize]], max_rows: usize)
+        -> Result<Option<usize>, DraftPolicyError> {
+        if action_rooms.len() != actions.len() || action_rooms.iter().zip(actions).any(|(rooms, action)|
+            rooms.len() != requests.len() || rooms.iter().zip(requests).any(|(&room, &(_, available))|
+                room > available || action.width == 0 && room != 0)) {
+            return Err(DraftPolicyError::RequestExtent);
+        }
+        self.choose_action_impl(shared, requests, actions, Some(action_rooms), max_rows)
+    }
+
+    fn choose_action_impl(&mut self, shared: bool, requests: &[(u64, usize)], actions: &[DraftAction],
+        action_rooms: Option<&[&[usize]]>, max_rows: usize) -> Result<Option<usize>, DraftPolicyError> {
         if requests.is_empty() || requests.len() > self.geometry.max_requests {
             return Err(DraftPolicyError::Requests(self.geometry.max_requests));
         }
@@ -1159,17 +1190,23 @@ impl DraftPolicy {
             || action.width == 0 && action.draft_us != 0.) {
             return Err(DraftPolicyError::Geometry("invalid pre-draft action"));
         }
-        if self.fixed { return Ok(actions.iter().enumerate().max_by_key(|(_, action)| action.width)
-            .map(|(index, _)| index)); }
+        let room = |action: usize, request: usize| action_rooms
+            .map_or(requests[request].1, |rooms| rooms[action][request]);
+        let eligible: Vec<_> = actions.iter().enumerate().map(|(index, action)|
+            max_rows > requests.len() && action.width > 0
+                && (0..requests.len()).any(|request| room(index, request) > 0)).collect();
+        if self.fixed { return Ok(actions.iter().enumerate()
+            .filter(|&(index, action)| action_rooms.is_none() || action.width == 0 || eligible[index])
+            .max_by_key(|(_, action)| action.width).map(|(index, _)| index)); }
         let _ = shared;
         let Some(bucket) = self.usable(requests.len()) else { return Ok(None) };
         let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
         let mut best: Option<(usize, f64)> = None;
         for (index, action) in actions.iter().enumerate() {
-            let cumulative: Vec<Vec<f64>> = requests.iter().map(|&(id, available)| {
+            let cumulative: Vec<Vec<f64>> = requests.iter().enumerate().map(|(request, &(id, _))| {
                 let recent = self.recent.get(&id);
                 let mut product = 1.;
-                (0..action.width.min(available)).map(|position| {
+                (0..action.width.min(room(index, request))).map(|position| {
                     let p = recent.and_then(|r| r[position])
                         .unwrap_or_else(|| self.calibrated(position, self.raw_mean[position]));
                     product *= self.request_probability(id, position, p);
@@ -1180,28 +1217,27 @@ impl DraftPolicy {
             let ratio = selection.expected_tokens / selection.predicted_us;
             if best.is_none_or(|(_, score)| ratio > score) { best = Some((index, ratio)); }
         }
-        let can_draft = max_rows > requests.len() && requests.iter().any(|&(_, room)| room > 0);
-        for action in actions.iter().filter(|action| can_draft && action.width > 0) {
+        for (_, action) in actions.iter().enumerate().filter(|&(index, _)| eligible[index]) {
             let age = self.action_age.entry((bucket, action.width)).or_default();
             *age = age.saturating_add(1);
         }
-        let explore = actions.iter().enumerate().filter(|(_, action)| can_draft && action.width > 0)
+        let explore = actions.iter().enumerate().filter(|&(index, _)| eligible[index])
             .filter_map(|(index, action)| self.action_age.get(&(bucket, action.width))
                 .filter(|&&age| age >= WIDTH_EXPLORE_ROUNDS).map(|&age| (index, age)))
             .max_by_key(|&(index, age)| (age, usize::MAX - index)).map(|(index, _)| index);
-        let recover = can_draft && requests.iter().any(|&(id, room)| room > 0
-            && self.skipped.get(&id).copied().unwrap_or(0) >= REQUEST_EXPLORE_SKIPS);
-        // Block drafters expose skip/full-block; select_core reserves only
-        // one verified row after the smallest supported positive pass.
-        let minimal = actions.iter().enumerate().filter(|(_, action)| action.width > 0)
+        // Recovery must pick a pass that actually includes an overdue request.
+        let recover = actions.iter().enumerate().filter(|&(index, _)| eligible[index]
+            && requests.iter().enumerate().any(|(request, &(id, _))| room(index, request) > 0
+                && self.skipped.get(&id).copied().unwrap_or(0) >= REQUEST_EXPLORE_SKIPS))
             .min_by_key(|&(index, action)| (action.width, index)).map(|(index, _)| index);
-        let chosen = if recover && minimal.is_some() { minimal } else { explore.or_else(|| best.map(|(index, _)| index)) };
+        let chosen = recover.or(explore).or_else(|| best.map(|(index, _)| index));
         if let Some(index) = chosen.filter(|&index| actions[index].width > 0) {
             self.action_age.insert((bucket, actions[index].width), 0);
         }
-        for &(id, room) in requests {
+        for (request, &(id, _)) in requests.iter().enumerate() {
             self.selected_requests.insert(id, requests.len());
-            self.selected_draft_room.insert(id, can_draft && room > 0 && minimal.is_some());
+            self.selected_draft_room.insert(id, eligible.iter().enumerate()
+                .any(|(index, &can_draft)| can_draft && room(index, request) > 0));
         }
         Ok(chosen)
     }
@@ -2219,6 +2255,86 @@ mod tests {
         let mut fixed = DraftPolicy::new(placement(5), PolicySeed::weak(7), true).unwrap();
         assert_eq!(fixed.choose_action(false, &[(1, 5)], &[
             DraftAction { width: 5, draft_us: 100. }, DraftAction { width: 0, draft_us: 0. }], 64).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn action_rooms_reserve_all_anchors_and_recover_only_participants() {
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.99; 5]); }
+        let requests = [(1, 5), (2, 5)];
+        let actions = [DraftAction { width: 0, draft_us: 0. },
+            DraftAction { width: 3, draft_us: 1e12 }, DraftAction { width: 5, draft_us: 1e12 }];
+        let masks: [&[usize]; 3] = [&[0, 0], &[3, 0], &[0, 5]];
+        policy.skipped.insert(2, REQUEST_EXPLORE_SKIPS);
+        assert_eq!(policy.choose_action_with_rooms(false, &requests, &actions, &masks, 3).unwrap(), Some(2));
+        assert_eq!(policy.selected_requests[&1], 2);
+        assert_eq!(policy.selected_requests[&2], 2);
+        assert!(policy.selected_draft_room[&1] && policy.selected_draft_room[&2]);
+        assert_eq!(policy.choose_action_with_rooms(false, &requests, &actions, &masks, 2).unwrap(), Some(0));
+        assert!(!policy.selected_draft_room[&1] && !policy.selected_draft_room[&2]);
+        let none: [&[usize]; 3] = [&[0, 0], &[0, 0], &[0, 0]];
+        for _ in 0..2 * WIDTH_EXPLORE_ROUNDS {
+            assert_eq!(policy.choose_action_with_rooms(false, &requests, &actions, &none, 64).unwrap(), Some(0));
+        }
+        assert!(policy.choose_action_with_rooms(false, &requests, &actions, &masks[..2], 64).is_err());
+        assert!(policy.choose_action_with_rooms(false, &requests, &actions,
+            &[&[0, 0], &[6, 0], &[0, 5]], 64).is_err());
+        assert!(policy.choose_action_with_rooms(false, &requests, &actions,
+            &[&[1, 0], &[3, 0], &[0, 5]], 64).is_err());
+    }
+
+    #[test]
+    fn action_rooms_match_legacy_and_price_distinct_participant_shapes() {
+        let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.99; 5]); }
+        let requests = [(1, 5), (2, 5), (3, 5), (4, 5)];
+        let actions = [DraftAction { width: 0, draft_us: 0. },
+            DraftAction { width: 3, draft_us: policy.draft_cost_drafted(false, 4, 4, 3) },
+            DraftAction { width: 5, draft_us: policy.draft_cost_drafted(false, 4, 1, 5) }];
+        let mut legacy = policy.clone();
+        let full: [&[usize]; 3] = [&[0; 4], &[5; 4], &[5; 4]];
+        assert_eq!(legacy.choose_action(false, &requests, &actions, 16).unwrap(),
+            policy.choose_action_with_rooms(false, &requests, &actions, &full, 16).unwrap());
+        let masks: [&[usize]; 3] = [&[0; 4], &[3; 4], &[0, 0, 0, 5]];
+        let chosen = policy.choose_action_with_rooms(false, &requests, &actions, &masks, 16).unwrap().unwrap();
+        let ids = [1, 2, 3, 4];
+        let mut best = (0, 0.);
+        for (index, action) in actions.iter().enumerate() {
+            let cumulative: Vec<Vec<_>> = masks[index].iter().map(|&room| {
+                let mut product = 1.;
+                (0..room.min(action.width)).map(|position| {
+                    product *= policy.calibrated(position, policy.raw_mean[position]);
+                    product
+                }).collect()
+            }).collect();
+            let selection = policy.select_core(draft_concurrency_bucket(4), &ids, &cumulative,
+                action.draft_us, 16, false);
+            assert!(selection.lengths.iter().sum::<usize>() + 4 <= 16);
+            assert!(selection.lengths.iter().zip(masks[index]).all(|(&length, &room)| length <= room));
+            let ratio = selection.expected_tokens / selection.predicted_us;
+            if ratio > best.1 { best = (index, ratio); }
+        }
+        assert_eq!(chosen, best.0);
+    }
+
+    #[test]
+    fn native_confidence_extent_is_independent_of_execution_width() {
+        let mut geometry = placement(5);
+        geometry.widths = vec![3, 5];
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        policy.outcomes.insert(1, vec![(0., 10.); 7]);
+        assert!(policy.request_probability(1, 3, 0.9) < 0.9);
+        policy.set_native_confidence_positions(5).unwrap();
+        assert_eq!(policy.request_probability(1, 3, 0.9), 0.9);
+        assert_eq!(policy.request_probability(1, 4, 0.9), 0.9);
+        assert!(policy.request_probability(1, 5, 0.9) < 0.9);
+        assert_eq!(policy.restarted(false).native_confidence_positions, 5);
+        assert!(policy.set_native_confidence_positions(0).is_err());
+        assert!(policy.set_native_confidence_positions(8).is_err());
+        policy.stats.rounds = 1;
+        assert!(policy.set_native_confidence_positions(5).is_err());
     }
 
     #[test]
