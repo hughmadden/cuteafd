@@ -49,26 +49,10 @@ struct Utilization {
     memory: c_uint,
 }
 
-/// `nvmlMarginTemperature_v1_t`.
-#[repr(C)]
-struct Margin {
-    version: c_uint,
-    margin: c_int,
-}
-const MARGIN_V1: c_uint = std::mem::size_of::<Margin>() as c_uint | (1 << 24);
-
 // Field ids (nvml.h, `NVML_FI_DEV_*`).
-const FI_SW_POWER_CAP_NS: c_uint = 74;
-const FI_MEMORY_TEMP: c_uint = 82;
 const FI_SHUTDOWN_TLIMIT: c_uint = 193;
 const FI_SLOWDOWN_TLIMIT: c_uint = 194;
 const FI_GPU_MAX_TLIMIT: c_uint = 196;
-const FI_SW_THERMAL_NS: c_uint = 269;
-const FI_HW_THERMAL_NS: c_uint = 270;
-const FI_HW_POWER_BRAKE_NS: c_uint = 271;
-/// The slow tier's batch (about 0.8 ms on an RTX PRO 6000: the HW counters are GSP RPCs).
-const SLOW_FIELDS: [c_uint; 5] = [FI_SW_POWER_CAP_NS, FI_SW_THERMAL_NS, FI_HW_THERMAL_NS, FI_HW_POWER_BRAKE_NS,
-    FI_MEMORY_TEMP];
 /// Read once per device.
 const LIMIT_FIELDS: [c_uint; 3] = [FI_SLOWDOWN_TLIMIT, FI_SHUTDOWN_TLIMIT, FI_GPU_MAX_TLIMIT];
 
@@ -102,7 +86,6 @@ type StringFn = unsafe extern "C" fn(Device, *mut c_char, c_uint) -> Ret;
 type PciFn = unsafe extern "C" fn(Device, *mut PciInfo) -> Ret;
 type FieldsFn = unsafe extern "C" fn(Device, c_int, *mut FieldValue) -> Ret;
 type TemperatureFn = unsafe extern "C" fn(Device, c_int, *mut c_uint) -> Ret;
-type MarginFn = unsafe extern "C" fn(Device, *mut Margin) -> Ret;
 type ClockFn = unsafe extern "C" fn(Device, c_int, *mut c_uint) -> Ret;
 type ReasonsFn = unsafe extern "C" fn(Device, *mut c_ulonglong) -> Ret;
 type UtilizationFn = unsafe extern "C" fn(Device, *mut Utilization) -> Ret;
@@ -119,7 +102,6 @@ pub struct Nvml {
     pci: Option<PciFn>,
     fields: Option<FieldsFn>,
     temperature: Option<TemperatureFn>,
-    margin: Option<MarginFn>,
     clock: Option<ClockFn>,
     reasons: Option<ReasonsFn>,
     utilization: Option<UtilizationFn>,
@@ -169,7 +151,6 @@ impl Nvml {
             pci: symbol(&library, b"nvmlDeviceGetPciInfo_v3"),
             fields: symbol(&library, b"nvmlDeviceGetFieldValues"),
             temperature: symbol(&library, b"nvmlDeviceGetTemperature"),
-            margin: symbol(&library, b"nvmlDeviceGetMarginTemperature"),
             clock: symbol(&library, b"nvmlDeviceGetClockInfo"),
             reasons: symbol(&library, b"nvmlDeviceGetCurrentClocksEventReasons")
                 .or_else(|| symbol(&library, b"nvmlDeviceGetCurrentClocksThrottleReasons")),
@@ -265,11 +246,10 @@ impl NvmlDevice<'_> {
         (unsafe { call(self.handle, &mut value) } == SUCCESS).then_some(value)
     }
 
-    /// One reading. The fast tier (temperature, SM clock, power, limit, reasons,
-    /// utilization) costs about 0.1 ms per device; `slow` adds the cumulative throttle
-    /// counters, memory temperature and T.Limit margin (about 2 ms, GSP round trips), which
-    /// read `None` when `slow` is false.
-    pub fn read(&self, slow: bool) -> GpuReading {
+    /// One reading: temperature, SM clock, power, enforced limit, clock-event reasons and
+    /// utilization (about 0.1 ms per device). No throttle counters or margin reads: throttle
+    /// time is estimated from the reason bits.
+    pub fn read(&self) -> GpuReading {
         let n = self.nvml;
         let temperature_c = n.temperature.and_then(|call| {
             let mut value: c_uint = 0;
@@ -291,26 +271,12 @@ impl NvmlDevice<'_> {
             // SAFETY: `value` is a valid out-pointer of nvmlUtilization_t's layout.
             (unsafe { call(self.handle, &mut value) } == SUCCESS).then_some(value.gpu)
         });
-        let mut reading = GpuReading {
+        let reading = GpuReading {
             temperature_c, sm_clock_mhz, reasons, utilization_pct,
             power_mw: self.uint(n.power),
             power_limit_mw: self.uint(n.power_limit),
             ..GpuReading::default()
         };
-        if slow {
-            let [power_cap, sw_thermal, hw_thermal, brake, memory] = self.field_values(SLOW_FIELDS);
-            let unsigned = |v: &FieldValue| v.get().and_then(|v| u64::try_from(v).ok());
-            reading.sw_power_cap_ns = unsigned(&power_cap);
-            reading.sw_thermal_ns = unsigned(&sw_thermal);
-            reading.hw_thermal_ns = unsigned(&hw_thermal);
-            reading.hw_power_brake_ns = unsigned(&brake);
-            reading.memory_temperature_c = memory.get().map(|v| v as i32);
-            reading.tlimit_margin_c = n.margin.and_then(|call| {
-                let mut margin = Margin { version: MARGIN_V1, margin: 0 };
-                // SAFETY: `margin` carries its struct version; NVML fills `margin`.
-                (unsafe { call(self.handle, &mut margin) } == SUCCESS).then_some(margin.margin)
-            });
-        }
         reading
     }
 }
@@ -323,8 +289,7 @@ mod tests {
     fn struct_layouts_match_nvml_h() {
         assert_eq!(std::mem::size_of::<FieldValue>(), 40);
         assert_eq!(std::mem::size_of::<PciInfo>(), 68);
-        assert_eq!(MARGIN_V1, 8 | (1 << 24));
-    }
+            }
 
     #[test]
     fn field_values_decode_by_type_and_status() {
@@ -347,11 +312,10 @@ mod live {
         let devices = nvml.devices().expect("devices");
         assert!(!devices.is_empty());
         for device in &devices {
-            let reading = device.read(true);
+            let reading = device.read();
             println!("{:?}\n{:?}", device.identity, reading);
             assert!(reading.temperature_c.is_some_and(|t| (1..125).contains(&t)));
             assert!(reading.sm_clock_mhz.is_some() && reading.reasons.is_some());
-            assert!(reading.sw_power_cap_ns.is_some());
         }
     }
 }
