@@ -464,6 +464,24 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     assert "--pool-tokens 0" in launch
 
 
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4"])
+@pytest.mark.parametrize("budget,total", [("", 32768), ("31.8", 98304), ("", 98304)])
+def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, budget, total):
+    result = _family_launch_result(
+        tmp_path, ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+                   if family == "glm5" else {"model_type": "deepseek_v4"}
+                   if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family]), "test/model",
+        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nGLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        gpu_total_mib=total, gpu_free_mib=total)
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    args = plan.split()
+    expected = float(budget) if budget else total / 1024
+    for flag in ("--coordinator-gpu-budget-gib", "--coordinator-weight-budget-gib"):
+        assert float(args[args.index(flag) + 1]) == expected
+    assert "94.97" not in plan
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_mimo_worker_selection_handshake_is_opt_in_on_both_ends(tmp_path, enabled):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}

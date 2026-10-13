@@ -114,8 +114,8 @@ pub(crate) struct EngineArgs {
     /// decode rows), or `shared`, the prefill lanes' scratch, which no decode step reads (782 MB with
     /// the 4,096-row KDA prefill programs). A record lives only from a speculative verify to its
     /// commit, with no prefill in between; a commit that would read records a prefill overwrote
-    /// fails. One GPU whose pool is sized from measured memory (an automatic pool with Spark
-    /// experts, or a coordinator GPU budget), where the step workspaces precede the KV pool.
+    /// fails. Supported on one GPU with Spark experts, with either an automatic or an explicit
+    /// pool; the step workspaces precede the KV pool.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
     pub replay_records: engine::ReplayRecords,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.

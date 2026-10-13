@@ -1974,10 +1974,10 @@ audio_peers=()
 audio_encoder_hash=""
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
-  plan_gib="${coordinator_budget:-94.97}"
+  total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
+  plan_gib="${coordinator_budget:-$(python3 -c 'import sys; print(float(sys.argv[1])/1024)' "$total_mib")}"
   if [[ "$family" == qwen4 ]]; then
     free_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
-    total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
     if ((restart)); then
       own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | python3 -c 'import sys; print(" ".join(x.strip() for x in sys.stdin if x.strip().isdigit()))' || true)"
       if [[ -n "$own_pids" ]]; then
