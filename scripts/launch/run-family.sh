@@ -1626,10 +1626,10 @@ split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
   qwen4:*)
-    if [[ "$ranks" == 0 && "$explicit_split" == 1 ]]; then
-      : # Explicit Spark-free TP2 qualification; automatic selection stays gated.
+    if [[ "$ranks" == 0 ]]; then
+      : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
     else
-      split_hint="Qwen dual requires an explicit Spark-free local TP2 layout"
+      split_hint="Qwen dual requires a Spark-free local TP2 layout"
     fi ;;
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
@@ -1668,7 +1668,7 @@ if [[ -n "$second" && "$split" != off ]]; then
   fi
 fi
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
-  release_die "Qwen whole-layer attention requires an explicit Spark-free coordinator pair"
+  release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native

@@ -1711,6 +1711,32 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     assert "auto selected GPU 0 alone" in result.stderr
 
 
+@pytest.mark.parametrize("keys,physical_gpus,ranks,dual", [
+    ("", (0, 1), 0, True),
+    ("RTX_GPUS=2\n", (0, 1), 0, True),
+    ("RTX_GPUS=1\n", (0, 1), 0, False),
+    ("COORDINATOR_SPLIT=off\n", (0, 1), 0, False),
+    ("", (0,), 0, False),
+    ("", (0, 1), 1, False),
+])
+def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys: str,
+                                                           physical_gpus: tuple[int, ...],
+                                                           ranks: int, dual: bool) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  keys + f"SPARK_COUNT={ranks}\nSPECULATOR=off\n",
+                                  physical_gpus=physical_gpus)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert ("--split-device" in launch) == dual
+    assert ("CUTEAFD_ATTENTION_PLACEMENT=layers" in launch) == dual
+    assert ("--local-experts" in launch) == (ranks == 0)
+    if dual:
+        assert "--rtx-expert-layers all" in launch
+        preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+        assert "--attention-placement layers" in preflight
+        assert "--rtx-expert-layers all" in preflight
+
+
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
 def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",

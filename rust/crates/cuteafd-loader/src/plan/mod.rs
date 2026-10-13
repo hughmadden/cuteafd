@@ -431,7 +431,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
-        let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split);
+        let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split)
+            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local);
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {

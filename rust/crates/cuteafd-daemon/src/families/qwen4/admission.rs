@@ -462,13 +462,14 @@ mod tests {
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
-                layout: Some(LayoutOptions { rtx_bytes: capacities.to_vec(), head_split: true, onboard: Some(Onboard::Fraction(1.0)),
+                layout: Some(LayoutOptions { rtx_bytes: capacities.to_vec(),
                     context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
                     qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head },
                     workspace_manifest: Some(manifest_path.clone()), ..Default::default() }), ..Default::default() })?;
             assert!(report.placement_supported, "{:?}", report.hints);
+            assert_eq!(report.attention_placement, cuteafd_loader::placement::AttentionPlacement::Layers);
             let layout = report.memory_layout.unwrap();
             let weights = super::dual_weights(&args, &checkpoint, &cfg, 4, mtp)?;
             let experts = super::dual_experts(&args, &catalog, 4)?;

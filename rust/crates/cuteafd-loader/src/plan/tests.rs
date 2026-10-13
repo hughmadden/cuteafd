@@ -2234,12 +2234,31 @@ fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
 }
 
 #[test]
-fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
+fn qwen_default_attention_follows_spark_free_coordinator_layout() {
+    use crate::placement::AttentionPlacement;
+    let dir = snapshot(qwen4_config(48), &[]);
+    for (gpus, peer, ranks, expected) in [
+        (2, true, 0, AttentionPlacement::Layers),
+        (1, true, 0, AttentionPlacement::Heads),
+        (2, false, 0, AttentionPlacement::Heads),
+        (2, true, 1, AttentionPlacement::Heads),
+    ] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
+        }), ..sparks(ranks) };
+        let report = plan(dir.path(), &options).unwrap();
+        assert_eq!(report.attention_placement, expected, "GPUs={gpus}, peer={peer}, Sparks={ranks}");
+        assert!(report.config_error.is_none(), "{:?}", report.config_error);
+    }
+}
+
+#[test]
+fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(qwen4_config(48), &[]);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![12 << 30, 96 << 30], pool_tokens: Some(0), ..Default::default()
+            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0), ..Default::default()
         }), ..sparks(0)
     };
     let report = plan(dir.path(), &options).unwrap();

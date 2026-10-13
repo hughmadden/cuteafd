@@ -569,7 +569,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         return mimo::layout(report, model, checkpoint, options, prefill_rows, concurrency,
             context_tokens, workspace_manifest.as_ref());
     }
-    if family == "qwen4" && options.rtx_bytes.len() == 2 && options.head_split && options.onboard.is_some()
+    if family == "qwen4" && options.rtx_bytes.len() == 2 && options.head_split
         && report.placement == ExpertPlacement::Local {
         return qwen_dual::layout(report, model, checkpoint, options, prefill_rows, concurrency,
             context_tokens, cache_native_layers > 0, workspace_manifest.as_ref());

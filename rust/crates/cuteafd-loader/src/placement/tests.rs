@@ -410,7 +410,8 @@ fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
         // #57), heads on one.
-        let recorded = if ["glm5", "glm5_flash"].contains(&executor.family) { AttentionPlacement::Context }
+        let recorded = if executor.family == "qwen4" { AttentionPlacement::Layers }
+            else if ["glm5", "glm5_flash"].contains(&executor.family) { AttentionPlacement::Context }
             else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
         assert_eq!(executor.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
