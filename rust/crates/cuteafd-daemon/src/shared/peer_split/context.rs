@@ -86,6 +86,43 @@ pub(crate) fn combine_order<T>(rank: usize, own: T, received: T) -> [T; 2] {
     if rank == 0 { [own, received] } else { [received, own] }
 }
 
+/// The `{family}_sparse_mla_partial_h{begin}_s{N}_m{rows}` variants a GPU with `sms` SMs runs,
+/// as (row cap, program) ascending: the exporter's split plan per (SM count, row cap)
+/// (`row_caps`; a variant without it serves the full `rows` of its `device_sm_counts`), else
+/// the one variant. A step of `t` rows runs the smallest cap >= `t` ([`pick_partial`]): a few
+/// verify rows plan more splits.
+pub(crate) fn partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
+    -> Result<Vec<(usize, String)>> {
+    let programs = manifest["programs"].as_array().context("program manifest")?;
+    let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
+    let suffix = format!("_m{rows}");
+    let variants: Vec<&serde_json::Value> = programs.iter()
+        .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))).collect();
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for p in &variants {
+        let name = p["name"].as_str().context("program name")?.to_string();
+        let caps: Vec<usize> = match p["params"]["row_caps"].get(sms.to_string()) {
+            Some(caps) => caps.as_array().context("row caps")?.iter().filter_map(|c| c.as_u64().map(|c| c as usize)).collect(),
+            None if p["params"]["device_sm_counts"].as_array()
+                .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))) => vec![rows],
+            None => Vec::new(),
+        };
+        out.extend(caps.into_iter().map(|cap| (cap, name.clone())));
+    }
+    if out.is_empty() && variants.len() == 1 {
+        out.push((rows, variants[0]["name"].as_str().context("program name")?.to_string()));
+    }
+    out.sort();
+    out.dedup_by_key(|(cap, _)| *cap);
+    ensure!(out.last().is_some_and(|(cap, _)| *cap >= rows), "no {prefix}*{suffix} variant planned for {sms} SMs at {rows} rows");
+    Ok(out)
+}
+
+/// The variant of `partials` (ascending caps, [`partial_programs`]) a step of `rows` rows runs.
+pub(crate) fn pick_partial(partials: &[(usize, String)], rows: usize) -> &str {
+    partials.iter().find(|(cap, _)| *cap >= rows).or(partials.last()).map_or("", |(_, name)| name.as_str())
+}
+
 /// One cache plane within an ownership unit. Its row coordinates can differ
 /// from token coordinates (pooled index keys use one row per four tokens).
 #[derive(Debug, Clone, Copy)]
@@ -442,6 +479,32 @@ mod tests {
         assert!(commit_blocks(0, &[5], &planes[..1], 1).is_err());
         assert!(commit_blocks(0, &pages, &planes, 1).is_err());
         assert!(commit_blocks(2, &pages, &planes, 3).is_err());
+    }
+
+    #[test]
+    fn partial_variants_follow_the_family_prefix_and_decode_rows() {
+        // V4 Pro's second head range (h64) at 64 decode rows, beside a GLM and an m128 variant.
+        let manifest = serde_json::json!({"programs": [
+            {"name": "dsv4p_sparse_mla_partial_h64_s2_m64", "params": {"device_sm_counts": [170, 188],
+                "row_caps": {"170": [64], "188": [64]}}},
+            {"name": "dsv4p_sparse_mla_partial_h64_s16_m64", "params": {"device_sm_counts": [170, 188],
+                "row_caps": {"170": [1, 8], "188": [1, 8]}}},
+            {"name": "dsv4p_sparse_mla_partial_h64_s4_m128", "params": {"device_sm_counts": [188]}},
+            {"name": "glm_sparse_mla_partial_h64_s4_m64", "params": {"device_sm_counts": [188]}},
+            {"name": "dsv4p2_sparse_mla_partial_h64_s4_m64", "params": {"device_sm_counts": [188]}}]});
+        let plans = partial_programs(&manifest, "dsv4p", 64, 64, 188).unwrap();
+        assert_eq!(plans, [(1, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()),
+            (8, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()), (64, "dsv4p_sparse_mla_partial_h64_s2_m64".to_string())]);
+        assert_eq!([1, 8, 9, 64, 65].map(|rows| pick_partial(&plans, rows)), ["dsv4p_sparse_mla_partial_h64_s16_m64",
+            "dsv4p_sparse_mla_partial_h64_s16_m64", "dsv4p_sparse_mla_partial_h64_s2_m64",
+            "dsv4p_sparse_mla_partial_h64_s2_m64", "dsv4p_sparse_mla_partial_h64_s2_m64"]);
+        // Another row count selects only its own variants.
+        assert_eq!(partial_programs(&manifest, "dsv4p", 64, 128, 188).unwrap(),
+            [(128, "dsv4p_sparse_mla_partial_h64_s4_m128".to_string())]);
+        assert!(partial_programs(&manifest, "dsv4p", 64, 128, 170).is_ok(), "the one variant serves any SM count");
+        assert!(partial_programs(&manifest, "dsv4p", 0, 64, 188).is_err(), "no head-0 variant");
+        assert!(partial_programs(&manifest, "dsv4f", 64, 64, 188).is_err(), "family prefixes do not cross");
+        assert_eq!(pick_partial(&[], 4), "");
     }
 
     #[test]
