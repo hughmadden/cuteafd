@@ -95,6 +95,9 @@ pub(crate) struct EngineArgs {
     #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROWS", default_value_t = engine::DECODE_ROWS,
         value_parser = parse_decode_rows)]
     pub decode_rows: usize,
+    /// Numerical decode/verify reduction rows, independent of execution capacity.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
+    pub attention_plan_rows: Option<usize>,
     /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
     /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
     /// --prefill-rows rows. The lanes share one set of attention temporaries.
@@ -446,6 +449,20 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn attention_plan_override_has_one_domain_for_narrow_and_wide_execution() {
+        use cuteafd_core::coordinator_programs::AttentionReductionPlan;
+        for execution in ["64", "128"] {
+            let args = parse(&["--decode-rows", execution, "--attention-plan-rows", "8"]);
+            assert_eq!(args.attention_plan_rows, Some(8));
+            assert_eq!(AttentionReductionPlan::new(engine::DECODE_ROWS, Some(7), args.attention_plan_rows)
+                .unwrap().rows(), 8);
+            for rows in [0, 65, 128] {
+                assert!(AttentionReductionPlan::new(engine::DECODE_ROWS, Some(7), Some(rows)).is_err());
+            }
+        }
     }
 
     /// `--draft-linear`: w8a16 by default (today's W8A16 GEMV), wide or w8a8 on request.
@@ -1436,7 +1453,25 @@ impl Opened {
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;
-        let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let active_drafts = args.draft.as_deref().map(|path| -> Result<usize> {
+            let (hidden, vocab, taps, drafts) = if dspark::is_dspark(path)? {
+                let cfg = dspark::DsparkConfig::read(path)?;
+                (cfg.hidden, cfg.vocab, cfg.taps.clone(), cfg.drafts())
+            } else {
+                let cfg = crate::families::glm5::dflash::DflashConfig::read(path)?;
+                (cfg.hidden, cfg.vocab, cfg.taps.clone(), cfg.drafts())
+            };
+            ensure!(hidden == self.cfg.hidden && vocab == self.cfg.vocab_size && taps.iter().all(|&l| l < layers),
+                "the provisional attention drafter does not fit this target");
+            Ok(drafts)
+        }).transpose()?;
+        // m64 and m128 are execution capacities of one numerical domain.
+        let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+            engine::DECODE_ROWS, active_drafts, args.attention_plan_rows)?;
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?.with_attention_plan(
+            attention_plan, |name| glmf_startup_program(name, args.split_device.is_some(),
+                args.decode_rows > engine::DECODE_ROWS))?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
         let mut needed = Vec::new();
@@ -1513,7 +1548,31 @@ impl Opened {
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
         // The MLA placement: auto is context on two GPUs where this build carries its programs
         // (with the compact index cache), else heads (whose split keeps the token keys).
-        let attention = resolve_attention(args, &programs, split_device.is_some())?;
+        let mut attention = resolve_attention(args, &programs, split_device.is_some())?;
+        let context_manifest = if attention.mode == cuteafd_loader::placement::AttentionPlacement::Context {
+            let fallback = args.manifest.with_file_name("DSV4_PROGRAMS.json");
+            let path = if !args.manifest.exists()
+                && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
+                &fallback
+            } else { &args.manifest };
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            let mut scratch = 0;
+            for device in std::iter::once(args.device).chain(split_device) {
+                let bytes = crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                    let sms = self.library.sm_count()?;
+                    let mut bytes = 0;
+                    for begin in [0, self.cfg.heads / 2] {
+                        let name = crate::shared::peer_split::context::partial_program(
+                            &manifest, "glmf", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
+                        bytes = bytes.max(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0));
+                    }
+                    Ok(bytes)
+                })?;
+                scratch = scratch.max(bytes);
+            }
+            attention.partial_scratch = scratch;
+            Some(manifest)
+        } else { None };
         let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
         let index_cache = if context_mode.is_some() { engine::IndexCache::Compact }
             else { served_index_cache(args.index_cache, split_device.is_some()) };
@@ -1533,7 +1592,6 @@ impl Opened {
             None => None,
         };
         let started = Instant::now();
-        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         // The prefix mark arena on the layout this engine serves, its index cache resolved above:
         // both admissions reserve these marks, and `prefix_cache` allocates as many.
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
@@ -1648,6 +1706,7 @@ impl Opened {
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode)?;
+        engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
         if !startup_graphs {
@@ -1666,10 +1725,9 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
-        if context_mode.is_some() {
-            // The solver charged the staging over the compiled extent it was given.
-            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-            engine.attach_context(args.max_context, &manifest)?;
+        if let Some(manifest) = &context_manifest {
+            // The solver charged selected partial scratch and full-extent staging.
+            engine.attach_context(args.max_context, manifest)?;
         }
         probe("peer-exchanges")?;
         engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
@@ -1730,6 +1788,9 @@ impl Opened {
             }
         }
         engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take())?;
+        engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
+        tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
+            "GLM Flash immutable attention reduction plan");
         if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
             let (device, stream) = peer_stream.context("remote draft lost its target producer")?;
             draft.validate_target_peer(crate::shared::peer_split::RankDevice { device, stream })?;
