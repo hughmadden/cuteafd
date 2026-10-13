@@ -16,6 +16,24 @@ use std::{
     ops::Range,
 };
 
+/// Full submission boundary, including captured graph replays and caller-side
+/// exchanges. Shutdown must publish aborts before draining and retire the engine;
+/// failure to prove drainage is fatal, never returned to owner-releasing callers.
+pub(crate) fn submit<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    require_live()?;
+    match body() {
+        Ok(value) => Ok(value),
+        Err(cause) => {
+            crate::shared::decode_graph::fatal_drain(shutdown(), "RTX submission shutdown");
+            Err(cause.context("submission drained; terminal engine cannot be reused"))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PackedRoutes {
     pub section: usize,
@@ -390,6 +408,45 @@ impl<'a> Pair<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn submission_faults_abort_then_drain_before_return_and_reject_replay() {
+        // Includes the caller's payload push after rank0 queued its route ack,
+        // later attention/copy/graph operations, and cancellation at each prefix.
+        for failure in 0..12 {
+            for cancellation in [false, true] {
+                let live = Cell::new(true);
+                let events = RefCell::new(Vec::new());
+                let result: Result<()> = submit(
+                    || { ensure!(live.get(), "closed"); Ok(()) },
+                    || {
+                        live.set(false);
+                        events.borrow_mut().push("abort both exchanges");
+                        events.borrow_mut().push("drain both ranks");
+                        Ok(())
+                    },
+                    || {
+                        for step in 0..12 {
+                            events.borrow_mut().push("enqueue");
+                            ensure!(step != failure, "injected step {step}, cancellation={cancellation}");
+                        }
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err());
+                let recorded = events.borrow();
+                assert_eq!(&recorded[recorded.len() - 2..], &["abort both exchanges", "drain both ranks"]);
+                drop(recorded);
+                let replayed = Cell::new(false);
+                assert!(submit(
+                    || { ensure!(live.get(), "closed"); Ok(()) },
+                    || panic!("already retired"),
+                    || { replayed.set(true); Ok(()) },
+                ).is_err());
+                assert!(!replayed.get());
+            }
+        }
+    }
+
     #[test]
     fn packed_routes_fit_aligned_exchange_for_every_short_shape() {
         for topk in [6, 8, 10] {

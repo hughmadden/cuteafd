@@ -291,6 +291,7 @@ pub(crate) struct GlmEngine<'a> {
     /// Lanes a long prefill chunk splits into.
     prefill_lanes: usize,
     pub lanes: RefCell<Vec<SparkLane<'a>>>,
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     pub full_prefill_logits: bool,
@@ -391,7 +392,7 @@ impl<'a> GlmEngine<'a> {
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
-            lanes: RefCell::new(Vec::new()), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
@@ -884,6 +885,14 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.retire_tp2(),
+            || self.step_inner(tables, tokens, logit_rows, experts, on_layer))
+    }
+
+    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
@@ -1327,6 +1336,7 @@ impl<'a> GlmEngine<'a> {
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
@@ -1585,6 +1595,12 @@ impl<'a> GlmEngine<'a> {
     /// posted and received on its thread while this thread queues the other
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
     fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.retire_tp2(),
+            || self.step_lanes_inner(lanes, chunks, logit_rows))
+    }
+
+    fn step_lanes_inner(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
         {
             let mut slots = self.lane_workspaces.borrow_mut();
             while slots.len() < lanes.len() {

@@ -721,6 +721,21 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {value}" in launch
 
 
+def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "test/glm", "SPARK_COUNT=0\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=all\nSPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
+    assert "--split-device 1" in launch
+    assert "--rtx-expert-layers all" in launch
+    assert "--peers" not in launch
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "--local-experts" not in launch
+    assert "CUTEAFD_GLM_PREFILL_LANES=1" in launch
+    assert "--rdma-endpoints" not in result.stderr
+
+
 @pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
 def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     keys = "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\n"

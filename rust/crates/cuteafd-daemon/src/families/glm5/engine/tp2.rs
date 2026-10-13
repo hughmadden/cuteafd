@@ -63,49 +63,67 @@ impl<'a> GlmEngine<'a> {
             .is_some_and(|pair| pair.layers.contains(&layer))
     }
 
+    pub(crate) fn require_live(&self) -> Result<()> {
+        let state = self.terminal.get();
+        if state != crate::shared::peer_split::TerminalState::Active {
+            return Err(crate::shared::peer_split::TerminalPeerError::Closed(state).into());
+        }
+        if let Some(exchange) = &self.exchange { exchange.require_live()?; }
+        if let Some(pair) = &self.tp2 { pair.routes.require_live()?; }
+        Ok(())
+    }
+
     fn abort_tp2(&self) -> Result<()> {
-        if self.tp2.is_none() {
-            return Ok(());
-        }
-        // A backend failure may occur with rank1 current; always publish on the home device.
-        crate::shared::memory::device::Device {
-            library: self.library,
-            id: self.device,
-        }
-        .run(|| {
-            for exchange in [
-                self.exchange()?,
-                &self.tp2.as_ref().context("TP2 pair")?.routes,
-            ] {
-                match exchange.terminal_state() {
-                    crate::shared::peer_split::TerminalState::Active => exchange.publish_abort()?,
+        // A backend failure may occur with rank1 current; publish on the home device.
+        crate::shared::memory::device::Device { library: self.library, id: self.device }.run(|| {
+            let mut failures = Vec::new();
+            for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
+                let result = match exchange.terminal_state() {
+                    crate::shared::peer_split::TerminalState::Active => exchange.publish_abort(),
                     crate::shared::peer_split::TerminalState::Aborting
-                    | crate::shared::peer_split::TerminalState::Drained => {}
-                    _ => anyhow::bail!("GLM TP2 abort owners retained"),
-                }
+                    | crate::shared::peer_split::TerminalState::Drained => Ok(()),
+                    state => Err(crate::shared::peer_split::TerminalPeerError::Closed(state).into()),
+                };
+                if let Err(error) = result { failures.push(format!("{error:#}")); }
             }
+            ensure!(failures.is_empty(), "GLM abort publication: {}", failures.join("; "));
             Ok(())
         })
     }
 
     pub(crate) fn retire_tp2(&self) -> Result<()> {
-        let Some(pair) = &self.tp2 else {
-            return Ok(());
-        };
-        self.abort_tp2()?;
-        self.exchange()?.drain_compute()?;
-        pair.routes.drain_compute()?;
-        self.on(0, || {
-            self.graphs.borrow_mut().clear();
+        use crate::shared::peer_split::{TerminalState, TerminalPeerError};
+        match self.terminal.get() {
+            TerminalState::Drained => return Ok(()),
+            TerminalState::Active => self.terminal.set(TerminalState::Aborting),
+            state => return Err(TerminalPeerError::Closed(state).into()),
+        }
+        let result = (|| {
+            self.abort_tp2()?;
+            if let Some(exchange) = &self.exchange { exchange.drain_compute()?; }
+            else {
+                // SAFETY: one-GPU stream and all its queued storage remain owned.
+                unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            }
+            if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
+            // Existing SparkLane Drop joins outstanding waves before its intake
+            // is freed. Here only retire compute/copy/graph owners; no new QP API.
+            for lane in self.lanes.borrow().iter() { lane.intake.terminal_drain_copies()?; }
+            for rank in 0..self.ranks() {
+                self.on(rank, || {
+                    if rank == 0 { self.graphs.borrow_mut().clear(); }
+                    else { self.peer()?.graphs.borrow_mut().clear(); }
+                    Ok(())
+                })?;
+            }
             Ok(())
-        })?;
-        self.on(1, || {
-            self.peer()?.graphs.borrow_mut().clear();
-            Ok(())
-        })?;
-        self.exchange()?.finish_terminal(true);
-        pair.routes.finish_terminal(true);
-        Ok(())
+        })();
+        let drained = result.is_ok();
+        self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
+            exchange.finish_terminal(drained);
+        }
+        result
     }
 
     pub(crate) fn prime_tp2(&self) -> Result<()> {
@@ -317,7 +335,7 @@ impl<'a> GlmEngine<'a> {
         if self.tp2.is_none() {
             return Ok(());
         }
-        let rows = 512.min(self.max_context.saturating_sub(1));
+        let rows = route_check_rows(self.prefill_rows, self.max_context);
         ensure!(rows > 0, "TP2 route diagnostics need two context rows");
         let mut allocator = PageAllocator::new(self);
         let mut placement = allocator.admit(rows + 1)?;
@@ -344,10 +362,22 @@ impl<'a> GlmEngine<'a> {
     }
 }
 
+fn route_check_rows(prefill_rows: usize, max_context: usize) -> usize {
+    512.min(prefill_rows).min(max_context.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::peer_split::order::{check, Schedule};
+
+    #[test]
+    fn diagnostic_prompt_fits_short_and_serial_all_local_lanes() {
+        assert_eq!(route_check_rows(64, 4096), 64);
+        assert_eq!(route_check_rows(256, 4096), 256);
+        assert_eq!(route_check_rows(4096, 129), 128);
+        assert_eq!(route_check_rows(4096, 1), 0);
+    }
 
     fn schedule(
         lanes: usize,
@@ -357,8 +387,8 @@ mod tests {
     ) -> Schedule {
         let mut s = Schedule::default();
         for _ in 0..repeats {
-            for _ in 0..lanes {
-                s.push(0, "main", DIRECT, "embedding");
+            for lane in 0..lanes {
+                s.push_to(0, "main", DIRECT, lane, "embedding");
             }
             let mut pending = std::collections::VecDeque::new();
             let post = |s: &mut Schedule, layer, lane, remote| {
@@ -378,7 +408,7 @@ mod tests {
                         post(&mut s, l, k, true);
                     }
                     if layer == 0 {
-                        s.wait(1, "main", DIRECT, "embedding received");
+                        s.wait_for(1, "main", DIRECT, lane, "embedding received");
                     }
                     for rank in 0..2 {
                         s.push(rank, "main", slot(layer, false, lane), "attention");
@@ -410,8 +440,64 @@ mod tests {
             while let Some((l, k)) = pending.pop_front() {
                 post(&mut s, l, k, true);
             }
+            s.end_request();
         }
         s
+    }
+
+    #[test]
+    fn missing_final_rank1_consumption_is_rejected() {
+        let mut s = schedule(1, 3..8, true, 1);
+        let at = s.streams[1].iter().rposition(|(_, label)| label == "rank1 FFN").unwrap();
+        s.streams[1].remove(at);
+        assert!(crate::shared::peer_split::order::check_terminal(&s, false).is_err());
+    }
+
+    #[test]
+    fn abort_and_cancellation_drain_every_enqueue_prefix() {
+        use crate::shared::peer_split::order::check_terminal;
+        for lanes in 1..=4 {
+            for end in 4..=8 {
+                for broadcast in [false, true] {
+                    let full = schedule(lanes, 3..end, broadcast, 1);
+                    let mut ops = Vec::new();
+                    for at in 0..full.streams.iter().map(Vec::len).max().unwrap() {
+                        for rank in 0..2 {
+                            if let Some(op) = full.streams[rank].get(at) {
+                                ops.push((rank, op.clone()));
+                            }
+                        }
+                    }
+                    for failure in 0..ops.len() {
+                        for cancel in [false, true] {
+                            let queued = RefCell::new(Schedule::default());
+                            let retired = Cell::new(false);
+                            let aborted = Cell::new(false);
+                            let drained = Cell::new(false);
+                            let result: Result<()> = crate::shared::experts::rtx::pair::submit(
+                                || { ensure!(!retired.get(), "closed"); Ok(()) },
+                                || {
+                                    aborted.set(true);
+                                    check_terminal(&queued.borrow(), aborted.get()).map_err(anyhow::Error::msg)?;
+                                    drained.set(true);
+                                    retired.set(true);
+                                    Ok(())
+                                },
+                                || {
+                                    for (at, (rank, op)) in ops.iter().enumerate() {
+                                        ensure!(at != failure, "{} at enqueue {at}", if cancel { "cancel" } else { "fault" });
+                                        queued.borrow_mut().streams[*rank].push(op.clone());
+                                    }
+                                    Ok(())
+                                },
+                            );
+                            assert!(result.is_err());
+                            assert!(aborted.get() && drained.get() && retired.get());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
