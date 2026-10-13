@@ -106,22 +106,45 @@ def top16(logits):
     return torch.topk(key, 16, dim=1).indices
 
 
-def head_rank_mismatches(expected, candidate, oracle, epsilon):
-    """Allow only changes inside groups of adjacent FP64 near-ties."""
+def head_bf16_interval(value, epsilon):
+    """Possible selector values at a BF16 midpoint within the FP64 error bound."""
+    def rounded(x):
+        bits = struct.unpack('<I', struct.pack('<f', x))[0]
+        bits = (bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000
+        return struct.unpack('<f', struct.pack('<I', bits))[0]
+    return rounded(value - epsilon), rounded(value + epsilon)
+
+
+def head_rank_mismatches(expected, candidate, oracle, epsilon, selector_bf16=False):
+    """Adjacent ties in raw FP64, or in the precision the selector consumes."""
     union = sorted(set(expected) | set(candidate), key=lambda i: (-oracle[i], i))
+    intervals = {i: head_bf16_interval(oracle[i], epsilon) for i in union} if selector_bf16 else None
     groups = {}
     group = 0
     previous = None
     for token in union:
-        if previous is not None and abs(oracle[token] - oracle[previous]) > epsilon:
-            group += 1
+        if previous is not None:
+            separated = (intervals[previous][0] > intervals[token][1] if intervals is not None
+                         else abs(oracle[token] - oracle[previous]) > epsilon)
+            if separated:
+                group += 1
         groups[token] = group
         previous = token
-    bad_order = any(groups[a] != groups[b] for a, b in zip(expected, candidate))
+    def overlap(a, b):
+        return max(intervals[a][0], intervals[b][0]) <= min(intervals[a][1], intervals[b][1])
+
+    bad_order = any(groups[a] != groups[b] or (intervals is not None and not overlap(a, b))
+                    for a, b in zip(expected, candidate))
     bad_set = sorted(groups[i] for i in expected) != sorted(groups[i] for i in candidate)
+    if intervals is not None:
+        removed = sorted(set(expected) - set(candidate), key=lambda i: -oracle[i])
+        added = sorted(set(candidate) - set(expected), key=lambda i: -oracle[i])
+        bad_set |= any(not overlap(a, b) for a, b in zip(removed, added))
     first_differs = expected[0] != candidate[0]
     top_gap = abs(oracle[expected[0]] - oracle[expected[1]])
-    bad_first = first_differs and (groups[expected[0]] != groups[candidate[0]] or top_gap > epsilon)
+    bad_first = first_differs and (
+        not overlap(expected[0], candidate[0]) if intervals is not None
+        else groups[expected[0]] != groups[candidate[0]] or top_gap > epsilon)
     return {
         "top1": int(first_differs),
         "set": int(set(expected) != set(candidate)),
@@ -143,6 +166,24 @@ def head_rank_selftest():
     assert check([0, 1, 2], [0, 1, 3], [3., 2., 1., 1. - 1e-6])["bad_set"] == 0
     assert check([0, 1, 2], [0, 1, 3], [3., 2., 1., .5])["bad_set"] == 1
     assert check([0, 1, 2], [0, 2, 1], [3., 2., 1.])["bad_order"] == 1
+
+    def bf16(expected, candidate, scores, epsilon=1e-4):
+        return head_rank_mismatches(expected, candidate, dict(enumerate(scores)), epsilon,
+                                    selector_bf16=True)
+
+    # The same bounded midpoint ambiguity applies to every route, at either sign.
+    assert head_bf16_interval(17.9375316, 1e-4) == (17.875, 18.)
+    assert head_bf16_interval(-17.9375316, 1e-4) == (-18., -17.875)
+    assert bf16([0, 1, 2], [1, 2, 0], [17.9375316, 17.8539804, 17.8374155])["bad_order"] == 0
+    assert bf16([0, 1], [1, 0], [-17.93748, -17.96])["bad_top1"] == 0
+    assert bf16([0, 1, 2], [0, 1, 3], [20., 19., 14.4687726, 14.4160921])["bad_set"] == 0
+    assert bf16([0, 1], [1, 0], [18.1, 17.8])["bad_top1"] == 1
+    assert bf16([0, 1, 2], [0, 2, 1], [20., 19., 18.])["bad_order"] == 1
+    assert bf16([0, 1, 2], [0, 1, 3], [20., 19., 18., 17.])["bad_set"] == 1
+    # Adjacent ambiguous bins cannot chain into permission to swap distinct endpoints.
+    assert bf16([0, 1, 2], [2, 1, 0], [18.06249, 17.93751, 17.875])["bad_order"] == 1
+    assert bf16([0, 1, 2], [0, 1, 3], [20., 18.06249, 17.93751, 17.875])["bad_set"] == 0
+    assert bf16([0, 1, 2], [0, 2, 3], [20., 18.06249, 17.93751, 17.875])["bad_set"] == 1
 
 
 def head_check(lib, args):
@@ -215,6 +256,12 @@ def head_check(lib, args):
             print(f"head: {name} max |error| / max |logit| over {reference_rows} rows: {err:.2e}")
             if err >= (1e-3 if name == "tensor" else 1e-5):
                 failures.append((name, "logit error", err))
+            row_errors = (out[name][:reference_rows].double() - ref).abs().amax(dim=1).cpu().tolist()
+            unbounded = [row for row, (error, epsilon) in enumerate(zip(row_errors, epsilons))
+                         if error > epsilon]
+            print(f"head: {name} rows outside BF16 selector ambiguity bound: {len(unbounded)}")
+            if unbounded:
+                failures.append((name, "selector ambiguity error bound", unbounded[:16]))
             candidate = top16(out[name][:reference_rows])
             candidate_rows = candidate.cpu().tolist()
             indices = torch.cat((reference_top, candidate), dim=1)
@@ -226,26 +273,35 @@ def head_check(lib, args):
                     expected_rows, candidate_rows, oracle_rows)):
                 ids = expected + actual
                 oracle = dict(zip(ids, scores))
-                result = head_rank_mismatches(expected, actual, oracle, epsilons[row])
+                result = head_rank_mismatches(expected, actual, oracle, epsilons[row],
+                                              selector_bf16=True)
                 results.append(result)
                 for key, value in result.items():
                     counts[key] += value
                 if result["order"] and len(details) < 8:
                     source, offset, _ = next(batch for batch in batches if batch[1] <= row < batch[1] + batch[2])
-                    changed = [(a, b, oracle[a], oracle[b], abs(oracle[a] - oracle[b]) / epsilons[row],
-                                out[name][row, a].item(), out[name][row, b].item())
-                               for a, b in zip(expected, actual) if a != b]
-                    details.append((source, row - offset, changed, result))
+                    changed = [(a, b, rank + 1, oracle[a], oracle[b],
+                                abs(oracle[a] - oracle[b]) / epsilons[row],
+                                out[name][row, a].item(), out[name][row, b].item(),
+                                ref[row, a].to(torch.bfloat16).item(),
+                                ref[row, b].to(torch.bfloat16).item(),
+                                out[name][row, a].to(torch.bfloat16).item(),
+                                out[name][row, b].to(torch.bfloat16).item())
+                               for rank, (a, b) in enumerate(zip(expected, actual)) if a != b]
+                    max_absolute = row_errors[row]
+                    details.append((source, row - offset, max_absolute, changed, result))
             rank_counts[name] = counts
             rank_results[name] = results
             print(f"head: {name} FP64 rank mismatches over {reference_rows} rows: {counts}; "
-                  "epsilon=1e-5 * row max |FP64 logit|")
+                  "BF16 selector intervals at epsilon=1e-5 * row max |FP64 logit|")
             for detail in details:
-                print(f"head: {name} mismatch source,row,(expected,actual,gap/epsilon),counts: {detail}")
+                print(f"head: {name} mismatch source,row,max_absolute,"
+                      f"(expected,actual,rank,FP64a,FP64b,gap/epsilon,rawa,rawb,"
+                      f"BF16refa,BF16refb,BF16a,BF16b),counts: {detail}")
         for name, results in rank_results.items():
             worse = [row for row, (actual, baseline) in enumerate(zip(results, rank_results["pedantic"]))
                      if any(actual[key] > baseline[key] for key in ("bad_top1", "bad_set", "bad_order"))]
-            print(f"head: {name} rows worse than pedantic under FP64 tie rule: {len(worse)}")
+            print(f"head: {name} rows worse than pedantic under BF16 selector tie rule: {len(worse)}")
             if worse:
                 failures.append((name, "rows worse than pedantic", worse[:16]))
         baseline = top16(out["pedantic"])

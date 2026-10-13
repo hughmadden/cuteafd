@@ -517,8 +517,8 @@ pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::pr
     unsafe { head.launch(x.cast(), weight.cast(), logits, rows as u32, stream) }
 }
 
-/// How a drafter's vocabulary head runs over the target's BF16 head (GLM 5.3 Flash's
-/// `--draft-head`). Drafts only steer speculation: the target verifies every proposal.
+/// Diagnostic drafter head arithmetic (GLM 5.3 Flash's golden/replay `--draft-head`).
+/// Serving uses the shared tensor head independently of this diagnostic selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DraftHead {
     /// As the target's head ([`launch_head`]): the few-row FP32 kernel for 2..=24 rows, one read
@@ -778,7 +778,7 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft_device(&seqs, &engine.embedding,
+                let drafts = drafter.draft_device_diagnostic(&seqs, &engine.embedding,
                     dflash::TargetHead::Bf16(&engine.weights.head))?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
@@ -1020,7 +1020,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     for position in prefill..end {
         let anchor = sequence[position];
         let timer = Instant::now();
-        let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
+        let draft = drafter.draft_device_diagnostic(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
@@ -1099,7 +1099,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
+        let draft = drafter.draft_device_diagnostic(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];

@@ -902,7 +902,7 @@ impl<'a> GlmDrafter<'a> {
     /// Drafts `block - 1` tokens after each sequence's anchor. `anchor_rows`
     /// holds the anchors' embedding rows; `head` is the target's vocabulary head.
     pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: TargetHead<'_>) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?, false)
     }
 
     /// [`Self::draft`] with the block's input rows gathered from the target's
@@ -910,7 +910,13 @@ impl<'a> GlmDrafter<'a> {
     /// drafter's mask row is that table row).
     pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, true)
+    }
+
+    /// Diagnostic device-input replay retains the explicit head arithmetic selection.
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, false)
     }
 
     /// Device input bridge for a drafter on another GPU. Existing same-device
@@ -918,7 +924,7 @@ impl<'a> GlmDrafter<'a> {
     /// returning and keep its owners alive through the draft's stream drain.
     pub(crate) fn draft_device_with(&self, sequences: &[DraftSeq], input: &InputLaunch<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Launch(input), self.head_call(&head)?)
+        self.draft_from(sequences, DraftInput::Launch(input), self.head_call(&head)?, true)
     }
 
     fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
@@ -937,7 +943,8 @@ impl<'a> GlmDrafter<'a> {
         Ok(owner.buffer.ptr)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>) -> Result<Vec<Draft>> {
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
+        serving: bool) -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
@@ -1030,6 +1037,8 @@ impl<'a> GlmDrafter<'a> {
             self.timing.end(forward_span, s)?;
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
             match &head {
+                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
                 HeadCall::Bf16(weight) => super::launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
                     w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
@@ -1159,7 +1168,7 @@ impl ReplayDrafter for GlmDrafter<'_> {
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
         // Replay's caller keeps the target BF16 head owner live throughout.
-        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head))?.into_iter()
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head), false)?.into_iter()
             .map(|d| d.tokens).collect())
     }
 

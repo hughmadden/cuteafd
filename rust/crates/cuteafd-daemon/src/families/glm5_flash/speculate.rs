@@ -96,7 +96,7 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
+        let draft = drafter.draft_device_diagnostic(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &engine.embedding, engine.draft_head())?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
@@ -263,7 +263,7 @@ impl DraftModeSteps for EngineDraftModes<'_, '_> {
     }
 
     fn draft(&mut self, sequences: &[DraftSeq]) -> Result<Vec<Vec<u32>>> {
-        Ok(self.drafter.draft_device(sequences, &self.engine.embedding, self.engine.draft_head())?
+        Ok(self.drafter.draft_device_diagnostic(sequences, &self.engine.embedding, self.engine.draft_head())?
             .into_iter().map(|d| d.tokens).collect())
     }
 }
@@ -344,7 +344,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
     for position in prefill..end {
         let anchor = sequence[position];
         let timer = Instant::now();
-        let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &engine.embedding,
+        let draft = drafter.draft_device_diagnostic(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &engine.embedding,
             engine.draft_head())?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));

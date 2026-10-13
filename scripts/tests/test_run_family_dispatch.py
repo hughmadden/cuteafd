@@ -931,6 +931,16 @@ def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_he
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("value", [None, "exact", "tensor", "fp8"])
+def test_glmf_serving_head_has_no_arithmetic_selection(tmp_path, value):
+    keys = "" if value is None else f"GLM5_FLASH_DRAFT_HEAD={value}\n"
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--draft-head" not in launch, launch
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_DRAFT_LINEAR=w8a16\n", None),
                                            ("GLM5_FLASH_DRAFT_LINEAR=wide\n", "wide"),
                                            ("GLM5_FLASH_DRAFT_LINEAR=w8a8\n", "w8a8")])
@@ -2352,7 +2362,7 @@ def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
                                   f"RTX_GPUS=1\nSPECULATOR_FP8={fp8}\n")
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert "--draft-head tensor" in serve
+    assert "--draft-head" not in serve
     assert ("--draft-linear w8a8" in serve) == (fp8 != "off")
 
 

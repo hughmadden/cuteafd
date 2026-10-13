@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import struct
 
 import pytest
 
@@ -60,8 +61,8 @@ def test_draft_head_fp64_rank_gate_allows_only_adjacent_near_ties():
     path = ROOT / 'native/tests/glm_draft_kernels_selftest.py'
     tree = ast.parse(path.read_text())
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-               and node.name in ('head_rank_mismatches', 'head_rank_selftest')]
-    namespace = {}
+               and node.name in ('head_bf16_interval', 'head_rank_mismatches', 'head_rank_selftest')]
+    namespace = {'struct': struct}
     exec(compile(ast.Module(body=helpers, type_ignores=[]), str(path), 'exec'), namespace)
     namespace['head_rank_selftest']()
     mismatch = namespace['head_rank_mismatches']
@@ -82,3 +83,23 @@ def test_mimo_serving_draft_head_is_tensor_without_changing_target_or_replay():
     serving = draft.split('pub fn draft(', 1)[1].split('pub fn draft_rows(', 1)[0]
     replay = draft.split('pub fn draft_rows(', 1)[1].split('fn draft_from(', 1)[0]
     assert 'head.launch_draft(' in serving and 'plan.launch(' in replay
+
+
+def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
+    source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
+    for path, variant in [('glm5/dflash.rs', 'HeadCall'), ('glm5_flash/dspark.rs', 'HeadRef')]:
+        text = (source / path).read_text()
+        assert f'{variant}::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(' in text
+        serving = text.split('pub fn draft_device(', 1)[1].split('pub fn draft_device_diagnostic(', 1)[0]
+        diagnostic = text.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
+        assert '?, true)' in serving and '?, false)' in diagnostic
+        assert f'{variant}::Bf16(head), false)' in text
+        assert 'self.head_mode.get()' in text
+    for path in ['glm5/mod.rs', 'glm5_flash/speculate.rs']:
+        text = (source / path).read_text()
+        assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text
+    flash = (source / 'glm5_flash/serve.rs').read_text()
+    assert '.draft_device(' in flash and '.draft_device_diagnostic(' not in flash
+    # GLM 5.3 switches only after qualifying its own hidden-6144 real inputs.
+    assert '.draft_device_diagnostic(' in (source / 'glm5/serve.rs').read_text()
+    assert 'GLM5_FLASH_DRAFT_HEAD' not in (ROOT / 'scripts/launch/run-family.sh').read_text()

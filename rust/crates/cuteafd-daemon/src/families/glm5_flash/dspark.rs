@@ -611,10 +611,15 @@ impl<'a> DsparkDrafter<'a> {
     /// from the target's embedding table.
     pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, true)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>)
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, false)
+    }
+
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
         -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadRef::Bf16(p) if p.is_null()), "dSpark has no borrowed target head");
         let c = &self.cfg;
@@ -688,6 +693,8 @@ impl<'a> DsparkDrafter<'a> {
                     rows, h, eps, s)?;
             }
             match head {
+                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
                 HeadRef::Bf16(weight) => crate::families::glm5::launch_draft_head(l, &w.head, w.n.buffer.ptr,
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
@@ -755,7 +762,7 @@ impl ReplayDrafter for DsparkDrafter<'_> {
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
         // Replay's caller keeps the target BF16 head live throughout.
-        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadRef::Bf16(head))?.into_iter()
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadRef::Bf16(head), false)?.into_iter()
             .map(|d| d.tokens).collect())
     }
 
@@ -937,6 +944,14 @@ impl<'a> Drafter<'a> {
             Self::Dflash2(d) => d.draft_device(sequences, embedding, head),
             Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head),
             Self::Dspark(d) => d.draft_device(sequences, embedding, head),
+        }
+    }
+
+    pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
+        head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        match self {
+            Self::Dflash2(d) => d.draft_device_diagnostic(sequences, embedding, head),
+            Self::Dspark(d) => d.draft_device_diagnostic(sequences, embedding, head),
         }
     }
 
