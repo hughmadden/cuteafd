@@ -342,3 +342,47 @@ done
     generic = family[family.index("# Validate the name before it is used"):]
     for text in (v41, generic):
         assert text.index("release_wip_slot_instance \"$wip_slot\"") < text.index("release_wip_serving_layout")
+
+
+def _fake_slot(root, slot, role):
+    ws = root / "slots" / slot / role / "workspace"
+    (ws / ".cuteafd-wip").mkdir(parents=True)
+    (ws / ".cuteafd-wip/cuteafd").write_text("bin")
+    (ws / ".cuteafd-wip/libcuteafd_native.so").write_text("lib")
+    (ws / "docker").mkdir()
+    (ws / "docker/release-entrypoint.sh").write_text("entry")
+    (ws / "third_party/sparkinfer").mkdir(parents=True)
+    (ws / "third_party/sparkinfer.lock.json").write_text("{}")
+    (ws / "scripts/build").mkdir(parents=True)
+    (ws / "scripts/build/verify-sparkinfer-source.py").write_text("raise SystemExit(0)\n")
+
+
+@pytest.mark.parametrize("role", ["coordinator", "spark-expert"])
+def test_sealed_slot_stages_without_its_builder_container(tmp_path, role):
+    wip_root = tmp_path / "builds/wip-gone"
+    _fake_slot(wip_root, "sealed", role)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    docker = binary / "docker"  # no container exists; a docker cp would fail
+    docker.write_text('#!/usr/bin/env bash\n[[ "$1 $2" == "container inspect" ]] && exit 1\necho "unexpected docker $*" >&2; exit 9\n')
+    docker.chmod(0o755)
+    layout = tmp_path / "layout"
+    script = f'source "{COMMON}"; WIP_ROOT="{wip_root}"; release_stage_wip_layout cuteafd-coordinator-wip-gone sealed {role} "{layout}"'
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}", HOME=str(tmp_path)),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (layout / "bin/cuteafd").read_text() == "bin"
+    assert (layout / "lib/libcuteafd_native.so").read_text() == "lib"
+    assert (layout / "share/release-entrypoint.sh").read_text() == "entry"
+
+
+def test_missing_slot_and_container_is_a_clear_error(tmp_path):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    docker = binary / "docker"
+    docker.write_text("#!/usr/bin/env bash\nexit 1\n")
+    docker.chmod(0o755)
+    script = f'source "{COMMON}"; WIP_ROOT="{tmp_path}/none"; release_stage_wip_layout c nope coordinator "{tmp_path}/l"'
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}", HOME=str(tmp_path)),
+                            capture_output=True, text=True)
+    assert result.returncode == 2 and "build the slot with ./wip.sh" in result.stderr

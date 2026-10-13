@@ -2216,10 +2216,17 @@ if [[ -n "$wip_slot" ]]; then
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" <<'STAGE' ||
+    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
 set -euo pipefail
 slot="$1" image="$2" pinned="$3"
 container="$4" layout_slot="$5"
+wip_root_arg="${6:-__default__}"; wip_instance_arg="${7:-__none__}"
+[[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
+[[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
+wip_cp() { # slot files come from the container when it exists, else from the WIP root
+  if docker container inspect "$container" >/dev/null 2>&1; then docker cp "$container:/wip/$1" "$2"
+  else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
+}
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   registry="${image%%/*}"
   [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || { echo "missing local dev image $image" >&2; exit 1; }
@@ -2227,18 +2234,18 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
-docker cp "$container:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
-docker cp "$container:/wip/slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
+wip_cp "slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
+wip_cp "slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
 mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
 mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
 [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
 [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
 mv "$raw/"* "$layout.tmp/share/"
 mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
-slot_source="$container:/wip/slots/$slot/spark-expert/workspace"
-docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
-docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
-docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+slot_source="slots/$slot/spark-expert/workspace"
+wip_cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+wip_cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+wip_cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
 python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
   --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
 rm -rf "$raw" "$layout" && mv "$layout.tmp" "$layout"
