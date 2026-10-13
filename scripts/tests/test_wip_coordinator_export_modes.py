@@ -130,3 +130,12 @@ def test_the_export_containers_gpu_binding_has_one_call_site():
     # The CDI switch (--device nvidia.com/gpu=...) edits release_gpu_device_args only.
     on = _function('wip_capped_export_on')
     assert 'release_gpu_device_args "$gpu"' in on and '--gpus' not in on
+
+
+def test_remote_export_matches_the_dev_image_by_layer_content_not_local_id():
+    # docker save | load gave oliver the same layers under another image ID; a
+    # local-ID check refused a usable host. Content identity is the layer list,
+    # while the native key keeps raptor's ID (CUTEAFD_WIP_DEV_IMAGE_ID via ENV_FILE).
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    assert "{{json .RootFS.Layers}}" in remote and "{{.Id}}" not in remote
+    assert '{{json .RootFS.Layers}}' in _function('wip_remote_export')

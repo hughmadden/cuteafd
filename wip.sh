@@ -1016,7 +1016,7 @@ wip_remote_export() {
   printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
   echo "WIP coordinator export: remote on $host"
   if ! "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
-      "$COORDINATOR_DOCKER_DEV" "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"; then
+      "$COORDINATOR_DOCKER_DEV" "$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"; then
     rm -f "$env_file"
     echo "WIP coordinator export: $host unavailable; next mode" >&2
     return 75

@@ -2,7 +2,7 @@
 # Coordinator native/AOT export on a remote SM120 export host (oliver), with no
 # GPU turn on raptor. Run from raptor by wip.sh's coordinator native phase.
 #
-#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_ID
+#   export-remote.sh HOST STAGING_DIR KEY ENV_FILE DEV_IMAGE DEV_IMAGE_LAYERS
 #
 # STAGING_DIR is wip.sh's frozen source tree; KEY the native key raptor's Rust
 # phase recorded; ENV_FILE the coordinator build scopes (KEY=VALUE lines).
@@ -19,7 +19,12 @@
 # their host target (#127), so any SM120 host's export is the same bytes.
 # Exit 75 means "not here": wip.sh falls back.
 set -euo pipefail
-host="$1" staging="$2" key="$3" env_file="$4" image="$5" image_id="$6"
+host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
+# DEV_IMAGE_LAYERS is the sha256 of the image's RootFS layer list: its content
+# identity. A local image ID is not portable (docker save | load can give the
+# same layers a different ID on another host); the native key still carries
+# raptor's ID through ENV_FILE (CUTEAFD_WIP_DEV_IMAGE_ID), so the export lands
+# under the key raptor's own build expects.
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
 NO_TURN=75
 fqdn="${CUTEAFD_EXPORT_HOST_ADDR:-$host}"
@@ -29,8 +34,9 @@ archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-120/$key.tar.z
 started=$SECONDS
 
 mountpoint -q /mnt/sparknest && command -v nest >/dev/null || { echo "export-remote: no sparknest here" >&2; exit "$NO_TURN"; }
-timeout 60 "${ssh_host[@]}" "mountpoint -q /mnt/sparknest && docker image inspect -f '{{.Id}}' '$image'" 2>/dev/null |
-  grep -qx "$image_id" || { echo "export-remote: $host lacks dev image $image_id or sparknest" >&2; exit "$NO_TURN"; }
+timeout 60 "${ssh_host[@]}" "mountpoint -q /mnt/sparknest && docker image inspect -f '{{json .RootFS.Layers}}' '$image' | sha256sum" 2>/dev/null |
+  awk '{print $1}' | grep -qx "$layers" ||
+  { echo "export-remote: $host lacks dev image $image (layers $layers) or sparknest" >&2; exit "$NO_TURN"; }
 
 settle() {
   local i
