@@ -436,7 +436,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut shared = drafter.map(|d| {
         let homes = resource::homes_with_local_tp2(
             &engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
-            None, &opened.snapshot, Some(ranks), engine.tp2.as_ref().map(|pair| pair.layers.clone()))?;
+            None, &opened.snapshot, Some(ranks), engine.tp2_layers())?;
         engine.arm_draft_probe()?;
         SharedPolicy::new(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS, d.cfg.drafts(),
             resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())

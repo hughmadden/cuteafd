@@ -57,6 +57,9 @@ impl<'a> GlmEngine<'a> {
     pub(crate) fn has_tp2(&self) -> bool {
         self.tp2.is_some()
     }
+    pub(crate) fn tp2_layers(&self) -> Option<std::ops::Range<usize>> {
+        self.tp2.as_ref().map(|pair| pair.layers.clone())
+    }
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
         self.tp2
             .as_ref()
