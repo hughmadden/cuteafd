@@ -171,6 +171,20 @@ extern "C" int32_t cuteafd_expert_group_rows(int32_t capacity, int32_t rows, uin
   }
   return cudaErrorInvalidValue;
 }
+#ifdef CUTEAFD_EXPERT_REDUCTION_CASES
+#define CUTEAFD_JOIN_IMPL(a, b) a##b
+#define CUTEAFD_JOIN(a, b) CUTEAFD_JOIN_IMPL(a, b)
+extern "C" int32_t CUTEAFD_JOIN(cuteafd_expert_info, _reduction)(
+    int32_t capacity, cuteafd_expert_reduction_t* out) {
+  if (!out) return cudaErrorInvalidValue;
+  switch (capacity) {
+    CUTEAFD_EXPERT_REDUCTION_CASES
+    default: return cudaErrorInvalidValue;
+  }
+}
+#undef CUTEAFD_JOIN
+#undef CUTEAFD_JOIN_IMPL
+#endif
 
 extern "C" int32_t cuteafd_expert_output_kind(int32_t capacity, uint32_t* out) {
   auto* variant = by_capacity(capacity);
