@@ -1891,6 +1891,24 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
     (agree, next_ok, golden_next, nll, scored)
 }
 
+/// Prints the per-program GPU times collected since the last read (`CUTEAFD_GLMF_PROFILE_OPS=1`; nothing
+/// without it), per run of `runs`.
+fn print_op_profile(engine: &engine::GlmfEngine<'_>, title: &str, runs: usize) -> Result<()> {
+    let ops = engine.op_profile()?;
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let runs = runs as f64;
+    let total: f64 = ops.iter().filter(|(k, _)| !k.starts_with("host")).map(|(_, v)| v.0).sum();
+    println!("{title} (GPU ms between events, {total:.1} ms total per {runs} runs):");
+    let mut rows: Vec<_> = ops.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+    for (label, (ms, count)) in rows {
+        println!("  {label:44} {:9.2} ms  {:6.1}%  x{}", ms / runs, 100.0 * ms / total, count as f64 / runs);
+    }
+    Ok(())
+}
+
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
     if args.padding_check {
         let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
@@ -2083,20 +2101,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             1e3 * phases[0] / times.len() as f64, 1e3 * phases[1] / times.len() as f64);
         println!("prefill bench: {n} tokens through {layers} layers, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
             1e3 * median, n as f64 / median, 1e3 * times[0]);
-        let ops = engine.op_profile()?;
-        if !ops.is_empty() {
-            let runs = times.len() as f64;
-            let total: f64 = ops.iter().filter(|(k, _)| !k.starts_with("host")).map(|(_, v)| v.0).sum();
-            println!("prefill ops per prefill (GPU ms between events, {total:.1} ms total per {runs} runs):");
-            let mut rows: Vec<_> = ops.into_iter().collect();
-            rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
-            for (label, (ms, count)) in rows {
-                println!("  {label:44} {:9.2} ms  {:6.1}%  x{}", ms / runs, 100.0 * ms / total, count as f64 / runs);
-            }
-        }
+        print_op_profile(engine, "prefill ops per prefill", times.len())?;
     }
     if args.bench_decode > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];
+        engine.op_profile()?;
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
@@ -2123,6 +2132,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             logits digest {digest:016x}; tokens {:?}", times.len(),
             1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0] / steps,
             1e3 * profile[1] / steps, 1e3 * profile[2] / steps, &produced[..produced.len().min(16)]);
+        print_op_profile(engine, "decode ops per step", times.len())?;
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),
