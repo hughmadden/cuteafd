@@ -379,7 +379,7 @@ impl<'a> Engine<'a> {
 
     pub fn check_routes(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
-        let mut allocator = super::super::pool::PoolAllocator::new(self.shape);
+        let mut allocator = super::super::pool::PoolAllocator::for_engine(self)?;
         // Both 256-row lanes are checked independently before their route buffers are reused.
         let tokens: Vec<u32> = (0..512).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         let mut placement = allocator.admit(tokens.len() + 1)?;

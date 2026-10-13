@@ -84,6 +84,27 @@ pub(crate) struct EngineArgs {
     pub skip_routed_experts: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+    /// Attention over the two GPUs: auto (the recorded default, heads), context (the C4
+    /// layers' compressed records split by 256-token unit parity with a q/candidate/partial
+    /// exchange per C4 layer; C128 and window state stay replicated), or heads.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
+    pub attention_placement: String,
+    /// Rows the context split's partial reduction plan is tuned for, fixed at startup: auto
+    /// (dSpark's verify width, draft block + 1; one row without a drafter) or 1..=decode rows.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS", default_value = "auto", value_parser = parse_plan_rows)]
+    pub attention_plan_rows: PlanRows,
+}
+
+/// `--attention-plan-rows`: `auto` or an explicit row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PlanRows(pub Option<usize>);
+
+fn parse_plan_rows(text: &str) -> std::result::Result<PlanRows, String> {
+    match text {
+        "auto" => Ok(PlanRows(None)),
+        n => n.parse::<usize>().ok().filter(|&n| n > 0).map(|n| PlanRows(Some(n)))
+            .ok_or_else(|| format!("attention plan rows must be auto or a positive integer (got {n:?})")),
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -96,8 +117,10 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
-    /// With --nll, also save tokens.bin and F32 logits.bin for a reference run.
-    #[arg(long, requires = "nll")]
+    /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
+    /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
+    /// runs compare exactly the rows the decode path produced.
+    #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// Compare only the first N layers' streams (all logits still compared).
     #[arg(long)]
@@ -173,19 +196,28 @@ impl EngineArgs {
     }
 }
 
-/// The engine runs one shape: every layer head-split under `--split-device`,
-/// every layer whole on GPU0 otherwise, and no hop but the step-start
-/// streams push. Anything else the solver hands it is refused before any
-/// cache or expert is allocated.
-fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool) -> Result<()> {
+/// The engine runs three shapes: every layer head-split under `--split-device` (`heads`), the
+/// same with every C4 layer token-split (`context`: all or none of them, C128 and window layers
+/// head-split), or every layer whole on GPU0, and no hop but the step-start streams push.
+/// Anything else the solver hands it is refused before any cache or expert is allocated.
+/// Returns whether the C4 layers run `context`.
+fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool, cfg: &DeepseekV4Config)
+    -> Result<bool> {
     use cuteafd_loader::placement::{families::DEEPSEEK_V4, FfnMode, LayerMode};
     DEEPSEEK_V4.check(placement).map_err(|error| anyhow::anyhow!("DeepSeek V4 placement: {error}"))?;
-    let engine = if split { LayerMode::HeadSplit } else { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } };
-    if let Some((layer, assignment)) = placement.layers.iter().enumerate().find(|(_, a)| a.mode != engine) {
-        anyhow::bail!("DeepSeek V4 runs every layer as {engine:?}; the placement has layer {layer} as {:?}",
+    let context = split && placement.layers.iter().any(|a| a.mode == LayerMode::ContextSplit);
+    ensure!(placement.layers.len() == cfg.n_layers, "DeepSeek V4 placement covers {} of {} layers",
+        placement.layers.len(), cfg.n_layers);
+    for (layer, (assignment, &ratio)) in placement.layers.iter().zip(&cfg.compress_ratios).enumerate() {
+        let engine = match (split, context && ratio == 4) {
+            (true, true) => LayerMode::ContextSplit,
+            (true, false) => LayerMode::HeadSplit,
+            (false, _) => LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+        };
+        ensure!(assignment.mode == engine, "DeepSeek V4 runs layer {layer} (C{ratio}) as {engine:?}; the placement has {:?}",
             assignment.mode);
     }
-    Ok(())
+    Ok(context)
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -375,7 +407,7 @@ pub(crate) fn with_engine<T>(
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
-        check_modes(&placement, split_device.is_some())?;
+        check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
@@ -386,12 +418,20 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
         placement
     };
+    let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
+        Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
+            loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
+            .context("context placement without the build's C4 context programs")?)
+    } else { None };
+    // The solver charged staging over the compiled extent it was given.
+    let context_extent = max_context;
     max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
         usize::try_from(placement.pool_tokens)?, 256)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
         caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
-        pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?, args.max_sequences),
+        pool::PoolShape::context_units(pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?,
+            args.max_sequences), context_mode.is_some()),
     );
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -417,6 +457,7 @@ pub(crate) fn with_engine<T>(
         shape,
         embedding,
         skip_routed: skip,
+        context: context_mode,
     })?;
     // Startup and inference share retirement: an error must not drop a rank
     // owner while the other rank is waiting for its missing publication.
@@ -458,6 +499,11 @@ pub(crate) fn with_engine<T>(
             };
             ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
             engine.install_tp2(ranks)?;
+        }
+        // The auto reduction plan uses draft_block(), which is nonzero only after
+        // the drafter's local stage experts are installed. Freeze it before capture.
+        if context_mode.is_some() {
+            engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
@@ -550,7 +596,7 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
     ensure!(chunk > 0, "prefill chunk must be positive");
@@ -630,7 +676,7 @@ fn golden_run(
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
     let mut logits = Vec::new();
@@ -734,6 +780,14 @@ fn golden_run(
         println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
             100.0 * decode_agree as f64 / decode_steps as f64);
     }
+    if let Some(dir) = &args.save_logits {
+        ensure!(decode_steps > 0, "--save-logits without --nll saves the decode rows: pass --prefill N");
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), tokens[prefill..].iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
+        std::fs::write(dir.join("logits.bin"), logits[prefill * vocab..].iter().flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>())?;
+        println!("saved {decode_steps} decode rows (positions {prefill}..{t}) to {}", dir.display());
+    }
     Ok(())
 }
 
@@ -746,7 +800,7 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
     if let Some(p) = args.prefill {
         tokens.truncate(p);
     }
-    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len() + steps + 1)?;
     let chunks: Vec<&[u32]> = tokens.chunks(engine.prefill_capacity()).collect();
     let mut last = None;
@@ -764,7 +818,27 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
 
 #[cfg(test)]
 mod program_selection_tests {
-    use cuteafd_core::coordinator_programs::CoordinatorPrograms;
+    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, CoordinatorPrograms};
+
+    #[test]
+    fn context_plan_is_frozen_after_draft_experts_and_before_capture() {
+        let source = include_str!("mod.rs");
+        let startup = source.split("let result = (|| -> Result<T> {").nth(1).unwrap()
+            .split("body(&engine, &mut transports, &runtime)").next().unwrap();
+        let install = startup.find("engine.install_local(local)").unwrap();
+        let attach = startup.find("engine.attach_context(").unwrap();
+        let capture = startup.find("engine.warm_local_graphs()").unwrap();
+        assert!(install < attach && attach < capture,
+            "context auto plan must see resident draft experts and precede graph capture");
+        assert_eq!(startup.matches("engine.attach_context(").count(), 1);
+        let context = include_str!("engine/context.rs");
+        assert!(context.contains("let block = self.draft_block();"));
+        assert!(context.contains("(block > 0).then_some(block)"));
+        let ready = include_str!("engine/dspark.rs");
+        assert!(ready.contains("self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)"));
+        assert_eq!(AttentionReductionPlan::new(64, Some(5), None).unwrap().rows(), 6);
+        assert_eq!(AttentionReductionPlan::new(64, None, None).unwrap().rows(), 1);
+    }
 
     #[test]
     fn every_v4_dispatch_template_is_selected_and_required_at_startup() {
@@ -797,7 +871,8 @@ mod program_selection_tests {
                                         assert!(selected.contains(&name), "unselected dispatch {name}");
                                         assert!(required.contains(&name), "startup misses dispatch {name}");
                                         if split && (args.starts_with("_on(1, true,") || args.starts_with("_on(rank, split,")
-                                            || args.starts_with("_on(0, weights.split,")) {
+                                            || args.starts_with("_on(rank, weights.attention_split,")
+                                            || args.starts_with("_on(0, weights.ffn_split,") || args.starts_with("_on(1, weights.ffn_split,")) {
                                             let name = format!("{split_family}_{suffix}");
                                             assert!(selected.contains(&name) && required.contains(&name),
                                                 "startup misses split dispatch {name}");

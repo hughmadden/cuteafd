@@ -1100,7 +1100,7 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # carries its programs); the planner and the server resolve it. Explicit modes run only where an
 # executor exists.
 case "$attention_placement:$family" in
-  auto:*|heads:*|context:glm5|context:glm5_flash) ;;
+  auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4) ;;
   context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac
