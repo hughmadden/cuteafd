@@ -443,7 +443,7 @@ fn layer_owners(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
     -> Result<Vec<u8>, PlacementError> {
     if !request.layers.iter().any(selected) { return Ok(vec![0; request.layers.len()]); }
     match request.policy.ownership {
-        LayerOwnership::Ranges => {
+        LayerOwnership::Ranges | LayerOwnership::NonemptyRanges => {
             let switch = layer_switch(request, selected)?;
             Ok((0..request.layers.len()).map(|index| if index < switch { request.layers_first_gpu }
                 else { 1 - request.layers_first_gpu }).collect())
@@ -490,6 +490,10 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
     let mandatory_tp2 = mandatory_tp2_arenas(request)?;
     let mut best = None;
     for k in 0..=request.layers.len() {
+        if request.policy.ownership == LayerOwnership::NonemptyRanges
+            && (!request.layers[..k].iter().any(selected) || !request.layers[k..].iter().any(selected)) {
+            continue;
+        }
         if request.layers.iter().enumerate().any(|(i, layer)| selected(layer) && layer.colocate.is_some_and(|group|
             request.layers.iter().enumerate().any(|(j, other)| selected(other) && other.colocate == Some(group) && (i < k) != (j < k)))) { continue; }
         let mut kv = [0u64; 2];

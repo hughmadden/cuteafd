@@ -1070,6 +1070,19 @@ fn owner_cut(req: &PlacementRequest) -> usize {
 }
 
 #[test]
+fn nonempty_layer_ranges_keep_both_owners_under_extreme_entry_skew() {
+    let mut req = owner_balance_request();
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 16 * GIB, Basis::Exact));
+    assert_eq!(owner_cut(&req), 0);
+    req.policy.ownership = LayerOwnership::NonemptyRanges;
+    assert_eq!(owner_cut(&req), 1);
+    req.fixed[0].gpu = 1;
+    assert_eq!(owner_cut(&req), 3);
+    req.layers.truncate(1);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory("no legal layer ownership boundary"))));
+}
+
+#[test]
 fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
     let mut req = owner_balance_request();
     req.layers[1].extra = vec![LayerExtraDemand::new(Category::Tables, "side table", GIB,
