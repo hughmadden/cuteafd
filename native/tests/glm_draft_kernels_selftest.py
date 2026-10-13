@@ -735,12 +735,17 @@ def attention_check(lib, args):
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     cases = [
         ("mimo", 128, 8, 4, 8, 0, 0, False, True),
+        ("mimo", 128, 16, 4, 8, 0, 0, False, True),
         ("mimo", 128, 12, 4, 3, 17, 1, False, False),
         ("mimo", 128, 16, 4, 8, 33, 17, False, True),
         ("mimo", 128, 64, 4, 8, 129, 31, False, False),
+        ("glm", 128, 8, 4, 8, 24, 0, False, False),
         ("glm", 128, 8, 4, 8, 31, 0, False, False),
         ("glm", 128, 32, 4, 8, 33, 5, False, False),
         ("glmf", 64, 8, 4, 8, 1, 0, True, False),
+        ("glmf", 64, 64, 64, 8, 1, 0, True, False),
+        ("glmf", 64, 64, 64, 8, 24, 0, True, False),
+        ("glmf", 64, 64, 64, 8, 25, 0, True, False),
         ("glmf", 64, 16, 4, 8, 129, 0, False, False),
         ("mimo", 128, 64, 8, 8, 1024, 1024, False, True),
         ("glm", 128, 32, 8, 8, 1024, 1024, False, False),

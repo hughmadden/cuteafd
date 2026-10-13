@@ -220,6 +220,13 @@ mod draft_attention_tests {
                         let partitions = tiles.div_ceil(tiles.div_ceil(wanted));
                         let used = sequences * heads * slices * partitions * 32 * (dim + 2) * 4;
                         assert!(used <= arena);
+                        // m16 uses compact partials and can keep at least one split per four key tiles.
+                        let compact_capacity = tiles.min(capacity * slices * 2);
+                        let compact_wanted = compact_capacity.min(
+                            (2 * sms).div_ceil(sequences * heads).max(tiles.div_ceil(4)));
+                        let compact_partitions = tiles.div_ceil(tiles.div_ceil(compact_wanted));
+                        let compact_used = sequences * heads * compact_partitions * 16 * (dim + 2) * 4;
+                        assert!(compact_used <= arena);
                     }
                 }
             }

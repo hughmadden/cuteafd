@@ -150,7 +150,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     };
     crate::families::glm5::dflash::replay_with(drafter.replay(), &tokens, &greedy, &taps,
         &|t| engine.embedding.host_rows(t), &|sequences, _| {
-            Ok(drafter.draft_device(sequences, &engine.embedding, engine.draft_head())?.into_iter()
+            Ok(drafter.draft_device_diagnostic(sequences, &engine.embedding, engine.draft_head())?.into_iter()
                 .map(|draft| draft.tokens).collect())
         }, start)
 }
@@ -606,7 +606,7 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
         if args.replay_draft_sync { engine.replay_device_sync()?; }
         if round.neural_tokens[0].is_some() {
             let drafter = engine.drafter.as_ref().context("neural trace replay needs --draft")?;
-            let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor: input[0], position: start, valid_from: 0 }],
+            let draft = drafter.draft_device_diagnostic(&[DraftSeq { slot: 0, anchor: input[0], position: start, valid_from: 0 }],
                 &engine.embedding, engine.draft_head())?.remove(0);
             println!("round {}: neural proposal matches trace {}", round.round,
                 round.neural_tokens[0].as_ref().is_some_and(|tokens| *tokens == draft.tokens));

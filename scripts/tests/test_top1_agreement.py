@@ -95,6 +95,12 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
         assert '?, true)' in serving and '?, false)' in diagnostic
         assert f'{variant}::Bf16(head), false)' in text
         assert 'self.head_mode.get()' in text
+    wrapper = (source / 'glm5_flash/dspark.rs').read_text().split("impl<'a> Drafter<'a>", 1)[1]
+    diagnostic = wrapper.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
+    assert 'Self::RemoteDflash(d) => d.draft_device(sequences, embedding, head)' in diagnostic
+    remote = (source / 'glm5_flash/remote_dflash.rs').read_text()
+    remote_head = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
+    assert 'self.draft.draft_head_mode()' in remote_head and 'launch_bf16_head' not in remote_head
     for path in ['glm5/mod.rs', 'glm5_flash/speculate.rs']:
         text = (source / path).read_text()
         assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text
