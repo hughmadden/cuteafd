@@ -60,6 +60,14 @@ impl<'a> GlmEngine<'a> {
     pub(crate) fn tp2_layers(&self) -> Option<std::ops::Range<usize>> {
         self.tp2.as_ref().map(|pair| pair.layers.clone())
     }
+
+    pub(crate) fn draft_group_rows(&self, layer: usize, rows: usize,
+        remote: &[cuteafd_transport::worker_selection::InstalledExpertGrouping]) -> Result<usize> {
+        match self.tp2.as_ref().filter(|pair| pair.layers.contains(&layer)) {
+            Some(pair) => pair.group_rows(rows),
+            None => crate::shared::draft::resource::worker_group_rows_for_input(remote, layer, rows, self.spark_bf16),
+        }
+    }
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
         self.tp2
             .as_ref()
