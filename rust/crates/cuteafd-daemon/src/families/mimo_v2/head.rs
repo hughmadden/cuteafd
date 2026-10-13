@@ -49,7 +49,7 @@ impl BorrowedHead<'_, '_> {
     }
 
     /// Verified draft proposals use the shared tensor route; target/MTP and
-    /// replay diagnostics retain `launch` and the original target arithmetic.
+    /// replay diagnostics retain `launch` and the configured target arithmetic.
     pub fn launch_draft(self, bf16: Option<&VocabularyHead<'_>>, x: CuteafdDeviceBuffer,
         logits: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void) -> Result<()> {
         self.launch_with(bf16, x, logits, rows, stream, true)
@@ -70,7 +70,9 @@ impl BorrowedHead<'_, '_> {
                         crate::shared::draft::launch_bf16_head(head, x.ptr.cast(), w.buffer.ptr.cast(),
                             logits.ptr.cast(), rows, stream)
                     } else {
-                        head.launch(x.ptr.cast(), w.buffer.ptr.cast(), logits.ptr.cast(), rows as u32, stream)
+                        crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                            head, x.ptr.cast_const(), w.buffer.ptr.cast_const(),
+                            logits.ptr.cast(), rows, stream)
                     }
                 }
             }
