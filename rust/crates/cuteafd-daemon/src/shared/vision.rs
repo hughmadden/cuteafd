@@ -515,6 +515,17 @@ impl EncoderService {
             .name("media-owner".into())
             .spawn(move || {
                 let _health = OwnerHealth(owner_health.clone());
+                // Query in the allocating owner/context, before loading either tower.
+                let vision_bytes = vision.as_ref().map_or(0, |(_, bytes)| *bytes);
+                let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes);
+                let preflight = vision_bytes.checked_add(audio_bytes)
+                    .ok_or_else(|| VisionError::Unsupported("media reservation overflow".into()))
+                    .and_then(|required| worker::check_cuda_room(&library, device, required)
+                        .map_err(|error| VisionError::Unsupported(error.to_string())));
+                if let Err(error) = preflight {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
                 let mut runtime = match vision.map(|(spec, admitted)| VitRuntime::load(spec, &library, device, admitted)).transpose() {
                     Ok(runtime) => runtime,
                     Err(error) => {

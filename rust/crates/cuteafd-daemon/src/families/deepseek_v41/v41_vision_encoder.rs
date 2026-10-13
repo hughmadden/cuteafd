@@ -140,6 +140,7 @@ impl LocalEncoder {
                         "V4.1 vision needs {admitted} admitted bytes, budget {budget}"
                     );
                     let free_before = lib.cuda_physical_memory_info()?.0;
+                    crate::shared::vision::worker::require_allocatable(admitted as u64, free_before as u64)?;
                     let available_before = if sm == 121 {
                         crate::shared::memory_report::unified_available_bytes()?
                     } else {
