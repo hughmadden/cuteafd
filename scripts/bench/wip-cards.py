@@ -318,6 +318,15 @@ def binary_supports(binary, repo, job, needs):
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
 
 
+def launcher_forwards_v41_trace(repo):
+    """Whether the checkout's V4.1 launch forwards SPECULATION_TRACE: run.sh's own
+    path before #82, run-family.sh's shared trace helper since."""
+    family = repo / 'scripts/launch/run-family.sh'
+    if family.is_file() and 'launch_deepseek_v41' in family.read_text():
+        return 'CUTEAFD_SPECULATION_TRACE' in family.read_text()
+    return 'CUTEAFD_SPECULATION_TRACE' in (repo / 'run.sh').read_text()
+
+
 def speculating(values):
     """Whether a launch resolves a speculator (traces are written only then)."""
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
@@ -347,6 +356,11 @@ def preflight_job(job, arm):
         if needs['audio'] and contents.get('audio') is False:
             problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
+        role = needs.get('tp_role')
+        # The seal check always reports tp_roles (None: no TP manifest); a record
+        # without the field is not a seal check result and carries no attestation.
+        if role and host != 'raptor' and 'tp_roles' in contents:
+            problems.extend(tp_role_problems(host, arm['slot'], role, needs.get('nvfp4', False), contents))
     for key in ('SPECULATION_TRACE', 'PROFILE_DIR'):
         if values.get(key):
             directory = Path(values[key]) if key == 'PROFILE_DIR' else Path(values[key]).parent
@@ -355,6 +369,24 @@ def preflight_job(job, arm):
     if problems:
         raise ValueError('; '.join(problems))
     return artifacts
+
+
+def tp_role_problems(host, slot, role, nvfp4, contents):
+    """The launcher's fail-closed V4.1 role check (#98): every Spark rank's slot
+    attests the role, with verified symbols and matching hashes."""
+    attested = contents.get('tp_roles')
+    rebuild = f'rebuild with CUTEAFD_WIP_SPARK_TP_ROLES={role} (wip-cards --build derives it from the card)'
+    if attested is None:
+        return [f'{host}: slot {slot} has no V41_EXPERT_TP_AOT.json; it cannot attest Spark TP role {role}; {rebuild}']
+    if attested.get('error'):
+        return [f"{host}: slot {slot} cannot attest Spark TP role {role}: {attested['error']}; {rebuild}"]
+    if role not in attested.get('roles', []):
+        return [f"{host}: slot {slot} attests Spark TP roles {';'.join(attested.get('roles')) or '<none>'}, not {role}; {rebuild}"]
+    if not attested.get('verified'):
+        return [f'{host}: slot {slot}: TP symbols are not verified for {role}; {rebuild}']
+    if nvfp4 and role not in attested.get('nvfp4', []):
+        return [f'{host}: slot {slot} lacks verified NVFP4 {role} exports; {rebuild} with the NVFP4 scope']
+    return []
 
 
 def smoke_command(binary, repo, job):
@@ -999,7 +1031,26 @@ def contents(p):
         if out.returncode==0: audio=any(line.split()[-1:]==['cuteafd_audio_required'] for line in out.stdout.splitlines())
     except (OSError,subprocess.SubprocessError):
         pass
-    return dict(packages=packages,audio=audio)
+    return dict(packages=packages,audio=audio,tp_roles=tp_roles(p,art))
+def tp_roles(p,art):
+    # The V4.1 Spark TP roles this slot attests, verified as run-family.sh's
+    # launch_deepseek_v41 verifies them; None when the slot carries no manifest.
+    try:
+        meta=json.loads((p/'META.json').read_bytes())
+        data=(art/'V41_EXPERT_TP_AOT.json').read_bytes()
+    except (OSError,ValueError):
+        return None
+    try:
+        assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
+        manifest=json.loads(data)
+        roles=manifest.get('spark_tp_roles')
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
+        lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
+        assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'
+        return dict(roles=roles,verified=manifest.get('symbols_verified') is True,nvfp4=manifest.get('nvfp4_spark_tp_roles',[]),error=None)
+    except (OSError,ValueError,AssertionError) as error:
+        return dict(roles=[],verified=False,nvfp4=[],error=str(error))
 try:
     m=check(host,lambda path: path.read_bytes())
     m['seal_source']='host:'+str(host)
@@ -1169,7 +1220,40 @@ def slot_needs(card):
     if int(values.get('SPARK_COUNT', len(card.get('sparks', [])))) == 0:
         spark = set()
     return dict(coordinator=sorted(coordinator), spark=sorted(spark),
-                audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON')
+                audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON', **v41_tp_role(card, values))
+
+
+def v41_tp_role(card, values):
+    """The SM121 expert role a DeepSeek V4.1 card's Spark TP requires, as the
+    launcher derives it (scripts/launch/run-family.sh, launch_deepseek_v41): an
+    explicit SPARK_TP/SPARK_EP topology with TP 2, 3 or 6, or a native non-EXL3
+    count other than 0 and 4 (TP = count). TP4 is the built-in default role.
+    NVFP4 checkpoints need the role's NVFP4 exports too."""
+    if card.get('family') != 'deepseek_v41':
+        return dict(tp_role=None, nvfp4=False)
+    count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+    explicit = bool(values.get('SPARK_TP') or values.get('SPARK_EP'))
+    exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
+    tp = int(values['SPARK_TP']) if explicit and values.get('SPARK_TP') else count
+    role = None
+    if explicit and tp in (2, 3, 6):
+        role = f'tp{tp}'
+    elif not explicit and not exl3 and count not in (0, 4) and count in (2, 3, 6):
+        role = f'tp{count}'
+    return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
+
+
+def checkpoint_is_nvfp4(values):
+    """Whether the card's checkpoint ships NVFP4 routed experts (its own
+    config.json's moe_quant_algo, as the launcher reads it)."""
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub' / ('models--' + model.replace('/', '--'))
+    revision = values.get('MODEL_REVISION') or ((hub / 'refs/main').read_text().strip() if (hub / 'refs/main').is_file() else '')
+    try:
+        quant = json.loads((hub / 'snapshots' / revision / 'config.json').read_text()).get('quantization_config') or {}
+        return quant.get('moe_quant_algo') == 'NVFP4'
+    except (OSError, ValueError):
+        return 'nvfp4' in model.lower()
 
 
 def toolchain_hash(revision):
@@ -1520,8 +1604,8 @@ def main():
             card['levels'] = levels
             if args.post_load_c1:
                 card['post_load_c1'] = True
-        if args.trace and card.get('family') == 'deepseek_v41' and not (args.repo / 'run.sh').read_text().count('CUTEAFD_SPECULATION_TRACE'):
-            raise ValueError(f"{card['name']}: this checkout's run.sh does not forward SPECULATION_TRACE on the V4.1 path")
+        if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
+            raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
     probes = {card['name']: set(card.get('probes', [])) for card in cards}
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.probe:
