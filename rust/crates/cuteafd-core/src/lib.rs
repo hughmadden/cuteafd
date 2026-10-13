@@ -18,6 +18,7 @@ pub use dspark_verify::{verify_dspark_greedy, GreedyVerification, MAX_DSPARK_PRO
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
+pub mod thermal;
 pub mod memory_layout;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};

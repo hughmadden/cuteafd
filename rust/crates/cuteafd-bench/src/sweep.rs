@@ -11,6 +11,7 @@ use crate::panels::speed::CONTENT;
 use crate::text::{filler, nonce};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -26,6 +27,9 @@ pub struct Point {
     pub per_request_tok_s: f64,
     pub ttft_s: f64,
     pub errors: usize,
+    /// GPU throttle report over the timed wave (`/v1/thermal`; absent without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<Value>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -36,6 +40,9 @@ pub struct PrefillPoint {
     pub prompt_tokens: u64,
     pub tok_s: f64,
     pub ttft_s: f64,
+    /// GPU throttle report over the timed request (`/v1/thermal`; absent without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -43,6 +50,10 @@ pub struct Sweep {
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
+    /// GPU throttle report per phase (`prefill`, `decode`), warm-ups included: the
+    /// sustained heat each phase built up, next to the timed points' own windows.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub thermal: serde_json::Map<String, Value>,
 }
 
 impl Sweep {
@@ -87,7 +98,9 @@ fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Re
     // Prime each width first: graphs, workspaces and mapped tables.
     batch().into_iter().collect::<Result<Vec<_>>>().with_context(|| format!("C{c} warm-up"))?;
     timed(on_timed)?;
+    let mark = client.thermal_mark();
     let results = batch();
+    let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
     let ok: Vec<Timed> = results.into_iter().filter_map(Result::ok).collect();
     if ok.is_empty() {
@@ -96,7 +109,7 @@ fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Re
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     Ok(Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors })
+        ttft_s: median(&mut ttft), errors, thermal })
 }
 
 /// Cold prefill at each length: fit tokens per filler word from two short
@@ -116,10 +129,13 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut On
         let words = ((target - intercept) / slope).max(64.0) as usize;
         ask(words, 200 + length).with_context(|| format!("{length}-token prefill warm-up"))?;
         timed(on_timed)?;
+        let mark = client.thermal_mark();
         let chat = ask(words, 300 + length).with_context(|| format!("{length}-token prefill"))?;
+        let thermal = client.thermal_since(mark);
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
-        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s });
+        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
+            thermal });
     }
     Ok(points)
 }
@@ -149,13 +165,22 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     let mut sweep = Sweep::default();
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
+        let mark = client.thermal_mark();
         sweep.prefill = prefill(&client, prefill_lengths, max_context, &mut on_timed)?;
+        if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("prefill".into(), window); }
     }
+    let mark = client.thermal_mark();
     for &c in levels {
         sweep.points.push(measure(&client, c, "levels", &mut on_timed)?);
     }
     if post_load_c1 {
         sweep.points.push(measure(&client, 1, "post_load", &mut on_timed)?);
+    }
+    if !levels.is_empty() || post_load_c1 {
+        if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }
+    }
+    for (phase, window) in &sweep.thermal {
+        eprintln!("sweep {phase} GPU throttle: {}", cuteafd_core::thermal::describe(window));
     }
     Ok(sweep)
 }
@@ -197,7 +222,7 @@ mod tests {
     fn rate_looks_up_level_and_phase() {
         let sweep = Sweep { points: vec![
             Point { c: 1, phase: "levels".into(), aggregate_tok_s: 50.0, ..Point::default() },
-            Point { c: 1, phase: "post_load".into(), aggregate_tok_s: 48.0, ..Point::default() }], prefill: vec![] };
+            Point { c: 1, phase: "post_load".into(), aggregate_tok_s: 48.0, ..Point::default() }], ..Sweep::default() };
         assert_eq!(sweep.rate(1, "levels"), Some(50.0));
         assert_eq!(sweep.rate(1, "post_load"), Some(48.0));
         assert_eq!(sweep.rate(16, "levels"), None);

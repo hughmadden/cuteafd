@@ -500,8 +500,10 @@ impl Bench {
             None => {
                 let estimate = crate::baseline::estimate_s(&rates, &info);
                 self.begin(active, "baseline", estimate, remaining, total, 1, 1, progress);
-                let b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context,
+                let thermal_mark = client.thermal_mark();
+                let mut b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context,
                     max_output)?;
+                b.thermal = client.thermal_since(thermal_mark);
                 remaining -= estimate;
                 if b.quality.status != crate::report::CheckStatus::Pending {
                     self.baselines.lock().expect("baselines lock").insert(fingerprint.clone(), b.clone());
@@ -538,7 +540,9 @@ impl Bench {
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
                     history: &earlier, max_context, max_output };
                 let table_before = panels::common::mapped_counters(&client);
+                let thermal_mark = client.thermal_mark();
                 let outcome = panel.run(&ctx);
+                let thermal = client.thermal_since(thermal_mark);
                 let table_after = panels::common::mapped_counters(&client);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
@@ -549,6 +553,8 @@ impl Bench {
                             value["mapped_tables"] = json!(tables);
                             value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
                         }
+                        // GPU throttle report over the whole pass (panel-internal warm-ups included).
+                        if let (Some(thermal), true) = (thermal, value.is_object()) { value["thermal"] = thermal; }
                         r.panels[index].passes.push(value);
                         r.panels[index].partial = None;
                     }

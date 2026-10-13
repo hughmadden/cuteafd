@@ -1,0 +1,358 @@
+//! GPU throttle report: a process-wide ring of NVML samples (filled by the
+//! daemon's background sampler) and the interval summaries the API serves
+//! (`/v1/thermal`, `/v1/stats`) and the bench attaches to each measured phase.
+//!
+//! Nothing here touches a device; the sampler pushes plain readings. A window
+//! summary answers whether, why and how much a phase was throttled: seconds
+//! in each clock-event reason (from the driver's cumulative counters), the
+//! share of samples each reason was active, SM clock while busy, temperature,
+//! T.Limit headroom and power.
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+/// Fast samples per second the sampler takes (temperature, clock, power, reasons).
+pub const SAMPLE_HZ: u32 = 10;
+/// Every this many fast samples also reads the slow tier (throttle counters, T.Limit margin).
+pub const SLOW_EVERY: u32 = 10;
+/// Samples kept per GPU (two hours at [`SAMPLE_HZ`]); a longer window is summarized over what remains.
+const KEEP: usize = 2 * 3600 * SAMPLE_HZ as usize;
+/// A sample counts as busy (for the busy-clock statistics) at or above this utilization.
+const BUSY_PCT: u32 = 50;
+
+// `nvmlClocksEventReasons` bits.
+pub const REASON_SW_POWER_CAP: u64 = 0x4;
+pub const REASON_HW_SLOWDOWN: u64 = 0x8;
+pub const REASON_SW_THERMAL: u64 = 0x20;
+pub const REASON_HW_THERMAL: u64 = 0x40;
+pub const REASON_HW_POWER_BRAKE: u64 = 0x80;
+const REASONS: [(&str, u64); 4] = [("sw_power_cap", REASON_SW_POWER_CAP), ("sw_thermal", REASON_SW_THERMAL),
+    ("hw_thermal", REASON_HW_THERMAL), ("hw_power_brake", REASON_HW_POWER_BRAKE)];
+
+/// A device's identity and fixed limits, recorded once.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct GpuInfo {
+    pub index: u32,
+    pub uuid: String,
+    pub pci_bus_id: String,
+    pub name: String,
+    /// T.Limit offsets of the slowdown, shutdown and maximum-operating points (degrees).
+    pub slowdown_tlimit_c: Option<i32>,
+    pub shutdown_tlimit_c: Option<i32>,
+    pub gpu_max_tlimit_c: Option<i32>,
+}
+
+/// One reading; `None` where the board does not expose a value or the tier was not read.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Reading {
+    pub temperature_c: Option<i32>,
+    pub tlimit_margin_c: Option<i32>,
+    pub memory_temperature_c: Option<i32>,
+    pub power_mw: Option<u32>,
+    pub power_limit_mw: Option<u32>,
+    pub sm_clock_mhz: Option<u32>,
+    pub utilization_pct: Option<u32>,
+    pub reasons: Option<u64>,
+    pub sw_power_cap_ns: Option<u64>,
+    pub sw_thermal_ns: Option<u64>,
+    pub hw_thermal_ns: Option<u64>,
+    pub hw_power_brake_ns: Option<u64>,
+}
+
+impl Reading {
+    fn counters(&self) -> [Option<u64>; 4] {
+        [self.sw_power_cap_ns, self.sw_thermal_ns, self.hw_thermal_ns, self.hw_power_brake_ns]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    t: f64,
+    reading: Reading,
+}
+
+struct Gpu {
+    info: GpuInfo,
+    samples: VecDeque<Sample>,
+    /// The newest slow-tier values (margin, memory temperature), carried into `current`.
+    slow: Reading,
+}
+
+#[derive(Default)]
+struct State {
+    gpus: Vec<Gpu>,
+    /// Extra facts merged into the report (e.g. a host power governor's state).
+    note: Option<Value>,
+}
+
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Seconds on the report's clock (process-relative, monotonic): the cursor the bench passes back.
+pub fn now_s() -> f64 {
+    epoch().elapsed().as_secs_f64()
+}
+
+fn state() -> &'static Mutex<State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(State::default()))
+}
+
+/// Register the sampled GPUs (replaces any earlier set).
+pub fn install(gpus: Vec<GpuInfo>) {
+    let _ = epoch();
+    if let Ok(mut state) = state().lock() {
+        state.gpus = gpus.into_iter().map(|info| Gpu { info, samples: VecDeque::new(), slow: Reading::default() }).collect();
+    }
+}
+
+/// Whether a sampler has registered any GPU.
+pub fn active() -> bool {
+    state().lock().map(|s| !s.gpus.is_empty()).unwrap_or(false)
+}
+
+/// Append one reading per registered GPU (same order as [`install`]), taken at `t` ([`now_s`]).
+pub fn push(t: f64, readings: &[Reading]) {
+    let Ok(mut state) = state().lock() else { return };
+    for (gpu, reading) in state.gpus.iter_mut().zip(readings) {
+        if gpu.samples.len() == KEEP { gpu.samples.pop_front(); }
+        gpu.samples.push_back(Sample { t, reading: *reading });
+        if reading.counters().iter().any(Option::is_some) || reading.tlimit_margin_c.is_some() {
+            gpu.slow = *reading;
+        }
+    }
+}
+
+/// Attach a note (e.g. the host power governor's current limit and reason) to every report.
+pub fn set_note(note: Option<Value>) {
+    if let Ok(mut state) = state().lock() { state.note = note; }
+}
+
+fn watts(mw: Option<u32>) -> Option<f64> { mw.map(|mw| f64::from(mw) / 1e3) }
+
+fn active_reasons(bits: u64) -> Vec<&'static str> {
+    let mut names: Vec<&str> = REASONS.iter().filter(|(_, bit)| bits & bit != 0).map(|(name, _)| *name).collect();
+    if bits & REASON_HW_SLOWDOWN != 0 && bits & (REASON_HW_THERMAL | REASON_HW_POWER_BRAKE) == 0 {
+        names.push("hw_slowdown");
+    }
+    names
+}
+
+/// The latest reading of every GPU, for the console and `/v1/stats`.
+pub fn current() -> Value {
+    let Ok(state) = state().lock() else { return Value::Null };
+    if state.gpus.is_empty() { return Value::Null; }
+    let gpus: Vec<Value> = state.gpus.iter().map(|gpu| {
+        let last = gpu.samples.back().map(|s| s.reading).unwrap_or_default();
+        json!({
+            "index": gpu.info.index, "uuid": gpu.info.uuid, "pci_bus_id": gpu.info.pci_bus_id, "name": gpu.info.name,
+            "temperature_c": last.temperature_c,
+            "tlimit_margin_c": gpu.slow.tlimit_margin_c,
+            "memory_temperature_c": gpu.slow.memory_temperature_c,
+            "power_w": watts(last.power_mw), "power_limit_w": watts(last.power_limit_mw),
+            "sm_clock_mhz": last.sm_clock_mhz, "utilization_pct": last.utilization_pct,
+            "throttling": last.reasons.map(active_reasons),
+            "slowdown_tlimit_c": gpu.info.slowdown_tlimit_c, "shutdown_tlimit_c": gpu.info.shutdown_tlimit_c,
+        })
+    }).collect();
+    let mut value = json!({"now_s": now_s(), "gpus": gpus});
+    if let Some(note) = &state.note { value["governor"] = note.clone(); }
+    value
+}
+
+#[derive(Default)]
+struct Stat { n: u32, sum: f64, min: f64, max: f64 }
+
+impl Stat {
+    fn add(&mut self, value: Option<f64>) {
+        let Some(v) = value else { return };
+        if self.n == 0 { self.min = v; self.max = v; }
+        self.n += 1;
+        self.sum += v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+    }
+    fn mean(&self) -> Option<f64> { (self.n > 0).then(|| self.sum / f64::from(self.n)) }
+    fn min(&self) -> Option<f64> { (self.n > 0).then_some(self.min) }
+    fn max(&self) -> Option<f64> { (self.n > 0).then_some(self.max) }
+}
+
+fn round1(v: Option<f64>) -> Value { v.map_or(Value::Null, |v| json!((v * 10.0).round() / 10.0)) }
+fn round3(v: Option<f64>) -> Value { v.map_or(Value::Null, |v| json!((v * 1000.0).round() / 1000.0)) }
+
+/// Throttle seconds per reason between two counter readings; a counter that went
+/// backwards (driver reload) reads `None`.
+fn counter_seconds(before: &[Option<u64>; 4], after: &[Option<u64>; 4]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (index, (name, _)) in REASONS.iter().enumerate() {
+        let delta = match (before[index], after[index]) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) as f64 / 1e9),
+            _ => None,
+        };
+        out.insert((*name).into(), round3(delta));
+    }
+    Value::Object(out)
+}
+
+fn summarize_gpu(gpu: &Gpu, from: f64, to: f64) -> Value {
+    let samples = &gpu.samples;
+    let start = samples.partition_point(|s| s.t < from);
+    let end = samples.partition_point(|s| s.t <= to);
+    let window = samples.range(start..end);
+    let (mut temp, mut margin, mut memory, mut power, mut limit, mut clock, mut busy_clock) =
+        (Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default(), Stat::default());
+    let mut reason_hits = [0u32; 4];
+    let mut reason_samples = 0u32;
+    let (mut n, mut busy) = (0u32, 0u32);
+    let (mut first_t, mut last_t) = (None, None);
+    let mut last_counters: Option<[Option<u64>; 4]> = None;
+    for sample in window {
+        let r = &sample.reading;
+        n += 1;
+        first_t.get_or_insert(sample.t);
+        last_t = Some(sample.t);
+        temp.add(r.temperature_c.map(f64::from));
+        margin.add(r.tlimit_margin_c.map(f64::from));
+        memory.add(r.memory_temperature_c.map(f64::from));
+        power.add(watts(r.power_mw));
+        limit.add(watts(r.power_limit_mw));
+        clock.add(r.sm_clock_mhz.map(f64::from));
+        if r.utilization_pct.is_some_and(|u| u >= BUSY_PCT) {
+            busy += 1;
+            busy_clock.add(r.sm_clock_mhz.map(f64::from));
+        }
+        if let Some(bits) = r.reasons {
+            reason_samples += 1;
+            for (index, (_, bit)) in REASONS.iter().enumerate() {
+                if bits & bit != 0 { reason_hits[index] += 1; }
+            }
+        }
+        if r.counters().iter().any(Option::is_some) { last_counters = Some(r.counters()); }
+    }
+    // Counter baseline: the last slow sample before the window, else the first inside it.
+    let before = samples.range(..start).rev().find(|s| s.reading.counters().iter().any(Option::is_some))
+        .map(|s| s.reading.counters())
+        .or_else(|| samples.range(start..end).find(|s| s.reading.counters().iter().any(Option::is_some))
+            .map(|s| s.reading.counters()));
+    let throttle_s = match (before, last_counters) {
+        (Some(before), Some(after)) => counter_seconds(&before, &after),
+        _ => Value::Null,
+    };
+    let mut reason_fraction = serde_json::Map::new();
+    for (index, (name, _)) in REASONS.iter().enumerate() {
+        reason_fraction.insert((*name).into(),
+            round3((reason_samples > 0).then(|| f64::from(reason_hits[index]) / f64::from(reason_samples))));
+    }
+    json!({
+        "index": gpu.info.index, "uuid": gpu.info.uuid, "pci_bus_id": gpu.info.pci_bus_id,
+        "samples": n,
+        "covered_s": round3(first_t.zip(last_t).map(|(a, b)| b - a)),
+        "throttle_s": throttle_s,
+        "reason_fraction": Value::Object(reason_fraction),
+        "sm_clock_mhz": {"min": round1(clock.min()), "mean": round1(clock.mean())},
+        "busy": {"fraction": round3((n > 0).then(|| f64::from(busy) / f64::from(n))),
+            "sm_clock_min_mhz": round1(busy_clock.min()), "sm_clock_mean_mhz": round1(busy_clock.mean())},
+        "temperature_c": {"max": round1(temp.max()), "mean": round1(temp.mean())},
+        "tlimit_margin_c": {"min": round1(margin.min()), "mean": round1(margin.mean())},
+        "memory_temperature_c": {"max": round1(memory.max())},
+        "power_w": {"mean": round1(power.mean()), "max": round1(power.max())},
+        "power_limit_w": {"min": round1(limit.min()), "max": round1(limit.max())},
+    })
+}
+
+/// Summary of every GPU over `[from, to]` on the [`now_s`] clock; `Value::Null` without a sampler.
+pub fn window(from: f64, to: f64) -> Value {
+    let Ok(state) = state().lock() else { return Value::Null };
+    if state.gpus.is_empty() { return Value::Null; }
+    let gpus: Vec<Value> = state.gpus.iter().map(|gpu| summarize_gpu(gpu, from, to)).collect();
+    let mut value = json!({"from_s": round3(Some(from)), "to_s": round3(Some(to)),
+        "seconds": round3(Some((to - from).max(0.0))), "gpus": gpus});
+    if let Some(note) = &state.note { value["governor"] = note.clone(); }
+    value
+}
+
+/// One line per GPU for a log or summary table.
+pub fn describe(window: &Value) -> String {
+    window["gpus"].as_array().into_iter().flatten().map(|g| {
+        let t = &g["throttle_s"];
+        format!("gpu{} power-cap {}s thermal {}s/{}s brake {}s · busy clock {} MHz (min {}) · max {} C · min headroom {} C · {} W mean",
+            g["index"], t["sw_power_cap"], t["sw_thermal"], t["hw_thermal"], t["hw_power_brake"],
+            g["busy"]["sm_clock_mean_mhz"], g["busy"]["sm_clock_min_mhz"], g["temperature_c"]["max"],
+            g["tlimit_margin_c"]["min"], g["power_w"]["mean"])
+    }).collect::<Vec<_>>().join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu(samples: &[(f64, Reading)]) -> Gpu {
+        Gpu { info: GpuInfo { index: 1, uuid: "GPU-x".into(), ..GpuInfo::default() },
+            samples: samples.iter().map(|&(t, reading)| Sample { t, reading }).collect(), slow: Reading::default() }
+    }
+
+    fn fast(temp: i32, clock: u32, util: u32, watts: u32, bits: u64) -> Reading {
+        Reading { temperature_c: Some(temp), sm_clock_mhz: Some(clock), utilization_pct: Some(util),
+            power_mw: Some(watts * 1000), power_limit_mw: Some(325_000), reasons: Some(bits), ..Reading::default() }
+    }
+
+    fn slow(mut r: Reading, margin: i32, cap_ns: u64, hw_thermal_ns: u64) -> Reading {
+        r.tlimit_margin_c = Some(margin);
+        r.sw_power_cap_ns = Some(cap_ns);
+        r.sw_thermal_ns = Some(0);
+        r.hw_thermal_ns = Some(hw_thermal_ns);
+        r.hw_power_brake_ns = Some(0);
+        r
+    }
+
+    #[test]
+    fn window_takes_counter_deltas_from_the_last_slow_sample_before_it() {
+        let g = gpu(&[
+            (0.0, slow(fast(40, 180, 0, 30, 0), 53, 1_000_000_000, 0)),
+            (1.0, fast(60, 2600, 100, 320, REASON_SW_POWER_CAP)),
+            (2.0, slow(fast(70, 1400, 100, 325, REASON_SW_POWER_CAP), 23, 2_500_000_000, 0)),
+            (3.0, fast(72, 1300, 100, 324, REASON_SW_POWER_CAP | REASON_HW_THERMAL)),
+            (4.0, slow(fast(74, 1200, 100, 324, REASON_SW_POWER_CAP), 19, 4_000_000_000, 250_000_000)),
+        ]);
+        let w = summarize_gpu(&g, 0.5, 4.0);
+        assert_eq!(w["samples"], 4);
+        assert_eq!(w["throttle_s"]["sw_power_cap"], 3.0);
+        assert_eq!(w["throttle_s"]["hw_thermal"], 0.25);
+        assert_eq!(w["reason_fraction"]["sw_power_cap"], 1.0);
+        assert_eq!(w["reason_fraction"]["hw_thermal"], 0.25);
+        assert_eq!(w["busy"]["fraction"], 1.0);
+        assert_eq!(w["busy"]["sm_clock_min_mhz"], 1200.0);
+        assert_eq!(w["temperature_c"]["max"], 74.0);
+        assert_eq!(w["tlimit_margin_c"]["min"], 19.0);
+        assert_eq!(w["power_limit_w"]["max"], 325.0);
+        assert!(w["memory_temperature_c"]["max"].is_null(), "N/A on this board stays null");
+    }
+
+    #[test]
+    fn idle_samples_do_not_drag_the_busy_clock_and_a_driver_reload_reads_null() {
+        let g = gpu(&[
+            (0.0, slow(fast(40, 180, 0, 30, 0), 53, 9_000_000_000, 0)),
+            (1.0, slow(fast(41, 2600, 90, 200, 0), 52, 1_000, 0)),
+        ]);
+        let w = summarize_gpu(&g, 0.0, 1.0);
+        assert_eq!(w["busy"]["sm_clock_min_mhz"], 2600.0);
+        assert_eq!(w["sm_clock_mhz"]["min"], 180.0);
+        assert!(w["throttle_s"]["sw_power_cap"].is_null());
+        assert_eq!(w["throttle_s"]["hw_thermal"], 0.0);
+    }
+
+    #[test]
+    fn an_empty_window_has_no_counters_and_names_no_reason() {
+        let g = gpu(&[(0.0, fast(40, 180, 0, 30, 0))]);
+        let w = summarize_gpu(&g, 5.0, 6.0);
+        assert_eq!(w["samples"], 0);
+        assert!(w["throttle_s"].is_null());
+        assert_eq!(active_reasons(REASON_SW_POWER_CAP | REASON_HW_SLOWDOWN | REASON_HW_THERMAL),
+            vec!["sw_power_cap", "hw_thermal"]);
+        assert_eq!(active_reasons(REASON_HW_SLOWDOWN), vec!["hw_slowdown"]);
+    }
+}

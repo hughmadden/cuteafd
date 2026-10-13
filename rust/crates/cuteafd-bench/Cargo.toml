@@ -13,6 +13,7 @@ axum.workspace = true
 base64 = "=0.22.1"
 clap.workspace = true
 cuteafd-api = { path = "../cuteafd-api" }
+cuteafd-core = { path = "../cuteafd-core" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 cuteafd-transport = { path = "../cuteafd-transport" }
 futures.workspace = true

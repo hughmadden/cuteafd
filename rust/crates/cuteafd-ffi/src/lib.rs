@@ -48,6 +48,7 @@ pub fn coordinator_gpu_budget() -> Option<cuteafd_core::serving_capacity::GpuMem
     (bytes != 0).then_some(cuteafd_core::serving_capacity::GpuMemoryBudget(bytes))
 }
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
+pub mod nvml;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 #[cfg(all(target_os = "linux", any(test, feature = "test-support")))]

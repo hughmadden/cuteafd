@@ -232,6 +232,12 @@ before → after tables with conditions.
   card set, not a multi-session parity campaign. Release images are built for
   release cuts, not to verify branches; agentic benches gate with 1–2 short
   sessions, the full bench runs at release.
+- Every bench report says whether, why and how much the GPUs throttled:
+  `/v1/thermal` windows (NVML, `THERMAL=on` default) land in `sweep.json`
+  per point and phase and in each panel pass. Read seconds of power-cap vs
+  thermal slowdown, busy SM clock, max temperature and min T.Limit headroom
+  before trusting a speed delta; a run that hit thermal slowdown is not
+  comparable to one that didn't.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness through wasted load

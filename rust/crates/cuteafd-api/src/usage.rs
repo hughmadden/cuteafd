@@ -475,7 +475,7 @@ impl Middleware {
 fn self_traffic(path: &str) -> bool {
     path == "/agent" || path.starts_with("/agent/") || path == "/" || path == "/usage" || path == "/bench" || path.starts_with("/assets/")
         || path.starts_with("/console/usage/") || path.starts_with("/v1/console") || path.starts_with("/v1/bench/")
-        || path == "/health" || path == "/bench/banner.js"
+        || path == "/health" || path == "/bench/banner.js" || path == "/v1/thermal"
 }
 pub async fn track(State(state): State<Middleware>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();

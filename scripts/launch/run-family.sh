@@ -1351,6 +1351,15 @@ case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, g
 # viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
+# THERMAL=on (default): a background thread samples each coordinator GPU through NVML
+# (temperature, T.Limit headroom, power and limit, SM clock, clock-event reasons and their
+# cumulative throttle seconds) for /v1/stats, /v1/thermal, the console and every bench
+# report's per-phase throttle summary; off disables it. A host power governor's state file
+# (/run/gpu-power-governor, when present) is mounted read-only so the report carries it.
+thermal="$(get THERMAL on)"
+case "$thermal" in on|off) ;; *) echo "THERMAL must be on or off" >&2; exit 2 ;; esac
+thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
+[[ ! -d /run/gpu-power-governor ]] || thermal_args+=(-v /run/gpu-power-governor:/run/gpu-power-governor:ro)
 api_mount_args=()
 agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
 mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"
@@ -1449,7 +1458,7 @@ release_serving_docker_args
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
