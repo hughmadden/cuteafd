@@ -154,46 +154,63 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    pub(super) fn shutdown_submission(&self, transports: &[SparkLink<'_>]) -> Result<()> {
-        self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
-        let result = (|| {
-            if self.exchange.is_some() { self.retire_tp2()?; }
-            else {
+    pub(crate) fn shutdown_submission(&self, transports: &mut [SparkLink<'_>]) -> Result<()> {
+        use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
+        self.terminal.set(TerminalState::Aborting);
+        let transports = RefCell::new(transports);
+        let result = teardown(&mut Teardown {
+            abort: || {
+                let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+                home.run(|| self.publish_tp2_abort())
+            },
+            ranks: || {
+                let mut failures = Vec::new();
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
-                    // SAFETY: all queued operands remain owned through shutdown.
-                    self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
+                    // SAFETY: queued operands remain owned throughout shared teardown.
+                    if let Err(error) = self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }) {
+                        failures.push(format!("rank {rank}: {error:#}"));
+                    }
                 }
-            }
-            for link in transports { link.intake.terminal_drain_copies()?; }
-            if let Some(link) = &self.device_link { link.terminal_drain_copies()?; }
-            if self.exchange.is_none() {
-                self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
-            }
-            Ok(())
-        })();
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            links: || {
+                // The proxy has no terminal QP/owner contract yet. Never pretend
+                // a copy-stream synchronization makes failed proxy work safe.
+                ensure!(self.device_link.is_none(), "device Spark proxy requires terminal owner retention");
+                let mut failures = Vec::new();
+                for link in transports.borrow_mut().iter_mut() {
+                    if let Err(error) = link.terminal_quiesce() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            copies: || {
+                let mut failures = Vec::new();
+                for link in transports.borrow().iter() {
+                    if let Err(error) = link.terminal_drain_copies() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            graphs: || {
+                for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
+                for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    self.on(rank, || {
+                        if rank == 0 { self.graphs.borrow_mut().clear(); }
+                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+            },
+        });
         crate::shared::decode_graph::fatal_drain(result, "V4 submission shutdown");
-        self.terminal.set(crate::shared::peer_split::TerminalState::Drained);
         Ok(())
-    }
-
-    /// Both abort words precede either drain; graphs and backend owners remain live.
-    pub fn retire_tp2(&self) -> Result<()> {
-        let Some(exchange) = &self.exchange else { return Ok(()); };
-        if exchange.terminal_state() == crate::shared::peer_split::TerminalState::Drained { return Ok(()); }
-        let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
-        home.run(|| {
-            self.publish_tp2_abort()?;
-            let mut failures = Vec::new();
-            for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-                if let Err(error) = exchange.drain_compute() { failures.push(format!("{error:#}")); }
-            }
-            ensure!(failures.is_empty(), "V4 TP2 rank drainage: {}", failures.join("; "));
-            self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
-            self.on(1, || { self.peer()?.graphs.borrow_mut().clear(); Ok(()) })?;
-            self.exchange()?.finish_terminal(true);
-            if let Some(tp2) = &self.tp2 { tp2.routes.finish_terminal(true); }
-            Ok(())
-        })
     }
 
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {

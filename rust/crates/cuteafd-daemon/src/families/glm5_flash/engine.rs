@@ -1916,26 +1916,44 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn shutdown_submission(&self) -> Result<()> {
-        self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
-        let result = (|| {
-            let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
-            if self.peer.is_some() || self.drafter.is_some() { home.run(|| self.publish_tp2_abort())?; }
-            self.synchronize()?;
-            if let Some(Experts::Spark { transports, .. }) = &self.experts {
-                for link in transports.borrow().iter() { link.intake.terminal_drain_copies()?; }
+    fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>) -> Result<()>) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Some(Experts::Spark { transports, .. }) = &self.experts {
+            for link in transports.try_borrow_mut()?.iter_mut() {
+                if let Err(error) = action(link) { failures.push(format!("{error:#}")); }
             }
-            for rank in 0..self.ranks() {
-                self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
-            }
-            Ok(())
-        })();
-        crate::shared::decode_graph::fatal_drain(result, "GLM Flash submission shutdown");
-        self.terminal.set(crate::shared::peer_split::TerminalState::Drained);
-        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-            exchange.finish_terminal(true);
         }
-        Ok(())
+        ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+    }
+
+    fn shutdown_submission(&self) -> Result<()> {
+        use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
+        self.terminal.set(TerminalState::Aborting);
+        let result = teardown(&mut Teardown {
+            abort: || {
+                let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+                home.run(|| self.publish_tp2_abort())
+            },
+            ranks: || self.synchronize(),
+            links: || self.terminal_links(|link| link.terminal_quiesce()),
+            copies: || self.terminal_links(|link| link.terminal_drain_copies()),
+            graphs: || {
+                self.terminal_links(|link| link.terminal_release())?;
+                for rank in 0..self.ranks() {
+                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+                }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+                if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }
+            },
+        });
+        crate::shared::decode_graph::fatal_drain(result, "GLM Flash submission shutdown"); Ok(())
     }
 
     fn publish_tp2_abort(&self) -> Result<()> {
@@ -2347,6 +2365,11 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
+    pub(crate) fn finish_request(&self) -> Result<()> {
+        if let Some(drafter) = &self.drafter { drafter.finish_request()?; }
+        Ok(())
+    }
+
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
         let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
@@ -2354,7 +2377,6 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
         });
-        if let Some(drafter) = &self.drafter { drafter.finish_terminal(result.is_ok()); }
         result
     }
 
@@ -4932,7 +4954,7 @@ impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // Every rank can still read graph operands, weights and workspaces.
         // Abort before any owner releases storage when drainage is unproved.
-        crate::shared::decode_graph::fatal_drain(self.synchronize(), "GLM Flash engine");
+        crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
         // SAFETY: all rank streams drained while their event and operands remained live.
         let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
         self.graphs = RefCell::new(GraphBank::new(None));

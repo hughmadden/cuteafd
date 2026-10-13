@@ -1218,7 +1218,7 @@ pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
     pub fp8_checkpoint: Option<Checkpoint>,
     pub cfg: GlmNextConfig,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
     /// The FP8 expert catalog for --local-experts.
     pub experts: Option<cuteafd_loader::OfficialV41Catalog>,
 }
@@ -1268,7 +1268,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         None
     };
     // SAFETY: the library is the cuteafd native shim built for this engine.
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
@@ -1925,6 +1925,7 @@ impl Opened {
             &peers, &executors, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
+        for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now, as GLM-5, MiMo and DeepSeek V4 do: a

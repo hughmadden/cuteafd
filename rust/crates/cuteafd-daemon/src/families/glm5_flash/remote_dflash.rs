@@ -163,18 +163,22 @@ impl<'a> RemoteDflash<'a> {
     /// No owner is released on an unproved drain; the engine's fatal-drain
     /// boundary also retains every target graph and peer-exchange operand.
     pub fn synchronize(&self) -> Result<()> {
-        // Consume the final context acknowledgement at this drained boundary,
-        // not only on the next update. Aborted waits also retire here.
+        self.finish_request()?;
+        self.stream.drain()?;
+        if self.exchange.terminal_state() == TerminalState::Aborting { self.update_pending.set(false); }
+        Ok(())
+    }
+
+    /// Consume the final acknowledgement before any request slot is reused.
+    pub fn finish_request(&self) -> Result<()> {
         if self.update_pending.get() && self.exchange.terminal_state() == TerminalState::Active {
             self.exchange.wait(0, TAPS)?;
             self.target.device.run(|| {
-                // SAFETY: the target stream and all context operands remain owned.
+                // SAFETY: request owners remain live until this acknowledgement retires.
                 unsafe { self.draft.device.library.cuda_stream_synchronize(self.exchange.stream(0)) }
             })?;
             self.update_pending.set(false);
         }
-        self.stream.drain()?;
-        if self.exchange.terminal_state() == TerminalState::Aborting { self.update_pending.set(false); }
         Ok(())
     }
 
@@ -223,9 +227,6 @@ impl<'a> RemoteDflash<'a> {
         let Some((first, last)) = tap_frontier(rows)? else { return Ok(()) };
         let pitch = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
         self.checked(|| {
-            // Conservatively retire the paired bridge before publishing the
-            // next context wave; metadata uploads themselves are stream-ordered.
-            self.synchronize()?;
             self.draft.device.run(|| self.draft.update_with(rows, || {
                 if self.update_pending.get() { self.exchange.wait(0, TAPS)?; }
                 // SAFETY: the checked row frontier is inside both tap owners.
@@ -245,7 +246,7 @@ impl<'a> RemoteDflash<'a> {
                 self.validate_target_peer(self.target_peer)?;
                 self.stream.device.run(|| unsafe {
                     // SAFETY: both same-device streams and the reusable ordering
-                    // event survive every queued update; the preceding wave drained.
+                    // event survive every queued update; stream order protects reuse.
                     self.draft.device.library.cuda_event_record(self.target_ready.raw, self.target_peer.stream)?;
                     self.draft.device.library.cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)
                 })?;

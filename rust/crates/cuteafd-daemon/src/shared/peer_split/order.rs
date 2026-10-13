@@ -157,8 +157,8 @@ pub(crate) fn check_terminal(schedule: &Schedule, aborted: bool) -> Result<(), D
 /// unfinished generations and releases waits for producers never enqueued.
 #[cfg(test)]
 pub(crate) fn check_submission_faults(schedule: &Schedule) -> Result<(), Deadlock> {
-    use crate::shared::experts::rtx::pair::{submit, TerminalStepError};
-    use std::cell::Cell;
+    use crate::shared::experts::rtx::pair::{submit, teardown, TerminalStepError, TestSubmission};
+    use std::cell::{Cell, RefCell};
     check(schedule)?;
     for rank in 0..2 {
         for at in 0..=schedule.streams[rank].len() {
@@ -166,23 +166,28 @@ pub(crate) fn check_submission_faults(schedule: &Schedule) -> Result<(), Deadloc
             prefix.requests.clear();
             prefix.streams[rank].truncate(at);
             for cancellation in [false, true] {
-                let live = Cell::new(true);
-                let drained = Cell::new(false);
-                let result: anyhow::Result<()> = submit(
-                    || { anyhow::ensure!(live.get(), "retired engine"); Ok(()) },
-                    || {
-                        live.set(false); // Both exchange abort words precede drainage.
-                        check_terminal(&prefix, true).map_err(|e| anyhow::anyhow!(e))?;
-                        drained.set(true);
-                        Ok(())
-                    },
-                    || anyhow::bail!("rank {rank} enqueue {at}, cancellation={cancellation}"),
-                );
-                assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
-                assert!(drained.get());
+                let owners = RefCell::new(TestSubmission::new(Some(&prefix)));
+                if cancellation {
+                    let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _: anyhow::Result<()> = submit(
+                            || owners.borrow().require_live(),
+                            || teardown(&mut *owners.borrow_mut()),
+                            || panic!("rank {rank} enqueue {at} dropped body"),
+                        );
+                    }));
+                    assert!(cancelled.is_err());
+                } else {
+                    let result: anyhow::Result<()> = submit(
+                        || owners.borrow().require_live(),
+                        || teardown(&mut *owners.borrow_mut()),
+                        || anyhow::bail!("rank {rank} enqueue {at}"),
+                    );
+                    assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+                }
+                owners.borrow().verify_retired().unwrap();
                 let replayed = Cell::new(false);
                 let replay = submit(
-                    || { anyhow::ensure!(live.get(), "retired engine"); Ok(()) },
+                    || owners.borrow().require_live(),
                     || panic!("retired engine drained twice"),
                     || { replayed.set(true); Ok(()) },
                 );

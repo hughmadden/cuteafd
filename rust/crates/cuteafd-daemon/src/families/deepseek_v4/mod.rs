@@ -255,7 +255,7 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
 pub(crate) struct Loaded {
     pub snapshot: PathBuf,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
     pub cfg: DeepseekV4Config,
     pub family: &'static str,
     pub manifest: serde_json::Value,
@@ -273,7 +273,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
         other => anyhow::bail!("not a DeepSeek V4 checkpoint (expert family {other:?})"),
     };
     let cfg = DeepseekV4Config::read(&args.snapshot, 1)?;
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     let mut manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)
         .with_context(|| format!("reading {}", args.manifest.display()))?)?;
@@ -518,6 +518,7 @@ pub(crate) fn with_engine<T>(
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
             loaded.cfg.dim * 2))
             .collect::<Result<Vec<_>>>()?;
+        for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
         for transport in &mut transports {
@@ -536,7 +537,7 @@ pub(crate) fn with_engine<T>(
         engine.check_routes(&mut transports, &runtime)?;
         body(&engine, &mut transports, &runtime)
     })();
-    crate::shared::decode_graph::fatal_drain(engine.retire_tp2(), "V4 RTX engine retirement");
+    crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.
         tracing::error!("{error:#}");

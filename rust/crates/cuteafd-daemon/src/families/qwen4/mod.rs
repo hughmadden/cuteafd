@@ -220,7 +220,7 @@ pub(crate) struct GoldenArgs {
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
     pub cfg: Qwen4Config,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
     /// Local backbone experts, or the coordinator-local MTP layer with Spark peers.
     pub experts: Option<cuteafd_loader::OfficialV41Catalog>,
 }
@@ -388,7 +388,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         None
     };
     // SAFETY: the library is the cuteafd native shim built for this engine.
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     Ok(Opened { checkpoint, cfg, library, experts })
 }
@@ -595,9 +595,10 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+        transport.enable_terminal_ownership(self.library.clone())?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime, mtp }))

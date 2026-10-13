@@ -28,16 +28,89 @@ pub(crate) struct TerminalStepError {
     drain: String,
 }
 
+/// Families supply owners; this sequence is also exercised by CPU fault tests.
+pub(crate) trait SubmissionOwners {
+    fn abort_all(&mut self) -> Result<()>;
+    fn drain_ranks(&mut self) -> Result<()>;
+    fn quiesce_links(&mut self) -> Result<()>;
+    fn drain_copies(&mut self) -> Result<()>;
+    fn retire_graphs(&mut self) -> Result<()>;
+    fn finish(&mut self, drained: bool);
+}
+
+pub(crate) struct Teardown<A, D, Q, C, R, F> {
+    pub abort: A,
+    pub ranks: D,
+    pub links: Q,
+    pub copies: C,
+    pub graphs: R,
+    pub finish: F,
+}
+impl<A, D, Q, C, R, F> SubmissionOwners for Teardown<A, D, Q, C, R, F>
+where A: FnMut() -> Result<()>, D: FnMut() -> Result<()>, Q: FnMut() -> Result<()>,
+    C: FnMut() -> Result<()>, R: FnMut() -> Result<()>, F: FnMut(bool),
+{
+    fn abort_all(&mut self) -> Result<()> { (self.abort)() }
+    fn drain_ranks(&mut self) -> Result<()> { (self.ranks)() }
+    fn quiesce_links(&mut self) -> Result<()> { (self.links)() }
+    fn drain_copies(&mut self) -> Result<()> { (self.copies)() }
+    fn retire_graphs(&mut self) -> Result<()> { (self.graphs)() }
+    fn finish(&mut self, drained: bool) { (self.finish)(drained) }
+}
+
+pub(crate) fn teardown(owners: &mut impl SubmissionOwners) -> Result<()> {
+    let mut failures = Vec::new();
+    let aborted = match owners.abort_all() {
+        Ok(()) => true,
+        Err(error) => { failures.push(format!("abort publication: {error:#}")); false }
+    };
+    // Failed abort publication cannot safely unblock a missing producer.
+    let compute = if aborted {
+        match owners.drain_ranks() {
+            Ok(()) => true,
+            Err(error) => { failures.push(format!("rank drainage: {error:#}")); false }
+        }
+    } else { false };
+    let quiesced = match owners.quiesce_links() {
+        Ok(()) => true,
+        Err(error) => { failures.push(format!("link quiescence: {error:#}")); false }
+    };
+    // Copy streams can depend on compute events; never drain an unproved dependency.
+    if compute && quiesced {
+        if let Err(error) = owners.drain_copies() { failures.push(format!("copy drainage: {error:#}")); }
+    }
+    if failures.is_empty() {
+        if let Err(error) = owners.retire_graphs() { failures.push(format!("graph retirement: {error:#}")); }
+    }
+    owners.finish(failures.is_empty());
+    ensure!(failures.is_empty(), "queued owners retained: {}", failures.join("; "));
+    Ok(())
+}
+
+struct SubmissionGuard<S: FnOnce() -> Result<()>>(Option<S>);
+impl<S: FnOnce() -> Result<()>> SubmissionGuard<S> {
+    fn shutdown(&mut self) -> Result<()> { self.0.take().expect("submission already retired")() }
+}
+impl<S: FnOnce() -> Result<()>> Drop for SubmissionGuard<S> {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.0.take() {
+            // Cancellation/unwinding must obey the same owner contract as enqueue errors.
+            if let Err(error) = shutdown() { tracing::error!(%error, "cancelled submission retains queued owners"); }
+        }
+    }
+}
+
 pub(crate) fn submit<T>(
     require_live: impl FnOnce() -> Result<()>,
     shutdown: impl FnOnce() -> Result<()>,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     require_live()?;
+    let mut guard = SubmissionGuard(Some(shutdown));
     match body() {
-        Ok(value) => Ok(value),
+        Ok(value) => { guard.0.take(); Ok(value) }
         Err(cause) => {
-            let drain = match shutdown() {
+            let drain = match guard.shutdown() {
                 Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
                 Err(error) => format!("queued owners retained: {error:#}"),
             };
@@ -418,44 +491,94 @@ impl<'a> Pair<'a> {
 }
 
 #[cfg(test)]
+pub(crate) struct TestSubmission<'a> {
+    pub events: Vec<&'static str>,
+    pub live: bool,
+    pub skip: Option<&'static str>,
+    schedule: Option<&'a crate::shared::peer_split::order::Schedule>,
+}
+#[cfg(test)]
+impl<'a> TestSubmission<'a> {
+    pub fn new(schedule: Option<&'a crate::shared::peer_split::order::Schedule>) -> Self {
+        Self { events: Vec::new(), live: true, skip: None, schedule }
+    }
+    fn phase(&mut self, name: &'static str, previous: Option<&str>) -> Result<()> {
+        if self.skip == Some(name) { return Ok(()); }
+        ensure!(previous.is_none() || self.events.last().copied() == previous,
+            "{name} ran without its required predecessor {previous:?}");
+        self.events.push(name); Ok(())
+    }
+    pub fn require_live(&self) -> Result<()> { ensure!(self.live, "retired engine"); Ok(()) }
+    pub fn verify_retired(&self) -> Result<()> {
+        ensure!(!self.live && self.events == ["abort", "ranks", "quiesce", "copies", "graphs", "finish"],
+            "incomplete production teardown: {:?}", self.events);
+        Ok(())
+    }
+}
+#[cfg(test)]
+impl SubmissionOwners for TestSubmission<'_> {
+    fn abort_all(&mut self) -> Result<()> {
+        self.live = false;
+        self.phase("abort", None)
+    }
+    fn drain_ranks(&mut self) -> Result<()> {
+        self.phase("ranks", Some("abort"))?;
+        if let Some(schedule) = self.schedule {
+            crate::shared::peer_split::order::check_terminal(schedule, self.events.contains(&"abort"))?;
+        }
+        Ok(())
+    }
+    fn quiesce_links(&mut self) -> Result<()> { self.phase("quiesce", Some("ranks")) }
+    fn drain_copies(&mut self) -> Result<()> { self.phase("copies", Some("quiesce")) }
+    fn retire_graphs(&mut self) -> Result<()> { self.phase("graphs", Some("copies")) }
+    fn finish(&mut self, drained: bool) {
+        if drained { self.events.push("finish"); }
+        else { self.events.push("retain"); }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn submission_faults_abort_then_drain_before_return_and_reject_replay() {
-        // Includes the caller's payload push after rank0 queued its route ack,
-        // later attention/copy/graph operations, and cancellation at each prefix.
         for failure in 0..12 {
-            for cancellation in [false, true] {
-                let live = Cell::new(true);
-                let events = RefCell::new(Vec::new());
-                let result: Result<()> = submit(
-                    || { ensure!(live.get(), "closed"); Ok(()) },
-                    || {
-                        live.set(false);
-                        events.borrow_mut().push("abort both exchanges");
-                        events.borrow_mut().push("drain both ranks");
-                        Ok(())
-                    },
-                    || {
-                        for step in 0..12 {
-                            events.borrow_mut().push("enqueue");
-                            ensure!(step != failure, "injected step {step}, cancellation={cancellation}");
-                        }
-                        Ok(())
-                    },
-                );
-                assert!(result.is_err());
-                let recorded = events.borrow();
-                assert_eq!(&recorded[recorded.len() - 2..], &["abort both exchanges", "drain both ranks"]);
-                drop(recorded);
-                let replayed = Cell::new(false);
-                assert!(submit(
-                    || { ensure!(live.get(), "closed"); Ok(()) },
-                    || panic!("already retired"),
-                    || { replayed.set(true); Ok(()) },
-                ).is_err());
-                assert!(!replayed.get());
-            }
+            let owners = RefCell::new(TestSubmission::new(None));
+            let result: Result<()> = submit(
+                || owners.borrow().require_live(),
+                || teardown(&mut *owners.borrow_mut()),
+                || {
+                    for step in 0..12 { ensure!(step != failure, "injected step {step}"); }
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+            owners.borrow().verify_retired().unwrap();
+            let replayed = Cell::new(false);
+            assert!(submit(|| owners.borrow().require_live(), || panic!("already retired"),
+                || { replayed.set(true); Ok(()) }).is_err());
+            assert!(!replayed.get());
+        }
+    }
+
+    #[test]
+    fn dropped_submission_body_runs_the_real_teardown() {
+        let owners = RefCell::new(TestSubmission::new(None));
+        let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = submit(|| owners.borrow().require_live(),
+                || teardown(&mut *owners.borrow_mut()), || panic!("dropped body"));
+        }));
+        assert!(cancelled.is_err());
+        owners.borrow().verify_retired().unwrap();
+    }
+
+    #[test]
+    fn teardown_mutations_cannot_pass_the_retirement_gate() {
+        for skip in ["abort", "ranks", "quiesce", "copies", "graphs"] {
+            let mut owners = TestSubmission::new(None);
+            owners.skip = Some(skip);
+            let result = teardown(&mut owners);
+            assert!(result.is_err() || owners.verify_retired().is_err(), "missing {skip} passed");
         }
     }
 

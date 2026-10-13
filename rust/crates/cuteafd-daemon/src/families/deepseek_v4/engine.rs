@@ -855,7 +855,7 @@ impl<'a> Engine<'a> {
     ) -> Result<Logits> {
         let transports = RefCell::new(transports);
         crate::shared::experts::rtx::pair::submit(
-            || self.require_live(), || self.shutdown_submission(&transports.borrow()),
+            || self.require_live(), || self.shutdown_submission(&mut transports.borrow_mut()),
             || self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download))
     }
 
