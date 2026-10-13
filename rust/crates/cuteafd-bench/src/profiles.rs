@@ -17,7 +17,7 @@ fn planned(ids: &[&str]) -> Vec<PlannedPanel> {
     ids.iter().map(|id| PlannedPanel { id: id.to_string(), passes: 1 }).collect()
 }
 
-const SPEED: [&str; 7] = ["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "startup", "agentic"];
+const SPEED: [&str; 8] = ["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "context_load", "startup", "agentic"];
 const QUALITY: [&str; 7] = ["tool_eval", "structured", "ifeval", "code", "math", "needle", "fidelity"];
 
 /// The built-in profiles, in dialog order.
@@ -39,7 +39,7 @@ pub fn builtin() -> Vec<Profile> {
         p("quant", "Quant check", "Quality panels that move with quantization: tool eval, IFEval, math, code.",
             &["tool_eval", "ifeval", "math", "code"]),
         p("long", "Long context", "Prefill to the model maximum, decode vs retained context, needle heatmap, \
-            prefix cache.", &["prefill", "retained", "needle", "prefix_cache"]),
+            prefix cache and shared-prefix concurrency.", &["prefill", "retained", "needle", "prefix_cache", "context_load"]),
         p("reasoning", "Reasoning effort", "Accuracy, tokens and time per official reasoning level.",
             &["reasoning_effort"]),
         p("full", "Full report", "Every panel.", &[SPEED.as_slice(), QUALITY.as_slice(), &["reasoning_effort"]].concat()),

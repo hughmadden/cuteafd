@@ -53,7 +53,7 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
+PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
 
 
 def short_instance(value):
@@ -811,6 +811,12 @@ def summarize_job(job, exit_code):
             fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
         elif report.get('status') in failed or quality.get('status') in failed:
             fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
+        context_panel = next((p for p in report.get('panels', []) if p.get('id') == 'context_load'), None)
+        if context_panel:
+            records = context_panel.get('passes', [])
+            latest = records[-1] if records else {}
+            if any(p.get('status') == 'failed' for p in latest.get('points', [])):
+                fail(row, 'context_load: request or prefix-reuse failure', 'measurement')
         lossless = lossless_set_result(report)
         if lossless:
             row['lossless_set'] = lossless
@@ -1502,6 +1508,8 @@ def main():
                         '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
+    parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
@@ -1604,6 +1612,18 @@ def main():
         if not prefill_lengths or len(prefill_lengths) != len([x for x in args.prefill_lengths.split(',') if x.strip()]) \
                 or not all(256 <= x <= 1 << 20 for x in prefill_lengths):
             parser.error('--prefill-lengths takes prompt lengths in 256..1048576, e.g. 8192')
+    context_lengths = None
+    if args.context_lengths is not None:
+        parts = [x.strip() for x in args.context_lengths.split(',') if x.strip()]
+        if not parts or not all(x.isdigit() and 256 <= int(x) <= 1 << 20 for x in parts):
+            parser.error('--context-lengths takes prompt lengths in 256..1048576, e.g. 32768,131072')
+        context_lengths = [int(x) for x in parts]
+    context_levels = None
+    if args.context_levels is not None:
+        parts = [x.strip() for x in args.context_levels.split(',') if x.strip()]
+        if not parts or not all(x.isdigit() and 1 <= int(x) <= 256 for x in parts) or len(set(map(int, parts))) != len(parts):
+            parser.error('--context-levels takes distinct concurrency levels in 1..256, e.g. 1,8,16')
+        context_levels = [int(x) for x in parts]
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
         if not selection and not (levels or prefill_lengths):
@@ -1620,6 +1640,10 @@ def main():
         if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
             parser.error('--lossless-set needs --panels with spec_lossless_set')
     for card in cards:
+        if context_lengths is not None:
+            card['context_lengths'] = context_lengths
+        if context_levels is not None:
+            card['context_levels'] = context_levels
         if lossless_set:
             card['lossless_set'] = lossless_set
         if prefill_lengths:
@@ -1743,7 +1767,8 @@ def main():
     fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
-        (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else [])
+        (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
+        (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else [])
     for job in jobs[:1]:
         binary_supports(args.binary, args.repo, job, fields)
     # Everything checkable without hardware, before any queue ticket.

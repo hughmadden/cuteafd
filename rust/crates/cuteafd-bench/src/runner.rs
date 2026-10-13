@@ -38,6 +38,10 @@ pub struct RunRequest {
     /// Cases for `spec_lossless_set` (default: the shipped set).
     #[serde(default)]
     pub lossless_set: Option<panels::lossless::SetRequest>,
+    #[serde(default)]
+    pub context_lengths: Option<Vec<u64>>,
+    #[serde(default)]
+    pub context_levels: Option<Vec<usize>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +54,8 @@ pub enum StartError {
     NotReady,
     #[error("invalid lossless set: {0}")]
     InvalidSet(String),
+    #[error("invalid context-load options: {0}")]
+    InvalidContext(String),
 }
 
 /// What the progress ticker knows about the panel now running: enough to price
@@ -376,6 +382,12 @@ impl Bench {
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
         let lossless_set = request.lossless_set.clone().map(|set| set.validated()).transpose()
             .map_err(StartError::InvalidSet)?;
+        let defaults = panels::context_load::Options::default();
+        let context_load = panels::context_load::Options {
+            lengths: request.context_lengths.clone().unwrap_or(defaults.lengths),
+            levels: request.context_levels.clone().unwrap_or(defaults.levels),
+        };
+        context_load.validate().map_err(StartError::InvalidContext)?;
         let (name, planned) = match (&request.panels, &request.profile) {
             (Some(panels), _) => ("custom".to_string(),
                 panels.iter().map(|id| PlannedPanel { id: id.clone(), passes: 1 }).collect::<Vec<_>>()),
@@ -415,7 +427,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, context_load);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -430,7 +442,7 @@ impl Bench {
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
-        lossless_set: Option<panels::lossless::CaseSet>) {
+        lossless_set: Option<panels::lossless::CaseSet>, context_load: panels::context_load::Options) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -440,7 +452,7 @@ impl Bench {
             std::thread::Builder::new().name("cuteafd-bench-tick".into())
                 .spawn(move || bench.tick(&report, &progress, &done, &base)).ok()
         };
-        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref());
+        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(), &context_load);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -480,7 +492,7 @@ impl Bench {
     }
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
-        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>)
+        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>, context_load: &panels::context_load::Options)
         -> anyhow::Result<()> {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
         let record = client.discover()?;
@@ -549,7 +561,7 @@ impl Bench {
                 client.check()?;
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
-                    history: &earlier, max_context, max_output, lossless_set };
+                    history: &earlier, max_context, max_output, lossless_set, context_load };
                 let table_before = panels::common::mapped_counters(&client);
                 let thermal_mark = client.thermal_mark();
                 let outcome = panel.run(&ctx);
