@@ -54,7 +54,7 @@ if [[ ! -f "$archive" ]]; then
   mv -T "$area/.source.partial" "$area/source.tar.zst"
   grep -E '^[A-Z0-9_]+=' "$env_file" >"$area/scope.env"
   settle "$area/source.tar.zst" && settle "$area/scope.env"
-  nest seal "$area/source.tar.zst" "$area/scope.env" >/dev/null
+  nest seal -r "$area" >/dev/null  # one path per call; -r seals the area
   timeout 900 nest replicate --hosts "$host" --wait "$area" >/dev/null
   echo "export-remote: staged source on $host in $((SECONDS - started))s"
   set +e

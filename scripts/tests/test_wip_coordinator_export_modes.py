@@ -139,3 +139,13 @@ def test_remote_export_matches_the_dev_image_by_layer_content_not_local_id():
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
     assert "{{json .RootFS.Layers}}" in remote and "{{.Id}}" not in remote
     assert '{{json .RootFS.Layers}}' in _function('wip_remote_export')
+
+
+def test_remote_staging_seals_with_one_path_per_nest_call():
+    # nest seal takes a single <PATH> (-r for a tree); two paths exited 2.
+    import re
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    for line in remote.splitlines():
+        if re.search(r'\bnest seal\b', line):
+            args = [a for a in line.split('nest seal', 1)[1].split('>')[0].split() if not a.startswith('-')]
+            assert len(args) == 1, line.strip()
