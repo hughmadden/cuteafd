@@ -1395,6 +1395,8 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 #                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
+#                     PROFILE_NSYS_GPU_METRICS=0 (or 0,1) also samples those GPUs'
+#                     clocks, power and DRAM/SM activity into the same report.
 #   ncu               the coordinator runs under `ncu`, replaying the first
 #                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
 #                     required regex PROFILE_NCU_KERNEL, collecting section set
@@ -1412,7 +1414,7 @@ case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
 release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
-  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)"
+  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
 profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 [[ -z "$(get PROFILE_DIR)" ]] || { mkdir -p "$(get PROFILE_DIR)"; release_require_writable_state "$(get PROFILE_DIR)"; }

@@ -667,7 +667,7 @@ if [[ -n "${PROFILE:-}${PROFILE_DIR:-}" ]]; then
 fi
 # PROFILE=nsys|ncu wrap the coordinator (see the PROFILE comment in run-family.sh).
 release_profile_wrapper "${PROFILE:-}" "${PROFILE_DIR:-}" "$(hostname -s)" coordinator \
-  "${PROFILE_NCU_KERNEL:-}" "${PROFILE_NCU_COUNT:-}" "${PROFILE_NCU_SET:-}"
+  "${PROFILE_NCU_KERNEL:-}" "${PROFILE_NCU_COUNT:-}" "${PROFILE_NCU_SET:-}" "${PROFILE_NSYS_GPU_METRICS:-}"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
 profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 graph_census_args=()
