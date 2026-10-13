@@ -484,7 +484,11 @@ def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
     assert "HF_HOME=/hf" in coordinator
     assert "CUTEAFD_BENCH_DIR=/run/cuteafd/bench" in coordinator
     # Dashboard fidelity reuses the host's verified reference cache (no re-download).
-    assert "/.cache/cuteafd/fidelity:/tmp/cuteafd-home/.cache/cuteafd/fidelity" in coordinator
+    assert "/.cache/cuteafd/fidelity:/run/cuteafd/fidelity" in coordinator
+    assert "CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity" in coordinator
+    # Nothing may be bind-mounted under the container HOME: Docker would create
+    # root-owned parents there, and the non-root coordinator's placement handoff fails.
+    assert ":/tmp/cuteafd-home/" not in coordinator
     worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
     assert 'id -u' in worker and 'id -g' in worker
     assert 'release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; docker run -d' in worker or ('release_serving_docker_args; cuteafd_cdi_gpu_args all' in worker and 'docker run -d' in worker)

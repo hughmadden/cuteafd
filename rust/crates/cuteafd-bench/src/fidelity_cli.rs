@@ -203,8 +203,10 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         .or_else(|| explicit.then(|| crate::fidelity_dataset::default_publication(model)).flatten());
     let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source_with(args, publication)? {
         crate::fidelity_dataset::ensure_valid_publication(repo, commit, config)?;
-        let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
-            std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
+        // CUTEAFD_FIDELITY_CACHE lets a serving container share the host's verified cache.
+        let cache = args.dataset_cache.clone()
+            .or_else(|| std::env::var_os("CUTEAFD_FIDELITY_CACHE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
         let (reference, digest, identity) = crate::fidelity_dataset::download(&agent, &cache, repo, commit, config)?;
         (reference, digest, Some(identity))
     } else if let Some(path) = &args.reference {
