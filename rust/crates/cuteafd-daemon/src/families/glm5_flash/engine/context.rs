@@ -113,6 +113,9 @@ impl<'a> GlmfContextSplit<'a> {
         let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [String; 2])> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
+                // The one row-independent split-plan choice (lossless speculation). Interim GLMF pin:
+                // becomes the shared row-independent choice when work/context-split-lossless lands
+                // in shared/peer_split/context.rs.
                 let partial = [0, cfg.heads / 2].map(|begin| partial_programs(manifest, "glmf", begin, DECODE_ROWS, sms)
                     .map(|variants| pick_partial(&variants, PARTIAL_ROWS).to_string()));
                 let [a, b] = partial;
