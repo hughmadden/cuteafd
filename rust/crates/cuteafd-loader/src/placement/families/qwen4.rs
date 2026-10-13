@@ -590,11 +590,11 @@ mod tests {
         }
         let packages = [dir.path().join("rtx-tp2-rank0"), dir.path().join("rtx-tp2-rank1")];
         for (rank, width) in [384, 256].into_iter().enumerate() {
-            for capacity in [1, 16] {
+            for capacity in [1, 16, 80] {
                 let path = packages[rank].join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path).unwrap();
                 let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false},
                         "state": {"allocation": "state", "bytes": 16, "zero_on_create": true}}});
@@ -602,11 +602,16 @@ mod tests {
             }
         }
         assert_eq!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 16).unwrap(),
-            [16 * 384 + 2 * (32 + 16) + 17 * 2560 * 2 + 16 * 2560 * 4,
-             16 * 256 + 2 * (32 + 16) + 17 * 2560 * 2 + 16 * 2560 * 4]);
+            [80 * 384 + 3 * (32 + 16) + 97 * 2560 * 2 + 16 * 2560 * 4,
+             80 * 256 + 3 * (32 + 16) + 97 * 2560 * 2 + 16 * 2560 * 4]);
         assert!(dual_expert_workspace(&catalog, [packages[1].as_path(), packages[0].as_path()], 16).is_err());
-        assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 17).is_err());
+        assert_eq!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 17).unwrap(),
+            [80 * 384 + 3 * (32 + 16) + 97 * 2560 * 2 + 17 * 2560 * 4,
+             80 * 256 + 3 * (32 + 16) + 97 * 2560 * 2 + 17 * 2560 * 4]);
+        assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 81).is_err());
         assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 4097).is_err());
+        std::fs::remove_file(packages[1].join("m80/v41_exl3.json")).unwrap();
+        assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 16).is_err());
         let mut config = config;
         config["quantization_config"] = serde_json::json!({"quant_method": "modelopt", "quant_algo": "NVFP4",
             "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}});
