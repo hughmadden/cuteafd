@@ -55,7 +55,7 @@ CHECKPOINT_CONTEXTS = {
 # ``geometry``. Prefill programs and the FP8-only ``kda_w8*`` programs are never built with them. OFF exports
 # every program as before.
 GLMF_KDA_DECODE_AB = True
-GLMF_KDA_DECODE_AB_OPTIONS = {"seq_ctas": 8, "decode_tiles": True}
+GLMF_KDA_DECODE_AB_OPTIONS = {"decode_tiles": True}
 
 
 def glmf_kda_decode_options(fp8) -> dict:
