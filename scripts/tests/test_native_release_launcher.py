@@ -112,8 +112,8 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
-            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state)', source)
-            self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
+            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
+            self.assertIn('docker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
             self.assertIn(':/run/cuteafd/bench', source)
@@ -121,7 +121,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
         self.assertEqual(FAMILY.read_text().count('-v "$USAGE_DIR:/run/cuteafd/usage"'), 1)
         self.assertIn('shared_api_state', v41_source())
         v41 = v41_source().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
-        self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+        self.assertIn('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
 
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))

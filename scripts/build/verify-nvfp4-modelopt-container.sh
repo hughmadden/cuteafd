@@ -31,7 +31,9 @@ docker_args=(
   --entrypoint python
 )
 if [ -n "$gpus" ] && [ "$gpus" != "none" ]; then
-  docker_args+=(--gpus "$gpus")
+  source "$repo_root/scripts/lib/cdi-gpus.sh"
+  cuteafd_cdi_gpu_args "$gpus" || exit 2
+  docker_args+=("${CUTEAFD_CDI_ARGS[@]}")
 fi
 
 docker "${docker_args[@]}" "$image" \

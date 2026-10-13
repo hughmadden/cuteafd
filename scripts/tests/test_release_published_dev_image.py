@@ -108,6 +108,7 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     for name in ('select-dev-image.py', 'dev-toolchain.py', 'install-dev-cache-tools.sh', 'build-caches.sh'):
         (staging/'scripts/build'/name).write_bytes((ROOT/'scripts/build'/name).read_bytes())
     (staging/'scripts/build/verify-sparkinfer-source.py').write_text('')
+    (staging/'scripts/lib').mkdir(parents=True); (staging/'scripts/lib/cdi-gpus.sh').write_text('')
     (staging/'docker').mkdir()
     for name in ('Dockerfile.dev', 'entrypoint.sh'):
         (staging/'docker'/name).write_bytes((ROOT/'docker'/name).read_bytes())
@@ -187,6 +188,7 @@ def test_wip_missing_default_images_select_on_both_hosts(tmp_path, mode):
         (staging/'scripts/build'/name).write_bytes((ROOT/'scripts/build'/name).read_bytes())
     # This fixture writes under pytest's isolated temporary directory, not NVMe.
     (staging/'scripts/build/assert-build-filesystem.py').write_text('')
+    (staging/'scripts/lib').mkdir(parents=True); (staging/'scripts/lib/cdi-gpus.sh').write_text('')
     for name in ('Dockerfile.dev', 'entrypoint.sh'):
         (staging/'docker'/name).write_bytes((ROOT/'docker'/name).read_bytes())
     (staging/'.dockerignore').write_text('')

@@ -20,6 +20,7 @@
 # 10.55.0.5-8 to 10.55.1.1-4 since v9, so the glmrt config is rewritten.
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "$repo/scripts/lib/cdi-gpus.sh"
 glmrt="${GLMRT_RELEASE:-$HOME/Developer/glmrt-release}"
 py="${PYTHON:-$HOME/Developer/cuteafd-work/.venv/bin/python}"
 export HF_HOME="${HF_HOME:-/mnt/sparknest/hf-home}"
@@ -102,7 +103,8 @@ case "${1:-}" in
     docker rm -f cuteafd-coordinator >/dev/null
     peers=10.55.0.1:19461,10.55.0.2:19461,10.55.0.3:19461,10.55.0.4:19461
     golden_run() {
-      docker run --rm --gpus device=0 --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
+      cuteafd_cdi_gpu_args 0 || exit 2
+      docker run --rm "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
         -v "$build:$build:ro" -v "$golden:$golden:ro" -v /mnt/sparknest:/mnt/sparknest:ro -e RUST_LOG=warn \
         --entrypoint bash "$p7" -c "export LD_LIBRARY_PATH=\$(python -m cutlass.cute.export.aot_config --libdir 2>/dev/null):\$LD_LIBRARY_PATH; \
         $build/target/release/cuteafd glm-golden --snapshot $hub/$k4 --native-lib $build/coord/native/libcuteafd_native.so \

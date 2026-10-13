@@ -89,7 +89,7 @@ def test_build_takes_a_cpu_lock_and_only_guards_its_export_gpus():
     # UUID, watches it, and cleans its container up inline (the old cleanup rode
     # on the lock helper's traps).
     assert 'export_gpu_pick="$(release_select_idle_export_gpu)" || exit 2' in build
-    assert '--gpus "device=$export_gpu_uuid"' in build
+    assert 'cuteafd_cdi_gpu_args "$export_gpu_uuid"' in build and '--gpus' not in build
     assert '-e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid"' in build
     assert 'release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &' in build
     assert 'timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container"' in build

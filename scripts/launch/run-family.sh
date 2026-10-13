@@ -11,6 +11,7 @@ set -euo pipefail
 launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/cdi-gpus.sh"
 config="$repo_root/cuteafd.config"
 restart=0
 restart_all=0
@@ -501,11 +502,7 @@ if ((topology_explicit)); then
     spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
   fi
 fi
-if ((RELEASE_RTX_GPUS == 2)); then
-  gpu_request="\"device=$gpu_uuid_csv\""
-else
-  gpu_request="device=$gpu_uuid_csv"
-fi
+cuteafd_cdi_gpu_args "$gpu_uuid_csv" || exit 2
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
 wip_layout=""
@@ -576,12 +573,19 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
 wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
+wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
+[[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
+[[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
+wip_cp() { # slot files come from the container when it exists, else from the WIP root
+  if docker container inspect "$wip_spark_container" >/dev/null 2>&1; then docker cp "$wip_spark_container:/wip/$1" "$2"
+  else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
+}
 [[ "$exl3_family" == __none__ ]] && exl3_family=
 # Every failure names the host and the check: this block runs over SSH, so a
 # bare nonzero exit would otherwise surface as an unexplained transport error.
@@ -612,19 +616,19 @@ fi
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
-  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
-    die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container"
-  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
+  wip_cp "slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
+    die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container or $wip_root_arg"
+  wip_cp "slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
   mkdir -p "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
   mv "$layout.tmp/raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
   [[ ! -d "$layout.tmp/raw/exl3" ]] || mv "$layout.tmp/raw/exl3" "$layout.tmp/lib/exl3"
   mv "$layout.tmp/raw/"* "$layout.tmp/share/"
   mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
-  slot_source="$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace"
-  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  slot_source="slots/$wip_slot/spark-expert/workspace"
+  wip_cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  wip_cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  wip_cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
   python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json" >&2 || die "slot SparkInfer verification failed"
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
@@ -665,14 +669,15 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        docker exec -i "$wip_spark_container" python3 - "$wip_slot" "${expert_format:-native}" "$spark_tp_roles_required" <<'PY'
+        "if docker container inspect '$wip_spark_container' >/dev/null 2>&1; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
 slot = sys.argv[1]
-root = pathlib.Path('/wip/slots') / slot / 'spark-expert'
+root = pathlib.Path(os.environ.get('WIP_SLOTS', '/wip/slots')) / slot / 'spark-expert'
 try:
     meta_bytes = (root / 'META.json').read_bytes()
     assert hashlib.sha256(meta_bytes).hexdigest() == (root / 'FINGERPRINT').read_text().strip(), 'metadata fingerprint mismatch'
@@ -895,7 +900,7 @@ if ((topology_explicit)); then
 fi
 [[ -z "$placement_directory" ]] || args+=(--placement-directory "$placement_directory")
 release_serving_docker_args
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no --gpus "$gpu_request" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
@@ -950,7 +955,7 @@ for i in "${!hosts[@]}"; do
   # PROFILE switches (absent unless set) and the shared worker environment.
   release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$host"
   remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}")
-  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state); export -f release_serving_docker_args release_require_writable_state; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
+  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
 # Defaults keep a legacy invocation (ten positional arguments) valid.
@@ -995,7 +1000,8 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+cuteafd_cdi_gpu_args all || exit 2
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -1597,7 +1603,7 @@ if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
-gpus="device=$gpu"
+gpus="$gpu"
 head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
   [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
@@ -1608,7 +1614,7 @@ if [[ -n "$second" && "$split" != off ]]; then
         { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
     done
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
-    gpus="\"device=$lower,$upper\""
+    gpus="$lower,$upper"
     head_split=1
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
   elif [[ "$explicit_split" != 1 ]]; then
@@ -2215,10 +2221,17 @@ if [[ -n "$wip_slot" ]]; then
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" <<'STAGE' ||
+    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
 set -euo pipefail
 slot="$1" image="$2" pinned="$3"
 container="$4" layout_slot="$5"
+wip_root_arg="${6:-__default__}"; wip_instance_arg="${7:-__none__}"
+[[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
+[[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
+wip_cp() { # slot files come from the container when it exists, else from the WIP root
+  if docker container inspect "$container" >/dev/null 2>&1; then docker cp "$container:/wip/$1" "$2"
+  else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
+}
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   registry="${image%%/*}"
   [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || { echo "missing local dev image $image" >&2; exit 1; }
@@ -2226,18 +2239,18 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
-docker cp "$container:/wip/slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
-docker cp "$container:/wip/slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
+wip_cp "slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
+wip_cp "slots/$slot/spark-expert/workspace/docker/release-entrypoint.sh" "$raw/"
 mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
 mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
 [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
 [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
 mv "$raw/"* "$layout.tmp/share/"
 mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
-slot_source="$container:/wip/slots/$slot/spark-expert/workspace"
-docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
-docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
-docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+slot_source="slots/$slot/spark-expert/workspace"
+wip_cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+wip_cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+wip_cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
 python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
   --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
 rm -rf "$raw" "$layout" && mv "$layout.tmp" "$layout"
@@ -2265,7 +2278,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   worker_profile="" worker_prep=""
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
-  ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state); release_serving_docker_args; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
+  ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info ${shared_worker_env_args[*]}$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
@@ -2323,7 +2336,8 @@ for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
   [[ -z "${!key:-}" ]] || tp2_env_args+=(-e "$key=${!key}")
 done
 release_serving_docker_args
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
+cuteafd_cdi_gpu_args "$gpus" || exit 2
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \

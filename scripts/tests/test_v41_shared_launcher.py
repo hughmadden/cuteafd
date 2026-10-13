@@ -5,7 +5,7 @@ path (scripts/tests/v41_launch_capture.py, before #82). Today's launcher must
 start the same coordinator and Spark containers for every V4.1 example config
 and the gate kit's v41-flash-max/min: the same options, mounts, environment,
 image and serve command. The only differences allowed are the intended
-additions listed in INTENDED: shared launch features that now reach V4.1 at
+additions listed in INTENDED and the legacy GPU-request conversion to CDI: shared launch features that now reach V4.1 at
 their defaults, with no V4.1 code.
 """
 from __future__ import annotations
@@ -75,7 +75,15 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         before, after = parse_run(old["argv"]), parse_run(new["argv"])
         role = "coordinator" if old["host"] == "raptor" else "worker"
         where = f"{case} {old['host']}"
-        assert after["options"] == before["options"], where
+        expected_options = []
+        for option in before["options"]:
+            if option.startswith("--gpus "):
+                request = option.removeprefix("--gpus ").strip('"')
+                names = request.removeprefix("device=").split(",")
+                expected_options.extend(f"--device nvidia.com/gpu={name}" for name in names)
+            else:
+                expected_options.append(option)
+        assert after["options"] == sorted(expected_options), where
         # shared_thermal_args also mounts the host power governor's state read-only
         # when gpu-powerd runs on this host (#114).
         governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []

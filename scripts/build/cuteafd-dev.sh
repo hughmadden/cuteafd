@@ -95,14 +95,18 @@ mapfile -t compiler_cache_args <<<"$cache_plan"
 docker_args+=("${compiler_cache_args[@]}")
 
 if [[ "$role" == "expert" || "$role" == "spark" ]]; then
-  docker_args+=(--gpus all)
+  source "$repo_root/scripts/lib/cdi-gpus.sh"
+  cuteafd_cdi_gpu_args all || exit 2
+  docker_args+=("${CUTEAFD_CDI_ARGS[@]}")
 elif [[ "$role" != cpu ]]; then
   source "$repo_root/scripts/lib/release-common.sh"
   release_load_config "${CUTEAFD_CONFIG:-$repo_root/cuteafd.config}"
   release_need nvidia-smi
   release_resolve_coordinator_gpu_identity
+  source "$repo_root/scripts/lib/cdi-gpus.sh"
+  cuteafd_cdi_gpu_args "$RELEASE_COORDINATOR_GPU_UUID" || exit 2
   docker_args+=(
-    --gpus device="$RELEASE_COORDINATOR_GPU_UUID"
+    "${CUTEAFD_CDI_ARGS[@]}"
     -e CUDA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )

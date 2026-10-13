@@ -235,12 +235,12 @@ release_ssh() {
 # host key is still checked under HOST's own name.
 release_bulk_ssh_opts=(-c aes128-gcm@openssh.com -o Compression=no)
 # release_gpu_device_args UUID: the docker run arguments that expose one GPU.
-# The one place a container's GPU binding is spelled, so a switch to CDI
-# (--device nvidia.com/gpu=UUID) changes only this function.
+# The one place a container's GPU binding is spelled; it is CDI (see cdi-gpus.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/cdi-gpus.sh"
 release_gpu_device_args() {
-  printf '%s\n' --gpus "device=$1"
+  cuteafd_cdi_gpu_args "$1" || return 1
+  printf '%s\n' "${CUTEAFD_CDI_ARGS[@]}"
 }
-
 # release_host_has_rdma HOST: HOST has at least one RDMA device (RoCE fabric).
 release_host_has_rdma() {
   release_ssh "$1" 'ls /sys/class/infiniband 2>/dev/null | grep -q .'
@@ -1854,15 +1854,34 @@ REMOTE
   fi
 }
 
+# A sealed slot is files under the WIP root (the persistent container only bind-mounts
+# it at /wip), so staging reads the root directly when the builder container is gone.
+release_wip_host_root() {
+  printf '%s' "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+}
+
+# release_wip_cp CONTAINER HOST_ROOT PATH_UNDER_/wip DEST: docker cp while the builder
+# container exists, else a plain copy from the same path under HOST_ROOT.
+release_wip_cp() {
+  local container="$1" root="$2" rel="$3" dest="$4"
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    docker cp "$container:/wip/$rel" "$dest"
+  else
+    [[ -e "$root/${rel%/.}" ]] || return 1
+    cp -a "$root/$rel" "$dest"
+  fi
+}
+
 release_stage_wip_layout() {
   local container="$1" slot="$2" role="$3" layout="$4"
-  local raw="$layout.tmp/raw"
-  docker container inspect "$container" >/dev/null 2>&1 ||
-    release_die "WIP container $container is missing; build the slot with ./wip.sh first"
+  local raw="$layout.tmp/raw" root
+  root="$(release_wip_host_root)"
+  [[ -d "$root/slots/$slot/$role" ]] || docker container inspect "$container" >/dev/null 2>&1 ||
+    release_die "WIP slot $slot is not under $root and $container is missing; build the slot with ./wip.sh first"
   rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
-  docker cp "$container:/wip/slots/$slot/$role/workspace/.cuteafd-wip/." "$raw/" ||
-    release_die "WIP slot $slot has no $role artifacts in $container"
-  docker cp "$container:/wip/slots/$slot/$role/workspace/docker/release-entrypoint.sh" "$raw/" ||
+  release_wip_cp "$container" "$root" "slots/$slot/$role/workspace/.cuteafd-wip/." "$raw/" ||
+    release_die "WIP slot $slot has no $role artifacts in $container or $root"
+  release_wip_cp "$container" "$root" "slots/$slot/$role/workspace/docker/release-entrypoint.sh" "$raw/" ||
     release_die "WIP slot $slot lacks docker/release-entrypoint.sh"
   mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
@@ -1870,10 +1889,10 @@ release_stage_wip_layout() {
   [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
   mv "$raw/"* "$layout.tmp/share/"
   mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
-  local slot_source="$container:/wip/slots/$slot/$role/workspace"
-  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  local slot_source="slots/$slot/$role/workspace"
+  release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
   python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
   rm -rf "$raw" "$layout"

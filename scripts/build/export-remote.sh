@@ -69,11 +69,13 @@ rm -rf "$root"; mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
 placement="$root/src/scripts/build/export-placement.py"
 python3 "$root/src/scripts/build/assert-build-filesystem.py" "$root"
+grep -Eq "name:[[:space:]]*\"?all\"?[[:space:]]*\$" /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null ||
+  { echo "export-remote: no CDI device nvidia.com/gpu=all on $(hostname); run: sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml" >&2; exit 2; }
 read -r cap jobs baseline < <(python3 "$placement" admit --smi "$smi" --gpu 0) || exit "$NO_TURN"
 echo "export-remote: admitted cap ${cap} MiB, ${jobs} jobs, device ${baseline} MiB in use"
 status=0
 python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --baseline-mib "$baseline" -- \
-  docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+  docker run --rm --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" \
     -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" \
     --env-file "$area/scope.env" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
     -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \

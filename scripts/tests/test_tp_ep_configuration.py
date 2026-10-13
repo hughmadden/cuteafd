@@ -674,7 +674,7 @@ v41_fp8_head_args=()
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
-        harness = 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
+        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1", "4096",
              "107374182400", "19441", "snapshot", "fingerprint", "3", "4", "1", "2", "2"],
@@ -1640,8 +1640,10 @@ release_die() { echo "die: $*" >&2; exit 1; }
 release_ssh() {
   [[ "$1" == -o ]]; shift 2
   host="$1"; shift
-  [[ "$1" == docker && "$2" == exec && "$3" == -i && "$5" == python3 ]]
-  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",*sys.argv[2:]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7" "$8" "$9"
+  # The remote command runs the guard in the builder container when it exists, else on the WIP root.
+  [[ "$1" == *"docker exec -i 'wip-test' python3 - "* && "$1" == *"WIP_SLOTS="* ]]
+  read -r -a w <<<"$(tr -d "'" <<<"$1")"
+  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",*sys.argv[2:]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "${w[-4]}" "${w[-3]}" "${w[-2]%;}"
 }
 hosts=(h0 h1 h2)
 spark_tp=3

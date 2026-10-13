@@ -83,7 +83,7 @@ def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
     assert 'smi=/usr/lib/wsl/lib/nvidia-smi' in remote
     admit = remote.index('"$placement" admit --smi "$smi"')
-    container = remote.index('docker run --rm --gpus all --user')
+    container = remote.index('docker run --rm --device nvidia.com/gpu=all --user')
     assert admit < container  # admission precedes the export container
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.
@@ -110,7 +110,8 @@ esac
         (bindir / tool).chmod(0o755)
     common = (ROOT / 'scripts/lib/release-common.sh').read_text()
     helper = common[common.index('release_gpu_device_args() {'):common.index('\n}\n', common.index('release_gpu_device_args() {')) + 3]
-    script = helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
+    cdi = (ROOT / 'scripts/lib/cdi-gpus.sh').read_text()
+    script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
 wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
 '''
@@ -120,7 +121,7 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     assert result.returncode == 0, result.stdout + result.stderr
     calls = trace.read_text()
     run = next(line for line in calls.splitlines() if line.startswith('docker run'))
-    assert '--gpus device=GPU-one' in run and '--volumes-from wipc' in run
+    assert '--device nvidia.com/gpu=GPU-one' in run and '--gpus' not in run and '--volumes-from wipc' in run
     assert '-e CUTEAFD_WIP_DSV4_AOT=ON' in run and '-e CUTEAFD_WIP_EXPERT_FAMILIES=a;b' in run
     assert 'docker exec cid123 /wip/source/scripts/build/build-wip-artifacts.sh' in calls and calls.rstrip().endswith('rm -f cid123')
     assert 'capped on gpu1' in result.stdout
