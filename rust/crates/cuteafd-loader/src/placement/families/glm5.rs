@@ -615,8 +615,12 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
             .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing trellis LUT asset name"))?;
         anyhow::ensure!(directory.join(lut).is_file(), "GLM TP2 missing trellis LUT in {}", directory.display());
         if value["direct"].as_bool() != Some(true) {
-            for file in ["v41_exl3_routes.json", "libv41_exl3_routes.so"] {
-                anyhow::ensure!(directory.join(file).is_file(), "GLM TP2 missing {file} in {}", directory.display());
+            let route = value["route_preparation"]["manifest"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing packed route export manifest"))?;
+            let route_manifest = directory.join(route);
+            // Match Exl3Execution: route assets live beside the declared manifest.
+            for asset in [route_manifest.clone(), route_manifest.parent().unwrap().join("libv41_exl3_routes.so")] {
+                anyhow::ensure!(asset.is_file(), "GLM TP2 missing route asset {}", asset.display());
             }
         }
         // Runtime separately attests ELF geometry and LUT hashes before execution.
@@ -1053,6 +1057,7 @@ mod tests {
             let value = json!({"hidden": 6144, "intermediate": 1024, "experts": 256,
                 "top_k": 8, "capacity": capacity, "bits": [4, 5], "output_dtype": "fp32",
                 "input_format": "e4m3_k32", "direct": false,
+                "route_preparation": {"manifest": "routes/v41_exl3_routes.json"},
                 "trellis_lut": {"file": "lut.bin", "bytes": 32}, "buffers": {
                     "scratch": {"allocation": "scratch", "bytes": capacity * 64,
                         "dtype": "f32", "zero_on_create": false},
@@ -1060,7 +1065,8 @@ mod tests {
                         "dtype": "i32", "zero_on_create": true}}});
             std::fs::write(package.join("v41_exl3.json"), serde_json::to_vec(&value).unwrap()).unwrap();
             // Header-only fixtures do not attest or execute these stand-in assets.
-            for file in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+            std::fs::create_dir_all(package.join("routes")).unwrap();
+            for file in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
                 std::fs::write(package.join(file), b"").unwrap();
             }
         }
@@ -1183,7 +1189,7 @@ mod tests {
             assert!(error.to_string().contains("capacity/geometry/tiers/output mismatch"), "{field}: {error:#}");
         }
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-        for asset in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+        for asset in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
             std::fs::remove_file(package.join(asset)).unwrap();
             let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
             assert!(error.to_string().contains("missing"), "{asset}: {error:#}");
@@ -1192,6 +1198,29 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
         let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
         assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
+    }
+
+    #[test]
+    fn local_inventory_resolves_declared_route_assets() {
+        use serde_json::json;
+        let (dir, catalog, manifest) = local_fixture();
+        let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2/m16");
+        let path = package.join("v41_exl3.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(package.join("routes"), package.join("packed")).unwrap();
+        value["route_preparation"]["manifest"] = json!("packed/v41_exl3_routes.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
+
+        value["route_preparation"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+        assert!(error.to_string().contains("missing packed route export manifest"), "{error:#}");
+
+        value["direct"] = json!(true);
+        std::fs::remove_dir_all(package.join("packed")).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
     }
 
     fn nvfp4_checkpoint_tensors() -> Vec<crate::plan::testing::Tensor> {
