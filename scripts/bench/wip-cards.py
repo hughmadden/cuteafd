@@ -448,7 +448,10 @@ def ready_log(job):
 
 
 def admitted_pool(text):
-    values = re.findall(r'\b(?:admitted_pool_tokens|admitted_tokens|pool_tokens)\s*=\s*(\d+)', ANSI.sub('', text))
+    # key=value forms, and GLM's admission line ("...; pool 2097152 tokens").
+    values = re.findall(r'\b(?:admitted_pool_tokens|admitted_tokens|pool_tokens)\s*=\s*(\d+)|\bpool (\d+) tokens\b',
+                        ANSI.sub('', text))
+    values = [a or b for a, b in values]
     if not values:
         raise ValueError('ready.log has no admitted pool value')
     return int(values[-1])

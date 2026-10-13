@@ -489,6 +489,7 @@ def test_summary_medians_paired_not_ratio_of_medians():
 
 def test_pool_precheck_and_red_square():
     assert cards.admitted_pool('\x1b[3madmitted_pool_tokens\x1b[0m=1048576') == 1048576
+    assert cards.admitted_pool('GLM admission placement=attention context; pool 2097152 tokens, 64 sequences') == 2097152
     png = cards.base64.b64decode(cards.red_square().split(',')[1])
     assert cards.struct.unpack('>II', png[16:24]) == (224, 224)
 
