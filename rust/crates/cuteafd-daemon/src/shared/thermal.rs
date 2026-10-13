@@ -11,15 +11,15 @@
 //! GPUs: the devices this process's CUDA context can see (NVML sees every
 //! device the container exposes; `CUDA_VISIBLE_DEVICES` names the coordinator's
 //! by UUID or index).
-//! A host power governor (`scripts/host/gpu-power-governor`) may publish its
-//! state in `CUTEAFD_POWER_GOVERNOR_STATE` (default
-//! `/run/gpu-power-governor/state.json`); when the file is readable, the report
-//! carries it as `governor`.
+//! A host power daemon (gpu-powerd, github.com/tpurtell/gpu-powerd) may publish
+//! its state in `CUTEAFD_POWER_GOVERNOR_STATE` (default
+//! `/run/gpu-powerd/state.json`); when the file is readable, the report carries
+//! it as `governor`.
 use cuteafd_core::thermal;
 use std::time::{Duration, Instant};
 
 const LOG_EVERY: Duration = Duration::from_secs(30);
-const STATE_FILE: &str = "/run/gpu-power-governor/state.json";
+const STATE_FILE: &str = "/run/gpu-powerd/state.json";
 
 /// Which NVML devices to sample: those named by `CUDA_VISIBLE_DEVICES` (UUIDs or
 /// indices), else all.
