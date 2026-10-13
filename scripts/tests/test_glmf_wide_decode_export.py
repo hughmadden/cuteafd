@@ -145,10 +145,12 @@ def test_the_wide_programs_are_new_m128_stems(exporter):
 def test_the_wide_programs_keep_the_decode_routes(exporter):
     calls = {stem: thunk() for stem, _, _, thunk in exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 131072)}
     kwargs = {stem: call[3] for stem, call in calls.items()}
-    assert kwargs["kda_m128"] == {"max_rows": 128, "fp8": True}
+    # The BF16-projection decode KDA programs take the A/B options while the switch is on (below).
+    ab = exporter.glmf_kda_decode_options(True)
+    assert kwargs["kda_m128"] == {"max_rows": 128, "fp8": True, **ab}
     assert kwargs["kda_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["kda_s16_m128"] == {"max_rows": 128, "fp8": True, "state_dtype": "bfloat16",
-                                      "state_rounding": "window"}
+                                      "state_rounding": "window", **ab}
     assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
     # The 128-row bucket keeps one split where the planner would split it maximally.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
@@ -164,6 +166,43 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
         assert kwargs[stem] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i2048_m128"] == {"inter": 2048, "max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i12288_m128"] == {"inter": 12288, "max_rows": 128, "fp8_only": "decode"}
+
+
+def test_the_kda_ab_switch_reaches_only_the_bf16_decode_kda_programs(exporter, monkeypatch):
+    """GLMF_KDA_DECODE_AB (ON in this branch): ``seq_ctas`` and ``decode_tiles`` go to ``kda_m*`` and
+    ``kda_s16_m*`` at the decode and wide decode rows (and, through the shared builder call, the head
+    split's ``kda_m64``), are recorded in their manifest params, and reach no prefill, ``kda_w8*`` or
+    other program; OFF passes none and leaves every other call as it is."""
+    options = {"seq_ctas": 8, "decode_tiles": True}
+    assert exporter.GLMF_KDA_DECODE_AB is True and exporter.GLMF_KDA_DECODE_AB_OPTIONS == options
+    assert exporter.glmf_kda_decode_options(True) == options
+    assert exporter.glmf_kda_decode_options("prefill") == exporter.glmf_kda_decode_options(False) == {}
+
+    def calls(make=None):
+        work = make(GEOMETRY, 64, 4096, 131072) if make else (
+            exporter.glmf_programs(GEOMETRY, 64, 4096, 131072)
+            + exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 131072))
+        found = {stem: (params, thunk()[3]) for stem, _, params, thunk in work}
+        assert len(found) == len(work)
+        return found
+
+    def optioned(found):
+        for stem, (params, kwargs) in found.items():
+            assert {k: params.get(k) for k in options} == {k: kwargs.get(k) for k in options}, stem
+        return {stem for stem, (params, _) in found.items() if set(options) & set(params)}
+
+    on = calls()
+    assert optioned(on) == {"kda_m64", "kda_s16_m64", "kda_m128", "kda_s16_m128"}
+    for stem in optioned(on):
+        assert {k: on[stem][0][k] for k in options} == options and on[stem][1]["fp8"] is True
+    assert optioned(calls(exporter.glmf_head_split_programs)) == {"kda_m64"}
+    monkeypatch.setattr(exporter, "GLMF_KDA_DECODE_AB", False)
+    off = calls()
+    assert set(off) == set(on) and optioned(off) == set()
+    assert optioned(calls(exporter.glmf_head_split_programs)) == set()
+    for stem, (params, kwargs) in on.items():
+        strip = lambda d: {k: v for k, v in d.items() if k not in options}  # noqa: E731
+        assert (strip(params), strip(kwargs)) == off[stem], stem
 
 
 def test_no_wide_programs_unless_wider_than_the_decode_programs(exporter):

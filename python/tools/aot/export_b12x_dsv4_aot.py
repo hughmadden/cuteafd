@@ -46,6 +46,24 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+# A/B switch (this branch only; the upstream form is undecided). ON builds GLM 5.3 Flash's decode KDA programs
+# over BF16 projections (``kda_m*`` and ``kda_s16_m*`` at the decode and wide decode rows; the glmf2 head split's
+# ``kda_m*`` shares the builder call) with ``GLMF_KDA_DECODE_AB_OPTIONS``: the token-sequential recurrence over 8
+# CTAs per head block (``seq_ctas``) and the BF16 projections' TMA tiles picked by live rows (``decode_tiles``;
+# SparkInfer has a tile table for the full-head weight shapes only). Stems, operands, scalars and scratch are
+# unchanged, so the daemon needs no change; the options are recorded in each program's manifest ``params`` and
+# ``geometry``. Prefill programs and the FP8-only ``kda_w8*`` programs are never built with them. OFF exports
+# every program as before.
+GLMF_KDA_DECODE_AB = True
+GLMF_KDA_DECODE_AB_OPTIONS = {"seq_ctas": 8, "decode_tiles": True}
+
+
+def glmf_kda_decode_options(fp8) -> dict:
+    """Extra ``compile_glmf_kda_aot`` arguments of a KDA program built with this ``fp8``: the A/B options for a
+    decode program over BF16 projections (``fp8=True``) while ``GLMF_KDA_DECODE_AB`` is on, else none."""
+    return dict(GLMF_KDA_DECODE_AB_OPTIONS) if GLMF_KDA_DECODE_AB and fp8 is True else {}
+
+
 def geometry_context(name: str, requested: int) -> int:
     if requested <= 0:
         raise ValueError("max_context must be positive")
@@ -314,8 +332,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
              lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
-            (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
+            (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8, **glmf_kda_decode_options(f8)},
+             lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f, **glmf_kda_decode_options(f))),
             (f"kda_w8_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only=m)),
             (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8_only": mode},
@@ -338,9 +356,11 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     for rows, f8, tag, rounding in ((decode_rows, True, "s16", "window"), (prefill_rows, "prefill", "s16", "window"),
                                     (prefill_rows, "prefill", "s16t", "tile")):
         out.append((f"kda_{tag}_m{rows}", "kda",
-                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding},
+                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding,
+                     **glmf_kda_decode_options(f8)},
                     lambda r=rows, f=f8, sr=rounding: glmf.compile_glmf_kda_aot(
-                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr)))
+                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr,
+                        **glmf_kda_decode_options(f))))
     out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
                 lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
     # Both: the compact index cache's commit (state and index tails in one launch) over a BF16 state.
@@ -376,12 +396,14 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode="decode")),
         (f"mhc_post_pre_m{r}", "mhc_post_pre", {"max_rows": r, "route": "decode"},
          lambda: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route="decode")),
-        (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True},
-         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True)),
+        (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True, **glmf_kda_decode_options(True)},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, **glmf_kda_decode_options(True))),
         (f"kda_w8_m{r}", "kda", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only="decode")),
-        (f"kda_s16_m{r}", "kda", {"max_rows": r, "fp8": True, "state_dtype": "bfloat16", "state_rounding": "window"},
-         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window")),
+        (f"kda_s16_m{r}", "kda", {"max_rows": r, "fp8": True, "state_dtype": "bfloat16", "state_rounding": "window",
+                                  **glmf_kda_decode_options(True)},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window",
+                                           **glmf_kda_decode_options(True))),
         (f"mla_producer_m{r}", "mla_producer", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},
