@@ -303,6 +303,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     # above; prefill W8A8 on ``fp8_rows`` bits (1 in-projection, 2 o_proj), else W8A16.
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         f8 = True if mode == "decode" else "prefill"
+        kda_decode = {"seq_ctas": 8, "decode_tiles": True} if mode == "decode" else {}
         # Prefill mHC mixes run on TF32 tensor cores (split FP32 fn) from 384 rows.
         route = None if mode == "decode" else "tf32"
         out += [
@@ -314,8 +315,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
              lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
-            (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
+            (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8, **kda_decode},
+             lambda r=rows, f=f8, kd=kda_decode: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f, **kd)),
             (f"kda_w8_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only=m)),
             (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8_only": mode},
@@ -337,10 +338,11 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     # tile). New stems: the FP32 programs above, and their objects, are unchanged.
     for rows, f8, tag, rounding in ((decode_rows, True, "s16", "window"), (prefill_rows, "prefill", "s16", "window"),
                                     (prefill_rows, "prefill", "s16t", "tile")):
+        kda_decode = {"seq_ctas": 8, "decode_tiles": True} if f8 is True else {}
         out.append((f"kda_{tag}_m{rows}", "kda",
-                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding},
-                    lambda r=rows, f=f8, sr=rounding: glmf.compile_glmf_kda_aot(
-                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr)))
+                    {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding, **kda_decode},
+                    lambda r=rows, f=f8, sr=rounding, kd=kda_decode: glmf.compile_glmf_kda_aot(
+                        g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr, **kd)))
     out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
                 lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
     # Both: the compact index cache's commit (state and index tails in one launch) over a BF16 state.
@@ -376,12 +378,14 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode="decode")),
         (f"mhc_post_pre_m{r}", "mhc_post_pre", {"max_rows": r, "route": "decode"},
          lambda: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route="decode")),
-        (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True},
-         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True)),
+        (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True, "seq_ctas": 8, "decode_tiles": True},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, seq_ctas=8, decode_tiles=True)),
         (f"kda_w8_m{r}", "kda", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only="decode")),
-        (f"kda_s16_m{r}", "kda", {"max_rows": r, "fp8": True, "state_dtype": "bfloat16", "state_rounding": "window"},
-         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window")),
+        (f"kda_s16_m{r}", "kda", {"max_rows": r, "fp8": True, "state_dtype": "bfloat16", "state_rounding": "window",
+                                 "seq_ctas": 8, "decode_tiles": True},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window",
+                                         seq_ctas=8, decode_tiles=True)),
         (f"mla_producer_m{r}", "mla_producer", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},
