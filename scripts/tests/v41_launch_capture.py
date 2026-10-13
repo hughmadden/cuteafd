@@ -267,10 +267,13 @@ def capture(launcher_root: Path, case: str) -> dict:
         (root / "plan.json").write_text(json.dumps({
             "version": 1, "rtx_gpus": rtx, "nonce": "n", "rtx_expert_layers": 20 if rtx == 2 else 5,
             "spark_first_layer": 20 if rtx == 2 else 5}))
+        spec = root / "nvidia.yaml"
+        spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
         log = root / "log.jsonl"
         env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"),
                "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_PLAN": str(root / "plan.json"),
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
+               "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),
                "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "30", "TMPDIR": str(root),
                "LANG": "C.UTF-8", "USER": "tj", "LOGNAME": "tj"}
         args = ["--config", str(config), "--restart"]

@@ -573,12 +573,19 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
 wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
+wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
+[[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
+[[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
+wip_cp() { # slot files come from the container when it exists, else from the WIP root
+  if docker container inspect "$wip_spark_container" >/dev/null 2>&1; then docker cp "$wip_spark_container:/wip/$1" "$2"
+  else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
+}
 [[ "$exl3_family" == __none__ ]] && exl3_family=
 # Every failure names the host and the check: this block runs over SSH, so a
 # bare nonzero exit would otherwise surface as an unexplained transport error.
@@ -609,19 +616,19 @@ fi
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
-  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
-    die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container"
-  docker cp "$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
+  wip_cp "slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
+    die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container or $wip_root_arg"
+  wip_cp "slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
   mkdir -p "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
   mv "$layout.tmp/raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
   [[ ! -d "$layout.tmp/raw/exl3" ]] || mv "$layout.tmp/raw/exl3" "$layout.tmp/lib/exl3"
   mv "$layout.tmp/raw/"* "$layout.tmp/share/"
   mkdir -p "$layout.tmp/source/third_party" "$layout.tmp/source/scripts/build"
-  slot_source="$wip_spark_container:/wip/slots/$wip_slot/spark-expert/workspace"
-  docker cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
-  docker cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
+  slot_source="slots/$wip_slot/spark-expert/workspace"
+  wip_cp "$slot_source/third_party/sparkinfer" "$layout.tmp/source/third_party/"
+  wip_cp "$slot_source/third_party/sparkinfer.lock.json" "$layout.tmp/source/third_party/"
+  wip_cp "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
   python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json" >&2 || die "slot SparkInfer verification failed"
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
@@ -662,14 +669,15 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        docker exec -i "$wip_spark_container" python3 - "$wip_slot" "${expert_format:-native}" "$spark_tp_roles_required" <<'PY'
+        "if docker container inspect '$wip_spark_container' >/dev/null 2>&1; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
 slot = sys.argv[1]
-root = pathlib.Path('/wip/slots') / slot / 'spark-expert'
+root = pathlib.Path(os.environ.get('WIP_SLOTS', '/wip/slots')) / slot / 'spark-expert'
 try:
     meta_bytes = (root / 'META.json').read_bytes()
     assert hashlib.sha256(meta_bytes).hexdigest() == (root / 'FINGERPRINT').read_text().strip(), 'metadata fingerprint mismatch'
