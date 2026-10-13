@@ -186,7 +186,8 @@ pub enum CacheGeometryError {
 
 /// Shared scalar/WMMA draft-attention arena. WMMA capacity partitions are
 /// sized for one sequence; the scalar floor admits 128-key chunks for up to
-/// 16 queries and 1024 resident keys, including the new block.
+/// 16 queries and 1024 resident keys, including the new block. Dim64 retains
+/// the original 32-row scalar stride; dim128 uses a compact 16-row stride.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u64,
     max_keys: u64, head_dim: u64, sms: u64) -> Result<u64, CacheGeometryError> {
@@ -201,7 +202,8 @@ pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u6
     let partitions = max_keys.div_ceil(32).min(sms.checked_mul(2).ok_or_else(overflow)?.div_ceil(base));
     let wmma_rows = slices.checked_mul(partitions).and_then(|n| n.checked_mul(32))
         .ok_or_else(overflow)?;
-    let scalar_rows = max_keys.min(1024 + 16).div_ceil(128) * 16;
+    let scalar_stride = if head_dim == 64 { 32 } else { 16 };
+    let scalar_rows = max_keys.min(1024 + 16).div_ceil(128) * scalar_stride;
     [kv_heads, wmma_rows.max(scalar_rows), head_dim + 2, 4].into_iter()
         .try_fold(sequences, |bytes, n| bytes.checked_mul(n).ok_or_else(overflow))
 }
@@ -226,8 +228,9 @@ mod draft_attention_tests {
                         // A capacity-sized arena also covers every skinny scalar launch.
                         for launch_keys in [1u64, 32, 128, 129, 1032, 1040] {
                             if launch_keys > keys { continue; }
+                            let scalar_stride = if dim == 64 { 32 } else { 16 };
                             let scalar_used = sequences * heads * launch_keys.div_ceil(128)
-                                * 16 * (dim + 2) * 4;
+                                * scalar_stride * (dim + 2) * 4;
                             assert!(scalar_used <= arena);
                         }
                     }
@@ -236,8 +239,10 @@ mod draft_attention_tests {
         }
         assert_eq!(draft_attention_workspace_bytes(8, 8, 2, 2056, 128, 188).unwrap(),
             8 * 8 * 2 * 24 * 32 * 130 * 4);
-        assert_eq!(draft_attention_workspace_bytes(8, 64, 1, 1032, 64, 48).unwrap(),
-            8 * 64 * 9 * 16 * 66 * 4);
+        for sms in [48, 170, 188] {
+            assert_eq!(draft_attention_workspace_bytes(8, 64, 1, 1032, 64, sms).unwrap(),
+                8 * 64 * 9 * 32 * 66 * 4);
+        }
     }
 
     #[test]

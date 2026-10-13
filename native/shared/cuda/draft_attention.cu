@@ -181,7 +181,7 @@ __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v
 
 // The original warp-per-query scalar arithmetic wins on skinny, short-context
 // shapes. Keep its 128-key chunks, FP32 probabilities and reduction order.
-template <int dim>
+template <int dim, bool windowed, bool has_sink>
 __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block,
     const bf16* k_ring, const bf16* v_ring, const int32_t* slots, const int32_t* lengths,
     const int32_t* ends, float* partial_o, float* partial_ml, int heads, int kv_heads,
@@ -190,9 +190,12 @@ __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const 
   const int group = heads / kv_heads, query = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int row = query / group, head = kvh * group + query % group;
   const int ctx = lengths[sequence], end = ends[sequence], slot = slots[sequence];
-  const int first = chunk * scalar_keys, last = min(min(ctx + block_rows, max_keys), first + scalar_keys);
-  const uint64_t base = ((uint64_t(sequence) * kv_heads + kvh) * chunks + chunk) * scalar_queries + query;
-  __shared__ float qs[scalar_queries][dim];
+  constexpr bool original_layout = dim == 64 && !windowed && !has_sink;
+  constexpr int partial_rows = original_layout ? queries_per_slice : scalar_queries;
+  const int total = original_layout ? ctx + block_rows : min(ctx + block_rows, max_keys);
+  const int first = chunk * scalar_keys, last = min(total, first + scalar_keys);
+  const uint64_t base = ((uint64_t(sequence) * kv_heads + kvh) * chunks + chunk) * partial_rows + query;
+  __shared__ float qs[partial_rows][dim];
   __shared__ __nv_bfloat162 ks[tile_keys][dim / 2 + 1];
   __shared__ __nv_bfloat162 vs[tile_keys][dim / 2];
   const bf16* q_row = q + ((uint64_t(sequence) * block_rows + row) * heads + head) * dim;
@@ -200,7 +203,7 @@ __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const 
   for (int d = lane; d < dim; d += 32) qs[query][d] = __bfloat162float(q_row[d]);
   float m = -CUDART_INF_F, l = 0, acc[dim / 64] = {};
   float acc_pair[dim / 64] = {};
-  const int lowest = window > 0 ? end + row - window + 1 : INT32_MIN;
+  const int lowest = windowed ? end + row - window + 1 : INT32_MIN;
   for (int tile = first; tile < last; tile += tile_keys) {
     const int n = min(tile_keys, last - tile);
     __syncthreads();
@@ -235,7 +238,8 @@ __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const 
       dot = fmaf(qs[query][2 * d + 1], b.y, dot);
     }
     const int j = tile + lane;
-    const bool visible = lane < n && (j < ctx ? end - ctx + j >= lowest : !causal || j - ctx <= row);
+    const bool visible = lane < n && (j < ctx || !causal || j - ctx <= row)
+        && (!windowed || j >= ctx || end - ctx + j >= lowest);
     const float score = visible ? dot * scale : -CUDART_INF_F;
     float tile_max = score;
     for (int o = 16; o; o >>= 1) tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, o));
@@ -266,18 +270,20 @@ __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const 
   }
 }
 
-template <int dim, int query_rows = queries_per_slice>
+template <int dim, int query_rows = queries_per_slice, bool has_sink = true, bool sliced = true>
 __global__ void merge_kernel(const float* partial_o, const float* partial_ml, const bf16* sinks,
     bf16* out, int heads, int kv_heads, int block_rows, int slices, int partitions) {
   const int query = blockIdx.x, kvh = blockIdx.y, sequence = blockIdx.z, d = threadIdx.x;
   const int group = heads / kv_heads, row = query / group, head = kvh * group + query % group;
-  const int slice = query / query_rows, local = query % query_rows;
-  const uint64_t base = ((uint64_t(sequence) * kv_heads + kvh) * slices + slice) * partitions;
-  const float sink = sinks ? __bfloat162float(sinks[head]) : -CUDART_INF_F;
+  const int slice = sliced ? query / query_rows : 0, local = sliced ? query % query_rows : query;
+  const uint64_t base = sliced
+      ? ((uint64_t(sequence) * kv_heads + kvh) * slices + slice) * partitions
+      : (uint64_t(sequence) * kv_heads + kvh) * partitions;
+  const float sink = has_sink && sinks ? __bfloat162float(sinks[head]) : -CUDART_INF_F;
   float m = sink;
   for (int p = 0; p < partitions; ++p)
     m = fmaxf(m, partial_ml[((base + p) * query_rows + local) * 2]);
-  float l = sinks ? expf(sink - m) : 0, value = 0;
+  float l = has_sink && sinks ? expf(sink - m) : 0, value = 0;
   for (int p = 0; p < partitions; ++p) {
     const uint64_t at = (base + p) * query_rows + local;
     const float pm = partial_ml[at * 2];
@@ -314,6 +320,29 @@ int dispatch_wmma(const void* q, const void* k_block, const void* v_block, const
       static_cast<const bf16*>(sinks), static_cast<bf16*>(out), heads, kv_heads, block_rows, slices, partitions);
   return cudaGetLastError();
 }
+template <int dim, bool windowed, bool has_sink>
+int dispatch_scalar(const void* q, const void* k_block, const void* v_block, const void* k_ring,
+    const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
+    void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
+    int max_keys, int window, bool causal, float scale, cudaStream_t stream) {
+  constexpr int partial_rows = dim == 64 && !windowed && !has_sink ? queries_per_slice : scalar_queries;
+  const int queries = heads / kv_heads * block_rows;
+  const int chunks = (max_keys + scalar_keys - 1) / scalar_keys;
+  auto* partial_o = static_cast<float*>(scratch);
+  auto* partial_ml = partial_o + uint64_t(sequences) * kv_heads * chunks * partial_rows * dim;
+  scalar_partial_kernel<dim, windowed, has_sink><<<dim3(chunks, kv_heads, sequences), queries * 32, 0, stream>>>(
+      static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
+      static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(slots),
+      static_cast<const int32_t*>(lengths), static_cast<const int32_t*>(ends), partial_o, partial_ml,
+      heads, kv_heads, block_rows, ring, chunks, max_keys, window, causal, scale);
+  auto status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  merge_kernel<dim, partial_rows, has_sink, false><<<dim3(queries, kv_heads, sequences), dim, 0, stream>>>(
+      partial_o, partial_ml, static_cast<const bf16*>(sinks), static_cast<bf16*>(out),
+      heads, kv_heads, block_rows, 1, chunks);
+  return cudaGetLastError();
+}
+
 template <int dim>
 int route(const void* q, const void* k_block, const void* v_block, const void* k_ring,
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
@@ -322,20 +351,11 @@ int route(const void* q, const void* k_block, const void* v_block, const void* k
   const int queries = heads / kv_heads * block_rows;
   // max_keys includes the new block; the boundary is resident context only.
   if (queries <= scalar_queries && max_keys - block_rows <= scalar_context) {
-    const int chunks = (max_keys + scalar_keys - 1) / scalar_keys;
-    auto* partial_o = static_cast<float*>(scratch);
-    auto* partial_ml = partial_o + uint64_t(sequences) * kv_heads * chunks * scalar_queries * dim;
-    scalar_partial_kernel<dim><<<dim3(chunks, kv_heads, sequences), queries * 32, 0, stream>>>(
-        static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
-        static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(slots),
-        static_cast<const int32_t*>(lengths), static_cast<const int32_t*>(ends), partial_o, partial_ml,
-        heads, kv_heads, block_rows, ring, chunks, max_keys, window, causal, scale);
-    auto status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-    merge_kernel<dim, scalar_queries><<<dim3(queries, kv_heads, sequences), dim, 0, stream>>>(
-        partial_o, partial_ml, static_cast<const bf16*>(sinks), static_cast<bf16*>(out),
-        heads, kv_heads, block_rows, 1, chunks);
-    return cudaGetLastError();
+#define SCALAR(W, S) dispatch_scalar<dim, W, S>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, \
+    sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, scale, stream)
+    if (window > 0) return sinks ? SCALAR(true, true) : SCALAR(true, false);
+    return sinks ? SCALAR(false, true) : SCALAR(false, false);
+#undef SCALAR
   }
   return dispatch_wmma<dim>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, sinks,
       out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
@@ -350,7 +370,8 @@ uint64_t workspace(int sequences, int kv_heads, int slices, int max_keys, int he
   const int capacity = partition_capacity(kv_heads, slices, max_keys, sms);
   // Scalar queries bound block_rows too, so its largest total key count is 1040.
   const int scalar_chunks = (std::min(max_keys, scalar_context + scalar_queries) + scalar_keys - 1) / scalar_keys;
-  const int rows = std::max(slices * capacity * queries_per_slice, scalar_chunks * scalar_queries);
+  const int scalar_rows = head_dim == 64 ? queries_per_slice : scalar_queries;
+  const int rows = std::max(slices * capacity * queries_per_slice, scalar_chunks * scalar_rows);
   return uint64_t(sequences) * kv_heads * rows * (head_dim + 2) * sizeof(float);
 }
 

@@ -131,7 +131,15 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
     assert 'constexpr int scalar_queries = 16;' in shared
     assert 'constexpr int scalar_context = 1024;' in shared
     assert 'queries <= scalar_queries && max_keys - block_rows <= scalar_context' in shared
-    assert 'scalar_partial_kernel<dim>' in shared and 'dispatch_wmma<dim>' in shared
+    assert 'scalar_partial_kernel<dim, windowed, has_sink>' in shared
+    assert 'dispatch_wmma<dim>' in shared
+    assert 'template <int dim, bool windowed, bool has_sink>' in shared
+    assert 'original_layout = dim == 64 && !windowed && !has_sink' in shared
+    assert 'original_layout ? queries_per_slice : scalar_queries' in shared
+    assert 'original_layout ? ctx + block_rows : min(ctx + block_rows, max_keys)' in shared
+    assert 'merge_kernel<dim, partial_rows, has_sink, false>' in shared
+    assert 'local = sliced ? query % query_rows : query' in shared
+    assert 'head_dim == 64 ? queries_per_slice : scalar_queries' in shared
     assert 'query_rows == 16' not in shared and 'bool direct' not in shared
     # Real MiMo/GLM Flash checkpoint geometry never enters the skinny route.
     for heads, kv_heads, block in [(64, 8, 8), (32, 8, 8)]:

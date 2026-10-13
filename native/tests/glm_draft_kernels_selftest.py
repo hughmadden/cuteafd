@@ -776,7 +776,8 @@ def attention_check(lib, args):
             arena = (workspace_fn(16, heads, kvh, block, max_keys) if family == "mimo"
                      else workspace_fn(16, kvh, max_keys))
             scalar_chunks = (min(max_keys, 1024 + 16) + 127) // 128
-            arena_rows = max(slices * partitions * 32, scalar_chunks * 16)
+            scalar_stride = 32 if dim == 64 else 16
+            arena_rows = max(slices * partitions * 32, scalar_chunks * scalar_stride)
             assert arena == 16 * kvh * arena_rows * (dim + 2) * 4
             # Smaller launches reuse the capacity arena; guard its exact admitted boundary.
             scratch = torch.full((arena + 256,), 173, device="cuda", dtype=torch.uint8)

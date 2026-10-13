@@ -249,7 +249,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "drafter.require_live()?;" in serving
     prime = remote.split("    pub fn prime(", 1)[1].split("    fn launch_head(", 1)[0]
     assert "self.draft.prime_remote()" in prime
-    assert "self.launch_head(&head, rows)?" in prime
+    assert "self.launch_head(&head, rows, true)?" in prime
+    assert "self.launch_head(&head, rows, false)?" in prime
+    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.exchange.stream(0))")
     assert "cuda_stream_synchronize(self.exchange.stream(0))" in prime
     assert "self.exchange.wait(" not in prime and "self.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
