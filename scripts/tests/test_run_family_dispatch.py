@@ -131,6 +131,16 @@ def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: s
     assert f"{key} was removed for GLM 5.3" in result.stderr
 
 
+@pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS"])
+@pytest.mark.parametrize("value", ["on", "off"])
+def test_v4_rejects_removed_draft_switches_with_shared_replacement(tmp_path: Path, key: str, value: str) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"},
+                                  "deepseek-ai/DeepSeek-V4-Flash-0731", f"{key}={value}\n")
+    assert result.returncode != 0
+    assert f"{key} was removed for deepseek_v4" in result.stderr
+    assert "shared resource-priced draft policy" in result.stderr
+
+
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
 @pytest.mark.parametrize("config,model", [
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "zai-org/GLM-5.3"),

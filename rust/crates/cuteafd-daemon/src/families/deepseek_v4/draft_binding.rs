@@ -2,7 +2,7 @@
 use super::{engine::Engine, Loaded};
 use crate::shared::{draft::{resource, runtime::SharedPolicy}, spark_intake::SparkLink};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+use cuteafd_core::{PolicyGeometry, PolicySeed, ResourceClass};
 
 /// Native V4 kernels read gate/up/down FP4 values and one K32 scale per
 /// projection. A 128-aligned shard has no packer padding; the exporter rejects
@@ -16,19 +16,24 @@ fn native_slice_bytes(hidden: usize, intermediate: usize, tp: usize) -> Result<f
     Ok(3. * (elements / 2 + elements / 32) as f64)
 }
 
+fn widths(native: usize) -> Vec<usize> {
+    let narrow = native.div_ceil(2);
+    if narrow == native { vec![native] } else { vec![narrow, native] }
+}
+
 fn geometry(homes: &[(u8, f64)], experts: usize, topk: usize, rows: usize, width: usize,
     group: impl Fn(usize, usize) -> Result<usize>) -> Result<PolicyGeometry> {
-    let groups = (0..=rows).map(|rows| (0..homes.len()).map(|layer|
-        u8::try_from(group(layer, rows)?).context("installed V4 expert group exceeds 255"))
-        .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
-    Ok(PolicyGeometry {
-        layers: homes.iter().enumerate().map(|(layer, &(class, slice_bytes))| LayerResource {
-            class: Some(class), slice_bytes, group_rows: groups[0][layer], timed: layer > 0,
-        }).collect(),
-        group_rows_by_rows: groups, experts: u16::try_from(experts)?, topk: u8::try_from(topk)?,
-        max_requests: rows, max_positions: width + resource::COPY_EXTENSION, widths: vec![width],
-        classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 1,
-    })
+    let homes = homes.iter().map(|&(class, slice_bytes)| {
+        ensure!(class <= 1, "unknown V4 expert home {class}");
+        Ok(if class == 0 { resource::LayerHome::Local { slice_bytes } }
+            else { resource::LayerHome::Remote { slice_bytes } })
+    }).collect::<Result<Vec<_>>>()?;
+    let mut geometry = resource::geometry_with_grouping(&homes, experts, topk, rows, width,
+        resource::COPY_EXTENSION, group)?;
+    geometry.max_positions = width + resource::COPY_EXTENSION;
+    geometry.widths = widths(width);
+    geometry.classes = vec![ResourceClass::rtx(), ResourceClass::spark()];
+    Ok(geometry)
 }
 
 pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<'_>]) -> Result<Option<SharedPolicy>> {
@@ -55,14 +60,10 @@ pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<
     }).collect::<Result<Vec<_>>>()?;
     let geometry = geometry(&homes, shape.experts, shape.topk, engine.decode_rows, width, |layer, rows| {
         if layer < local { return engine.local_group_rows(rows); }
-        let mut groups = remote.iter().filter(|report| report.layers().iter()
-            .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-            .map(|report| report.group_rows(rows));
-        let group = groups.next().context("V4 installed worker report missing layer")??;
-        for other in groups { ensure!(other? == group, "V4 installed workers disagree on layer {layer} grouping"); }
-        Ok(group)
+        resource::worker_group_rows(&remote, layer, rows)
     })?;
-    let shared = SharedPolicy::with_geometry(geometry, resource::Prior::History, PolicySeed::weak(width))?;
+    let mut shared = SharedPolicy::with_geometry(geometry, resource::Prior::History, PolicySeed::weak(width))?;
+    shared.policy.set_native_confidence_positions(width)?;
     resource::publish(&shared.policy, 0, 0, None);
     Ok(Some(shared))
 }
@@ -91,6 +92,8 @@ mod tests {
         }).unwrap();
         let shared = SharedPolicy::with_geometry(geometry, resource::Prior::History, PolicySeed::weak(5)).unwrap();
         let geometry = shared.policy.geometry();
+        assert_eq!(geometry.widths, [3, 5]);
+        assert_eq!(widths(1), [1]);
         assert!(!geometry.layers[0].timed);
         assert_eq!(geometry.layers[1].slice_bytes, 200.);
         assert_eq!(geometry.layers[2].class, Some(1));

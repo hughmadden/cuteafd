@@ -363,12 +363,32 @@ fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_i
     Ok((selector.select(logits, &batch)?, poisoned))
 }
 
+fn action_rooms(limits: &[usize], width: usize, rows: usize, start: usize) -> Vec<usize> {
+    let mut rooms = vec![0; limits.len()];
+    if width == 0 || limits.is_empty() { return rooms; }
+    let mut remaining = rows / width;
+    // Runtime workspace can fit fewer native than narrow participants. Rotate
+    // the subset so workspace exclusion cannot starve an active request.
+    for offset in 0..limits.len() {
+        let index = (start % limits.len() + offset) % limits.len();
+        if limits[index] == 0 || remaining == 0 { continue; }
+        rooms[index] = limits[index].min(width);
+        remaining -= 1;
+    }
+    rooms
+}
+
+fn cold_action(widths: &[usize], rooms: &[Vec<usize>], preferred: usize) -> usize {
+    let fits = |index: usize| rooms[index].iter().any(|&room| room > 0);
+    widths.iter().position(|&width| width == preferred).filter(|&index| fits(index))
+        .or_else(|| (0..rooms.len()).find(|&index| fits(index))).unwrap_or(0)
+}
+
 /// One global verifier budget, including requests that did not draft.
 #[allow(clippy::too_many_arguments)]
 fn speculative_step(
     engine: &super::engine::Engine<'_>,
     active: &mut [Active<'_>],
-    block: usize,
     shared: &mut SharedPolicy,
     observed: &mut u64,
     skipped: &mut u64,
@@ -386,9 +406,27 @@ fn speculative_step(
             .min(a.job.max_tokens.saturating_sub(a.generated + 1))
             .min(a.capacity.saturating_sub(a.placement.len + 2))
     }).collect();
+    let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
+    let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
+    let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, engine.decode_rows,
+        observed.wrapping_add(*skipped) as usize)).collect();
+    let actions: Vec<_> = widths.iter().zip(&rooms).map(|(&width, rooms)| cuteafd_core::DraftAction {
+        width, draft_us: shared.policy.draft_cost_drafted(false, active.len(),
+            rooms.iter().filter(|&&room| room > 0).count(), width),
+    }).collect();
+    let masks: Vec<_> = rooms.iter().map(Vec::as_slice).collect();
+    let priced = shared.policy.choose_action_with_rooms(false, &requests, &actions, &masks, engine.decode_rows)?;
+    let chosen = priced.unwrap_or_else(|| {
+        // Collect installed width fits before pricing can choose skip, but do
+        // not discard an eligible narrow pass when the preferred width cannot fit.
+        cold_action(&widths, &rooms, shared.policy.choose_width(false, &requests))
+    });
+    binding::trace_action(&shared.policy, false, &requests, &actions, Some(&masks), engine.decode_rows,
+        priced, chosen);
+    let block = actions[chosen].width;
     let noise = engine.cfg.dspark_noise_token_id as u32;
-    let draft_indices: Vec<usize> = active.iter().enumerate().filter_map(|(i, _)|
-        (limits[i] > 0 && block > 0).then_some(i)).take(engine.decode_rows / block.max(1)).collect();
+    let draft_indices: Vec<usize> = rooms[chosen].iter().enumerate().filter_map(|(i, &room)|
+        (room > 0).then_some(i)).collect();
     let mut drafts = vec![Vec::new(); active.len()];
     if !draft_indices.is_empty() {
         let inputs: Vec<u32> = draft_indices.iter().flat_map(|&i|
@@ -866,10 +904,9 @@ fn schedule(
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let mut shape = StepShape::default();
         let caching = cache.enabled();
-        let block = engine.draft_block();
         // Undrafted rounds use the same route and resource observations.
         let step = if let Some(shared) = shared.as_mut() {
-            speculative_step(engine, &mut active, block, shared, &mut observed, &mut skipped, eos,
+            speculative_step(engine, &mut active, shared, &mut observed, &mut skipped, eos,
                 transports, runtime, selector, caching, &mut shape, cycle)
         } else {
             let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
@@ -947,6 +984,36 @@ fn schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_room_masks_use_runtime_width_capacity_and_skip_ineligible_requests() {
+        let limits = [5; 16];
+        assert_eq!(action_rooms(&limits, 0, 64, 0), [0; 16]);
+        assert_eq!(action_rooms(&limits, 3, 64, 0), [3; 16]);
+        assert_eq!(action_rooms(&limits, 5, 64, 0), [vec![5; 12], vec![0; 4]].concat());
+        assert_eq!(action_rooms(&[0, 1, 0, 5, 2], 3, 6, 0), [0, 1, 0, 3, 0]);
+        assert_eq!(action_rooms(&limits, 5, 4, 0), [0; 16]);
+        let rotated = action_rooms(&limits, 5, 64, 4);
+        assert!(rotated[..4].iter().all(|&room| room == 0));
+        assert!(rotated[4..].iter().all(|&room| room == 5));
+        for width in [1, 3, 5] {
+            let rooms = action_rooms(&limits, width, 64, 0);
+            assert!(rooms.iter().filter(|&&room| room > 0).count() * width <= 64);
+        }
+    }
+
+    #[test]
+    fn cold_action_keeps_eligible_pass_when_preferred_width_cannot_fit() {
+        let widths = [0, 3, 5];
+        let limits = [5, 5];
+        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, 4, 0)).collect();
+        assert_eq!(cold_action(&widths, &rooms, 5), 1);
+        assert_eq!(cold_action(&widths, &rooms, 3), 1);
+        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, 10, 0)).collect();
+        assert_eq!(cold_action(&widths, &rooms, 5), 2);
+        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&[0, 0], width, 10, 0)).collect();
+        assert_eq!(cold_action(&widths, &rooms, 5), 0);
+    }
 
     #[test]
     fn terminal_and_stream_failures_keep_only_judged_rejections() {
