@@ -3486,7 +3486,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index);
+            self.probe_mark(index)?;
         }
         self.finish_route_checks()?;
         if layers.len() < self.cfg.layers {
@@ -3655,7 +3655,7 @@ impl<'a> GlmfEngine<'a> {
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
-                self.probe_mark(index);
+                self.probe_mark(index)?;
             }
         }
         if layers.len() < self.cfg.layers {
@@ -4345,11 +4345,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// The draft probe's layer mark: the end of `index` on the engine stream.
-    fn probe_mark(&self, index: usize) {
+    fn probe_mark(&self, index: usize) -> Result<()> {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
             // SAFETY: the engine's own stream, live for the engine's lifetime.
-            unsafe { probe.mark(index, self.stream) };
+            unsafe { probe.mark(index, self.stream)? };
         }
+        Ok(())
     }
 
     /// Queue layer `index`'s router ids into the draft probe's ring right

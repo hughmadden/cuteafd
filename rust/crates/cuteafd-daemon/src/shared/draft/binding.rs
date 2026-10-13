@@ -346,6 +346,93 @@ mod tests {
     }
 
     #[test]
+    fn sampled_layer_times_preserve_routes_and_round_observations() {
+        use cuteafd_core::{LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()], regimes: 1 };
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let p = [0.9; 5];
+        let requests = [request(1, 6, 4, DraftSource::Neural, Some(Evidence::Head(&p)), None)];
+        let routes = routes(6);
+        for round in 0..160 {
+            let layer_us = if round % 8 == 7 {
+                [Some(100.), Some(100.)]
+            } else { [None, None] };
+            let record = RoundRecord { shared: false, requests: &requests, routes: &routes,
+                layer_us: &layer_us, times: RoundTimes { total_us: 800, draft_us: Some(200) },
+                draft: Some(DraftPass { width: 5, requests: Some(1) }), predicted: None };
+            let observation = build(&record, 5).unwrap();
+            assert_eq!(observation.view().routes, routes.flat());
+            assert_eq!(observation.view().total_us, 800.);
+            assert_eq!(observation.view().layer_us, layer_us);
+            observe(&mut policy, &record).unwrap();
+        }
+        let fit = policy.cost_snapshot(false, 1);
+        assert_eq!(fit.layers[0][3], 20.);
+        // Class sums are sampled, but untimed rounds still teach the residual.
+        assert!(fit.round[3] > 0.);
+        assert_eq!(policy.stats().rounds, 160);
+    }
+
+    #[test]
+    fn sampled_class_fit_replay_reports_warmth_and_decisions() {
+        use cuteafd_core::{DraftAction, DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: (0..2).map(|class| LayerResource {
+            class: Some(class), slice_bytes: 1e6, group_rows: 16, timed: true }).collect(),
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 1 };
+        let every = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let mut policies = [every.clone(), every];
+        let mut first_class = [[None; 2]; 2];
+        let mut first_warm = [None; 2];
+        let mut first_engaged = [None; 2];
+        let mut decisions = [Vec::new(), Vec::new()];
+        let p = [0.95, 0.9, 0.8, 0.65, 0.5];
+        for round in 0..160 {
+            let rows = 2 + round % 5;
+            let requests: Vec<_> = (1..=16).map(|id| request(id, rows, rows.min(4), DraftSource::Neural,
+                Some(Evidence::Head(&p)), None)).collect();
+            let candidates: Vec<_> = (1..=16).map(|id| DraftCandidate { id, confidence: &p }).collect();
+            let routes = routes(rows * 16);
+            // Identical exogenous C16 transcript; a midpoint cost change tests stale fits.
+            let class_us = if round < 80 { [400., 800.] } else { [1200., 2400.] };
+            for (arm, policy) in policies.iter_mut().enumerate() {
+                let selected = policy.select_drafted_within(false, &candidates, 5, 96, 16).unwrap();
+                let lengths = selected.as_ref().map_or(vec![5; 16], |s| s.lengths.clone());
+                let action_requests: Vec<_> = (1..=16).map(|id| (id, 5)).collect();
+                let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 5, draft_us: 3000. }];
+                let width = policy.choose_action(false, &action_requests, &actions, 96).unwrap();
+                decisions[arm].push((width, lengths));
+                let layer_us = if arm == 0 || round % 8 == 7 {
+                    class_us.map(Some)
+                } else { [None, None] };
+                observe(policy, &RoundRecord { shared: false, requests: &requests, routes: &routes,
+                    layer_us: &layer_us, times: RoundTimes { total_us: (class_us.iter().sum::<f64>() + 5000.) as u64,
+                        draft_us: Some(3000) }, draft: Some(DraftPass { width: 5, requests: Some(16) }),
+                    predicted: None }).unwrap();
+                let fit = policy.cost_snapshot(false, 16);
+                for class in 0..2 {
+                    if fit.layers[class][3] >= 4. { first_class[arm][class].get_or_insert(round + 1); }
+                }
+                if policy.warm(false, 16) { first_warm[arm].get_or_insert(round + 1); }
+                if policy.engaged(false, 16) { first_engaged[arm].get_or_insert(round + 1); }
+                if [31, 79, 87, 159].contains(&round) {
+                    println!("cadence_replay arm={arm} round={} class_fits={:?} warm={} engaged={}",
+                        round + 1, fit.layers, policy.warm(false, 16), policy.engaged(false, 16));
+                }
+            }
+        }
+        let differences = decisions[0].iter().zip(&decisions[1]).filter(|(a, b)| a != b).count();
+        println!("cadence_replay first_class={first_class:?} first_warm={first_warm:?} first_engaged={first_engaged:?} differing_decisions={differences}");
+        assert_eq!(first_class, [[Some(4); 2], [Some(32); 2]]);
+        assert_eq!(first_warm, [Some(12), Some(32)]);
+        assert_eq!(policies[0].cost_snapshot(false, 16).layers[0][3], 160.);
+        assert_eq!(policies[1].cost_snapshot(false, 16).layers[0][3], 20.);
+    }
+
+    #[test]
     fn round_trace_captures_head_routes_grouped_bytes_and_calibrated_probabilities() {
         use cuteafd_core::{DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
         let geometry = PolicyGeometry { layers: vec![LayerResource {

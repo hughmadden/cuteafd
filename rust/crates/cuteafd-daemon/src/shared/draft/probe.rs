@@ -2,13 +2,12 @@
 //! verify step's per-layer device time and routed expert ids, collected where
 //! the engine already has them and read once after the step's own sync.
 //!
-//! - Layer time: a [`LayerClock`] event at every `console::layer_mark` site,
+//! - Layer time: owner-local [`LayerClock`] events every observed round,
 //!   between the per-layer graph segments (or eager layers).
 //! - Spark layers: the ids the step already stages to pinned host memory for
 //!   the expert request, copied before the staging is reused.
-//! - Local layers (FP8 or EXL3 on this GPU): one async D2H of the layer's ids
-//!   into a pinned ring right after its router, decoded after the sync; no
-//!   per-layer host wait.
+//! - Local layers: D2D each router's ids into a device layer-major arena, then
+//!   one D2H at the last owned routed layer, before the step's existing sync.
 //! - Dense layers carry no routes.
 //!
 //! The probe is armed only by the shared draft policy and is active only
@@ -19,9 +18,9 @@
 //! the ring on hardware wherever Spark experts serve.
 use crate::shared::draft::clock::LayerClock;
 use crate::shared::draft::routes::{RoundRoutes, RouteError};
-use crate::shared::memory::HostAllocation;
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::Result;
-use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
 
 /// GLM Flash router ids are plain expert indices (no flag bits).
@@ -37,8 +36,11 @@ pub(crate) struct RingCheck {
 pub(crate) struct RoundProbe<'a> {
     clock: LayerClock<'a>,
     routes: RoundRoutes,
-    /// Pinned `[layer][row][slot]` u32 ids, `capacity` rows per layer.
+    /// Pinned `[layer][row][slot]` u32 ids, packed to this round's row stride.
     ring: HostAllocation<'a>,
+    device_ring: DeviceAllocation<'a>,
+    last_owned: Option<usize>,
+    downloaded: bool,
     capacity: usize,
     topk: usize,
     dense: Vec<bool>,
@@ -61,8 +63,14 @@ impl<'a> RoundProbe<'a> {
     /// `capacity` rows, on the current device.
     pub fn new(library: &'a NativeLibrary, dense: Vec<bool>, topk: usize, capacity: usize) -> Result<Self> {
         let layers = dense.len();
-        let ring = HostAllocation::new(library, layers * capacity * topk * 4)?;
-        Ok(Self { clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring, capacity,
+        let bytes = layers * capacity * topk * 4;
+        let ring = HostAllocation::new(library, bytes)?;
+        let device_ring = DeviceAllocation::new(library, bytes)?;
+        // Initialize padding once: the single contiguous download includes unused row slots.
+        library.copy_h2d(device_ring.buffer, ring.bytes())?;
+        let last_owned = dense.iter().rposition(|&dense| !dense);
+        Ok(Self { clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
+            device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
             check: std::env::var("CUTEAFD_GLMF_ROUTE_RING_CHECK").is_ok_and(|v| v == "1"),
             ring_check: RingCheck::default(), active: false, pending: false, error: None })
@@ -75,6 +83,7 @@ impl<'a> RoundProbe<'a> {
             if dense { let _ = self.routes.dense(layer); }
         }
         self.clock.reset();
+        self.downloaded = false;
         self.ringed.fill(false);
         self.staged.fill(false);
         self.error = (rows > self.capacity).then_some(RouteError::Extent { layer: 0, found: rows, expected: self.capacity });
@@ -96,11 +105,20 @@ impl<'a> RoundProbe<'a> {
     ///
     /// # Safety
     /// `stream` is the engine's live stream on this probe's device.
-    pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) {
+    pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.active {
             // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
             unsafe { self.clock.mark(layer, stream, false) };
+            if Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
+                // SAFETY: all owner-local D2D writes precede this download on the same stream;
+                // the pinned ring remains owned until the existing verifier sync and finish.
+                unsafe { self.device_ring.library.copy_d2h_host_buffer_async(
+                    self.ring.buffer, self.device_ring.buffer,
+                    self.ringed.len() * self.routes.rows() * self.topk * 4, stream)?; }
+                self.downloaded = true;
+            }
         }
+        Ok(())
     }
 
     /// Mark the first layer after an owner cut using this device's own event.
@@ -123,8 +141,8 @@ impl<'a> RoundProbe<'a> {
         }
     }
 
-    /// Queue a D2H of `layer`'s `rows * topk` router ids (`ids`, u32) into
-    /// the ring on `stream`, behind the router that wrote them.
+    /// Preserve `layer`'s `rows * topk` router ids with a D2D on `stream`,
+    /// behind the router and before its reusable output is overwritten.
     ///
     /// # Safety
     /// `ids` holds this step's ids of `layer` in stream order on `stream`, the
@@ -133,16 +151,16 @@ impl<'a> RoundProbe<'a> {
         stream: *mut c_void) -> Result<()> {
         if !self.active || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
         let bytes = rows * self.topk * 4;
-        let offset = layer * self.capacity * self.topk * 4;
-        let host = self.ring.buffer;
-        let slot = CuteafdHostBuffer {
-            // SAFETY: `layer < layers` and `rows <= capacity` keep the slot inside the ring.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
+        let offset = layer * rows * self.topk * 4;
+        let arena = self.device_ring.buffer;
+        let slot = CuteafdDeviceBuffer {
+            // SAFETY: `layer < layers` and `rows <= capacity` keep the slot inside the arena.
+            ptr: unsafe { arena.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: arena.bytes - offset,
+            ..arena
         };
-        // SAFETY: the caller guarantees the source and stream; the slot is pinned and sized above.
-        unsafe { library.copy_d2h_host_buffer_async(slot, ids, bytes, stream)? };
+        // SAFETY: the source is live on this stream; the arena slot is owned and sized above.
+        unsafe { library.copy_d2d_async(slot, ids, bytes, stream)? };
         self.ringed[layer] = true;
         Ok(())
     }
@@ -154,8 +172,13 @@ impl<'a> RoundProbe<'a> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
+        if self.ringed.iter().any(|&queued| queued) && !self.downloaded {
+            tracing::debug!("draft policy route arena was not downloaded before verifier sync");
+            return None;
+        }
         if self.error.is_none() {
-            if let Err(error) = settle(&mut self.routes, self.ring.bytes(), self.capacity, self.topk, &self.ringed, &self.staged,
+            let rows = self.routes.rows();
+            if let Err(error) = settle(&mut self.routes, self.ring.bytes(), rows, self.topk, &self.ringed, &self.staged,
                 &mut self.ring_check) {
                 self.error = Some(error);
             }

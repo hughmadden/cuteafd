@@ -1623,7 +1623,7 @@ impl<'a> Qwen4Engine<'a> {
                 unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.execution_stream())?; }
             }
             // SAFETY: this probe's CUDA events belong to the current layer's owner.
-            unsafe { probe.mark(index, self.execution_stream()); }
+            unsafe { probe.mark(index, self.execution_stream())?; }
         }
         Ok(())
     }
