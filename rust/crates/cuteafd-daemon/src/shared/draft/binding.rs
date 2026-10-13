@@ -370,9 +370,9 @@ mod tests {
             observe(&mut policy, &record).unwrap();
         }
         let fit = policy.cost_snapshot(false, 1);
-        assert_eq!(fit.layers[0][3], 40.);
-        // Before #95 the residual fit requires all layer times; update after that rebase.
-        assert_eq!(fit.round[3], 20.);
+        assert_eq!(fit.layers[0][3], 20.);
+        // Class sums are sampled, but untimed rounds still teach the residual.
+        assert!(fit.round[3] > 0.);
         assert_eq!(policy.stats().rounds, 160);
     }
 
