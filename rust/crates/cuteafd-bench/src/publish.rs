@@ -268,8 +268,9 @@ pub fn results(placed: &[Placed]) -> String {
         }
         let b = r.baseline.as_ref().expect("filtered");
         let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
-        let concurrent = b.card.concurrent.as_ref().map_or("—".into(),
-            |c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s)));
+        let concurrent = r.server.card_levels().iter().filter_map(|width| b.card.concurrent_at(*width))
+            .map(|c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s))).collect::<Vec<_>>().join(" · ");
+        let concurrent = if concurrent.is_empty() { "—".into() } else { concurrent };
         let (prefill, ttft) = b.card.prefill.as_ref()
             .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
         let hardware = format!("{} ({label})", short_hardware(r));
@@ -278,7 +279,7 @@ pub fn results(placed: &[Placed]) -> String {
             decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
             link(&p.dir, "report.svg")));
     }
-    out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (up to C8, clamped to server admission), \
+    out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (C1/C4/C8/C16 on PRO 6000; through C8 at ≤32 GiB, within server admission), \
         8K prefill cold. Quality: logit fidelity against the family golden \
         reference, prefix-cache restore exactness, lossless speculation. Simulated 5090 reports cap RTX PRO 6000 memory only; \
         SM count (188 vs 170), L2, clocks and power are not emulated. Their speed is indicative and likely optimistic.\n");

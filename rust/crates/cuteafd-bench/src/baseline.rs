@@ -1,9 +1,9 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
-//! with thinking off; C8 code aggregate tok/s; 8K prefill rate and TTFT) and quick quality (logit
+//! with thinking off; C1/C4/C8/C16 code aggregate tok/s; 8K prefill rate and TTFT) and quick quality (logit
 //! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
-//! The warmed C8 batch adds about 20-30 seconds, clamped to server admission.
+//! C1 reuses the code measurement; wider levels use short warmed waves, within admission.
 use crate::client::{Chat, Client};
 use crate::panels::{common, speed, Progress, Rates};
 use crate::report::{
@@ -18,6 +18,8 @@ use std::time::Instant;
 
 /// Decode tokens per content type.
 const DECODE_TOKENS: u64 = 320;
+/// Short waves keep the mandatory scaling sweep within the smoke budget.
+const SWEEP_TOKENS: u64 = 160;
 /// The prefill case's prompt length.
 const PREFILL_TOKENS: u64 = 8192;
 
@@ -51,15 +53,17 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     decode + concurrent_estimate_s(rates, info) + prefill + fidelity + cache + spec + template + c4 + 4.0
 }
 
-fn concurrent_width(info: &ServerInfo) -> usize {
-    common::concurrency(info).min(8)
+fn concurrent_levels(info: &ServerInfo) -> Vec<usize> {
+    let limit = common::concurrency(info);
+    info.card_levels().iter().copied().filter(|width| *width <= limit).collect()
 }
 
 fn concurrent_estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
-    let width = concurrent_width(info) as f64;
-    if width == 0.0 { return 0.0; }
-    // Warm-up and timed wave; the sweep's estimate models the same batching cost.
-    2.0 * rates.seconds(120.0 * width, DECODE_TOKENS as f64) * (1.0 + 0.08 * width)
+    // C1 is already measured above; warm-up and timed waves at each wider level.
+    concurrent_levels(info).into_iter().filter(|width| *width > 1).map(|width| {
+        let width = width as f64;
+        2.0 * rates.seconds(120.0 * width, SWEEP_TOKENS as f64) * (1.0 + 0.08 * width)
+    }).sum()
 }
 
 fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64) -> ConcurrentRate {
@@ -158,24 +162,29 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
         let chat = client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
+        if *content == "code" {
+            run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
+                run.baseline.card.warmup_s.unwrap_or_default()));
+        }
         run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
             runs: vec![chat.timing], acceptance: None });
         run.publish();
     }
-    // C8 code: never enqueue more than the server admits, and keep warm-up untimed.
-    let width = concurrent_width(info);
-    anyhow::ensure!(width > 0, "server admits no concurrent sequences");
-    run.step(0.28, &format!("C{width} code warm-up"));
-    let warmup = Instant::now();
-    speed::code_batch(client, width, DECODE_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-        .with_context(|| format!("C{width} code warm-up"))?;
-    let warmup_s = warmup.elapsed().as_secs_f64();
-    client.check()?;
-    run.step(0.34, &format!("C{width} code aggregate"));
-    let batch = speed::code_batch(client, width, DECODE_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-        .with_context(|| format!("C{width} code decode"))?;
-    run.baseline.card.concurrent = Some(concurrent_rate(batch, warmup_s));
-    run.publish();
+    // One untimed warm wave per width primes graphs, tables and first-use workspaces.
+    let levels = concurrent_levels(info);
+    anyhow::ensure!(!levels.is_empty(), "server admits no concurrent sequences");
+    for (i, width) in levels.iter().copied().filter(|width| *width > 1).enumerate() {
+        run.step(0.28 + 0.035 * i as f64, &format!("C{width} code warm-up"));
+        let warmup = Instant::now();
+        speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} code warm-up"))?;
+        let warmup_s = warmup.elapsed().as_secs_f64();
+        client.check()?;
+        let batch = speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} code decode"))?;
+        run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s));
+        run.publish();
+    }
     // 8K prefill: a cold prompt sized from the fit.
     run.step(0.40, "8K prefill");
     let (slope, intercept) = match fit.as_slice() {
@@ -789,33 +798,39 @@ mod tests {
     use crate::report::Check;
 
     #[test]
-    fn concurrent_width_never_exceeds_server_admission() {
+    fn concurrent_levels_respect_admission_and_card_memory() {
         use crate::report::Setting;
         let mut info = ServerInfo::default();
-        assert_eq!(concurrent_width(&info), 8);
+        assert_eq!(concurrent_levels(&info), vec![1, 4, 8]);
         for name in ["concurrency", "max-sequences"] {
-            for (limit, width) in [(0, 0), (1, 1), (4, 4), (6, 6), (8, 8), (16, 8)] {
+            for (limit, levels) in [(0, vec![]), (1, vec![1]), (4, vec![1, 4]), (6, vec![1, 4]),
+                (8, vec![1, 4, 8]), (16, vec![1, 4, 8, 16])] {
                 info.configuration.settings = vec![Setting { name: name.into(), value: Some(limit.to_string()),
                     ..Setting::default() }];
-                assert_eq!(concurrent_width(&info), width);
+                assert_eq!(concurrent_levels(&info), levels);
             }
         }
+        info.configuration.settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some("32".into()),
+            ..Setting::default() });
+        assert_eq!(concurrent_levels(&info), vec![1, 4, 8]);
+        info.configuration.settings.pop();
+        info.hardware.gpus.push(crate::report::Gpu { used: true, memory_mib: Some(32 * 1024), ..Default::default() });
+        assert_eq!(concurrent_levels(&info), vec![1, 4, 8]);
     }
 
     #[test]
-    fn estimate_includes_warm_and_timed_concurrent_batches() {
+    fn estimate_includes_warm_and_timed_sweep_batches() {
         use crate::report::Setting;
         let rates = Rates { decode_tok_s: 50.0, prefill_tok_s: 1500.0, measured: true };
         let mut info = ServerInfo::default();
-        let c8 = estimate_s(&rates, &info);
-        let expected = 2.0 * rates.seconds(8.0 * 120.0, DECODE_TOKENS as f64) * 1.64;
-        assert!((20.0..30.0).contains(&expected));
-        assert!((concurrent_estimate_s(&rates, &info) - expected).abs() < 1e-9);
-        info.configuration.settings = vec![Setting { name: "concurrency".into(), value: Some("0".into()),
+        info.configuration.settings = vec![Setting { name: "concurrency".into(), value: Some("16".into()),
             ..Setting::default() }];
-        assert!((c8 - estimate_s(&rates, &info) - expected).abs() < 1e-9);
-        info.configuration.settings[0].value = Some("4".into());
-        assert!(concurrent_estimate_s(&rates, &info) < expected);
+        let expected: f64 = [4.0, 8.0, 16.0].into_iter().map(|width|
+            2.0 * rates.seconds(width * 120.0, SWEEP_TOKENS as f64) * (1.0 + 0.08 * width)).sum();
+        assert!((concurrent_estimate_s(&rates, &info) - expected).abs() < 1e-9);
+        let full = estimate_s(&rates, &info);
+        info.configuration.settings[0].value = Some("0".into());
+        assert!((full - estimate_s(&rates, &info) - expected).abs() < 1e-9);
     }
 
     #[test]

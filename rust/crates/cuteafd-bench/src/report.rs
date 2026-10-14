@@ -118,6 +118,15 @@ impl ServerInfo {
             .and_then(|s| s.value.as_deref())
     }
 
+    /// The chart and basic sweep stop at C8 on cards with at most 32 GiB per GPU.
+    pub fn card_levels(&self) -> &'static [usize] {
+        let used: Vec<_> = self.hardware.gpus.iter().filter(|g| g.used).collect();
+        let gpus = if used.is_empty() { self.hardware.gpus.iter().collect() } else { used };
+        let small = self.column_5090() || self.coordinator_budget().is_some_and(|gib| gib <= 32.0)
+            || gpus.iter().any(|gpu| gpu.memory_mib.is_some_and(|mib| mib <= 32 * 1024));
+        if small { &[1, 4, 8] } else { &[1, 4, 8, 16] }
+    }
+
     pub fn coordinator_budget(&self) -> Option<f64> {
         self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok()
             .filter(|gib| gib.is_finite() && *gib > 0.0)
@@ -231,6 +240,9 @@ pub struct PowerGpu {
     /// The governor's dominant plan bound (`max`, `budget`, `model`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<String>,
+    /// Measured seconds with a software power cap or hardware power brake.
+    #[serde(default)]
+    pub cap_seconds: f64,
 }
 
 fn collect_windows<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
@@ -255,7 +267,7 @@ impl Power {
         roots.iter().for_each(|root| collect_windows(root, &mut windows));
         // index -> (weight, limit*weight, draw weight, draw*weight, min, max, bound seconds)
         #[derive(Default)]
-        struct Acc { w: f64, limit: f64, dw: f64, draw: f64, min: Option<f64>, max: Option<f64>, bounds: Vec<(String, f64)> }
+        struct Acc { w: f64, limit: f64, dw: f64, draw: f64, min: Option<f64>, max: Option<f64>, bounds: Vec<(String, f64)>, cap_seconds: f64 }
         let mut accs: std::collections::BTreeMap<u32, Acc> = Default::default();
         let (mut governor, mut budget) = (false, None);
         for window in windows {
@@ -268,6 +280,8 @@ impl Power {
                 let (Some(index), Some(mean)) = (gpu["index"].as_u64(), gpu["power_limit_w"]["mean"].as_f64()
                     .or_else(|| gpu["power_limit_w"]["max"].as_f64())) else { continue };
                 let acc = accs.entry(index as u32).or_default();
+                acc.cap_seconds += ["sw_power_cap", "hw_power_brake"].iter()
+                    .filter_map(|reason| gpu["throttle_s"][reason].as_f64()).filter(|s| s.is_finite() && *s > 0.0).sum::<f64>();
                 acc.w += weight;
                 acc.limit += mean * weight;
                 if let Some(draw) = gpu["power_w"]["mean"].as_f64() { acc.dw += weight; acc.draw += draw * weight; }
@@ -287,9 +301,14 @@ impl Power {
         let gpus = accs.into_iter().map(|(index, a)| PowerGpu {
             index, mean_limit_w: a.limit / a.w, min_limit_w: a.min.unwrap_or_default(), max_limit_w: a.max.unwrap_or_default(),
             mean_draw_w: (a.dw > 0.0).then(|| a.draw / a.dw),
+            cap_seconds: a.cap_seconds,
             bound: a.bounds.into_iter().max_by(|x, y| x.1.total_cmp(&y.1)).map(|(b, _)| b),
         }).collect();
         Some(Power { governor: governor.then(|| "gpu-powerd".to_string()), budget_w: budget, gpus })
+    }
+
+    pub fn capped(&self) -> bool {
+        self.gpus.iter().any(|gpu| gpu.cap_seconds > 0.0)
     }
 
     /// `gpu-powerd 450/450 W` or `325 W`, plus ` (380–600)` when a limit moved by more than 10 W.
@@ -526,9 +545,9 @@ pub struct Baseline {
 pub struct BasicCard {
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
-    /// Code decode at up to C8, thinking off; aggregate over the batch's decode interval.
+    /// Code decode sweep, thinking off; aggregate over each batch's decode interval.
     #[serde(default)]
-    pub concurrent: Option<ConcurrentRate>,
+    pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
@@ -643,6 +662,10 @@ impl Report {
 }
 
 impl BasicCard {
+    pub fn concurrent_at(&self, width: usize) -> Option<&ConcurrentRate> {
+        self.concurrency.iter().find(|point| point.width == width)
+    }
+
     pub fn decode_of(&self, content: &str) -> Option<&ContentRate> {
         self.decode.iter().find(|d| d.content == content)
     }
@@ -963,6 +986,17 @@ mod tests {
             used: true, power_limit_w: Some(325.0), ..Gpu::default() }).collect(), ..Hardware::default() };
         hw.power = Power::from_json(&windows.iter().collect::<Vec<_>>());
         hw.line()
+    }
+
+    #[test]
+    fn power_cap_preserves_short_throttled_windows_without_inventing_caps() {
+        let mut cap = window(1.0, true, &[(0, 325.0, 325.0, 325.0, "budget")]);
+        cap["gpus"][0]["throttle_s"] = json!({"sw_power_cap": 0.25, "hw_power_brake": 0.0});
+        let clean = window(90.0, true, &[(0, 325.0, 325.0, 325.0, "budget")]);
+        assert!(!Power::from_json(&[&clean]).unwrap().capped());
+        let power = Power::from_json(&[&clean, &cap]).unwrap();
+        assert!(power.capped());
+        assert_eq!(power.gpus[0].cap_seconds, 0.25);
     }
 
     #[test]
