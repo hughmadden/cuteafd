@@ -189,6 +189,20 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
 
 
+def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
+    """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        return capture_module.append_config(original(name, directory), "KV_CACHE=fp8\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    with pytest.raises(RuntimeError, match=r"unused configuration key: KV_CACHE"):
+        capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+
+
 def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeypatch) -> None:
     import subprocess
     from v41_launch_capture import example_config

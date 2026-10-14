@@ -23,7 +23,9 @@ placeholder Spark hosts and addresses): V2.6 Flash MOPD [min](../../examples/con
 - Attention: GQA full attention on some layers, 128-token sliding-window
   GQA with a learned per-layer sink bias on the rest; sinks are taken on SWA
   layers only. NeoX RoPE on a partial head width; int8 full-attention KV
-  (FP32 scale per 32 dims) in paged pools, BF16 SWA rings.
+  (FP32 scale per 32 dims) in paged pools, BF16 SWA rings. The launcher key
+  is `KV_CACHE=int8|bf16`. Unset omits `--kv-cache`, so the daemon default
+  (int8) applies. `cuteafd plan` does not take this flag.
 - No shared expert; sigmoid noaux_tc router. Flash MOPD uses BF16 router
   weights and an FP32 `e_score_correction_bias` (legacy Flash's router
   program uses FP32 hi/lo operands).
