@@ -17,6 +17,7 @@ pub mod testing;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub use checkpoint::Checkpoint;
 pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
@@ -350,21 +351,68 @@ fn numerics_deviations(family: &str, modules: &BTreeMap<String, checkpoint::Modu
     } else { Vec::new() }
 }
 
+/// A checkpoint opened once, with the routed-expert catalog parsed from it:
+/// what a plan is built from. Reading every shard header and building the
+/// expert catalog dominate planning and neither changes between layouts, so
+/// a caller that evaluates many plans over one snapshot opens it once and
+/// asks `PlanInput` for each report (`plan_spark_count` walks one per
+/// candidate Spark count; `cuteafd plan --layout` adds more).
+pub struct PlanInput {
+    checkpoint: Checkpoint,
+    /// The routed-expert catalog, read on first use.
+    catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
+}
+
+impl PlanInput {
+    pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Ok(Self::from_checkpoint(Checkpoint::open(snapshot)?))
+    }
+
+    /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
+    pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
+        Self { checkpoint, catalog: OnceLock::new() }
+    }
+
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.checkpoint
+    }
+
+    /// The routed-expert catalog of this checkpoint, read on first call and
+    /// kept for the lifetime of the input. Families that stage no routed
+    /// experts never ask for it, so no read happens for them.
+    pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> {
+        match self.catalog.get_or_init(|| crate::read_expert_catalog(&self.checkpoint.snapshot)) {
+            Ok(catalog) => Ok(catalog),
+            Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        }
+    }
+
+    /// The plan for `options` over this checkpoint.
+    pub fn plan(&self, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+        plan_of(self, options)
+    }
+}
+
 pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    PlanInput::open(snapshot)
+        .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?
+        .plan(options)
+}
+
+fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     options.validate()?;
-    let checkpoint = Checkpoint::open(snapshot)
-        .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
+    let checkpoint = input.checkpoint();
     let mut report = PlanReport {
         attention_placement: options.attention_placement.unwrap_or_default(),
         requested_attention: options.attention_placement,
         vision: options.vision,
-        audio: resolve_audio(options.audio, snapshot)?,
+        audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
         encoder_plan_hash: String::new(),
         max_image_tokens: None,
-        snapshot: snapshot.display().to_string(),
+        snapshot: checkpoint.snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
         quantization: None,
@@ -464,7 +512,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     let ownership = options.draft_ownership.unwrap_or_else(|| {
         let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
         spec::DraftOwnership::selected(family.id(), if !native { "off" }
-            else if family.id() == "mimo_v2" && snapshot.join("dflash").is_dir() { "dflash2" }
+            else if family.id() == "mimo_v2" && checkpoint.snapshot.join("dflash").is_dir() { "dflash2" }
             else if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" }
             else { "mtp" })
     });
@@ -489,7 +537,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             let unavailable = tensors.iter().filter(|(name, _)|
                 checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name.as_str())).is_err())
                 .map(|(tensor, shard)| Rejection { tensor: tensor.clone(), reason:
-                    format!("role {role} lacks header for shard {shard} at snapshot {}", snapshot.display()) }).collect();
+                    format!("role {role} lacks header for shard {shard} at snapshot {}", checkpoint.snapshot.display()) }).collect();
             report.role_readiness.push(RoleReadiness { role, required_shards: shards.into_iter().collect(), unavailable });
         }
         report.unneeded_missing_shards = checkpoint.missing_shards.iter()
@@ -520,7 +568,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     // The expert staging's own verdict on the routed experts.
     let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
-        .then(|| crate::read_expert_catalog(&checkpoint.snapshot));
+        .then(|| input.expert_catalog());
     report.expert_storage = catalog.as_ref().and_then(|catalog| catalog.as_ref().ok()?.exl3().map(|m| m.storage));
     let catalog_error = catalog.and_then(Result::err).map(|error| format!("{error:#}"));
     let mut hinted = BTreeSet::new();
@@ -607,7 +655,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
-        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &layout_options,
+        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), input, &layout_options,
             options.coordinator_budget_bytes);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
@@ -652,7 +700,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             ..Default::default() };
-        let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), &checkpoint, &inventory,
+        let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), input, &inventory,
             options.coordinator_budget_bytes);
     }
     if let Some(encoder) = &report.encoder {
@@ -833,6 +881,15 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
 /// Count policy never depends on card size; each candidate uses the same admission.
 pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize,
     explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    let input = PlanInput::open(snapshot)
+        .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
+    plan_spark_count_of(&input, options, available, explicit)
+}
+
+/// Count candidates differ only in placement, so every one shares the
+/// checkpoint and catalog `input` already read.
+fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usize,
+    explicit: Option<usize>) -> Result<PlanReport, PlanError> {
     if available > 8 {
         return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
     }
@@ -841,7 +898,7 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
         let mut candidate = PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
-        let mut report = plan(snapshot, &candidate)?;
+        let mut report = input.plan(&candidate)?;
         if report.family.as_deref() != Some("deepseek_v41") || candidate.layout.is_none() {
             return Ok(report);
         }
@@ -863,7 +920,7 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
                 let layout = candidate.layout.as_mut().unwrap();
                 layout.prefill_rows = rows;
                 layout.spark_capacity_rows = rows;
-                let mut smaller = plan(snapshot, &candidate)?;
+                let mut smaller = input.plan(&candidate)?;
                 smaller.prefill_rows = Some(rows);
                 if smaller.executable() {
                     smaller.prefill_selection = Some(format!(

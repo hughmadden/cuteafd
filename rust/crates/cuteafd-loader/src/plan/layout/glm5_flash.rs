@@ -4,8 +4,9 @@ use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    checkpoint: &super::super::Checkpoint, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
+    input: &super::super::PlanInput, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
     rows: u64, sequences: u64, context: u64, weight_budget: u64) -> MemoryLayout {
+    let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -47,7 +48,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
         let router = if ranks == 2 { resident::router_replica_bytes(checkpoint, &cfg, cfg.layers).map_err(anyhow::Error::msg)? } else { 0 };
-        let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+        let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
         let onboard = options.onboard.or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
             .unwrap_or_else(glmf::default_onboard);

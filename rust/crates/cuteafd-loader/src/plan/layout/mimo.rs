@@ -5,8 +5,9 @@ use crate::families::mimo_v2::{admission::*, capacity::*, resident::MimoResident
 use anyhow::{Context, Result};
 
 pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    checkpoint: &super::super::Checkpoint, options: &LayoutOptions, rows: u64,
+    input: &super::super::PlanInput, options: &LayoutOptions, rows: u64,
     concurrency: u64, context: u64, manifest: Option<&serde_json::Value>) -> MemoryLayout {
+    let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
     let mut notes = vec![format!("resolved context {context} tokens"), "MiMo attention placement heads".into()];
@@ -51,9 +52,9 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // solve. An explicit POOL_TOKENS stays strict.
         media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
-        match apply(checkpoint, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
+        match apply(input, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
             Ok(placement) => {
-                if let Err(error) = spark_experts(checkpoint, options, &mut sparks, placement.onboard_layers) {
+                if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
                 }
                 resolve_encoder(checkpoint, report, model, &mut admission, &mut sparks,
@@ -76,7 +77,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     device.items.push(Item::new(Category::Reserved, "unavailable target admission", "",
                         device.capacity_bytes, Basis::Formula));
                 }
-                let _ = spark_experts(checkpoint, options, &mut sparks, 0);
+                let _ = spark_experts(input, options, &mut sparks, 0);
                 resolve_encoder(checkpoint, report, model, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
@@ -84,7 +85,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
     }
     let mut pool_tokens = 0;
-    match apply(checkpoint, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
+    match apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok(placement) => {
             pool_tokens = placement.pool_tokens;
             notes.push(format!("placement: {}", placement.summary()));
@@ -92,7 +93,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", tp2.layers, tp2.first, tp2.first + tp2.layers));
             }
             if spark_ranks > 0 {
-                let expert_bytes = spark_experts(checkpoint, options, &mut sparks, placement.onboard_layers);
+                let expert_bytes = spark_experts(input, options, &mut sparks, placement.onboard_layers);
                 if let Err(error) = expert_bytes { report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}")); }
             }
         }
@@ -113,10 +114,11 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
 }
 
-fn spark_experts(checkpoint: &super::super::Checkpoint, _options: &LayoutOptions,
+fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
     sparks: &mut [DeviceLayout], onboard: usize) -> Result<()> {
     if sparks.is_empty() { return Ok(()); }
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let checkpoint = input.checkpoint();
+    let catalog = input.expert_catalog()?;
     let tensors = catalog.fp8().context("MiMo Spark expert headers")?;
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let remote = cfg.dense.iter().filter(|&&dense| !dense).count().checked_sub(onboard)
@@ -235,7 +237,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         ranks: runtime, host_prefix_bytes: 0 })?)
 }
 
-fn expert_costs(checkpoint: &super::super::Checkpoint, cfg: &MimoV2Config,
+fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     options: &LayoutOptions, ranks: usize, spark_ranks: usize, rows: u64)
     -> Result<(Vec<Option<crate::placement::ExpertCost>>, u64, [u64; 2], crate::placement::Onboard)> {
     use crate::placement::{Bytes2, ExpertCost, Onboard};
@@ -243,7 +245,7 @@ fn expert_costs(checkpoint: &super::super::Checkpoint, cfg: &MimoV2Config,
     use crate::formats::fp8_experts::Slicing;
     let onboard = options.onboard.unwrap_or_else(|| options.local_expert_layers
         .map(Onboard::Layers).unwrap_or(Onboard::Auto));
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = input.expert_catalog()?;
     let tensors = catalog.fp8().context("MiMo needs native FP8/MXFP4/NVFP4 expert headers")?;
     let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref());
     let directory = package_directory(&lib, cfg, tensors.format(), ranks)?;
@@ -295,9 +297,10 @@ fn expert_costs(checkpoint: &super::super::Checkpoint, cfg: &MimoV2Config,
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 
-pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions,
+pub(super) fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>) -> Result<crate::placement::Placement> {
+    let checkpoint = input.checkpoint();
     let profiles = profile(checkpoint, options, devices.len(), spark_ranks, rows, concurrency, context, manifest)?;
     let no_spark = if spark_ranks == 0 { profiles.clone() }
         else { profile(checkpoint, options, devices.len(), 0, rows, concurrency, context, manifest)? };
@@ -308,7 +311,7 @@ pub(super) fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptio
     }
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let ranks = devices.len();
-    let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(checkpoint, &cfg, options, ranks, spark_ranks, rows)?;
+    let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
@@ -367,7 +370,7 @@ use crate::placement::families::mimo_v2::reservation_category;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{checkpoint::Checkpoint, testing::*};
+    use crate::plan::{checkpoint::Checkpoint, testing::*, PlanInput};
 
     #[test]
     fn planner_equals_runtime_admission_flash_pro_one_two_rtx() {
@@ -377,6 +380,8 @@ mod tests {
             config["max_position_embeddings"] = serde_json::json!(1 << 20);
             write_snapshot(dir.path(), &config, &if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() }, Some(if pro { 8 } else { 4 }));
             let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let input = PlanInput::from_checkpoint(checkpoint);
+            let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
@@ -411,7 +416,7 @@ mod tests {
                         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
                         items: vec![], kv_tokens: 0,
                     }).collect();
-                    assert_eq!(apply(&checkpoint, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap().pool_tokens, 32768);
+                    assert_eq!(apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap().pool_tokens, 32768);
                     for rank in 0..ranks {
                         let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
                             + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;
@@ -431,6 +436,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let input = PlanInput::from_checkpoint(checkpoint);
+        let checkpoint = input.checkpoint();
         for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
             (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
             let baseline = baseline + 35_651_584;
@@ -448,7 +455,7 @@ mod tests {
                 &[(0, 64 << 20)]).unwrap();
             let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total,
                 items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
-            let pool = apply(&checkpoint, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
+            let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
             assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
             assert_eq!(devices[0].capacity_bytes, total - headroom_bytes(total, true));
         }
@@ -498,6 +505,8 @@ mod tests {
             let (config, tensors) = shipped_mimo(pro);
             write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
             let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let input = PlanInput::from_checkpoint(checkpoint);
+            let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 // Native CPU scratch sizing from the pinned SM120 package;
@@ -523,7 +532,7 @@ mod tests {
                     ..Default::default() };
                 let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
                 let (experts, expert_workspace, tp2_workspace, onboard) =
-                    expert_costs(&checkpoint, &cfg, &opts, ranks, sparks, 4096).unwrap();
+                    expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                 let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
                 let inputs = MimoInputs { cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
                     kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
@@ -558,7 +567,7 @@ mod tests {
                     items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
                         baseline[rank], Basis::Calibrated)],
                 }).collect::<Vec<_>>();
-                let planned = apply(&checkpoint, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
+                let planned = apply(&input, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
                 assert_eq!(&planned, runtime, "pro={pro}, ranks={ranks}");
                 assert_eq!(planned.pool_tokens, 2 << 20);
                 assert_eq!(capacity.active_max_context_sequences, 8);
@@ -607,6 +616,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let input = PlanInput::from_checkpoint(checkpoint);
+        let checkpoint = input.checkpoint();
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot).unwrap();
         let tensors = catalog.fp8().unwrap();
         let options = LayoutOptions { workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
@@ -619,7 +630,7 @@ mod tests {
             kind: DeviceKind::Spark, index: rank, capacity_bytes: 108 * GIB,
             items: vec![], kv_tokens: 0,
         }).collect::<Vec<_>>();
-        spark_experts(&checkpoint, &options, &mut sparks, 0).unwrap();
+        spark_experts(&input, &options, &mut sparks, 0).unwrap();
         for spark in &sparks {
             assert_eq!(spark.used_bytes(), expert_layer_bytes(tensors, 6, spark.index as usize,
                 recipe.slicing).unwrap());
@@ -638,6 +649,8 @@ mod tests {
             let tensors = if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() };
             write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
             let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let input = PlanInput::from_checkpoint(checkpoint);
+            let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 let manifest = dir.path().join(format!("spark-free-tp{ranks}.json"));
@@ -648,7 +661,7 @@ mod tests {
                     kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 32 * GIB,
                     items: vec![], kv_tokens: 0,
                 }).collect::<Vec<_>>();
-                assert!(apply(&checkpoint, &options, &mut devices(), 0, 4096, 4, 256 << 10, None).is_err(),
+                assert!(apply(&input, &options, &mut devices(), 0, 4096, 4, 256 << 10, None).is_err(),
                     "Spark-free cannot fall back without its mandatory expert package");
                 let scratch = match (pro, ranks) {
                     (true, 1) => 805_573_632, (true, _) => 604_247_040,
@@ -662,7 +675,7 @@ mod tests {
                     "capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
                 }}})).unwrap()).unwrap();
                 let mut admitted = devices();
-                let placement = apply(&checkpoint, &options, &mut admitted, 0, 4096, 4, 256 << 10, None).unwrap();
+                let placement = apply(&input, &options, &mut admitted, 0, 4096, 4, 256 << 10, None).unwrap();
                 assert_eq!(placement.onboard_layers, cfg.dense.iter().filter(|&&dense| !dense).count());
                 assert!(placement.pool_tokens >= 256 << 10);
                 for (layer, assignment) in placement.layers.iter().enumerate().filter(|(layer, _)| !cfg.dense[*layer]) {
@@ -671,7 +684,7 @@ mod tests {
                 }
                 assert!(admitted.iter().all(|gpu| gpu.used_bytes() <= gpu.capacity_bytes));
                 options.rtx_bytes = vec![1 * GIB; ranks];
-                assert!(apply(&checkpoint, &options, &mut devices(), 0, 4096, 4, 256 << 10, None).is_err(),
+                assert!(apply(&input, &options, &mut devices(), 0, 4096, 4, 256 << 10, None).is_err(),
                     "Mandatory experts or the agentic pool floor must not silently shrink away");
             }
         }
