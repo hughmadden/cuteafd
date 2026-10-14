@@ -309,6 +309,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> Result<()> {
     request.console_retire();
+    let state = if !request.failed && requests.borrow().cache().request_id(request.lease).is_ok() {
+        requests.borrow_mut().record_state(request.lease, &request.job.probe, "turn")
+    } else { Ok(()) };
     // Chunk-4b: consult the turn bank before requiring the retained frontier, so
     // a cache-disabled deployment does not warn about a frontier it correctly
     // chose not to download.
@@ -347,5 +350,9 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     }
     let target = requests.borrow_mut().release_if_present(request.lease);
     let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id())).transpose();
-    target.and(speculative.map(|_| ()))
+    if let Some(probe) = request.job.probe.as_ref().filter(|probe| probe.spec.record_state) {
+        if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
+        probe.finish_state();
+    }
+    target.and(speculative.map(|_| ())).and(state)
 }

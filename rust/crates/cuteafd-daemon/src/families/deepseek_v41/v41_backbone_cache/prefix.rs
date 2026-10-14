@@ -29,6 +29,57 @@ fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Cuteaf
 }
 
 impl<'a> BackboneCache<'a> {
+    /// Canonical initialized state for the golden gate. Physical page ids and unused
+    /// ring/carry/page padding are deliberately excluded from the comparison.
+    pub fn diagnostic_state(&mut self, lease: CacheLease) -> Result<(BackboneMark, Vec<u8>)> {
+        use crate::shared::memory::device::{Allocation, Device};
+        let library = self.prefix_stream.library;
+        let device = Device { library, id: library.cuda_get_device()? };
+        let mark = Allocation::new(device, BackboneMark::BYTES)?;
+        let meta = self.capture_mark(lease, mark.buffer)?;
+        let mut bytes = Vec::new();
+        let mut read = |buffer: CuteafdDeviceBuffer| -> Result<()> {
+            let start = bytes.len();
+            bytes.resize(start + buffer.bytes, 0);
+            library.copy_d2h(&mut bytes[start..], buffer)
+        };
+        for (layer, &(begin, end)) in meta.windows.iter().enumerate() {
+            let first = begin.max(end.saturating_sub(128));
+            let count = (end - first) as usize;
+            let offset = first as usize % 128;
+            let initial = count.min(128 - offset);
+            for (offset, rows) in [(offset, initial), (0, count - initial)] {
+                if rows == 0 { continue; }
+                for (base, width) in [(0, 512), (128 * 512, 16)] {
+                    read(slice(mark.buffer, layer * WINDOW_PREFIX_BYTES + base + offset * width, rows * width))?;
+                }
+            }
+            read(slice(mark.buffer, layer * WINDOW_PREFIX_BYTES + 128 * 528, 8))?;
+        }
+        if meta.end % 2 == 1 {
+            // Only the three ratio-two sources have a live compressor carry.
+            for source in 0..3 {
+                read(slice(mark.buffer, 40 * WINDOW_PREFIX_BYTES + source * COMPRESSOR_PREFIX_BYTES,
+                    COMPRESSOR_PREFIX_BYTES))?;
+            }
+        }
+        let request = self.request_identity(lease)?;
+        for (state, &source_lease) in self.sources.iter().zip(&request.sources) {
+            let (pages, rows) = state.binding(source_lease)?;
+            ensure!(rows == meta.end as usize / state.ratio(), "diagnostic source frontier differs");
+            state.device.run(|| {
+                for (index, &page) in pages.iter().take(rows.div_ceil(PAGE_ROWS)).enumerate() {
+                    let count = (rows - index * PAGE_ROWS).min(PAGE_ROWS);
+                    for segment in state.source_cache().page_segments(page) {
+                        read(slice(segment, 0, count * (segment.bytes / PAGE_ROWS)))?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok((meta, bytes))
+    }
+
     /// Start a fresh request at the complete-group frontier `end` of source pages the prefix
     /// engine forked and bound, with empty encoder windows at the bounded replay start
     /// `end - 128`. Decoder windows remain fresh. Replay reads the shared source rows without

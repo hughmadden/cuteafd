@@ -261,6 +261,27 @@ impl<'a> Requests<'a> {
         -> RequestMark {
         RequestMark { backbone, engram_position: request.history.position(), engram_recent: request.history.lookback() }
     }
+    /// Record exactly the initialized target state plus Engram history, never allocator padding.
+    pub fn record_state(&mut self, lease: CacheLease, probe: &crate::shared::probe::ProbeRef,
+        kind: &str) -> Result<()> {
+        let Some(probe) = probe.as_ref().filter(|probe| probe.spec.record_state) else { return Ok(()); };
+        use sha2::{Digest, Sha256};
+        let request = self.request(lease)?;
+        ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
+            "diagnostic state has pending or inconsistent history");
+        let (backbone, bytes) = self.cache.diagnostic_state(lease)?;
+        let meta = self.mark_of(self.request(lease)?, backbone);
+        let metadata = serde_json::to_vec(&meta)?;
+        let mut hash = Sha256::new();
+        hash.update(&metadata);
+        hash.update(&bytes);
+        probe.state(cuteafd_api::openai::probe::ProbeState {
+            kind: kind.to_owned(), end: meta.backbone.end as usize,
+            sha256: format!("{:x}", hash.finalize()), bytes: metadata.len() + bytes.len(),
+        });
+        Ok(())
+    }
+
     /// Copy a complete request's backbone mark into `mark` (synchronously) and describe it.
     pub fn capture_mark(&mut self, lease: CacheLease, mark: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<RequestMark> {
         let request = self.request(lease)?;

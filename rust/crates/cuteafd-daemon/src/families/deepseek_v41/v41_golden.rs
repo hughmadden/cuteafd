@@ -45,6 +45,15 @@ pub(crate) struct GoldenArgs {
     /// Generated rows recorded per request in --resume-at.
     #[arg(long, default_value_t = 16)]
     pub resume_rows: usize,
+    /// Require an exact host-tier promotion after evicting the device snapshot.
+    #[arg(long)]
+    pub resume_host: bool,
+    /// Run the restore cases on an existing keyed serving daemon (real Spark layout).
+    #[arg(long, env = "CUTEAFD_SMOKE_URL")]
+    pub resume_url: Option<String>,
+    /// Directory for the exact-state case manifest (hashes only, no credentials).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Rows the probe records, in position order: each row's log-probabilities
@@ -72,7 +81,7 @@ fn read_tokens(args: &GoldenArgs) -> Result<Vec<u32>> {
 fn golden(args: GoldenArgs) -> Result<()> {
     let tokens = read_tokens(&args)?;
     if !args.resume_at.is_empty() {
-        return resume::check(args.serve, &tokens, &args.resume_at, args.resume_rows);
+        return resume::check(args.serve, &tokens, &args.resume_at, args.resume_rows, args.resume_host, args.resume_url.as_deref(), args.output.as_deref());
     }
     ensure!((1..tokens.len()).contains(&args.score_from), "--score-from must be inside the golden prompt");
     let GoldenArgs { serve, golden, score_from, score_path, verify_rows, save_logits, .. } = args;

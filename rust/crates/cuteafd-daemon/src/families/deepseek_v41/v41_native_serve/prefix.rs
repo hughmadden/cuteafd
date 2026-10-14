@@ -130,6 +130,7 @@ pub(crate) fn layout(units: usize, draft: bool, partial: bool) -> FamilyLayout {
         draft_bytes: 0,
         rule: if partial { ReuseRule::V41 } else { ReuseRule::EXACT },
         mark_store: MarkStore::Arena,
+        page_owners: cuteafd_engine::prefix::PageOwners::Uniform,
     }
 }
 
@@ -359,6 +360,7 @@ pub(crate) struct V41Cache<'a> {
 /// What a V4.1 admission restored: the resume point and, for an exact full-prompt hit, the
 /// retained scores of the first token.
 pub(crate) struct Restored {
+    pub source: Option<cuteafd_engine::prefix::Source>,
     pub cached: usize,
     pub scores: Option<RetainedScores>,
     pub plan: Option<RestorePlan>,
@@ -452,7 +454,7 @@ impl<'a> V41Cache<'a> {
             None => None,
         };
         let plan = admitted.placement.plan;
-        Ok(Restored { cached: admitted.resume, scores, plan })
+        Ok(Restored { cached: admitted.resume, scores, plan, source: admitted.source })
     }
 
     /// Whether `work` (each request's remaining declared tokens) fits the units bound to it.

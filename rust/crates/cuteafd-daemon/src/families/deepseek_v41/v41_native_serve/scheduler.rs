@@ -133,6 +133,9 @@ impl Active<'_> {
 fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut Requests<'a>,
     prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
     request.console_retire();
+    let state = if !request.failed && requests.cache().request_id(request.lease).is_ok() {
+        requests.record_state(request.lease, &request.job.probe, "turn")
+    } else { Ok(()) };
     // Chunk-4b: retention is consulted **before** the retained frontier is
     // required. With the turn bank disabled `retain` early-returns, so requiring
     // `next_after_commit` first would turn a cache-disabled deployment into a
@@ -150,7 +153,11 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
     // Release both owners even if one cleanup reports an error.
     let target = requests.release_if_present(request.lease);
     let speculative = draft.map(|draft| draft.release(request.id())).transpose();
-    target.and(speculative.map(|_| ()))
+    if let Some(probe) = request.job.probe.as_ref().filter(|probe| probe.spec.record_state) {
+        if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
+        probe.finish_state();
+    }
+    target.and(speculative.map(|_| ())).and(state)
 }
 
 /// Allocate the optional pinned pool before signalling HTTP readiness. A bad
@@ -414,6 +421,14 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     }
                     other => other?,
                 };
+                if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
+                    if let Some(source) = &restored.source {
+                        probe.provenance(serde_json::json!({"prefix_restore": source}));
+                        if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
+                            requests.record_state(lease, &job.probe, "restore")?;
+                        }
+                    }
+                }
                 let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
@@ -490,7 +505,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                         &prompt, from, args.prefill_batch_tokens as usize, &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
                 }
-                if SHARED_PREFILL && decoding && cached != prompt.len() && crate::shared::probe::scoring(&job.probe).is_none() {
+                if SHARED_PREFILL && decoding && !job.probe.as_ref().is_some_and(|p| !p.spec.cold_steps.is_empty()) && cached != prompt.len() && crate::shared::probe::scoring(&job.probe).is_none() {
                     // Park: the prompt prefills in waves between decode rounds.
                     return Ok((Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
                         lease, job, decoder, anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false,
@@ -502,6 +517,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 else { prefill(lib, runtime, first, second, requests, first_transport,
                     second_transport, lease, &prompt, args.prefill_batch_tokens as usize, &job,
                     draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
+                requests.record_state(lease, &job.probe, "prompt")?;
                 if crate::shared::probe::wants_first(&job.probe) {
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
                 }
@@ -668,6 +684,7 @@ fn prefill_round<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runti
             run_unit(&mut step, &mut parked.cursor, budget)?
         };
         let Some(scores) = scores else { return Ok(Chunk::More) };
+        requests.record_state(request.lease, &request.job.probe, "prompt")?;
         if crate::shared::probe::wants_first(&request.job.probe) {
             crate::shared::probe::host_row(&request.job.probe, request.tokens.len(), &scores.logits()?);
         }

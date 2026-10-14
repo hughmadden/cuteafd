@@ -239,6 +239,11 @@ impl Client {
             finish_reason,
         };
         chat.tool_calls = tool_calls;
+        if let Some((_, probe)) = &registered {
+            if probe.spec.record_state && probe.record().engine.as_deref() == Some("deepseek_v41") {
+                probe.wait_state()?;
+            }
+        }
         chat.probe = registered.map(|(_, probe)| probe.record());
         Ok(chat)
     }

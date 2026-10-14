@@ -677,6 +677,44 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<RetainedScores> {
     use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
+    if let Some(probe) = job.probe.as_ref().filter(|probe| !probe.spec.cold_steps.is_empty()) {
+        probe.spec.validate_cold_steps(tokens.len(), tokens.len(), 1)?;
+        ensure!(!probe.spec.cold_steps[0].decode, "V4.1 cold replay must begin with encoder prefill");
+        let mut previous = 0;
+        let mut scores = None;
+        let mut draft = draft;
+        for (index, cold_step) in probe.spec.cold_steps.iter().enumerate() {
+            let chunk = &tokens[previous..cold_step.end];
+            if index == 0 {
+                let mut times = V41PrefillTimes::default();
+                let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
+                    other_transport, lease, tokens: chunk, chunk_rows, job, draft: draft.as_deref_mut(),
+                    hold, times: &mut times };
+                scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
+            } else if cold_step.decode {
+                let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
+                    image_mask: None, kind: ExpertV2SourceKind::Decode }])?;
+                let result = (|| -> Result<RetainedScores> {
+                    // SAFETY: the probe's request and batch stay owned until execution and commit drain.
+                    runtime.block_on(unsafe { pass.execute_shared(&std::cell::RefCell::new(&mut *requests),
+                        &mut batch, transport, 0, &[chunk.len() - 1]) })?;
+                    let bytes = runtime.block_on(pass.download_logits(&batch, &[0]))?;
+                    runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
+                    RetainedScores::new(scores::VOCAB, bytes)
+                })();
+                if result.is_err() { pass.discard(&mut batch)?; }
+                scores = Some(result?);
+            } else {
+                if index + 1 == probe.spec.cold_steps.len() {
+                    requests.record_state(lease, &job.probe, "checkpoint")?;
+                }
+                scores = Some(prefill_continuation(lib, runtime, pass, requests, transport, lease,
+                    chunk, chunk_rows, job, draft.as_deref_mut(), hold)?);
+            }
+            previous = cold_step.end;
+        }
+        return scores.context("V4.1 cold replay produced no logits");
+    }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
         other_transport, lease, tokens, chunk_rows, job, draft, hold, times: &mut times };
