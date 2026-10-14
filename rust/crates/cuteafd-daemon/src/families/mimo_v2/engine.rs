@@ -344,7 +344,8 @@ struct Workspace<'a> {
     kv_step: Dev<'a>,
     /// 8-bit KV prefill: BF16 copy of one sequence's full-attention records (`max_context` rows).
     kv_wide: Rc<Dev<'a>>,
-    positions: Dev<'a>,
+    step_inputs: Dev<'a>,
+    step_host: RefCell<Vec<u8>>,
     slots: Dev<'a>,
     step_slots: Dev<'a>,
     ring_slots: Dev<'a>,
@@ -379,8 +380,6 @@ pub(crate) struct Peer<'a> {
     pub stream: *mut c_void,
     pub layers: Vec<MimoLayer<'a>>,
     kv: Vec<Rc<Allocation<'a>>>,
-    cos_sin_full: Dev<'a>,
-    cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     /// The earlier prefill lanes' workspaces (see [`MimoEngine::step_lanes`]).
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
@@ -401,22 +400,67 @@ fn lane_slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
 
-/// cos | sin of position * theta^(-2i/dim) for `max_context` positions, FP32
-/// like the reference's inv_freq, on the current device.
-fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_context: usize) -> Result<Dev<'a>> {
-    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/rope");
-    let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
-    let mut values = vec![0f32; max_context * dim];
-    for p in 0..max_context {
-        for (i, f) in inv.iter().enumerate() {
-            let angle = p as f32 * f;
-            values[p * dim + i] = angle.cos();
-            values[p * dim + dim / 2 + i] = angle.sin();
-        }
+/// Step-local rows retain the original host FP32 arithmetic, not libdevice's
+/// different cos/sin rounding. Positions remain absolute for attention.
+struct RopeWindow {
+    full: Vec<f32>,
+    swa: Vec<f32>,
+}
+
+impl RopeWindow {
+    fn new(dim: usize, full_theta: f64, swa_theta: f64) -> Self {
+        let inv = |theta: f64| (0..dim / 2)
+            .map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
+        Self { full: inv(full_theta), swa: inv(swa_theta) }
     }
-    let allocation = DeviceAllocation::new(library, values.len() * 4)?;
-    library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-    Ok(allocation)
+
+    fn fill(&self, positions: &[i64], rows: usize, max_context: usize, bytes: &mut [u8]) -> Result<()> {
+        ensure!(positions.len() <= rows && positions.iter().all(|&p| p >= 0 && (p as usize) < max_context),
+            "RoPE window positions exceed workspace or context");
+        let dim = self.full.len() * 2;
+        ensure!(bytes.len() == rows * (8 + 2 * dim * 4), "RoPE window extent mismatch");
+        for (row, &position) in positions.iter().enumerate() {
+            bytes[row * 8..row * 8 + 8].copy_from_slice(&position.to_ne_bytes());
+            for (kind, inv) in [&self.full, &self.swa].into_iter().enumerate() {
+                let base = rows * 8 + (kind * rows + row) * dim * 4;
+                for (i, f) in inv.iter().enumerate() {
+                    let angle = position as f32 * f;
+                    bytes[base + i * 4..base + i * 4 + 4].copy_from_slice(&angle.cos().to_ne_bytes());
+                    let at = base + (dim / 2 + i) * 4;
+                    bytes[at..at + 4].copy_from_slice(&angle.sin().to_ne_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The producer's positions operand is only a RoPE row index; attention's
+/// positions operand still controls absolute masking and cache history.
+struct StepInputBindings {
+    producer_positions: *mut c_void,
+    attention_positions: *mut c_void,
+    kv_slots: *mut c_void,
+    cos_sin: *mut c_void,
+}
+
+fn step_input_bindings(inputs: *mut c_void, identity: *mut c_void, slots: *mut c_void,
+    rows: usize, dim: usize, attention: MimoAttention) -> StepInputBindings {
+    let sliding = attention == MimoAttention::Sliding;
+    let offset = rows * 8 + usize::from(sliding) * rows * dim * 4;
+    StepInputBindings {
+        producer_positions: identity,
+        attention_positions: inputs,
+        kv_slots: if sliding { identity } else { slots },
+        cos_sin: inputs.cast::<u8>().wrapping_add(offset).cast(),
+    }
+}
+
+impl Workspace<'_> {
+    fn attention_bindings(&self, dim: usize, attention: MimoAttention) -> StepInputBindings {
+        step_input_bindings(self.step_inputs.buffer.ptr, self.step_slots.buffer.ptr,
+            self.slots.buffer.ptr, self.rows, dim, attention)
+    }
 }
 
 pub(crate) struct MimoEngine<'a> {
@@ -427,6 +471,7 @@ pub(crate) struct MimoEngine<'a> {
     /// latches this bit, so a caller cannot swallow a terminal execution error.
     submission_failed: Cell<bool>,
     quantize_grid: Fp8QuantizeGrid,
+    rope: RopeWindow,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: MimoV2Config,
@@ -449,8 +494,6 @@ pub(crate) struct MimoEngine<'a> {
     exchange: Option<PeerExchange<'a>>,
     /// Per layer: the paged record pool (full) or the rings (SWA).
     kv: Vec<Rc<Allocation<'a>>>,
-    cos_sin_full: Dev<'a>,
-    cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// The earlier prefill lanes (the last one uses `workspace`); the first
@@ -570,13 +613,11 @@ impl<'a> MimoEngine<'a> {
                 MimoAttention::Sliding => rings * RING_ROWS * record,
             })
         }).collect::<Result<Vec<_>>>()?;
-        let table = |theta: f64| rope_table(library, cfg.rope_dim, theta, max_context);
-        let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
+        let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
             max_context, prefill_rows, prefill_output, pages, rings, family, device,
-            split_family, peer: None, exchange: None, kv, cos_sin_full,
-            cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
+            split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
@@ -782,9 +823,7 @@ impl<'a> MimoEngine<'a> {
                     MimoAttention::Sliding => self.rings * RING_ROWS * record,
                 })
             }).collect::<Result<Vec<_>>>()?;
-            let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
-            Ok(Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
-                cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
+            Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
                 lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
@@ -1058,7 +1097,8 @@ impl<'a> MimoEngine<'a> {
             kv_wide: if options.shares_prefill_kv_wide() {
                 self.shared_prefill_kv_wide(rank, size(layout.kv_wide)?)?
             } else { Rc::new(self.alloc(size(layout.kv_wide)?)?) },
-            positions: self.alloc(size(layout.positions)?)?,
+            step_inputs: self.alloc(size(layout.step_inputs)?)?,
+            step_host: RefCell::new(vec![0; size(layout.step_inputs)?]),
             slots: self.alloc(size(layout.slots)?)?,
             step_slots,
             ring_slots: self.alloc(size(layout.ring_slots)?)?,
@@ -1087,6 +1127,16 @@ impl<'a> MimoEngine<'a> {
             },
             _head_workspace: head_workspace,
         })
+    }
+
+    /// Replace the existing positions upload with one packed positions/RoPE copy.
+    /// Pointers stay fixed across graph replay; each prefill lane owns its window.
+    fn put_step_inputs(&self, rank: usize, w: &Workspace<'_>, positions: &[i64]) -> Result<()> {
+        let mut bytes = w.step_host.borrow_mut();
+        self.rope.fill(positions, w.rows, self.max_context, &mut bytes)?;
+        // SAFETY: workspace and stream belong to this rank; all readers follow
+        // this upload on that stream, outside capture. FFI retains pinned staging.
+        unsafe { self.library.copy_h2d_ordered(w.step_inputs.buffer, &bytes, self.stream_of(rank)) }
     }
 
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
@@ -1297,7 +1347,7 @@ impl<'a> MimoEngine<'a> {
         // SAFETY: the engine owns this stream; the previous step must be done reading the tables.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         for (i, (tables, tokens)) in lanes.iter().enumerate() {
-            self.put(&w[i].positions, &tables.positions)?;
+            self.put_step_inputs(0, w[i], &tables.positions)?;
             self.put(&w[i].slots, &tables.slots)?;
             self.put(&w[i].ring_slots, &tables.ring_slots)?;
             self.put(&w[i].seq_first, &tables.seq_first)?;
@@ -1330,7 +1380,7 @@ impl<'a> MimoEngine<'a> {
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             for (i, (tables, _)) in lanes.iter().enumerate() {
                 self.on(1, || {
-                    self.put(&peers[i].positions, &tables.positions)?;
+                    self.put_step_inputs(1, peers[i], &tables.positions)?;
                     self.put(&peers[i].slots, &tables.slots)?;
                     self.put(&peers[i].ring_slots, &tables.ring_slots)?;
                     self.put(&peers[i].seq_first, &tables.seq_first)?;
@@ -1552,7 +1602,7 @@ impl<'a> MimoEngine<'a> {
         }
         for (rank, w) in std::iter::once(w).chain(split.map(|(_, w1)| w1)).enumerate() {
             self.on(rank, || {
-                self.put(&w.positions, &tables.positions)?;
+                self.put_step_inputs(rank, w, &tables.positions)?;
                 self.put(&w.slots, &tables.slots)?;
                 self.put(&w.ring_slots, &tables.ring_slots)?;
                 self.put(&w.seq_first, &tables.seq_first)?;
@@ -2024,6 +2074,9 @@ impl<'a> MimoEngine<'a> {
             Some(ws) => Some(ws.as_ref().context("peer workspace")?),
             None => None,
         };
+        for (rank, workspace) in std::iter::once(w).chain(w1).enumerate() {
+            self.on(rank, || self.put_step_inputs(rank, workspace, &vec![0; DECODE_ROWS]))?;
+        }
         let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
         let free_before_head = free(0)?;
         // The cuBLAS head's first call (handle setup) runs before any capture.
@@ -2378,7 +2431,11 @@ impl<'a> MimoEngine<'a> {
         }
         let workspace = self.decode_workspace.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        self.stage_async(w.positions.buffer, bytes_of(&tables.positions))?;
+        {
+            let mut bytes = w.step_host.borrow_mut();
+            self.rope.fill(&tables.positions, w.rows, self.max_context, &mut bytes)?;
+            self.stage_async(w.step_inputs.buffer, &bytes)?;
+        }
         self.stage_async(w.ring_slots.buffer, bytes_of(&tables.ring_slots))?;
         self.stage_async(w.seq_first.buffer, bytes_of(&tables.seq_first))?;
         self.stage_async(w.page_table.buffer, bytes_of(&tables.page_table))?;
@@ -2478,14 +2535,7 @@ impl<'a> MimoEngine<'a> {
         rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let k = kind(layer.attention);
-        let (full, swa) = match (rank, &self.peer) {
-            (1, Some(peer)) => (&peer.cos_sin_full, &peer.cos_sin_swa),
-            _ => (&self.cos_sin_full, &self.cos_sin_swa),
-        };
-        let (slots, cos_sin) = match layer.attention {
-            MimoAttention::Full => (w.slots.buffer.ptr, full.buffer.ptr),
-            MimoAttention::Sliding => (w.step_slots.buffer.ptr, swa.buffer.ptr),
-        };
+        let bindings = w.attention_bindings(self.cfg.rope_dim, layer.attention);
         let split = layer.split;
         let records = match layer.attention {
             MimoAttention::Full => kv,
@@ -2493,8 +2543,8 @@ impl<'a> MimoEngine<'a> {
         };
         let decode = tables.decode;
         if part == 0 {
-            let pointers = [("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
-                ("cos_sin", cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
+            let pointers = [("x", w.x.buffer.ptr), ("positions", bindings.producer_positions), ("kv_slots", bindings.kv_slots),
+                ("cos_sin", bindings.cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
                 ("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
             let kv = self.kv_cache.of(layer.attention).program_tag();
             return self.run_on(rank, split, &format!("mimo_{k}_producer{kv}_{cap}"), &pointers, &self.w8_scalars(rows, decode));
@@ -2505,7 +2555,7 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Full => {
                 let mut scalars = vec![rows, Scalar::I32(tables.table_stride as i32)];
                 let mut pointers = vec![("q", w.query.buffer.ptr), ("kv_cache", kv),
-                    ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr)];
+                    ("positions", bindings.attention_positions), ("page_table", w.page_table.buffer.ptr)];
                 if tables.decode {
                     scalars.push(Scalar::I32(DECODE_SPLITS));
                 } else if self.kv_cache != MimoKvCache::Bf16 {
@@ -2520,7 +2570,7 @@ impl<'a> MimoEngine<'a> {
             }
             MimoAttention::Sliding => {
                 self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
-                    ("ring", kv), ("positions", w.positions.buffer.ptr),
+                    ("ring", kv), ("positions", bindings.attention_positions),
                     ("ring_slots", w.ring_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
                     ("sinks", layer.ptr("sinks")?), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                     &[rows])?;
@@ -2891,6 +2941,92 @@ mod terminal_fault_tests;
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity, prefill_lane_count,
         scale_operand, MimoAttentionWorkspace, MimoPlacement, MimoPrefillOutput, DECODE_ROWS, MIN_LANE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn attention_bindings_keep_absolute_positions_and_independent_kv_slots() {
+        use super::{step_input_bindings, MimoAttention};
+        for rank in 0..2 {
+            for rows in [4096, DECODE_ROWS] { // Prefill and decode/verify/MTP workspace extents.
+                let inputs = (0x100000 + rank * 0x100000) as *mut std::ffi::c_void;
+                let identity = 0x400000 as *mut std::ffi::c_void;
+                let slots = 0x500000 as *mut std::ffi::c_void;
+                for attention in [MimoAttention::Full, MimoAttention::Sliding] {
+                    let bindings = step_input_bindings(inputs, identity, slots, rows, 64, attention);
+                    assert_eq!(bindings.producer_positions, identity);
+                    assert_eq!(bindings.attention_positions, inputs);
+                    assert_eq!(bindings.kv_slots, if attention == MimoAttention::Full { slots } else { identity });
+                    let kind = usize::from(attention == MimoAttention::Sliding);
+                    assert_eq!(bindings.cos_sin as usize, inputs as usize + rows * 8 + kind * rows * 64 * 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_window_reuse_long_short_long_keeps_each_lane_exact() {
+        let window = super::RopeWindow::new(64, 1.0e7, 1.0e4);
+        let rows = 7;
+        let mut lanes = [vec![0; rows * 520], vec![0; rows * 520]];
+        let long = [1048575, 999999, 524287, 1048501, 13, 1048107, 262143];
+        let short = [1048511, 127];
+        for positions in [&long[..], &short[..], &long[..]] {
+            for (lane, packed) in lanes.iter_mut().enumerate() {
+                let positions: Vec<i64> = positions.iter().map(|&p| p - lane as i64).collect();
+                window.fill(&positions, rows, 1 << 20, packed).unwrap();
+                for (kind, theta) in [1.0e7, 1.0e4].into_iter().enumerate() {
+                    for (row, &p) in positions.iter().enumerate() {
+                        assert_eq!(i64::from_ne_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap()), p);
+                        let base = rows * 8 + (kind * rows + row) * 64 * 4;
+                        for i in 0..32 {
+                            let inv = 1.0 / (theta as f32).powf((2 * i) as f32 / 64.0);
+                            let angle = p as f32 * inv;
+                            for (column, expected) in [(i, angle.cos()), (32 + i, angle.sin())] {
+                                let at = base + column * 4;
+                                assert_eq!(u32::from_ne_bytes(packed[at..at + 4].try_into().unwrap()), expected.to_bits());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_windows_match_original_full_tables_bitwise_at_large_positions() {
+        let dim = 64;
+        let max_context = 1 << 20;
+        let positions = [0, 1, 63, 127, 128, 4095, 32768, 262143, 524287, 999999, 1048575, 128, 0];
+        for theta in [1.0e7, 5.0e6] {
+            let window = super::RopeWindow::new(dim, theta, 1.0e4);
+            let rows = positions.len() + 3;
+            let mut packed = vec![0; rows * (8 + 2 * dim * 4)];
+            window.fill(&positions, rows, max_context, &mut packed).unwrap();
+            for (kind, theta) in [theta, 1.0e4].into_iter().enumerate() {
+                // Independent reference: the original full-table generator.
+                let inv: Vec<f32> = (0..dim / 2).map(|i|
+                    1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
+                let mut table = vec![0f32; max_context * dim];
+                for p in 0..max_context {
+                    for (i, f) in inv.iter().enumerate() {
+                        let angle = p as f32 * f;
+                        table[p * dim + i] = angle.cos();
+                        table[p * dim + dim / 2 + i] = angle.sin();
+                    }
+                }
+                for (row, &p) in positions.iter().enumerate() {
+                    assert_eq!(i64::from_ne_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap()), p);
+                    let base = rows * 8 + (kind * rows + row) * dim * 4;
+                    for i in 0..dim {
+                        let actual = u32::from_ne_bytes(packed[base + i * 4..base + i * 4 + 4].try_into().unwrap());
+                        assert_eq!(actual, table[p as usize * dim + i].to_bits(), "theta={theta} p={p} i={i}");
+                    }
+                }
+            }
+            assert!(window.fill(&[-1], rows, max_context, &mut packed).is_err());
+            assert!(window.fill(&[max_context as i64], rows, max_context, &mut packed).is_err());
+            assert!(window.fill(&vec![0; rows + 1], rows, max_context, &mut packed).is_err());
+        }
+    }
 
     #[test]
     fn fp8_output_scale_operands_match_both_exported_abis() {

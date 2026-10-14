@@ -140,7 +140,7 @@ macro_rules! workspace_buffers {
 }
 
 workspace_buffers! {
-    h, x, query, attn, delta, kv_step, kv_wide, positions, slots,
+    h, x, query, attn, delta, kv_step, kv_wide, step_inputs, slots,
     step_slots, ring_slots, seq_first, page_table, scratch, logits,
     router_logits, route_ids, route_weights, wire, zero_plane,
     ids, select, head_workspace,
@@ -214,7 +214,7 @@ impl MimoWorkspaceLayout {
                     ],
                 )?
             },
-            positions: bytes("MiMo positions", &[t, 8])?,
+            step_inputs: bytes("MiMo positions and full/SWA RoPE windows", &[t, 8 + 2 * cfg.rope_dim as u64 * 4])?,
             slots: bytes("MiMo KV slots", &[t, 8])?,
             step_slots: bytes("MiMo identity slots", &[t, 8])?,
             ring_slots: bytes("MiMo ring slots", &[t, 8])?,
@@ -292,6 +292,16 @@ mod tests {
             native_scratch_bytes: 16 << 20,
             head_workspace_bytes: 32 << 20,
         }
+    }
+
+    #[test]
+    fn rope_windows_charge_rows_not_compiled_context() {
+        let cfg = MimoV2Config::from_hf(&mimo_flash_config()).unwrap();
+        let before = MimoWorkspaceOptions { max_context: 1 << 16, ..options() };
+        let layout = MimoWorkspaceLayout::new(&cfg, before).unwrap();
+        assert_eq!(layout.step_inputs, before.rows * (8 + 2 * 64 * 4));
+        let large = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { max_context: 1 << 20, ..before }).unwrap();
+        assert_eq!(large.step_inputs, layout.step_inputs);
     }
 
     #[test]

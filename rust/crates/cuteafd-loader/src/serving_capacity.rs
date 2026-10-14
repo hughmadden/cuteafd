@@ -736,10 +736,7 @@ pub fn mimo_cache_geometry(
         )?,
         active_state_per_sequence_bytes: product("MiMo SWA rings", &[swa, 256, swa_record])?,
         retained_mark_bytes: product("MiMo SWA marks", &[swa, cfg.window as u64, swa_record])?,
-        context_table_bytes_per_token: product(
-            "MiMo full/SWA RoPE tables",
-            &[2, cfg.rope_dim as u64, 4],
-        )?,
+        context_table_bytes_per_token: 0,
         speculative_replay_bytes: 0,
         ..Default::default()
     };
