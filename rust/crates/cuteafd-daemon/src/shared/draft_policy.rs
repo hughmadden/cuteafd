@@ -1,4 +1,4 @@
-//! Shared request acceptance history and GLM Flash draft backoff.
+//! Shared request acceptance history.
 //! Resource prices, calibration and allocation live in cuteafd-core::draft_policy.
 use std::collections::VecDeque;
 
@@ -77,45 +77,6 @@ impl DraftHistory {
 /// Half the history's weight keeps a sequence unlike the others its own.
 const POOL_TRIALS: f64 = 8.0;
 
-/// Longest run of steps without a draft step after plans that verified none.
-const MAX_DRAFT_SKIP: usize = 8;
-
-/// After plans that verify no drafts, skip drafting for a while (doubling up
-/// to `MAX_DRAFT_SKIP` steps): a draft step costs about a verified row.
-#[derive(Debug, Clone)]
-pub(crate) struct DraftSkip {
-    skip: usize,
-    next: usize,
-}
-
-impl Default for DraftSkip {
-    fn default() -> Self {
-        Self { skip: 0, next: 1 }
-    }
-}
-
-impl DraftSkip {
-    /// Whether this step drafts.
-    pub fn drafts(&self) -> bool {
-        self.skip == 0
-    }
-
-    /// After planning a step: `drafted` when it drafted, `none_planned` when
-    /// the plan verifies no drafts (adaptive plans only).
-    pub fn after(&mut self, drafted: bool, none_planned: bool) {
-        if self.skip > 0 {
-            self.skip -= 1;
-        } else if drafted {
-            if none_planned {
-                self.skip = self.next;
-                self.next = (self.next * 2).min(MAX_DRAFT_SKIP);
-            } else {
-                self.next = 1;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,20 +109,7 @@ mod tests {
         assert!((rates[1] - prior).abs() < 1e-12, "{rates:?}");
     }
 
-    #[test]
-    fn draft_skip_backs_off_and_resets() {
-        let mut skip = DraftSkip::default();
-        skip.after(true, true);
-        assert!(!skip.drafts());
-        skip.after(false, false);
-        assert!(skip.drafts());
-        skip.after(true, true);
-        skip.after(false, false);
-        assert!(!skip.drafts());
-        skip.after(false, false);
-        skip.after(true, false);
-        assert!(skip.drafts());
-    }
+
 }
 
 /// Candidate policy switches deliberately stay off until throughput gates pass.

@@ -36,7 +36,7 @@ use crate::shared::console;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::shared::draft::evidence::{Censor, DraftSource};
-use crate::families::glm5::dflash_policy::{self, DraftHistory};
+use crate::shared::draft_policy::DraftHistory;
 use super::{open, Opened};
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
@@ -420,7 +420,7 @@ impl SharedPolicy {
 
     /// The completed round, once the verify step's stream drained.
     fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[super::draft_binding::Verified<'_>],
-        times: crate::shared::draft::clock::RoundTimes, width: usize, predicted: Option<f64>) {
+        times: crate::shared::draft::clock::RoundTimes, width: usize, drafted_requests: usize, predicted: Option<f64>) {
         // The caller captured the round clock before diagnostics; evaluate
         // against the pre-observation policy without charging trace work to its fit.
         let decision = if self.trace {
@@ -433,7 +433,7 @@ impl SharedPolicy {
         } else { None };
         let policy = &mut self.policy;
         let outcome = engine.probe_finish(|routes, layer_us|
-            super::draft_binding::observe(policy, requests, routes, layer_us, times, width, predicted));
+            super::draft_binding::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
         match outcome {
             Some(Ok(())) => self.observed += 1,
             Some(Err(error)) => {
@@ -916,7 +916,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // A verify step schedules up to `verify_rows` rows (64, or the GPU's whole sparse MLA waves with
     // `--decode-rows 128`).
     let verify_rows = engine.verify_rows;
-    let mut skip = dflash_policy::DraftSkip::default();
     // The resource-priced shared draft policy (v3 D2/D3) chooses DFlash2/dSpark verify lengths under the
     // cost verify policy; a fixed count and the chain cut keep their own.
     let mut shared = match drafter {
@@ -1255,6 +1254,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let cycle = Instant::now();
         let mut round_clock = crate::shared::draft::clock::RoundClock::at(cycle);
         let mut drafted_width = 0usize;
+        let mut drafted_requests = 0usize;
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
@@ -1276,10 +1276,21 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
             });
         }
-        // DFlash2 drafts after every next token, then the policy's counts.
+        let eligible: Vec<_> = active.iter().enumerate()
+            .filter(|&(i, a)| a.slot.is_some() && limits[i] > 0)
+            .take(drafter.map_or(0, |d| d.max_batch_sequences()))
+            .map(|(i, a)| (a.ticket.id(), limits[i],
+                shared.as_ref().is_some_and(|s| s.prior.cold_start(&a.drafts)))).collect();
+        let run_draft = if eligible.is_empty() { false } else if let Some(shared) = shared.as_mut() {
+            let requests: Vec<_> = active.iter().map(|a| (a.ticket.id(),
+                eligible.iter().find(|&&(id, _, _)| id == a.ticket.id()).map_or(0, |&(_, room, _)| room))).collect();
+            crate::shared::draft::resource::choose_block(&mut shared.policy, &requests,
+                drafter.unwrap().drafts(), eligible.len(), verify_rows, eligible.iter().any(|e| e.2))?
+        } else { true };
+        // The shared pre-draft action prices skip and block before spending drafter work.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0) => {
+            Some(drafter) if run_draft => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot|
                         (i, DraftSeq { slot, anchor: a.next, position: a.placement.len, valid_from: a.draft_from })))
@@ -1288,6 +1299,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 for &(i, _) in &seqs {
                     active[i].counts[3] += 1;
                 }
+                drafted_requests = seqs.len();
                 let draft_seqs: Vec<DraftSeq> = seqs.iter().map(|(_, s)| *s).collect();
                 let drafts = round_clock.draft(|| drafter.draft_device(&draft_seqs, &engine.embedding,
                     engine.draft_head()));
@@ -1337,10 +1349,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
                         limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
                     .collect();
-                let selection = super::draft_binding::select(&mut shared.policy, &candidates, drafted_width, verify_rows);
+                let selection = super::draft_binding::select_drafted(&mut shared.policy, &candidates, drafted_width, verify_rows, drafted_requests);
                 if shared.trace {
                     shared.decision = Some(super::draft_binding::DecisionTrace::capture(&candidates,
-                        drafted_width, verify_rows, &selection));
+                        drafted_width, drafted_requests, verify_rows, &selection));
                 }
                 predicted = selection.predicted;
                 selection.lengths
@@ -1351,7 +1363,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             // No neural drafter means no speculative proposal.
             (VerifyPolicy::Cost, None, None) => vec![0; active.len()],
         };
-        skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // A history continuation never competes with or replaces the confident prefix.
         let mut sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
             let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
@@ -1502,7 +1513,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     features: draft.filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()), censor }
             }).collect();
             let times = round_clock.observe();
-            shared.observe(engine, &requests, times, drafted_width, predicted);
+            shared.observe(engine, &requests, times, drafted_width, drafted_requests, predicted);
         }
         if let Some(trace) = &mut trace {
             trace_round += 1;
