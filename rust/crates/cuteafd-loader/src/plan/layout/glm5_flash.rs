@@ -197,10 +197,17 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             report.placement_supported = false;
             report.fits = false;
             let reason = format!("GLM Flash pool-first placement: {error:#}");
-            report.hints.push(super::super::Hint {
-                what: reason.clone(),
-                how: "Change the reported pool, replay-records or placement constraint.".into(),
-            });
+            // `context` is the two-GPU default, so an absent program manifest fails the solve
+            // before any pool or replay constraint applies: point at the programs to rebuild
+            // rather than at the pool (issue #202).
+            let how = if matches!(error.downcast_ref::<placement::PlacementError>(),
+                Some(placement::PlacementError::MissingContextPrograms { .. })) {
+                "Rebuild the GLM Flash coordinator programs with the context-split kernels \
+                    (CUTEAFD_CONTEXT_SPLIT_AOT), or request `heads` explicitly.".into()
+            } else {
+                "Change the reported pool, replay-records or placement constraint.".into()
+            };
+            report.hints.push(super::super::Hint { what: reason.clone(), how });
             notes.push(reason);
         }
     }
