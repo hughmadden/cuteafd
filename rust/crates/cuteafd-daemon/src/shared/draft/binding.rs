@@ -141,7 +141,7 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
 }
 
 /// Opt-in complete observation capture, including dSpark head evidence. The
-/// selector-only ConfidencePolicy trace does not cover that serving path.
+/// selector-only confidence trace does not cover that serving path.
 fn replay_trace() -> Option<&'static crate::shared::speculation_trace::Trace> {
     use std::sync::OnceLock;
     static TRACE: OnceLock<Option<crate::shared::speculation_trace::Trace>> = OnceLock::new();

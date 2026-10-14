@@ -280,8 +280,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     if valid:
                         # The shared draft policy switches (default off) precede the trace.
-                        expected = ['before', '-e', 'CUTEAFD_DRAFT_COST_BUCKETS=0', '-e', 'CUTEAFD_DRAFT_CONFIDENCE=0',
-                                    '-e', 'CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0']
+                        expected = ['before', '-e', 'CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0']
                         if value:
                             parent = str(Path(value).parent)
                             self.assertTrue(Path(parent).is_dir())

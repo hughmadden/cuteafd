@@ -1,5 +1,4 @@
-//! Drafter-specific selector priors and deployment-local online refinement.
-use super::draft_policy::{Calibration, DraftHistory};
+//! Frozen drafter-specific selector priors; DraftPolicy owns online calibration.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -102,75 +101,6 @@ impl SelectorFit {
     }
 }
 
-/// The keyed logistic fit is the prior; the existing forgotten, slope-clamped
-/// online correction absorbs deployment/target-quant shifts without per-quant files.
-pub(crate) struct ConfidencePolicy {
-    pub key: String,
-    selector: Option<SelectorFit>,
-    online: Calibration,
-    enabled: bool,
-    trace: Option<super::speculation_trace::Trace>,
-}
-
-impl ConfidencePolicy {
-    pub fn load(directory: &Path, key: String) -> Result<Self> {
-        let enabled = super::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
-        let fit = if enabled { SelectorFit::load(directory, &key)? } else { SelectorFit::default() };
-        let selector = (enabled || !key.starts_with("mimo_v2/")).then_some(fit);
-        Self::new(key, selector)
-    }
-
-    /// Frozen selector prior for adapters whose online owner is DraftPolicy.
-    pub fn load_prior(directory: &Path, key: String) -> Result<Self> {
-        let selector = Some(SelectorFit::load(directory, &key)?);
-        Ok(Self { key, selector, online: Calibration::default(), enabled: false, trace: None })
-    }
-
-    /// Native MTP's frozen history prior has no selector or online owner here.
-    pub fn history(key: String) -> Result<Self> {
-        Ok(Self { key, selector: None, online: Calibration::default(), enabled: false, trace: None })
-    }
-
-    fn new(key: String, selector: Option<SelectorFit>) -> Result<Self> {
-        let trace = super::speculation_trace::Trace::open("CUTEAFD_DRAFT_CONFIDENCE_TRACE")?;
-        let enabled = super::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
-        // Enabled selector loading already logs the selected key or fallback once.
-        if !enabled || selector.is_none() {
-            tracing::info!(key, enabled, selector_prior = selector.as_ref().map(|fit| fit.key.as_str()),
-                "draft confidence policy initialized");
-        }
-        Ok(Self { key, selector, online: Calibration::default(), enabled, trace })
-    }
-
-    /// Unrefined rates are retained for a causally correct online observation.
-    pub fn prior(&self, history: &DraftHistory, selector: Option<&[[f32; 4]]>, width: usize) -> Vec<f64> {
-        let rates = history.conditional(width);
-        self.selector.as_ref().zip(selector).and_then(|(fit, selector)| fit.confidence(&rates, selector)).unwrap_or(rates)
-    }
-
-    pub fn apply(&self, rates: &[f64]) -> Vec<f64> {
-        if self.enabled { rates.iter().map(|&rate| self.online.apply(rate)).collect() } else { rates.to_vec() }
-    }
-
-    pub fn observe(&mut self, history: &DraftHistory, selector: Option<&[[f32; 4]]>, prior: &[f64],
-        proposed: usize, accepted: usize, finished: bool, request: u64) {
-        // A terminal token/client cutoff censors the next position rather than rejecting it.
-        let observed = proposed.min(accepted.saturating_add(usize::from(!finished)));
-        if self.enabled {
-            for (i, &rate) in prior.iter().enumerate().take(observed) { self.online.observe(rate, i < accepted); }
-        }
-        if let (Some(trace), Some(selector)) = (&mut self.trace, selector) {
-            let record = serde_json::json!({"type": "draft_confidence", "key": self.key, "request": request,
-                "history": history.conditional(selector.len()), "features": selector, "prior": prior,
-                "proposed": proposed, "accepted": accepted, "observed": observed,
-                "online": self.online.fitted()});
-            if let Err(error) = trace.write(&record) {
-                tracing::warn!(%error, "draft confidence trace failed");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,31 +149,4 @@ mod tests {
         assert!(features(f64::NAN, 1, [1.0, 0.5, 1.0, 2.0]).is_none());
     }
 
-    #[test]
-    fn disabled_policy_keeps_frozen_glm_and_history_only_mimo_baselines() {
-        let history = DraftHistory::default();
-        let selector = [[1.0, 0.5, 1.0, 2.0]; 7];
-        let mut policy = ConfidencePolicy { key: "glm5/dflash2/bf16-r1".into(), selector: Some(SelectorFit::default()),
-            online: Calibration::default(), enabled: false, trace: None };
-        let prior = policy.prior(&history, Some(&selector), 7);
-        assert_eq!(prior, SelectorFit::default().confidence(&history.conditional(7), &selector).unwrap());
-        policy.observe(&history, Some(&selector), &prior, 7, 0, false, 0);
-        assert_eq!(policy.apply(&prior), prior);
-        policy.selector = None;
-        assert_eq!(policy.prior(&history, Some(&selector), 7), history.conditional(7));
-    }
-
-    #[test]
-    fn online_state_is_per_key_and_terminal_outcomes_are_censored() {
-        let mut policy = ConfidencePolicy { key: "mimo_v2/dflash/bf16-r1".into(), selector: Some(SelectorFit::default()),
-            online: Calibration::default(), enabled: true, trace: None };
-        let history = DraftHistory::default();
-        for _ in 0..200 { policy.observe(&history, None, &[0.8; 7], 7, 0, false, 0); }
-        assert!(policy.apply(&[0.8])[0] < 0.1);
-        let other = Calibration::default();
-        assert_eq!(other.apply(0.8), 0.8);
-        let before = policy.online.fitted();
-        policy.observe(&history, None, &[0.8; 7], 7, 0, true, 0);
-        assert_eq!(policy.online.fitted(), before);
-    }
 }

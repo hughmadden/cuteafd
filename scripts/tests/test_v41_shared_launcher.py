@@ -31,8 +31,6 @@ INTENDED = {
         "CUTEAFD_ATTENTION_PLACEMENT": "auto",
         "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
         # shared_trace_args: the shared draft policy switches, default off.
-        "CUTEAFD_DRAFT_COST_BUCKETS": "0",
-        "CUTEAFD_DRAFT_CONFIDENCE": "0",
         "CUTEAFD_DRAFT_SURVIVAL_LENGTHS": "0",
         # shared_thermal_args: the GPU throttle sampler (#114), default on.
         "CUTEAFD_THERMAL": "on",

@@ -489,11 +489,6 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 }
 
 impl<'a> GlmDrafter<'a> {
-    pub fn confidence_policy(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
-        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
-            self.confidence_key(family, fp8_head))
-    }
-
     /// The keyed selector prior (`family/dflash2/numerics`), or the generic
     /// GLM-5.3 fit when the drafter ships none for this key.
     pub fn selector_fit(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::SelectorFit> {
