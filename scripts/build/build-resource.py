@@ -79,6 +79,8 @@ def main():
         stopping = True
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGHUP, stop)
+    signal.signal(signal.SIGQUIT, stop)
     directory = Path(os.environ.get('CUTEAFD_LOCK_DIR', str(Path.home() / '.cache/cuteafd')))
     if not directory.is_dir():
         parser.error(f'lock directory does not exist: {directory}')

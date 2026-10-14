@@ -59,6 +59,47 @@ def export_slot():
 
 
 _context_lease = None
+_gpu_lease = None
+
+
+def gpu_admission():
+    """Weighted device budget shared by all packages on the selected GPU."""
+    global _gpu_lease
+    if _gpu_lease is not None or not os.environ.get('CUTEAFD_EXPORT_GPU_SLOT_DIR'):
+        return
+    root = Path(os.environ['CUTEAFD_EXPORT_GPU_SLOT_DIR'])
+    root.mkdir(parents=True, exist_ok=True)
+    budget = int(os.environ['CUTEAFD_EXPORT_GPU_BUDGET_MIB'])
+    reservation = int(os.environ.get('CUTEAFD_EXPORT_WORKER_GPU_MIB', '640'))
+    if reservation < 1 or reservation > budget:
+        raise ValueError('export GPU reservation exceeds budget')
+    deadline = time.monotonic() + 7200
+    while True:
+        with (root / 'admission.lock').open('a') as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            reserved = 0
+            vacant = None
+            for path in root.glob('context.*.lock'):
+                with path.open('a+') as existing:
+                    try:
+                        fcntl.flock(existing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        vacant = path
+                    except BlockingIOError:
+                        existing.seek(0)
+                        reserved += int(existing.read())
+            if reserved + reservation <= budget:
+                path = vacant or root / f'context.{os.getpid()}.lock'
+                handle = path.open('w+')
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.write(str(reservation))
+                handle.flush()
+                _gpu_lease = handle
+                atexit.register(handle.close)
+                print(f'AOT GPU admitted: {reservation} MiB, {reserved} MiB reserved, {budget} MiB budget', flush=True)
+                return
+        if time.monotonic() >= deadline:
+            raise TimeoutError('CUDA context waited 7200s for GPU budget')
+        time.sleep(1)
 
 
 def context_admission():
@@ -127,6 +168,7 @@ def install_context_admission():
         return
     def admitted_init(*args, **kwargs):
         context_admission()
+        gpu_admission()
         return original(*args, **kwargs)
     admitted_init._cuteafd_context_admission = True
     torch.cuda._lazy_init = admitted_init

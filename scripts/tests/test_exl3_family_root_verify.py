@@ -188,3 +188,23 @@ def test_worker_target_is_explicit_and_failures_are_observed_unordered():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_verification_checks_every_packaged_dso_including_routes(tmp_path):
+    import struct
+    tool = load_tool()
+    files = {}
+    for name, compute in [('core.so', 121), ('routes/metadata.so', 120)]:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = bytearray(64)
+        data[:6] = b'\x7fELF\x02\x01'
+        struct.pack_into('<H', data, 18, 190)
+        struct.pack_into('<I', data, 48, compute << 8)
+        path.write_bytes(data)
+        files[name] = {'bytes': len(data), 'sha256': tool.digest(path)}
+    (tmp_path / 'manifest.json').write_text(json.dumps({
+        'schema': 'cuteafd.exl3-package.v1', 'role': 'coordinator',
+        'variants': [], 'files': files, 'compute': [12, 1]}))
+    with pytest.raises(ValueError, match='metadata.so'):
+        tool.verify(tmp_path)

@@ -229,3 +229,62 @@ def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_p
         if export._context_lease:
             export._context_lease.close()
         export._context_lease = None
+
+
+def test_weighted_gpu_budget_shared_across_package_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_gpu_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_GPU_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_GPU_BUDGET_MIB', '12288')
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_GPU_MIB', '2688')
+    held = (tmp_path / 'context.999.lock').open('w+')
+    held.write('10752')
+    held.flush()
+    fcntl.flock(held, fcntl.LOCK_EX)
+    def stop_wait(seconds):
+        raise TimeoutError('budget full')
+    monkeypatch.setattr(export.time, 'sleep', stop_wait)
+    try:
+        with pytest.raises(TimeoutError):
+            export.gpu_admission()
+        assert export._gpu_lease is None
+    finally:
+        held.close()
+    export.gpu_admission()
+    assert export._gpu_lease
+    assert (tmp_path / 'context.999.lock').read_text() == '2688'
+    export._gpu_lease.close()
+    export._gpu_lease = None
+
+
+@pytest.mark.parametrize('signum', [1, 3])
+def test_seed_hup_quit_stops_container_before_unlock(tmp_path, signum):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    marker = tmp_path / 'stopped'
+    ssh = bin_dir / 'ssh'
+    ssh.write_text(f'#!/bin/sh\nsleep 0.3\ntouch {marker}\n')
+    ssh.chmod(0o755)
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    os.mkfifo(lease / 'release')
+    (lease / 'active').touch()
+    process = subprocess.Popen(['python3', str(ROOT / 'scripts/build/build-resource.py'), '--host', 'rhea',
+                                '--slots', '1', '--container', 'owned', '--lease-dir', str(lease)],
+                               env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+                                    'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 5
+        while not (lease / 'granted').exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (lease / 'granted').exists()
+        process.send_signal(signum)
+        assert resource.try_lock(tmp_path / 'rhea.lock') is None
+        assert process.wait(timeout=5) == 0
+        assert marker.exists()
+        handle = resource.try_lock(tmp_path / 'rhea.lock')
+        assert handle
+        handle.close()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)

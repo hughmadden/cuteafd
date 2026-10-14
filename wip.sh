@@ -157,11 +157,7 @@ if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" == on ]]; then
   [[ "$COORDINATOR_GPU" =~ ^[01]$ ]] || release_die "export locking needs COORDINATOR_GPU=0 or 1"
   # Rust takes no hardware mutex. A native cache miss probes a free GPU
   # without waiting, then uses the bounded remote exporter if none is free.
-  wip_export_gpu_lock="gpu${COORDINATOR_GPU}"
 fi
-wip_hwlock() {
-  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$1" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-1800}" -- "${@:2}"
-}
 mapfile -t wip_hosts < <(release_spark_values HOST)
 # A coordinator-only clone of a config with no active Sparks (0-Spark cards)
 # also skips the Spark leg: nothing to clone, rebuild or reach.
@@ -1124,38 +1120,6 @@ native_store_has() {
 wip_seed_lock() {
   case "$1" in rhea|moa|kakapo) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
 }
-# A lease holds the seed's lock (one fair turn through hwlock) across the whole
-# Spark build leg: source sync, Cargo, native/export, finalize. Spark CPU work
-# would otherwise slow cards serving from that host. The holder is a background
-# hwlock child that waits on a release FIFO; the lease ends when the FIFO opens
-# for writing or the leg's shell exits.
-wip_seed_lease_acquire() {
-  local lock="$1" dir
-  [[ -z "${wip_build_resource_pid:-}" ]] || return 0
-  dir="$(mktemp -d "${TMPDIR:-/tmp}/wip-seed-lease.XXXXXXXX")"
-  mkfifo "$dir/release"
-  wip_seed_lease_dir="$dir"
-  wip_hwlock "$lock" bash -c 'printf granted >"$1/granted"; read -r _ <"$1/release"' wip-seed-lease "$dir" &
-  wip_seed_lease_pid=$!
-  while [[ ! -s "$dir/granted" ]]; do
-    if ! kill -0 "$wip_seed_lease_pid" 2>/dev/null; then
-      wait "$wip_seed_lease_pid" 2>/dev/null || true
-      rm -rf "$dir"
-      wip_seed_lease_dir=""
-      return 1
-    fi
-    sleep 1
-  done
-  export CUTEAFD_WIP_SEED_LEASE="$lock"
-}
-wip_seed_lease_release() {
-  [[ -n "${wip_seed_lease_dir:-}" ]] || return 0
-  : >"$wip_seed_lease_dir/release" 2>/dev/null || true
-  wait "$wip_seed_lease_pid" 2>/dev/null || true
-  rm -rf "$wip_seed_lease_dir"
-  wip_seed_lease_dir=""
-  unset CUTEAFD_WIP_SEED_LEASE
-}
 # Auto never queues on a raptor GPU: capped admission is nonblocking, then
 # remote retries are bounded. A live seed lease excludes every GPU-lock probe.
 wip_coordinator_export_modes() {
@@ -1200,7 +1164,6 @@ wip_remote_export() {
 wip_capped_export() {
   # Never take a GPU mutex while any seed lease is live, including kakapo.
   [[ -z "${wip_build_resource_dir:-}" || ! -e "$wip_build_resource_dir/granted" ]] || return 75
-  [[ -z "${wip_seed_lease_dir:-}" || ! -e "$wip_seed_lease_dir/granted" ]] || return 75
   local status=0
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
     python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" -- \
@@ -1210,7 +1173,7 @@ wip_capped_export() {
 }
 
 # wip_capped_export_on: runs under export-placement.py hold, CUTEAFD_EXPORT_GPU set.
-wip_capped_export_on() {
+wip_capped_export_on() (
   local placement="$repo_root/scripts/build/export-placement.py" gpu cap jobs used started=$SECONDS
   gpu="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v i="$CUTEAFD_EXPORT_GPU" '$1 == i {print $2}')"
   [[ -n "$gpu" ]] || return 75
@@ -1225,20 +1188,39 @@ wip_capped_export_on() {
   for ((i = 2; i < ${#build[@]}; i++)); do
     [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
   done
-  local id status=0 gpu_args
+  local id status=0 gpu_args name="${coordinator_container}-export-$$"
+  cleanup_capped() {
+    local names
+    # A failed daemon query is never proof that CUDA has stopped.
+    while true; do
+      if names="$(timeout 30 docker ps -a --filter "name=^/$name$" --format '{{.Names}}')"; then
+        if [[ -z "$names" ]]; then return 0; fi
+        if timeout 30 docker rm -f "$name" >/dev/null; then
+          if names="$(timeout 30 docker ps -a --filter "name=^/$name$" --format '{{.Names}}')" && [[ -z "$names" ]]; then return 0; fi
+        fi
+      fi
+      echo "Capped export cleanup unconfirmed; retaining GPU lock" >&2
+      sleep 60
+    done
+  }
+  trap cleanup_capped EXIT
+  trap 'exit 143' TERM INT HUP QUIT
   mapfile -t gpu_args < <(release_gpu_device_args "$gpu")
-  id="$(docker run -d --name "${coordinator_container}-export-$$" --user "$(id -u):$(id -g)" "${gpu_args[@]}" \
+  id="$(docker run -d --name "$name" --user "$(id -u):$(id -g)" "${gpu_args[@]}" \
     -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}" \
-    -e "CMAKE_BUILD_PARALLEL_LEVEL=$((jobs / 2 > 0 ? jobs / 2 : 1))" -e "CUTEAFD_EXPORT_JOBS=$((jobs / 2 > 0 ? jobs / 2 : 1))" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
+    -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-${CARGO_BUILD_JOBS:-$(nproc)}}" -e "CUTEAFD_EXPORT_JOBS=$((cap / 2688))" \
+    -e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots -e "CUTEAFD_EXPORT_HOST_WORKERS=$(nproc)" \
+    -e "CUTEAFD_EXPORT_GPU_SLOT_DIR=/export-slots/gpu$CUTEAFD_EXPORT_GPU" -e "CUTEAFD_EXPORT_GPU_BUDGET_MIB=$cap" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
     --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
   # The watchdog counts only this container's processes (its cgroup carries the ID).
   python3 "$placement" watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id" -- \
-    docker exec "$id" /wip/source/scripts/build/build-wip-artifacts.sh \
+    docker exec "$id" timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator native || status=$?
-  docker rm -f "$id" >/dev/null 2>&1 || true
+  cleanup_capped
+  trap - EXIT TERM INT HUP QUIT
   ((status == 0)) || return "$status"
   echo "WIP phase coordinator export-capped: $((SECONDS - started))s (gpu$CUTEAFD_EXPORT_GPU)"
-}
+)
 
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
@@ -1345,16 +1327,6 @@ build_coordinator() {
 
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
-  if [[ "${wip_export_locks:-off}" == on ]]; then
-    local seed_lock
-    seed_lock="$(wip_seed_lock "$seed_host")"
-    echo "WIP Spark leg: queueing for $seed_lock (held for the whole leg on $seed_host)"
-    local lease_started=$SECONDS
-    wip_seed_lease_acquire "$seed_lock" ||
-      release_die "Spark WIP leg on $seed_host got no fair turn on $seed_lock"
-    trap wip_seed_lease_release EXIT
-    echo "WIP phase expert seed-lock-wait: $((SECONDS - lease_started))s"
-  fi
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"

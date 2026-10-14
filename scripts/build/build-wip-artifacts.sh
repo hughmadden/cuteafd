@@ -268,19 +268,7 @@ if ((native_hit)); then
   # The build tree is untouched: keep its native fingerprint, record the new Rust one.
   printf '%s %s' "$wip_rust_fingerprint" "$wip_previous_native" >"$wip_fingerprint_marker"
 else
-# Cargo is complete before GPU admission. Current wip.sh runs this native phase
-# under a held fair turn on the host (CUTEAFD_WIP_HOST_EXPORT_TURN) and passes
-# CUTEAFD_WIP_EXPORT_LOCKS=off; the in-container flock below only serves older
-# containers that still mount a lock file. Ordinary WIP builds take no locks.
-export_lock_fds=()
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]]; then
-  for export_lock in ${CUTEAFD_WIP_EXPORT_LOCK_FILES:?missing export lock files}; do
-    echo "WIP AOT/export waiting for $export_lock (timeout 1800s)"
-    exec {export_lock_fd}>"$export_lock"
-    flock -w 1800 "$export_lock_fd" || { echo "timed out waiting for $export_lock" >&2; exit 2; }
-    export_lock_fds+=("$export_lock_fd")
-  done
-fi
+# Hardware admission and lifetime are owned by wip.sh on the host.
 cmake \
   "${compiler_cache_cmake_args[@]}" \
   -S "$source_dir/native" \
@@ -327,10 +315,6 @@ cmake \
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
 export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
 cmake --build "$build_dir/native"
-for export_lock_fd in "${export_lock_fds[@]}"; do
-  flock -u "$export_lock_fd"
-  exec {export_lock_fd}>&-
-done
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"

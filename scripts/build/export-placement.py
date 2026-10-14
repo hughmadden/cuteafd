@@ -68,7 +68,7 @@ def admit(free_mib: int, max_cap_mib: int = MAX_CAP_MIB, headroom_mib: int = HEA
     cap = min(max_cap_mib, free_mib - headroom_mib)
     if cap < MIN_CAP_MIB:
         return None
-    jobs = max(1, cap // (SIZING_MIB + CONTEXT_MIB))
+    jobs = max(1, (cap - SIZING_MIB) // CONTEXT_MIB)
     return cap, jobs
 
 
@@ -115,8 +115,8 @@ def reserve(path, token, row, ram_mib, owner, max_cap=MAX_CAP_MIB, max_jobs=64):
         decision = admit(gpu_free, max_cap)
         if decision is None:
             return None
-        cap, jobs = decision
-        jobs = min(jobs, max_jobs, (ram_free - RAM_HEADROOM_MIB) // RAM_PER_WORKER_MIB)
+        cap, _ = decision
+        jobs = min(cap // (SIZING_MIB + CONTEXT_MIB), max_jobs, (ram_free - RAM_HEADROOM_MIB) // RAM_PER_WORKER_MIB)
         if jobs < 2:
             return None
         cap = jobs * (SIZING_MIB + CONTEXT_MIB)
@@ -175,8 +175,9 @@ def watch(args) -> int:
                 args.cap_mib = cap
             else:
                 used = export_mib(args.smi, args.gpu, args.cgroup, args.baseline_mib)
-        except (subprocess.SubprocessError, OSError, ValueError):
-            used = 0  # a failed read never kills; the next one decides
+        except (subprocess.SubprocessError, OSError, ValueError, SystemExit) as error:
+            print(f'export-placement: memory budget unreadable: {error}; stopping export', file=sys.stderr)
+            used = args.cap_mib + 1
         peak = max(peak, used)
         if used > args.cap_mib:
             print(f'export-placement: export used {used} MiB over its {args.cap_mib} MiB cap; stopping it',
@@ -203,14 +204,31 @@ def held_by_caller() -> list[str]:
     return [lock for lock in os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(',') if lock]
 
 
-def hold(gpus: list[str], command: list[str], lock_dir: Path) -> int:
-    import fcntl
+def run_held(command, env, handle=None):
+    # The child retains the mutex even if this supervisor is killed abruptly.
+    process = subprocess.Popen(command, env=env, start_new_session=True,
+                               pass_fds=(() if handle is None else (handle.fileno(),)))
+    previous = {}
+    def forward(signum, frame):
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            pass
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            previous[signum] = signal.signal(signum, forward)
+        return process.wait()
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
+
+def hold(gpus: list[str], command: list[str], lock_dir: Path) -> int:
     held = held_by_caller()
     for gpu in gpus:
         if f'gpu{gpu}' in held:
             print(f'export-placement: caller already holds gpu{gpu}.lock', file=sys.stderr)
-            return subprocess.run(command, env={**os.environ, 'CUTEAFD_EXPORT_GPU': gpu}).returncode
+            return run_held(command, {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu})
     for gpu in gpus:
         handle = open(lock_dir / f'gpu{gpu}.lock', 'a')
         try:
@@ -222,9 +240,8 @@ def hold(gpus: list[str], command: list[str], lock_dir: Path) -> int:
             print(f'export-placement: holding gpu{gpu}.lock for the export', file=sys.stderr)
             env = {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu,
                    'CUTEAFD_HW_LOCKS_HELD': ','.join([*held, f'gpu{gpu}'])}
-            return subprocess.run(command, env=env).returncode
+            return run_held(command, env, handle)
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
             handle.close()
     print(f'export-placement: every candidate GPU lock is held ({",".join("gpu" + g for g in gpus)})', file=sys.stderr)
     return NO_TURN

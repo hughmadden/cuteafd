@@ -17,10 +17,10 @@ before → after tables with conditions.
   with the full command line visible. Never put ncu (or anything else) under
   sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
   the approver can't see what it runs and will flag or deny it.
-- Lock order: when a run needs both locks, take `sparks.lock` first, then
-  `gpu1.lock` (as `~/.cache/cuteafd/builds/tp2/locked2.sh` does); never hold
-  one while waiting on the other in the opposite order — that deadlocks the
-  cluster. Every lock wait and run has a timeout.
+- Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
+  `rhea.lock` -> `moa.lock` -> `kakapo.lock`. Never acquire an earlier lock
+  while holding a later one. Coordinator exports skip all GPU probes while
+  a seed lease is live. Every lock wait and run has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
   command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
   and let its completion wake you. Don't poll status or tail logs in between;
@@ -114,8 +114,9 @@ before → after tables with conditions.
   `build.lock`, which wip.sh and build.sh take), held only while compiling.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
-  release images. Slots isolate artifacts, not GPUs or ports: serialize
-  builds and performance runs, one model served at a time per GPU.
+  release images. Slots isolate artifacts, not GPUs or ports: CPU builds
+  use five counting slots; kakapo uses counting leases, serving-host seeds
+  remain exclusive. Serialize performance runs, one model per GPU.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
@@ -123,7 +124,9 @@ before → after tables with conditions.
   without waiting, then oliver (config `CUTEAFD_EXPORT_HOST`, environment
   override wins), with bounded remote retry and no queued GPU-turn fallback.
   Independent EXL3 variants use bounded spawned workers; all exporters share
-  host-wide CPU/context admission. GB10 RAM admission uses `MemAvailable`:
+  host-wide CPU/context admission. Raptor Ninja CPU jobs are independent of
+  a shared weighted GPU budget (640 MiB/context plus 2048 MiB per EXL3
+  sizing worker), with the same 12 GiB watchdog cap. GB10 RAM admission uses `MemAvailable`:
   CUDA allocations reclaim clean file cache; `MemFree` and cudaMemGetInfo
   under-report usable unified memory. Remote exports reserve aggregate GPU
   and host RAM before container creation and release only after it stops.

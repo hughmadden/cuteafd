@@ -10,8 +10,10 @@ WIP = (ROOT / 'wip.sh').read_text()
 
 
 def _function(name):
-    start = WIP.index(name + '() {')
-    return WIP[start:WIP.index('\n}\n', start) + 3]
+    opening = name + ('() (' if name == 'wip_capped_export_on' else '() {')
+    closing = '\n)\n' if name == 'wip_capped_export_on' else '\n}\n'
+    start = WIP.index(opening)
+    return WIP[start:WIP.index(closing, start) + 3]
 
 
 def _dispatch():
@@ -52,7 +54,7 @@ wip_coordinator_export_modes() {{ printf 'capped remote turn\\n'; }}
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
 wip_hwlock() {{ echo turn >> {trace}; }}
-wip_export_gpu_lock=gpu1 coordinator_build=(docker exec c)
+coordinator_build=(docker exec c)
 run() {{
 {_dispatch()}
 }}
@@ -120,7 +122,8 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     run = next(line for line in calls.splitlines() if line.startswith('docker run'))
     assert '--device nvidia.com/gpu=GPU-one' in run and '--gpus' not in run and '--volumes-from wipc' in run
     assert '-e CUTEAFD_WIP_DSV4_AOT=ON' in run and '-e CUTEAFD_WIP_EXPERT_FAMILIES=a;b' in run
-    assert 'docker exec cid123 /wip/source/scripts/build/build-wip-artifacts.sh' in calls and calls.rstrip().endswith('rm -f cid123')
+    assert 'docker exec cid123 timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh' in calls
+    assert 'docker ps -a' in calls
     assert 'capped on gpu1' in result.stdout
 
 

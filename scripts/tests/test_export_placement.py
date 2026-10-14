@@ -39,9 +39,9 @@ def run(*args, timeout=60):
 
 
 @pytest.mark.parametrize('free,expected', [
-    (97000, (placement.MAX_CAP_MIB, placement.MAX_CAP_MIB // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
-    (32000, (placement.MAX_CAP_MIB, placement.MAX_CAP_MIB // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
-    (10000, (10000 - placement.HEADROOM_MIB, (10000 - placement.HEADROOM_MIB) // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
+    (97000, (placement.MAX_CAP_MIB, (placement.MAX_CAP_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
+    (32000, (placement.MAX_CAP_MIB, (placement.MAX_CAP_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
+    (10000, (10000 - placement.HEADROOM_MIB, (10000 - placement.HEADROOM_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
     (placement.MIN_CAP_MIB + placement.HEADROOM_MIB - 1, None),
     (2000, None),
 ])
@@ -100,7 +100,7 @@ def test_watch_counts_only_the_export_containers_processes(tmp_path, monkeypatch
     assert placement.export_mib(str(smi), '1', 'abc', None) == 2500
 
 
-def test_watch_ignores_a_failed_reading(tmp_path, monkeypatch):
+def test_watch_stops_on_a_failed_reading(tmp_path, monkeypatch):
     calls = iter([subprocess.SubprocessError('smi hiccup'), 10, 10])
     def reading(*args):
         value = next(calls, 10)
@@ -110,7 +110,7 @@ def test_watch_ignores_a_failed_reading(tmp_path, monkeypatch):
     monkeypatch.setattr(placement, 'export_mib', reading)
     args = placement.argparse.Namespace(smi='x', gpu='0', cgroup=None, baseline_mib=0, cap_mib=100,
                                         interval=0.05, command=['bash', '-c', 'sleep 0.3'])
-    assert placement.watch(args) == 0
+    assert placement.watch(args) == placement.NO_TURN
 
 
 def _hold(tmp_path, held=(), env_held='', gpus='1,0'):
@@ -175,3 +175,47 @@ def test_reservations_share_baseline_and_cannot_double_admit(tmp_path):
 def test_ram_limits_concurrent_sizing_workers(tmp_path):
     row = ['0', 'GPU-a', '1000', '98000', '97000']
     assert placement.reserve(tmp_path / 'ledger.json', 'a', row, 16000, 1) is None
+
+
+@pytest.mark.parametrize("signum", [15, 1, 3])
+def test_hold_signal_retains_mutex_until_child_cleanup(tmp_path, signum):
+    import fcntl
+    import signal
+    import time
+    lock = tmp_path / 'gpu0.lock'
+    ready, stopping, done = [tmp_path / name for name in ('ready', 'stopping', 'done')]
+    command = f"trap 'touch {stopping}; sleep 0.5; touch {done}; exit 0' TERM HUP QUIT; touch {ready}; while true; do sleep 0.1; done"
+    process = subprocess.Popen([sys.executable, str(SCRIPT), 'hold', '--gpus', '0', '--', 'bash', '-c', command],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        process.send_signal(signum)
+        while not stopping.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert stopping.exists()
+        with lock.open('a') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert process.wait(timeout=5) == 0
+            assert done.exists()
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_capped_and_remote_cleanup_require_successful_absence_query():
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    cleanup = remote.split('cleanup_export() {', 1)[1].split('trap cleanup_export', 1)[0]
+    assert 'docker ps -a' in cleanup and 'sleep 60' in cleanup
+    assert 'docker container inspect' not in cleanup
+    wip = (ROOT / 'wip.sh').read_text().split('wip_capped_export_on() (', 1)[1].split('build_coordinator()', 1)[0]
+    assert 'trap cleanup_capped EXIT' in wip
+    assert 'timeout --kill-after=30 7200' in wip
+    assert '-e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots' in wip
+    assert 'CUTEAFD_EXPORT_GPU_BUDGET_MIB=$cap' in wip
+    assert 'docker rm -f "$id" >/dev/null 2>&1 || true' not in wip

@@ -86,6 +86,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'unsafe EXL3 package path: {name}')
         if path.stat().st_size != spec['bytes'] or digest(path) != spec['sha256']:
             raise ValueError(f'EXL3 package file mismatch: {name}')
+        if path.suffix == '.so':
+            verify_object_target(path, manifest['compute'])
     if runtime is not None and digest(runtime) != manifest['runtime']['sha256']:
         raise ValueError('EXL3 CuTe runtime mismatch')
     required = set()
@@ -98,7 +100,6 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError('duplicate EXL3 package variant')
         seen.add(directory)
         meta = json.loads((package / directory / 'v41_exl3.json').read_text())
-        verify_object_target(package / directory / 'libcuteafd_exl3.so', manifest['compute'])
         if meta.get('compute') != manifest['compute']:
             raise ValueError(f'EXL3 variant target differs from package target: {directory}')
         # Records without a hidden size predate other geometries: they are V4.1.
@@ -612,6 +613,7 @@ def tile_overrides(values: list[str], capacities: list[int], role: str, paired: 
 def compile_variant(payload):
     os.setsid()
     os.environ['CUTEAFD_EXPORT_WORKER_RAM_MIB'] = '4096'
+    os.environ['CUTEAFD_EXPORT_WORKER_GPU_MIB'] = '2688'
     args, target_compute, raw, width, experts, capacity, topk, dtype, run_options = payload
     import _pinned_sparkinfer
     from export_b12x_exl3_aot import export
@@ -644,6 +646,9 @@ def compile_variant(payload):
                 str(args.cuda_driver), '-Wl,-z,defs',
                 '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
             runtime_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
+        for name in runtime_files:
+            if name.endswith('.so'):
+                verify_object_target(raw / name, target_compute)
         gc.collect()
         torch.cuda.empty_cache()
     return meta, runtime_files

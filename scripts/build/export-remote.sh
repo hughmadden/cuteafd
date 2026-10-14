@@ -88,16 +88,24 @@ container="cuteafd-export-$(basename "$root")"
 reservation="$(basename "$root")"
 ledger="$HOME/.cache/cuteafd/export-reservations.json"
 cleanup_export() {
-  # Confirm container termination before freeing its reservation or artifacts.
-  if docker container inspect "$container" >/dev/null 2>&1; then
-    docker rm -f "$container" >/dev/null || return 1
-  fi
+  local names
+  # Keep the slot and reservation until a successful query proves absence.
+  while true; do
+    if names="$(timeout 30 docker ps -a --filter "name=^/$container$" --format '{{.Names}}')"; then
+      if [[ -z "$names" ]]; then break; fi
+      if timeout 30 docker rm -f "$container" >/dev/null; then
+        if names="$(timeout 30 docker ps -a --filter "name=^/$container$" --format '{{.Names}}')" && [[ -z "$names" ]]; then break; fi
+      fi
+    fi
+    echo "Remote export cleanup unconfirmed; retaining reservation" >&2
+    sleep 60
+  done
   [[ ! -f "$root/src/scripts/build/export-placement.py" ]] ||
     python3 "$root/src/scripts/build/export-placement.py" release --ledger "$ledger" --reservation "$reservation"
   rm -rf "$root"
 }
 trap cleanup_export EXIT
-trap 'exit 143' TERM HUP INT
+trap 'exit 143' TERM HUP INT QUIT
 mkdir -p "$HOME/.cache/cuteafd/export-workers"
 mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
