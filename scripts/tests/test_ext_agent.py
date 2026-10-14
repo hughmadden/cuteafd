@@ -381,6 +381,19 @@ def test_context_usage_and_wait_progress(cli):
         assert time.monotonic() < deadline
         time.sleep(0.1)
     assert result['context_usage'] == {'used': '124K', 'limit': '256K', 'percent': 49}
+    # The context wake is edge-triggered: already past the threshold when the wait
+    # starts does not return at once (a driver would spin), a fresh crossing does.
+    started = time.monotonic()
+    result = call('wait', name, '--until', 'error', '--timeout', '1', '--until-context', '40')
+    assert result['timed_out'] and 'woke' not in result and time.monotonic() - started >= 0.9
+    process = subprocess.Popen([sys.executable, str(SCRIPT), 'wait', name,
+                                '--until', 'error', '--timeout', '5', '--until-context', '60'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    subprocess.run(['tmux', 'send-keys', '-t', meta['pane'], '-l', ' 170K / 256K (66%)'], check=True)
+    output, stderr = process.communicate(timeout=8)
+    assert process.returncode == 0, stderr
+    assert json.loads(output.splitlines()[-1])['woke'] == 'context'
 
 
 def test_wait_idle_yields_for_question(cli):

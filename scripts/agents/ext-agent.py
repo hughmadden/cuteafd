@@ -418,7 +418,12 @@ def start(args):
 
 def wait(args):
     path = directory(args.name)
-    initial = snapshot(path)['state']
+    first = snapshot(path)
+    initial = first['state']
+    # Edge-triggered: a worker already past the threshold when the wait starts
+    # was reported by an earlier wait, so only a fresh crossing wakes the driver.
+    start_usage = first['context_usage']
+    context_armed = not (start_usage and args.until_context and start_usage['percent'] >= args.until_context)
     if args.progress_interval < 0:
         raise ValueError('progress interval must be nonnegative')
     deadline = time.monotonic() + args.timeout
@@ -459,7 +464,9 @@ def wait(args):
             return result
         # Wake the driver when it has something to act on, not only on a timer.
         usage = result['context_usage']
-        if args.until_context and usage and usage['percent'] >= args.until_context:
+        if usage and args.until_context and usage['percent'] < args.until_context:
+            context_armed = True
+        if context_armed and args.until_context and usage and usage['percent'] >= args.until_context:
             result['woke'] = 'context'
             return result
         if args.until_quiet and result['state'] == 'busy' and result['seconds_since_output'] >= args.until_quiet:
@@ -548,7 +555,7 @@ def parser():
             c.add_argument('--until', choices=('idle', 'asking', 'error', 'exited', 'any'), default='idle')
             c.add_argument('--timeout', type=float, default=600)
             c.add_argument('--progress-interval', type=float, default=0, metavar='S', help='emit progress JSON lines on new output every S seconds')
-            c.add_argument('--until-context', type=float, default=0, metavar='PCT', help='also return once the worker context fill reaches PCT percent')
+            c.add_argument('--until-context', type=float, default=0, metavar='PCT', help='also return when the worker context fill crosses PCT percent during this wait')
             c.add_argument('--return-on-progress', action='store_true', help='return after the first progress event (one driver turn per period)')
             c.add_argument('--until-quiet', type=float, default=0, metavar='S', help='also return if a busy worker writes nothing for S seconds')
         if command == 'transcript':
