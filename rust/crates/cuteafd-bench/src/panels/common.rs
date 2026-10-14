@@ -5,6 +5,7 @@ use crate::client::{Chat, Client};
 use crate::report::ServerInfo;
 use crate::text::{filler, nonce};
 use anyhow::Result;
+use cuteafd_api::openai::probe::ProbeSpec;
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -15,6 +16,15 @@ pub fn messages(text: &str) -> Value {
 /// Greedy, thinking off.
 pub fn plain(text: &str, max_tokens: u64) -> Value {
     json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+}
+
+/// The probe a request whose prompt re-renders model output carries: a
+/// follow-up turn, a rendered assistant/tool message, or ids taken from a
+/// response. Its token ids are model-determined, so a matched pair compares
+/// only the input-determined prompts and the engine logs this one without a
+/// prompt token hash.
+pub fn output_dependent() -> ProbeSpec {
+    ProbeSpec { output_dependent: true, ..ProbeSpec::default() }
 }
 
 pub fn setting<'a>(info: &'a ServerInfo, names: &[&str]) -> Option<&'a str> {
@@ -57,13 +67,23 @@ impl Timed {
 
 /// Sends every body at once (one thread each) and waits for all.
 pub fn wave(client: &Client, bodies: Vec<Value>) -> Vec<Result<Timed>> {
+    send(client, bodies.into_iter().map(|body| (body, None)).collect())
+}
+
+/// [`wave`] of prompts that re-render model output (a retained base or a
+/// follow-up turn), so every request carries [`output_dependent`].
+pub fn wave_output_dependent(client: &Client, bodies: Vec<Value>) -> Vec<Result<Timed>> {
+    send(client, bodies.into_iter().map(|body| (body, Some(output_dependent()))).collect())
+}
+
+fn send(client: &Client, bodies: Vec<(Value, Option<ProbeSpec>)>) -> Vec<Result<Timed>> {
     let start = Instant::now();
     std::thread::scope(|scope| {
-        let handles: Vec<_> = bodies.into_iter().map(|body| {
+        let handles: Vec<_> = bodies.into_iter().map(|(body, probe)| {
             let client = client.clone();
             scope.spawn(move || {
                 let sent = start.elapsed().as_secs_f64();
-                client.chat(body, None).map(|chat| Timed { chat, sent })
+                client.chat(body, probe).map(|chat| Timed { chat, sent })
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("request thread panicked"))))
