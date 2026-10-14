@@ -498,7 +498,7 @@ int contract_check(int rule, const Case& c, void* scratch, size_t scratch_bytes)
   const int rows_all[] = {8, 64, 65, 96, 127, 128, 129, 136, 200, 1024, 2048};
   uint64_t s = 0x5a5a5a5aull ^ (uint64_t(k) << 21) ^ uint64_t(n);
   const std::vector<uint16_t> w3 = ternary_weights(s, n, k);
-  Buf w3_dev, packed3, scale3, xt, xe, o0, o1, o2, o2f;
+  Buf w3_dev, packed3, scale3, xt, xe, o0, o1, o2, o2f, o0f;
   w3_dev.alloc(w3.size() * 2);
   w3_dev.upload(w3.data(), w3.size() * 2);
   packed3.alloc(size_t(n) * k);
@@ -518,6 +518,7 @@ int contract_check(int rule, const Case& c, void* scratch, size_t scratch_bytes)
     o1.alloc(size_t(rows) * n * 2);
     o2.alloc(size_t(rows) * n * 2);
     o2f.alloc(size_t(rows) * n * 4);
+    o0f.alloc(size_t(rows) * n * 4);
     int status = 0;
     auto run = [&](int mode, const void* xp, void* out, int out_f32) {
       status = cuteafd_fp8_linear(xp, packed3.p, scale3.p, out, out_f32, rows, k, n, mode, scratch, scratch_bytes,
@@ -530,35 +531,50 @@ int contract_check(int rule, const Case& c, void* scratch, size_t scratch_bytes)
       run(1, xp, o1.p, 0);
       run(2, xp, o2.p, 0);
       run(2, xp, o2f.p, 1);
+      run(0, xp, o0f.p, 1);
       std::vector<uint16_t> h0(size_t(rows) * n), h1(h0.size()), h2(h0.size());
-      std::vector<float> f2(h0.size());
+      std::vector<float> f0(h0.size()), f2(h0.size());
       o0.download(h0.data(), h0.size() * 2);
       o1.download(h1.data(), h1.size() * 2);
       o2.download(h2.data(), h2.size() * 2);
+      o0f.download(f0.data(), f0.size() * 4);
       o2f.download(f2.data(), f2.size() * 4);
       const std::vector<float> r0 = widen(h0), r2 = widen(h2);
-      size_t wide_diff = 0, w8a8_diff = 0, unrounded = 0;
-      double gap = 0.0, ref_max = 0.0;
+      size_t wide_diff = 0, w8a8_diff = 0, unrounded = 0, unrounded0 = 0, f32_diff = 0;
+      double gap = 0.0, ref_max = 0.0, f32_gap = 0.0, f32_max = 0.0;
       for (size_t i = 0; i < h0.size(); ++i) {
         wide_diff += (h1[i] != h0[i]);
         w8a8_diff += (h2[i] != h0[i]);
         unrounded += (h2[i] != uint16_t(fbits(bf16_rn(f2[i])) >> 16));
+        unrounded0 += (h0[i] != uint16_t(fbits(bf16_rn(f0[i])) >> 16));
+        f32_diff += (f0[i] != f2[i]);
         gap = std::max(gap, std::fabs(double(r2[i]) - double(r0[i])));
         ref_max = std::max(ref_max, std::fabs(double(r0[i])));
+        f32_gap = std::max(f32_gap, std::fabs(double(f2[i]) - double(f0[i])));
+        f32_max = std::max(f32_max, std::fabs(double(f0[i])));
       }
-      const double bound = ref_max * 2e-3;
-      const bool ok = status == cudaSuccess && wide_diff == 0 && unrounded == 0 &&
-                      (set ? gap <= bound : w8a8_diff == 0);
+      // The repository's own contract (native/tests/glm_draft_kernels_selftest.py) reads the FP32
+      // outputs: on E4M3-exact operands the gap stays under 2e-3 of the max, and on ternary
+      // operands the two routes agree bit for bit. The rounded BF16 outputs are compared as well
+      // (the drafters' dtype): one BF16 step of separation there is the boundary effect of
+      // whatever sub-ULP FP32 difference the two accumulation orders leave, so it is reported
+      // next to the FP32 gap rather than gated.
+      const double f32_bound = f32_max * 2e-3;
+      const bool fp32_ok = set ? f32_gap <= f32_bound : f32_diff == 0;
+      const bool bf16_ok = set ? gap <= ref_max * 2e-3 : w8a8_diff == 0;
+      const bool ok = status == cudaSuccess && wide_diff == 0 && unrounded == 0 && unrounded0 == 0 && fp32_ok;
       bad += !ok;
       if (set) {
         std::printf("contract k=%5d n=%4d M=%4d e4m3-exact  mode1==mode0 %s  bf16==round(fp32) %s  "
-                    "|mode2-mode0| %.3e <= %.3e %s\n",
-                    k, n, rows, wide_diff ? "NO" : "yes", unrounded ? "NO" : "yes", gap, bound,
-                    gap <= bound ? "yes" : "NO");
+                    "fp32 |m2-m0| %.3e <= %.3e %s  fp32 bits %zu  bf16 |m2-m0| %.3e %.2e of ref %s\n",
+                    k, n, rows, wide_diff ? "NO" : "yes", (unrounded || unrounded0) ? "NO" : "yes", f32_gap,
+                    f32_bound, fp32_ok ? "yes" : "NO", f32_diff, gap, gap / (ref_max > 0.0 ? ref_max : 1.0),
+                    bf16_ok ? "yes" : "no");
       } else {
         std::printf("contract k=%5d n=%4d M=%4d ternary     mode1==mode0 %s  bf16==round(fp32) %s  "
-                    "mode2==mode0 %s\n",
-                    k, n, rows, wide_diff ? "NO" : "yes", unrounded ? "NO" : "yes", w8a8_diff ? "NO" : "yes");
+                    "mode2==mode0 fp32 %s (%zu bits)  bf16 %s\n",
+                    k, n, rows, wide_diff ? "NO" : "yes", (unrounded || unrounded0) ? "NO" : "yes",
+                    f32_diff ? "NO" : "yes", f32_diff, w8a8_diff ? "NO" : "yes");
       }
     }
   }

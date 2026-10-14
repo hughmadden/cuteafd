@@ -144,6 +144,30 @@ Reading of the table:
   the wide path's bits to differ from the old route's; calls with `rows <= 64`, and every W8A16 path,
   are untouched.
 
+The brief also asks for the new route against the old route directly. Both binaries' mode 2 outputs
+(BF16, the drafters' dtype) on the harness's generic gaussian operands, dumped per row count and
+compared elementwise:
+
+| k -> n | M | elements differing | max abs |old - new| | old element there |
+| --- | --- | --- | --- | --- |
+| 20480 -> 4096 | 65 | 45 of 262,144 | 1.250e-01 | 17.25 |
+| 20480 -> 4096 | 128 | 105 of 524,288 | 3.125e-02 | 7.25 |
+| 20480 -> 4096 | 129 | 3938 of 528,384 | 6.562e-01 | 8.06 |
+| 20480 -> 4096 | 1024 | 818 of 4,194,304 | 1.250e-01 | 17.25 |
+| 20480 -> 4096 | 2048 | 1646 of 8,388,608 | 1.250e-01 | 17.00 |
+| 4096 -> 2048 | 65 | 15 of 133,120 | 1.562e-02 | 3.17 |
+| 4096 -> 2048 | 128 | 29 of 262,144 | 3.125e-02 | 5.22 |
+| 4096 -> 2048 | 129 | 1938 of 264,192 | 2.744e-01 | 0.369 |
+| 4096 -> 2048 | 1024 | 247 of 2,097,152 | 6.250e-02 | 8.50 |
+| 4096 -> 2048 | 2048 | 470 of 4,194,304 | 6.250e-02 | 9.38 |
+| any M <= 64 | | 0 | 0 | -- |
+
+Away from M = 129 every difference is exactly one BF16 step of the element it lands on (0.125 on 17.25,
+0.03125 on 7.25): the routes' FP32 values differ by a sub-ULP amount -- one accumulation chain against
+split-chain partials summed by a reduce kernel -- and an element sitting within that amount of a BF16
+midpoint rounds to the other BF16 value. 0.01-0.02% of elements are that close and the rest are bit
+for bit; at M = 129 the extra disagreement is the trailing-pass row, not rounding.
+
 Contract checks (`--contract`, GPU against GPU, on operand sets whose arithmetic is exact -- the
 properties the repo's own `native/tests/glm_draft_kernels_selftest.py` asserts for the wide path,
 replicated over `rows` in {8, 64, 65, 96, 127, 128, 129, 136, 200, 1024, 2048} x both shapes, with the
@@ -157,12 +181,18 @@ pristine binary run as a control):
 - plus a tail probe that reports `|mode2 - mode0|` per row region on generic operands, which measures
   the f16 trailing pass described above for both routes.
 
-This is the one measurement of this task that the fair queue did not grant in time: `--contract` was
-queued on gpu1 as ticket 1146 (`~/.cache/cuteafd/builds/ds-k100/contract_r1.log`) behind two
-`cuteafd bench smoke` runs holding gpu1, and the run had not started when this report was written
-(`./fp8_selftest_old_contract --rule 1 --contract; ./fp8_selftest_contract --rule 1 --contract`). Every
-check that gates the brief's hard requirements is from a completed run: the FP64 reference table, the
-bit-identical `M <= 64` dumps, the M = 129 localization, the SASS identity and the performance table.
+The window landed (ticket 1146, `~/.cache/cuteafd/builds/ds-k100/contract_r1.log`): the pristine
+control passed (`rc=0`) and the patched binary failed the **BF16** form of the E4M3-exact bound at
+M >= 96 (1.25e-01 against 1.025e-01, and 2.5e-01 at M = 2048), by exactly one BF16 step, on 0.01-0.02%
+of elements. That is the same effect as the dump table above: the repository's test reads the **FP32**
+outputs (`out_f32 = 1`, `exact0 = torch.empty(rows, n)` defaults to float32), where a sub-ULP
+accumulation difference is the quantity the 2e-3 bound is written against, while rounding both routes
+to BF16 first turns it into a whole step wherever an element sits near a midpoint. The harness now
+checks both forms: the FP32 gap, the FP32 bit count and the ternary bit equality the repository asserts
+(which must hold exactly, since every product and partial sum on that operand set is a small integer
+times a power of two, so no accumulation order can change a bit), with the BF16 gap printed next to
+them and not gated.
+
 
 ## Performance
 
@@ -210,22 +240,24 @@ Where the win comes from, per 128-row block of the row height (16 blocks at M = 
 
 ## Wall-time split
 
-Derived from the agent transcript (13:32:57Z .. 14:03:43Z, 31.0 min), each gap between events charged
-to the tool in flight (capped at 600 s per gap) and everything else to the action it precedes:
+Derived from the agent transcript (13:32:57Z .. 14:40Z, 67.6 min, 689 events), each gap between events
+charged to the tool in flight (capped at 600 s per gap) and everything else to the action it precedes:
 
 | | min | share |
 | --- | --- | --- |
-| GPU under the fair queue (hwlock waits, queue-wait poll loop, harness GPU sessions) | 10.0 | 32% |
-| thinking/generation between tool calls (design, kernel and harness writing, reference, dump and SASS analysis) | 18.4 | 59% |
-| model time immediately preceding file writes/edits | 1.3 | 4% |
-| reading tools in flight (Read/Grep/Glob/cat/sed/diff) | 0.4 | 1% |
-| `nvcc` compiles in the cpu container (5, incl. the `-dc` pair for the SASS diff) | 0.2 | 1% |
-| uncategorized | 0.7 | 2% |
+| fair queue: `hwlock` waits and the poll loops that watched the two GPU windows | 36.5 | 54% |
+| model time between tool calls (kernel and harness design and writing, reference, dump, SASS and contract analysis) | 29.6 | 44% |
+| harness GPU sessions inside the windows + reading tools in flight | 0.8 | 1% |
+| `nvcc` compiles in the cpu container (7, incl. the `-dc` pair for the SASS diff) | 0.2 | <1% |
 
-The GPU bucket is dominated by waiting: the queue wait plus the poll loop that watched the first
-window are ~9.5 of its 10.0 min, and the harness's own GPU sessions are a small part of it (the FP64
-CPU reference and the 51-iteration medians are seconds each). Compiles are cheap because only one
-small translation unit is built in the cpu container rather than the whole native library.
+Almost all of the tool-runtime wall time is queue wait, not work: the harness itself runs in seconds
+(a 51-iteration median per shape, a few seconds of FP64 CPU reference, 14 row counts of contract
+checks). The four longest gaps in the transcript are 600, 570, 552 and 468 s of waiting on gpu1 --
+two `cuteafd bench smoke` runs held it -- and on the poll loops that watched the contract log, which
+is the wrong pattern (a backgrounded blocking command replaced them mid-task; they cost wall time,
+not tokens). Moving the second window to gpu0 per the coordinator's note did not shorten the wait: a
+4-hour gpu0+gpu1 ticket was ahead of it. Compiles are cheap because only one small translation unit
+is built in the cpu container rather than the whole native library.
 
 ## Reproducing
 
