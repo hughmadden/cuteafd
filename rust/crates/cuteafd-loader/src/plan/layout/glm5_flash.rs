@@ -33,6 +33,11 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             anyhow::bail!("wide decode needs CUTEAFD_GLMF_WIDE_DECODE_ROWS=128");
         }
         let representation = options.glmf_representation;
+        let state = options.glmf_kda_state;
+        anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || (!representation.kda_fp8 && ranks == 1),
+            "BF16 KDA state needs BF16 projections (--kda-fp8 off) on one GPU; W8+S16 needs a new export");
+        notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
+            if representation.kda_fp8 { "FP8" } else { "BF16" }, if representation.fp8_head { "FP8" } else { "BF16" }));
         let mut resident = resident::resident_weights(checkpoint, &cfg, cfg.layers, ranks, representation)
             .map_err(anyhow::Error::msg)?;
         let host_embedding = options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding);
@@ -54,7 +59,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push(format!("RTX expert onboarding unavailable: {error}")); None } };
         let experts = glmf::expert_costs(&catalog, ranks == 2 && available.is_some())?;
         let geometry = crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
-            index, 4, decode_rows, attention.mode, 0)?;
+            index, state.bytes(), decode_rows, attention.mode, 0)?;
         let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
             options.glmf_mark_lanes.unwrap_or(sequences), options.mimo_prefix_entries,
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes));
@@ -62,7 +67,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
-                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials));
+                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials, state));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
@@ -135,7 +140,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
-            index, kda_state_bytes: 4, shared_replay: options.glmf_shared_replay, representation,
+            index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
             resident, router_replica_bytes: router, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },

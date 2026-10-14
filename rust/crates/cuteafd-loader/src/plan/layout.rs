@@ -54,6 +54,8 @@ pub struct LayoutOptions {
     pub glmf_decode_rows: u64,
     /// Loaded projection/head formats; defaults match the launcher.
     pub glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation,
+    /// Recurrent state precision, including active slots, prefix marks and program scratch.
+    pub glmf_kda_state: crate::serving_capacity::GlmfKdaState,
     /// Expanded KDA head-split prefill; the launcher enables it.
     pub glmf_prefill_expanded: bool,
     /// GLM Flash index storage; a head split keeps the token keys, as serving does.
@@ -164,6 +166,7 @@ impl Default for LayoutOptions {
             prefill_lanes: 0,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
+            glmf_kda_state: Default::default(),
             glmf_prefill_expanded: true,
             glmf_index: crate::serving_capacity::GlmfIndexCache::Keys,
             graph_budget_bytes: None,
@@ -1334,14 +1337,15 @@ fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], to
 #[allow(clippy::too_many_arguments)]
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
     lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
-    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, rtx_experts: bool, fp32_partials: bool) -> Option<Vec<crate::placement::families::glm5_flash::GlmfBufferDemand>> {
+    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, rtx_experts: bool, fp32_partials: bool,
+    kda_state: crate::serving_capacity::GlmfKdaState) -> Option<Vec<crate::placement::families::glm5_flash::GlmfBufferDemand>> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
-    // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them.
+    // Requested precision must have its programs; never account for a silent BF16 fallback.
     let options = GlmfScratchOptions { index_compact, split, kda_fp32_partials: fp32_partials, kda_output_shard: split && repr.output_shard, kda_prefill_expanded: split && expanded,
-        kda_w8: repr.kda_fp8 && lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
+        kda_w8: repr.kda_fp8, kda_state,
         ..Default::default() };
     let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
     let (table_pages, table_pool_pages) = glmf_table_pages(context);

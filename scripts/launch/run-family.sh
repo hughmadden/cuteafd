@@ -2081,6 +2081,12 @@ audio_encoder_hash=""
     # gets, vision stays on; without one, a checkpoint template that cannot mark images plans text.
     [[ -z "$chat_template_from" || "$vision" == off ]] || plan_draft_args+=(--chat-template-from "$chat_template_from")
   fi
+  if [[ "$family" == glm5_flash ]]; then
+    plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$([[ $fp8_head == on ]] && echo true || echo false)")
+    [[ "${target_head:-auto}" == auto || -z "${target_head:-}" ]] || plan_draft_args+=(--target-head "$target_head")
+    # Draft-head arithmetic borrows the same target weight, not a second resident head.
+    plan_draft_args+=(--draft-head exact)
+  fi
   [[ "$family" != glm5_flash || "${index_cache:-keys}" != compact ]] || plan_draft_args+=(--index-cache compact)
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")

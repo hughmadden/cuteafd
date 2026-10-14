@@ -54,6 +54,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 full_prefill_logits: args.full_prefill_logits,
                 prefill_lanes: args.prefill_lanes,
                 glmf_decode_rows: args.decode_rows,
+                glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
+                    kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
+                    fp8_head: args.fp8_head, ..Default::default() },
+                glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
@@ -102,6 +106,14 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else { 4096 };
 }
 
+fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanError> {
+    if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor) && args.fp8_head {
+        return Err(PlanError::InvalidOption { option: "--target-head", reason:
+            "explicit tensor head needs --fp8-head false; the FP8 head has its own program".into() });
+    }
+    Ok(())
+}
+
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
@@ -148,6 +160,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     };
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
+    validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
@@ -639,6 +652,9 @@ mod tests {
             pool_tokens: None,
             kv_format: Default::default(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
+            kda_state: crate::families::glm5_flash::engine::KdaState::F32,
+            fp8_head: true, target_head: None, draft_head: crate::families::glm5::DraftHead::Exact,
             drafter_gib: 0.0,
             local_expert_layers: None,
             rtx_expert_layers: None,
@@ -1093,6 +1109,42 @@ mod tests {
             let layout = options(&args).unwrap().layout.unwrap();
             assert_eq!(layout.glm5_draft_bf16, bf16);
             assert!(!layout.mimo_draft_bf16, "GLM's representation must not affect MiMo");
+        }
+    }
+
+    #[test]
+    fn glm_flash_precision_reaches_the_layout_without_duplicate_heads() {
+        use clap::Parser;
+        use crate::families::glm5_flash::{fp8::KdaFp8, engine::KdaState};
+        let parse = |extra: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(
+                ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            args
+        };
+        let defaults = parse(&[]);
+        assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.fp8_head), (KdaFp8::Row128, KdaState::F32, true));
+        for state in ["f32", "bf16", "bf16-tile"] {
+            for kda in ["off", "row128", "channel"] {
+                for head in ["true", "false"] {
+                    let args = parse(&["--kda-state", state, "--kda-fp8", kda, "--fp8-head", head]);
+                    let layout = options(&args).unwrap().layout.unwrap();
+                    assert_eq!(layout.glmf_kda_state.bytes(), if state == "f32" { 4 } else { 2 });
+                    assert_eq!(layout.glmf_representation.kda_fp8, kda != "off");
+                    assert_eq!(layout.glmf_representation.fp8_head, head == "true");
+                }
+            }
+        }
+        let tensor = parse(&["--target-head", "tensor"]);
+        assert!(validate_glmf_precision(&tensor, "glm5_flash").is_err());
+        assert!(validate_glmf_precision(&tensor, "glm5").is_ok());
+        for target in ["exact", "tensor"] {
+            for draft in ["exact", "tensor"] {
+                let layout = options(&parse(&["--fp8-head", "false", "--target-head", target,
+                    "--draft-head", draft])).unwrap().layout.unwrap();
+                assert!(!layout.glmf_representation.fp8_head);
+                assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
+            }
         }
     }
 
