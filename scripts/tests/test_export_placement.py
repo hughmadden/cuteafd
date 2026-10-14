@@ -272,3 +272,26 @@ def test_capped_cleanup_ignores_second_signal_and_retains_gpu_lock(tmp_path):
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
             process.wait(timeout=5)
+
+
+def test_run_held_forwards_a_signal_that_arrives_before_the_child_exists(tmp_path, monkeypatch):
+    import importlib.util
+    import signal
+    import time
+    spec = importlib.util.spec_from_file_location('export_placement', SCRIPT)
+    placement = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(placement)
+    stopping = tmp_path / 'stopping'
+    command = ['bash', '-c', f"trap 'touch {stopping}; exit 0' HUP; while true; do sleep 0.1; done"]
+    real_popen = placement.subprocess.Popen
+
+    def popen_after_signal(*args, **kwargs):
+        # The signal lands in the window between installing the forwarders and the spawn.
+        os.kill(os.getpid(), signal.SIGHUP)
+        process = real_popen(*args, **kwargs)
+        time.sleep(0.3)  # let bash install its trap before the deferred forward
+        return process
+
+    monkeypatch.setattr(placement.subprocess, 'Popen', popen_after_signal)
+    assert placement.run_held(command, dict(os.environ)) == 0
+    assert stopping.exists()

@@ -206,10 +206,16 @@ def held_by_caller() -> list[str]:
 
 def run_held(command, env, handle=None):
     # The child retains the mutex even if this supervisor is killed abruptly.
-    process = subprocess.Popen(command, env=env, start_new_session=True,
-                               pass_fds=(() if handle is None else (handle.fileno(),)))
+    # Forwarders are installed before the spawn so a signal that arrives while
+    # the child starts is delivered to it rather than killing this supervisor;
+    # one that arrives before the child exists is forwarded once it does.
+    process = None
+    pending = []
     previous = {}
     def forward(signum, frame):
+        if process is None:
+            pending.append(signum)
+            return
         try:
             os.killpg(process.pid, signum)
         except ProcessLookupError:
@@ -217,6 +223,10 @@ def run_held(command, env, handle=None):
     try:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
             previous[signum] = signal.signal(signum, forward)
+        process = subprocess.Popen(command, env=env, start_new_session=True,
+                                   pass_fds=(() if handle is None else (handle.fileno(),)))
+        for signum in pending:
+            forward(signum, None)
         return process.wait()
     finally:
         for signum, handler in previous.items():
