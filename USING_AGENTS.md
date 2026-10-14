@@ -279,20 +279,32 @@ orchestrator's to use; TJ isn't using these subscriptions.
 | `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota (the backup Codex subscription expires in a few weeks) |
 | `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
-Launch and control, through a detached tmux session so a run can be watched,
-steered and stopped:
+Use the interactive stdlib driver for a worker that needs steering or answers:
 
 ```sh
-scripts/agents/ext-launch.sh grok|agy <name> [model] [effort]   # background; exit wakes the orchestrator
-tail ~/.cache/cuteafd/builds/codex-runs/<name>.log              # progress
-scripts/agents/ext-stop.sh <name>                                # stop
+python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
+python3 scripts/agents/ext-agent.py transcript TASK --since-last
+python3 scripts/agents/ext-agent.py send TASK 'One concise correction.'
+python3 scripts/agents/ext-agent.py stop TASK
 ```
 
-The brief format and preamble are the same as Codex's. These agents can't
-SendMessage, so the orchestrator reads `<name>.report.md` and the log. A
-meta-driver (a DeepSeek or Sol agent that drives the CLI in tmux, sends
-steering messages and summarises progress) is an option for long runs; try it
-once a plain run shows where steering would have helped.
+Give the DeepSeek driver agent
+`scripts/agents/skills/ext-agent-driver/SKILL.md` and the worker's brief.
+The worker cannot SendMessage; its driver reports milestones, unresolved
+questions and validated results to the orchestrator. `wait` blocks instead
+of agent-side polling. `idle` is an available input prompt, not proof the
+task is done. Busy sends are queued; inspect the answer to verify steering.
+Runs and transcripts live in `EXT_AGENT_RUNS` (default `~/.cache/ext-agent`).
+Antigravity 503s have bounded automatic backoff; state and retry evidence
+are exposed in JSON. Python 3, tmux and authenticated CLIs are required.
+
+The old `ext-launch.sh grok|agy NAME [model] [effort]` remains a single-turn
+batch launcher with logs under `AGENT_RUNS`; use `ext-stop.sh` only for those
+batch runs. Use `ext-agent.py stop` for interactive runs so its supervisor
+and process descendants are stopped too. Never give both launchers the same
+run name: both use the `ext-NAME` tmux namespace.
 
 **They are on trial.** Every use is scored in `docs/agent-scorecard.md`:
 correctness, judgement, quality, creativity, wall time, plus notes. Trial
