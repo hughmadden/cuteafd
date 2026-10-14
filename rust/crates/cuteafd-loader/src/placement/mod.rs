@@ -31,7 +31,7 @@ mod tests;
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, LayerExecutionPlan, LayerPlanError, ResidualHome, Transition, HOP_SLOTS};
-pub use solve::solve;
+pub use solve::{solve, solve_frozen};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
 /// What a request asks of the hardware, built by a family from its own

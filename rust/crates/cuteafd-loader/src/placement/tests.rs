@@ -1181,3 +1181,65 @@ fn qwen_refuses_shared_solver_empty_owner_chain() {
     assert!(families::qwen4::check_dual_layer_owners(&[]).is_err());
     families::qwen4::check_dual_layer_owners(&[0, 0, 1, 1]).unwrap();
 }
+
+
+#[test]
+fn frozen_admission_keeps_loaded_owners_and_still_checks_memory_and_executor() {
+    let req = request(2, 44 * GIB, 8, 4, Onboard::Auto);
+    let original = solve(&req).unwrap();
+    let checked = solve_frozen(&req, &original).unwrap();
+    assert_eq!(checked.layers, original.layers);
+    assert_eq!(checked.hops, original.hops);
+    assert_eq!(checked.pool_tokens, original.pool_tokens);
+    let mut invalid = original.clone();
+    invalid.layers.pop();
+    assert!(matches!(solve_frozen(&req, &invalid), Err(PlacementError::Inventory(_))));
+    invalid = original.clone();
+    invalid.layers[0].mode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
+    assert!(matches!(solve_frozen(&req, &invalid), Err(PlacementError::UnsupportedMode { .. })));
+    let mut insufficient = req;
+    insufficient.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 1 };
+    insufficient.pool.requested = Some(original.pool_tokens);
+    assert!(solve_frozen(&insufficient, &original).is_err());
+}
+
+
+#[test]
+fn frozen_owned_admission_does_not_rechoose_after_measured_rank_balance_changes() {
+    let mut req = request(2, 32 * GIB, 3, 4, Onboard::Layers(0));
+    req.pool.requested = Some(2 << 20);
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    req.pool_overhead = vec![0; 2];
+    req.hops = MHC;
+    for layer in &mut req.layers {
+        layer.experts = None;
+        layer.modes = vec![LayerMode::HeadSplit, S0, S1];
+        layer.weights = ModeBytes { whole: GIB, split: [GIB / 2; 2] };
+        layer.kv_unit = ModeBytes::replicated(UNIT / 4).into();
+    }
+    let original = solve(&req).unwrap();
+    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 48 * GIB };
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: 20 * GIB };
+    req.pool.requested = Some(original.pool_tokens);
+    req.pool.floor = original.pool_tokens;
+    assert_ne!(solve(&req).unwrap().layers, original.layers);
+    let frozen = solve_frozen(&req, &original).unwrap();
+    assert_eq!(frozen.layers, original.layers);
+    assert_eq!(frozen.hops, original.hops);
+    assert_eq!(frozen.residual, original.residual);
+    assert_eq!(frozen.pool_tokens, original.pool_tokens);
+    let mut changed = req.clone();
+    changed.attention_placement = Some(AttentionPlacement::Heads);
+    assert!(matches!(solve_frozen(&changed, &original), Err(PlacementError::Inventory(_))));
+    changed = req.clone();
+    changed.attention_placement = None;
+    changed.policy.attention = vec![(AttentionClass::Csa, AttentionPlacement::Layers); 2];
+    assert!(matches!(solve_frozen(&changed, &original), Err(PlacementError::Inventory(_))));
+    let mut invalid = original.clone();
+    invalid.attention_by_kind.push(invalid.attention_by_kind[0]);
+    assert!(matches!(solve_frozen(&req, &invalid), Err(PlacementError::Inventory(_))));
+    invalid = original.clone();
+    invalid.layers[0].mode = LayerMode::HeadSplit;
+    assert!(matches!(solve_frozen(&req, &invalid), Err(PlacementError::Inventory(_))));
+}

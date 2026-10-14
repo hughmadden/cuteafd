@@ -1527,7 +1527,10 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     if devices.len() == 2 && tp2_workspace.is_none() && onboard != Onboard::Auto && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
     }
-    let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
+    let inputs = v4::V4Inputs { cfg: &cfg,
+        weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
+            shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
+        cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace: shape.workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
