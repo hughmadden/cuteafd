@@ -149,7 +149,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             if timed && rate(foreign) > 1.0 && foreign as f64 > nic as f64 * 0.05 {
                 phase.assessments.push(format!("foreign traffic: {label} {:.2} Gb/s (>5% and >1 Gb/s)", rate(foreign)));
             }
-            let signal = |key: &str| counters.get(key).is_some_and(|n| *n > 0);
+            let signal = |key: &str| counters.iter().any(|(name, n)| *n > 0 && (name == key || name.strip_prefix("hw_counters/") == Some(key)));
             let wait_rate = counters.get("port_xmit_wait").map(|ticks| *ticks as f64 / seconds);
             let rising_wait = wait_rate.zip(port.idle_xmit_wait_ticks_per_s)
                 .is_some_and(|(rate, idle)| rate > idle + (idle * 0.1).max(1.0));
@@ -161,7 +161,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
                 phase.assessments.push(format!("congestion at high utilization: {label}"));
             }
             if counters.iter().any(|(key, n)| *n > 0 && (key.contains("retrans")
-                || matches!(key.as_str(), "out_of_sequence" | "packet_seq_err" | "local_ack_timeout_err"))) {
+                || matches!(key.strip_prefix("hw_counters/").unwrap_or(key), "out_of_sequence" | "packet_seq_err" | "local_ack_timeout_err"))) {
                 phase.assessments.push(format!("retransmit/sequence signal: {label}"));
             }
             phase.ports.push(Port { host: host.clone(), device: port.device.clone(), port: port.port,

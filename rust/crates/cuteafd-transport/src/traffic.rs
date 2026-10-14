@@ -169,9 +169,8 @@ pub fn read_ports(root: &Path) -> Vec<PortSample> {
                     let Some(mut value) = std::fs::read_to_string(file.path()).ok()
                         .and_then(|s| s.trim().parse::<u64>().ok()) else { continue };
                     if matches!(name.as_str(), "port_xmit_data" | "port_rcv_data") { value = value.saturating_mul(4); }
-                    // Preserve standard names for arithmetic, but retain both
-                    // observations when a driver repeats a hardware name.
-                    let key = if counters.contains_key(&name) { format!("{directory}/{name}") } else { name };
+                    // Hardware identity must not change when a standard read fails.
+                    let key = if directory == "hw_counters" { format!("hw_counters/{name}") } else { name };
                     counters.insert(key, value);
                 }
             }
@@ -281,6 +280,11 @@ mod tests {
         assert_eq!(ports[0].counters["hw_counters/port_xmit_data"], 1824);
         assert!(!ports[0].counters.contains_key("port_rcv_data"));
         assert_eq!(ports[0].link_gbps, Some(200.0));
+        std::fs::write(port.join("counters/port_xmit_data"), "unavailable").unwrap();
+        std::fs::write(port.join("hw_counters/port_xmit_data"), "500").unwrap();
+        let next = read_ports(&root);
+        assert!(!next[0].counters.contains_key("port_xmit_data"));
+        assert_eq!(next[0].counters["hw_counters/port_xmit_data"], 2000);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

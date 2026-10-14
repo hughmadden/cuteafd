@@ -11,7 +11,7 @@ const histories = new Map();
 let run, sequence = 0;
 const esc = (text) => String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const cnp = (c) => {
-  const values = [c?.np_cnp_sent, c?.rp_cnp_handled].filter(Number.isFinite);
+  const values = ['np_cnp_sent', 'rp_cnp_handled'].map(key => c?.[`hw_counters/${key}`] ?? c?.[key]).filter(Number.isFinite);
   return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
 };
 const fmt = (value) => Number.isFinite(value) ? value.toFixed(2) : 'unavailable';
@@ -70,10 +70,10 @@ function draw(container, key, history) {
   history.forEach((p, i) => {
     const c = p.port.counters || {};
     const wait = (c.port_xmit_wait || 0) > 0;
-    const cnp = (c.np_cnp_sent || 0) + (c.rp_cnp_handled || 0) > 0;
-    if (wait || cnp) {
+    const hasCnp = (cnp(c) || 0) > 0;
+    if (wait || hasCnp) {
       const marker = mark('text', { x: x(i), y: 164, 'text-anchor': 'middle', fill: 'var(--ink-2)', 'font-size': 10 }, svg);
-      marker.textContent = `${wait ? 'W' : ''}${cnp ? 'C' : ''}`;
+      marker.textContent = `${wait ? 'W' : ''}${hasCnp ? 'C' : ''}`;
       const title = mark('title', {}, marker); title.textContent = 'W: xmit_wait grew; C: CNP grew';
     }
   });
