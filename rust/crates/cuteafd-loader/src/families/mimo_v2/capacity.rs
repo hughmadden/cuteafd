@@ -184,17 +184,6 @@ pub fn mimo_capacity_profiles(
             )?,
         );
         reserve(&mut costs, "state.fixed", storage.fixed_state_bytes);
-        reserve(
-            &mut costs,
-            "context.rope_tables",
-            product(
-                "MiMo RoPE tables",
-                &[
-                    options.max_context_tokens,
-                    storage.context_table_bytes_per_token,
-                ],
-            )?,
-        );
         post_target_kv.push(DeviceCosts {
             device: runtime.device,
             reservations: costs.clone(),
@@ -417,7 +406,7 @@ mod tests {
             assert!(phase
                 .reservations
                 .iter()
-                .any(|cost| cost.name == "context.rope_tables"));
+                .all(|cost| cost.name != "context.rope_tables"));
             assert!(!phase
                 .reservations
                 .iter()
