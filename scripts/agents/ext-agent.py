@@ -18,6 +18,7 @@ import uuid
 ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
 POLL = 0.5
+IDLE_SETTLE = 2.0
 
 
 def clean(text):
@@ -84,7 +85,8 @@ class Adapter:
     def state(self, text, meta):
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         body = '\n'.join(lines)
-        if (re.search(self.busy, '\n'.join(lines[-2:])) or
+        if (re.search(r'^[\s]*[⠁-⣿]', '\n'.join(lines[-5:]), re.M) or
+                re.search(self.busy, '\n'.join(lines[-2:])) or
                 re.search(r'\b[1-9][0-9]* queued\b|edit queued messages', '\n'.join(lines[-2:])) or
                 re.search(r'^[\s⠀-⣿]*(?:Waiting for response|Thinking|Working|Responding|Running command|Loading)[^\n]*', '\n'.join(lines[-3:]), re.M)):
             return 'busy'
@@ -160,6 +162,11 @@ def snapshot(path, lines=30):
     if not info and state not in ('starting', 'error'):
         state = 'exited'
     quiet = max(0, time.time() - meta.get('last_output_at', meta['created_at']))
+    if state in ('idle', 'asking') and meta.get('submitted_at'):
+        raw = path / 'transcript.raw'
+        size = raw.stat().st_size if raw.exists() else 0
+        if quiet < IDLE_SETTLE or size != meta.get('raw_size'):
+            state = 'busy'
     context = re.findall(r'\b([0-9.]+[KM]?)\s*/\s*([0-9.]+[KM]?)\s*\(([0-9]+)%\)', text, re.I)
     usage = {'used': context[-1][0], 'limit': context[-1][1], 'percent': int(context[-1][2])} if context else None
     return {'context_usage': usage, 'name': meta['name'], 'tool': meta['tool'], 'state': state,
@@ -271,6 +278,31 @@ def terminate(meta):
         tmux('kill-session', '-t', meta['pane'], check=False)
 
 
+def write_final(path, text, meta):
+    lines = [line.rstrip() for line in text.splitlines()]
+    headers = [i for i, line in enumerate(lines) if re.match(r'^\s*[>❯]\s+\S', line)]
+    if headers:
+        lines = lines[headers[-1] + 1:]
+    adapter = ADAPTERS[meta['tool']]
+    result = []
+    for line in lines:
+        if re.search(r'^\s*Worked for ', line):
+            break
+        if (re.search(adapter.prompt, line) or adapter.footer(line) or
+                re.search(r'^\s*[┃◆○●]|^\s*\$ ', line)):
+            continue
+        result.append(line)
+    message = '\n'.join(result).strip()
+    with locked(path):
+        destination = path / 'final.md'
+        if destination.exists():
+            return
+        destination.write_text('# Worker final snapshot\n\nState: idle\n'
+                               f"Created: {meta['created_at']}\nSubmitted: {meta['submitted_at']}\n"
+                               f'Idle: {time.time()}\n\nLast assistant message (screen-extracted):\n\n' + message + '\n')
+    event(path, 'final_snapshot', file=str(destination))
+
+
 def supervise(path):
     meta = read_meta(path)
     save(path, supervisor_pid=os.getpid(), supervisor_birth=identity(os.getpid()))
@@ -289,8 +321,9 @@ def supervise(path):
             fingerprint = hashlib.sha256(text.encode()).hexdigest()
             raw = path / 'transcript.raw'
             size = raw.stat().st_size if raw.exists() else 0
-            if fingerprint != meta.get('screen_hash') or size != meta.get('raw_size'):
-                save(path, screen_hash=fingerprint, raw_size=size, last_output_at=time.time())
+            changed = fingerprint != meta.get('screen_hash') or size != meta.get('raw_size')
+            if changed:
+                meta = save(path, screen_hash=fingerprint, raw_size=size, last_output_at=time.time())
             if 'Do you trust the contents' in text and not trust_sent:
                 tmux('send-keys', '-t', meta['pane'], adapter.trust_key)
                 trust_sent = True
@@ -298,6 +331,8 @@ def supervise(path):
                 time.sleep(POLL)
                 continue
             state = adapter.state(text, meta) if info and not info['dead'] else 'exited'
+            if state in ('idle', 'asking') and meta.get('submitted_at') and time.time() - meta['last_output_at'] < IDLE_SETTLE:
+                state = 'busy'
             # Old 503 output must not trigger retries after a later successful turn.
             current = text
             marker = message_marker(meta.get('last_message', ''))
@@ -326,6 +361,8 @@ def supervise(path):
             if state == 'exited':
                 save(path, state=state, exited_at=time.time())
                 return
+            if state == 'idle' and meta.get('submitted_at'):
+                write_final(path, text, meta)
             if state != meta.get('state'):
                 save(path, state=state)
                 event(path, 'state', state=state)

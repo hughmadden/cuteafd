@@ -389,3 +389,40 @@ def test_wait_idle_yields_for_question(cli):
     call('send', name, 'question')
     result = call('wait', name, '--until', 'idle', '--timeout', '8')
     assert result['state'] == 'asking' and not result.get('timed_out')
+
+
+def test_final_snapshot_survives_driver_and_is_first_idle_only(cli):
+    name, call, root = cli
+    call('start', name, '--tool', 'grok', '--cwd', str(root))
+    final = root / 'runs' / name / 'final.md'
+    assert not final.exists()
+    call('send', name, 'first assistant result')
+    call('wait', name, '--until', 'idle', '--timeout', '8')
+    deadline = time.monotonic() + 3
+    while not final.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+    first = final.read_text()
+    assert 'State: idle' in first and 'Submitted:' in first and 'Idle:' in first
+    assert 'DONE first assistant result' in first
+    call('send', name, 'later result')
+    call('wait', name, '--until', 'idle', '--timeout', '8')
+    assert final.read_text() == first
+
+
+def test_visible_prompt_stream_growth_is_not_idle(cli):
+    name, call, root = cli
+    call('start', name, '--tool', 'grok', '--cwd', str(root))
+    call('send', name, 'streaming turn')
+    assert call('status', name)['state'] == 'busy'
+    # The fake clears its busy footer and leaves a visible prompt after 0.8 s;
+    # the two-second quiet window must still keep it busy.
+    time.sleep(1)
+    assert call('wait', name, '--until', 'idle', '--timeout', '0.1')['timed_out']
+    result = call('wait', name, '--until', 'idle', '--timeout', '8')
+    assert result['state'] == 'idle' and result['seconds_since_output'] >= 2
+
+
+def test_bare_spinner_with_prompt_is_busy():
+    assert driver.Grok().state('⠸ Thinking...\n❯\nGrok 4.7 high', {}) == 'busy'
+    assert driver.Agy().state('⠸ Streaming response...\n>\n? for shortcuts', {}) == 'busy'
