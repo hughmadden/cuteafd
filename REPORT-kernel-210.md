@@ -1,9 +1,15 @@
-# #210 — one canonical FP8 decode reduction, row-invariant from 1 row to the program cap
+# #210 — one canonical FP8 decode reduction, plus the M-tile ladder requalified per shape
 
 Worker: DeepSeek Flash (kernel engineer), duel `duel/ds-210`.
 Engine worktree `~/Developer/cuteafd-ds-k210` (branch `duel/ds-210`, based on
-`origin/work/p0` at merge-base `e123753b`), fork `third_party/sparkinfer`
-(branch `duel/ds-210`, not pushed).
+`origin/work/p0` at merge-base `e123753b`, landing commit `98c993df`), fork
+`third_party/sparkinfer` (branch `duel/ds-210`, pushed as `5f32f49c`; fork
+`master` stays at the merge commit `e9a8450b` until these gates are green).
+
+Sections 1-9 are phase 1 (the decode route decision and its gates). Section 10 is phase 2:
+landing arm B's multi-tile ladder on that base with the short-K tile policy requalified here,
+and the phase-2 gates for the KDA M=1 reordering, the GLM Flash golden, the decode-path
+fidelity compare against `work/p0` and the strict `spec_lossless_set`.
 
 ## 1. The defect
 
@@ -436,12 +442,13 @@ program touched by this change bakes in a card's SM count.
   row-invariant and the 172-case gate covers exactly that range. A 128-row GEMV
   tile is the follow-up if a 128-row decode step becomes a served shape. This is
   recorded in the `FP8_DECODE_ROWS` doc comment in `engine.rs`, not hidden.
-* **The fork pin is local-only.** Kernel changes are supposed to go to
-  `../sparkinfer-glmrt` master first, and this duel forbids pushing. The fix commit
-  (`b0c81048`) exists only in this worktree; `third_party/sparkinfer.lock.json` points at it,
-  so a clone of `duel/ds-210` cannot verify the pin (`b0c81048`, tree
-  `34a8ecd6...`) until the fork branch is
-  pushed and re-pinned. Everything else in the engine diff is self-contained.
+* **The fork pin resolves on the branch, and master moves only after the landing gates.**
+  The fix commits (`b0c81048`, then `5f32f49c` for the requalified tile policy) are pushed to
+  `duel/ds-210` on `tpurtell/sparkinfer-glmrt`, so a clone of this branch verifies the lock
+  (`5f32f49c`, tree
+  `3d343816...`). Per the duel lead's direction, fork `master` stays at the merge commit
+  `e9a8450b` and is fast-forwarded to `5f32f49c` only once this branch's gates are green;
+  `work/p0`'s pin does not move until then, so nothing served is affected either way.
 * **Measurements are one launch per arm.** Both performance arms and the M=1 dumps ran once,
   per the AGENTS frugality rule. The 1.11 at `mimo_dense_down` M=1 and the flat ~4%
   `mimo_pro_*` offsets are the two numbers a second, interleaved session would settle; neither
@@ -506,9 +513,10 @@ host is where AGENTS puts script tests and the host run below is the gate.
 
 ## 9. Reproduce
 
-The five commands that produced the evidence. Fork revision `b0c81048` (branch `duel/ds-210`,
-unpushed) pinned by `third_party/sparkinfer.lock.json`; the engine changes are commit
-`bf87212` on branch `duel/ds-210`.
+The five commands that produced the evidence. Fork revision `b0c81048` (pushed to branch
+`duel/ds-210`) pinned by `third_party/sparkinfer.lock.json`; the engine changes are commit
+`bf87212` on branch `duel/ds-210`. Phase 2 moves the pin to `5f32f49c` and the engine to
+`98c993df`; the commands below run unchanged against either.
 
 ```bash
 # the hard gate (needs a GPU; through the fair queue, tickets 1181/1175)
@@ -545,3 +553,127 @@ The before-state arms (`perf-before.json`, `m1-before.pt`) were produced by the 
 in `~/Developer/cuteafd-ds-k210b` (a second worktree of the same engine branch point, fork at
 `e087083e`) - see section 8 for their tickets. `analyze_perf.py` (scratchpad) turns the two perf
 JSONs into the table in section 5 and the stop-bar verdict.
+
+## 10. Phase 2: the ladder lands, requalified per shape
+
+Phase 1 decided the route -- one canonical FP8 decode reduction per program, row-invariant
+from 1 row to the program cap. Phase 2 lands the second half of the shootout on that base:
+the multi-tile `MmaFp8Gemv` ladder from arm B, with B's short-K tile policy *requalified*
+here rather than adopted, and B's head extension left out.
+
+Fork `sparkinfer-glmrt`, branch `duel/ds-210`: `51a3570a` "Split MmaFp8Gemv's row tiles
+across the launch grid" (the ladder, ported) then `5f32f49c` "Requalify the FP8 GEMV tile
+split: two tiles only above k=2048". Engine, branch `duel/ds-210`: `98c993df` (submodule
+pin, lock and the re-audited `_fp8_weights.py` source hash in
+`families/glm5_flash/engine.rs`).
+
+### What the ladder is
+
+`total_m_tiles = ceil(max_rows / 16)`; `gemv_cta_tiles(n, k, *, groups, warps)` caps how many
+16-row tiles one CTA keeps; the launch becomes 2D, `(n // cols, grid_m, 1)` with
+`grid_m = ceil(rows / (16 * m_tiles))`. A CTA holding more than two tiles folds its epilogue
+one 16-row tile at a time through a tile-sized shared-memory buffer (a leading
+`sync_threads()` before the first fold) instead of holding every tile's fragment registers at
+once.
+
+Nothing about a row's own reduction moves: its warp K partition, its k-slot traversal and the
+ascending-`src` cross-warp fold stay functions of the program, not of the live `rows` or of
+the tile index a row lands in. That is what keeps phase 1's row invariance intact under a
+launch shape that now *does* depend on `rows`, and it is what the 172-case gate and the M=1
+dump verify -- on the combined change, not on phase 1 alone.
+
+The head span stays 16 rows: B's head extension is not ported. The head's own kernel is not in
+this branch's diff at all, so every number below is a head-16 number.
+
+### The tile policy, requalified (Req 1)
+
+The policy is not adopted, it is re-decided per shape on this tree. First sweep, all 99 decode
+consumers, arms 2 and 4 tiles per CTA, same program and same tensors, L2-cold SM120 at 325 W,
+median us at 17/32/48/64 rows, against arm A (four tiles everywhere, the pre-ladder route):
+
+| rule | 2/4 geo / worst | vs arm A geo / worst | cells past 1.05 |
+| --- | --- | --- | --- |
+| four tiles everywhere (arm A) | 1.000 / 1.000 | 0.985 / 1.017 | - |
+| `k <= 2560 -> 2` (B, as landed upstream) | 0.941 / 1.396 | 0.927 / 1.279 | `glmf_mla_q_b`@M64 1.279, `routed_glm_q_b`@M48 1.124 |
+| `2048 < k <= 2560 -> 2` (**landed**) | 0.956 / 1.000 | 0.941 / 1.017 | - |
+
+Then confirmed by an interleaved re-run -- 24 reps, arms 4a/2/4b alternating inside one
+process, ratios paired per cell, on the 43 consumers that carry this engine's coordinator
+projections at widths 1/4/16/17/32/48/64 (301 cells). The middle column is the harness's own
+same-config floor, the two four-tile launches against each other:
+
+| measurement | cells | geomean | worst |
+| --- | --- | --- | --- |
+| two tiles / four tiles, ungated | 301 | 1.031 | 1.694 |
+| same-config noise floor (4a / 4b) | 301 | 0.999 | 1.356 |
+| **landed policy / four tiles** | 301 | **0.995** | **1.050** |
+| landed policy / four tiles, wide M>=17, K<=2560 | 40 | 0.962 | 1.000 |
+| the cells the policy sends to two tiles (K=2560) | 14 | 0.898 | 1.050 |
+
+The landed rule is `2 if 2048 < k <= 2560 else 4`. Ten of the 99 consumers have k <= 2560 and
+89 have k > 2560, so the rule only ever moves the ten, and inside them only the k=2560 pair
+(`qwen_attn_in` 13952x2560, `qwen_gdn_in` 16480x2560): 0.75-0.94 of four from M=17 up, ~1.00
+below it, and 0.71-0.87 of arm A. Two tiles is a wash up to k=1024 and loses on 16384x1536
+(1.27/1.47 of four at 48/64 rows in the interleaved run) -- that last shape is what B's
+blanket short-K rule broke.
+
+k=2048 is the band worth stating outright, because no policy can get it right on its own:
+`glm_q_b` and `routed_glm_q_b` are both 16384x2048 and build the *same* `MmaFp8Gemv` key
+`(16384, 2048, 4, 4, 4, m_tiles, 'BFloat16', False, False)`, so no `(n, k, groups, warps)`
+rule can separate them -- yet they disagree on the arm. Two tiles takes the plain one to
+0.82-0.86 of four and the routed one to 1.05-1.16 at 48/64 rows (noise floor there 0.95).
+Keeping four at k=2048 is the safe side of a split the kernel cannot see: the plain consumer
+gives up a real win, and the routed consumer stays at 0.93-0.98 of arm A, which is what the
+requirement asks for. Long K keeps four as well (2/4 geomean 1.101 over 132 cells).
+
+The rule keys on the shape alone; `groups` and `warps` are accepted but unused, and there is
+no family or model branch anywhere in it.
+
+### KDA M=1: the accepted floating-point reordering (Req 3)
+
+The engine used to pass `decode_recipe="w8a16"`, which froze the KDA's decode reduction: a
+single-row KDA step ran the W8A16 TMA kernel. Deleting the recipe moves that step onto the
+thin FP8 GEMV. Same E4M3 copy, same per-row x 128-K scales, different summation order -- the
+reordering AGENTS.md accepts. It is measured at the launch boundary, where the W8A16 route is
+still reachable with the *same program* by setting `fp8_rows=0`, so this is one program, two
+scalars, same weights, same state, same buffers:
+
+| case (heads, out dtype, op) | rows | FP32 out, rel. L2 | KDA state, rel. L2 | conv state, rel. L2 | max abs out | replay state |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32, FP32, projection (the unmasked number) | 1 | 7.10e-05 | 6.04e-05 | 7.63e-05 | 0.0000 | bitwise |
+| 32, FP32, projection | 16 | 8.35e-04 | 3.36e-04 | 1.51e-04 | 0.0011 | bitwise |
+| 32, BF16, projection | 1 | 4.72e-04 | 6.04e-05 | 7.63e-05 | 0.0010 | bitwise |
+| 64, BF16, projection | 1 | 1.31e-03 | 1.26e-04 | 1.21e-04 | 0.0020 | bitwise |
+| 64, BF16, projection | 16 | 1.42e-03 | 3.77e-04 | 1.38e-04 | 0.0039 | bitwise |
+| 32, BF16, norm | 1 | 7.12e-05 | 6.04e-05 | 7.63e-05 | 0.0005 | bitwise |
+| 32, BF16, norm | 16 | 8.39e-04 | 3.36e-04 | 1.51e-04 | 0.0156 | bitwise |
+
+All 16 cases (heads 32/64 x rows 1/2/5/16) replay bitwise-identically; the output differences
+sit at the BF16 rounding floor where the output is BF16 (one bf16 ulp at the output's
+magnitude) and at 7.1e-05 relative in FP32, which is the unmasked measure of the reordering
+itself. At M=1 the tile count is 1 (`total_m_tiles = 1`), so the ladder's policy does not
+enter the M=1 path at all.
+
+### Wide decode, 65-128 rows: an arm sweep for the `_m128` programs
+
+The 65-128 row band (`--glmf-wide-decode-rows 128`, where `total_m_tiles = 8`) is not a served
+decode shape today, so it is not a gate -- but the ladder caps tiles per CTA there too, so the
+policy is swept across arms 2/4/8 at widths 65/96/128 on the nine `_m128` consumers.
+
+| consumer | n | k | M=65 | M=96 | M=128 |
+| --- | --- | --- | --- | --- | --- |
+| `glmf_dense_down` | 4096 | 12288 | 67.2 (4: 61.1) | 95.9 (4: 91.8) | 122.5 (4: 118.4) |
+| `glmf_dense_gu` | 24576 | 4096 | 144.5 (8: 122.5) | 155.3 (8: 143.0) | 188.1 (8: 173.7) |
+| `glmf_kda_in` | 24896 | 4096 | 143.0 (4: 143.0) | 153.2 | 181.9 (4: 181.2) |
+| `glmf_kda_in_half` | 12576 | 4096 | 62.6 (4: 50.8) | 83.6 (4: 67.2) | 110.2 (4: 89.7) |
+| `glmf_kda_o` | 4096 | 8192 | 38.1 (4: 38.0) | 57.7 (4: 57.0) | 71.3 |
+| `glmf_kda_o_half` | 4096 | 4096 | 21.7 (4: 21.7) | 32.4 (4: 30.0) | 40.1 (4: 38.6) |
+| `glmf_mla_o` | 4096 | 16384 | 89.8 (2: 85.6) | 116.4 | 120.5 |
+| `glmf_mla_q_b` | 16384 | 1536 | 23.8 | 32.4 (8: 31.9) | 40.6 (8: 40.2) |
+| `glmf_shared_gu` | 4096 | 4096 | 21.7 (4: 21.7) | 30.4 (4: 30.1) | 38.6 (4: 38.1) |
+
+The landed policy takes the bold arm everywhere those cells are equal (all nine are k>2560
+except `glmf_mla_q_b`, whose k=1536 is also four). It is within 1-5% of the best arm on eight
+of the nine; the exception is `glmf_dense_gu` 24576x4096, where eight tiles is 8-18% faster at
+65-128 rows. That is a follow-up for a band nothing serves yet, not a reason to widen the rule
+now.
