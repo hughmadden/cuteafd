@@ -1206,8 +1206,8 @@ qwen_exl3=0
 qwen_nvfp4=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
-  kv_format="$(get KV_FORMAT fp8)"
-  case "$kv_format" in bf16|fp8) ;; *) release_die "KV_FORMAT must be bf16 or fp8" ;; esac
+  kv_cache="$(get KV_CACHE fp8)"
+  case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
   qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
@@ -1429,8 +1429,13 @@ if [[ $family == mimo_v2 ]]; then
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
-  # dims; SWA rings stay BF16) or bf16.
-  [[ -z "$(get KV_CACHE)" ]] || family_args+=(--kv-cache "$(get KV_CACHE)")
+  # dims; SWA rings stay BF16) or bf16. Unset omits --kv-cache so the daemon default (int8) applies.
+  mimo_kv="$(get KV_CACHE)"
+  case "$mimo_kv" in
+    "") ;;
+    int8|bf16) family_args+=(--kv-cache "$mimo_kv") ;;
+    *) release_die "KV_CACHE must be int8 or bf16" ;;
+  esac
   # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
   # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
   case "$(get DECODE_GRAPHS)" in
@@ -1453,7 +1458,7 @@ fi
 # resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
 # MTP share. Unset keeps the engine defaults.
 if [[ $family == qwen4 ]]; then
-  family_args+=(--kv-cache "$kv_format")
+  family_args+=(--kv-cache "$kv_cache")
   for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
     mode="$(get "QWEN_${key%%:*}")"
     case "$mode" in
@@ -2074,7 +2079,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--decode-rows 128)
   fi
   if [[ "$family" == qwen4 ]]; then
-    plan_draft_args+=(--kv-cache "$kv_format")
+    plan_draft_args+=(--kv-cache "$kv_cache")
     for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
       case "$(get "QWEN_${key%%:*}")" in
         on) plan_draft_args+=("${key#*:}" true) ;;
