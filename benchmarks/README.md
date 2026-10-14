@@ -93,6 +93,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-14 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× RTX PRO 6000 @ gpu-powerd 435/460 W (300–550) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg)
 - 2026-10-14 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 430/455 W (335–530) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550) · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ gpu-powerd 450/445 W (300–570) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min/report.svg)
