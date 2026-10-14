@@ -6,24 +6,13 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
+use cuteafd_loader::families::deepseek_v4::{DeepseekV4Config,
+    resident::{layer_sources, resident_operands, scale_extents, share, Prep, Share, WeightSplit}};
 use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis};
-
-enum Prep {
-    Raw,
-    /// Block-FP8 scales for a weight [groups*n, k].
-    Scale { n: usize, k: usize, groups: usize },
-}
-
-struct Source {
-    operand: &'static str,
-    tensors: &'static [&'static str],
-    prep: Prep,
-}
 
 pub(crate) struct LayerWeights<'a> {
     pub ratio: usize,
@@ -71,62 +60,6 @@ pub(crate) struct ModelWeights<'a> {
     pub norm: DeviceAllocation<'a>,
 }
 
-fn layer_sources(cfg: &DeepseekV4Config, ratio: usize) -> Vec<Source> {
-    let (h, q, heads, g, r) = (cfg.dim, cfg.q_lora_rank, cfg.n_heads, cfg.o_groups, cfg.o_lora_rank);
-    let w = heads * 512 / g;
-    let inter = cfg.moe_inter_dim;
-    let mut sources = vec![
-        Source { operand: "attn.fn", tensors: &["hc_attn_fn"], prep: Prep::Raw },
-        Source { operand: "attn.scale", tensors: &["hc_attn_scale"], prep: Prep::Raw },
-        Source { operand: "attn.base", tensors: &["hc_attn_base"], prep: Prep::Raw },
-        Source { operand: "attn.norm", tensors: &["attn_norm.weight"], prep: Prep::Raw },
-        Source { operand: "ffn.fn", tensors: &["hc_ffn_fn"], prep: Prep::Raw },
-        Source { operand: "ffn.scale", tensors: &["hc_ffn_scale"], prep: Prep::Raw },
-        Source { operand: "ffn.base", tensors: &["hc_ffn_base"], prep: Prep::Raw },
-        Source { operand: "ffn.norm", tensors: &["ffn_norm.weight"], prep: Prep::Raw },
-        Source { operand: "w_qkv", tensors: &["attn.wq_a.weight", "attn.wkv.weight"], prep: Prep::Raw },
-        Source { operand: "w_qkv_scale", tensors: &["attn.wq_a.scale", "attn.wkv.scale"],
-            prep: Prep::Scale { n: q + 512, k: h, groups: 1 } },
-        Source { operand: "w_q", tensors: &["attn.wq_b.weight"], prep: Prep::Raw },
-        Source { operand: "w_q_scale", tensors: &["attn.wq_b.scale"], prep: Prep::Scale { n: heads * 512, k: q, groups: 1 } },
-        Source { operand: "q_norm", tensors: &["attn.q_norm.weight"], prep: Prep::Raw },
-        Source { operand: "kv_norm", tensors: &["attn.kv_norm.weight"], prep: Prep::Raw },
-        Source { operand: "attn_sink", tensors: &["attn.attn_sink"], prep: Prep::Raw },
-        Source { operand: "wo_a", tensors: &["attn.wo_a.weight"], prep: Prep::Raw },
-        Source { operand: "wo_a_scale", tensors: &["attn.wo_a.scale"], prep: Prep::Scale { n: r, k: w, groups: g } },
-        Source { operand: "wo_b", tensors: &["attn.wo_b.weight"], prep: Prep::Raw },
-        Source { operand: "wo_b_scale", tensors: &["attn.wo_b.scale"], prep: Prep::Scale { n: h, k: g * r, groups: 1 } },
-        Source { operand: "w13", tensors: &["ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight"], prep: Prep::Raw },
-        Source { operand: "w13_scale", tensors: &["ffn.shared_experts.w1.scale", "ffn.shared_experts.w3.scale"],
-            prep: Prep::Scale { n: 2 * inter, k: h, groups: 1 } },
-        Source { operand: "w2", tensors: &["ffn.shared_experts.w2.weight"], prep: Prep::Raw },
-        Source { operand: "w2_scale", tensors: &["ffn.shared_experts.w2.scale"], prep: Prep::Scale { n: h, k: inter, groups: 1 } },
-        Source { operand: "gate", tensors: &["ffn.gate.weight"], prep: Prep::Raw },
-    ];
-    if ratio == 4 {
-        sources.extend([
-            Source { operand: "joint_projection", tensors: &["attn.compressor.wkv.weight", "attn.compressor.wgate.weight",
-                "attn.indexer.compressor.wkv.weight", "attn.indexer.compressor.wgate.weight"], prep: Prep::Raw },
-            Source { operand: "index_ape", tensors: &["attn.indexer.compressor.ape"], prep: Prep::Raw },
-            Source { operand: "index_norm", tensors: &["attn.indexer.compressor.norm.weight"], prep: Prep::Raw },
-            Source { operand: "index_w_q", tensors: &["attn.indexer.wq_b.weight"], prep: Prep::Raw },
-            Source { operand: "index_w_q_scale", tensors: &["attn.indexer.wq_b.scale"],
-                prep: Prep::Scale { n: cfg.index_n_heads * cfg.index_head_dim, k: q, groups: 1 } },
-            Source { operand: "index_w_proj", tensors: &["attn.indexer.weights_proj.weight"], prep: Prep::Raw },
-        ]);
-    } else if ratio == 128 {
-        sources.push(Source { operand: "joint_projection",
-            tensors: &["attn.compressor.wkv.weight", "attn.compressor.wgate.weight"], prep: Prep::Raw });
-    }
-    if ratio != 0 {
-        sources.extend([
-            Source { operand: "main_ape", tensors: &["attn.compressor.ape"], prep: Prep::Raw },
-            Source { operand: "main_norm", tensors: &["attn.compressor.norm.weight"], prep: Prep::Raw },
-        ]);
-    }
-    sources
-}
-
 pub(crate) struct WeightLoader<'a, 'p> {
     pub library: &'a NativeLibrary,
     pub catalog: &'a OfficialV41Catalog,
@@ -137,80 +70,6 @@ pub(crate) struct WeightLoader<'a, 'p> {
     pub device: i32,
     /// The other GPU of a head split (rank 1), if any.
     pub peers: Vec<crate::shared::peer_split::RankDevice>,
-}
-
-/// How a head split shares an operand's checkpoint tensors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Share {
-    /// Every rank holds the whole operand.
-    All,
-    /// Rows split evenly (per tensor, concatenated): heads, wo groups, shared-expert intermediate.
-    Rows,
-    /// Columns split evenly: wo_b over the groups, the shared expert's w2 over the intermediate.
-    Cols,
-}
-
-/// Attention and FFN ownership are independent for whole-attention layers.
-fn share(operand: &str, attention_split: bool, ffn_split: bool) -> Share {
-    match operand {
-        "w_q" | "w_q_scale" | "attn_sink" | "wo_a" | "wo_a_scale" if attention_split => Share::Rows,
-        "wo_b" | "wo_b_scale" if attention_split => Share::Cols,
-        "w13" | "w13_scale" if ffn_split => Share::Rows,
-        "w2" | "w2_scale" if ffn_split => Share::Cols,
-        _ => Share::All,
-    }
-}
-
-/// A mode's checkpoint layout, resolved before uploading any operands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WeightSplit {
-    attention: bool,
-    ffn: bool,
-    owner: Option<usize>,
-}
-
-impl WeightSplit {
-    fn for_mode(mode: cuteafd_loader::placement::LayerMode, ratio: usize, ranks: usize) -> Result<Self> {
-        use cuteafd_loader::placement::{FfnMode, LayerMode};
-        ensure!(ranks == 1 || ranks == 2, "V4 weights need one or two ranks");
-        Ok(match mode {
-            LayerMode::HeadSplit => {
-                ensure!(ranks == 2, "V4 head split needs two ranks");
-                Self { attention: true, ffn: true, owner: None }
-            }
-            LayerMode::ContextSplit => {
-                ensure!(ranks == 2 && ratio == 4, "V4 context weights need two ranks and C4");
-                Self { attention: true, ffn: true, owner: None }
-            }
-            LayerMode::Whole { gpu, ffn } => {
-                let owner = usize::from(gpu);
-                ensure!(owner < ranks && (ranks == 1 || ratio == 4), "V4 attention owner or ratio unsupported");
-                ensure!((ranks == 1 && ffn == FfnMode::Owner) || (ranks == 2 && ffn == FfnMode::Split),
-                    "V4 owned attention keeps the existing FFN placement");
-                Self { attention: false, ffn: ffn == FfnMode::Split, owner: Some(owner) }
-            }
-        })
-    }
-
-    fn operand(self, operand: &str, rank: usize) -> Option<Share> {
-        let ffn = operand.starts_with("ffn.") || operand.starts_with("gate")
-            || matches!(operand, "w13" | "w13_scale" | "w2" | "w2_scale");
-        if !ffn && self.owner.is_some_and(|owner| owner != rank) {
-            None
-        } else {
-            Some(share(operand, self.attention, self.ffn))
-        }
-    }
-}
-
-fn scale_extents(operand: &str, kind: Share, n: usize, k: usize, groups: usize, ranks: usize)
-    -> (usize, usize, usize) {
-    match (operand, kind) {
-        ("wo_a_scale", Share::Rows) => (n, k, groups / ranks),
-        (_, Share::Rows) => (n / ranks, k, groups),
-        (_, Share::Cols) => (n, k / ranks, groups),
-        _ => (n, k, groups),
-    }
 }
 
 impl<'a> WeightLoader<'a, '_> {
@@ -263,8 +122,7 @@ impl<'a> WeightLoader<'a, '_> {
         self.layer_mode(cfg, layer, mode)
     }
 
-    /// The caller must select modes before its baseline/admission sample.
-    /// Until the executor is bound, production calls [`Self::layer`] only.
+    /// Explicit frozen owner mode selected before uploading this layer.
     fn layer_mode(&self, cfg: &DeepseekV4Config, layer: usize,
         mode: cuteafd_loader::placement::LayerMode) -> Result<Vec<LayerWeights<'a>>> {
         let ratio = *cfg.compress_ratios.get(layer).context("V4 weight layer past config")?;
@@ -420,15 +278,37 @@ impl<'a> WeightLoader<'a, '_> {
     /// second value), the drafter and the head.
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &DeepseekV4Config, dspark: bool) -> Result<(ModelWeights<'a>, Vec<Vec<LayerWeights<'a>>>)> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        let modes = vec![if self.ranks() == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+            else { LayerMode::HeadSplit }; cfg.n_layers];
+        self.model_modes(cfg, dspark, &modes)
+    }
+
+    /// Load exactly the pre-admission modes; reject incomplete headers before
+    /// any weight upload and verify final per-operand sizes on every rank.
+    #[allow(clippy::type_complexity)]
+    pub fn model_modes(&self, cfg: &DeepseekV4Config, dspark: bool,
+        modes: &[cuteafd_loader::placement::LayerMode]) -> Result<(ModelWeights<'a>, Vec<Vec<LayerWeights<'a>>>)> {
+        let inventory = resident_operands(cfg, modes, self.ranks(), dspark,
+            self.catalog.tensors().iter().map(|t| &t.metadata))?;
         let mut shares: Vec<Vec<LayerWeights<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
-        for layer in 0..cfg.n_layers {
-            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
+        for (layer, &mode) in modes.iter().enumerate() {
+            for (rank, (share, part)) in shares.iter_mut().zip(self.layer_mode(cfg, layer, mode)?).enumerate() {
+                let expected = inventory.iter().filter(|i| i.layer == Some(layer) && i.rank == rank).collect::<Vec<_>>();
+                ensure!(part.operands.len() == expected.len(), "V4 layer {layer} rank {rank}: operand inventory differs");
+                for item in expected {
+                    let allocation = part.operands.get(item.operand.as_str())
+                        .with_context(|| format!("V4 layer {layer} rank {rank}: missing {}", item.operand))?;
+                    ensure!(allocation.buffer.bytes as u64 == item.bytes,
+                        "V4 layer {layer} rank {rank} {}: loaded bytes {}, header inventory {}",
+                        item.operand, allocation.buffer.bytes, item.bytes);
+                }
                 share.push(part);
             }
         }
         let mut shares = shares.into_iter();
         let layers = shares.next().context("rank 0")?;
-        Ok((ModelWeights {
+        let model = ModelWeights {
             layers,
             dspark: if dspark { self.dspark(cfg)? } else { None },
             head: self.tensor("head.weight")?,
@@ -436,7 +316,47 @@ impl<'a> WeightLoader<'a, '_> {
             head_scale: self.tensor("hc_head_scale")?,
             head_base: self.tensor("hc_head_base")?,
             norm: self.tensor("norm.weight")?,
-        }, shares.collect()))
+        };
+        if let Some(draft) = &model.dspark {
+            for (stage, weights) in draft.stages.iter().enumerate() {
+                let expected = inventory.iter().filter(|item| item.draft_stage == Some(stage)).count();
+                ensure!(weights.operands.len() == expected,
+                    "V4 dSpark stage {stage}: operand inventory differs");
+            }
+        }
+        for item in inventory.iter().filter(|item| item.layer.is_none() && item.group != "embedding") {
+            let allocation = if let Some(stage) = item.draft_stage {
+                let weights = &model.dspark.as_ref().context("V4 inventory expects dSpark")?.stages[stage];
+                weights.operands.get(item.operand.as_str()).context("V4 dSpark operand absent")?
+            } else {
+                match item.operand.as_str() {
+                    "head.weight" => &model.head,
+                    "hc_head_fn" => &model.head_fn,
+                    "hc_head_scale" => &model.head_scale,
+                    "hc_head_base" => &model.head_base,
+                    "norm.weight" => &model.norm,
+                    name => {
+                        let draft = model.dspark.as_ref().context("V4 inventory expects dSpark head")?;
+                        match name {
+                            "mtp.0.main_proj.weight" => &draft.main_proj,
+                            "mtp.0.main_proj.scale" => &draft.main_proj_scale,
+                            "mtp.0.main_norm.weight" => &draft.main_norm,
+                            "mtp.2.hc_head_fn" => &draft.head_fn,
+                            "mtp.2.hc_head_scale" => &draft.head_scale,
+                            "mtp.2.hc_head_base" => &draft.head_base,
+                            "mtp.2.norm.weight" => &draft.norm,
+                            "mtp.2.markov_head.markov_w1.weight" => &draft.markov_w1,
+                            "mtp.2.markov_head.markov_w2.weight" => &draft.markov_w2,
+                            _ => anyhow::bail!("unknown V4 root operand {name}"),
+                        }
+                    }
+                }
+            };
+            ensure!(allocation.buffer.bytes as u64 == item.bytes,
+                "V4 root/dSpark {:?} {}: loaded bytes {}, header inventory {}",
+                item.draft_stage, item.operand, allocation.buffer.bytes, item.bytes);
+        }
+        Ok((model, shares.collect()))
     }
 
 }

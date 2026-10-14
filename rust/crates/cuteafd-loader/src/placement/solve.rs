@@ -6,22 +6,8 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
-    request.executor.check_attention(request.attention_placement, request.inventory.gpus.len(), request.inventory.peer_access)?;
-    if request.attention_placement.is_none() {
-        let mut kinds = Vec::new();
-        for &(kind, _) in &request.policy.attention {
-            if kinds.contains(&kind) || !request.layers.iter().any(|layer| layer.kind == kind) {
-                return Err(PlacementError::Inventory("duplicate or absent attention policy kind"));
-            }
-            kinds.push(kind);
-        }
-        if request.inventory.gpus.len() == 2 && request.inventory.peer_access {
-            for &(_, mode) in &request.policy.attention {
-                request.executor.check_attention(Some(mode), 2, true)?;
-            }
-        }
-    }
-    let mut best = solve_once(request, &[]);
+    validate_attention(request)?;
+    let mut best = solve_once(request, &[], None);
     if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
         || best.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return best; }
     // Step 7: largest replicated-KV saving first. Only auto may flip; only
@@ -54,7 +40,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             flips = prior_flips.clone();
             flips.retain(|(k, _)| *k != kind);
             flips.push((kind, mode));
-            let trial = solve_once(request, &flips);
+            let trial = solve_once(request, &flips, None);
             if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return prune_flips(request, &flips); }
             if let Ok(p) = &trial {
                 if p.pool_tokens >= kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
@@ -73,13 +59,13 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
 
 fn prune_flips(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
     let mut flips = flips.to_vec();
-    let mut placement = solve_once(request, &flips)?;
+    let mut placement = solve_once(request, &flips, None)?;
     loop {
         let mut removed = false;
         for i in 0..flips.len() {
             let mut trial = flips.clone();
             trial.remove(i);
-            if let Ok(candidate) = solve_once(request, &trial) {
+            if let Ok(candidate) = solve_once(request, &trial, None) {
                 // Removing context can also recover an odd pool unit that its
                 // even-unit constraint rounded away.
                 if candidate.pool_tokens >= placement.pool_tokens {
@@ -94,7 +80,51 @@ fn prune_flips(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPl
     }
 }
 
-fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
+fn validate_attention(request: &PlacementRequest) -> Result<(), PlacementError> {
+    request.executor.check_attention(request.attention_placement, request.inventory.gpus.len(), request.inventory.peer_access)?;
+    if request.attention_placement.is_none() {
+        let mut kinds = Vec::new();
+        for &(kind, _) in &request.policy.attention {
+            if kinds.contains(&kind) || !request.layers.iter().any(|layer| layer.kind == kind) {
+                return Err(PlacementError::Inventory("duplicate or absent attention policy kind"));
+            }
+            kinds.push(kind);
+        }
+        if request.inventory.gpus.len() == 2 && request.inventory.peer_access {
+            for &(_, mode) in &request.policy.attention {
+                request.executor.check_attention(Some(mode), 2, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-admit loaded owner modes without running the owner chooser again.
+/// Shape, executable-mode and hop checks still run, as do all memory gates.
+pub fn solve_frozen(request: &PlacementRequest, placement: &Placement) -> Result<Placement, PlacementError> {
+    validate_attention(request)?;
+    let mut kinds = Vec::new();
+    for &(kind, mode) in &placement.attention_by_kind {
+        if kinds.contains(&kind) || !request.layers.iter().any(|layer| layer.kind == kind) {
+            return Err(PlacementError::Inventory("duplicate or absent frozen attention kind"));
+        }
+        kinds.push(kind);
+        if request.inventory.gpus.len() == 2 && request.inventory.peer_access {
+            request.executor.check_attention(Some(mode), 2, true)?;
+        }
+    }
+    let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
+    if modes.len() != request.layers.len() { return Err(PlacementError::Inventory("frozen modes per layer")); }
+    let checked = solve_once(request, &placement.attention_by_kind, Some(&modes))?;
+    if checked.attention_placement != placement.attention_placement
+        || checked.attention_by_kind != placement.attention_by_kind {
+        return Err(PlacementError::Inventory("frozen attention policy differs from request"));
+    }
+    Ok(checked)
+}
+
+fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)], frozen: Option<&[LayerMode]>)
+    -> Result<Placement, PlacementError> {
     use PlacementError::Overflow;
     let gpus = request.inventory.gpus.len();
     if !(1..=2).contains(&gpus) { return Err(PlacementError::Inventory("one or two coordinator GPUs")); }
@@ -123,8 +153,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     let executor = &request.executor;
     let layer_selected = |layer: &LayerDemand| selected_attention(request, flips, layer.kind) == AttentionPlacement::Layers
         && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
-    let owners = layer_owners(request, &layer_selected)?;
+    let owners = if let Some(modes) = frozen {
+        modes.iter().map(|mode| match mode { LayerMode::Whole { gpu, .. } => *gpu, _ => 0 }).collect()
+    } else { layer_owners(request, &layer_selected)? };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
+        if let Some(modes) = frozen {
+            let mode = modes[index];
+            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
+                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
+            }
+        }
         let selected = Some(selected_attention(request, flips, layer.kind));
         let desired = match selected {
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
@@ -142,12 +180,19 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
                 return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
             }
+            if frozen.is_some_and(|modes| modes[index] != mode) {
+                return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
+            }
             return Ok(mode);
         }
         let wanted = request.policy.preference(layer.kind);
-        wanted.iter().copied().chain(layer.modes.iter().copied())
+        let preferred = wanted.iter().copied().chain(layer.modes.iter().copied())
             .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
-            .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })
+            .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })?;
+        if frozen.is_some_and(|modes| modes[index] != preferred) {
+            return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
+        }
+        Ok(preferred)
     }).collect::<Result<Vec<_>, _>>()?;
     for (index, (layer, &mode)) in request.layers.iter().zip(&modes).enumerate() {
         if !matches!(mode, LayerMode::Whole { .. }) {
@@ -285,7 +330,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 trial.onboard = Onboard::Layers(n);
                 trial.pool.requested = None;
                 trial.pool.floor = floor;
-                solve_once(&trial, flips).is_ok()
+                solve_once(&trial, flips, frozen).is_ok()
             };
             let (mut lo, mut hi) = (0usize, routed);
             if !fits(0) {
@@ -296,7 +341,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     let mut trial = request.clone();
                     trial.onboard = Onboard::Layers(0);
                     trial.pool.floor = pool_floor;
-                    solve_once(&trial, flips).is_ok()
+                    solve_once(&trial, flips, frozen).is_ok()
                 };
                 if !fallback { return Err(match request.pool.requested {
                     Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
@@ -306,7 +351,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 let mut trial = request.clone();
                 trial.onboard = Onboard::Layers(0);
                 trial.pool.floor = pool_floor;
-                return solve_once(&trial, flips);
+                return solve_once(&trial, flips, frozen);
             }
             while lo < hi {
                 let mid = (lo + hi + 1) / 2;

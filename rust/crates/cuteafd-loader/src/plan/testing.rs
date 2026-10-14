@@ -436,9 +436,32 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
         "o_groups": 8, "o_lora_rank": 1024, "window_size": 128, "original_seq_len": 65536, "rope_theta": 10000,
         "rope_factor": 16, "beta_fast": 32, "beta_slow": 1, "index_n_heads": 64, "index_head_dim": 128,
         "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
-        "compress_ratios": ratios[1..].to_vec()
+        "compress_ratios": ratios[1..].to_vec(), "dspark_block_size": if stages > 0 { 5 } else { 0 },
+        "dspark_target_layer_ids": [1, 2, 3], "dspark_markov_rank": 256
     });
-    let mut tensors = vec![t("embed.weight", "BF16", &[64, 4096])];
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::from_model_args(&args, stages).unwrap();
+    let mut tensors = vec![t("embed.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
+        t("head.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
+        t("hc_head_fn", "F32", &[4, 4 * cfg.dim]), t("hc_head_scale", "F32", &[1]),
+        t("hc_head_base", "F32", &[4]), t("norm.weight", "BF16", &[cfg.dim])];
+    for layer in 0..cfg.n_layers {
+        tensors.extend(v4_block(&cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer], cfg.is_hash_layer(layer)));
+    }
+    for stage in 0..stages { tensors.extend(v4_block(&cfg, &format!("mtp.{stage}"), 0, false)); }
+    if stages > 0 {
+        let last = stages - 1;
+        tensors.extend([
+            t("mtp.0.main_proj.weight", "F8_E4M3", &[cfg.dim, 3 * cfg.dim]),
+            t("mtp.0.main_proj.scale", "F8_E8M0", &[cfg.dim / 128, 3 * cfg.dim / 128]),
+            t("mtp.0.main_norm.weight", "BF16", &[cfg.dim]),
+            t(format!("mtp.{last}.hc_head_fn"), "F32", &[4, 4 * cfg.dim]),
+            t(format!("mtp.{last}.hc_head_scale"), "F32", &[1]),
+            t(format!("mtp.{last}.hc_head_base"), "F32", &[4]),
+            t(format!("mtp.{last}.norm.weight"), "BF16", &[cfg.dim]),
+            t(format!("mtp.{last}.markov_head.markov_w1.weight"), "BF16", &[cfg.vocab_size, 256]),
+            t(format!("mtp.{last}.markov_head.markov_w2.weight"), "BF16", &[cfg.vocab_size, 256]),
+        ]);
+    }
     for layer in 0..4 {
         for expert in 0..256 {
             for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
@@ -460,4 +483,51 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
     write_snapshot(path, &hf, &tensors, None);
     std::fs::create_dir_all(path.join("inference")).unwrap();
     std::fs::write(path.join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+}
+
+/// Complete native coordinator operands; routed experts are added separately.
+fn v4_block(cfg: &crate::families::deepseek_v4::DeepseekV4Config, prefix: &str, ratio: usize, hash: bool)
+    -> Vec<Tensor> {
+    let (h, q, heads, groups, rank, inter) =
+        (cfg.dim, cfg.q_lora_rank, cfg.n_heads, cfg.o_groups, cfg.o_lora_rank, cfg.moe_inter_dim);
+    let mut out = Vec::new();
+    for site in ["attn", "ffn"] {
+        out.extend([t(format!("{prefix}.hc_{site}_fn"), "F32", &[24, 4 * h]),
+            t(format!("{prefix}.hc_{site}_scale"), "F32", &[3]),
+            t(format!("{prefix}.hc_{site}_base"), "F32", &[24]),
+            t(format!("{prefix}.{site}_norm.weight"), "BF16", &[h])]);
+    }
+    for (name, n, k) in [("attn.wq_a", q, h), ("attn.wkv", 512, h), ("attn.wq_b", heads * 512, q),
+        ("attn.wo_a", groups * rank, heads * 512 / groups), ("attn.wo_b", h, groups * rank),
+        ("ffn.shared_experts.w1", inter, h), ("ffn.shared_experts.w3", inter, h),
+        ("ffn.shared_experts.w2", h, inter)] {
+        out.extend([t(format!("{prefix}.{name}.weight"), "F8_E4M3", &[n, k]),
+            t(format!("{prefix}.{name}.scale"), "F8_E8M0", &[n / 128, k / 128])]);
+    }
+    out.extend([t(format!("{prefix}.attn.q_norm.weight"), "BF16", &[q]),
+        t(format!("{prefix}.attn.kv_norm.weight"), "BF16", &[512]),
+        t(format!("{prefix}.attn.attn_sink"), "F32", &[heads]),
+        t(format!("{prefix}.ffn.gate.weight"), "BF16", &[cfg.n_routed_experts, h])]);
+    out.push(if hash { t(format!("{prefix}.ffn.gate.tid2eid"), "I64", &[cfg.vocab_size, cfg.n_activated_experts]) }
+        else { t(format!("{prefix}.ffn.gate.bias"), "F32", &[cfg.n_routed_experts]) });
+    if ratio > 0 {
+        let width = if ratio == 4 { 1024 } else { 512 };
+        for projection in ["wkv", "wgate"] {
+            out.push(t(format!("{prefix}.attn.compressor.{projection}.weight"), "BF16", &[width, h]));
+        }
+        out.extend([t(format!("{prefix}.attn.compressor.ape"), "F32", &[ratio, width]),
+            t(format!("{prefix}.attn.compressor.norm.weight"), "BF16", &[512])]);
+    }
+    if ratio == 4 {
+        for projection in ["wkv", "wgate"] {
+            out.push(t(format!("{prefix}.attn.indexer.compressor.{projection}.weight"), "BF16", &[256, h]));
+        }
+        let n = cfg.index_n_heads * cfg.index_head_dim;
+        out.extend([t(format!("{prefix}.attn.indexer.compressor.ape"), "F32", &[4, 256]),
+            t(format!("{prefix}.attn.indexer.compressor.norm.weight"), "BF16", &[cfg.index_head_dim]),
+            t(format!("{prefix}.attn.indexer.wq_b.weight"), "F8_E4M3", &[n, q]),
+            t(format!("{prefix}.attn.indexer.wq_b.scale"), "F8_E8M0", &[n / 128, q / 128]),
+            t(format!("{prefix}.attn.indexer.weights_proj.weight"), "BF16", &[cfg.index_n_heads, h])]);
+    }
+    out
 }

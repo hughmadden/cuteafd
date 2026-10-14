@@ -38,6 +38,8 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
     pub cfg: &'a DeepseekV4Config,
+    /// Header-derived uploads; no attention weights hidden in the baseline.
+    pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
     pub cache_stages: usize,
     /// Per-GPU total bytes and baseline; one or two entries. The V4 reserve
@@ -234,7 +236,11 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
 /// GPU0's arena. The pool unit sums each layer's records plus the overhead.
 pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError> {
     let gpus = inputs.gpus.len();
-    let (fixed, pool_overhead, reserves) = fixed_demands(inputs)?;
+    let (mut fixed, pool_overhead, reserves) = fixed_demands(inputs)?;
+    if inputs.weights.c4_attention.len() != inputs.cfg.n_layers {
+        return Err(PlacementError::Inventory("V4 attention weight inventory per layer"));
+    }
+    fixed.extend(inputs.weights.fixed.iter().cloned());
     let budgets = inputs.gpus.iter().zip(&reserves).map(|(&(capacity_bytes, baseline), &headroom_bytes)|
         GpuBudget { capacity_bytes, headroom_bytes, baseline }).collect::<Vec<_>>();
     let first = inputs.first_routed;
@@ -247,8 +253,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             tp2: gpus == 2 && inputs.experts_half.get(layer - first).is_some(), spark_ok: true });
         LayerDemand {
             kind: AttentionClass::Csa,
-            // Coordinator weights load before admission (inside the baseline).
-            weights: ModeBytes::default(),
+            weights: inputs.weights.c4_attention[layer],
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
             colocate: None, fixed_bytes: ModeBytes::default(), extra: Vec::new(),

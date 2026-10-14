@@ -336,23 +336,12 @@ pub(crate) fn with_engine<T>(
             || loaded.library.cuda_stream_create())?)),
         None => None,
     };
-    let started = Instant::now();
-    let loader = weights::WeightLoader {
-        library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
-        device: args.device,
-        peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-            .collect(),
-    };
-    let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
-        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&loaded.cfg, args.dspark) })?;
-    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
-    // One shared admission solve (`cuteafd_loader::placement`), the same
-    // request `cuteafd plan --layout` resolves, over one measured sample per
-    // GPU taken after weights and modules and before any cache or expert.
+    // Select and freeze owners before the first weight upload. Header-derived
+    // uploads are explicit demands, so the owner chooser sees their true costs.
     let placement = {
         use cuteafd_loader::placement::Baseline;
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
@@ -360,15 +349,20 @@ pub(crate) fn with_engine<T>(
         // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
         // functions, cuBLAS: `placement::inventory::LOADED_CODE`), which the planner charges in its
         // baseline.
+        let embedding_bytes = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
+            loaded.catalog.tensor("embed.weight")?.metadata.byte_length
+        } else { 0 };
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
                 loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
+                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending)
+                    .saturating_sub(if rank == 0 { embedding_bytes } else { 0 }) }))
             })
         }).collect::<Result<Vec<_>>>()?;
-        let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
+        let cache_stages = if args.dspark && loaded.cfg.dspark_block_size > 0
+            && loaded.catalog.tensor("mtp.0.main_proj.weight").is_ok() { 3 } else { 0 };
         let onboard = args.onboard()?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let max_rows = prefill_rows.max(decode_rows);
@@ -400,14 +394,49 @@ pub(crate) fn with_engine<T>(
         } else { None };
         let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
-            family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
+            family: loaded.family, gpus, loaded_modes: None, cache_stages,
+            prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32 };
-        inventory.record(loaded.family, &inputs.gpus.iter().map(|(_, b)| match b {
-            Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
+        let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
+        let started = Instant::now();
+        let loader = weights::WeightLoader {
+            library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
+            device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect(),
+        };
+        let (embedding, (model, shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+            embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) })?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
+
+        // Measured cross-check uses the same frozen owner map and explicitly
+        // admits the selected pool/expert count. Allocation slack may not
+        // silently relocate a loaded layer or shrink the promised pool.
+        let measured_gpus = devices.iter().enumerate().map(|(rank, &device)| {
+            let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+            crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
+                let (free, total) = loaded.library.cuda_memory_info()?;
+                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        inventory.record(loaded.family, &measured_gpus.iter().map(|(_, b)| match b {
+            Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
+        let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
+        let mut measured_request = admission::request(args, &measured_inputs)?;
+        measured_request.pool.requested = Some(placement.pool_tokens);
+        measured_request.pool.floor = placement.pool_tokens;
+        measured_request.onboard = cuteafd_loader::placement::Onboard::Layers(placement.onboard_layers);
+        let checked = cuteafd_loader::placement::solve_frozen(&measured_request, &placement)
+            .map_err(|error| anyhow::anyhow!("DeepSeek V4 measured frozen admission: {error}"))?;
+        ensure!(checked.layers == placement.layers && checked.pool_tokens == placement.pool_tokens
+            && checked.movables == placement.movables && checked.tp2 == placement.tp2
+            && checked.expert_ranges == placement.expert_ranges,
+            "DeepSeek V4 measured admission disagrees with frozen pre-load placement");
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
@@ -416,8 +445,9 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
-        placement
+        (placement, embedding, model, shares)
     };
+    let (placement, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)

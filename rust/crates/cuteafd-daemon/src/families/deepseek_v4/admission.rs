@@ -3,7 +3,7 @@
 //! half (samples, native workspace) is the caller's, so the equality test
 //! drives this exact path with fake samples.
 use super::EngineArgs;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use cuteafd_loader::placement::{families::deepseek_v4 as v4, Baseline, Onboard, PlacementRequest};
 
@@ -15,6 +15,9 @@ pub(crate) struct Inputs<'a> {
     pub family: &'a str,
     /// (total bytes, baseline) per GPU: `--device` then `--split-device`.
     pub gpus: Vec<(u64, Baseline)>,
+    /// None before uploads; exact frozen modes after uploads. Rebase measured
+    /// free bytes by their non-embedding weights, which remain explicit demands.
+    pub loaded_modes: Option<&'a [cuteafd_loader::placement::LayerMode]>,
     /// dSpark stages the loaded drafter owns caches for.
     pub cache_stages: usize,
     pub prefill_rows: usize,
@@ -31,6 +34,22 @@ pub(crate) struct Inputs<'a> {
 
 pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
     let gpus = inputs.gpus.len();
+    let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
+        inputs.cfg, gpus, args.dspark, inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
+    let mut baselines = inputs.gpus.clone();
+    if let Some(modes) = inputs.loaded_modes {
+        let loaded = weights.loaded_bytes(modes, gpus)?;
+        for ((total, baseline), bytes) in baselines.iter_mut().zip(loaded) {
+            *baseline = match *baseline {
+                Baseline::Measured { free_bytes } => {
+                    let free_bytes = free_bytes.checked_add(bytes).context("V4 measured weight rebase overflow")?;
+                    ensure!(free_bytes <= *total, "V4 measured sample and resident weights exceed total memory");
+                    Baseline::Measured { free_bytes }
+                }
+                Baseline::Planned { .. } => anyhow::bail!("V4 loaded modes require a measured sample"),
+            };
+        }
+    }
     // The loader's legacy config requests one nextn stage, but a dSpark
     // checkpoint loads all three concrete stages. Describe those actual
     // cache owners rather than the caller's nextn configuration.
@@ -74,8 +93,8 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         }
     } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
-    let request = v4::request(&v4::V4Inputs { cfg: &cache_cfg, cache_stages: inputs.cache_stages,
-        gpus: inputs.gpus.clone(), headroom_floor: 0, spark_ranks,
+    let request = v4::request(&v4::V4Inputs { cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
+        gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
