@@ -2211,10 +2211,10 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_concurrency_default_is_small_card_only_and_overridable() {
+fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    for (gib, expected) in [(32, 16), (96, 8)] {
+    for (gib, expected) in [(32, 8), (96, 16)] {
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -2232,6 +2232,31 @@ fn mimo_concurrency_default_is_small_card_only_and_overridable() {
         options.layout.as_mut().unwrap().mimo_rings = 32;
         let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert!(state(&more_rings) > state(&automatic));
+    }
+}
+
+#[test]
+fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
+    let flash = glm5_flash_config(2);
+    let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[]),
+        snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None))),
+        snapshot(flash.clone(), &glm5_flash_tensors(&flash)),
+        snapshot(mimo_flash_config(), &mimo_flash_tensors()),
+        snapshot(mimo_pro_config(), &mimo_pro_tensors())];
+    for dir in snapshots {
+        for bytes in [32u64 << 30, (32u64 << 30) + 1, 96u64 << 30] {
+            let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![bytes], workspace_manifest: Some(dir.path().join("absent.json")),
+                glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
+            }), ..sparks(4) };
+            let automatic = plan(dir.path(), &options).unwrap();
+            options.layout.as_mut().unwrap().concurrency =
+                cuteafd_core::serving_capacity::default_concurrency(bytes);
+            let explicit = plan(dir.path(), &options).unwrap();
+            assert_eq!(automatic.memory_layout, explicit.memory_layout, "family {:?}, {bytes}", automatic.family);
+            assert_eq!(automatic.placement_supported, explicit.placement_supported);
+            assert_eq!(automatic.config_error, explicit.config_error);
+        }
     }
 }
 

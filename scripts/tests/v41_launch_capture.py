@@ -252,6 +252,8 @@ def capture(launcher_root: Path, case: str) -> dict:
         (repo / "rust/crates/cuteafd-core/src").mkdir(parents=True)
         shutil.copy(launcher_root / "rust/crates/cuteafd-core/src/coordinator_programs.rs",
                     repo / "rust/crates/cuteafd-core/src/coordinator_programs.rs")
+        shutil.copy(launcher_root / "rust/crates/cuteafd-core/src/serving_capacity.rs",
+                    repo / "rust/crates/cuteafd-core/src/serving_capacity.rs")
         (repo / "third_party/sparkinfer").mkdir(parents=True)
         lock = json.loads((launcher_root / "third_party/sparkinfer.lock.json").read_text())
         (repo / "third_party/sparkinfer.lock.json").write_text(json.dumps(lock))

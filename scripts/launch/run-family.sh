@@ -402,7 +402,7 @@ case "${V41_FP8_HEAD:-}" in
 esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] || release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
-[[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
 [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
 [[ "$MAX_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_OUTPUT_TOKENS <= 393216)) || release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
@@ -431,7 +431,9 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
 profile_mib="$(nvidia-smi --id="$RELEASE_COORDINATOR_GPU_UUID" --query-gpu=memory.total --format=csv,noheader,nounits)"
-profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$COORDINATOR_GPU_BUDGET_GIB")"
+profile="$(release_coordinator_profile "$profile_mib" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
+read -r profile_gib default_concurrency <<<"$profile"
+((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY="$default_concurrency"
 if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
   if [[ -z "${cfg_overrides[EMBEDDING]:-}" ]] && ! grep -Eq '^[[:space:]]*EMBEDDING[[:space:]]*=[[:space:]]*[^#[:space:]]' "$config"; then
     EMBEDDING=host
@@ -1321,13 +1323,13 @@ esac
 draft_args=()
 embedding="$(get EMBEDDING gpu)"
 default_context=0
-default_concurrency=8
+profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
+profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
+profile="$(release_coordinator_profile "$profile_mib" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
+read -r profile_gib default_concurrency <<<"$profile"
+effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
 if [[ "$family" == mimo_v2 ]]; then
-  profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
-  profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
-  profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$coordinator_budget")"
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
-    default_concurrency=16
     [[ -n "${cfg[EMBEDDING]:-}" ]] || embedding=host
     echo "MiMo 32 GB profile: logical GPU ${profile_gib} GiB, embedding=$embedding (EMBEDDING overrides), int8 KV, checkpoint-full context unless MAX_CONTEXT_TOKENS overrides" >&2
   fi
@@ -2052,10 +2054,9 @@ audio_encoder_hash=""
     fi
     plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
   fi
-  plan_draft_args=()
+  plan_draft_args=(--concurrency "$effective_concurrency")
   if [[ "$family" == mimo_v2 ]]; then
-    plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
-      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
+    plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --prefill-rows 4096 --expert-input "${expert_input:-fp8}")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
@@ -2073,10 +2074,10 @@ audio_encoder_hash=""
   # is 8, --max-sequences) slots, and its prefix mark arena counts min(--max-sequences,
   # DECODE_ROWS = 64) lanes, so both go to the plan as such beside the sequences.
   if [[ "$family" == glm5_flash ]]; then
-    glmf_sequences="$(get CONCURRENCY)"
+    glmf_sequences="$effective_concurrency"
     if [[ -n "$glmf_sequences" ]]; then
       [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive sequence count" >&2; exit 2; }
-      plan_draft_args+=(--concurrency "$glmf_sequences" --state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
+      plan_draft_args+=(--state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
         --mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))")
     fi
     [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
@@ -2429,7 +2430,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
-  --max-sequences "$(get CONCURRENCY "$default_concurrency")" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
+  --max-sequences "$effective_concurrency" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"

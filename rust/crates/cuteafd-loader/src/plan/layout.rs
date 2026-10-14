@@ -563,8 +563,8 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
     let concurrency = if options.concurrency > 0 { options.concurrency }
-        else if family == "deepseek_v41" || (family == "mimo_v2" && small_card) { 16 }
-        else { 8 };
+        else { cuteafd_core::serving_capacity::default_concurrency(
+            options.rtx_bytes.first().copied().unwrap_or(0)) };
     let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     if family == "glm5_flash" {
