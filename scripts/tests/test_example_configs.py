@@ -204,10 +204,13 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[f"SPARK_{rank}_HOST"] == host
             assert values[f"SPARK_{rank}_LANE_A"].startswith("10.55.0.")
         if entry["family"] == "qwen4" or entry["name"] in {
-            "glm53f-exl3-max", "glm53f-nvfp4-max", "glm53f-tr3-max"
+            "glm53f-exl3-max"
         }:
             assert not entry["sparks"]
             assert values["EXPERT_BACKEND"] == "local"
+        if entry["name"] in {"glm53f-nvfp4-max", "glm53f-tr3-max"}:
+            assert entry["sparks"] == ["ostrich", "dodo"]
+            assert values["EXPERT_BACKEND"] == "spark"
         for key in ("ADDR", "EXPERT_PORT"):
             assert values[key] not in ports
             ports.add(values[key])
