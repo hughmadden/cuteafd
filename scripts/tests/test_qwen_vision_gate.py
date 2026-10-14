@@ -35,9 +35,12 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
         assert scalar_rule(n, 2560) == rust("QWEN_MEDIUM_SKINNY_ROWS")
     for n in (320, 324):
         assert scalar_rule(n, 10240) == rust("QWEN_SMALL_SKINNY_ROWS")
-    glm = (fork / "integration/cuteafd/_glm_kernels.py").read_text()
-    assert int(re.search(r"WIDE_SKINNY_MAX_ROWS = (\d+)", glm).group(1)) == rust("GLM_BF16_SKINNY_ROWS")
-    assert "max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None" in glm
+    glm = ast.parse((fork / "integration/cuteafd/_glm_kernels.py").read_text())
+    canonical = next(n for n in glm.body if isinstance(n, ast.FunctionDef) and n.name == "glm_projection")
+    route = next(n.value for n in canonical.body if isinstance(n, ast.Return))
+    assert isinstance(route, ast.Call) and route.func.id == "RoutedBf16Projection"
+    cutoff = next(keyword.value for keyword in route.keywords if keyword.arg == "max_skinny_rows")
+    assert ast.literal_eval(cutoff) == rust("GLM_BF16_SKINNY_ROWS") == 0
     fp8 = (fork / "integration/cuteafd/_fp8_weights.py").read_text()
     assert int(re.search(r"FP8_GEMV_ROWS = (\d+)", fp8).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
     assert "self.inner = glm_projection(n, k)" in fp8
