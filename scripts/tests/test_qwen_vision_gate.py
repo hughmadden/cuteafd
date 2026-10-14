@@ -180,7 +180,7 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert "probe.spec.cold_steps.get(p.chunks)" in serve
     assert "let logits = if decode {\n                        engine.verify_device_ungraphed" in serve
     assert "} else { engine.prefill_device(&mut p.placement, chunk, None, None, 1)? };" in serve
-    assert 'matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4")' in api
+    assert 'matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4" | "deepseek_v41")' in api
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
 
 
