@@ -191,7 +191,7 @@ def overrides_from(items):
     return overrides
 
 
-def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False):
+def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'))
     values = config(entry['config'])
@@ -264,6 +264,18 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                 close=dict(argv=exec_nsys + ['stop', '--session=' + NSYS_SESSION], timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
+    if exact_state:
+        # A family's exact prefix-state golden, run against the live server while
+        # smoke holds the card's locks (CUTEAFD_SMOKE_URL); output in the job dir.
+        if entry.get('window'):
+            raise ValueError(card + ': --exact-state uses the measurement window; drop PROFILE=nsys')
+        if not (entry.get('levels') or entry.get('prefill_lengths')):
+            raise ValueError(card + ': --exact-state runs at the end of the sweep; pass --levels')
+        # Smoke exports the live server's address as CUTEAFD_SMOKE_URL to every hook.
+        argv = [*exact_state, '--output', str(dest / 'exact-state')]
+        entry['window'] = dict(open=dict(argv=['true'], timeout_s=10, required=True),
+                               close=dict(argv=['sh', '-c', 'exec "$@" --resume-url "$CUTEAFD_SMOKE_URL"', 'exact-state', *argv],
+                                          timeout_s=3600, required=True))
     if trace:
         if values.get('SPECULATION_TRACE'):
             raise ValueError(card + ': --trace owns SPECULATION_TRACE; drop the explicit setting')
@@ -1514,6 +1526,8 @@ def main():
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
                         'checked after warm-up and recorded in result.json')
+    parser.add_argument('--exact-state', metavar='ARGV', help='run this exact prefix-state golden (shell-split argv; gets '
+                        '--resume-url URL --output JOB/exact-state) against the live server at the end of the sweep; needs --levels')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
                         'ones; a rerun job keeps its earlier attempt under attempt-N/')
     parser.add_argument('--preflight-only', action='store_true', help='run every CPU check (slots, packages, audio, containers, '
@@ -1703,7 +1717,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat, args.trace) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])

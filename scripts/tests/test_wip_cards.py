@@ -1433,3 +1433,19 @@ def test_context_load_reuse_failure_fails_card(entry, tmp_path):
         {'id': 'context_load', 'passes': [{'points': [{'context': 32768, 'c': 1, 'status': 'failed'}]}]}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'failed' and 'prefix-reuse failure' in row['error']
+
+
+def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp_path):
+    golden = ['/opt/x/cuteafd', 'v41-golden', '--golden', '/g']
+    with pytest.raises(ValueError, match='--exact-state runs at the end of the sweep'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       exact_state=golden)
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                         {}, set(), None, 1, exact_state=golden)
+    close = job['entry']['window']['close']
+    assert close['required'] and close['argv'][:2] == ['sh', '-c']
+    assert '--resume-url "$CUTEAFD_SMOKE_URL"' in close['argv'][2]
+    assert close['argv'][4:8] == golden and close['argv'][-1] == str(Path(job['state']) / 'exact-state')
+    with pytest.raises(ValueError, match='--exact-state uses the measurement window'):
+        cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
+                       {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
