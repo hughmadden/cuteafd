@@ -332,8 +332,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                         if value:
                             parent = str(Path(value).parent)
                             self.assertTrue(Path(parent).is_dir())
-                            expected += ['-v', f'{parent}:{parent}', '-e', f'CUTEAFD_SPECULATION_TRACE={value}',
-                                         '-e', f'CUTEAFD_GLM_TRACE={value}', '-e', f'CUTEAFD_QWEN4_TRACE={value}']
+                            expected += ['-v', f'{parent}:{parent}', '-e', f'CUTEAFD_SPECULATION_TRACE={value}']
                         expected += ['after']
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 

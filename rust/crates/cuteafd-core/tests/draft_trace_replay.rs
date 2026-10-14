@@ -1,4 +1,4 @@
-//! Offline replay of a recorded draft-round trace (`CUTEAFD_DRAFT_CONFIDENCE_TRACE`
+//! Offline replay of a recorded draft-round trace (`CUTEAFD_SPECULATION_TRACE`
 //! / `SPECULATION_TRACE` `draft_round` records) through the shared policy.
 //!
 //! Every recorded round is observed in order, so fits, calibration and route

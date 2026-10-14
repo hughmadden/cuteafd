@@ -14,9 +14,9 @@ type FileId = (u64, u64);
 type Writers = HashMap<FileId, Weak<Mutex<File>>>;
 
 impl Trace {
-    pub(crate) fn open(legacy: &'static str) -> Result<Option<Self>> {
-        crate::shared::draft_policy::speculation_trace_path(legacy)
-            .map(|(var, path)| Self::open_path(Path::new(&path)).with_context(|| format!("{var} {path}")))
+    pub(crate) fn open() -> Result<Option<Self>> {
+        std::env::var("CUTEAFD_SPECULATION_TRACE").ok().filter(|path| !path.is_empty())
+            .map(|path| Self::open_path(Path::new(&path)).with_context(|| format!("CUTEAFD_SPECULATION_TRACE {path}")))
             .transpose()
     }
 

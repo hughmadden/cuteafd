@@ -1270,7 +1270,6 @@ def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path
 @pytest.mark.parametrize("keys,expected,absent", [
     ("", (), ("CUTEAFD_GLMF_ROUTE_RING_CHECK", "CUTEAFD_GLMF_DRAFT_POLICY")),
     ("GLM5_FLASH_ROUTE_RING_CHECK=on\n", ("CUTEAFD_GLMF_ROUTE_RING_CHECK=1",), ("CUTEAFD_GLMF_DRAFT_POLICY",)),
-    ("GLM5_FLASH_DRAFT_TRACE=on\n", ("CUTEAFD_GLMF_DRAFT_TRACE=1",), ("CUTEAFD_GLMF_DRAFT_POLICY",)),
 ])
 def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, absent):
     """The shared draft policy has no switch; the route ring check is diagnostic."""
@@ -1287,7 +1286,7 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_DRAFT_POLICY=shared\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
-    ("GLM5_FLASH_DRAFT_TRACE=yes\n", "GLM5_FLASH_DRAFT_TRACE must be"),
+    ("GLM5_FLASH_DRAFT_TRACE=yes\n", "unknown configuration key: GLM5_FLASH_DRAFT_TRACE"),
     ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):

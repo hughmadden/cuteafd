@@ -133,8 +133,6 @@ fi
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
 # (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
-# COORDINATOR_TRACE is its pre-rename key; images older than the rename read
-# the family variables, which are set too for one release.
 shared_trace_args() {
 trace_args=()
 # Optional diagnostic length rule; production selection uses resource prices.
@@ -143,13 +141,12 @@ case "$(get DRAFT_SURVIVAL_LENGTHS off)" in
   off) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0) ;;
   *) echo "DRAFT_SURVIVAL_LENGTHS must be on or off" >&2; exit 2 ;;
 esac
-trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
+trace="$(get SPECULATION_TRACE)"
 if [[ -n "$trace" ]]; then
   [[ "$trace" == /* ]] || { echo 'SPECULATION_TRACE must be an absolute path' >&2; exit 2; }
   mkdir -p "$(dirname "$trace")"
   release_require_writable_state --file "$trace"
-  trace_args+=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
-    -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
+  trace_args+=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace")
 fi
 # TARGET_HEAD: every family's BF16 target vocabulary head (rust shared::target_head). Unset or
 # tensor (default) runs BF16 tensor cores with FP32 accumulation at every row count; exact is a
@@ -1928,11 +1925,6 @@ if [[ $family == glm5_flash ]]; then
     off) ;;
     on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
     *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
-  esac
-  case "$(get GLM5_FLASH_DRAFT_TRACE off)" in
-    off) ;;
-    on) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_TRACE=1") ;;
-    *) echo "GLM5_FLASH_DRAFT_TRACE must be on or off" >&2; exit 2 ;;
   esac
   remote_drafter="$(get GLM5_FLASH_REMOTE_DRAFTER)"
   case "$remote_drafter" in

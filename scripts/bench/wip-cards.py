@@ -265,7 +265,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
     if trace:
-        if values.get('SPECULATION_TRACE') or values.get('COORDINATOR_TRACE'):
+        if values.get('SPECULATION_TRACE'):
             raise ValueError(card + ': --trace owns SPECULATION_TRACE; drop the explicit setting')
         values['SPECULATION_TRACE'] = str(dest / 'speculation-trace.jsonl')
     base = dest / 'base.config'

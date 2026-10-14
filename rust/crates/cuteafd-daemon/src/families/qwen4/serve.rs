@@ -396,7 +396,7 @@ struct Trace(crate::shared::speculation_trace::Trace);
 
 impl Trace {
     fn open() -> Result<Option<Self>> {
-        Ok(crate::shared::speculation_trace::Trace::open("CUTEAFD_QWEN4_TRACE")?.map(Self))
+        Ok(crate::shared::speculation_trace::Trace::open()?.map(Self))
     }
 
     fn cycle(&mut self, line: serde_json::Value) {
