@@ -135,3 +135,9 @@ def export_target(properties) -> str:
     ("sm120"), never the export host's GPU marketing name, which made two hosts'
     identical exports differ (RTX PRO 6000 vs its Max-Q edition, #127)."""
     return f"sm{properties.major}{properties.minor}"
+
+
+# Every exporter imports this module before first CUDA use. Admission holds a
+# host RAM/context reservation until exit, including sequential FP8 packages.
+from _export_jobs import install_context_admission
+install_context_admission()

@@ -1318,7 +1318,7 @@ def build_lock_mode(revision):
     native = run(['git', '-C', str(REPO), 'show', revision + ':scripts/build/build-wip-artifacts.sh']).stdout
     # Native-phase sources lock only their export: on the host under a held fair
     # turn (CUTEAFD_WIP_HOST_EXPORT_TURN) or, older, through a mounted lock file.
-    if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
+    if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('wip_capped_export()' in text or 'CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
         return 'native-phase'
     return 'legacy-full-build'
 

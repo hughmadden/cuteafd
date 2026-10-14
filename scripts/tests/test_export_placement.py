@@ -100,7 +100,7 @@ def test_watch_counts_only_the_export_containers_processes(tmp_path, monkeypatch
     assert placement.export_mib(str(smi), '1', 'abc', None) == 2500
 
 
-def test_watch_ignores_a_failed_reading(tmp_path, monkeypatch):
+def test_watch_stops_on_a_failed_reading(tmp_path, monkeypatch):
     calls = iter([subprocess.SubprocessError('smi hiccup'), 10, 10])
     def reading(*args):
         value = next(calls, 10)
@@ -110,7 +110,7 @@ def test_watch_ignores_a_failed_reading(tmp_path, monkeypatch):
     monkeypatch.setattr(placement, 'export_mib', reading)
     args = placement.argparse.Namespace(smi='x', gpu='0', cgroup=None, baseline_mib=0, cap_mib=100,
                                         interval=0.05, command=['bash', '-c', 'sleep 0.3'])
-    assert placement.watch(args) == 0
+    assert placement.watch(args) == placement.NO_TURN
 
 
 def _hold(tmp_path, held=(), env_held='', gpus='1,0'):
@@ -153,3 +153,114 @@ def test_hold_never_uses_a_gpu_someone_else_holds(tmp_path):
     # moves on to the export host or the fair queue.
     result = _hold(tmp_path, held=('1', '0'))
     assert result.returncode == placement.NO_TURN and 'every candidate GPU lock is held' in result.stderr
+
+
+def test_reservations_share_baseline_and_cannot_double_admit(tmp_path):
+    path = tmp_path / 'ledger.json'
+    row = ['0', 'GPU-a', '65000', '98000', '33000']
+    first = placement.reserve(path, 'a', row, 64000, 1, max_cap=12288, max_jobs=8)
+    second = placement.reserve(path, 'b', row, 64000, 2, max_cap=12288, max_jobs=8)
+    assert first and second
+    baseline, budget = placement.reservation_budget(path, 'a')
+    assert baseline == 65000 and budget == first[0] + second[0]
+    state = __import__('json').loads(path.read_text())
+    assert sum(v['ram'] for v in state['leases'].values()) <= 64000 - placement.RAM_HEADROOM_MIB
+    assert first[0] == first[1] * (placement.CONTEXT_MIB + placement.SIZING_MIB)
+    # Baseline is shared, even when the second entrant sees allocated growth.
+    assert placement.reserve(path, 'c', ['0', 'GPU-a', '76000', '98000', '22000'], 32000, 3) is None
+    placement.release_reservation(path, 'a')
+    assert placement.reservation_budget(path, 'b')[1] == second[0]
+
+
+def test_ram_limits_concurrent_sizing_workers(tmp_path):
+    row = ['0', 'GPU-a', '1000', '98000', '97000']
+    assert placement.reserve(tmp_path / 'ledger.json', 'a', row, 16000, 1) is None
+
+
+@pytest.mark.parametrize("signum", [15, 1, 3])
+def test_hold_signal_retains_mutex_until_child_cleanup(tmp_path, signum):
+    import fcntl
+    import signal
+    import time
+    lock = tmp_path / 'gpu0.lock'
+    ready, stopping, done = [tmp_path / name for name in ('ready', 'stopping', 'done')]
+    command = f"trap 'touch {stopping}; sleep 0.5; touch {done}; exit 0' TERM HUP QUIT; touch {ready}; while true; do sleep 0.1; done"
+    process = subprocess.Popen([sys.executable, str(SCRIPT), 'hold', '--gpus', '0', '--', 'bash', '-c', command],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        process.send_signal(signum)
+        while not stopping.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert stopping.exists()
+        with lock.open('a') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert process.wait(timeout=5) == 0
+            assert done.exists()
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_capped_and_remote_cleanup_require_successful_absence_query():
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    cleanup = remote.split('cleanup_export() {', 1)[1].split('trap cleanup_export', 1)[0]
+    assert 'docker ps -a' in cleanup and 'sleep 60' in cleanup
+    assert 'docker container inspect' not in cleanup
+    wip = (ROOT / 'wip.sh').read_text().split('wip_capped_export_on() (', 1)[1].split('build_coordinator()', 1)[0]
+    assert 'trap cleanup_capped EXIT' in wip
+    assert 'timeout --kill-after=30 7200' in wip
+    assert '-e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots' in wip
+    assert 'CUTEAFD_EXPORT_GPU_BUDGET_MIB=$cap' in wip
+    assert 'docker rm -f "$id" >/dev/null 2>&1 || true' not in wip
+
+
+def test_capped_cleanup_ignores_second_signal_and_retains_gpu_lock(tmp_path):
+    import fcntl
+    import signal
+    import time
+    wip = (ROOT / 'wip.sh').read_text()
+    cleanup = wip[wip.index('  cleanup_capped() {'):wip.index('  trap cleanup_capped EXIT')]
+    tools = tmp_path / 'bin'
+    tools.mkdir()
+    entered, allow, ready = [tmp_path / name for name in ('entered', 'allow', 'ready')]
+    docker = tools / 'docker'
+    docker.write_text(f'#!/bin/sh\ntouch {entered}\ntest -f {allow} && exit 0\nexit 1\n')
+    docker.chmod(0o755)
+    pause = tools / 'sleep'
+    pause.write_text('#!/bin/sh\nexec /bin/sleep 0.05\n')
+    pause.chmod(0o755)
+    command = cleanup + f"\nname=owned; trap cleanup_capped EXIT; trap 'exit 143' TERM INT HUP QUIT; touch {ready}; while true; do sleep 60; done"
+    process = subprocess.Popen([sys.executable, str(SCRIPT), 'hold', '--gpus', '0', '--', 'bash', '-c', command],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env={**os.environ, 'PATH': f'{tools}:{os.environ["PATH"]}',
+                                    'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        process.send_signal(signal.SIGTERM)
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered.exists()
+        process.send_signal(signal.SIGTERM)
+        time.sleep(0.15)
+        assert process.poll() is None
+        with (tmp_path / 'gpu0.lock').open('a') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            allow.touch()
+            assert process.wait(timeout=5) == 143
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        allow.touch()
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)

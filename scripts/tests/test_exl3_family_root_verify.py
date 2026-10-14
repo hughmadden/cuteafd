@@ -157,5 +157,54 @@ def test_build_sh_checksums_real_exl3_manifest_paths():
     assert '"${dist_exl3_manifests[@]}"' in checksum_block
 
 
+def test_sm121_object_requires_actual_cuda_target(tmp_path):
+    import struct
+    tool = load_tool()
+    blob = bytearray(64)
+    blob[:6] = b'\x7fELF\x02\x01'
+    struct.pack_into('<H', blob, 18, 190)
+    struct.pack_into('<I', blob, 48, 0x06007902)
+    path = tmp_path / 'kernel.o'
+    path.write_bytes(b'host object prefix' + blob)
+    tool.verify_object_target(path, (12, 1))
+    with pytest.raises(ValueError, match='target differs'):
+        tool.verify_object_target(path, (12, 0))
+    struct.pack_into('<I', blob, 48, 0x06007802)
+    path.write_bytes(blob)
+    with pytest.raises(ValueError, match='target differs'):
+        tool.verify_object_target(path, (12, 1))
+
+
+def test_worker_target_is_explicit_and_failures_are_observed_unordered():
+    source = TOOL.read_text()
+    assert 'args, target_compute, raw' in source
+    assert 'describe_gb10()' in source
+    assert "meta['compute'] != list(target_compute)" in source
+    assert 'as_completed(futures)' in source and 'pool.map(' not in source
+    assert 'process.kill()' in source and 'process.join()' in source
+    assert 'for group in groups:' in source
+    assert source.index('for group in groups:') > source.index('process.join(timeout=5)')
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_verification_checks_every_packaged_dso_including_routes(tmp_path):
+    import struct
+    tool = load_tool()
+    files = {}
+    for name, compute in [('core.so', 121), ('routes/metadata.so', 120)]:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = bytearray(64)
+        data[:6] = b'\x7fELF\x02\x01'
+        struct.pack_into('<H', data, 18, 190)
+        struct.pack_into('<I', data, 48, compute << 8)
+        path.write_bytes(data)
+        files[name] = {'bytes': len(data), 'sha256': tool.digest(path)}
+    (tmp_path / 'manifest.json').write_text(json.dumps({
+        'schema': 'cuteafd.exl3-package.v1', 'role': 'coordinator',
+        'variants': [], 'files': files, 'compute': [12, 1]}))
+    with pytest.raises(ValueError, match='metadata.so'):
+        tool.verify(tmp_path)

@@ -523,8 +523,7 @@ def _wip_function(name, end):
     text = (ROOT / 'wip.sh').read_text()
     start = text.index(name)
     helpers = text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_coordinator() {')]
-    return text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3] + \
-        helpers + text[start:text.index(end, start)]
+    return helpers + text[start:text.index(end, start)]
 
 
 def _trace_tools(tmp_path, extra=None):
@@ -544,7 +543,7 @@ def _trace_tools(tmp_path, extra=None):
     return tools
 
 
-def test_spark_leg_holds_one_seed_turn_for_its_whole_duration(tmp_path):
+def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
     function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
@@ -562,19 +561,14 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert rust'))
-    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
+    assert not any(line.startswith('turn ') for line in lines)
     native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native') and not line.startswith('turn '))
-    end = lines.index('end', turn)
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
-    assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 --' in lines[turn]
-    # One fair turn on the seed covers the whole Spark leg (Cargo, export,
-    # finalize): Spark CPU work never overlaps cards serving from that host.
-    assert turn < rust < native < finalize < end
-    assert sum(line.startswith('turn ') for line in lines) == 1
+    assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
 
 
-def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
+def test_coordinator_export_probes_after_rust_without_queued_turn(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -584,19 +578,18 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
-# The fair turn as the only mode (off-queue modes: test_wip_coordinator_export_modes.py).
-CUTEAFD_WIP_COORDINATOR_EXPORT=turn
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
     modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nbuild_coordinator'], check=True,
+    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
-    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native') and not line.startswith('turn '))
-    assert 'scripts/hw/hwlock.py --locks gpu1 --wait 1800 --' in lines[turn]
-    assert rust < turn < native < lines.index('end', turn)
+    capped = lines.index('capped')
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
+    assert rust < capped < native
+    assert not any('hwlock.py --locks gpu1' in line for line in lines)
     assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
     assert '/wip-export-gpu.lock' not in wip
@@ -611,27 +604,11 @@ def test_split_native_phase_requires_matching_rust_source_and_cache_mode():
     assert '[[ "$phase" != rust ]] || exit 0' in text
 
 
-def test_native_export_lock_only_after_cargo(tmp_path):
+def test_native_export_has_no_in_container_lock_compatibility():
     text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    start = text.index('export_lock_fds=()')
-    end = text.index("printf '%s'", start)
-    phase = text[start:end]
-    phase = phase[:phase.index('cmake \\\n')] + 'printf "export\\n" >> "$TRACE"\n' + phase[phase.index('for export_lock_fd in'):]
-    tools = tmp_path / 'tools'
-    tools.mkdir()
-    mock = tools / 'flock'
-    mock.write_text('#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n')
-    mock.chmod(0o755)
-    trace = tmp_path / 'trace'
-    env = {**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace), 'CUTEAFD_WIP_EXPORT_LOCK_FILES': str(tmp_path / 'gpu1.lock')}
-    subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'on'}, check=True)
-    assert trace.read_text().splitlines()[0].startswith('flock -w 1800')
-    assert trace.read_text().splitlines()[1] == 'export'
-    assert trace.read_text().splitlines()[2].startswith('flock -u')
-    trace.unlink()
-    subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'off'}, check=True)
-    assert trace.read_text() == 'export\n'
-    assert text.index('cuteafd_host_isa_cargo_build ') < start
+    assert 'export_lock_fds' not in text
+    assert 'flock -w 1800' not in text
+    assert 'Hardware admission and lifetime are owned by wip.sh' in text
 
 
 @pytest.mark.parametrize('matched', [False, True])
