@@ -151,6 +151,7 @@
       "speculator": "MTP ×3",
       "layout": "1 RTX · experts on the coordinator",
       "settings": [
+        {"name": "qualification.hardware-label", "value": "1\u00d7 RTX, no Sparks (local experts), vision on RTX0, fixed 262,144 pool (1\u00d7 RTX)", "default": null, "source": "publication"},
         {
           "name": "snapshot",
           "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1/snapshots/888306bd3996d6317758c07df50622829259ad17",
