@@ -288,3 +288,25 @@ def test_seed_hup_quit_stops_container_before_unlock(tmp_path, signum):
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+def test_gpu_lease_pid_collision_never_truncates_live_reservation(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_gpu_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_GPU_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_GPU_BUDGET_MIB', '12288')
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_GPU_MIB', '640')
+    live = tmp_path / f'context.{os.getpid()}.lock'
+    held = live.open('w+')
+    held.write('2688')
+    held.flush()
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        export.gpu_admission()
+        assert live.read_text() == '2688'
+        assert Path(export._gpu_lease.name) != live
+        assert export._gpu_lease.readable()
+    finally:
+        held.close()
+        if export._gpu_lease:
+            export._gpu_lease.close()
+        export._gpu_lease = None

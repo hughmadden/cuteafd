@@ -1190,6 +1190,7 @@ wip_capped_export_on() (
   done
   local id status=0 gpu_args name="${coordinator_container}-export-$$"
   cleanup_capped() {
+    trap '' TERM HUP INT QUIT
     local names
     # A failed daemon query is never proof that CUDA has stopped.
     while true; do

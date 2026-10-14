@@ -88,6 +88,7 @@ container="cuteafd-export-$(basename "$root")"
 reservation="$(basename "$root")"
 ledger="$HOME/.cache/cuteafd/export-reservations.json"
 cleanup_export() {
+    trap '' TERM HUP INT QUIT
   local names
   # Keep the slot and reservation until a successful query proves absence.
   while true; do

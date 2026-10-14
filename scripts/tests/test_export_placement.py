@@ -219,3 +219,48 @@ def test_capped_and_remote_cleanup_require_successful_absence_query():
     assert '-e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots' in wip
     assert 'CUTEAFD_EXPORT_GPU_BUDGET_MIB=$cap' in wip
     assert 'docker rm -f "$id" >/dev/null 2>&1 || true' not in wip
+
+
+def test_capped_cleanup_ignores_second_signal_and_retains_gpu_lock(tmp_path):
+    import fcntl
+    import signal
+    import time
+    wip = (ROOT / 'wip.sh').read_text()
+    cleanup = wip[wip.index('  cleanup_capped() {'):wip.index('  trap cleanup_capped EXIT')]
+    tools = tmp_path / 'bin'
+    tools.mkdir()
+    entered, allow, ready = [tmp_path / name for name in ('entered', 'allow', 'ready')]
+    docker = tools / 'docker'
+    docker.write_text(f'#!/bin/sh\ntouch {entered}\ntest -f {allow} && exit 0\nexit 1\n')
+    docker.chmod(0o755)
+    pause = tools / 'sleep'
+    pause.write_text('#!/bin/sh\nexec /bin/sleep 0.05\n')
+    pause.chmod(0o755)
+    command = cleanup + f"\nname=owned; trap cleanup_capped EXIT; trap 'exit 143' TERM INT HUP QUIT; touch {ready}; while true; do sleep 60; done"
+    process = subprocess.Popen([sys.executable, str(SCRIPT), 'hold', '--gpus', '0', '--', 'bash', '-c', command],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env={**os.environ, 'PATH': f'{tools}:{os.environ["PATH"]}',
+                                    'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        process.send_signal(signal.SIGTERM)
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered.exists()
+        process.send_signal(signal.SIGTERM)
+        time.sleep(0.15)
+        assert process.poll() is None
+        with (tmp_path / 'gpu0.lock').open('a') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            allow.touch()
+            assert process.wait(timeout=5) == 143
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        allow.touch()
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)

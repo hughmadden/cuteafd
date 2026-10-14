@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import time
+import uuid
 
 
 def export_jobs() -> int:
@@ -88,9 +89,11 @@ def gpu_admission():
                         existing.seek(0)
                         reserved += int(existing.read())
             if reserved + reservation <= budget:
-                path = vacant or root / f'context.{os.getpid()}.lock'
-                handle = path.open('w+')
+                path = vacant or root / f'context.{uuid.uuid4().hex}.lock'
+                handle = path.open('r+' if vacant else 'x+')
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                handle.truncate()
                 handle.write(str(reservation))
                 handle.flush()
                 _gpu_lease = handle
