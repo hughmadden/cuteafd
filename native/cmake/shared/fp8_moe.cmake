@@ -18,7 +18,7 @@ elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
 else()
   message(FATAL_ERROR "FP8 expert packages require a single native SM120 or SM121 target")
 endif()
-set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096" CACHE STRING "FP8 expert package capacities")
+set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096")  # recipe, not a cached option
 # Spark builds may add fp8-FAMILY-bf16 beside each package: the same slices
 # taking BF16 rows instead of FP8 K32 wire rows (the ranks then accept both;
 # the coordinator chooses per step, e.g. serve-mimo --expert-input).

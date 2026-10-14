@@ -57,8 +57,8 @@ option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (sa
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
   "DeepSeek V4 program geometries, comma-separated: flash, pro; flash2 / pro2 their two-GPU head splits")
-set(CUTEAFD_DSV4_DECODE_ROWS "64" CACHE STRING "DeepSeek V4 decode program capacity (below 96 keeps mHC on its decode route)")
-set(CUTEAFD_DSV4_PREFILL_ROWS "4096" CACHE STRING "DeepSeek V4 prefill program capacity")
+set(CUTEAFD_DSV4_DECODE_ROWS "64")  # decode program capacity (below 96 keeps mHC on its decode route); recipe, not cached
+set(CUTEAFD_DSV4_PREFILL_ROWS "4096")  # prefill program capacity; recipe, not cached
 set(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING
   "GLM 5.3 Flash wide decode and verify program capacity (serve --decode-rows 128); 0 exports none")
 set(CUTEAFD_CONTEXT_SPLIT_AOT "OFF" CACHE STRING

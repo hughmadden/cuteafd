@@ -447,6 +447,14 @@ def test_native_family_decode_uses_one_wide_recipe_and_shared_admission() -> Non
     cmake = (ROOT / "native/cmake/shared/expert_families.cmake").read_text()
     wide = "1:128,16:128,80:128,256:128,1024:128,4096:128"
     assert f'CUTEAFD_EXPERT_FAMILY_WIDTH "{wide}"' in cmake
+    # A cached recipe survives a reused CMakeCache.txt and silently overrides the
+    # source (a stale m1 width 64 shipped that way after the wide-recipe change).
+    for name, path in (("CUTEAFD_EXPERT_FAMILY_WIDTH", "native/cmake/shared/expert_families.cmake"),
+                       ("CUTEAFD_FP8_MOE_CAPACITIES", "native/cmake/shared/fp8_moe.cmake"),
+                       ("CUTEAFD_DSV4_DECODE_ROWS", "native/CMakeLists.txt"),
+                       ("CUTEAFD_DSV4_PREFILL_ROWS", "native/CMakeLists.txt")):
+        line = next(l for l in (ROOT / path).read_text().splitlines() if l.startswith(f"set({name} "))
+        assert "CACHE" not in line, name
     assert wide in (ROOT / "scripts/build/compare-sm-exports.py").read_text()
     recipe = _slice_recipe()
     for intermediate in (512, 768, 1024, 1536, 2048, 3072):

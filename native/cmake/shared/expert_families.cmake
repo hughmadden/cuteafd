@@ -36,8 +36,9 @@ set(CUTEAFD_EXPERT_FAMILY_INCLUDE_DIRS)
 set(CUTEAFD_EXPERT_FAMILY_ROWS 1 16 80 256 1024 4096)
 # 192-wide slices do not tile these 128-aligned extents (512, 1024).
 # Serial decode adopts the existing wide recipe so every decode row folds alike.
-set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:128,16:128,80:128,256:128,1024:128,4096:128" CACHE STRING
-  "Slice width map for non-V4.1 expert families")
+# A recipe, not a build option: a plain variable, so a source change always wins
+# over a CMakeCache.txt a reused build directory carries.
+set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:128,16:128,80:128,256:128,1024:128,4096:128")
 set(expert_ops info initialize output_kind group_rows bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
