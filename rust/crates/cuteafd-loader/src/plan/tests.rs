@@ -2797,6 +2797,63 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     assert!(!rendered.contains("MiMo key-0"));
 }
 
+/// Explicit VISION=spark on a GLM Flash layout whose routed experts never
+/// open a Spark worker. The launcher attaches the encoder to an expert rank,
+/// so the planner refuses instead of inventing a vision-only worker.
+#[test]
+fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(2);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let tensors: Vec<_> = super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect();
+    let dir = snapshot_tp(cfg, &tensors, Some(4));
+    let base = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(4) };
+    let sentence = "vision-only Spark workers aren't supported; set VISION=rtx or RTX_EXPERT_LAYERS";
+    for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
+        let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
+        assert!(!report.placement_supported, "{vision:?}");
+        assert!(!report.executable(), "{vision:?}");
+        let encoder = report.encoder.as_ref().unwrap();
+        assert_eq!(encoder.kind, EncoderKind::Off, "{vision:?}");
+        assert_eq!(encoder.reason, sentence, "{vision:?}");
+        assert_eq!(encoder.shortfall, 0, "{vision:?}");
+        assert_eq!(encoder.admitted_bytes(), 0);
+        assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), 0);
+        assert!(report.hints.iter().any(|hint| hint.what == sentence), "{:?}", report.hints);
+        assert_ne!(component(&report, Component::Vision).status, Status::Disabled);
+        assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(sentence)));
+    }
+    // Automatic vision still falls back onto the last RTX.
+    let auto = plan(dir.path(), &base).unwrap();
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 });
+    assert!(auto.hints.iter().all(|hint| hint.what != sentence));
+
+    let explicit = plan_spark_count(dir.path(), &PlanOptions {
+        vision: MediaMode::Spark(None), ..base.clone()
+    }, 4, Some(4)).unwrap();
+    assert!(!explicit.executable());
+    assert!(explicit.spark_count_warning.is_none());
+    let refusal = &explicit.hints.last().unwrap().what;
+    assert!(refusal.contains(sentence), "{refusal}");
+    assert!(refusal.contains("Spark count 4 refused:"), "{refusal}");
+    assert!(refusal.contains("counts that work: []"), "{refusal}");
+
+    // An unspecified count must not adopt a vision-only Spark either.
+    let open = plan_spark_count(dir.path(), &PlanOptions {
+        vision: MediaMode::Spark(None), ..base
+    }, 4, None).unwrap();
+    assert!(!open.executable());
+    assert!(open.spark_count_warning.is_none());
+    assert!(open.hints.last().unwrap().what.contains("counts that work: []"));
+}
+
 #[test]
 fn explicit_encoder_failure_and_small_pool_admission() {
     use super::encoder::EncoderKind;

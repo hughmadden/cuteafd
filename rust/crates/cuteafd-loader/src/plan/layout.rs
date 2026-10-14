@@ -1707,7 +1707,17 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
             expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
-    let placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
+    let mut placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
+    // Launch starts a Spark worker only for an expert rank and attaches the
+    // encoder to that worker. No expert package means no worker to host it.
+    let vision_only_spark = matches!(&placement.kind, EncoderKind::Off)
+        && matches!(report.vision, super::MediaMode::Spark(_))
+        && sparks.is_empty()
+        && placement.reason == "requested Spark encoder/replicas unavailable";
+    if vision_only_spark {
+        placement.reason = "vision-only Spark workers aren't supported; set VISION=rtx or RTX_EXPERT_LAYERS".into();
+        placement.shortfall = 0;
+    }
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
         let spark_overhead = if hardware.v41 && d.kind == DeviceKind::Spark {
@@ -1725,10 +1735,13 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
         }
         EncoderKind::Off if matches!(report.vision, super::MediaMode::Rtx(_) | super::MediaMode::Spark(_)) => {
             report.placement_supported = false;
-            report.hints.push(super::Hint {
-                what: format!("requested vision placement unavailable: {}", placement.reason),
-                how: format!("Select an available encoder device with tower/scratch/KV headroom (shortfall {} bytes), or explicitly use --vision=off.", placement.shortfall),
-            });
+            let (what, how) = if vision_only_spark {
+                (placement.reason.clone(), "Place the tower on an RTX with VISION=rtx, or keep expert layers on Sparks with RTX_EXPERT_LAYERS.".into())
+            } else {
+                (format!("requested vision placement unavailable: {}", placement.reason),
+                    format!("Select an available encoder device with tower/scratch/KV headroom (shortfall {} bytes), or explicitly use --vision=off.", placement.shortfall))
+            };
+            report.hints.push(super::Hint { what, how });
         }
         EncoderKind::Off => {
             if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Vision)
