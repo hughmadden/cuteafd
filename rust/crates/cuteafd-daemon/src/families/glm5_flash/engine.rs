@@ -1745,7 +1745,7 @@ impl<'a> GlmfEngine<'a> {
         }
         self.synchronize()?;
         let free = || (0..self.ranks()).map(|rank| self.on(rank,
-            || self.library.cuda_physical_memory_info().map(|(free, _)| free as i64))).collect::<Result<Vec<_>>>();
+            || self.library.cuda_allocatable_memory_info().map(|(free, _)| free as i64))).collect::<Result<Vec<_>>>();
         let before = free()?;
         let started = std::time::Instant::now();
         self.warming_graphs.set(true);

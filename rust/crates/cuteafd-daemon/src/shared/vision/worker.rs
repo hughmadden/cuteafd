@@ -80,7 +80,7 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         // SAFETY: this is the selected architecture-matching native library.
         let native = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
         native.cuda_set_device(0)?;
-        let (free, _) = native.cuda_physical_memory_info()?;
+        let (free, _) = native.cuda_memory_info()?;
         require_allocatable(reserved, free as u64)?;
     }
     if let (Some(image_config), Some(audio_config)) = (vision, audio) {
@@ -121,17 +121,15 @@ pub(crate) fn check_cuda_room(library: &Path, device: i32, required: u64) -> Res
     // SAFETY: selected architecture-matching native library, queried before tower allocation.
     let native = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
     native.cuda_set_device(device)?;
-    let (free, _) = native.cuda_physical_memory_info()?;
+    let (free, _) = native.cuda_memory_info()?;
     require_allocatable(required, free as u64)
 }
 
 pub(crate) fn require_allocatable(required: u64, free: u64) -> Result<()> {
     ensure!(required <= free,
-        "media tower allocation needs {required} bytes, cudaMemGetInfo reports only {free} immediately free bytes; \
-        Linux MemAvailable includes reclaimable file cache and is not CUDA allocation headroom \
-        (host MemAvailable={:?}, Cached={:?}); free physical memory or choose another encoder owner",
-        crate::shared::memory_report::unified_available_bytes().ok(),
-        crate::shared::memory_report::cached_bytes());
+        "media tower allocation needs {required} bytes but only {free} allocatable bytes remain; \
+        GB10 uses MemAvailable including reclaimable file cache, discrete RTX uses cudaMemGetInfo; \
+        free memory or choose another encoder owner");
     Ok(())
 }
 
@@ -175,11 +173,11 @@ mod tests {
         assert!(audio_reservation(u64::MAX, u64::MAX).is_err());
     }
     #[test]
-    fn tower_preflight_requires_immediately_allocatable_memory() {
+    fn tower_preflight_requires_allocatable_memory() {
         assert!(require_allocatable(3 << 30, 3 << 30).is_ok());
         assert!(require_allocatable(0, 0).is_ok());
         let error = require_allocatable(3 << 30, 2 << 30).unwrap_err().to_string();
-        for text in ["cudaMemGetInfo", "immediately free", "MemAvailable", "file cache", "another encoder owner"] {
+        for text in ["cudaMemGetInfo", "allocatable", "MemAvailable", "file cache", "another encoder owner"] {
             assert!(error.contains(text), "{error}");
         }
     }

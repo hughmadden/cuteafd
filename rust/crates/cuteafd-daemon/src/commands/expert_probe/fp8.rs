@@ -168,7 +168,6 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     let mut slowest = Duration::ZERO;
     for rank in 0..tp {
         let (free, _) = library.cuda_memory_info()?;
-        let free = free.max(unified_available());
         let started = Instant::now();
         let experts = Fp8Experts::load(&library, tensors, &directory, args.layer..args.layer + 1, tp, rank, rows,
             free.saturating_sub(2 << 30))?;
@@ -211,14 +210,4 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     // SAFETY: nothing is queued on the drained stream.
     unsafe { library.cuda_stream_destroy(stream)? };
     Ok((total, slowest))
-}
-
-/// `MemAvailable` on unified-memory hosts (GB10): `cudaMemGetInfo` there
-/// reports only `MemFree`, although device allocations reclaim the page cache
-/// (a probe right after reading a checkpoint would otherwise see ~no memory).
-fn unified_available() -> usize {
-    if !cfg!(target_arch = "aarch64") {
-        return 0;
-    }
-    crate::shared::memory_report::unified_available_bytes().unwrap_or(0)
 }

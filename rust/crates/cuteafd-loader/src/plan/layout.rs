@@ -316,7 +316,7 @@ pub struct FamilyCosts {
     pub spark_workspace_bytes: u64,
     /// RDMA rings per Spark rank (every coordinator endpoint).
     pub spark_ring_bytes: u64,
-    /// Host memory charged by CUDA on GB10 after checkpoint caches are dropped.
+    /// Non-reclaimable host memory charged beside CUDA allocations on GB10.
     pub spark_host_bytes: u64,
 }
 

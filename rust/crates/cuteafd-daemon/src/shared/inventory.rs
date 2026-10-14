@@ -88,6 +88,8 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
                 .total(cuteafd_ffi::memory_ledger::Space::Device, device);
             tracing::info!(target: "cuteafd::placement", probe = %serde_json::json!({
                 "stage": stage, "device": device, "free": free, "total": total,
+                "cuda_memory_scope": "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache",
+                "allocatable_free_bytes": library.cuda_allocatable_memory_info()?.0,
                 "tracked": tracked, "untracked": total.saturating_sub(free).saturating_sub(tracked)
             }), "startup memory probe");
         }

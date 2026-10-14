@@ -68,7 +68,6 @@ glmrt_prepare() {
 launch() {
   local arm=$1 out=$2 tag=$3
   stop_all
-  nest drop-caches $(printf -- '--host %s ' "${sparks[@]}") >/dev/null 2>&1 || true
   if [[ $arm == glmrt ]]; then
     (cd "$glmrt" && ./run.sh --profile "$glmrt_config" --restart) > "$out/$tag.launch.log" 2>&1
     echo http://127.0.0.1:8000

@@ -483,7 +483,9 @@ device, pinned and RDMA allocation now goes through a process-wide ledger
 tensor and resident format being uploaded; `cuteafd::memory` log reports;
 `scripts/bench/memory-audit.py` tabulates and `--compare`s against the
 planner). One launch per config (codex/v1 tree + ledger, after an 8K prefill,
-a C4 and a C1 request; default pools). GiB per device:
+a C4 and a C1 request; default pools). GiB per device. Historical `used`
+and `free` are raw CUDA readings: on GB10 they charge reclaimable page cache
+as used memory, not an allocation limit:
 
 | config | device | weights | emb | drafter | KV | marks | workspace | exchange | experts | runtime | used | free |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -519,10 +521,10 @@ at one RTX, 20 at two). The waste is elsewhere:
    2,097,152 tokens, 44 GiB still free, unchanged speed). GLM 5.3 takes
    `POOL_TOKENS=auto` (262144 -> 1,292,672 tokens, 65 GiB KV per GPU) but keeps
    its fixed default until item 5 is bounded (2.9 GiB left on GPU0 after a bench).
-2. Spark page cache: ~10 GiB of the checkpoint stays cached per Spark after
-   loading (CUDA free 4.0 of 121.6 GiB on MiMo Pro TP6); the worker's own
-   fadvise does not reach sparknest's passthrough pages. Fixed: launchers
-   drop Spark caches once every rank is resident (+9.5 GiB CUDA free).
+2. Spark page cache: GB10 CUDA allocations reclaim checkpoint cache (measured
+   2026-10-14). Raw CUDA free under-reports that headroom: use Linux
+   `MemAvailable` for SM121 admission and leave serving caches warm. The
+   earlier post-load cache drop addressed the counter, not an allocation limit.
 3. Retained load staging: the copy_h2d pinned buffer stayed at the largest
    upload (0.45 GiB per Spark on MiMo, 1.77 GiB pinned on raptor for GLM,
    1.0 for V4 Flash). Fixed: released after loading.
@@ -1042,8 +1044,8 @@ Work, in priority order:
    `ImageTooLarge` variant must stay in each family's permanent-400 fallback.
 5. **Platform robustness:** GeForce defaults (probed pinned intake, no
    P2P/GPUDirect; PLAT-3), RDMA device from the fabric address and bond
-   balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
-   without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
+   balance (#2 FR-D.4), reclaim-aware per-Spark free-memory admission
+   without cache eviction (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
    returned as content (#1 FR-G.14). Bond balance, in part: with the
    coordinator key `RDMA_BOND_BALANCE=probe` the expert QPs connect with

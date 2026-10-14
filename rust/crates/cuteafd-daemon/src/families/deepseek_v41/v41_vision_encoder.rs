@@ -140,16 +140,8 @@ impl LocalEncoder {
                         "V4.1 vision needs {admitted} admitted bytes, budget {budget}"
                     );
                     let free_before = lib.cuda_physical_memory_info()?.0;
-                    crate::shared::vision::worker::require_allocatable(admitted as u64, free_before as u64)?;
-                    let available_before = if sm == 121 {
-                        crate::shared::memory_report::unified_available_bytes()?
-                    } else {
-                        lib.cuda_memory_info()?.0
-                    };
-                    ensure!(
-                        admitted <= available_before,
-                        "V4.1 vision needs {admitted} bytes, available {available_before}"
-                    );
+                    let available_before = lib.cuda_memory_info()?.0;
+                    crate::shared::vision::worker::require_allocatable(admitted as u64, available_before as u64)?;
                     let _scope = cuteafd_ffi::memory_ledger::scope("v41/vision");
                     let mut runtime = VisionRuntime::new(&lib, &catalog, CAPACITY, bytes)?;
                     // Cache reclamation changes raw CUDA free independently of
@@ -163,6 +155,7 @@ impl LocalEncoder {
                         available_before,
                         free_before,
                         free_after,
+                        cuda_free_scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache",
                         observed_device_delta = free_before.saturating_sub(free_after),
                         "V4.1 vision owner admitted and allocated"
                     );

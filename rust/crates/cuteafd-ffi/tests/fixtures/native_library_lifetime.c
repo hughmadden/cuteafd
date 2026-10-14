@@ -16,6 +16,22 @@ void fixture_configure_memory(int device, size_t total, size_t used, size_t grap
     graph_bytes = graph;
 }
 
+struct device_info {
+    int device_id, cuda_available, compute_capability_major, compute_capability_minor;
+    int integrated, can_map_host_memory, unified_addressing;
+    uint64_t total_memory_bytes;
+    char name[128], driver_version[64], runtime_version[64];
+};
+int cuteafd_cuda_device_info(int device, struct device_info *info) {
+    memset(info, 0, sizeof(*info));
+    info->device_id = device;
+    info->cuda_available = 1;
+    info->compute_capability_major = 12;
+    info->compute_capability_minor = 0;
+    info->total_memory_bytes = memory_total[device];
+    return 0;
+}
+
 int cuteafd_cuda_get_device(int *device) { *device = current_device; return 0; }
 int cuteafd_cuda_memory_info(size_t *free_bytes, size_t *total) {
     *total = memory_total[current_device];

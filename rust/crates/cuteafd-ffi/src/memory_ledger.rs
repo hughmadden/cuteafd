@@ -361,7 +361,7 @@ pub fn current_cuda_memory_snapshot() -> Option<serde_json::Value> {
         }
         Some(serde_json::json!({"device": device, "physical_free_bytes": free,
             "physical_total_bytes": total, "cuda_current_pool": pool_data,
-            "scope": "current process/device CUDA runtime queries; no synchronization or pool trimming; CUDA pool bytes are physical telemetry, not additional tracked allocations"}))
+            "scope": "raw cudaMemGetInfo under-reports reclaimable page cache on GB10; use host MemAvailable for allocatable headroom; current process/device CUDA runtime queries; no synchronization or pool trimming; CUDA pool bytes are physical telemetry, not additional tracked allocations"}))
     }
 }
 
