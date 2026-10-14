@@ -677,3 +677,39 @@ except `glmf_mla_q_b`, whose k=1536 is also four). It is within 1-5% of the best
 of the nine; the exception is `glmf_dense_gu` 24576x4096, where eight tiles is 8-18% faster at
 65-128 rows. That is a follow-up for a band nothing serves yet, not a reason to widen the rule
 now.
+
+### Gamma: the GLM Flash golden and the p0 fidelity compare
+
+One lock turn on gpu0+gpu1, two arms alternating (`ds210` = this branch at `98c993df`,
+`p0` = `d5-final-base-20261014:d5base`, the work/p0-lineage slot). Launch: GLM Flash
+EXL3-K3.25 max on 2x RTX, `--kda-fp8 row128 --fp8-head --prefill 64 --step-rows 1`,
+teacher-forced single-row decode against the frozen reference in
+`scratchpad/glmf-launch-golden`, plus `--nll --save-logits`.
+
+| arm | decode rows (128) | prefill rows (64) |
+| --- | --- | --- |
+| ds210 | top-1 88.28% \| NLL 3.4802 (golden 3.5019) \| KL 0.03816 | top-1 78.1% \| NLL 4.2368 (golden 4.2339) \| KL 0.10584 |
+| p0 | identical to the printed precision | identical to the printed precision |
+
+The prefill band is the one that matters for this change: 64 rows makes
+`total_m_tiles = 4`, so `gemv_cta_tiles` sends the k=2560 shapes to two tiles and
+everything else to four, `grid_m` splits the row band across CTAs and the epilogue folds
+through shared memory. Those 64 rows' logits are **byte-identical** between the two arms
+(`--compare-logits ds210:p0`: max abs diff 0.0, mean KL 0.000000, top-1 100.00% over 64
+rows). The 128 decode rows run at one row per step (`total_m_tiles = 1`), so the ladder is
+not in that path at all; they agree with each other on every printed statistic and sit
+0.038 KL from the reference.
+
+### Gates on the landing tree (engine `98c993df`, fork `5f32f49c`)
+
+| gate | result |
+| --- | --- |
+| fork `pytest` row-invariance + KDA W8 AOT (GPU, both routes, through the 64-row cap) | 215 passed (172 + 43) |
+| raw M=1 dump, all 43 consumers vs the arm-A tree | 439,232 int16 words, none differing |
+| `compare-sm-exports.py --sms 188,170`, full scope | 196 groups, 2254 verdicts: 2246 identical, 8 cubin-bytes (the pre-existing `index_topk_decode_m{1,16}` suspects), 0 failed; verdict diff vs the pre-requalification run: 0 changed, 41 added |
+| `cargo test --workspace --locked --no-fail-fast` (host, two V4 planner ids skipped) | 3053 passed, 0 failed, 228 ignored, 58 binaries |
+| `pytest -q scripts/tests` (host) | 2965 passed, 18 skipped, 0 failed |
+| interleaved 24-rep tile-policy confirmation | landed 0.995 geo / 1.050 worst; noise floor 0.999 / 1.356 |
+| KDA M=1 old-TMA vs new-GEMV, 16 cases | replay bitwise; 7.1e-05 rel. L2 in FP32 |
+| GLM Flash golden + p0 fidelity compare | prefill logits byte-identical to p0; decode statistics identical; 0.038 KL vs the reference |
+| `spec_lossless_set` v1 (strict, DFlash2 on vs off) | 10/10 lossless |
