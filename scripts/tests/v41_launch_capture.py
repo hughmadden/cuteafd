@@ -137,6 +137,8 @@ if tool == "docker":
     if args and args[0] in ("inspect", "container") or args[:2] == ["container", "inspect"]:
         joined = " ".join(args)
         if args[:2] == ["container", "inspect"] and "-wip" in args[-1]:
+            if "State.Running" in joined:
+                print("true")
             sys.exit(0)
         if "State.Status" in joined:
             print("running")

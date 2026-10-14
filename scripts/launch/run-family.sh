@@ -702,7 +702,7 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        "if docker container inspect '$wip_spark_container' >/dev/null 2>&1; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
+        "if [ \"\$(docker container inspect -f '{{.State.Running}}' '$wip_spark_container' 2>/dev/null)\" = true ]; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
 import hashlib
 import json
 import os
