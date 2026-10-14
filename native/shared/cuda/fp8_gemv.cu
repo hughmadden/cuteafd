@@ -21,7 +21,10 @@
 // f16 path at twice the rate. Its B fragments follow the packed weights' K
 // order, so the weights are read as packed: a lane's 16 bytes of a 16 x 32
 // tile hold k c, c + 1, c + 8, c + 9 (+16) of rows g and g + 8, which byte
-// permutes turn into the k32 A fragment of the same K order.
+// permutes turn into the k32 A fragment of the same K order. Past 64 rows a
+// W8A8 call leaves the pass loop entirely: the whole height is one single-split
+// 2D-grid pass per activation tile, writing BF16 out with no split partials
+// (a prefill context update, where the tiles alone fill the device).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -470,6 +473,125 @@ __global__ void __launch_bounds__(kWarps * 32) gemv_w8a8_kernel(
   }
 }
 
+// gemv_w8a8_kernel for a whole-height pass: one CTA per 128-row activation
+// tile (blockIdx.y, the grid's slowest dimension so every live CTA reads the
+// same weight tiles) and 64 output columns (blockIdx.x). One CTA owns a
+// (16 output rows x 128 activation rows) tile per warp and no K split, so the
+// BF16 outputs go straight to `out` and the split partials and their reduce
+// kernel disappear. The activations are packed for the pass at once
+// (`groups_total` 8-row groups, `stride` = 8 * groups_total rows), the tile's
+// first group is `blockIdx.y * GROUPS`; per-K-block sums are scaled and folded
+// into the FP32 total in the same order as gemv_w8a8_kernel's, one group's
+// 4-register accumulator at a time (16 live accumulators would otherwise
+// double the kernel's register demand at GROUPS = 16).
+template <int GROUPS>
+__global__ void __launch_bounds__(kWarps * 32) gemv_w8a8_wide_kernel(
+    const uint4* __restrict__ wp, const float* __restrict__ scale, const uint2* __restrict__ xq,
+    const float* __restrict__ sxa, void* __restrict__ out, int out_f32, int rows, int n, int k,
+    int groups_total, int stride) {
+  const int lane = threadIdx.x & 31;
+  const int rt = blockIdx.x * kWarps + threadIdx.x / 32;
+  const int tiles = n / 16;
+  if (rt >= tiles) return;
+  const int mg = blockIdx.y * GROUPS, m0 = mg * 8;
+  const int kbs = k / 128;
+  const int g = lane / 4, c = (lane % 4) * 2;
+  float acc[GROUPS][4];
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+  const uint4* wrow = wp + size_t(rt) * (k / 32) * 32 + lane;
+  const float* s_lo = scale + size_t(rt * 16 + g) * kbs;
+  const float* s_hi = scale + size_t(rt * 16 + g + 8) * kbs;
+  const uint2* xrow = xq + size_t(mg) * 32 + lane;
+  for (int kb = 0; kb < kbs; ++kb) {
+    uint4 a[4];
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) a[kt] = load_stream(wrow + size_t(kb * 4 + kt) * 32);
+    const float lo = __ldg(s_lo + kb), hi = __ldg(s_hi + kb);
+#pragma unroll
+    for (int i = 0; i < GROUPS; ++i) {
+      float blk[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) {
+        const uint32_t af[4] = {__byte_perm(a[kt].x, a[kt].y, 0x5410), __byte_perm(a[kt].x, a[kt].y, 0x7632),
+                                __byte_perm(a[kt].z, a[kt].w, 0x5410), __byte_perm(a[kt].z, a[kt].w, 0x7632)};
+        const uint2 bv = __ldg(xrow + size_t((kb * 4 + kt) * groups_total + i) * 32);
+        mma_e4m3(blk, af, bv.x, bv.y);
+      }
+      const float2 sa = __ldg(reinterpret_cast<const float2*>(sxa + size_t(kb) * stride + m0 + i * 8 + c));
+      acc[i][0] += blk[0] * (lo * sa.x);
+      acc[i][1] += blk[1] * (lo * sa.y);
+      acc[i][2] += blk[2] * (hi * sa.x);
+      acc[i][3] += blk[3] * (hi * sa.y);
+    }
+  }
+  const int row_lo = rt * 16 + g, row_hi = row_lo + 8;
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int m = m0 + i * 8 + c + (j & 1);
+      const int col = j < 2 ? row_lo : row_hi;
+      if (m >= rows) continue;
+      if (out_f32) {
+        static_cast<float*>(out)[size_t(m) * n + col] = acc[i][j];
+      } else {
+        static_cast<__nv_bfloat16*>(out)[size_t(m) * n + col] = __float2bfloat16(acc[i][j]);
+      }
+    }
+  }
+}
+
+// Largest multiple of a 128-row grid tile whose packed activations and their
+// scales fit in `workspace_bytes` after the wide layout's row scales, maxima
+// and fragment arena (which the E4M3 B fragments' uint2 view shares): k bytes
+// an activation row for xq, k / 128 FP32 each for sxa, and 256-byte
+// alignment per region. 0 when not even one tile fits (the caller keeps the
+// pass loop then). The base is `run_wide`'s fragment offset.
+int w8a8_tile_rows(size_t workspace_bytes, int rows, int k) {
+  const size_t base = align256(2 * kWideRows * sizeof(float)) + align256(row_max_bytes(k, kWideRows));
+  if (workspace_bytes <= base) return 0;
+  const size_t per_row = size_t(k) + size_t(k / 128) * 4;
+  size_t fits = (workspace_bytes - base) / per_row / 128 * 128;
+  const size_t want = size_t(rows + 127) / 128 * 128;
+  if (fits > want) fits = want;
+  // The exact regions round up to 256 bytes; step down a tile if the estimate lands a byte over.
+  for (int tile = int(fits); tile >= 128; tile -= 128) {
+    const size_t need = align256(size_t(k) * tile) + align256(size_t(k / 128) * tile * sizeof(float));
+    if (need <= workspace_bytes - base) return tile;
+  }
+  return 0;
+}
+
+// run_wide's W8A8 route for more than kMaxRows rows: whole-height passes of
+// `w8a8_tile_rows` rows, each one pack kernel and one single-split 2D-grid
+// GEMM writing `out` directly (see gemv_w8a8_wide_kernel). Activations are
+// packed per pass, so xq and sxa live in the workspace the split partials
+// would have taken.
+int32_t run_wide_w8a8(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32, int32_t rows,
+                      int32_t k, int32_t n, int tile, void* workspace, void* stream) {
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  uint8_t* ws = static_cast<uint8_t*>(workspace);
+  const size_t base = align256(2 * kWideRows * sizeof(float)) + align256(row_max_bytes(k, kWideRows));
+  const uint4* wp = static_cast<const uint4*>(packed);
+  const float* sc = static_cast<const float*>(scale);
+  const size_t out_row = size_t(n) * (out_f32 ? 4 : 2);
+  const dim3 block(kWarps * 32);
+  for (int first = 0; first < rows; first += tile) {
+    const int m = rows - first < tile ? rows - first : tile;
+    const int stride = (m + 127) / 128 * 128;  // whole grid tiles: padding rows pack as zero at scale 1
+    const int groups = stride / 8;
+    uint2* xq = reinterpret_cast<uint2*>(ws + base);
+    float* sxa = reinterpret_cast<float*>(ws + base + align256(size_t(k) * stride));
+    const __nv_bfloat16* xm = static_cast<const __nv_bfloat16*>(x) + size_t(first) * k;
+    void* om = static_cast<uint8_t*>(out) + size_t(first) * out_row;
+    pack_x_e4m3_kernel<<<dim3(k / 128, groups), 32, 0, s>>>(xm, xq, sxa, m, k, groups, stride);
+    const dim3 grid((n / 16 + kWarps - 1) / kWarps, stride / 128);
+    gemv_w8a8_wide_kernel<16><<<grid, block, 0, s>>>(wp, sc, xq, sxa, om, out_f32, m, n, k, groups, stride);
+  }
+  return cudaGetLastError();
+}
+
 // reduce_kernel for W8A8 partials, which carry their scales: the K splits'
 // sum in split order.
 __global__ void reduce_w8a8_kernel(const float* __restrict__ partial, void* __restrict__ out, int out_f32, int rows,
@@ -575,14 +697,27 @@ extern "C" int32_t cuteafd_fp8_w8a16_linear(const void* x, const void* packed, c
 namespace {
 
 // out = x @ W^T in passes of kWideRows rows; with `w8a8`, a pass of more than
-// kW8a16Rows rows takes E4M3 activations. A pass of up to kMaxRows rows on the
-// f16 path is one chunk of cuteafd_fp8_w8a16_linear and runs there (the same
-// kernels and bits); the wide passes launch the kernels above at 16 groups.
+// kW8a16Rows rows takes E4M3 activations, and more than kMaxRows rows take the
+// whole-height single-split route instead of the loop (run_wide_w8a8). A pass
+// of up to kMaxRows rows on the f16 path is one chunk of
+// cuteafd_fp8_w8a16_linear and runs there (the same kernels and bits); the wide
+// passes launch the kernels above at 16 groups.
 int32_t run_wide(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32, int32_t rows,
                  int32_t k, int32_t n, bool w8a8, void* workspace, size_t workspace_bytes, void* stream) {
   if (rows < 1 || n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
   if (workspace_bytes < wide_bytes(rows, k, n, w8a8)) return cudaErrorInvalidValue;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  // Past a draft block worth of rows the passes stop paying for their split-K:
+  // the whole height is enough tiles to fill the device, so route it through
+  // one single-split 2D-grid pass per activation tile, outputs written straight
+  // out (two pack + GEMM pairs for the 20480-wide tap projection, one each for
+  // the 4096-wide KV slices, against 48 kernels before).
+  if (w8a8 && rows > kMaxRows) {
+    const int tile = w8a8_tile_rows(workspace_bytes, rows, k);
+    if (tile >= 128) {
+      return run_wide_w8a8(x, packed, scale, out, out_f32, rows, k, n, tile, workspace, stream);
+    }
+  }
   uint8_t* ws = static_cast<uint8_t*>(workspace);
   float* sx = reinterpret_cast<float*>(ws);
   // gemv_kernel and reduce_kernel read a row's inverse at [kMaxRows + m].
