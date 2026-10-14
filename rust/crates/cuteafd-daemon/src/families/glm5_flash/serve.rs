@@ -399,7 +399,7 @@ impl SharedPolicy {
         crate::shared::draft::apply_length_rule(&mut policy);
         engine.arm_draft_probe(engine.decode_rows)?;
         let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
-        let trace = crate::shared::draft_policy::enabled("CUTEAFD_GLMF_DRAFT_TRACE");
+        let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
         Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })
     }
 
@@ -927,7 +927,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
-    let mut trace = crate::shared::speculation_trace::Trace::open("CUTEAFD_GLMF_TRACE")?;
+    let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let mut trace_round = 0u64;
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);

@@ -512,7 +512,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     } else { None };
     let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
 
-    let mut trace = crate::shared::speculation_trace::Trace::open("CUTEAFD_MIMO_TRACE")?;
+    let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()

@@ -146,7 +146,7 @@ fn replay_trace() -> Option<&'static crate::shared::speculation_trace::Trace> {
     use std::sync::OnceLock;
     static TRACE: OnceLock<Option<crate::shared::speculation_trace::Trace>> = OnceLock::new();
     TRACE.get_or_init(|| {
-        match crate::shared::speculation_trace::Trace::open("CUTEAFD_DRAFT_CONFIDENCE_TRACE") {
+        match crate::shared::speculation_trace::Trace::open() {
             Ok(trace) => trace,
             Err(error) => { tracing::warn!(%error, "draft replay trace open failed"); None }
         }
