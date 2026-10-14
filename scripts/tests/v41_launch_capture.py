@@ -218,12 +218,30 @@ def example_config(name: str, directory: Path) -> Path:
     return config
 
 
+def append_config(config: Path, lines: str) -> Path:
+    """Append KEY=VALUE lines to a config the capture is about to launch.
+
+    The launcher exits 2 when a line names a key that family never reads
+    (`unused configuration key`). `capture` raises RuntimeError with that stderr.
+    V4.1 has no KV-precision choice, so `KV_CACHE` is one of those keys.
+    """
+    text = config.read_text()
+    if text and not text.endswith("\n"):
+        text += "\n"
+    config.write_text(text + (lines if lines.endswith("\n") else lines + "\n"))
+    return config
+
+
 def normalize(value: str, root: Path) -> str:
     return value.replace(str(root), "<root>")
 
 
 def capture(launcher_root: Path, case: str) -> dict:
-    """Run LAUNCHER_ROOT/run.sh for one case; return the recorded serving containers."""
+    """Run LAUNCHER_ROOT/run.sh for one case; return the recorded serving containers.
+
+    A non-zero exit (unknown key, unused key, bad value) raises RuntimeError
+    with the launcher stderr.
+    """
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as temporary:
         root = Path(temporary)
         (root / "bin").mkdir()

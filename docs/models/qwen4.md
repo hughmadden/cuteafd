@@ -29,6 +29,8 @@ placeholder Spark hosts and addresses): EXL3 K4.25 [min](../../examples/configs/
   feedback path). The launcher defaults to MTP3 with resident local EXL3 or
   NVFP4 experts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
   depth. The policy adapts the number of drafts to concurrency and acceptance.
+- KV precision: `KV_CACHE=bf16|fp8` (default `fp8`), forwarded as `--kv-cache`
+  on plan and serve.
 - RTX/Spark layouts: qualified EXL3 fits on one RTX with resident local
   experts; the official FP8 expert package (~173 GB) does not fit one RTX.
   Spark EXL3 supports whole-expert TP1 and TP4 using uneven intermediate
