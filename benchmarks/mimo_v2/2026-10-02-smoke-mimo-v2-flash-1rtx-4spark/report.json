@@ -398,6 +398,31 @@
     "run_id": "19eb19f7b8b44f88bab854ff39da4938",
     "created": "2026-10-02T07:32:35Z",
     "card": {
+      "concurrency": [
+        {
+          "width": 1,
+          "aggregate_tok_s": 70.87699350856569,
+          "per_stream_median_tok_s": 70.87699350856569,
+          "decode_s": 4.500755241,
+          "runs": [
+            {
+              "sent_s": 0.0,
+              "timing": {
+                "prompt_tokens": 78,
+                "completion_tokens": 320,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "ttft_s": 0.211035429,
+                "total_s": 4.711825422,
+                "decode_s": 4.500755241,
+                "reasoning_end_s": null,
+                "finish_reason": "length"
+              }
+            }
+          ],
+          "warmup_s": 2.05852168
+        }
+      ],
       "decode": [
         {
           "content": "code",

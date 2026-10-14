@@ -142,6 +142,7 @@
       "speculator": null,
       "layout": "planner-only: 1 capped coordinator + 6 Sparks",
       "settings": [
+        {"name": "qualification.caveat", "value": "Memory rejection with all six Sparks (rc3 planner); no server launched, no performance.", "default": null, "source": "publication"},
         {
           "name": "qualification.no-fit",
           "value": "rtx0 full memory layout needs 33511016304 bytes, budget 31031138713 bytes, shortfall 2479877591 bytes",
