@@ -20,7 +20,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Astra 6 (Codex) | hard kernel design | — | expensive; once spent a week on probe plumbing | few |
 | DeepSeek Flash | structural, mechanical | — | — | none recently |
 | Claude Opus 5.5 (orchestrator) | design, review, merges, decisions | fast cross-task diagnosis (#191 Spark regression, stale CMake cache) | pushed a red commit once (61256a22); held agents for an answer while GPUs idled; wrong guesses before evidence (masked-V, cold-start) | this session |
-| Grok 4.7 (xAI, CLI `grok`) | to be determined | — | — | trial starting 2026-10-14 |
+| Grok 4.7 (xAI, CLI `grok`) | bounded fixes, tests, races (early) | found a real race behind a "flaky test" and proved it deterministically | — (1 task) | 1 task |
 | Gemini 4 Argon (Antigravity, CLI `agy`) | to be determined: kernels, deep research, vision | — | first call returned a transient 503 | trial starting 2026-10-14 |
 
 ## Log
@@ -33,3 +33,5 @@ Rubric, each 1–5 (5 best), plus wall time:
 | 2026-10-14 | Sol 6.1 | V4 layers stages 2–3 | 4 | 4 | 4 | 4 | ongoing | careful; one wrong "Spark suffix" claim, self-corrected |
 | 2026-10-14 | Sol 6.1 | card renderer #203 | 5 | 5 | 5 | 4 | ~3 h | caught publisher drift and hand-edited caveats |
 | 2026-10-14 | Opus (orchestrator) | merges | 4 | 3 | 4 | — | — | pushed 61256a22 with a failing test; later gated pushes on green |
+| 2026-10-14 | Grok 4.7 | flaky prefill-cancel test (#208) | 5 | 5 | 5 | 5 | ~25 min | brief said test flake; found a real race in qualify-prefix-cache's cancel flag (timer.is_alive vs socket shutdown), fixed with an event + join, removed the sleep loop, proved it by forcing the window (40/40 before fails, after passes); full suite green. Merged as-is. |
+| 2026-10-14 | Gemini 4 Argon | #175 kernel duel | — | — | — | — | — | first launch failed on my launcher (prompt quoting, then --effort with a model); retrying through agy 503s |

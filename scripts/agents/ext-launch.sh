@@ -16,6 +16,7 @@ name="${2:?task name}"
 model="${3:-}"
 effort="${4:-high}"
 [[ -f "$runs/$name.md" ]] || { echo "missing $runs/$name.md" >&2; exit 2; }
+[[ "$tool" == grok || "$tool" == agy ]] || { echo "unknown tool: $tool, expected grok or agy" >&2; exit 2; }
 session="ext-$name"
 if tmux has-session -t "$session" 2>/dev/null; then
   echo "$session is already running; stop it first" >&2
@@ -40,7 +41,6 @@ runner="$runs/$name.run.sh"
       echo "  grep -q 'Eligibility check failed: UNAVAILABLE' /tmp/agy-\$\$.out || break"
       echo '  echo "agy 503, retry $attempt in 60 s"; sleep 60'
       echo "done; rm -f /tmp/agy-\$\$.out" ;;
-    *) echo "unknown tool $tool (grok or agy)" >&2; exit 2 ;;
   esac
   echo 'echo "exit $rc"'
 } > "$runner"
