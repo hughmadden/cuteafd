@@ -34,4 +34,4 @@ Rubric, each 1–5 (5 best), plus wall time:
 | 2026-10-14 | Sol 6.1 | card renderer #203 | 5 | 5 | 5 | 4 | ~3 h | caught publisher drift and hand-edited caveats |
 | 2026-10-14 | Opus (orchestrator) | merges | 4 | 3 | 4 | — | — | pushed 61256a22 with a failing test; later gated pushes on green |
 | 2026-10-14 | Grok 4.7 | flaky prefill-cancel test (#208) | 5 | 5 | 5 | 5 | ~25 min | brief said test flake; found a real race in qualify-prefix-cache's cancel flag (timer.is_alive vs socket shutdown), fixed with an event + join, removed the sleep loop, proved it by forcing the window (40/40 before fails, after passes); full suite green. Merged as-is. |
-| 2026-10-14 | Gemini 4 Argon | #175 kernel duel | — | — | — | — | — | first launch failed on my launcher (prompt quoting, then --effort with a model); retrying through agy 503s |
+| 2026-10-14 | Gemini 4 Argon | #175 kernel duel (plain -p) | — | — | — | — | ~1 h, no output | not scored: my -p launcher failed twice (prompt quoting, --effort with a model), then the run sat invisible behind a 503 retry for ~1 h and was stopped. Lesson: -p mode gives no visibility; use ext-agent with a driver. To rerun driven. |
