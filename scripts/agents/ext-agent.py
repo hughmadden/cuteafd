@@ -88,6 +88,8 @@ class Adapter:
         if (re.search(r'^[\s]*[⠁-⣿]', '\n'.join(lines[-5:]), re.M) or
                 re.search(self.busy, '\n'.join(lines[-2:])) or
                 re.search(r'\b[1-9][0-9]* queued\b|edit queued messages', '\n'.join(lines[-2:])) or
+                # Grok shows its prompt while a background command runs.
+                re.search(r'\b[1-9][0-9]* commands? still running\b', '\n'.join(lines[-4:])) or
                 re.search(r'^[\s⠀-⣿]*(?:Waiting for response|Thinking|Working|Responding|Running command|Loading)[^\n]*', '\n'.join(lines[-3:]), re.M)):
             return 'busy'
         # Only inspect the current turn, not old questions/errors in scrollback.

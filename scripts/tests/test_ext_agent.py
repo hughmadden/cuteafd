@@ -436,6 +436,11 @@ def test_visible_prompt_stream_growth_is_not_idle(cli):
     assert result['state'] == 'idle' and result['seconds_since_output'] >= 2
 
 
+def test_running_background_command_with_prompt_is_busy():
+    text = '◆ Task started: Test cuteafd-core\n◎ 1 command still running · send a message to interrupt\n❯\nGrok 4.7 (high) · always-approve · 159K / 256K (62%) · ctrl+o transcript\n'
+    assert driver.ADAPTERS['grok'].state(text, {'submitted_at': 1}) == 'busy'
+
+
 def test_bare_spinner_with_prompt_is_busy():
     assert driver.Grok().state('⠸ Thinking...\n❯\nGrok 4.7 high', {}) == 'busy'
     assert driver.Agy().state('⠸ Streaming response...\n>\n? for shortcuts', {}) == 'busy'
