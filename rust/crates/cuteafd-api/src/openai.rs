@@ -341,7 +341,9 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
 }
 /// GPU throttle report over `[from, to]` seconds on the report clock (`now_s` in the reply).
 /// Without `from`, the reply carries only the current readings and the clock, so a client can
-/// mark a phase's start and later ask for exactly that interval.
+/// mark a phase's start and later ask for exactly that interval. `current.queried_s` is when
+/// those readings were read; each GPU's `sampled_s` is the time of the sample they came from
+/// (`null` when that GPU has no sample yet). Window bounds stay on `now_s`.
 #[derive(serde::Deserialize)]
 struct ThermalWindow { from: Option<f64>, to: Option<f64> }
 async fn thermal_route(axum::extract::Query(q): axum::extract::Query<ThermalWindow>) -> Json<Value> {
