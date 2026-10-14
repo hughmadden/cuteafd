@@ -306,6 +306,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         kda_decode = {"seq_ctas": 8, "decode_tiles": True} if mode == "decode" else {}
         # Prefill mHC mixes run on TF32 tensor cores (split FP32 fn) from 384 rows.
         route = None if mode == "decode" else "tf32"
+        mhc_groups = ({"wide_partials_per_cta": 25, "wide_min_rows": 64}
+                      if mode == "decode" and mhc.mhc_post_pre_route(rows) == "decode" else {})
         out += [
             (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
              lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
@@ -313,8 +315,9 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows: glmf.compile_glmf_index_producer_c_aot(g, max_rows=r)),
             (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": pool_pages},
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
-            (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
-             lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
+            (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route, **mhc_groups},
+             lambda r=rows, rt=route, groups=mhc_groups: mhc.compile_dsv4_mhc_post_pre_aot(
+                 mg, max_rows=r, route=rt, **groups)),
             (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8, **kda_decode},
              lambda r=rows, f=f8, kd=kda_decode: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f, **kd)),
             (f"kda_w8_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode},
@@ -376,8 +379,10 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_index_producer_c_aot(g, max_rows=r, verify_rows=r)),
         (f"index_topk_decode_m{r}", "index_topk", {"mode": "decode", "max_rows": r, "max_pages": pool_pages},
          lambda: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode="decode")),
-        (f"mhc_post_pre_m{r}", "mhc_post_pre", {"max_rows": r, "route": "decode"},
-         lambda: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route="decode")),
+        (f"mhc_post_pre_m{r}", "mhc_post_pre", {"max_rows": r, "route": "decode",
+                                              "wide_partials_per_cta": 25, "wide_min_rows": 64},
+         lambda: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route="decode",
+                                                wide_partials_per_cta=25, wide_min_rows=64)),
         (f"kda_m{r}", "kda", {"max_rows": r, "fp8": True, "seq_ctas": 8, "decode_tiles": True},
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, seq_ctas=8, decode_tiles=True)),
         (f"kda_w8_m{r}", "kda", {"max_rows": r, "fp8_only": "decode"},
