@@ -68,15 +68,15 @@ impl NativeLibrary {
     fn validate_output_reduction(&self, capacity: u32, k: u32, n: u32)
         -> Result<Option<cuteafd_core::coordinator_programs::OutputReductionPlan>> {
         if k != 8192 || !matches!(n, 5120 | 2560) { return Ok(None); }
-        let serial = self.v41_output_reduction_info(1, k, n)?;
+        let canonical = self.v41_output_reduction_info(16, k, n)?;
         for rows in capacities(capacity)?.into_iter().filter(|&rows| rows <= 80) {
             let recipe = self.v41_output_reduction_info(rows, k, n)?;
-            cuteafd_core::coordinator_programs::OutputReductionPlan::serial(
-                rows as usize, serial.split_slices as usize)?.validate(rows as usize,
+            cuteafd_core::coordinator_programs::OutputReductionPlan::new(
+                rows as usize, canonical.expected_rows as usize, canonical.split_slices as usize)?.validate(rows as usize,
                     recipe.expected_rows as usize, recipe.split_slices as usize, recipe.all_rows == 1)?;
         }
-        Ok(Some(cuteafd_core::coordinator_programs::OutputReductionPlan::serial(
-            capacity.min(80) as usize, serial.split_slices as usize)?))
+        Ok(Some(cuteafd_core::coordinator_programs::OutputReductionPlan::new(
+            capacity.min(80) as usize, canonical.expected_rows as usize, canonical.split_slices as usize)?))
     }
     pub fn v41_fp8_matrix_plan_info(
         &self,

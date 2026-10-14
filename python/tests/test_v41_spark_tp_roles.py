@@ -158,7 +158,7 @@ def test_packer_accepts_tp3_extent_and_requires_scale_alignment() -> None:
     assert "intermediate % 32 != 0" in pack
 
 
-SPARK_WIDTH_DEFAULT = "1:64,16:64,80:64,256:192,1024:192,4096:192"
+SPARK_WIDTH_DEFAULT = "1:192,16:192,80:192,256:192,1024:192,4096:192"
 
 
 def test_spark_tp_width_maps_are_per_role_cache_knobs_with_identical_defaults() -> None:
@@ -378,7 +378,7 @@ def _slice_recipe():
     return namespace["numerical_recipe"]
 
 
-def test_decode_width_recipe_preserves_m1_and_prefill() -> None:
+def test_decode_width_recipe_uses_wide_arithmetic_for_m1() -> None:
     tree = ast.parse(EXPERTS.read_text())
     widths = next(node.value for node in ast.walk(tree)
                   if isinstance(node, ast.Assign)
@@ -386,23 +386,40 @@ def test_decode_width_recipe_preserves_m1_and_prefill() -> None:
                           for target in node.targets))
     rows = (1, 16, 80, 256, 1024, 4096)
     selected = eval(compile(ast.Expression(widths), str(EXPERTS), "eval"), {"rows": rows})
-    assert selected == {1: 64, 16: 64, 80: 64, 256: 192, 1024: 192, 4096: 192}
+    assert selected == {capacity: 192 for capacity in rows}
     tp = CMAKE_TP.read_text()
     for degree in (2, 3, 6):
-        assert f'SPARK_TP{degree}_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192"' in tp
+        assert f'SPARK_TP{degree}_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192"' in tp
+
+
+
+def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity() -> None:
+    source = ROOT / "python/tools/aot/export_b12x_v41_fp8_aot.py"
+    tree = ast.parse(source.read_text())
+    body = next(node.body for node in ast.walk(tree)
+                if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+                and node.test.id == "fixed_output")
+    recipe = compile(ast.Module(body=body, type_ignores=[]), str(source), "exec")
+    for capacity in (1, 16, 80):
+        namespace = {"capacity": capacity, "expected_m": capacity}
+        exec(recipe, namespace)
+        assert namespace["expected_m"] == 16
+    text = source.read_text()
+    assert "if fixed_output and split_k != 1:" in text
+    assert "'all_rows': fixed_output or capacity == 1" in text
 
 
 def test_native_manifest_records_inner_accumulation_and_outer_fold() -> None:
     recipe = _slice_recipe()
-    for intermediate, planes in ((576, 9), (1152, 18), (768, 12), (384, 6)):
-        serial = recipe(64, intermediate, atomic=False, compact=False)
-        assert serial["fc2_k_steps"] == 2
+    for intermediate, planes in ((576, 3), (1152, 6), (768, 4), (384, 2)):
+        serial = recipe(192, intermediate, atomic=False, compact=False)
+        assert serial["fc2_k_steps"] == 6
         assert serial["plane_count"] == planes
         assert serial["plane_fold"] == "ascending_fp32"
         assert serial["output_kind"] == "fp32_routes"
         prefill = recipe(192, intermediate, atomic=True, compact=False)
         assert prefill["fc2_k_steps"] == 6
-        assert prefill["plane_count"] == planes // 3
+        assert prefill["plane_count"] == planes
         assert prefill["plane_fold"] == "atomic_tokens"
         assert prefill["output_kind"] == "fp32_tokens"
         assert prefill != serial

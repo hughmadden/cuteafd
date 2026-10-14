@@ -59,11 +59,11 @@ pub struct OutputReductionPlan {
 }
 
 impl OutputReductionPlan {
-    pub fn serial(capacity_rows: usize, split_slices: usize) -> Result<Self, OutputPlanError> {
-        if capacity_rows == 0 || !matches!(split_slices, 1 | 2 | 4) {
+    pub fn new(capacity_rows: usize, expected_rows: usize, split_slices: usize) -> Result<Self, OutputPlanError> {
+        if capacity_rows == 0 || expected_rows == 0 || !matches!(split_slices, 1 | 2 | 4) {
             return Err(OutputPlanError::InvalidRecipe);
         }
-        Ok(Self { capacity_rows, expected_rows: 1, split_slices })
+        Ok(Self { capacity_rows, expected_rows, split_slices })
     }
     pub fn expected_rows(self) -> usize { self.expected_rows }
     pub fn split_slices(self) -> usize { self.split_slices }
@@ -262,16 +262,17 @@ mod tests {
 
     #[test]
     fn output_recipe_is_immutable_and_rejects_partial_row_exports() {
-        let plan = OutputReductionPlan::serial(64, 2).unwrap();
+        let plan = OutputReductionPlan::new(64, 16, 1).unwrap();
         for _rows in 1..=64 {
-            assert_eq!((plan.expected_rows(), plan.split_slices()), (1, 2));
-            assert!(plan.validate(80, 1, 2, true).is_ok());
+            assert_eq!((plan.expected_rows(), plan.split_slices()), (16, 1));
+            assert!(plan.validate(80, 16, 1, true).is_ok());
         }
-        assert!(plan.validate(16, 1, 2, true).is_err());
-        assert!(plan.validate(80, 16, 1, true).is_err());
-        assert!(plan.validate(80, 1, 2, false).is_err());
-        assert!(OutputReductionPlan::serial(0, 2).is_err());
-        assert!(OutputReductionPlan::serial(64, 3).is_err());
+        assert!(plan.validate(16, 16, 1, true).is_err());
+        assert!(plan.validate(80, 1, 2, true).is_err());
+        assert!(plan.validate(80, 16, 1, false).is_err());
+        assert!(OutputReductionPlan::new(0, 16, 1).is_err());
+        assert!(OutputReductionPlan::new(64, 0, 1).is_err());
+        assert!(OutputReductionPlan::new(64, 16, 3).is_err());
     }
 
     #[test]

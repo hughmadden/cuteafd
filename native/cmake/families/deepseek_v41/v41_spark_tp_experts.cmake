@@ -33,8 +33,8 @@ set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS 1 16 80 256 1024 4096)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096")
-# Decode capacities through 80 share the serial width-64 reduction recipe;
-# prefill capacities retain width 192.
+# Decode capacities share the fast width-192, six-K-step reduction recipe;
+# prefill keeps its existing direct-token fold.
 # Per-role cache strings so a build can select a width map for TP2, TP3 and TP6
 # independently (for example a capacity-80 candidate) without patching this file.
 # Each value is either a
@@ -44,11 +44,11 @@ set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096")
 # accepted here. For TP6 the extra `slices * width <= kernel_intermediate`
 # relation (384 % 32 == 0, so 384/64, 384/128 and 384/192 all tile exactly) is
 # checked by the exporter's slice kernel too; an untileable width fails there.
-set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP2 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP3 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP6 expert slice width: scalar 64/128/192 or capacity:width map")
 
 foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
