@@ -192,13 +192,20 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
             default: None, source: "cli".into() });
     }
-    let requested = std::env::var("CUTEAFD_ATTENTION_PLACEMENT").unwrap_or_else(|_| "auto".into());
+    // The parsed flag already applies CUTEAFD_ATTENTION_PLACEMENT (cli over env over
+    // default). Report that resolution once; the launch spelling is the same option.
+    let requested = sub.try_get_one::<String>("attention_placement").ok().flatten().map(String::as_str)
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CUTEAFD_ATTENTION_PLACEMENT").ok())
+        .unwrap_or_else(|| "auto".into());
     // Reject an unrunnable placement before loading CUDA or starting workers.
     let mode = attention_mode(family, sub, &requested)?;
     let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
-    settings.extend(cuteafd_bench::context::env_settings());
+    settings.extend(cuteafd_bench::context::env_settings().into_iter()
+        .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     cuteafd_bench::context::set(cuteafd_bench::context::ServerContext { command: name.to_string(),
         family: Some(family.to_string()), snapshot, settings });
     Ok(())
@@ -219,6 +226,13 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    /// `capture` writes one process-wide server context. Tests that read it back
+    /// hold this for the whole check so a parallel test cannot replace it mid-assert.
+    fn context_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn context_load_arguments_parse_and_validate() {
@@ -254,6 +268,7 @@ mod tests {
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
+        let _guard = context_lock();
         let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
@@ -276,5 +291,38 @@ mod tests {
         assert_eq!(output.source, "default");
         assert!(!output.differs());
         assert!(!context.settings.iter().any(|s| s.name == "no-copy-drafts"));
+    }
+
+    #[test]
+    fn attention_placement_is_reported_once_as_the_resolved_value() {
+        let _guard = context_lock();
+        let serve = |extra: &[&str]| {
+            let argv = ["cuteafd", "serve-glmf", "--snapshot", "/s", "--native-lib", "/l"].into_iter()
+                .chain(extra.iter().copied()).collect::<Vec<_>>();
+            crate::cli::Cli::command().try_get_matches_from(argv).unwrap()
+        };
+        let placement = || cuteafd_bench::context::get().settings.into_iter()
+            .filter(|s| s.name == "attention-placement" || s.name == "CUTEAFD_ATTENTION_PLACEMENT").collect::<Vec<_>>();
+        capture(&serve(&["--split-device", "1", "--attention-placement", "context"]), None).unwrap();
+        let placed = placement();
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!((placed[0].value.as_deref(), placed[0].default.as_deref(), placed[0].source.as_str()),
+            (Some("context"), Some("context"), "resolved"));
+        // An older capture left the launch spelling beside the resolved mode. Admission keeps one.
+        let mut stale = cuteafd_bench::context::get();
+        stale.settings.retain(|s| s.name != "attention-placement");
+        stale.settings.extend([
+            Setting { name: "attention-placement".into(), value: Some("auto".into()), default: Some("auto".into()), source: "env".into() },
+            Setting { name: "attention-placement".into(), value: Some("context".into()), default: Some("context".into()), source: "resolved".into() },
+        ]);
+        cuteafd_bench::context::set(stale);
+        cuteafd_bench::context::set_resolved("attention-placement", "context");
+        let placed = placement();
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].value.as_deref(), Some("context"));
+        capture(&serve(&[]), None).unwrap();
+        let placed = placement();
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].value.as_deref(), Some("heads"));
     }
 }

@@ -58,15 +58,21 @@ pub fn set(context: ServerContext) {
 }
 
 /// Records a value the engine resolved at admission (the resolved onboard
-/// and KV pool), replacing the launch-time setting of that name so the
-/// card's configuration panel shows what actually served.
+/// and KV pool), replacing every launch-time setting of that name so the
+/// card's configuration panel shows what actually served, once.
 pub fn set_resolved(name: &str, value: &str) {
     if let Ok(mut slot) = state().context.lock() {
-        let setting = Setting { name: name.into(), value: Some(value.into()), default: None, source: "resolved".into() };
-        match slot.settings.iter_mut().find(|s| s.name == name) {
-            Some(existing) => *existing = Setting { default: existing.default.clone(), ..setting },
-            None => slot.settings.push(setting),
-        }
+        let mut resolved = Setting { name: name.into(), value: Some(value.into()), default: None, source: "resolved".into() };
+        let mut replaced = false;
+        slot.settings.retain_mut(|existing| {
+            if existing.name != resolved.name { return true; }
+            if replaced { return false; }
+            resolved.default = existing.default.clone();
+            *existing = resolved.clone();
+            replaced = true;
+            true
+        });
+        if !replaced { slot.settings.push(resolved); }
     }
 }
 
