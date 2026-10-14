@@ -42,6 +42,7 @@ def exporter(monkeypatch):
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
+    package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
     package.context_split.sparse_mla_partial_split_plan = lambda g, **kw: {
         (170, 1): 32, (170, 8): 8, (170, 64): 1, (188, 1): 32, (188, 8): 11, (188, 64): 4}[(kw["sm_count"], kw["max_rows"])]
@@ -153,7 +154,8 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
     assert kwargs["kda_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["kda_s16_m128"] == {"max_rows": 128, "fp8": True, "state_dtype": "bfloat16",
                                       "state_rounding": "window", "seq_ctas": 8, "decode_tiles": True}
-    assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
+    assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode",
+                                            "wide_partials_per_cta": 25, "wide_min_rows": 64}
     # Wide execution shares the m64 numerical recipe domain.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
                                                 "fp32_partials": True, "plan_capacity_rows": 64, "sm_count": None}
@@ -168,6 +170,26 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
         assert kwargs[stem] == {"max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i2048_m128"] == {"inter": 2048, "max_rows": 128, "fp8_only": "decode"}
     assert kwargs["ffn_i12288_m128"] == {"inter": 12288, "max_rows": 128, "fp8_only": "decode"}
+
+
+def test_glmf_decode_partial_fusion_is_opt_in_and_prefill_unchanged(exporter):
+    groups = {"glmf": exporter.glmf_programs(GEOMETRY, 64, 4096, 1048576)
+              + exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 1048576),
+              "glmf2": exporter.glmf_head_split_programs(GEOMETRY, 64, 4096, 1048576)}
+    changed = set()
+    for prefix, programs in groups.items():
+        for stem, op, params, thunk in programs:
+            if op != "mhc_post_pre":
+                continue
+            kwargs = thunk()[3]
+            if stem in ("mhc_post_pre_m64", "mhc_post_pre_m128"):
+                assert params["wide_partials_per_cta"] == kwargs["wide_partials_per_cta"] == 25
+                assert params["wide_min_rows"] == kwargs["wide_min_rows"] == 64
+                changed.add(f"{prefix}_{stem}")
+            else:
+                assert "wide_partials_per_cta" not in params
+                assert "wide_partials_per_cta" not in kwargs
+    assert changed == {"glmf_mhc_post_pre_m64", "glmf_mhc_post_pre_m128"}
 
 
 def test_only_five_bf16_decode_stems_use_parallel_tiled_kda(exporter):
