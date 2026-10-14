@@ -170,10 +170,11 @@ fn serve_flow_probe(
     // The coordinator reads, then says done (or closes); only then does the
     // exposed buffer go away.
     match read_control_value(reader) {
-        Ok(done) => anyhow::ensure!(
-            control_message(&done)? == FLOW_PROBE_DONE,
-            "RDMA flow probe expected {FLOW_PROBE_DONE}"
-        ),
+        Ok(done) => {
+            anyhow::ensure!(control_message(&done)? == FLOW_PROBE_DONE,
+                "RDMA flow probe expected {FLOW_PROBE_DONE}");
+            endpoint.traffic.sent(start.probe_bytes);
+        },
         Err(error) if error.to_string().contains("control plane closed") => {}
         Err(error) => return Err(error),
     }
@@ -226,6 +227,7 @@ fn probe_once(
         ready.read_rkey,
         PROBE_READ_TIMEOUT_MS,
     )?;
+    endpoint.traffic.received(probe_bytes);
     let after = counters.read()?;
     let _ = write_control(&mut stream, &serde_json::json!({ "message": FLOW_PROBE_DONE }));
     Ok(bond::classify(&before, &after, probe_bytes as u64))

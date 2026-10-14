@@ -66,6 +66,7 @@ impl Panel for DecodeContent {
         let mut rows = Vec::new();
         for (i, (content, prompt)) in CONTENT.iter().enumerate() {
             ctx.progress.step(i as f64 / CONTENT.len() as f64, *content);
+            let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
             let before = common::draft_counters(ctx.client);
             let chat = ctx.client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
@@ -73,7 +74,8 @@ impl Panel for DecodeContent {
             let acceptance = common::acceptance(before, common::draft_counters(ctx.client));
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
                 "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance,
-                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client))}));
+                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             ctx.progress.partial(json!({"rows": rows}));
         }
         let table_rows = rows.iter().map(|r| vec![r["content"].clone(), r["tok_s"].clone(), r["tokens"].clone(),
@@ -109,6 +111,7 @@ impl Panel for Concurrency {
             code_batch(ctx.client, c, 192).into_iter().collect::<Result<Vec<_>>>()
                 .with_context(|| format!("C{c} warm-up"))?;
             ctx.client.check()?;
+            let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
             let results = code_batch(ctx.client, c, 192);
             let errors = results.iter().filter(|r| r.is_err()).count();
@@ -117,7 +120,8 @@ impl Panel for Concurrency {
             let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
             points.push(json!({"c": c, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
                 "ttft_s": common::median(&mut ttft), "errors": errors,
-                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client))}));
+                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             ctx.progress.partial(json!({"points": points}));
         }
         let rows = points.iter().map(|p| vec![json!(format!("C{}", p["c"])), p["aggregate_tok_s"].clone(),
@@ -148,12 +152,14 @@ impl Panel for DraftMix {
             ctx.progress.step(0.4 * wave_index as f64, format!("C{width} mixed, wave {}", wave_index + 1));
             let bodies = (0..width).map(|i| plain(&format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
                 MIX_TOKENS)).collect();
+            let fabric_mark = ctx.client.fabric_mark();
             let results = wave(ctx.client, bodies);
             let errors = results.iter().filter(|r| r.is_err()).count();
             let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
             let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
             waves.push(json!({"c": width, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
-                "errors": errors}));
+                "errors": errors,
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("draft_mix/wave/{wave_index}"), true)}));
             ctx.progress.partial(json!({"waves": waves}));
         }
         let source = crate::panels::agentic::fixture(REWRITE_SOURCE).context("rewrite fixture missing")?;
@@ -163,6 +169,7 @@ impl Panel for DraftMix {
             let prompt = format!("[{}] Rewrite this Python module exactly as it is, adding a one-line comment \
                 `# reviewed` at the very top and changing nothing else. Output only the code.\n\n```python\n{source}```",
                 nonce());
+            let fabric_mark = ctx.client.fabric_mark();
             let before = common::round_counters(ctx.client);
             let drafts = common::draft_counters(ctx.client);
             let chat = ctx.client.chat(plain(&prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
@@ -170,7 +177,8 @@ impl Panel for DraftMix {
             let per_round = before.zip(after).and_then(|((r0, t0), (r1, t1))| (r1 > r0).then(|| (t1 - t0) / (r1 - r0)));
             rewrites.push(json!({"tok_s": chat.timing.decode_tok_s(), "tokens": chat.timing.completion_tokens,
                 "tokens_per_round": per_round,
-                "acceptance": common::acceptance(drafts, common::draft_counters(ctx.client))}));
+                "acceptance": common::acceptance(drafts, common::draft_counters(ctx.client)),
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("draft_mix/rewrite/{pass}"), true)}));
             ctx.progress.partial(json!({"waves": waves, "rewrite": rewrites}));
         }
         let mut rows: Vec<Vec<Value>> = waves.iter().enumerate().map(|(i, w)| vec![json!(format!("C{} mixed {}", w["c"], i + 1)),
@@ -205,17 +213,21 @@ impl Panel for Prefill {
             ctx.progress.step(i as f64 / lengths.len() as f64, format!("{}K", target / 1024));
             let text = sized_prompt(ctx, 1000 + i as u64, target, "Reply with the single word OK.");
             // Cold: a fresh prompt; its ids come back for the cached run.
+            let fabric_mark = ctx.client.fabric_mark();
             let cold = ctx.client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
             let ids = cold.probe.as_ref().filter(|r| r.engine.is_some()).map(|r| r.prompt_ids.clone());
             let mut point = json!({"target": target, "prompt_tokens": cold.timing.prompt_tokens,
-                "cold_ttft_s": cold.timing.ttft_s, "cold_tok_s": cold.timing.prefill_tok_s()});
+                "cold_ttft_s": cold.timing.ttft_s, "cold_tok_s": cold.timing.prefill_tok_s(),
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("prefill/{target}/cold"), true)});
             if let Some(ids) = ids.filter(|ids| ids.len() > 512) {
                 // Cached: retain all but the last 256 tokens, then send the whole prompt.
                 let cut = ids.len() - 256;
                 ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
                     ..ProbeSpec::default() }))?;
+                let fabric_mark = ctx.client.fabric_mark();
                 let cached = ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids.clone()),
                     ..ProbeSpec::default() }))?;
+                point["cached_fabric"] = json!(ctx.client.fabric_since(fabric_mark, &format!("prefill/{target}/cached"), true));
                 point["cached_tokens"] = json!(cached.timing.cached_tokens);
                 point["cached_ttft_s"] = json!(cached.timing.ttft_s);
             }
@@ -258,10 +270,12 @@ impl Panel for Retained {
             let question = format!("Ignore the notes. {}", CONTENT[1].1);
             let text = if context == 0 { format!("[{}] {question}", nonce()) }
                 else { sized_prompt(ctx, 2000 + i as u64, context, &question) };
+            let fabric_mark = ctx.client.fabric_mark();
             let chat = ctx.client.chat(plain(&text, 160), None)?;
             points.push(json!({"context": context, "prompt_tokens": chat.timing.prompt_tokens,
                 "decode_tok_s": chat.timing.decode_tok_s(), "ttft_s": chat.timing.ttft_s,
-                "tokens": chat.timing.completion_tokens}));
+                "tokens": chat.timing.completion_tokens,
+                "fabric": ctx.client.fabric_since(fabric_mark, &format!("retained/{context}"), true)}));
             ctx.progress.partial(json!({"points": points}));
         }
         let rows = points.iter().map(|p| vec![p["prompt_tokens"].clone(), p["decode_tok_s"].clone(),
@@ -289,14 +303,18 @@ impl Panel for PrefixCache {
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
                 filler(turn as u64 * 77, 120))}));
             let body = json!({"messages": history, "max_tokens": 64, "temperature": 0, "thinking": {"type": "disabled"}});
+            let fabric_mark = ctx.client.fabric_mark();
             let chat = ctx.client.chat(body.clone(), None)?;
+            let fabric = ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cached"), true);
             let mut cold_body = body.clone();
             cold_body["max_tokens"] = json!(1);
+            let fabric_mark = ctx.client.fabric_mark();
             let cold = ctx.client.chat(cold_body, Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
             let supported = cold.probe.as_ref().is_some_and(|r| r.engine.is_some());
             turns.push(json!({"turn": turn, "prompt_tokens": chat.timing.prompt_tokens,
                 "cached_tokens": chat.timing.cached_tokens, "ttft_s": chat.timing.ttft_s,
-                "cold_ttft_s": supported.then_some(cold.timing.ttft_s)}));
+                "cold_ttft_s": supported.then_some(cold.timing.ttft_s), "fabric": fabric,
+                "cold_fabric": ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cold"), true)}));
             history.push(json!({"role": "assistant", "content": chat.content}));
             ctx.progress.partial(json!({"turns": turns}));
         }

@@ -292,6 +292,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/assets/cuteafd-logo.svg", get(console::logo))
         .route("/assets/cuteafd-mark.svg", get(console::mark))
         .with_state(console);
+    cuteafd_transport::traffic::start();
     let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
     let mount = profile.gateway.clone();
     let state = NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) };
@@ -299,6 +300,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/health", get(health))
         .route("/v1/stats", get(stats_route))
         .route("/v1/thermal", get(thermal_route))
+        .route("/v1/fabric", get(|| async { Json(cuteafd_transport::traffic::snapshot()) }))
         .route("/v1/chat/completions", post(chat));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the

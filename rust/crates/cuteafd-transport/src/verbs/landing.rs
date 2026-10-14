@@ -110,6 +110,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let wire_bytes = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + header.output_payload_bytes as usize;
         anyhow::ensure!(wire_bytes <= config.max_frame_bytes,
             "GPU-landed response of {wire_bytes} bytes exceeds the frame budget");
+        self.endpoint.traffic.received(wire_bytes);
         // The device range is written again only by the response to this
         // session's next request, which its owner posts after consuming it.
         self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,

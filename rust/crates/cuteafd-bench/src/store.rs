@@ -134,7 +134,7 @@ mod tests {
         Report { schema: SCHEMA.into(), id: id.into(), created: created.into(), finished: None,
             status: RunStatus::Done, profile: "share".into(), plan: vec![],
             server: ServerInfo { model: "m".into(), ..ServerInfo::default() }, fingerprint: fingerprint.into(),
-            baseline: None, panels: vec![], error: None }
+            baseline: None, panels: vec![], fabric: vec![], error: None }
     }
 
     #[test]

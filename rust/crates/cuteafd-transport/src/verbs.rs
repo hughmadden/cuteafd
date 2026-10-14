@@ -2206,6 +2206,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         };
         // Write mode: responses are RDMA writes, so no receive is posted.
         let write_mode = start.write_target.is_some();
+        if write_mode { endpoint.traffic.receives_writes(); }
         for slot in (0..response_ring.depth).filter(|_| !write_mode) {
             endpoint.post_recv_at(
                 response_ring.slot_offset(slot),
@@ -2378,6 +2379,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             self.endpoint.library.rdma_rc_endpoint_post_send_slot_region(self.endpoint.info.handle, offset,
                 request_prefix.len(), region, payload_offset, request.hidden_payload.len(),
                 VERBS_HOST_SEND_WR_ID + request_send_slot as u64)?;
+            self.endpoint.traffic.sent(request_wire_bytes);
         } else if request.hidden_payload.len() >= PARALLEL_REQUEST_COPY_BYTES {
             // Prefill waves: one core copies ~10 GB/s, so staging the same
             // hidden rows for six ranks one after another delayed the last
@@ -2553,6 +2555,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     .min(config.max_frame_bytes)
             );
         }
+        self.endpoint.traffic.received(response_wire_bytes);
         let retained = match &mut self.retained_response_ring {
             Some(ring) => ring.try_retain_final(&self.endpoint, self.response_ring,
                                               self.response_recv_sequence, response_wire_bytes)?,
@@ -2758,6 +2761,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                         .min(config.max_frame_bytes)
                 );
             }
+            self.endpoint.traffic.received(response_wire_bytes);
             let mut response_frame = self.take_response_frame(response_wire_bytes, streaming)?;
             self.endpoint.copy_recv_at(
                 response_frame.as_mut(),
@@ -2988,6 +2992,7 @@ fn verbs_host_protocol_v2_roundtrip_blocking(
     endpoint.poll(1, 1, config.timeout)?;
     let mut response_frame = vec![0_u8; endpoint_plan.response_frame_bytes];
     endpoint.copy_recv(&mut response_frame, endpoint_plan.response_frame_bytes)?;
+    endpoint.traffic.received(endpoint_plan.response_frame_bytes);
     let response = ExpertProtocolV2Response::decode(&response_frame)
         .context("decoding verbs-host ProtocolV2 response frame")?;
     validate_response_matches_request(&response.header, &request)?;
@@ -3057,6 +3062,10 @@ fn handle_verbs_host_protocol_v2_connection(
             }
         }
         let message = control_message(&value)?;
+        if message == "fabric_traffic" {
+            write_control(&mut stream, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
+            return Ok(());
+        }
         if message == "mapped_rdma_ring_start" {
             let start: VerbsHostMappedRdmaRingStart = serde_json::from_value(value)
                 .context("decoding mapped RDMA ring start control message")?;
@@ -3111,6 +3120,7 @@ fn handle_verbs_host_protocol_v2_connection(
         endpoint.poll(0, 1, default_control_timeout())?;
         let mut request_frame = vec![0_u8; start.request_wire_bytes];
         endpoint.copy_recv(&mut request_frame, start.request_wire_bytes)?;
+        endpoint.traffic.received(start.request_wire_bytes);
         let request = ExpertProtocolV2RequestView::parse(&request_frame)
             .context("parsing verbs-host ProtocolV2 request frame")?;
         if request.header.request_id != start.request_id {
@@ -3168,6 +3178,7 @@ fn handle_mapped_protocol_v2_ring_connection(
             &request_storage[..EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN],
             request_capacity,
         )?;
+        ring.endpoint.traffic.received(request_wire_bytes);
         let request = ExpertProtocolV2RequestView::parse(&request_storage[..request_wire_bytes])
             .context("parsing mapped RDMA ring ProtocolV2 request")?;
         let device_payload = protocol_v2_request_device_payload(
@@ -3428,6 +3439,7 @@ struct NativeRdmaEndpoint {
     library: Arc<NativeLibrary>,
     info: CuteafdRdmaRcEndpointInfo,
     terminal_owner: Option<Arc<AtomicBool>>,
+    traffic: Arc<crate::traffic::WireCounter>,
 }
 
 impl NativeRdmaEndpoint {
@@ -3548,7 +3560,8 @@ impl NativeRdmaEndpoint {
             send_frame_bytes, recv_frame_bytes, send_span, recv_span,
             queue_depth, queue_depth, max_sge, host_buffer_flags,
         )?;
-        Ok(Self { library, info, terminal_owner: None })
+        Ok(Self { library, info, terminal_owner: None,
+            traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex)) })
     }
 
     fn send_buffer_view(&self) -> Result<CuteafdRdmaRcEndpointBufferView> {
@@ -3600,6 +3613,7 @@ impl NativeRdmaEndpoint {
     }
 
     fn connect(&self, peer: &VerbsHostNativeEndpointDescriptor) -> Result<()> {
+        self.traffic.peer(&peer.gid_hex);
         self.library.rdma_rc_endpoint_connect(
             self.info.handle,
             peer.qp_num,
@@ -3615,6 +3629,7 @@ impl NativeRdmaEndpoint {
         if flow_label == 0 {
             return self.connect(peer);
         }
+        self.traffic.peer(&peer.gid_hex);
         self.library.rdma_rc_endpoint_connect_flow_label(
             self.info.handle,
             peer.qp_num,
@@ -3640,12 +3655,16 @@ impl NativeRdmaEndpoint {
 
     fn send_at(&self, frame: &[u8], offset_bytes: usize, wr_id: u64) -> Result<()> {
         self.library
-            .rdma_rc_endpoint_send_at(self.info.handle, frame, offset_bytes, wr_id)
+            .rdma_rc_endpoint_send_at(self.info.handle, frame, offset_bytes, wr_id)?;
+        self.traffic.sent(frame.len());
+        Ok(())
     }
 
     fn post_send_at(&self, offset_bytes: usize, bytes: usize, wr_id: u64) -> Result<()> {
         self.library
-            .rdma_rc_endpoint_post_send_at(self.info.handle, offset_bytes, bytes, wr_id)
+            .rdma_rc_endpoint_post_send_at(self.info.handle, offset_bytes, bytes, wr_id)?;
+        self.traffic.sent(bytes);
+        Ok(())
     }
 
     /// Write mode: RDMA-writes `bytes` of the send buffer at `offset_bytes`
@@ -3657,8 +3676,10 @@ impl NativeRdmaEndpoint {
         // connection (handshake) and keeps them while it lives.
         unsafe {
             self.library.rdma_rc_endpoint_post_write_flagged(self.info.handle, offset_bytes, bytes, target.plane_addr,
-                target.rkey, flag, target.flag_addr, target.rkey, wr_id)
+                target.rkey, flag, target.flag_addr, target.rkey, wr_id)?;
         }
+        self.traffic.written(bytes + 8);
+        Ok(())
     }
 
     fn send_parts_at(
@@ -3674,7 +3695,9 @@ impl NativeRdmaEndpoint {
             payload,
             offset_bytes,
             wr_id,
-        )
+        )?;
+        self.traffic.sent(prefix.len() + payload.len());
+        Ok(())
     }
 
     fn poll(&self, send: u32, recv: u32, active_timeout: Duration) -> Result<()> {
@@ -4168,6 +4191,9 @@ impl VerbsHostMappedRdmaRing {
         mapped_ring_slot(self.recv_view, self.layout, sequence)
     }
 
+    /// Account a consumed frame using its protocol length, never slot capacity.
+    pub fn record_received_bytes(&self, bytes: usize) { self.endpoint.traffic.received(bytes); }
+
     pub fn release_recv_slot(&mut self, sequence: u64) -> Result<()> {
         anyhow::ensure!(
             sequence == self.recv_release_sequence,
@@ -4386,8 +4412,10 @@ fn connect_control_stream(peer: &str, timeout: Duration) -> Result<TcpStream> {
     let first = addrs
         .next()
         .with_context(|| format!("verbs-host ProtocolV2 peer {peer} resolved no addresses"))?;
-    TcpStream::connect_timeout(&first, timeout)
-        .with_context(|| format!("connecting verbs-host ProtocolV2 control plane to {peer}"))
+    let stream = TcpStream::connect_timeout(&first, timeout)
+        .with_context(|| format!("connecting verbs-host ProtocolV2 control plane to {peer}"))?;
+    crate::traffic::observe_peers(&[first]);
+    Ok(stream)
 }
 
 fn configure_control_stream(stream: &TcpStream, timeout: Duration) -> Result<()> {

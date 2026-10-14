@@ -67,6 +67,7 @@ fn run_empty_selection(listener: TcpListener, rank: usize,
             cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, rank, selection)
         })();
         if let Err(error) = result {
+            if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() { continue; }
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             tracing::warn!(%error, "empty worker rejects expert traffic or changed selection");
         }
@@ -84,6 +85,7 @@ impl Drop for Admission {
 }
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
+    cuteafd_transport::traffic::start();
     ensure!(
         config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
@@ -133,16 +135,20 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         listener.set_nonblocking(true)?;
         tracing::info!(rank = config.rank, world = config.world, "native worker bootstrap ready");
         let deadline = Instant::now() + Duration::from_secs(1200);
-        let mut stream = loop {
+        let (mut stream, selection) = loop {
             ensure!(Instant::now() < deadline, "coordinator worker selection timed out");
             match listener.accept() {
-                Ok((stream, _)) => break stream,
+                Ok((stream, _)) => match cuteafd_transport::worker_selection::receive_worker_selection(
+                    &stream, config.rank, deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(30))) {
+                    Ok(selection) => break (stream, selection),
+                    Err(error) if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() => continue,
+                    Err(error) => return Err(error),
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
                 Err(error) => return Err(error.into()),
             }
         };
         let selected = (|| -> Result<_> {
-            let selection = cuteafd_transport::worker_selection::receive_worker_selection(&stream, config.rank, Duration::from_secs(1200))?;
             let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
                 &config.snapshot, geometry, config.world, config.topology)?;
             selection.validate_for(&identity)?;
@@ -279,6 +285,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             Err(error) if error.is::<cuteafd_transport::worker_selection::WorkerSelectionOnly>() => {
                                 tracing::debug!("acknowledged unchanged worker selection")
                             }
+                            Err(error) if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() => {}
                             Err(error) if error.is::<cuteafd_transport::FlowProbesOnly>() => {
                                 tracing::debug!("served RDMA flow probes")
                             }

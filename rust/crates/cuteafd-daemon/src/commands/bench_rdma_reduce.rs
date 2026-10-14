@@ -386,6 +386,7 @@ pub(super) fn run_reduction_follower(
             }
             let wait_started = Instant::now();
             let request = ring.wait_recv_slot()?;
+            ring.record_received_bytes(REDUCTION_HEADER_BYTES);
             if measured {
                 measurements
                     .request_wait_us
@@ -571,6 +572,7 @@ fn run_root_phase(
         for (peer_index, ring) in rings.iter_mut().enumerate() {
             let source_rank = peer_index + 1;
             let slot = ring.wait_recv_slot()?;
+            ring.record_received_bytes(response_frame_bytes);
             let frame = unsafe {
                 std::slice::from_raw_parts(slot.host_ptr.cast_const(), REDUCTION_HEADER_BYTES)
             };

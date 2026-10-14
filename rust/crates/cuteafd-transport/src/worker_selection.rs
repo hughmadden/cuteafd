@@ -405,7 +405,12 @@ fn read<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T> {
 pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Duration) -> Result<WorkerSelection> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let start: Start = read(stream)?;
+    let value: serde_json::Value = read(stream)?;
+    if value["message"] == "fabric_traffic" {
+        write(&mut stream.try_clone()?, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
+        return Err(crate::traffic::TrafficProbeOnly.into());
+    }
+    let start: Start = serde_json::from_value(value)?;
     ensure!(start.message == "worker_selection_start", "worker requires coordinator placement handshake");
     ensure!(start.rank == rank && rank < start.selection.identity.world as usize, "worker selection rank mismatch");
     start.selection.validate()?;
@@ -488,6 +493,7 @@ pub fn select_worker_layers(peers: &[SocketAddr], selection: &WorkerSelection, t
         if let Some(previous) = seals.get(&peer) { ensure!(previous == &digest, "worker peer placement changed concurrently"); }
     }
     for &peer in peers { seals.insert(peer, digest.clone()); }
+    crate::traffic::observe_peers(peers);
     Ok(())
 }
 
@@ -690,6 +696,18 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         client.write_all(&vec![b' '; CONTROL_LIMIT + 1]).unwrap();
         assert!(receive_worker_selection(&server, 0, Duration::from_secs(3)).is_err());
+    }
+    #[test]
+    fn fabric_control_is_served_without_worker_or_native_admission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        write(&mut client, &serde_json::json!({"message": "fabric_traffic"})).unwrap();
+        let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
+        assert!(error.is::<crate::traffic::TrafficProbeOnly>());
+        let reply: serde_json::Value = read(&client).unwrap();
+        assert_eq!(reply["message"], "fabric_traffic");
+        assert!(reply["sample"].is_object());
     }
     #[test]
     fn worker_selection_control_checks_exact_ack_and_reconnect() {

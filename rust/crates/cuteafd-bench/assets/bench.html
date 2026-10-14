@@ -102,6 +102,22 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
 .picks small { color: var(--muted); }
 .eta { font: 600 13px var(--mono); color: var(--ink); }
 .eta small { color: var(--muted); font-weight: 400; }
+/* Traffic is identity-coded with line patterns as well as color. */
+#fabric { --fabric-1: #3987e5; --fabric-2: #d95926; --fabric-3: #199e70; padding: 16px; }
+html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --fabric-3: #1baf7a; }
+.fabric-plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr)); gap: 20px; }
+.fabric-port { min-width: 0; }
+.fabric-port h4 { margin: 10px 0; font: 600 12px var(--mono); overflow-wrap: anywhere; }
+.fabric-port small, .fabric-port summary { color: var(--ink-2); font: 11px var(--mono); }
+.fabric-legend { display: flex; flex-wrap: wrap; gap: 12px; font: 11px var(--mono); }
+.fabric-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.fabric-plot { position: relative; }
+.fabric-plot > svg { width: 100%; display: block; }
+.fabric-tooltip { position: absolute; left: 46px; top: 4px; max-width: calc(100% - 50px); padding: 6px; background: var(--panel-2); border: 1px solid var(--line-2); font: 11px var(--mono); pointer-events: none; }
+.fabric-table { overflow-x: auto; }
+.fabric-table th, .fabric-table td { padding: 5px; font: 10px var(--mono); white-space: nowrap; text-align: right; }
+.fabric-assessments { font: 12px var(--mono); overflow-wrap: anywhere; }
+@media (forced-colors: active) { #fabric { --fabric-1: CanvasText; --fabric-2: CanvasText; --fabric-3: CanvasText; } }
 </style>
 </head>
 <body>
@@ -126,6 +142,11 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
     <span class="note" id="run-note"></span>
     <div class="menu"><button class="btn" id="export-report">EXPORT REPORT ▾</button><div id="export-menu" hidden></div></div>
   </div>
+  <section class="panel" id="fabric" hidden>
+    <h3>Fabric traffic <small>1 Hz · last 60 observations · Gb/s</small></h3>
+    <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) against the full-duplex link rate. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
+    <div class="fabric-plots"></div><p class="fabric-assessments" role="status"></p>
+  </section>
   <div class="grid" id="panels"></div>
   <p class="note">Benchmarks run inside this server and drive its own OpenAI API over loopback. While one runs, requests from
     other clients get 503 with Retry-After. The baseline (basic card and quick quality) runs once per server and configuration
@@ -148,6 +169,7 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
 </dialog>
 
 <script src="/assets/cuteafd-ui.js"></script>
+<script src="/bench/fabric.js"></script>
 <script>
 (() => {
 'use strict';
@@ -529,7 +551,7 @@ async function load(id) {
 }
 async function refreshRuns() { runs = (await api('/v1/bench/runs')).runs || []; renderRuns(); }
 async function refreshCatalog() { catalog = await api('/v1/bench/panels'); }
-function render() { renderHeader(); renderStrip(); renderRuns(); renderPanels(); }
+function render() { window.CuteFabric?.report(report); renderHeader(); renderStrip(); renderRuns(); renderPanels(); }
 
 async function start(body) {
   try {
@@ -618,6 +640,8 @@ async function connect() {
       if (status.active && follow && status.active.id !== viewing) load(status.active.id);
       if (was && !status.active) { refreshRuns(); refreshCatalog().then(render); }
       render();
+    } else if (event.type === 'fabric') {
+      if (event.run === viewing || follow && status.active?.id === event.run) window.CuteFabric?.interval(event);
     } else if (event.type === 'progress') {
       progress = event;
       if (status.active) { status.active.panel = event.panel; status.active.eta_s = event.eta_s; status.active.fraction = event.fraction; }

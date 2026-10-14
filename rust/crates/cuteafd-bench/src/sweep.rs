@@ -30,6 +30,8 @@ pub struct Point {
     /// GPU throttle report over the timed wave (`/v1/thermal`; absent without one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<Value>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -43,6 +45,8 @@ pub struct PrefillPoint {
     /// GPU throttle report over the timed request (`/v1/thermal`; absent without one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -99,7 +103,9 @@ fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Re
     batch().into_iter().collect::<Result<Vec<_>>>().with_context(|| format!("C{c} warm-up"))?;
     timed(on_timed)?;
     let mark = client.thermal_mark();
+    let fabric_mark = client.fabric_mark();
     let results = batch();
+    let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
     let ok: Vec<Timed> = results.into_iter().filter_map(Result::ok).collect();
@@ -109,7 +115,7 @@ fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Re
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     Ok(Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal })
+        ttft_s: median(&mut ttft), errors, thermal, fabric })
 }
 
 /// Cold prefill at each length: fit tokens per filler word from two short
@@ -130,12 +136,14 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut On
         ask(words, 200 + length).with_context(|| format!("{length}-token prefill warm-up"))?;
         timed(on_timed)?;
         let mark = client.thermal_mark();
+        let fabric_mark = client.fabric_mark();
         let chat = ask(words, 300 + length).with_context(|| format!("{length}-token prefill"))?;
         let thermal = client.thermal_since(mark);
+        let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
         points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            thermal });
+            thermal, fabric });
     }
     Ok(points)
 }

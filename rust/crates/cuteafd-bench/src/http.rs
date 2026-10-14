@@ -96,6 +96,10 @@ async fn page() -> Response {
     ([(header::CACHE_CONTROL, "no-cache")], axum::response::Html(page)).into_response()
 }
 
+async fn fabric_script() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../assets/fabric.js")).into_response()
+}
+
 async fn banner() -> Response {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], BANNER)
         .into_response()
@@ -367,6 +371,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
     Router::new()
         .route("/bench", get(page))
         .route("/bench/banner.js", get(banner))
+        .route("/bench/fabric.js", get(fabric_script))
         .route("/v1/bench/status", get(status))
         .route("/v1/bench/probe", post(probe_request))
         .route("/v1/bench/panels", get(panels))
@@ -502,7 +507,7 @@ mod tests {
             profile: "fidelity".into(), plan: vec![], server: Default::default(), fingerprint: String::new(),
             baseline: None, panels: vec![crate::report::PanelResult {
                 id: "fidelity".into(), passes: vec![json!({"saved":true})], partial: Some(json!({"decode":null})),
-                ..Default::default() }], error: None };
+                ..Default::default() }], fabric: vec![], error: None };
         attach_fidelity_comparison(&mut report, None, "missing");
         let panel = report.panel("fidelity").unwrap();
         assert_eq!(panel.latest().unwrap()["paired"]["earlier_run"], "missing");

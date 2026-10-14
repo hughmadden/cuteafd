@@ -418,6 +418,7 @@ impl Bench {
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
                 ..PanelResult::default() }).collect(),
+            fabric: Vec::new(),
             error: (!dropped.is_empty()).then(|| format!("panels not in this build: {}", dropped.join(", "))),
         }));
         // Publish the starting run before its id can reach a polling client.
@@ -516,7 +517,7 @@ impl Bench {
             + if baseline.is_none() && !skip_baseline { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
         let total = remaining.max(1.0);
         let baseline = match baseline {
-            Some(b) => Some(b),
+            Some(mut b) => { b.fabric.clear(); Some(b) },
             // Explicit panels alone: no basic card, no quick quality.
             None if skip_baseline => None,
             None => {
@@ -534,7 +535,11 @@ impl Bench {
                 Some(b)
             }
         };
-        report.lock().expect("report lock").baseline = baseline.clone();
+        {
+            let mut r = report.lock().expect("report lock");
+            r.fabric.extend(baseline.iter().flat_map(|b| b.fabric.iter().cloned()));
+            r.baseline = baseline.clone();
+        }
         Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
         let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
@@ -564,7 +569,9 @@ impl Bench {
                     history: &earlier, max_context, max_output, lossless_set, context_load };
                 let table_before = panels::common::mapped_counters(&client);
                 let thermal_mark = client.thermal_mark();
+                let fabric_mark = client.fabric_mark();
                 let outcome = panel.run(&ctx);
+                let fabric = client.fabric_since(fabric_mark, &format!("{}/pass{pass}", panel.id()), false);
                 let thermal = client.thermal_since(thermal_mark);
                 let table_after = panels::common::mapped_counters(&client);
                 remaining -= estimate;
@@ -576,6 +583,24 @@ impl Bench {
                             value["mapped_tables"] = json!(tables);
                             value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
                         }
+                        if let Some(phase) = fabric {
+                            value["fabric"] = json!(phase);
+                            r.fabric.push(phase);
+                        }
+                        fn collect_fabric(value: &Value, phases: &mut Vec<crate::fabric::Phase>) {
+                            match value {
+                                Value::Object(fields) => for (key, value) in fields {
+                                    if key == "fabric" || key.ends_with("_fabric") {
+                                        if let Ok(phase) = serde_json::from_value::<crate::fabric::Phase>(value.clone()) {
+                                            if phase.timed { phases.push(phase); }
+                                        }
+                                    } else { collect_fabric(value, phases); }
+                                },
+                                Value::Array(values) => for value in values { collect_fabric(value, phases); },
+                                _ => {}
+                            }
+                        }
+                        collect_fabric(&value, &mut r.fabric);
                         // GPU throttle report over the whole pass (panel-internal warm-ups included).
                         if let (Some(thermal), true) = (thermal, value.is_object()) { value["thermal"] = thermal; }
                         r.panels[index].passes.push(value);
@@ -637,6 +662,8 @@ impl Bench {
         let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
         let mut last: Option<(Instant, f64)> = None;
         let mut revision = u64::MAX;
+        let mut fabric_before = None;
+        cuteafd_transport::traffic::background_priority();
         while !done.load(Ordering::Relaxed) {
             let state = progress.get();
             let plan = self.plan_state().lock().map(|s| s.clone()).unwrap_or_default();
@@ -664,6 +691,16 @@ impl Bench {
                     let t = &stats["totals"];
                     Some(t["requests_admitted"].as_u64()?.saturating_sub(t["requests_retired"].as_u64()?))
                 });
+            }
+            if let Some(after) = stats_client.fabric() {
+                if let Some(before) = fabric_before.as_ref() {
+                    let interval = crate::fabric::interval(&plan.panel, false, before, &after);
+                    self.emit(json!({"type": "fabric", "run": plan.run, "interval": interval}));
+                }
+                fabric_before = Some(after);
+            } else {
+                self.emit(json!({"type": "fabric", "run": plan.run, "interval": {"ports": []}}));
+                fabric_before = None;
             }
             let title = if plan.panel == "baseline" { "Basic card + quick quality".to_string() }
                 else { panels::find(&plan.panel).map_or(plan.panel.clone(), |p| p.title().to_string()) };

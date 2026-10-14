@@ -128,6 +128,37 @@ impl Client {
             "prefix_cache": stats["prefix_cache"], "console": console["g"]})
     }
 
+    /// Cached 1 Hz observations; no sysfs or peer I/O in this HTTP handler.
+    pub fn fabric(&self) -> Option<cuteafd_transport::traffic::Snapshot> {
+        let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(200))
+            .timeout_read(Duration::from_millis(300)).build();
+        self.authorize(agent.get(&format!("{}/v1/fabric", self.base))).call().ok()?.into_json().ok()
+    }
+
+    /// Wait outside request timing for a new 1 Hz observation on each known
+    /// host. This excludes the preceding warm-up and includes the final work;
+    /// rates describe the sampled envelope, including idle boundary padding.
+    pub fn fabric_mark(&self) -> Option<cuteafd_transport::traffic::Snapshot> {
+        let before = self.fabric()?;
+        if before.hosts.values().all(|host| host.ports.is_empty()) { return None; }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.cancel.load(Ordering::Relaxed) { return None; }
+            let after = self.fabric()?;
+            let fresh = before.hosts.iter().all(|(name, b)| after.hosts.get(name)
+                .is_none_or(|a| a.incarnation != b.incarnation || a.sampled_s > b.sampled_s));
+            if fresh { return Some(after); }
+            if Instant::now() >= deadline { return None; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn fabric_since(&self, before: Option<cuteafd_transport::traffic::Snapshot>, name: &str, timed: bool)
+        -> Option<crate::fabric::Phase> {
+        let phase = crate::fabric::interval(name, timed, &before?, &self.fabric_mark()?);
+        (!phase.ports.is_empty()).then_some(phase)
+    }
+
     pub fn stats(&self) -> Result<Value> {
         self.get("/v1/stats")
     }
