@@ -445,6 +445,10 @@ def wait(args):
                           'recent_tools': [line[:160] for line in result['recent_tools']],
                           'new_markers': markers[-5:]}
                 print(json.dumps(digest, separators=(',', ':')), flush=True)
+                if args.return_on_progress:
+                    # One driver turn per progress period while the worker is producing.
+                    result['woke'] = 'progress'
+                    return result
             progress_at = time.monotonic() + args.progress_interval
         meta = read_meta(path)
         retryable = (meta['tool'] == 'agy' and result['retry_count'] < meta['max_retries'] and
@@ -452,6 +456,14 @@ def wait(args):
         if ((args.until == 'any' and result['state'] != initial) or result['state'] == args.until or
                 (args.until == 'idle' and (result['state'] in ('asking', 'exited') or
                                           (result['state'] == 'error' and not result['retry_at'] and not retryable)))):
+            return result
+        # Wake the driver when it has something to act on, not only on a timer.
+        usage = result['context_usage']
+        if args.until_context and usage and usage['percent'] >= args.until_context:
+            result['woke'] = 'context'
+            return result
+        if args.until_quiet and result['state'] == 'busy' and result['seconds_since_output'] >= args.until_quiet:
+            result['woke'] = 'quiet'
             return result
         if time.monotonic() >= deadline:
             result['timed_out'] = True
@@ -536,6 +548,9 @@ def parser():
             c.add_argument('--until', choices=('idle', 'asking', 'error', 'exited', 'any'), default='idle')
             c.add_argument('--timeout', type=float, default=600)
             c.add_argument('--progress-interval', type=float, default=0, metavar='S', help='emit progress JSON lines on new output every S seconds')
+            c.add_argument('--until-context', type=float, default=0, metavar='PCT', help='also return once the worker context fill reaches PCT percent')
+            c.add_argument('--return-on-progress', action='store_true', help='return after the first progress event (one driver turn per period)')
+            c.add_argument('--until-quiet', type=float, default=0, metavar='S', help='also return if a busy worker writes nothing for S seconds')
         if command == 'transcript':
             c.add_argument('--since-last', action='store_true')
     c = sub.add_parser('_supervise', help=argparse.SUPPRESS)

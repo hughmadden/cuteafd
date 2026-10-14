@@ -426,3 +426,12 @@ def test_visible_prompt_stream_growth_is_not_idle(cli):
 def test_bare_spinner_with_prompt_is_busy():
     assert driver.Grok().state('⠸ Thinking...\n❯\nGrok 4.7 high', {}) == 'busy'
     assert driver.Agy().state('⠸ Streaming response...\n>\n? for shortcuts', {}) == 'busy'
+
+
+def test_wait_wake_flags_are_wired():
+    source = (Path(__file__).resolve().parents[2] / 'scripts/agents/ext-agent.py').read_text()
+    for flag in ('--return-on-progress', '--until-context', '--until-quiet'):
+        assert flag in source
+    assert "result['woke'] = 'progress'" in source
+    assert "result['woke'] = 'context'" in source
+    assert "result['woke'] = 'quiet'" in source
