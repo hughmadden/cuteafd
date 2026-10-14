@@ -35,6 +35,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4.1
 
+- 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 445 W (415–540) + 3× DGX Spark · build 92ad5b03d029 · [report](deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-min/report.svg)
 - 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 4 Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-rc3-sim5090/report.svg) · ⚠ quality gate failed
 - 2026-10-09 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-rc3-sim5090/report.svg)
 - 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max-rc3/report.svg) · ⚠ quality gate failed
