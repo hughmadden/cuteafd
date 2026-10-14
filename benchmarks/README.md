@@ -62,6 +62,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3
 
+- 2026-10-14 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 1× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](glm5/2026-10-14-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/report.svg)
 - 2026-10-09 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 6 Spark · build v2.0.0-rc3 · [report](glm5/2026-10-09-smoke-glm53-exl3-no-fit-rc3-sim5090/report.svg) · doesn't fit: rtx0 full memory layout needs 38219720132 bytes, budget 31997506355 bytes, shortfall 6222213777 bytes
 - 2026-10-09 · Release smoke · nvidia/GLM-5.3-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 6 Spark · build v2.0.0-rc3 · [report](glm5/2026-10-09-smoke-glm53-nvfp4-no-fit-rc3-sim5090/report.svg) · doesn't fit: coordinator weights need 52.6 GiB, over the 32 GiB coordinator budget; rtx0 full memory layout needs 54111029708 bytes, budget 31997506355 bytes, shortfall 22113523353 bytes
 - 2026-10-09 · Release smoke · nvidia/GLM-5.3-NVFP4 · 2× RTX PRO 6000 @ 325 W + 6× DGX Spark · build v2.0.0-rc3 · [report](glm5/2026-10-09-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max-rc3/report.svg)
