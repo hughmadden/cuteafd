@@ -177,15 +177,21 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
             for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
-                result = subprocess.run(['bash', '-c',
-                    'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
-                    'family="$1"; attention_placement="$2"; ' + block,
-                    'test', family, mode], cwd=ROOT, text=True, capture_output=True)
-                # GLM and V4 run context; Qwen layers requires a Spark-free pair (checked later).
-                runs = mode in ['auto', 'heads'] or (family, mode) in [('glm5', 'context'), ('glm5_flash', 'context'), ('deepseek_v4', 'context'), ('qwen4', 'layers')]
-                self.assertEqual(result.returncode == 0, runs, result.stderr)
-                if mode in ['context', 'layers'] and not runs:
-                    self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
+                for wip_slot in ['', 'slot-test']:
+                    result = subprocess.run(['bash', '-c',
+                        'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
+                        'family="$1"; attention_placement="$2"; wip_slot="$3"; ' + block,
+                        'test', family, mode, wip_slot], cwd=ROOT, text=True, capture_output=True)
+                    # GLM and V4 run context; Qwen layers requires a Spark-free pair (checked later).
+                    # V4 layers is a dev executor: only a WIP slot may pass it to the daemon.
+                    runs = mode in ['auto', 'heads'] or (family, mode) in [
+                        ('glm5', 'context'), ('glm5_flash', 'context'), ('deepseek_v4', 'context'), ('qwen4', 'layers')]
+                    runs = runs or (family, mode, bool(wip_slot)) == ('deepseek_v4', 'layers', True)
+                    self.assertEqual(result.returncode == 0, runs, result.stderr)
+                    if (family, mode) == ('deepseek_v4', 'layers') and not runs:
+                        self.assertIn('dev-only executor', result.stderr)
+                    elif mode in ['context', 'layers'] and not runs:
+                        self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
 
     def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
         source = v41_source()
