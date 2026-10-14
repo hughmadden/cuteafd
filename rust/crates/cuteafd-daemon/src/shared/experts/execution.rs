@@ -415,7 +415,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         if rows == 0 { return Ok(self.kernel.group_rows()); }
         ensure!(rows <= self.kernel.info().capacity_rows as usize,
             "invalid expert grouping row count {rows}");
-        self.execution_state(u32::try_from(rows)?).0.group_rows_for(rows)
+        self.execution_state(u32::try_from(rows)?)?.0.group_rows_for(rows)
     }
 
     pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
