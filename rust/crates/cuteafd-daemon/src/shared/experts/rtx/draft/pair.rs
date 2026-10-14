@@ -7,7 +7,7 @@ use cuteafd_ffi::{
 };
 use std::{ffi::c_void, rc::Rc};
 
-pub(super) struct Pair<'a> {
+pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
     // first. Our peer stream drains before any of its referenced allocations.
     peer: Stream<'a>,

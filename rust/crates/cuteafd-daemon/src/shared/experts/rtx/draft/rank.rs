@@ -1,5 +1,5 @@
 //! Native draft expert halves, with device-scoped ownership and fixed scratch.
-use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
+use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs};
@@ -66,7 +66,7 @@ struct State<'a> {
 /// One lane's workspace for one rank. Enqueue borrows an external stream so the
 /// containing draft chain can capture both ranks in its single CUDA graph.
 /// That chain must drain its streams and destroy graphs before dropping this.
-pub(super) struct Wave<'a> {
+pub(crate) struct Wave<'a> {
     states: Vec<State<'a>>,
     _scratch: Allocation<'a>,
     weights: Rc<Weights<'a>>,

@@ -111,11 +111,18 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
             }
         }
     }
-    let catalog =
-        cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &snapshot)?;
-    let weights = RankWeights::load_exl3_pair(
-        devices, &catalog, 1, [4_000_000_000; 2], &package,
-    )?.map(Rc::new);
+    let catalog = cuteafd_loader::read_official_v41_catalog(
+        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
+        &snapshot,
+    )?;
+    let weights = super::super::tp2_ffn::load_routed_weights(
+        devices,
+        &catalog,
+        1,
+        16,
+        [4_000_000_000; 2],
+        &package,
+    )?;
     let inputs = (0..4)
         .map(|index| -> Result<_> {
             let device = devices[index % 2];
@@ -130,8 +137,12 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     // Wave owners drain before releasing any of the inputs above.
-    let mut first = ExpertWave::new(weights.clone(), 16)?;
-    let mut second = ExpertWave::new(weights, 16)?;
+    let mut first = OwnerPair::new(
+        weights.clone(),
+        16,
+        cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+    )?;
+    let mut second = OwnerPair::new(weights, 16, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     for (step, rows) in [16usize, 1, 3, 16, 1].into_iter().enumerate() {
         let row_order: [Vec<usize>; 2] = std::array::from_fn(|lane| {
@@ -159,11 +170,11 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
                 }
             }
         }
-        let make_inputs = |lane: usize| -> [RankInputs<'_, '_>; 2] {
+        let make_inputs = |lane: usize| -> [OwnerInputs<'_, '_>; 2] {
             std::array::from_fn(|rank| {
                 let (buffers, stream) = &inputs[lane * 2 + rank];
-                RankInputs {
-                    wire: CuteafdDeviceBuffer {
+                OwnerInputs {
+                    input: CuteafdDeviceBuffer {
                         bytes: rows * 5280,
                         ..buffers[0].buffer
                     },
@@ -171,7 +182,7 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
                         bytes: rows * 24,
                         ..buffers[1].buffer
                     },
-                    routing: CuteafdDeviceBuffer {
+                    weights: CuteafdDeviceBuffer {
                         bytes: rows * 24,
                         ..buffers[2].buffer
                     },
@@ -200,7 +211,7 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
                 let mut actual = vec![0; rows * 5120 * 4];
                 let view = CuteafdDeviceBuffer {
                     bytes: actual.len(),
-                    ..wave.ranks[rank].output.buffer
+                    ..wave.rank_output(rank)
                 };
                 devices[rank].run(|| lib.copy_d2h(&mut actual, view))?;
                 ensure!(

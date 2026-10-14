@@ -1,10 +1,9 @@
 //! Native TP2 draft expert ownership and graph integration.
-mod rank;
-mod pair;
+use crate::shared::experts::rtx::draft::{rank, pair};
 #[cfg(test)]
 mod checkpoint_tests;
 
-pub(super) use rank::Weights;
+pub(super) use crate::shared::experts::rtx::draft::rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Result};

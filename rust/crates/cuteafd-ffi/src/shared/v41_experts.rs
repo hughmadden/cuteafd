@@ -1549,6 +1549,14 @@ impl NativeLibrary {
     }
 }
 impl V41Tp2ExpertReducer<'_> {
+    /// The installed owner-reduction symbols have a fixed hidden/top-k ABI.
+    /// Reject unsupported geometry before allocating or launching an owner path.
+    pub fn require_owner_geometry(geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        ensure!(geometry.hidden == 5120 && geometry.topk == 6,
+            "native owner reduction requires hidden=5120, topk=6; got hidden={}, topk={}",
+            geometry.hidden, geometry.topk);
+        Ok(())
+    }
     pub fn supports_route_sums(&self) -> bool { self.sum_routes.is_some() }
     pub fn supports_geometry_route_sums(&self) -> bool { self.sum_routes_geometry.is_some() }
     /// FP32 route sums in route order, with no intermediate rounding.

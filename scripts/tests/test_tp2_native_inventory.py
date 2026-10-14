@@ -205,6 +205,29 @@ def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     assert "for chunk in prompt.chunks" in bench
 
 
+def test_owner_pair_diagnostic_timing_waits_for_end_before_elapsed_query():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx/pair.rs").read_text()
+    owner = source.split("impl<'a> OwnerPair<'a>", 1)[1]
+    constructor = owner.split("pub(crate) fn new(", 1)[1].split(
+        "pub(crate) fn uses_bf16_input", 1)[0]
+    assert 'timing: std::env::var_os("CUTEAFD_TP2_TIMING")' in constructor
+    assert '.is_some()\n                    .then(||' in constructor
+    execute = owner.split("pub(crate) async unsafe fn execute(", 1)[1].split(
+        "#[cfg(test)]", 1)[0]
+    diagnostics = execute.split("for rank in drain.ranks.iter() {", 1)[1].split(
+        "drain.complete = true", 1)[0]
+    assert "if let Some([start, end]) = &rank.timing {" in diagnostics
+    scoped = diagnostics.split("rank.stream.device.run(|| unsafe {", 1)[1].split(
+        "})?;", 1)[0]
+    assert scoped.index("library.cuda_event_synchronize(end.raw)?;") < scoped.index(
+        "library.cuda_event_elapsed_ms(start.raw, end.raw)")
+    # Ordinary deferred submission must not gain a host timing wait.
+    assert execute.count("cuda_event_synchronize(") == 1
+    assert execute.count("cuda_event_elapsed_ms(") == 1
+    assert "start.record(&rank.stream)?;" in execute
+    assert "end.record(&rank.stream)?;" in execute
+
+
 def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
     compiler = shutil.which("g++")
     if not compiler:
