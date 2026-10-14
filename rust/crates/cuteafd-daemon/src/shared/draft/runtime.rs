@@ -10,6 +10,7 @@ pub(crate) struct SharedPolicy {
 }
 
 impl SharedPolicy {
+    #[cfg(test)]
     pub fn new(homes: &[resource::LayerHome], experts: usize, topk: usize, rows: usize,
         width: usize, prior: resource::Prior, seed: PolicySeed) -> Result<Self> {
         let geometry = resource::geometry(homes, experts, topk, rows, width, COPY_EXTENSION)?;

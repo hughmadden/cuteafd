@@ -243,6 +243,12 @@ impl<'a> Pair<'a> {
         Ok(group)
     }
 
+    pub(crate) fn weight_read_bytes(&self) -> Result<usize> {
+        let bytes = self.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(*bytes.iter().max().context("installed TP2 ranks missing")?)
+    }
+
     pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);

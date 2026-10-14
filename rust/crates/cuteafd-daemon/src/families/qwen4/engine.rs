@@ -1568,7 +1568,18 @@ impl<'a> Qwen4Engine<'a> {
         };
         (0..self.cfg.layers).map(|index| {
             let bytes = match (catalog.fp8(), catalog.exl3()) {
-                (Some(tensors), _) => resource::fp8_slice_bytes(tensors, tp)?,
+                (Some(_), _) => {
+                    let bytes = match &self.experts {
+                        Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
+                        Some(Experts::Tp2 { routed, .. }) => routed.borrow().experts.iter()
+                            .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
+                            .into_iter().max().context("Qwen installed TP2 ranks missing")?,
+                        Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
+                            &transport.borrow().transport.installed_grouping()?, index)?,
+                        _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
+                    };
+                    bytes as f64
+                }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, index, tp)?,
                 _ => anyhow::bail!("Qwen routed expert format cannot be priced"),
             };

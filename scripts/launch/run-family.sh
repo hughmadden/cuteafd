@@ -141,8 +141,9 @@ trace_args=()
 for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE DRAFT_SURVIVAL_LENGTHS; do
   # DRAFT_SURVIVAL_LENGTHS (every shared-policy family, GLM 5.3 included):
   # verify drafts while calibrated survival >= 0.5 instead of pricing rows.
-  if [[ $family == glm5 && $policy_key != DRAFT_SURVIVAL_LENGTHS && -n "$(get "$policy_key")" ]]; then
-    echo "$policy_key was removed for GLM 5.3: it always runs the shared draft policy; delete the key" >&2
+  if [[ $family =~ ^(glm5|deepseek_v4)$ && $policy_key != DRAFT_SURVIVAL_LENGTHS && -n "$(get "$policy_key")" ]]; then
+    label="$family"; [[ $family != glm5 ]] || label="GLM 5.3"
+    echo "$policy_key was removed for $label: it always runs the shared resource-priced draft policy; delete the key" >&2
     exit 2
   fi
   case "$(get "$policy_key" off)" in
@@ -1493,7 +1494,7 @@ fi
 if [[ -n "$(get COPY_DRAFTS)" || -n "$(get COPY_DRAFT_POLICY)" ]]; then
   label="$family"; [[ $family != glm5 ]] || label="GLM 5.3"
   for removed in COPY_DRAFTS COPY_DRAFT_POLICY; do
-    [[ -z "$(get "$removed")" ]] || { echo "$removed was removed for $label: copies only extend agreeing neural drafts; delete the key" >&2; exit 2; }
+    [[ -z "$(get "$removed")" ]] || { echo "$removed was removed for $label: the shared resource-priced draft policy only extends agreeing neural drafts with copies; delete the key" >&2; exit 2; }
   done
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts

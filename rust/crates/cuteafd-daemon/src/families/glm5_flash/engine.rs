@@ -2090,7 +2090,17 @@ impl<'a> GlmfEngine<'a> {
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
             let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
-                (Some(tensors), _) => resource::fp8_slice_bytes(tensors, tp)?,
+                (Some(_), _) => {
+                    let bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                        tp2.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
+                            .collect::<Result<Vec<_>>>()?.into_iter().max().context("GLM Flash installed TP2 ranks missing")?
+                    } else { match self.routed_experts(layer) {
+                        Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
+                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
+                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
+                    }};
+                    bytes as f64
+                }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
                 _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
             };

@@ -68,6 +68,13 @@ impl<'a> GlmEngine<'a> {
             None => crate::shared::draft::resource::worker_group_rows_for_input(remote, layer, rows, self.spark_bf16),
         }
     }
+    pub(crate) fn draft_weight_read_bytes(&self, layer: usize,
+        remote: &[cuteafd_transport::worker_selection::InstalledExpertGrouping]) -> Result<usize> {
+        match self.tp2.as_ref().filter(|pair| pair.layers.contains(&layer)) {
+            Some(pair) => pair.weight_read_bytes(),
+            None => crate::shared::draft::resource::worker_weight_read_bytes(remote, layer),
+        }
+    }
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
         self.tp2
             .as_ref()
