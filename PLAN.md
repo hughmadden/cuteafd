@@ -525,6 +525,8 @@ at one RTX, 20 at two). The waste is elsewhere:
    2026-10-14). Raw CUDA free under-reports that headroom: use Linux
    `MemAvailable` for SM121 admission and leave serving caches warm. The
    earlier post-load cache drop addressed the counter, not an allocation limit.
+   Warm-cache MiMo Pro max serving passed on two RTX and six Sparks; shared
+   admission preserved the default pool despite low raw CUDA free readings.
 3. Retained load staging: the copy_h2d pinned buffer stayed at the largest
    upload (0.45 GiB per Spark on MiMo, 1.77 GiB pinned on raptor for GLM,
    1.0 for V4 Flash). Fixed: released after loading.
