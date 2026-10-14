@@ -168,30 +168,42 @@ split-chain partials summed by a reduce kernel -- and an element sitting within 
 midpoint rounds to the other BF16 value. 0.01-0.02% of elements are that close and the rest are bit
 for bit; at M = 129 the extra disagreement is the trailing-pass row, not rounding.
 
-Contract checks (`--contract`, GPU against GPU, on operand sets whose arithmetic is exact -- the
-properties the repo's own `native/tests/glm_draft_kernels_selftest.py` asserts for the wide path,
-replicated over `rows` in {8, 64, 65, 96, 127, 128, 129, 136, 200, 1024, 2048} x both shapes, with the
-pristine binary run as a control):
+Contract checks (`--contract`, GPU against GPU with the pristine binary as a control in the same
+window, on operand sets whose arithmetic is exact -- the properties the repo's own
+`native/tests/glm_draft_kernels_selftest.py` asserts for the wide path, replicated over `rows` in
+{8, 64, 65, 96, 127, 128, 129, 136, 200, 1024, 2048} x both shapes, 22 cases):
 
-- mode 1 (wide W8A16) is bit-identical to mode 0 everywhere;
-- mode 2 (W8A8) is bit-identical to mode 0 on ternary operands everywhere;
-- mode 2's BF16 output is its FP32 output rounded, everywhere;
-- mode 2 stays inside the accumulation-rounding bound (2e-3 of the operand set's own max) of mode 0 on
-  E4M3-exact activations;
-- plus a tail probe that reports `|mode2 - mode0|` per row region on generic operands, which measures
+| check | old route | new route |
+| --- | --- | --- |
+| mode 1 (wide W8A16) == mode 0, bit for bit | yes, all 22 | yes, all 22 |
+| mode 2's BF16 output == its FP32 output rounded | yes, all 22 | yes, all 22 |
+| mode 2 == mode 0 on ternary operands, FP32 bits | 0 differ, all 22 | 0 differ, all 22 |
+| mode 2 vs mode 0 on E4M3-exact: FP32 max gap (bound = 2e-3 x set max) | 0.000e+00, all 22 | <= 3.433e-05 of 8.46e-02 .. 1.18e-01 |
+| the same on BF16 outputs (reported, not gated) | 0.000e+00 | <= 2.500e-01, always one BF16 step |
+
+Both binaries exit 0 (`~/.cache/cuteafd/builds/ds-k100/target/contract_old2.log`, `contract_new2.log`).
+
+- **The repository's contract holds for the new route.** Ternary operands are bit-identical in FP32 at
+  every row count -- as they must be: every product there is `7 * n * 2^j` with `|n| <= 128`, so every
+  partial sum is exact in FP32 and no accumulation order can move a bit. On E4M3-exact activations the
+  FP32 gap is at most 3.433e-05 against a 1.181e-01 bound (kv: 1.144e-05 of 5.925e-02), i.e. over 3000x
+  under it, and 5.8e-07 of the set's own scale against the 2e-3 the test allows.
+- **The old route is stronger than the contract asks**: it is bit-identical to mode 0 on the E4M3-exact
+  set too (0.000e+00, 0 differing FP32 bits) because 12-way K splits sum those values exactly. Nothing
+  requires that, and the new route keeps one chain instead; the honest size of the difference is that at
+  M = 2048 85% of the new route's FP32 elements differ from mode 0's in some low bit, with the largest
+  such difference 3.4e-05.
+- **The BF16 form of the bound is stricter than the repository's and the new route does not meet it**
+  (1.25e-01 at M = 96 against 1.025e-01; 2.5e-01 at M = 2048). Rounding two FP32 values that differ in
+  their last bits to BF16 first turns any element within that difference of a midpoint into a whole
+  step. The repository compares the FP32 outputs (`out_f32 = 1`; `exact0 = torch.empty(rows, n)` is
+  float32), so the harness computes all three columns and gates only the FP32 ones, printing the BF16
+  figure beside them. This is the one place where the first version of the harness was wrong: it
+  compared widened BF16 outputs, which reported the patched binary as failing at M >= 96 when the
+  property it was checking was the stricter one.
+- Plus a tail probe that reports `|mode2 - mode0|` per row region on generic operands, which measures
   the f16 trailing pass described above for both routes.
 
-The window landed (ticket 1146, `~/.cache/cuteafd/builds/ds-k100/contract_r1.log`): the pristine
-control passed (`rc=0`) and the patched binary failed the **BF16** form of the E4M3-exact bound at
-M >= 96 (1.25e-01 against 1.025e-01, and 2.5e-01 at M = 2048), by exactly one BF16 step, on 0.01-0.02%
-of elements. That is the same effect as the dump table above: the repository's test reads the **FP32**
-outputs (`out_f32 = 1`, `exact0 = torch.empty(rows, n)` defaults to float32), where a sub-ULP
-accumulation difference is the quantity the 2e-3 bound is written against, while rounding both routes
-to BF16 first turns it into a whole step wherever an element sits near a midpoint. The harness now
-checks both forms: the FP32 gap, the FP32 bit count and the ternary bit equality the repository asserts
-(which must hold exactly, since every product and partial sum on that operand set is a small integer
-times a power of two, so no accumulation order can change a bit), with the BF16 gap printed next to
-them and not gated.
 
 
 ## Performance
@@ -240,24 +252,23 @@ Where the win comes from, per 128-row block of the row height (16 blocks at M = 
 
 ## Wall-time split
 
-Derived from the agent transcript (13:32:57Z .. 14:40Z, 67.6 min, 689 events), each gap between events
-charged to the tool in flight (capped at 600 s per gap) and everything else to the action it precedes:
+Derived from the agent transcript (13:32:57Z .. 15:08:26Z, 95.6 min, 761 events), each gap between
+events charged to whatever was in flight:
 
 | | min | share |
 | --- | --- | --- |
-| fair queue: `hwlock` waits and the poll loops that watched the two GPU windows | 36.5 | 54% |
-| model time between tool calls (kernel and harness design and writing, reference, dump, SASS and contract analysis) | 29.6 | 44% |
-| harness GPU sessions inside the windows + reading tools in flight | 0.8 | 1% |
-| `nvcc` compiles in the cpu container (7, incl. the `-dc` pair for the SASS diff) | 0.2 | <1% |
+| fair-queue wait: `hwlock` blocks, the poll loops that watched the first window, and the wall time between the interim report and the queued run's completion notice | 64.9 | 68% |
+| model time between tool calls (kernel and harness design and writing, FP64 reference, dump, SASS and contract analysis) | 29.6 | 31% |
+| `nvcc` compiles in the cpu container (8, incl. the `-dc` pair for the SASS diff) | 0.8 | 1% |
+| other tool runtime (reads, greps, the dump comparison) | 0.4 | <1% |
 
-Almost all of the tool-runtime wall time is queue wait, not work: the harness itself runs in seconds
-(a 51-iteration median per shape, a few seconds of FP64 CPU reference, 14 row counts of contract
-checks). The four longest gaps in the transcript are 600, 570, 552 and 468 s of waiting on gpu1 --
-two `cuteafd bench smoke` runs held it -- and on the poll loops that watched the contract log, which
-is the wrong pattern (a backgrounded blocking command replaced them mid-task; they cost wall time,
-not tokens). Moving the second window to gpu0 per the coordinator's note did not shorten the wait: a
-4-hour gpu0+gpu1 ticket was ahead of it. Compiles are cheap because only one small translation unit
-is built in the cpu container rather than the whole native library.
+Two thirds of the task is queue wait, not work: each of the three windows sat behind `cuteafd bench
+smoke` tickets on gpu1, then behind a 4-hour gpu0+gpu1 ticket after the move to gpu0. The harness
+inside a window runs in seconds (three row-count sweeps, a few seconds of FP64 CPU reference, 22
+contract cases per shape). The poll loops that watched the first window are the wrong pattern and
+replaced mid-task by one backgrounded blocking command; they cost wall time, not tokens. Compiles are
+cheap because only one small translation unit is built in the cpu container rather than the whole
+native library.
 
 ## Reproducing
 
