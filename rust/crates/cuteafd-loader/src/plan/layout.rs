@@ -1715,7 +1715,7 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
         && sparks.is_empty()
         && placement.reason == "requested Spark encoder/replicas unavailable";
     if vision_only_spark {
-        placement.reason = "vision-only Spark workers aren't supported; set VISION=rtx or RTX_EXPERT_LAYERS".into();
+        placement.reason = "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS".into();
         placement.shortfall = 0;
     }
     let add = |d: &mut DeviceLayout| {

@@ -2814,7 +2814,7 @@ fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
     let base = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768), ..Default::default()
     }), ..sparks(4) };
-    let sentence = "vision-only Spark workers aren't supported; set VISION=rtx or RTX_EXPERT_LAYERS";
+    let sentence = "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS";
     for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
         let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
         assert!(!report.placement_supported, "{vision:?}");
