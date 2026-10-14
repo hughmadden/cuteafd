@@ -183,12 +183,24 @@ pub fn resolve_in(model: &str, snapshot: Option<&Path>, hub: &Path) -> Result<Re
     Ok(Resolution::new("name", publication, vec![chain]))
 }
 
-pub fn resolve(model: &str, snapshot: Option<&Path>) -> Result<Resolution> {
-    let hub = std::env::var_os("HF_HUB_CACHE").map(PathBuf::from).unwrap_or_else(|| {
+/// This host's Hugging Face hub cache: `HF_HUB_CACHE`, else `HF_HOME/hub`,
+/// else `~/.cache/huggingface/hub`.
+pub fn hub() -> PathBuf {
+    std::env::var_os("HF_HUB_CACHE").map(PathBuf::from).unwrap_or_else(|| {
         std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(||
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface")).join("hub")
-    });
-    resolve_in(model, snapshot, &hub)
+    })
+}
+
+/// The local snapshot a served checkpoint path resolves to: a path that exists
+/// as given, else the same revision in this host's hub (a container path
+/// differs from the client's mount).
+pub fn served_snapshot_path(model: &str, snapshot: Option<&Path>) -> Option<PathBuf> {
+    served_snapshot(&hub(), model, snapshot)
+}
+
+pub fn resolve(model: &str, snapshot: Option<&Path>) -> Result<Resolution> {
+    resolve_in(model, snapshot, &hub())
 }
 
 #[cfg(test)]

@@ -259,6 +259,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("verdict", json!(verdict));
     check.set("run", json!(scored));
     check.status = if verdict.pass { CheckStatus::Pass } else { CheckStatus::Fail };
+    crate::quality::apply_fidelity(run.info, check);
     check.summary = format!("KL {:.3} · top-1 {:.1}% · {} generated / 4096 total rows · 8 windows",
         f.kl, 100.0 * f.top1, f.positions);
     Ok(())

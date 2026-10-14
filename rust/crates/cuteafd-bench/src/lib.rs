@@ -19,6 +19,7 @@ pub mod http;
 pub mod panels;
 pub mod profiles;
 pub mod publish;
+pub mod quality;
 pub mod reference;
 pub mod render;
 pub mod report;

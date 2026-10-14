@@ -802,13 +802,21 @@ impl Quality {
         };
     }
 
-    /// The share-card badge, e.g. `KL 0.058 · top-1 89.9% ✓ exact cache`.
+    /// The share-card badge, e.g. `KL 0.058 · top-1 89.9% ✓ exact cache`. An
+    /// informational fidelity keeps its numbers with the reason it is not
+    /// gated: `KL 0.039 · top-1 93.7% (info: calibrated W4A4) ✓ exact cache`.
     pub fn badge(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(fidelity) = self.check("fidelity").filter(|c| matches!(c.status, CheckStatus::Pass | CheckStatus::Fail)) {
+        if let Some(fidelity) = self.check("fidelity")
+            .filter(|c| matches!(c.status, CheckStatus::Pass | CheckStatus::Fail | CheckStatus::Info)) {
             if let (Some(kl), Some(top1)) = (fidelity.metric("kl"), fidelity.metric("top1")) {
                 let mark = if fidelity.status == CheckStatus::Fail { "✗ " } else { "" };
-                parts.push(format!("{mark}KL {kl:.3} · top-1 {:.1}%", top1 * 100.0));
+                let note = match (&fidelity.note, fidelity.status) {
+                    (Some(note), CheckStatus::Info) => format!(" (info: {note})"),
+                    (None, CheckStatus::Info) => " (info)".into(),
+                    _ => String::new(),
+                };
+                parts.push(format!("{mark}KL {kl:.3} · top-1 {:.1}%{note}", top1 * 100.0));
             }
         }
         let mut tail = Vec::new();
@@ -851,6 +859,9 @@ pub struct Check {
     pub status: CheckStatus,
     /// One line: what was found.
     pub summary: String,
+    /// Why an informational check is not gated (`calibrated W4A4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// Named numbers (kl, top1, nll, ...).
     #[serde(default)]
     pub metrics: serde_json::Map<String, Value>,
@@ -869,6 +880,15 @@ impl Check {
 
     pub fn set(&mut self, name: &str, value: impl Into<Value>) {
         self.metrics.insert(name.into(), value.into());
+    }
+
+    /// The summary and, when the check is informational, the reason it is not
+    /// gated: `KL 0.039 · top-1 93.7% (info: calibrated W4A4)`.
+    pub fn detail(&self) -> String {
+        match (&self.note, self.status) {
+            (Some(note), CheckStatus::Info) => format!("{} (info: {note})", self.summary),
+            _ => self.summary.clone(),
+        }
     }
 }
 

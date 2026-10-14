@@ -111,6 +111,17 @@ mod tests {
     }
 
     #[test]
+    fn a_published_card_renders_unchanged_under_the_fidelity_rule() {
+        let report: crate::report::Report = serde_json::from_str(include_str!(
+            "../../../../benchmarks/mimo_v2/2026-10-09-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min-rc3/report.json")).unwrap();
+        let before = render::card::card_svg(&report);
+        let mut reconciled = report.clone();
+        crate::quality::reconcile(&mut reconciled);
+        assert_eq!(reconciled.baseline.as_ref().unwrap().quality.status, report.baseline.as_ref().unwrap().quality.status);
+        assert_eq!(render::card::card_svg(&reconciled), before);
+    }
+
+    #[test]
     fn scaling_card_snapshots_cover_pro_small_and_missing_points() {
         let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
         for case in ["pro", "32gb", "missing"] {

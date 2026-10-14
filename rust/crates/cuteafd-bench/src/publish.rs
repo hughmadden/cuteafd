@@ -45,7 +45,11 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
                 continue;
             }
             let text = std::fs::read_to_string(&path)?;
-            let report: Report = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+            let mut report: Report = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+            // Publish under the rule in force now, not the one the report was
+            // written under: a stored status is data, and the checkpoint's own
+            // numerics decide whether absolute fidelity was a gate.
+            crate::quality::reconcile(&mut report);
             let relative = dir.path().strip_prefix(root).unwrap_or(&dir.path()).to_path_buf();
             placed.push(Placed { dir: relative, report });
         }

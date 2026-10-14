@@ -377,7 +377,7 @@ impl<'a> View<'a> {
             }
             doc.text(0.0, y + 13.0, Font::new(13.0, color).bold(), check.status.symbol());
             doc.text(22.0, y + 13.0, Font::new(12.0, t.ink).weight(600), &check.title);
-            doc.text(230.0, y + 13.0, Font::new(11.5, t.ink2), &fit(&check.summary, 11.5, w - 300.0));
+            doc.text(230.0, y + 13.0, Font::new(11.5, t.ink2), &fit(&check.detail(), 11.5, w - 300.0));
             if check.seconds > 0.0 {
                 doc.text(w, y + 13.0, Font::new(10.0, t.muted).anchor(Anchor::End), &seconds(check.seconds));
             }
