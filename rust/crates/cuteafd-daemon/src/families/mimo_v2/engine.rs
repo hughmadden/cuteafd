@@ -435,11 +435,31 @@ impl RopeWindow {
     }
 }
 
+/// The producer's positions operand is only a RoPE row index; attention's
+/// positions operand still controls absolute masking and cache history.
+struct StepInputBindings {
+    producer_positions: *mut c_void,
+    attention_positions: *mut c_void,
+    kv_slots: *mut c_void,
+    cos_sin: *mut c_void,
+}
+
+fn step_input_bindings(inputs: *mut c_void, identity: *mut c_void, slots: *mut c_void,
+    rows: usize, dim: usize, attention: MimoAttention) -> StepInputBindings {
+    let sliding = attention == MimoAttention::Sliding;
+    let offset = rows * 8 + usize::from(sliding) * rows * dim * 4;
+    StepInputBindings {
+        producer_positions: identity,
+        attention_positions: inputs,
+        kv_slots: if sliding { identity } else { slots },
+        cos_sin: inputs.cast::<u8>().wrapping_add(offset).cast(),
+    }
+}
+
 impl Workspace<'_> {
-    fn rope_ptr(&self, dim: usize, sliding: bool) -> *mut c_void {
-        let offset = self.rows * 8 + usize::from(sliding) * self.rows * dim * 4;
-        // SAFETY: step_inputs owns positions followed by two [rows, dim] FP32 tables.
-        unsafe { self.step_inputs.buffer.ptr.cast::<u8>().add(offset).cast() }
+    fn attention_bindings(&self, dim: usize, attention: MimoAttention) -> StepInputBindings {
+        step_input_bindings(self.step_inputs.buffer.ptr, self.step_slots.buffer.ptr,
+            self.slots.buffer.ptr, self.rows, dim, attention)
     }
 }
 
@@ -2515,11 +2535,7 @@ impl<'a> MimoEngine<'a> {
         rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let k = kind(layer.attention);
-        let slots = match layer.attention {
-            MimoAttention::Full => w.slots.buffer.ptr,
-            MimoAttention::Sliding => w.step_slots.buffer.ptr,
-        };
-        let cos_sin = w.rope_ptr(self.cfg.rope_dim, layer.attention == MimoAttention::Sliding);
+        let bindings = w.attention_bindings(self.cfg.rope_dim, layer.attention);
         let split = layer.split;
         let records = match layer.attention {
             MimoAttention::Full => kv,
@@ -2527,8 +2543,8 @@ impl<'a> MimoEngine<'a> {
         };
         let decode = tables.decode;
         if part == 0 {
-            let pointers = [("x", w.x.buffer.ptr), ("positions", w.step_slots.buffer.ptr), ("kv_slots", slots),
-                ("cos_sin", cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
+            let pointers = [("x", w.x.buffer.ptr), ("positions", bindings.producer_positions), ("kv_slots", bindings.kv_slots),
+                ("cos_sin", bindings.cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
                 ("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
             let kv = self.kv_cache.of(layer.attention).program_tag();
             return self.run_on(rank, split, &format!("mimo_{k}_producer{kv}_{cap}"), &pointers, &self.w8_scalars(rows, decode));
@@ -2539,7 +2555,7 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Full => {
                 let mut scalars = vec![rows, Scalar::I32(tables.table_stride as i32)];
                 let mut pointers = vec![("q", w.query.buffer.ptr), ("kv_cache", kv),
-                    ("positions", w.step_inputs.buffer.ptr), ("page_table", w.page_table.buffer.ptr)];
+                    ("positions", bindings.attention_positions), ("page_table", w.page_table.buffer.ptr)];
                 if tables.decode {
                     scalars.push(Scalar::I32(DECODE_SPLITS));
                 } else if self.kv_cache != MimoKvCache::Bf16 {
@@ -2554,7 +2570,7 @@ impl<'a> MimoEngine<'a> {
             }
             MimoAttention::Sliding => {
                 self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
-                    ("ring", kv), ("positions", w.step_inputs.buffer.ptr),
+                    ("ring", kv), ("positions", bindings.attention_positions),
                     ("ring_slots", w.ring_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
                     ("sinks", layer.ptr("sinks")?), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                     &[rows])?;
@@ -2925,6 +2941,55 @@ mod terminal_fault_tests;
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity, prefill_lane_count,
         scale_operand, MimoAttentionWorkspace, MimoPlacement, MimoPrefillOutput, DECODE_ROWS, MIN_LANE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn attention_bindings_keep_absolute_positions_and_independent_kv_slots() {
+        use super::{step_input_bindings, MimoAttention};
+        for rank in 0..2 {
+            for rows in [4096, DECODE_ROWS] { // Prefill and decode/verify/MTP workspace extents.
+                let inputs = (0x100000 + rank * 0x100000) as *mut std::ffi::c_void;
+                let identity = 0x400000 as *mut std::ffi::c_void;
+                let slots = 0x500000 as *mut std::ffi::c_void;
+                for attention in [MimoAttention::Full, MimoAttention::Sliding] {
+                    let bindings = step_input_bindings(inputs, identity, slots, rows, 64, attention);
+                    assert_eq!(bindings.producer_positions, identity);
+                    assert_eq!(bindings.attention_positions, inputs);
+                    assert_eq!(bindings.kv_slots, if attention == MimoAttention::Full { slots } else { identity });
+                    let kind = usize::from(attention == MimoAttention::Sliding);
+                    assert_eq!(bindings.cos_sin as usize, inputs as usize + rows * 8 + kind * rows * 64 * 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_window_reuse_long_short_long_keeps_each_lane_exact() {
+        let window = super::RopeWindow::new(64, 1.0e7, 1.0e4);
+        let rows = 7;
+        let mut lanes = [vec![0; rows * 520], vec![0; rows * 520]];
+        let long = [1048575, 999999, 524287, 1048501, 13, 1048107, 262143];
+        let short = [1048511, 127];
+        for positions in [&long[..], &short[..], &long[..]] {
+            for (lane, packed) in lanes.iter_mut().enumerate() {
+                let positions: Vec<i64> = positions.iter().map(|&p| p - lane as i64).collect();
+                window.fill(&positions, rows, 1 << 20, packed).unwrap();
+                for (kind, theta) in [1.0e7, 1.0e4].into_iter().enumerate() {
+                    for (row, &p) in positions.iter().enumerate() {
+                        assert_eq!(i64::from_ne_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap()), p);
+                        let base = rows * 8 + (kind * rows + row) * 64 * 4;
+                        for i in 0..32 {
+                            let inv = 1.0 / (theta as f32).powf((2 * i) as f32 / 64.0);
+                            let angle = p as f32 * inv;
+                            for (column, expected) in [(i, angle.cos()), (32 + i, angle.sin())] {
+                                let at = base + column * 4;
+                                assert_eq!(u32::from_ne_bytes(packed[at..at + 4].try_into().unwrap()), expected.to_bits());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn rope_windows_match_original_full_tables_bitwise_at_large_positions() {
