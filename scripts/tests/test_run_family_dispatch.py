@@ -50,7 +50,7 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     _snapshot(hf, "zai-org/GLM-5.3-Flash", {"model_type": "glm5_next", "num_hidden_layers": 45,
                                            "layer_types": ["linear_attention"] * 45,
                                            "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42})
-    (repo / "glmf.config").write_text("MODEL_ID=zai-org/GLM-5.3-Flash\nDRAFT_MODEL_ID=incoai/x\n")
+    (repo / "glmf.config").write_text("MODEL_ID=zai-org/GLM-5.3-Flash\nSPECULATOR_MODEL_ID=incoai/x\n")
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--restart")
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart\n"
@@ -101,7 +101,7 @@ def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
-    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE", "DRAFT_SURVIVAL_LENGTHS"]
+    names = ["DRAFT_SURVIVAL_LENGTHS"]
     keys = "".join(f"{name}={value}\n" for name in names) if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
@@ -121,24 +121,27 @@ def test_glm53_bare_default_uses_release_dflash2(tmp_path: Path) -> None:
     assert "models--incoai--GLM-5.3-DFlash2/snapshots/abc" in result.stderr
 
 
-@pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS"])
+@pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "CUTEAFD_COPY_DRAFT_POLICY",
+    "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS", "MIMO_COPY_WINDOWS", "GLM5_FLASH_DRAFT_POLICY",
+    "DRAFT_MODEL_ID", "DRAFT_MODEL_REVISION", "DRAFT_FP8", "DFLASH", "MTP"])
 @pytest.mark.parametrize("value", ["on", "off"])
-def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: str) -> None:
+def test_removed_draft_keys_are_unknown(tmp_path: Path, key: str, value: str) -> None:
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
     }, "zai-org/GLM-5.3", f"{key}={value}\n")
-    assert result.returncode != 0
-    assert f"{key} was removed for GLM 5.3" in result.stderr
+    assert result.returncode == 2, result.stderr
+    assert f"unknown configuration key: {key}" in result.stderr
+    assert "deprecated" not in result.stderr and "was removed" not in result.stderr
+    assert "docker run -d" not in result.stderr
 
 
 @pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS"])
 @pytest.mark.parametrize("value", ["on", "off"])
-def test_v4_rejects_removed_draft_switches_with_shared_replacement(tmp_path: Path, key: str, value: str) -> None:
+def test_v4_rejects_removed_draft_switches_as_unknown_keys(tmp_path: Path, key: str, value: str) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"},
                                   "deepseek-ai/DeepSeek-V4-Flash-0731", f"{key}={value}\n")
     assert result.returncode != 0
-    assert f"{key} was removed for deepseek_v4" in result.stderr
-    assert "shared resource-priced draft policy" in result.stderr
+    assert f"unknown configuration key: {key}" in result.stderr
 
 
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
@@ -193,9 +196,9 @@ def test_thermal_report_key_rejects_unknown_value(tmp_path: Path) -> None:
 def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
-                                  "DRAFT_CONFIDENCE=maybe\n")
+                                  "DRAFT_SURVIVAL_LENGTHS=maybe\n")
     assert result.returncode != 0
-    assert "DRAFT_CONFIDENCE must be on or off" in result.stderr
+    assert "DRAFT_SURVIVAL_LENGTHS must be on or off" in result.stderr
 
 
 def test_family_table_names_every_launchable_family() -> None:
@@ -1240,8 +1243,8 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
 
 
 @pytest.mark.parametrize("keys,message", [
-    ("GLM5_FLASH_DRAFT_POLICY=shared\n", "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3"),
-    ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3"),
+    ("GLM5_FLASH_DRAFT_POLICY=shared\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
+    ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "GLM5_FLASH_DRAFT_TRACE must be"),
     ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
@@ -1476,7 +1479,7 @@ def test_glm_drafter_context_slots_and_batch_are_independent(tmp_path, family):
     model = "test/model" if family == "glm5" else "zai-org/GLM-5.3-Flash"
     result = _family_launch_result(tmp_path, config, model,
                                   f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={model}\n"
-                                  "DRAFT_CONTEXT_SLOTS=20\nDRAFT_SEQUENCES=16\nDRAFT_FP8=on\n")
+                                  "DRAFT_CONTEXT_SLOTS=20\nDRAFT_SEQUENCES=16\nSPECULATOR_FP8=on\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     for argument in ("--draft-context-slots 20", "--draft-sequences 16", "--draft-fp8 true"):
@@ -1545,7 +1548,7 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
     assert "docker run" not in result.stderr
 
 
-@pytest.mark.parametrize("key", ["SPECULATOR_FP8", "DRAFT_FP8"])
+@pytest.mark.parametrize("key", ["SPECULATOR_FP8"])
 @pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("auto", None),
                                             ("on", "true"), ("off", "false")])
 def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(tmp_path, key, value, expected):
@@ -1894,16 +1897,13 @@ def test_explicit_split_requires_two_physical_gpus(tmp_path: Path, keys: str) ->
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> None:
+def test_speculator_uses_canonical_depth_and_validates_family(tmp_path: Path) -> None:
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
     new = _family_launch_lines(tmp_path / "a", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=mtp\nSPECULATOR_DEPTH=2\n")
-    old = _family_launch_lines(tmp_path / "b", config, "XiaomiMiMo/MiMo-V2-Flash", "MTP=2\n")
-    launch = lambda text: [l for l in text.splitlines() if "cuteafd serve-mimo" in l]
-    assert launch(new) and "--mtp 2" in launch(new)[0]
-    assert [l.replace(str(tmp_path / "b"), "X") for l in launch(old)] == \
-        [l.replace(str(tmp_path / "a"), "X") for l in launch(new)]
-    assert "deprecated" in old and "deprecated" not in new
-    bad = _family_launch_lines(tmp_path / "c", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=dspark\n")
+    launch = [line for line in new.splitlines() if "cuteafd serve-mimo" in line]
+    assert launch and "--mtp 2" in launch[0]
+    assert "deprecated" not in new
+    bad = _family_launch_lines(tmp_path / "b", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=dspark\n")
     assert "does not apply to mimo_v2" in bad
 
 
@@ -2058,8 +2058,7 @@ def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
 @pytest.mark.parametrize("keys,expected", [
     ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
     ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
-    ("DRAFT_FP8=off\n", "bf16"), ("SPECULATOR=off\n", "off"),
-    ("MTP=0\n", "off"), ("DFLASH=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
+    ("SPECULATOR=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
 ])
 def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str) -> None:
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
@@ -2138,8 +2137,8 @@ def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("keys,depth", [("", 3), ("SPECULATOR=mtp\n", 3),
-                                      ("SPECULATOR_DEPTH=2\n", 2), ("MTP=2\n", 2),
-                                      ("SPECULATOR=off\n", None), ("MTP=0\n", None)])
+                                      ("SPECULATOR_DEPTH=2\n", 2),
+                                      ("SPECULATOR=off\n", None)])
 def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, depth: int | None) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
                                             "quantization_config": {"quant_method": "exl3"}},

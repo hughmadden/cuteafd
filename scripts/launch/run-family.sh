@@ -137,21 +137,12 @@ fi
 # the family variables, which are set too for one release.
 shared_trace_args() {
 trace_args=()
-# Experimental shared policy changes stay off until emitted-throughput gates pass.
-for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE DRAFT_SURVIVAL_LENGTHS; do
-  # DRAFT_SURVIVAL_LENGTHS (every shared-policy family, GLM 5.3 included):
-  # verify drafts while calibrated survival >= 0.5 instead of pricing rows.
-  if [[ $family =~ ^(glm5|deepseek_v4)$ && $policy_key != DRAFT_SURVIVAL_LENGTHS && -n "$(get "$policy_key")" ]]; then
-    label="$family"; [[ $family != glm5 ]] || label="GLM 5.3"
-    echo "$policy_key was removed for $label: it always runs the shared resource-priced draft policy; delete the key" >&2
-    exit 2
-  fi
-  case "$(get "$policy_key" off)" in
-    on) trace_args+=(-e "CUTEAFD_$policy_key=1") ;;
-    off) trace_args+=(-e "CUTEAFD_$policy_key=0") ;;
-    *) echo "$policy_key must be on or off" >&2; exit 2 ;;
-  esac
-done
+# Optional diagnostic length rule; production selection uses resource prices.
+case "$(get DRAFT_SURVIVAL_LENGTHS off)" in
+  on) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=1) ;;
+  off) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0) ;;
+  *) echo "DRAFT_SURVIVAL_LENGTHS must be on or off" >&2; exit 2 ;;
+esac
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
   [[ "$trace" == /* ]] || { echo 'SPECULATION_TRACE must be an absolute path' >&2; exit 2; }
@@ -1252,9 +1243,7 @@ snapshot_of() {
 # Official Flash MOPD's bundled drafter defaults to single-copy FP8 (measured
 # separately from its checkpoint BF16 target head/O); other MiMo defaults follow
 # runtime weight policy. SPECULATOR_FP8=auto keeps drafter checkpoint format. GLM auto/unset
-# drafts in single-copy FP8. on converts, off selects BF16. Pre-rename keys
-# (DRAFT_MODEL_ID, DFLASH,
-# MTP, DSPARK, DRAFT_FP8) still work for one release.
+# drafts in single-copy FP8. on converts, off selects BF16.
 # GLM 5.3 Flash always drafts with an external speculator: the one measured
 # fastest (emitted tok/s: C1/C4 code and an agentic reasoning session, 1 RTX +
 # 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
@@ -1278,11 +1267,7 @@ fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
 if [[ -z "$speculator" ]]; then
-  if [[ -n "$(get DRAFT_MODEL_ID)" || "$(get DFLASH off)" == on ]]; then speculator=dflash2
-  elif [[ "$(get MTP 0)" != 0 ]]; then speculator=mtp
-  elif [[ $family == deepseek_v4 && "$(get DSPARK off)" == on ]]; then speculator=dspark
-  else speculator=off; fi
-  [[ $speculator == off ]] || echo "warning: DRAFT_MODEL_ID/DFLASH/MTP/DSPARK are deprecated; use SPECULATOR=$speculator" >&2
+  speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
     speculator=dflash2 default_drafter=incoai/GLM-5.3-DFlash2
     echo "note: GLM 5.3 drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
@@ -1297,19 +1282,18 @@ if [[ -z "$speculator" ]]; then
       speculator=off default_drafter=""
     fi
   fi
-  if [[ $speculator == off && $mimo_bundled_dflash == 1 && -z ${cfg[MTP]+set} && -z ${cfg[DFLASH]+set} ]]; then
+  if [[ $speculator == off && $mimo_bundled_dflash == 1 ]]; then
     speculator=dflash2
     echo "note: $model drafts with its bundled DFlash; SPECULATOR=off disables it" >&2
   fi
-  if [[ $speculator == off && $dsv4_dspark == 1 && -z ${cfg[DSPARK]+set} ]]; then
+  if [[ $speculator == off && $dsv4_dspark == 1 ]]; then
     speculator=dspark
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
   # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
   # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
-  # expert formats keep their opt-in status. An explicit SPECULATOR=off or
-  # legacy MTP=0 disables the family default.
-  if [[ $speculator == off && ( $qwen_exl3 == 1 || $qwen_nvfp4 == 1 ) && $qwen_mtp == 1 && $ranks == 0 && -z ${cfg[MTP]+set} ]]; then
+  # expert formats keep their opt-in status. SPECULATOR=off disables the default.
+  if [[ $speculator == off && ( $qwen_exl3 == 1 || $qwen_nvfp4 == 1 ) && $qwen_mtp == 1 && $ranks == 0 ]]; then
     speculator=mtp
     echo "note: Qwen local $([[ $qwen_exl3 == 1 ]] && echo EXL3 || echo NVFP4) drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
   fi
@@ -1384,12 +1368,12 @@ if [[ $family == mimo_v2 ]]; then
 fi
 case "$speculator" in
   dflash2|dspark)
-    drafter="$(key SPECULATOR_MODEL_ID DRAFT_MODEL_ID)"
+    drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
-      draft_snapshot="$(snapshot_of "$drafter" "$(key SPECULATOR_MODEL_REVISION DRAFT_MODEL_REVISION)")" ||
+      draft_snapshot="$(snapshot_of "$drafter" "$(get SPECULATOR_MODEL_REVISION)")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
     elif [[ $family == mimo_v2 ]]; then
@@ -1400,7 +1384,7 @@ case "$speculator" in
   mtp)
     mtp_depth=1
     [[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
-    family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
+    family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
 # (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
@@ -1426,7 +1410,6 @@ fi
 if [[ $family == mimo_v2 ]]; then
   [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
   [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
-  [[ -z "$(get MIMO_COPY_WINDOWS)" ]] || { echo "MIMO_COPY_WINDOWS was removed: copies only extend agreeing neural drafts; delete the key" >&2; exit 2; }
   [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
@@ -1491,12 +1474,6 @@ if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ ]]; then
   fi
   family_args+=(--pool-tokens "$pool")
 fi
-if [[ -n "$(get COPY_DRAFTS)" || -n "$(get COPY_DRAFT_POLICY)" ]]; then
-  label="$family"; [[ $family != glm5 ]] || label="GLM 5.3"
-  for removed in COPY_DRAFTS COPY_DRAFT_POLICY; do
-    [[ -z "$(get "$removed")" ]] || { echo "$removed was removed for $label: the shared resource-priced draft policy only extends agreeing neural drafts with copies; delete the key" >&2; exit 2; }
-  done
-fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
@@ -1548,15 +1525,15 @@ if [[ $serve != serve-dsv4 ]]; then
       if [[ $mimo_flash_mopd == 1 && $speculator == dflash2 && -z "$drafter" ]]; then
         mimo_draft_default=on
       fi
-      case "$(key SPECULATOR_FP8 DRAFT_FP8 "$mimo_draft_default")" in
+      case "$(get SPECULATOR_FP8 "$mimo_draft_default")" in
         "") ;;
         auto) family_args+=(--draft-representation checkpoint) ;;
         on) family_args+=(--draft-fp8 true) ;;
         off) family_args+=(--draft-fp8 false) ;;
-        *) echo "MiMo SPECULATOR_FP8/DRAFT_FP8 must be auto, on or off" >&2; exit 2 ;;
+        *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then
-      case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
+      case "$(get SPECULATOR_FP8 auto)" in
         auto) ;; # The engine default: single-copy FP8 drafter weights.
         on) family_args+=(--draft-fp8 true) ;;
         off) family_args+=(--draft-fp8 false) ;;
@@ -1564,7 +1541,7 @@ if [[ $serve != serve-dsv4 ]]; then
       esac
       [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
       [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
-    elif [[ "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then
+    elif [[ "$(get SPECULATOR_FP8 on)" == off ]]; then
       family_args+=(--draft-fp8 false)
     fi
   fi
@@ -1777,7 +1754,7 @@ if [[ $family == glm5_flash ]]; then
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
   # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
   draft_linear_default=w8a16
-  if [[ ${#draft_args[@]} != 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
+  if [[ ${#draft_args[@]} != 0 && "$(get SPECULATOR_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
   draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR "$draft_linear_default")"
   case "$draft_linear" in
     ""|w8a16) ;;
@@ -1943,11 +1920,6 @@ if [[ $family == glm5_flash ]]; then
     chain) family_args+=(--verify-policy chain) ;;
     *) echo "GLM5_FLASH_VERIFY_POLICY must be cost or chain" >&2; exit 2 ;;
   esac
-  # GLM Flash always runs the resource-priced shared draft policy (v3 D3); the D2 switch is gone.
-  if [[ -n "$(get GLM5_FLASH_DRAFT_POLICY)" ]]; then
-    echo "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3: GLM Flash always runs the shared draft policy; delete the key" >&2
-    exit 2
-  fi
   # GLM5_FLASH_ROUTE_RING_CHECK=on (diagnostic) also copies Spark layers' router ids through the local
   # route ring and counts disagreements with the staged ids.
   case "$(get GLM5_FLASH_ROUTE_RING_CHECK off)" in
