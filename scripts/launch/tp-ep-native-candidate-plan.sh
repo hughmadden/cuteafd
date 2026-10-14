@@ -34,7 +34,7 @@ candidate_print_plan() {
   echo "expect_spark_lib_sha256=${expect_spark_lib_sha256:-unset}"
   echo "role_manifest=${role_manifest:-unset}"
   echo "qualified=$qualified require_arch=$require_arch"
-  echo "dspark=$DSPARK dspark_draft_limit=$dspark_draft_limit (coordinator only)"
+  echo "speculator=$SPECULATOR dspark_draft_limit=$dspark_draft_limit (coordinator only)"
   echo "host_device_map=CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-unset} (required on both roles)"
   echo "tcp_timing=CUTEAFD_PROTOCOL_V2_TCP_TIMING=${CUTEAFD_PROTOCOL_V2_TCP_TIMING:-unset} (startup diagnostic; unset means the RC GID line is not emitted)"
   echo "sparkinfer_source=${CUTEAFD_SPARKINFER_SOURCE_DIR:-unset} pythonpath=${PYTHONPATH:-unset}"

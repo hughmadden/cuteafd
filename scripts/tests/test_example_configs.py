@@ -61,7 +61,7 @@ CHECKPOINTS = {
 FAMILY_DOCS = {"deepseek_v41": "deepseek_v41", "deepseek_v4": "deepseek_v4", "glm5": "glm5",
                "glm5_flash": "glm5_flash", "mimo_v2": "mimo_v2", "qwen4": "qwen4"}
 # Launcher keys that select the speculator and the KV pool.
-SPECULATOR_KEYS = ("SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "DSPARK")
+SPECULATOR_KEYS = ("SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH")
 POOL_KEYS = ("POOL_TOKENS",)
 # The one named exception (decided 2026-10-10): the V4.1 cards ran with
 # POOL_TOKENS=auto, so the V4.1 examples pin it, while the V4.1 loader leaves the key
@@ -217,11 +217,11 @@ def test_v41_starting_config_passes_the_native_config_validation(path: Path, tmp
     _pin_snapshots(hf, keys(path))
     result = subprocess.run(
         ["bash", "-euc", 'source scripts/lib/release-common.sh; [[ "$(release_config_family "$1")" == deepseek_v41 ]]; '
-         'release_load_config "$1"; printf "%s\\n" "$SPARK_COUNT" "$RTX_GPUS" "$POOL_TOKENS" "$DSPARK"',
+         'release_load_config "$1"; printf "%s\\n" "$SPARK_COUNT" "$RTX_GPUS" "$POOL_TOKENS" "$SPECULATOR"',
          "test", str(path)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     count, gpus, pool, dspark = result.stdout.split()
-    assert (count, gpus, pool, dspark) == (keys(path)["SPARK_COUNT"], keys(path)["RTX_GPUS"], "auto", "on")
+    assert (count, gpus, pool, dspark) == (keys(path)["SPARK_COUNT"], keys(path)["RTX_GPUS"], "auto", "dspark")
 
 
 @pytest.mark.parametrize("path", FAMILY, ids=lambda p: p.name)
@@ -271,7 +271,7 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
     values = keys(path)
     result = subprocess.run(
         ["bash", "-euc", 'source scripts/lib/release-common.sh; release_load_config "$1"; '
-         'printf "%s=%s\\n" DSPARK "$DSPARK" POOL_TOKENS "$POOL_TOKENS"',
+         'printf "%s=%s\\n" SPECULATOR "$SPECULATOR" POOL_TOKENS "$POOL_TOKENS"',
          "test", str(_strip(path, tmp_path, SPECULATOR_KEYS + POOL_KEYS))],
         cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

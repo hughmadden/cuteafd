@@ -144,7 +144,7 @@ def test_plan_renders_ordered_six_rank_lifecycle() -> None:
         [f"STEP expert-start rank={index}" for index in range(6)] + \
         ["STEP worker-ready", "STEP plan-ack", "STEP readiness-gate",
          "STEP first-request", "STEP gid-capture"], steps
-    assert "dspark=on dspark_draft_limit=7 (coordinator only)" in dual
+    assert "speculator=dspark dspark_draft_limit=7 (coordinator only)" in dual
     assert "tcp_timing=CUTEAFD_PROTOCOL_V2_TCP_TIMING=unset" in dual
     assert "PREREQ stage-0:" in dual and "NOT performed" in dual
     experts = [line for line in dual.splitlines() if line.startswith("CMD expert-")]
@@ -158,7 +158,22 @@ def test_plan_renders_ordered_six_rank_lifecycle() -> None:
         [f"STEP expert-start rank={index}" for index in range(6)] + \
         ["STEP worker-ready", "STEP coordinator-start", "STEP readiness-gate",
          "STEP first-request", "STEP gid-capture"], single_steps
-    assert "dspark=on dspark_draft_limit=5 (coordinator only)" in single
+    assert "speculator=dspark dspark_draft_limit=5 (coordinator only)" in single
+
+
+def test_direct_native_candidate_rejects_invalid_speculator(tmp_path) -> None:
+    bin_dir, log = _fake_bin(tmp_path), tmp_path / "calls.log"
+    base = (FIX / "site-2rtx6-tp3ep2.config").read_text()
+    for value in ("mtp", "dflash2", "on", "typo"):
+        config = tmp_path / f"speculator-{value}.config"
+        config.write_text(base.replace("SPECULATOR=dspark", f"SPECULATOR={value}"))
+        result = subprocess.run(
+            ["bash", str(LAUNCHER), "plan", "--config", str(config), "--rtx-gpus", "2",
+             "--host-artifact-root", str(ROOT / "runs" / "tp-ep-six")],
+            capture_output=True, text=True, cwd=ROOT, env=_start_env(bin_dir, log))
+        assert result.returncode == 2, result.stderr
+        assert "SPECULATOR must be dspark or off for DeepSeek V4.1" in result.stderr
+    assert not log.exists() or log.read_text() == "", "a rejected config must send no remote command"
 
 
 # 2. Wrapper guards: overflow-safe budget bound, exact named arms, missing key.
