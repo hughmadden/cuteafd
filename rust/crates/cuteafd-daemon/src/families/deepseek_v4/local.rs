@@ -52,6 +52,7 @@ enum Backend<'a> {
         /// dSpark stage experts (same geometry), loaded before backbone layers.
         stages: Vec<ExpertWeights<'a>>,
         states: Vec<State<'a>>,
+        reduction_plan: crate::shared::experts::ExpertReductionPlan,
         _scratch: DeviceAllocation<'a>,
     },
     /// One execution per package capacity over shared resident weights:
@@ -102,10 +103,13 @@ pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalo
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
         let mut scratch = 0;
+        let mut infos = Vec::new();
         for capacity in capacities {
             let Ok(kernel) = library.v41_local_expert_kernel(capacity) else { return Ok(None); };
             scratch = scratch.max(usize::try_from(kernel.info().scratch_bytes)?);
+            infos.push(*kernel.info());
         }
+        crate::shared::experts::ExpertReductionPlan::native(library, infos)?;
         let measured = scratch + max_rows * (shape.hidden * 2 + shape.topk * 8);
         let planned = cuteafd_loader::serving_capacity::deepseek_v4_native_workspace(shape.hidden as u64,
             shape.intermediate as u64, shape.experts as u64, shape.topk as u64, max_rows as u64)?;
@@ -132,10 +136,13 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
         let mut scratch = 0;
+        let mut infos = Vec::new();
         for capacity in capacities {
             let Ok(kernel) = library.v41_local_expert_kernel(capacity) else { return Ok(empty()); };
             scratch = scratch.max(usize::try_from(kernel.info().scratch_bytes)?);
+            infos.push(*kernel.info());
         }
+        crate::shared::experts::ExpertReductionPlan::native(library, infos)?;
         scratch + max_rows * (shape.hidden * 2 + shape.topk * 8)
     };
     let weight_plan = |layer| -> Result<_> {
@@ -223,6 +230,8 @@ impl<'a> LocalExperts<'a> {
             scratch_bytes = scratch_bytes.max(usize::try_from(kernel.info().scratch_bytes)?);
             states.push(State { kernel, slots: [std::ptr::null_mut(); V41_EXPERT_POINTER_COUNT] });
         }
+        let reduction_plan = crate::shared::experts::ExpertReductionPlan::native(library,
+            states.iter().map(|s| *s.kernel.info()))?;
         let workspace = scratch_bytes + max_rows * (shape.hidden * 2 + shape.topk * 8);
         ensure!(budget > workspace, "local experts need {workspace} workspace bytes, budget is {budget}");
         let mut remaining = budget - workspace;
@@ -260,7 +269,7 @@ impl<'a> LocalExperts<'a> {
             }
         }
         Ok(Some(Self {
-            backend: Backend::Native { first: backbone.start, layers, stages, states, _scratch: scratch },
+            backend: Backend::Native { first: backbone.start, layers, stages, states, reduction_plan, _scratch: scratch },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, max_rows * shape.hidden * 2)?,
             topk: shape.topk,
@@ -346,12 +355,13 @@ impl<'a> LocalExperts<'a> {
 
     pub fn group_rows(&self, rows: usize) -> Result<usize> {
         match &self.backend {
-            Backend::Native { states, .. } => {
+            Backend::Native { states, reduction_plan, .. } => {
                 if rows == 0 {
                     return Ok(states.last().context("no installed local expert capacity")?.kernel.group_rows());
                 }
-                states.iter().find(|s| s.kernel.info().capacity_rows as usize >= rows)
-                    .context("no local expert capacity for this many rows")?.kernel.group_rows_for(rows)
+                let selected = reduction_plan.execution_index(rows, rows,
+                    states.iter().map(|s| s.kernel.info().capacity_rows as usize))?;
+                states[selected].kernel.group_rows_for(rows)
             }
             Backend::Exl3 { executions, row_policy, .. } => {
                 let selected = if rows == 0 { executions.last() } else {
@@ -394,8 +404,9 @@ impl<'a> LocalExperts<'a> {
         shared: *mut c_void,
         stream: *mut c_void,
     ) -> Result<()> {
-        let (first, layers, stages, states) = match &mut self.backend {
-            Backend::Native { first, layers, stages, states, .. } => (*first, layers, stages, states),
+        let (first, layers, stages, states, reduction_plan) = match &mut self.backend {
+            Backend::Native { first, layers, stages, states, reduction_plan, .. } =>
+                (*first, layers, stages, states, reduction_plan),
             Backend::Exl3 { executions, row_policy, reduction_plan, stages, first, layers } => {
                 let index = match layer {
                     LocalLayer::Stage(n) if n < *stages => n,
@@ -428,8 +439,9 @@ impl<'a> LocalExperts<'a> {
             LocalLayer::Backbone(n) => n.checked_sub(first).and_then(|n| layers.get(n)),
             LocalLayer::Stage(n) => stages.get(n),
         }.with_context(|| format!("local expert layer {layer:?} is not resident"))?;
-        let state = states.iter_mut().find(|s| s.kernel.info().capacity_rows as usize >= rows)
-            .context("no local expert capacity for this many rows")?;
+        let selected = reduction_plan.execution_index(rows, rows,
+            states.iter().map(|s| s.kernel.info().capacity_rows as usize))?;
+        let state = &mut states[selected];
         resident.bind(&state.kernel, &mut state.slots)?;
         state.slots[0] = wire;
         state.slots[1] = ids;

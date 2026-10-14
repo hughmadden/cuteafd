@@ -66,7 +66,7 @@ def jobs(scope):
             name = f"{family}-slices" + ("-rtx_tp2" if role == "rtx_tp2" else "")
             result.append((name, "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
-                            "--width", "1:64,16:128,80:128,256:128,1024:128,4096:128",
+                            "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128",
                             "--atomic-min-capacity", "256", "--standard-names"]))
     result.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),

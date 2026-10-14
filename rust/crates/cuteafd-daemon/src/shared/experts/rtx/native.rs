@@ -122,6 +122,7 @@ pub(crate) struct NativeTp2<'a> {
     max_rows: usize,
     workspace_bytes: usize,
     states: DeviceOwner<'a, Vec<RankState<'a>>>,
+    reduction_plan: crate::shared::experts::ExpertReductionPlan,
     weights: DeviceOwner<'a, Vec<ExpertWeights<'a>>>,
     _scratch: Allocation<'a>,
     output: Allocation<'a>,
@@ -158,16 +159,11 @@ impl<'a> NativeTp2<'a> {
     /// Max kernel scratch across unique compiled capacities plus one FP32
     /// `[max_rows, hidden]` output. Weight and module bytes are separate.
     pub(crate) fn workspace_bytes_for(library: &NativeLibrary, max_rows: usize) -> Result<usize> {
-        let scratch = kernel_capacities(max_rows)?
-            .into_iter()
-            .map(|capacity| {
-                usize::try_from(library.v41_tp2_expert_info(capacity)?.scratch_bytes)
-                    .map_err(Into::into)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap();
+        let infos = kernel_capacities(max_rows)?.into_iter()
+            .map(|capacity| library.v41_tp2_expert_info(capacity)).collect::<Result<Vec<_>>>()?;
+        crate::shared::experts::ExpertReductionPlan::native(library, infos.iter().copied())?;
+        let scratch = infos.iter().map(|info| usize::try_from(info.scratch_bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().max().unwrap();
         scratch
             .checked_add(output_bytes(expert_geometry(), max_rows)?)
             .context("TP2 workspace overflow")
@@ -294,6 +290,8 @@ impl<'a> NativeTp2<'a> {
                 "TP2 native geometry/format mismatch"
             );
         }
+        let reduction_plan = crate::shared::experts::ExpertReductionPlan::native(device.library,
+            kernels.iter().map(|k| *k.info()))?;
         let scratch_bytes = kernels
             .iter()
             .map(|k| k.info().scratch_bytes as usize)
@@ -335,6 +333,7 @@ impl<'a> NativeTp2<'a> {
             max_rows,
             workspace_bytes,
             states,
+            reduction_plan,
             weights,
             _scratch: scratch,
             output,
@@ -364,8 +363,9 @@ impl RtxExpertLayer for NativeTp2<'_> {
             return Ok(self.states.last().context("no installed TP2 expert capacity")?.kernel.group_rows());
         }
         ensure!(rows <= self.max_rows, "invalid TP2 grouping row count");
-        self.states.iter().find(|s| s.kernel.info().capacity_rows as usize >= rows)
-            .context("no TP2 expert capacity for this many rows")?.kernel.group_rows_for(rows)
+        let selected = self.reduction_plan.execution_index(rows, rows,
+            self.states.iter().map(|s| s.kernel.info().capacity_rows as usize))?;
+        self.states[selected].kernel.group_rows_for(rows)
     }
     fn output(&self) -> *mut c_void {
         self.output.buffer.ptr
@@ -392,11 +392,9 @@ impl RtxExpertLayer for NativeTp2<'_> {
                 "null TP2 input"
             );
             self.device.run(|| {
-                let state = self
-                    .states
-                    .iter_mut()
-                    .find(|s| s.kernel.info().capacity_rows as usize >= rows)
-                    .unwrap();
+                let selected = self.reduction_plan.execution_index(rows, rows,
+                    self.states.iter().map(|s| s.kernel.info().capacity_rows as usize))?;
+                let state = &mut self.states[selected];
                 // SAFETY: caller retains complete rank-local inputs and owns exclusive stream/output use.
                 unsafe {
                     self.weights[layer - self.layers.start]

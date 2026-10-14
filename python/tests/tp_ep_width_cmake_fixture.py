@@ -128,6 +128,7 @@ def run_width_override_scenario() -> dict:
         (tools / "lib" / "v41_spark_tp3_launch_geometry.py").write_text(
             "# stub\n", encoding="utf-8"
         )
+        (tools / "lib" / "expert_grouping.py").write_text("# stub\n", encoding="utf-8")
         build = tmp / "build"
         build.mkdir()
         log = tmp / "exports.log"
