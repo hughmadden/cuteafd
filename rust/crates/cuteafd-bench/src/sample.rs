@@ -95,6 +95,22 @@ mod tests {
     use crate::render;
 
     #[test]
+    fn obsolete_single_point_reports_are_refused_and_migrated_history_keeps_c8() {
+        let mut value = serde_json::to_value(super::report(false)).unwrap();
+        let card = value["baseline"]["card"].as_object_mut().unwrap();
+        let sweep = card.remove("concurrency").unwrap();
+        card.insert("concurrent".into(), sweep[2].clone());
+        let error = serde_json::from_value::<crate::report::Report>(value).unwrap_err().to_string();
+        assert!(error.contains("unknown field `concurrent`"), "{error}");
+        let report: crate::report::Report = serde_json::from_str(include_str!(
+            "../../../../benchmarks/mimo_v2/2026-10-09-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min-rc3/report.json")).unwrap();
+        assert!((report.baseline.as_ref().unwrap().card.concurrent_at(8).unwrap().aggregate_tok_s - 171.12859).abs() < 0.001);
+        assert!(render::card::card_svg(&report).contains(">171</text>"));
+        let placed = crate::publish::Placed { dir: "benchmarks/history/card".into(), report };
+        assert!(crate::publish::results(&[placed]).contains("C8: 171"));
+    }
+
+    #[test]
     fn scaling_card_snapshots_cover_pro_small_and_missing_points() {
         let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
         for case in ["pro", "32gb", "missing"] {

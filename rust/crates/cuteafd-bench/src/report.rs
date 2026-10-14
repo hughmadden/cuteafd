@@ -542,6 +542,7 @@ pub struct Baseline {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BasicCard {
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
