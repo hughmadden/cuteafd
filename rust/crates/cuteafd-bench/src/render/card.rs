@@ -1,5 +1,5 @@
-//! The 1200×675 share card: model, C1 and concurrent code decode beside 8K
-//! prefill (two headlines for old reports), three content bars, one hardware line, the non-default option
+//! The 1200×675 share card: model, C1 and code decode scaling beside 8K
+//! prefill, three content bars, one hardware line, the non-default option
 //! chips, the build footer and the fidelity badge.
 use super::bodies::{self, chips, content_color, LOGO, LOGO_ASPECT};
 use super::svg::{fit, text_width, Anchor, Doc, Font};
@@ -40,12 +40,10 @@ pub fn card_svg(report: &Report) -> String {
     let baseline = r.baseline.as_ref();
     let code = baseline.and_then(|b| b.card.decode_of("code")).map_or(0.0, |d| d.tok_s);
     let prefill = baseline.and_then(|b| b.card.prefill.as_ref());
-    let concurrent = baseline.and_then(|b| b.card.concurrent.as_ref());
-    let columns = if concurrent.is_some() { 3.0 } else { 2.0 };
-    let gap = if concurrent.is_some() { 28.0 } else { 20.0 };
-    let column_width = (WIDTH - 2.0 * pad - gap * (columns - 1.0)) / columns;
-    let max_size: f64 = if concurrent.is_some() { 88.0 } else { 112.0 };
-    let sub_size = if concurrent.is_some() { 13.0 } else { 15.0 };
+    let gap = 28.0;
+    let column_width = (WIDTH - 2.0 * pad - gap * 2.0) / 3.0;
+    let max_size: f64 = 88.0;
+    let sub_size = 13.0;
     // Reserve the unit's width before sizing numerals, including commas and the failure badge.
     let huge = |doc: &mut Doc, x: f64, label: &str, value: &str, sub: &str, color: &str| {
         doc.text(x, 246.0, Font::new(15.0, t.muted).spacing(3.0).weight(600), label);
@@ -63,11 +61,8 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(pad, 386.0, Font::new(15.0, t.muted), "Planner-only qualification; no performance measured");
     } else {
         huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), "thinking off · one request", t.series[0]);
-        if let Some(c) = concurrent {
-            huge(&mut doc, pad + column_width + gap, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s),
-                &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
-        }
-        let prefill_x = if concurrent.is_some() { pad + 2.0 * (column_width + gap) } else { 610.0 };
+        bodies::decode_scaling(&mut doc, &t, r, pad + column_width + gap, 246.0, column_width - 60.0, 1.0);
+        let prefill_x = pad + 2.0 * (column_width + gap);
         match prefill {
             Some(p) => huge(&mut doc, prefill_x, "8K PREFILL", &rate(p.tok_s),
                 &format!("TTFT {} for {} tokens", seconds(p.ttft_s), grouped(p.prompt_tokens as f64)), t.series[3]),
@@ -100,28 +95,52 @@ pub fn card_svg(report: &Report) -> String {
     doc.text(pad, 538.0, Font::new(16.0, t.ink).weight(600), &fit(&hardware, 16.0, WIDTH - 2.0 * pad));
     doc.text(pad, 560.0, Font::new(13.0, t.ink2), &fit(&r.capacity().line(), 13.0, WIDTH - 2.0 * pad));
     // Publication evidence belongs in the full report, not the fixed-height option strip.
-    let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
+    let mut options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
         && !s.name.starts_with("provenance.") && !s.name.starts_with("qualification.")
+        && !(s.name == "pool-tokens" && matches!(s.value.as_deref(), Some("0" | "auto")))
         && s.name != "supersedes-checkpoint")
-        .map(|s| s.chip()).take(10).collect();
-    if !options.is_empty() {
-        chips(&mut doc, &t, pad, 572.0, WIDTH - 2.0 * pad, &options, t.series[2]);
+        .map(|s| s.chip()).collect();
+    if let Some(power) = hw.power.as_ref().filter(|power| power.capped()) {
+        // Report the longest per-GPU evidence, not a sum of GPU-seconds.
+        let capped = power.gpus.iter().map(|gpu| gpu.cap_seconds).fold(0.0, f64::max);
+        options.insert(0, format!("POWER-CAPPED {}", seconds(capped)));
     }
+    // Only two chip rows fit above the footer. Keep overflow in the full report.
+    let omitted = |items: &[String]| {
+        let mut probe = Doc::new(WIDTH, HEIGHT);
+        chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > 46.0
+    };
+    let total = options.len();
+    while omitted(&options) {
+        options.pop();
+    }
+    if options.len() < total {
+        loop {
+            let mut shown = options.clone();
+            shown.push(format!("+{} more in report", total - options.len()));
+            if !omitted(&shown) {
+                options = shown;
+                break;
+            }
+            options.pop();
+        }
+    }
+    chips(&mut doc, &t, pad, 572.0, WIDTH - 2.0 * pad, &options, t.series[2]);
     let b = &r.server.build;
     let mut build = format!("build {}", b.label());
     if let Some(remote) = &b.remote {
         build.push_str(&format!(" · {}", remote.trim_start_matches("https://")));
     }
-    doc.text(pad, HEIGHT - 34.0, Font::new(13.0, t.muted), &fit(&build, 13.0, 640.0));
     let (badge, status) = match baseline {
         Some(b) => (b.quality.badge(), b.quality.status),
         None => ("quality not verified".to_string(), crate::report::CheckStatus::Pending),
     };
     let color = t.status(status);
     let width = (text_width(&badge, 14.0) + 36.0).min(520.0);
-    doc.rect_attrs(WIDTH - pad - width, HEIGHT - 58.0, width, 34.0, 17.0,
+    doc.text(pad, HEIGHT - 28.0, Font::new(13.0, t.muted), &fit(&build, 13.0, WIDTH - 2.0 * pad - width - 24.0));
+    doc.rect_attrs(WIDTH - pad - width, HEIGHT - 46.0, width, 34.0, 17.0,
         &format!(r#"fill="{}" stroke="{color}" stroke-width="1.5""#, t.panel2));
-    doc.text(WIDTH - pad - width / 2.0, HEIGHT - 36.0, Font::new(14.0, color).anchor(Anchor::Middle).weight(600),
+    doc.text(WIDTH - pad - width / 2.0, HEIGHT - 24.0, Font::new(14.0, color).anchor(Anchor::Middle).weight(600),
         &fit(&badge, 14.0, width - 20.0));
     bodies::watermark(&mut doc, &t);
     doc.finish()

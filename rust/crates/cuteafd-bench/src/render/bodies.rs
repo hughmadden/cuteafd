@@ -59,6 +59,59 @@ fn row(doc: &mut Doc, theme: &Theme, x: f64, y: f64, w: f64, label: &str, value:
     20.0 + 17.0 * lines.len().saturating_sub(1) as f64
 }
 
+/// Decode scaling chart, shared by the compact card and baseline panel.
+/// Coordinates use the approved card's chart box; panels scale the same geometry.
+pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: f64, width: f64, scale: f64) {
+    let Some(baseline) = &report.baseline else { return };
+    let levels = report.server.card_levels();
+    let points: Vec<_> = levels.iter().filter_map(|width| baseline.card.concurrent_at(*width))
+        .filter(|point| point.aggregate_tok_s.is_finite() && point.aggregate_tok_s >= 0.0).collect();
+    let top = y + 36.0 * scale;
+    let bottom = y + 106.0 * scale;
+    doc.text(x, y, Font::new(15.0 * scale, theme.muted).spacing(3.0 * scale).weight(600), "DECODE SCALING");
+    doc.line(x, bottom, x + width, bottom, theme.line2, 1.0);
+    let max = points.iter().map(|point| point.aggregate_tok_s).fold(1.0f64, f64::max) * 1.08;
+    let px = |level: usize| {
+        let index = levels.iter().position(|width| *width == level).unwrap_or(0);
+        x + 16.0 * scale + (width - 32.0 * scale) * index as f64 / (levels.len() - 1) as f64
+    };
+    let py = |value: f64| bottom - (bottom - top) * value / max;
+    for level in levels {
+        doc.text(px(*level), bottom + 17.0 * scale,
+            Font::new(12.0 * scale, if *level == 8 { theme.ink } else { theme.muted })
+                .weight(if *level == 8 { 700 } else { 400 }).anchor(Anchor::Middle), &format!("C{level}"));
+    }
+    if let (Some(first), Some(last)) = (points.first(), points.last()) {
+        let path = points.iter().enumerate().map(|(i, point)| format!("{}{},{}",
+            if i == 0 { "M" } else { " L" }, px(point.width), py(point.aggregate_tok_s))).collect::<String>();
+        if points.len() > 1 {
+            doc.raw(&format!(r#"<path d="{path} L{},{} L{},{} Z" fill="{}" fill-opacity="0.10"/>"#,
+                px(last.width), bottom, px(first.width), bottom, theme.concurrent));
+            doc.raw(&format!(r#"<path d="{path}" fill="none" stroke="{}" stroke-width="{}" stroke-linejoin="round" stroke-linecap="round"/>"#,
+                theme.concurrent, 3.0 * scale));
+        }
+        for point in &points {
+            let highlight = point.width == 8;
+            let (cx, cy) = (px(point.width), py(point.aggregate_tok_s));
+            doc.group_attrs(&format!(r#"aria-label="{}""#, super::svg::escape(&format!(
+                "C{}: {} aggregate tok/s, {} median tok/s per request", point.width,
+                rate(point.aggregate_tok_s), rate(point.per_stream_median_tok_s)))));
+            doc.raw(&format!("<title>{}</title>", super::svg::escape(&format!(
+                "C{}: {} aggregate tok/s; {} per request (median)", point.width,
+                rate(point.aggregate_tok_s), rate(point.per_stream_median_tok_s)))));
+            doc.raw(&format!(r#"<circle cx="{cx}" cy="{cy}" r="{}" fill="{}" stroke="{}" stroke-width="{}"/>"#,
+                if highlight { 6.5 * scale } else { 4.5 * scale },
+                if highlight { theme.concurrent } else { theme.bg }, theme.concurrent, 2.5 * scale));
+            doc.text(cx, cy - 13.0 * scale, Font::new(if highlight { 19.0 * scale } else { 14.0 * scale }, theme.ink)
+                .bold().anchor(Anchor::Middle), &format!("{:.0}", point.aggregate_tok_s));
+            doc.end();
+        }
+    }
+    let caption = baseline.card.concurrent_at(8).map_or_else(|| "aggregate tok/s · C8 not measured".into(),
+        |point| format!("aggregate tok/s · {}/stream at C8", rate(point.per_stream_median_tok_s)));
+    doc.text(x, y + 140.0 * scale, Font::new(13.0 * scale, theme.ink2), &fit(&caption, 13.0 * scale, width));
+}
+
 /// The rendering context of one report.
 pub struct View<'a> {
     pub theme: Theme,
@@ -266,8 +319,7 @@ impl<'a> View<'a> {
         let warn = if failed { "⚠ " } else { "" };
         let code = b.card.decode_of("code").map_or(0.0, |d| d.tok_s);
         let prefill = b.card.prefill.as_ref();
-        let concurrent = b.card.concurrent.as_ref();
-        let headline_width = if concurrent.is_some() { (w - 48.0) / 3.0 } else { 226.0 };
+        let headline_width = (w - 48.0) / 3.0;
         let big = |doc: &mut Doc, x: f64, label: &str, value: &str, unit: &str, sub: &str, color: &str| {
             doc.text(x, 12.0, Font::new(10.0, t.muted).spacing(1.4), label);
             let value = format!("{warn}{value}");
@@ -279,18 +331,14 @@ impl<'a> View<'a> {
         let code_tokens = b.card.decode_of("code").and_then(|d| d.runs.first()).map_or(0, |r| r.completion_tokens);
         big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tok/s", &format!("thinking off · {code_tokens} tokens"),
             t.series[0]);
-        if let Some(c) = concurrent {
-            big(doc, headline_width + 24.0, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s), "tok/s",
-                &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
-        }
-        let prefill_x = if concurrent.is_some() { 2.0 * (headline_width + 24.0) } else { 250.0 };
+        decode_scaling(doc, t, self.report, headline_width + 24.0, 12.0, headline_width, 0.48);
+        let prefill_x = 2.0 * (headline_width + 24.0);
         match prefill {
             Some(p) => big(doc, prefill_x, "8K PREFILL", &rate(p.tok_s), "tok/s",
                 &format!("TTFT {} · {} tokens", seconds(p.ttft_s), super::grouped(p.prompt_tokens as f64)), t.series[3]),
             None => big(doc, prefill_x, "8K PREFILL", "—", "", "not measured", t.series[3]),
         }
-        // Old reports keep their two headlines and bars alongside; new reports put bars below.
-        let (bx, by) = if concurrent.is_some() { (0.0, 100.0) } else { (520.0, 0.0) };
+        let (bx, by) = (0.0, 100.0);
         let bw = w - bx;
         doc.text(bx, by + 12.0, Font::new(10.0, t.muted).spacing(1.4), "C1 DECODE BY CONTENT");
         let max = b.card.decode.iter().map(|d| d.tok_s).fold(1.0f64, f64::max) * 1.12;
@@ -431,7 +479,7 @@ pub fn title(doc: &mut Doc, theme: &Theme, x: f64, y: f64, size: f64, text: &str
 /// Panel titles and hints by id (renderers outside the catalog: the baseline).
 pub fn panel_title(id: &str) -> (&'static str, &'static str) {
     match id {
-        "baseline" => ("Basic card", "C1 decode by content (thinking off), C8 code aggregate, 8K prefill, quick quality"),
+        "baseline" => ("Basic card", "C1 decode by content (thinking off), C1/C4/C8/C16 aggregate sweep, 8K prefill, quick quality"),
         _ => match crate::panels::find(id) {
             Some(panel) => (panel.title(), ""),
             None => ("Panel", ""),

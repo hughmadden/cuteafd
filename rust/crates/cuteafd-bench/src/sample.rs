@@ -61,9 +61,11 @@ pub fn report(failed: bool) -> Report {
     let baseline = Baseline {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
-            concurrent: Some(ConcurrentRate { width: 8, aggregate_tok_s: 960.0, per_stream_median_tok_s: 120.0,
-                decode_s: 319.0 / 120.0, runs: (0..8).map(|_| ConcurrentTiming { sent_s: 0.0,
-                    timing: timing(320, 319.0 / 120.0) }).collect(), warmup_s: 3.0 }),
+            concurrency: [(1, 187.3, 187.3), (4, 640.0, 158.0), (8, 960.0, 118.0), (16, 1280.0, 78.0)]
+                .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
+                    width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
+                    runs: (0..width).map(|_| ConcurrentTiming { sent_s: 0.0,
+                        timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0 }).collect(),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
             warmup_s: Some(14.2),
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
@@ -93,42 +95,88 @@ mod tests {
     use crate::render;
 
     #[test]
-    fn old_reports_without_concurrent_rate_still_deserialize() {
+    fn obsolete_single_point_reports_are_refused_and_migrated_history_keeps_c8() {
         let mut value = serde_json::to_value(super::report(false)).unwrap();
-        value["baseline"]["card"].as_object_mut().unwrap().remove("concurrent");
-        let report: crate::report::Report = serde_json::from_value(value).unwrap();
-        assert!(report.baseline.as_ref().unwrap().card.concurrent.is_none());
-        let card = render::card::card_svg(&report);
-        assert!(!card.contains("C8 CODE DECODE"));
-        assert!(card.contains(r#"x="610" y="246""#));
-        assert!(!render::report::panel_svg(&report, "baseline").contains("C8 CODE DECODE"));
+        let card = value["baseline"]["card"].as_object_mut().unwrap();
+        let sweep = card.remove("concurrency").unwrap();
+        card.insert("concurrent".into(), sweep[2].clone());
+        let error = serde_json::from_value::<crate::report::Report>(value).unwrap_err().to_string();
+        assert!(error.contains("unknown field `concurrent`"), "{error}");
+        let report: crate::report::Report = serde_json::from_str(include_str!(
+            "../../../../benchmarks/mimo_v2/2026-10-09-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min-rc3/report.json")).unwrap();
+        assert!((report.baseline.as_ref().unwrap().card.concurrent_at(8).unwrap().aggregate_tok_s - 171.12859).abs() < 0.001);
+        assert!(render::card::card_svg(&report).contains(">171</text>"));
+        let placed = crate::publish::Placed { dir: "benchmarks/history/card".into(), report };
+        assert!(crate::publish::results(&[placed]).contains("C8: 171"));
     }
 
     #[test]
-    fn concurrent_rate_renders_at_the_measured_width_everywhere() {
-        let mut report = super::report(false);
-        for width in [8, 4] {
-            report.baseline.as_mut().unwrap().card.concurrent.as_mut().unwrap().width = width;
-            let label = format!("C{width} CODE DECODE");
+    fn scaling_card_snapshots_cover_pro_small_and_missing_points() {
+        let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
+        for case in ["pro", "32gb", "missing"] {
+            let mut report = super::report(false);
+            if case == "32gb" { report.server.hardware.gpus[0].memory_mib = Some(32 * 1024); }
+            if case == "missing" { report.baseline.as_mut().unwrap().card.concurrency.retain(|p| p.width != 4 && p.width != 8); }
             let card = render::card::card_svg(&report);
             let panel = render::report::panel_svg(&report, "baseline");
-            assert!(card.contains(&label) && card.contains(">960</text>"));
-            assert!(panel.contains(&label) && panel.contains(">960</text>"));
-            assert!(card.contains("aggregate · 120 tok/s per stream"));
-            let color = render::Theme::for_report(false).concurrent;
-            assert!(card.contains(&format!(r#"fill="{color}""#)));
-            assert!(panel.contains(&format!(r#"fill="{color}""#)));
-            assert!(!render::Theme::for_report(false).series[..4].contains(&color));
-            assert!(!card.contains("code, aggregate"));
-            assert!(card.find("C1 CODE DECODE").unwrap() < card.find(&label).unwrap());
-            assert!(card.find(&label).unwrap() < card.find("8K PREFILL").unwrap());
-            assert!(render::report::report_svg(&report).contains(&label));
+            assert!(card.contains(r#"<line x1="428" y1="352" x2="712" y2="352""#));
+            assert!(card.contains("DECODE SCALING") && panel.contains("DECODE SCALING"));
+            assert!(card.contains(r#"x="800" y="246""#));
+            let points = |svg: &str| svg.matches("<circle ").count();
+            let expected = match case { "pro" => 4, "32gb" => 3, _ => 2 };
+            assert_eq!(points(&card), expected, "{case}");
+            assert_eq!(points(&panel), expected, "{case}");
+            assert_eq!(card.contains(">C16</text>"), case != "32gb");
+            assert_eq!(card.contains(">960</text>"), case != "missing");
+            if case != "missing" {
+                assert!(card.contains(r##"r="6.5" fill="#d66086""##));
+                // Median is 118, deliberately not the aggregate / width (120).
+                assert!(card.contains("aggregate tok/s · 118/stream at C8"));
+                assert!(!card.contains("120/stream"));
+            } else {
+                assert!(card.contains("C8 not measured"));
+                assert!(!card.contains("r=\"6.5\""));
+            }
             let placed = crate::publish::Placed { dir: "benchmarks/sample/card".into(), report: report.clone() };
             let readme = crate::publish::results(&[placed]);
-            assert!(readme.contains("Concurrent code (aggregate)"));
-            assert!(readme.contains(&format!("C{width}: 960")));
-            assert!(readme.contains("<th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
+            assert!(readme.contains("C1: 187"));
+            assert_eq!(readme.contains("C4: 640"), case != "missing");
+            assert_eq!(readme.contains("C16: 1,280"), case != "32gb");
+            if let Some(dir) = &dir {
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(dir.join(format!("card-{case}.svg")), &card).unwrap();
+                std::fs::write(dir.join(format!("card-{case}.png")), render::png::png(&card, 1.0).unwrap()).unwrap();
+            }
         }
+    }
+
+    #[test]
+    fn cap_flag_requires_measurement_and_footer_does_not_overlap_chips() {
+        use crate::report::{Power, PowerGpu, Setting};
+        let mut report = super::report(false);
+        report.server.hardware.power = Some(Power { governor: Some("gpu-powerd".into()), gpus: vec![PowerGpu {
+            mean_limit_w: 325.0, min_limit_w: 325.0, max_limit_w: 325.0, ..Default::default()
+        }], ..Default::default() });
+        assert!(!render::card::card_svg(&report).contains("POWER-CAPPED"));
+        report.server.hardware.power.as_mut().unwrap().gpus[0].cap_seconds = 0.25;
+        report.server.configuration.settings.push(Setting { name: "pool-tokens".into(), value: Some("0".into()),
+            source: "resolved".into(), ..Default::default() });
+        let card = render::card::card_svg(&report);
+        assert!(card.contains("POWER-CAPPED 250 ms"));
+        assert!(!card.contains("pool-tokens=0"));
+        report.server.hardware.power.as_mut().unwrap().gpus[0].cap_seconds = 5.001;
+        assert!(render::card::card_svg(&report).contains("POWER-CAPPED 5.00 s"));
+        for i in 0..10 {
+            report.server.configuration.settings.push(Setting { name: format!("long-option-{i}"), value: Some("x".repeat(80)),
+                source: "cli".into(), ..Default::default() });
+        }
+        let card = render::card::card_svg(&report);
+        assert!(card.contains("POWER-CAPPED"));
+        assert!(card.contains("more in report"));
+        assert!(card.contains(r#"y="629""#)); // Badge begins after both chip rows (ending at 618).
+        assert!(!card.contains(r#"y="624""#)); // No third chip row.
+        assert!(!card.contains(r#"y="638""#));
+        assert!(card.contains(r#"x="56" y="647""#));
     }
 
     #[test]

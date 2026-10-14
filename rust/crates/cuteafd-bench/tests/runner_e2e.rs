@@ -62,6 +62,12 @@ async fn share_run_completes_and_locks_out_other_clients() {
     let baseline = report.baseline.as_ref().expect("baseline");
     assert_eq!(baseline.card.decode.len(), 3);
     assert!(baseline.card.decode.iter().all(|d| d.tok_s > 0.0), "{:?}", baseline.card.decode);
+    assert_eq!(baseline.card.concurrency.iter().map(|point| point.width).collect::<Vec<_>>(), vec![1, 4, 8]);
+    let code = baseline.card.decode_of("code").unwrap();
+    let c1 = baseline.card.concurrent_at(1).unwrap();
+    assert!((c1.aggregate_tok_s - code.tok_s).abs() < 1e-9);
+    assert_eq!(c1.runs[0].timing, code.runs[0]);
+    assert_eq!(c1.per_stream_median_tok_s, code.tok_s);
     assert!(baseline.card.prefill.as_ref().is_some_and(|p| p.prompt_tokens > 1000));
     assert_eq!(baseline.quality.checks.len(), 5, "{:?}", baseline.quality.checks);
     // Exports of the stored run, and the lock lifted.
