@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -79,7 +79,16 @@ pub enum TrafficError {
     InvalidReply,
 }
 
-/// One handle per QP, registered before serving. Two relaxed atomic adds on the
+/// Isolate each QP's hot counters from metadata and other QPs.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct WireBytes {
+    written: AtomicU64,
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+/// One handle per QP, registered before serving. Relaxed atomic adds on the
 /// exchange path, no lookup, allocation, lock, logging or sysfs access.
 #[derive(Debug)]
 pub(crate) struct WireCounter {
@@ -87,25 +96,23 @@ pub(crate) struct WireCounter {
     port: u32,
     peer: OnceLock<String>,
     local_gid: String,
-    written: AtomicU64,
     receives_writes: AtomicBool,
-    sent: AtomicU64,
-    received: AtomicU64,
+    bytes: WireBytes,
 }
 impl WireCounter {
-    pub(crate) fn sent(&self, bytes: usize) { self.sent.fetch_add(bytes as u64, Ordering::Relaxed); }
+    pub(crate) fn sent(&self, bytes: usize) { self.bytes.sent.fetch_add(bytes as u64, Ordering::Relaxed); }
     pub(crate) fn written(&self, bytes: usize) {
         self.sent(bytes);
-        self.written.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes.written.fetch_add(bytes as u64, Ordering::Relaxed);
     }
     pub(crate) fn receives_writes(&self) { self.receives_writes.store(true, Ordering::Relaxed); }
-    pub(crate) fn received(&self, bytes: usize) { self.received.fetch_add(bytes as u64, Ordering::Relaxed); }
+    pub(crate) fn received(&self, bytes: usize) { self.bytes.received.fetch_add(bytes as u64, Ordering::Relaxed); }
     pub(crate) fn peer(&self, peer: &str) { let _ = self.peer.set(peer.into()); }
     fn sample(&self) -> EngineSample {
         EngineSample { device: self.device.clone(), port: self.port, peer: self.peer.get().cloned().unwrap_or_default(),
             receives_writes: self.receives_writes.load(Ordering::Relaxed),
-            local_gid: self.local_gid.clone(), written_sent_bytes: self.written.load(Ordering::Relaxed),
-            sent_bytes: self.sent.load(Ordering::Relaxed), received_bytes: self.received.load(Ordering::Relaxed) }
+            local_gid: self.local_gid.clone(), written_sent_bytes: self.bytes.written.load(Ordering::Relaxed),
+            sent_bytes: self.bytes.sent.load(Ordering::Relaxed), received_bytes: self.bytes.received.load(Ordering::Relaxed) }
     }
 }
 
@@ -122,9 +129,8 @@ fn registry() -> &'static Mutex<Registry> {
 }
 
 pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String) -> Arc<WireCounter> {
-    start();
     let counter = Arc::new(WireCounter { device: device.into(), port, peer: { let p = OnceLock::new(); if !peer.is_empty() { let _ = p.set(peer.into()); } p },
-        local_gid, written: AtomicU64::new(0), receives_writes: AtomicBool::new(false), sent: AtomicU64::new(0), received: AtomicU64::new(0) });
+        local_gid, receives_writes: AtomicBool::new(false), bytes: WireBytes::default() });
     registry().lock().unwrap().counters.push(counter.clone());
     counter
 }
@@ -132,11 +138,9 @@ pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String) -
 /// Called during transport setup, not while dispatching requests.
 pub fn observe_peers(peers: &[SocketAddr]) {
     registry().lock().unwrap().peers.extend(peers.iter().copied());
-    start();
 }
 pub fn add_source(source: Arc<dyn TrafficSource>) {
     registry().lock().unwrap().sources.push(source);
-    start();
 }
 
 fn latest() -> &'static Mutex<Snapshot> {
@@ -144,11 +148,12 @@ fn latest() -> &'static Mutex<Snapshot> {
     LATEST.get_or_init(|| Mutex::new(Snapshot::default()))
 }
 
+/// Reading the cache does not subscribe or wake the observer.
 pub fn snapshot() -> Snapshot {
-    start();
     latest().lock().map(|s| s.clone()).unwrap_or_default()
 }
 pub fn local() -> HostSample {
+    renew();
     snapshot().hosts.remove("coordinator").unwrap_or_default()
 }
 
@@ -196,14 +201,47 @@ fn read_peer(peer: SocketAddr) -> Result<HostSample, TrafficError> {
     BufReader::new(std::io::Read::take(stream, 1 << 20)).read_line(&mut line)?;
     let value: serde_json::Value = serde_json::from_str(&line)?;
     if value["message"] != "fabric_traffic" { return Err(TrafficError::InvalidReply); }
-    Ok(serde_json::from_value(value["sample"].clone())?)
+    let sample: HostSample = serde_json::from_value(value["sample"].clone())?;
+    if sample.incarnation.is_empty() || !sample.sampled_s.is_finite() || sample.sampled_s <= 0.0 {
+        return Err(TrafficError::InvalidReply);
+    }
+    Ok(sample)
 }
 
-/// Start once per serving process. Sysfs and network reads run on a niced OS
-/// thread at 1 Hz. API handlers only clone cached observations.
+/// Renewable leases expire after disconnected clients/coordinators disappear.
+/// No lease means no sysfs reads, peer probes or timer wakeups.
+#[derive(Default)]
+struct Demand {
+    until: Mutex<Option<Instant>>,
+    wake: Condvar,
+}
+impl Demand {
+    fn renew(&self, now: Instant) {
+        *self.until.lock().unwrap() = Some(now + Duration::from_secs(5));
+        self.wake.notify_one();
+    }
+    fn active(until: Option<Instant>, now: Instant) -> bool {
+        until.is_some_and(|end| end > now)
+    }
+}
+fn demand() -> &'static Demand {
+    static DEMAND: OnceLock<Demand> = OnceLock::new();
+    DEMAND.get_or_init(Demand::default)
+}
+pub fn renew() {
+    demand().renew(Instant::now());
+    start();
+}
+pub fn subscribed_snapshot() -> Snapshot {
+    renew();
+    snapshot()
+}
+
+/// Sysfs and network reads run on a niced OS thread at 1 Hz while leased.
+/// API handlers only renew demand and clone cached observations.
 pub fn background_priority() { cuteafd_ffi::background_thread_priority(); }
 
-pub fn start() {
+fn start() {
     static START: OnceLock<()> = OnceLock::new();
     START.get_or_init(|| {
         let _ = std::thread::Builder::new().name("fabric-observer".into()).spawn(|| {
@@ -214,6 +252,16 @@ pub fn start() {
             let mut previous: Option<HostSample> = None;
             let mut idle = BTreeMap::new();
             loop {
+                {
+                    let demand = demand();
+                    let mut until = demand.until.lock().unwrap();
+                    while !Demand::active(*until, Instant::now()) {
+                        latest().lock().unwrap().hosts.clear();
+                        previous = None;
+                        idle.clear();
+                        until = demand.wake.wait(until).unwrap();
+                    }
+                }
                 let at = Instant::now();
                 let (counters, peers, sources) = {
                     let state = registry().lock().unwrap();
@@ -290,10 +338,39 @@ mod tests {
     #[test]
     fn wire_counter_is_cumulative_and_directional() {
         let counter = WireCounter { device: "nic".into(), port: 1, peer: OnceLock::from("peer".to_string()),
-            local_gid: "local".into(), written: AtomicU64::new(0), receives_writes: AtomicBool::new(false), sent: AtomicU64::new(0), received: AtomicU64::new(0) };
+            local_gid: "local".into(), receives_writes: AtomicBool::new(false), bytes: WireBytes::default() };
         counter.sent(128); counter.sent(4096); counter.written(72); counter.received(64);
         assert_eq!(counter.sample().sent_bytes, 4296);
         assert_eq!(counter.sample().written_sent_bytes, 72);
         assert_eq!(counter.sample().received_bytes, 64);
+        assert_eq!(std::mem::align_of::<WireBytes>(), 64);
+        assert_eq!((&counter.bytes as *const WireBytes as usize) % 64, 0);
+    }
+    #[test]
+    fn peer_sample_must_be_initialized() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            writeln!(stream, "{}", serde_json::json!({"message": "fabric_traffic", "sample": HostSample::default()})).unwrap();
+        });
+        assert!(matches!(read_peer(address), Err(TrafficError::InvalidReply)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sampling_demand_expires_and_renews() {
+        let demand = Demand::default();
+        let now = Instant::now();
+        assert!(!Demand::active(*demand.until.lock().unwrap(), now));
+        demand.renew(now);
+        assert!(Demand::active(*demand.until.lock().unwrap(), now + Duration::from_secs(4)));
+        assert!(!Demand::active(*demand.until.lock().unwrap(), now + Duration::from_secs(5)));
+        demand.renew(now + Duration::from_secs(4));
+        assert!(Demand::active(*demand.until.lock().unwrap(), now + Duration::from_secs(8)));
     }
 }

@@ -56,6 +56,9 @@ pub(crate) struct RunArgs {
     /// full) or saved profile. The baseline always runs first (once per server).
     #[arg(long, conflicts_with = "panels")]
     pub(crate) profile: Option<String>,
+    /// Collect leased fabric samples (profiles enable this by default).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) fabric: Option<bool>,
     /// Explicit panels instead of a profile, e.g. tool_eval,prefill.
     #[arg(long, value_delimiter = ',')]
     pub(crate) panels: Option<Vec<String>>,
@@ -129,7 +132,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             };
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
-                passes, baseline: None, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
+                passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;

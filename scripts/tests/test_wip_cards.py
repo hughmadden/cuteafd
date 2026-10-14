@@ -694,6 +694,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     monkeypatch.setattr(sys, 'argv', args)
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
     seen = []
     def detached(cmd, log, exit_file, env):
@@ -752,6 +753,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
         argv.append('--dry-run')
     monkeypatch.setattr(sys, 'argv', argv)
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(
         dict(image='release', image_id='sha256:abc', repo_digests=['digest']) if 'release' in arm
         else dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='artifacts')))
@@ -1451,3 +1453,24 @@ def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp
     with pytest.raises(ValueError, match='--exact-state uses the measurement window'):
         cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
                        {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
+
+
+def test_fabric_probe_card_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:console,fabric'], [entry], {'a': {}, 'b': {}})
+    assert not scoped
+    assert probes['v41-min'] == {'console', 'fabric'}
+    for arm in ('a', 'b'):
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, probes['v41-min'], None, 1)
+        assert job['entry']['fabric'] is True
+
+
+def test_fabric_probe_arm_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:', 'on:v41-min:fabric'], [entry], {'off': {}, 'on': {}})
+    for arm, enabled in [('off', False), ('on', True)]:
+        selected = scoped.get(arm, {}).get('v41-min', probes['v41-min'])
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, selected, None, 1)
+        assert job['entry']['fabric'] is enabled
+    with pytest.raises(ValueError, match='probe arm'):
+        cards.probe_selection(['missing:v41-min:fabric'], [entry], {'on': {}})

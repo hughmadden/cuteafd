@@ -24,6 +24,8 @@ pub struct RunRequest {
     /// A built-in or saved profile name.
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub fabric: Option<bool>,
     /// Explicit panels (a custom run); overrides the profile's list.
     #[serde(default)]
     pub panels: Option<Vec<String>>,
@@ -398,6 +400,8 @@ impl Bench {
             }
             (None, None) => ("share".to_string(), Vec::new()),
         };
+        let fabric = request.fabric.unwrap_or_else(|| request.panels.is_none()
+            && self.profiles().iter().any(|p| p.name == name && p.fabric));
         let passes: Vec<(String, u32)> = request.passes.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let (plan, dropped) = profiles::resolve(&planned, &passes);
         let skip_baseline = request.panels.is_some() && request.baseline == Some(false);
@@ -428,7 +432,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, context_load);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, context_load, fabric);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -443,7 +447,7 @@ impl Bench {
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
-        lossless_set: Option<panels::lossless::CaseSet>, context_load: panels::context_load::Options) {
+        lossless_set: Option<panels::lossless::CaseSet>, context_load: panels::context_load::Options, fabric: bool) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -451,9 +455,9 @@ impl Bench {
             let (bench, progress, done, report, base) = (self.clone(), progress.clone(), done.clone(), report.clone(),
                 base.clone());
             std::thread::Builder::new().name("cuteafd-bench-tick".into())
-                .spawn(move || bench.tick(&report, &progress, &done, &base)).ok()
+                .spawn(move || bench.tick(&report, &progress, &done, &base, fabric)).ok()
         };
-        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(), &context_load);
+        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(), &context_load, fabric);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -493,9 +497,9 @@ impl Bench {
     }
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
-        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>, context_load: &panels::context_load::Options)
+        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>, context_load: &panels::context_load::Options, fabric: bool)
         -> anyhow::Result<()> {
-        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
+        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
@@ -658,8 +662,8 @@ impl Bench {
     }
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
-    fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str) {
-        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
+    fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str, fabric: bool) {
+        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let mut last: Option<(Instant, f64)> = None;
         let mut revision = u64::MAX;
         let mut fabric_before = None;
@@ -692,15 +696,17 @@ impl Bench {
                     Some(t["requests_admitted"].as_u64()?.saturating_sub(t["requests_retired"].as_u64()?))
                 });
             }
-            if let Some(after) = stats_client.fabric() {
-                if let Some(before) = fabric_before.as_ref() {
-                    let interval = crate::fabric::interval(&plan.panel, false, before, &after);
-                    self.emit(json!({"type": "fabric", "run": plan.run, "interval": interval}));
+            if fabric {
+                if let Some(after) = stats_client.fabric() {
+                    if let Some(before) = fabric_before.as_ref() {
+                        let interval = crate::fabric::interval(&plan.panel, false, before, &after);
+                        self.emit(json!({"type": "fabric", "run": plan.run, "interval": interval}));
+                    }
+                    fabric_before = Some(after);
+                } else {
+                    self.emit(json!({"type": "fabric", "run": plan.run, "interval": {"ports": []}}));
+                    fabric_before = None;
                 }
-                fabric_before = Some(after);
-            } else {
-                self.emit(json!({"type": "fabric", "run": plan.run, "interval": {"ports": []}}));
-                fabric_before = None;
             }
             let title = if plan.panel == "baseline" { "Basic card + quick quality".to_string() }
                 else { panels::find(&plan.panel).map_or(plan.panel.clone(), |p| p.title().to_string()) };

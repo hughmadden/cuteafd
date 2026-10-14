@@ -12,6 +12,7 @@ use std::time::Duration;
 pub struct RunOptions {
     pub url: String,
     pub profile: Option<String>,
+    pub fabric: Option<bool>,
     pub panels: Option<Vec<String>>,
     pub passes: Vec<(String, u32)>,
     /// `Some(false)` asks the server to run explicit panels without its
@@ -124,6 +125,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         body["panels"] = json!(panels);
     }
     body["passes"] = Value::Object(options.passes.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
+    if let Some(fabric) = options.fabric { body["fabric"] = json!(fabric); }
     if let Some(baseline) = options.baseline {
         body["baseline"] = json!(baseline);
     }

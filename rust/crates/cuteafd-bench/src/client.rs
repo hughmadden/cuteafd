@@ -18,9 +18,24 @@ pub struct Client {
     pub base: String,
     pub model: String,
     agent: ureq::Agent,
+    fabric_enabled: bool,
     token: Option<String>,
     api_key: Option<cuteafd_api::openai::auth::ApiKey>,
     cancel: Arc<AtomicBool>,
+}
+
+/// Renew an off-path observation lease for a long standalone sweep.
+pub(crate) struct FabricSubscription {
+    stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for FabricSubscription {
+    fn drop(&mut self) {
+        let (stop, wake) = &*self.stop;
+        *stop.lock().unwrap() = true;
+        wake.notify_one();
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
 }
 
 /// One completed chat request.
@@ -50,13 +65,18 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None }
+        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
     }
 
     pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
         self.api_key = key;
         self
     }
+    pub fn with_fabric(mut self, enabled: bool) -> Self {
+        self.fabric_enabled = enabled;
+        self
+    }
+
     fn authorize(&self, mut request: ureq::Request) -> ureq::Request {
         if let Some(key) = &self.api_key { request = request.set("Authorization", &key.authorization()); }
         else if let Some(token) = &self.token { request = request.set("Authorization", &format!("Bearer {token}")); }
@@ -128,8 +148,25 @@ impl Client {
             "prefix_cache": stats["prefix_cache"], "console": console["g"]})
     }
 
+    pub(crate) fn fabric_subscription(&self) -> Option<FabricSubscription> {
+        if !self.fabric_enabled { return None; }
+        let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (client, signal) = (self.clone(), stop.clone());
+        let thread = std::thread::Builder::new().name("fabric-lease".into()).spawn(move || {
+            cuteafd_transport::traffic::background_priority();
+            loop {
+                let _ = client.fabric();
+                let (stop, wake) = &*signal;
+                let stopped = wake.wait_timeout_while(stop.lock().unwrap(), Duration::from_secs(1), |stop| !*stop).unwrap().0;
+                if *stopped || client.cancelled() { break; }
+            }
+        }).ok()?;
+        Some(FabricSubscription { stop, thread: Some(thread) })
+    }
+
     /// Cached 1 Hz observations; no sysfs or peer I/O in this HTTP handler.
     pub fn fabric(&self) -> Option<cuteafd_transport::traffic::Snapshot> {
+        if !self.fabric_enabled { return None; }
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(200))
             .timeout_read(Duration::from_millis(300)).build();
         self.authorize(agent.get(&format!("{}/v1/fabric", self.base))).call().ok()?.into_json().ok()
@@ -139,13 +176,18 @@ impl Client {
     /// host. This excludes the preceding warm-up and includes the final work;
     /// rates describe the sampled envelope, including idle boundary padding.
     pub fn fabric_mark(&self) -> Option<cuteafd_transport::traffic::Snapshot> {
-        let before = self.fabric()?;
-        if before.hosts.values().all(|host| host.ports.is_empty()) { return None; }
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut before = self.fabric()?;
+        let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if self.cancel.load(Ordering::Relaxed) { return None; }
+            if self.cancel.load(Ordering::Relaxed) || Instant::now() >= deadline { return None; }
             let after = self.fabric()?;
-            let fresh = before.hosts.iter().all(|(name, b)| after.hosts.get(name)
+            if after.hosts.keys().any(|name| !before.hosts.contains_key(name)) {
+                before = after;
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let fresh = !after.hosts.is_empty() && after.hosts.values().all(|h| !h.incarnation.is_empty() && h.sampled_s > 0.0)
+                && after.hosts.values().any(|h| !h.ports.is_empty()) && before.hosts.iter().all(|(name, b)| after.hosts.get(name)
                 .is_none_or(|a| a.incarnation != b.incarnation || a.sampled_s > b.sampled_s));
             if fresh { return Some(after); }
             if Instant::now() >= deadline { return None; }
@@ -306,6 +348,48 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fabric_mark_waits_for_new_peers_to_advance() {
+        use std::io::Write;
+        use cuteafd_transport::traffic::{HostSample, PortSample, Snapshot};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for step in 0..4 {
+                let mut sample = Snapshot::default();
+                for (name, time) in [("coordinator", step as f64), ("peer", (step as f64 - 1.0).max(0.0))] {
+                    if time > 0.0 {
+                        sample.hosts.insert(name.into(), HostSample { incarnation: name.into(), sampled_s: time,
+                            ports: vec![PortSample { device: "nic".into(), port: 1, ..Default::default() }], ..Default::default() });
+                    }
+                }
+                let body = serde_json::to_vec(&sample).unwrap();
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(&body).unwrap();
+            }
+        });
+        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false))).with_fabric(true);
+        let mark = client.fabric_mark().unwrap();
+        assert_eq!(mark.hosts["peer"].sampled_s, 2.0);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn fabric_is_opt_in_without_http_or_background_work() {
+        let client = Client::new("not-a-url", None, Arc::new(AtomicBool::new(false)));
+        assert!(client.fabric().is_none());
+        assert!(client.fabric_mark().is_none());
+        assert!(client.fabric_subscription().is_none());
+    }
 
     #[test]
     fn chat_rejection_has_a_typed_upstream_status() {

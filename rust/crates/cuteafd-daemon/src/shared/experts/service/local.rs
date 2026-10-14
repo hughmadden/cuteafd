@@ -85,7 +85,6 @@ impl Drop for Admission {
 }
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
-    cuteafd_transport::traffic::start();
     ensure!(
         config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"

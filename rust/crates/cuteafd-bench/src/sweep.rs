@@ -161,14 +161,15 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, prefill_lengths, None)
+    run_windowed(url, api_key, levels, post_load_c1, prefill_lengths, false, None)
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request.
 pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64],
-    mut on_timed: OnTimed) -> Result<Sweep> {
+    fabric: bool, mut on_timed: OnTimed) -> Result<Sweep> {
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
-    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
+    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
+    let _subscription = client.fabric_subscription();
     let record = client.discover().context("sweep: /v1/models")?;
     let mut sweep = Sweep::default();
     if !prefill_lengths.is_empty() {
