@@ -93,6 +93,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-14 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max/report.svg)
 - 2026-10-14 · Release smoke · zai-org/GLM-5.3-Flash · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (395–500) + 4× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max/report.svg)
 - 2026-10-14 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× RTX PRO 6000 @ gpu-powerd 435/460 W (300–550) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg)
 - 2026-10-14 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 430/455 W (335–530) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg)
