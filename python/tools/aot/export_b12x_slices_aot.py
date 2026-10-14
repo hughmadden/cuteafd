@@ -107,7 +107,7 @@ def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bo
 
 def fc2_n_splits(role: str, capacity: int, width: int, hidden: int) -> int:
     """Static launch partition; canonical K steps and plane folds stay unchanged."""
-    return 2 if role == "spark" and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
+    return 2 if role in ("spark", "rtx_tp2") and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
 
 
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
