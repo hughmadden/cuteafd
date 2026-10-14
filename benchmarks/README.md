@@ -6,6 +6,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4
 
+- 2026-10-14 · Release smoke · wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (300–550) + 6× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 · 1× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min/report.svg)
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4-Flash-0731 · 2× RTX PRO 6000 @ gpu-powerd 445/450 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max/report.svg)
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4-Flash-0731 · 1× RTX PRO 6000 @ gpu-powerd 455/445 W (300–600) + 2× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/report.svg)
