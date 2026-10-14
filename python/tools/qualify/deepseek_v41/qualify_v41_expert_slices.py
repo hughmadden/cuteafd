@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Compare official TP4 expert slices with a deployed native FP8 consumer.
 
-Inputs are two captured capacity-80 wire/ID/routing files. GPU route planning and ordered slice reduction are included in candidate
-timing; native timing includes its internal planner.
-Only referenced expert shards are loaded, into full 384-expert GPU pools.
+Inputs are two captured wire/ID/routing cases at the selected capacity.
+GPU route planning and ordered slice reduction are included in candidate
+timing; native timing includes its internal planner. Only referenced expert
+shards are loaded, into full pools for the selected geometry.
 """
 
 import sys as _sys
@@ -28,6 +29,14 @@ def main():
     import argparse, inspect
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--geometry", choices=("v41", "dsv4f"), default="v41")
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
+    parser.add_argument("--topk", type=int)
+    parser.add_argument("--experts", type=int)
+    parser.add_argument("--capacity", type=int, default=80)
+    parser.add_argument("--rows", type=int, nargs="+")
+    parser.add_argument("--widths", type=int, nargs="+")
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--native-lib", type=Path, required=True)
     parser.add_argument(
@@ -41,7 +50,7 @@ def main():
         type=Path,
         help="Earlier Rust-owner route files; required files must match exactly",
     )
-    parser.add_argument("--layer", type=int, choices=range(40), required=True)
+    parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--rank", type=int, choices=range(4), default=0)
     parser.add_argument(
         "--no-timing",
@@ -52,6 +61,18 @@ def main():
     options = parser.parse_args()
     if options.baseline and (options.layer not in (0, 1) or options.rank != 0):
         parser.error("Rust-owner baseline files cover rank zero, layers zero and one")
+    h, n, experts, topk = {"v41": (5120, 576, 384, 6), "dsv4f": (4096, 512, 256, 6)}[options.geometry]
+    h, n, experts, topk = (options.hidden or h, options.intermediate or n, options.experts or experts, options.topk or topk)
+    capacity = options.capacity
+    widths = options.widths or ([64, 128] if options.geometry == "dsv4f" else [64, 128, 192])
+    rows_to_check = options.rows or [m for m in (1, 2, 6, 16, capacity, 1) if m <= capacity]
+    capacities = sorted({1, min(16, capacity), capacity})
+    if capacity not in (1, 16, 80) or h <= 0 or h % 128 or n <= 0 or n % 32 or topk < 1 or topk > experts or any(m < 1 or m > capacity for m in rows_to_check):
+        parser.error("invalid geometry or rows; captured route qualification uses native ordered capacities 1, 16 or 80")
+    if not widths or len(set(widths)) != len(widths) or any(w not in (64, 128, 192) or -(-n // w) * w > -(-n // 128) * 128 for w in widths):
+        parser.error("slice widths must tile the packed intermediate")
+    wire_bytes = h + h // 32
+    geometry = (h, n, experts, topk)
     records = []
 
     def emit(kind, value):
@@ -65,7 +86,7 @@ def main():
             *(
                 [
                     options.candidate_dir / f"w{width}" / "libcuteafd_native.so"
-                    for width in (64, 128, 192)
+                    for width in widths
                 ]
                 if options.candidate_dir
                 else []
@@ -96,7 +117,8 @@ def main():
     )
     snapshot = options.snapshot
     layer = options.layer
-    lib = library(str(options.native_lib))
+    lib = library(str(options.native_lib), family=options.geometry)
+    check(lib.cuteafd_set_expert_hidden(h))
     cases = []
     for case in [0, 1]:
         fields = [
@@ -105,21 +127,23 @@ def main():
                 dtype=dtype,
             )
             .clone()
-            .reshape(80, width)
+            .reshape(capacity, width)
             for name, dtype, width in [
-                ("hidden", torch.uint8, 5280),
-                ("ids", torch.int32, 6),
-                ("routing", torch.float32, 6),
+                ("hidden", torch.uint8, wire_bytes),
+                ("ids", torch.int32, topk),
+                ("routing", torch.float32, topk),
             ]
         ]
         cases.append(fields)
     active = sorted(set(torch.cat([case[1].flatten() for case in cases]).tolist()))
+    assert all(0 <= expert < experts for expert in active), active
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    sizes = [3276800, 204800, 1638400, 102400]
+    storage_n = -(-n // 128) * 128
+    sizes = [storage_n * h // divisor for divisor in (1, 16, 2, 32)]
     weights = [
-        torch.empty((384, size), device="cuda", dtype=torch.uint8) for size in sizes
+        torch.empty((experts, size), device="cuda", dtype=torch.uint8) for size in sizes
     ]
     start = time.perf_counter()
     with ExitStack() as stack:
@@ -142,9 +166,9 @@ def main():
                     )
                 tensor = files[shard].get_tensor(key)
                 expected_shape = (
-                    (5120, 1152 if suffix == "weight" else 72)
+                    (h, n * 4 // (2 if suffix == "weight" else 32))
                     if projection == "w2"
-                    else (2304, 2560 if suffix == "weight" else 160)
+                    else (n * 4, h // (2 if suffix == "weight" else 32))
                 )
                 assert tuple(tensor.shape) == expected_shape, (key, tensor.shape)
                 assert tensor.dtype == (
@@ -152,14 +176,14 @@ def main():
                 ), (key, tensor.dtype)
                 raw = tensor.view(torch.uint8)
                 shard_tensor = (
-                    raw[options.rank * 576 : (options.rank + 1) * 576]
+                    raw[options.rank * n : (options.rank + 1) * n]
                     if projection != "w2"
                     else raw[
                         :,
-                        options.rank * (288 if suffix == "weight" else 18) : (
+                        options.rank * (n // (2 if suffix == "weight" else 32)) : (
                             options.rank + 1
                         )
-                        * (288 if suffix == "weight" else 18),
+                        * (n // (2 if suffix == "weight" else 32)),
                     ]
                 )
                 sources.append(shard_tensor.contiguous().cuda())
@@ -167,7 +191,7 @@ def main():
             dst = (P * 4)(*[x[expert].data_ptr() for x in weights])
             check(
                 lib.cuteafd_pack_expert_async(
-                    src, dst, 576, torch.cuda.current_stream().cuda_stream
+                    src, dst, n, torch.cuda.current_stream().cuda_stream
                 )
             )
         torch.cuda.synchronize()
@@ -177,35 +201,36 @@ def main():
             layer=layer, active_experts=len(active), seconds=time.perf_counter() - start
         ),
     )
-    wire = torch.empty((80, 5280), device="cuda", dtype=torch.uint8)
-    ids = torch.empty((80, 6), device="cuda", dtype=torch.int32)
-    routing = torch.empty((80, 6), device="cuda")
-    qa = wire[:, :5120].view(torch.uint32)
-    qs = wire[:, 5120:]
+    wire = torch.empty((capacity, wire_bytes), device="cuda", dtype=torch.uint8)
+    ids = torch.empty((capacity, topk), device="cuda", dtype=torch.int32)
+    routing = torch.empty((capacity, topk), device="cuda")
+    qa = wire[:, :h].view(torch.uint32)
+    qs = wire[:, h:]
     packed = [x.view(torch.uint32).flatten() for x in weights]
     native = {
-        capacity: Native(lib, capacity, weights, wire, ids, routing)
-        for capacity in [1, 80]
+        capacity: Native(lib, capacity, weights, wire, ids, routing, geometry=geometry)
+        for capacity in capacities
     }
     variants = {}
     planners = {}
     native_variants = {}
     if options.candidate_dir:
-        for width in (64, 128, 192):
+        for width in widths:
             candidate_lib = library(
-                str(options.candidate_dir / f"w{width}" / "libcuteafd_native.so")
+                str(options.candidate_dir / f"w{width}" / "libcuteafd_native.so"), family=options.geometry
             )
-            for capacity in (1, 16, 80):
+            check(candidate_lib.cuteafd_set_expert_hidden(h))
+            for capacity in capacities:
                 native_variants[capacity, width] = Native(
-                    candidate_lib, capacity, weights, wire, ids, routing
+                    candidate_lib, capacity, weights, wire, ids, routing, geometry=geometry
                 )
     else:
-        for capacity in [1, 16, 80]:
+        for capacity in capacities:
             metadata = torch.full(
-                (capacity * 6, 19), -1, device="cuda", dtype=torch.int32
+                (capacity * topk, 19), -1, device="cuda", dtype=torch.int32
             )
-            pairmap = torch.empty(capacity * 6, device="cuda", dtype=torch.int32)
-            rw = torch.empty(capacity * 6, device="cuda")
+            pairmap = torch.empty(capacity * topk, device="cuda", dtype=torch.int32)
+            rw = torch.empty(capacity * topk, device="cuda")
             mv = from_dlpack(metadata, assumed_align=16)
             pv = from_dlpack(pairmap, assumed_align=16)
             live = torch.empty(1, device="cuda", dtype=torch.int32)
@@ -213,38 +238,38 @@ def main():
                 ids.flatten(),
                 routing.flatten(),
                 live,
-                torch.empty(384 * capacity * 6, device="cuda", dtype=torch.int32),
-                torch.empty(384, device="cuda", dtype=torch.int32),
-                torch.empty((384, 2), device="cuda", dtype=torch.int32),
+                torch.empty(experts * capacity * topk, device="cuda", dtype=torch.int32),
+                torch.empty(experts, device="cuda", dtype=torch.int32),
+                torch.empty((experts, 2), device="cuda", dtype=torch.int32),
                 metadata,
                 rw,
                 pairmap,
             ]
             planner_args = [from_dlpack(t, assumed_align=16) for t in planner_buffers]
             planner = cute.compile(
-                V41RoutePlan(capacity), *planner_args, current_cuda_stream()
+                V41RoutePlan(capacity, experts, topk), *planner_args, current_cuda_stream()
             )
             planners[capacity] = (planner, planner_args, planner_buffers)
-            for width in [64, 128, 192]:
+            for width in widths:
                 output = torch.empty(
-                    ((576 + width - 1) // width, capacity * 6, 5120), device="cuda"
+                    ((n + width - 1) // width, capacity * topk, h), device="cuda"
                 )
-                reduced = torch.empty((capacity * 6, 5120), device="cuda")
+                reduced = torch.empty((capacity * topk, h), device="cuda")
                 args = [
                     from_dlpack(x, assumed_align=16)
                     for x in [qa, qs, *packed, rw, output]
                 ]
                 rv = from_dlpack(reduced, assumed_align=16)
                 fn = cute.compile(
-                    V41FusedSliceKernel(width, grouped=True),
+                    V41FusedSliceKernel(width, grouped=True, hidden=h, intermediate=n),
                     *args,
-                    cutlass.Int32(80),
+                    cutlass.Int32(capacity),
                     current_cuda_stream(),
                     mv,
-                    cutlass.Int32(capacity * 6),
+                    cutlass.Int32(capacity * topk),
                 )
                 reduce = cute.compile(
-                    V41SliceReduce(width, capacity),
+                    V41SliceReduce(width, capacity, topk, hidden=h, intermediate=n),
                     args[-1],
                     rv,
                     pv,
@@ -268,22 +293,22 @@ def main():
         wire.copy_(wire_cpu)
         ids.copy_(ids_cpu)
         routing.copy_(rw_cpu)
-        for rows in [1, 2, 6, 16, 80, 1]:
-            baseline = native[1 if rows == 1 else 80]
+        for rows in rows_to_check:
+            baseline = native[min(c for c in capacities if c >= rows)]
             baseline.run(rows)
             torch.cuda.synchronize()
-            base = baseline.output[: rows * 6].clone()
+            base = baseline.output[: rows * topk].clone()
             assert torch.isfinite(base).all() and base.norm() > 0
             prior = (
                 (options.baseline / f"v{layer}-c{case}-m{rows}-routes.bin")
                 if options.baseline
                 else None
             )
-            if prior is not None and rows in (1, 16, 80):
+            if prior is not None and rows in capacities:
                 assert prior.is_file(), prior
                 expected = (
                     torch.frombuffer(bytearray(prior.read_bytes()), dtype=torch.float32)
-                    .reshape(rows * 6, 5120)
+                    .reshape(rows * topk, h)
                     .cuda()
                 )
                 assert torch.equal(base, expected), (
@@ -308,15 +333,15 @@ def main():
             with torch.cuda.graph(graph):
                 baseline.run(rows)
             graphs["native"] = graph
-            cap = 1 if rows == 1 else 16 if rows <= 16 else 80
+            cap = min(c for c in capacities if c >= rows)
             tasks, pairs = _metadata(ids_cpu[:rows])
             groups = len(tasks)
-            routes = rows * 6
+            routes = rows * topk
             if not options.candidate_dir:
                 planner, planner_args, planner_buffers = planners[cap]
                 planner_buffers[2].fill_(rows)
             metrics = {}
-            for width in [64, 128, 192]:
+            for width in widths:
                 if options.candidate_dir:
                     owner = native_variants[cap, width]
                     reduced = owner.output
@@ -330,7 +355,7 @@ def main():
 
                     def run():
                         planner(*planner_args, current_cuda_stream())
-                        fn(*args, rows, current_cuda_stream(), mv, cap * 6)
+                        fn(*args, rows, current_cuda_stream(), mv, cap * topk)
                         reduce(args[-1], rv, pv, planner_args[2], current_cuda_stream())
 
                 run()
@@ -344,7 +369,7 @@ def main():
                 if not options.candidate_dir:
                     assert torch.equal(meta[:groups].cpu(), tasks)
                     expected_inverse = torch.empty(routes, dtype=torch.int32)
-                    expected_inverse[pairs[:, 0] * 6 + pairs[:, 1]] = torch.arange(
+                    expected_inverse[pairs[:, 0] * topk + pairs[:, 1]] = torch.arange(
                         routes, dtype=torch.int32
                     )
                     assert torch.equal(pmap[:routes].cpu(), expected_inverse)
@@ -353,7 +378,7 @@ def main():
                 rel = (diff.norm() / base.norm()).item()
                 maxabs = diff.abs().max().item()
                 # Compare current compact rank arithmetic as well as individual FP32 routes.
-                ac = torch.empty(rows, 5120, device="cuda", dtype=torch.bfloat16)
+                ac = torch.empty(rows, h, device="cuda", dtype=torch.bfloat16)
                 bc = torch.empty_like(ac)
                 check(
                     lib.cuteafd_compact_routes_bf16_async(

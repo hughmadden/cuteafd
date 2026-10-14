@@ -82,3 +82,18 @@ def test_symbol_families_are_mutually_exclusive() -> None:
             module.expert_symbol_prefix(spark_tp=unsupported)
     assert module.expert_symbol_prefix(spark_tp=2) == "cuteafd_v41_spark_tp2_expert_"
     assert module.expert_symbol_prefix(spark_tp=6) == "cuteafd_v41_spark_tp6_expert_"
+
+
+@pytest.mark.parametrize("family", ("dsv4f", "dsv4p"))
+def test_native_v4_family_symbols_keep_shared_packer(family) -> None:
+    module = _load()
+    prefix = module.expert_symbol_prefix(family=family)
+    assert prefix == f"cuteafd_{family}_expert_"
+    assert module.namespaced_symbol("cuteafd_v41_expert_launch", prefix) == f"{prefix}launch"
+    assert module.namespaced_symbol("cuteafd_pack_expert_async", prefix) == "cuteafd_pack_expert_async"
+    assert module.namespaced_symbol("cuteafd_set_expert_hidden", prefix) == "cuteafd_set_expert_hidden"
+    assert module.expert_symbol_prefix(family=family, tp2=True) == f"cuteafd_{family}_tp2_expert_"
+    assert module.expert_symbol_prefix(family=family, spark_tp=2) == f"cuteafd_{family}_spark_tp2_expert_"
+    for unsupported in (3, 6):
+        with pytest.raises(AssertionError):
+            module.expert_symbol_prefix(family=family, spark_tp=unsupported)
